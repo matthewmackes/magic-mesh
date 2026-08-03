@@ -53,6 +53,17 @@ pub(crate) struct AppSessionHandoff {
     pub(crate) app_id: String,
 }
 
+/// Identity-only focus intent for an ordinary brokered desktop session.
+///
+/// The rail deliberately carries no peer, VM, protocol, or authentication
+/// fields. Those belong to the exact [`crate::vdi::ConnectRequest`] retained by
+/// the VDI owner; reconstructing them from roster presentation data would lose
+/// Browser profiles, transport choices, and sealed guest credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DesktopSessionFocus {
+    pub(crate) id: String,
+}
+
 // The `SessionRequest` verbs read off `action/vdi/session` are the shared
 // `mackes_mesh_types::vdi_session::SessionRequest` (arch-2) — imported above, not a
 // local mirror. Only `Deserialize` is exercised here (this side reads the wire).
@@ -64,6 +75,7 @@ pub(crate) struct SessionRailState {
     cursor: Option<String>,
     sessions: BTreeMap<String, RailSession>,
     pending_app_handoff: Option<AppSessionHandoff>,
+    pending_desktop_focus: Option<DesktopSessionFocus>,
 }
 
 impl SessionRailState {
@@ -112,10 +124,32 @@ impl SessionRailState {
             .collect()
     }
 
-    /// Focus a broker-visible session locally. This mirrors the broker lifecycle
-    /// state for the shell's session selection without publishing a fake broker
-    /// `Active` transition; the shared `SessionStore` remains the live multi-seat
-    /// authority when it lands.
+    /// Return only sessions that are connected on this seat. These transient
+    /// entries feed the center taskbar; pending, disconnected, and closed
+    /// sessions remain available through the full Sessions surface instead of
+    /// pretending to be directly openable taskbar targets.
+    pub(crate) fn connected_entries(&mut self, client_peer: &str) -> Vec<SessionRailEntry> {
+        self.poll();
+        self.sessions
+            .values()
+            .filter(|session| session.client_peer == client_peer)
+            .filter(|session| session_is_connected(session))
+            .map(|session| {
+                SessionRailEntry::with_session_id(
+                    &session.id,
+                    session_label(session),
+                    session_badge(session),
+                )
+            })
+            .collect()
+    }
+
+    /// Queue a local focus intent for a broker-visible session.
+    ///
+    /// Focus is presentation state, not a broker lifecycle publication. The
+    /// local projection may show the focused row as live, but no `Active`, `Open`,
+    /// or `Close` record is emitted and no ordinary connection is reconstructed
+    /// from roster text.
     pub(crate) fn focus_session(&mut self, id: &str) -> bool {
         self.poll();
         let Some(session) = self.sessions.get_mut(id) else {
@@ -136,6 +170,10 @@ impl SessionRailState {
                     vm_id: session.vm_id.clone(),
                     app_id,
                 });
+            } else {
+                self.pending_desktop_focus = Some(DesktopSessionFocus {
+                    id: session.id.clone(),
+                });
             }
             true
         } else {
@@ -147,6 +185,12 @@ impl SessionRailState {
     /// A focus action is not allowed to retrigger a launch on every frame.
     pub(crate) fn take_app_handoff(&mut self) -> Option<AppSessionHandoff> {
         self.pending_app_handoff.take()
+    }
+
+    /// Consume the identity-only ordinary desktop focus raised by a taskbar or
+    /// Sessions click. The VDI owner resolves it only against retained requests.
+    pub(crate) fn take_desktop_focus(&mut self) -> Option<DesktopSessionFocus> {
+        self.pending_desktop_focus.take()
     }
 
     fn poll(&mut self) {
@@ -220,9 +264,7 @@ impl SessionRailState {
                 state,
                 reason,
                 ..
-            } => {
-                self.set_app_state(&id, state, reason)
-            }
+            } => self.set_app_state(&id, state, reason),
             SessionRequest::Disconnect { id } => self.set_state(&id, SessionState::Disconnected),
             SessionRequest::Close { id } => {
                 self.sessions.remove(&id);
@@ -261,6 +303,14 @@ const fn app_session_can_focus(session: &RailSession) -> bool {
             | AppVmLifecycleState::StaleCatalog
             | AppVmLifecycleState::Failed,
         ) => false,
+    }
+}
+
+const fn session_is_connected(session: &RailSession) -> bool {
+    match session.app_state {
+        Some(AppVmLifecycleState::Connected) => true,
+        Some(_) => false,
+        None => matches!(session.state, SessionState::Active),
     }
 }
 
@@ -382,7 +432,53 @@ mod tests {
     }
 
     #[test]
-    fn focused_session_entry_marks_the_local_rail_entry_live() {
+    fn connected_entries_include_desktop_and_app_sessions_but_drop_pending_or_disconnected() {
+        let root = temp_bus("connected-taskbar");
+        publish(
+            &root,
+            r#"{"op":"open","id":"desktop-1","serving_peer":"oak","vm_id":"win11","client_peer":"eagle"}"#,
+        );
+        publish(&root, r#"{"op":"active","id":"desktop-1"}"#);
+        publish(
+            &root,
+            r#"{"op":"open_app","id":"app-1","serving_peer":"ash","vm_id":"writer-vm","client_peer":"eagle","app_id":"org.example.Writer","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":[],"resume":true}"#,
+        );
+        publish(
+            &root,
+            r#"{"op":"app_state","id":"app-1","state":"connected"}"#,
+        );
+        publish(
+            &root,
+            r#"{"op":"open","id":"pending","serving_peer":"birch","vm_id":"linux","client_peer":"eagle"}"#,
+        );
+        publish(
+            &root,
+            r#"{"op":"open","id":"other-seat","serving_peer":"cedar","vm_id":"mac","client_peer":"other"}"#,
+        );
+
+        let mut state = SessionRailState::with_bus_root(root.clone());
+        assert_eq!(
+            state.connected_entries("eagle"),
+            vec![
+                SessionRailEntry::with_session_id("app-1", "org.example.Writer · ash", "LIVE"),
+                SessionRailEntry::with_session_id("desktop-1", "oak win11", "LIVE"),
+            ]
+        );
+
+        publish(&root, r#"{"op":"disconnect","id":"desktop-1"}"#);
+        assert_eq!(
+            state.connected_entries("eagle"),
+            vec![SessionRailEntry::with_session_id(
+                "app-1",
+                "org.example.Writer · ash",
+                "LIVE",
+            )]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn focused_session_entry_queues_identity_without_publishing_broker_state() {
         let root = temp_bus("focus");
         publish(
             &root,
@@ -395,9 +491,20 @@ mod tests {
             vec![SessionRailEntry::with_session_id("s1", "oak win11", "VDI")]
         );
         assert!(state.focus_session("s1"));
+        let focus = state
+            .take_desktop_focus()
+            .expect("desktop focus queues an identity-only intent");
+        assert_eq!(
+            focus,
+            DesktopSessionFocus {
+                id: "s1".to_owned()
+            }
+        );
+        assert!(state.take_desktop_focus().is_none());
         assert_eq!(
             state.entries("eagle"),
-            vec![SessionRailEntry::with_session_id("s1", "oak win11", "LIVE")]
+            vec![SessionRailEntry::with_session_id("s1", "oak win11", "LIVE")],
+            "local focus remains visible without publishing a broker transition"
         );
         assert!(
             !state.focus_session("missing"),
@@ -421,10 +528,12 @@ mod tests {
         let mut state = SessionRailState::with_bus_root(root.clone());
         assert_eq!(
             state.entries("eagle"),
-            vec![SessionRailEntry::new("org.example.Writer · oak", "BOOT").with_app_status(
-                Some("guest boot accepted".to_owned()),
-                Some("Starting guest"),
-            )]
+            vec![
+                SessionRailEntry::new("org.example.Writer · oak", "BOOT").with_app_status(
+                    Some("guest boot accepted".to_owned()),
+                    Some("Starting guest"),
+                )
+            ]
         );
         publish(
             &root,
@@ -445,9 +554,24 @@ mod tests {
         let mut state = SessionRailState::with_bus_root(root.clone());
 
         for (wire_state, badge, reason, guidance) in [
-            ("failed", "FAILED", "flatpak install failed", "Retry from Desktop"),
-            ("unavailable", "OFFLINE", "guest is unreachable", "Retry from Desktop"),
-            ("reconnecting", "RECON", "surface connection dropped", "Waiting for connection"),
+            (
+                "failed",
+                "FAILED",
+                "flatpak install failed",
+                "Retry from Desktop",
+            ),
+            (
+                "unavailable",
+                "OFFLINE",
+                "guest is unreachable",
+                "Retry from Desktop",
+            ),
+            (
+                "reconnecting",
+                "RECON",
+                "surface connection dropped",
+                "Waiting for connection",
+            ),
         ] {
             publish(
                 &root,

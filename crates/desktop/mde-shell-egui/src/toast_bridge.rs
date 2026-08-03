@@ -8,14 +8,15 @@
 //!   node / worker — `mackesd`, a remote peer — can raise an alert fleet-wide
 //!   (lock 7), decoding each body into an alert [`Toast`];
 //! * drives the host once per frame ([`ToastBridge::drive`]): `tick` the real
-//!   frame delta, drain the lane, then paint the centered OSD;
+//!   frame delta, drain the lane, then paint the top-center alert banner and
+//!   centered OSD;
 //! * fires **one** severity-scaled notification sound on a new alert (lock 8),
 //!   the single sound authority — no double-beeps;
 //! * applies **suppression** (lock 10): DND / a per-VM-session focus mute silence
 //!   an Info/Warning ambient alert *and* its sound, audio-mute silences a non-critical's
 //!   sound, but a **Critical always breaks through**; and
-//! * keeps the action-verb grammar centralized for Chat inline notification actions
-//!   ([`resolve_action`]).
+//! * keeps the action-verb grammar centralized for banner and Chat inline
+//!   notification actions ([`resolve_action`]).
 //!
 //! The wire body is a JSON boundary (local serde structs, not a `mackesd`
 //! dependency — §6 mesh/desktop boundary), the same pattern the Fleet plane and
@@ -370,15 +371,17 @@ impl ToastBridge {
     }
 
     /// The per-frame drive: advance the countdowns by the real frame delta, drain
-    /// any new `event/toast/show`, then paint the OSD tier. Notification-class
-    /// alerts are logged/folded into Chat, not mounted as shell popups.
+    /// any new `event/toast/show`, then paint the alert banner and OSD tiers.
+    /// Alerts remain folded into Notification history as well as being surfaced;
+    /// suppression decides whether an ambient banner is admitted.
     pub(crate) fn drive(&mut self, ctx: &egui::Context) -> Option<Navigate> {
         self.tick(ctx);
         self.drain();
+        let action = self.host.chyron(ctx).action;
         // The centered OSD tier is a separate, instant channel; painting it here
         // keeps hardware feedback live without notification clutter.
         self.host.osd(ctx);
-        None
+        action.as_deref().and_then(resolve_action)
     }
 
     /// Advance the host's countdowns by the elapsed frame delta and keep the
@@ -459,10 +462,10 @@ impl ToastBridge {
         );
     }
 
-    /// Apply suppression (lock 10) then ring (lock 8). A suppressed Info/Warning
-    /// never rings; a Critical always does. Notification-class visuals belong to
-    /// Chat, so alert toasts are deliberately not enqueued into the popup host.
-    /// Split from the Bus read so the whole policy is unit-tested without a spool.
+    /// Apply suppression (lock 10), enqueue the visible banner, then ring (lock 8).
+    /// A suppressed Info/Warning is retained in history but neither shown nor
+    /// rung; a Critical always breaks through. Split from the Bus read so the
+    /// whole policy is unit-tested without a spool.
     fn admit(&mut self, toast: Toast) {
         let Some(severity) = alert_severity(&toast) else {
             // An OSD-tier toast on the alert lane would just flash — but the lane
@@ -475,9 +478,14 @@ impl ToastBridge {
         // found later). Pure data tap; nothing below changes.
         self.history
             .record(severity, &toast.source_host, &toast.flag, &toast.headline);
-        if self.suppress.hides_ambient_push(severity) {
+        // Deployment notices tagged AI-GENERATED-ALERT are an explicit operator
+        // safety channel: they remain visible through DND/focused-VDI posture so
+        // a seat is warned before its shell or services are updated. Audio still
+        // follows the normal mute policy.
+        if !toast.is_ai_generated_alert() && self.suppress.hides_ambient_push(severity) {
             return;
         }
+        self.host.enqueue(toast);
         if !self.suppress.hushes_sound(severity) {
             self.chime.ring(severity);
         }
@@ -581,10 +589,7 @@ mod tests {
         assert!(rec.0.borrow().is_empty());
 
         b.admit(decode(&body("critical", "lh1", "intrusion")).unwrap());
-        assert!(
-            b.host.is_idle(),
-            "a Critical no longer opens a notification popup"
-        );
+        assert!(b.host.has_critical(), "Critical opened a visible alert");
         assert_eq!(*rec.0.borrow(), vec![Severity::Critical], "and still rings");
     }
 
@@ -599,12 +604,15 @@ mod tests {
     }
 
     #[test]
-    fn audio_mute_hushes_the_sound_and_no_popup_is_opened() {
+    fn audio_mute_hushes_the_sound_but_keeps_the_visible_alert() {
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
         b.set_suppression(false, false, true);
         b.admit(decode(&body("warning", "a", "build failed")).unwrap());
-        assert!(b.host.is_idle(), "notification popups stay retired");
+        assert!(
+            !b.host.is_idle(),
+            "audio mute must not hide the visual alert"
+        );
         assert!(rec.0.borrow().is_empty(), "but no sound fired");
     }
 
@@ -624,12 +632,30 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_alert_rings_exactly_once_without_opening_a_popup() {
+    fn a_plain_alert_rings_exactly_once_and_opens_one_popup() {
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
         b.admit(decode(&body("info", "nyc3", "hi")).unwrap());
-        assert!(b.host.is_idle(), "the shell bridge did not enqueue a popup");
+        assert!(!b.host.is_idle(), "the shell bridge enqueued the popup");
         assert_eq!(*rec.0.borrow(), vec![Severity::Info], "one beep, no double");
+    }
+
+    #[test]
+    fn an_ai_generated_alert_breaks_through_dnd_visually() {
+        let rec = Recorder::default();
+        let mut b = bridge_with(&rec);
+        b.set_suppression(true, true, true);
+        b.admit(
+            decode(
+                r#"{"severity":"warning","source_host":"controller","flag":"AI-GENERATED-ALERT","headline":"Update begins in 5 seconds"}"#,
+            )
+            .unwrap(),
+        );
+        assert!(!b.host.is_idle(), "deployment warning was hidden by DND");
+        assert!(
+            rec.0.borrow().is_empty(),
+            "mute posture still hushes its sound"
+        );
     }
 
     // ── action verb resolution (KIRON-2 executes it) ──────────────────────────
@@ -754,22 +780,22 @@ mod tests {
         use mde_egui::{OsdKind, OsdLevel};
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
-        // A Critical alert rings but does not mount a popup; OSD remains separate.
+        // A Critical alert and OSD remain independent visible channels.
         b.admit(decode(&body("critical", "lh1", "intrusion")).unwrap());
         b.flash_osd(OsdLevel::new(OsdKind::Volume, 0.4));
         assert!(b.host.osd_active(), "the volume hotkey lit the OSD tier");
         assert!(
-            b.host.current().is_none(),
-            "the OSD flash did not resurrect alert popups"
+            b.host.current().is_some(),
+            "the OSD flash disturbed the active alert"
         );
         // The OSD is a direct channel — it never rings the notification chime.
         assert_eq!(*rec.0.borrow(), vec![Severity::Critical]);
     }
 
-    // ── alert popups are retired; OSD remains render-mounted (§7) ─────────────
+    // ── visible alert and OSD render mounts (§7) ──────────────────────────────
 
     #[test]
-    fn an_alert_does_not_tessellate_a_notification_popup_through_the_bridge() {
+    fn an_alert_tessellates_a_notification_popup_through_the_bridge() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let rec = Recorder::default();
@@ -788,12 +814,12 @@ mod tests {
         });
         let out = ctx.run(input(), |ctx| {
             let nav = b.drive(ctx);
-            assert!(nav.is_none(), "alert actions now execute from Chat");
+            assert!(nav.is_none(), "no alert action was clicked");
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(prims.is_empty(), "an alert popup still produced geometry");
+        assert!(!prims.is_empty(), "the alert popup produced no geometry");
         assert_eq!(*rec.0.borrow(), vec![Severity::Info]);
-        assert!(b.host.is_idle());
+        assert!(!b.host.is_idle());
     }
 
     #[test]

@@ -741,6 +741,14 @@ enum Cmd {
         cmd: SecretCmd,
     },
 
+    /// Operate a first-class universal service card. `save` accepts one bounded
+    /// JSON submission on stdin so secret fields never appear in argv or the
+    /// inherited environment.
+    ServiceCard {
+        #[command(subcommand)]
+        cmd: ServiceCardCmd,
+    },
+
     /// DAR-2 — seal arbitrary bytes from stdin under the canonical Argon2id +
     /// XChaCha20-Poly1305 envelope (`ca::backup::seal_bytes`), emitting the
     /// ASCII-armored bundle on stdout. This is the ONE passphrase-sealed-blob
@@ -832,9 +840,11 @@ enum Cmd {
         /// (`mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>`). Omit to
         /// launch the TUI.
         token: Option<String>,
-        /// Role to pin when unpinned (lighthouse|workstation).
-        #[arg(long, default_value = "workstation")]
-        role: String,
+        /// Role to pin when unpinned (lighthouse|workstation). When omitted,
+        /// an existing pin remains authoritative; a fresh node defaults to
+        /// Workstation.
+        #[arg(long)]
+        role: Option<String>,
         /// Optional display name; defaults to the system hostname.
         #[arg(long)]
         name: Option<String>,
@@ -1330,6 +1340,20 @@ enum SecretCmd {
         #[arg(long)]
         local: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCardCmd {
+    /// Validate and persist desired state, sealing secret fields immediately.
+    Save,
+    /// Probe a configured service's endpoint.
+    Test { service_kind: String },
+    /// Probe and then enable the service adapter.
+    Enable { service_kind: String },
+    /// Disable the adapter while retaining sealed configuration.
+    Disable { service_kind: String },
+    /// Remove desired configuration while retaining sealed credential history.
+    Remove { service_kind: String },
 }
 
 #[derive(clap::Subcommand)]
@@ -2175,6 +2199,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::MeshSshKey { cmd } => cli::mesh_ssh_key::run(cmd)?,
         Cmd::Transfer { cmd } => cli::transfer::run(cmd)?,
         Cmd::Secret { cmd } => cli::secret::run(cmd)?,
+        Cmd::ServiceCard { cmd } => cli::service_card::run(cmd)?,
         Cmd::SecretSeal { passphrase_file } => cli::secret::seal(&passphrase_file)?,
         Cmd::SecretUnseal { passphrase_file } => cli::secret::unseal(&passphrase_file)?,
         Cmd::Lighthouse { cmd } => match cmd {
@@ -2209,7 +2234,7 @@ fn main() -> anyhow::Result<()> {
             role,
             name,
             workgroup_root,
-        } => cli::join::run(token, &role, name, workgroup_root)?,
+        } => cli::join::run(token, role.as_deref(), name, workgroup_root)?,
         Cmd::Peers { json } => cli::peers::run(json, db_path)?,
         Cmd::Remediate { cmd } => cli::remediate::run(cmd, db_path)?,
         Cmd::Policy { cmd } => cli::policy::run(cmd, db_path)?,
@@ -2265,6 +2290,50 @@ fn main() -> anyhow::Result<()> {
         Cmd::Playbooks { cmd } => cli::playbooks::run(cmd)?,
     }
     Ok(())
+}
+
+fn install_mesh_service_key(
+    role_rank: u8,
+    workgroup_root: &std::path::Path,
+) -> Result<
+    mackesd_core::ipc::mesh_ssh_key::ProvisionOutcome,
+    mackesd_core::ipc::mesh_ssh_key::ProvisionError,
+> {
+    use mackesd_core::ipc::mesh_ssh_key::{MeshKeyProvisioner, ProvisionError};
+    use mackesd_core::ipc::secret_store::{repo_root, SecretStore};
+
+    let store = SecretStore::resolve(&repo_root(), workgroup_root);
+    let provisioner = MeshKeyProvisioner::new(store);
+    if role_rank == mde_role::Role::Lighthouse.rank() {
+        return provisioner.provision();
+    }
+    let line = provisioner.sealed_public_line()?.ok_or_else(|| {
+        ProvisionError::Store("mesh SSH key has not reached this node yet".to_owned())
+    })?;
+    let reload = provisioner.apply(&line)?;
+    Ok(mackesd_core::ipc::mesh_ssh_key::ProvisionOutcome {
+        generated: false,
+        rekeyed: false,
+        public_line: line,
+        reload,
+    })
+}
+
+fn log_mesh_service_key_outcome(
+    outcome: &mackesd_core::ipc::mesh_ssh_key::ProvisionOutcome,
+) {
+    use mackesd_core::ipc::mesh_ssh_key::SshdReload;
+
+    match &outcome.reload {
+        SshdReload::Reloaded | SshdReload::Skipped => tracing::info!(
+            generated = outcome.generated,
+            "mesh-unique service key installed for overlay file access"
+        ),
+        SshdReload::Gated(reason) => tracing::error!(
+            %reason,
+            "mesh service key config landed but sshd activation is gated"
+        ),
+    }
 }
 
 /// This node's short hostname (`hostname`), or `"unknown"`.
@@ -2609,6 +2678,45 @@ fn run_serve(
             }
         };
         let role_rank = deploy_class.rank;
+        // Joined-node invariant: every member has the same password-locked
+        // service username, while the SSH private key is scoped to this mesh's
+        // replicated secret store. A founding Lighthouse may mint the key;
+        // Workstations only install an already-sealed mesh key and never race to
+        // create a second identity during concurrent enrollment.
+        let account_outcome = mackesd_core::ipc::mesh_service_account::ensure_mesh_service_account()
+            .map_err(|error| anyhow::anyhow!("mesh service identity unavailable: {error}"))?;
+        tracing::info!(
+            user = mackesd_core::ipc::mesh_service_account::MESH_SERVICE_USER,
+            ?account_outcome,
+            "joined-mesh service account ready"
+        );
+        match install_mesh_service_key(role_rank, &workgroup_root) {
+            Ok(outcome) => log_mesh_service_key_outcome(&outcome),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "mesh service key is not available yet; background reconciliation is active"
+                );
+                let retry_root = workgroup_root.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        match install_mesh_service_key(role_rank, &retry_root) {
+                            Ok(outcome) => {
+                                log_mesh_service_key_outcome(&outcome);
+                                break;
+                            }
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "mesh service key reconciliation is still pending"
+                            ),
+                        }
+                    }
+                });
+            }
+        }
         tracing::info!(
             role_rank,
             media = deploy_class.media,
@@ -3178,6 +3286,43 @@ fn resolve_enroll_endpoint_host(
     let raw = explicit.or(external_addr)?;
     let host = raw.rsplit_once(':').map_or(raw, |(host, _)| host);
     (!host.is_empty()).then(|| host.to_string())
+}
+
+#[cfg(test)]
+mod join_cli_role_tests {
+    use super::{Cli, Cmd};
+    use clap::Parser as _;
+
+    fn parsed_join_role(args: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(args).expect("join CLI parses");
+        match cli.cmd {
+            Cmd::Join { role, .. } => role,
+            _ => panic!("expected join command"),
+        }
+    }
+
+    #[test]
+    fn omitted_join_role_remains_distinguishable_from_workstation() {
+        assert_eq!(
+            parsed_join_role(&["mackesd", "join", "not-a-real-token"]),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_join_role_is_preserved_for_authoritative_resolution() {
+        assert_eq!(
+            parsed_join_role(&[
+                "mackesd",
+                "join",
+                "not-a-real-token",
+                "--role",
+                "lighthouse",
+            ])
+            .as_deref(),
+            Some("lighthouse")
+        );
+    }
 }
 
 #[cfg(test)]

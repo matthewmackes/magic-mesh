@@ -25,11 +25,15 @@ Documentation=https://github.com/matthewmackes/magic-mesh
 # seats in the RPM lane may still boot to multi-user.target, so the install
 # target below binds this unit into both normal boot targets.
 ConditionPathExists=/var/lib/mde/role.toml
-After=systemd-user-sessions.service plymouth-quit-wait.service magic-setup.service
+After=systemd-user-sessions.service plymouth-quit-wait.service magic-setup.service user@1000.service
 # The shell talks to mackesd over the shared bus spool; degrade gracefully if
 # the daemon is still coming up (panels show their honest empty states).
 After=mackesd.service
 Wants=mackesd.service
+# The physical-audio policy session belongs to the persistent primary seat user.
+# The root DRM shell connects to that PipeWire graph for native media and RDP
+# RDPSND playback; without this ordering/environment `pw-cat` has no sink.
+Wants=user@1000.service
 Conflicts=getty@tty1.service
 Before=getty.target
 # The shell IS the UI — keep bringing it back, but don't tight-loop a broken
@@ -58,6 +62,7 @@ Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 # Offline maps are persistent seat data, not Bus spool data. Keep this explicit
 # so a shared `/run/mde-bus` client root cannot redirect Maps to tmpfs.
 Environment=MDE_MAPS_DIR=/var/lib/mde/maps
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 # The shipped root DRM shell is the only production token minter. A provisioning
 # helper installs its LoadCredentialEncrypted drop-in only after host ciphertext
 # exists; without it every live action fails closed before publishing.

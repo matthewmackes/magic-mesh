@@ -63,6 +63,7 @@ use mde_collab_types::value::{
 use mde_collab_types::{
     ActorId, AiSuggestionRequestStatus, AiSuggestionRequestView, AiSuggestionRequests,
     CollabCommand, CollabEventEnvelope, CollabEventKind, SpaceId, SpaceKind, SpaceRole,
+    MAX_CLIPBOARD_TEXT_BYTES,
 };
 
 use super::{ShutdownToken, Worker};
@@ -90,15 +91,15 @@ const ALERT_LANE_PREFIXES: &[&str] = &[
 ];
 
 /// The cross-mesh clipboard-capture lane the `clipboard_sync` worker broadcasts
-/// on. Its body is `{ id, text, source, time }` (text-only, uncapped); we fold
+/// on. Its body is `{ id, text, source, time }` (text-only, bounded); we fold
 /// each capture into a [`ClipboardPublished`](CollabEventKind::ClipboardPublished)
 /// event, recomputing the full content address + gating on size.
 const CLIPBOARD_CAPTURE_TOPIC: &str = "event/clipboard/clip";
 
-/// The clipboard-lane size ceiling: a clip up to 100 MB rides the lane; anything
+/// The clipboard-lane size ceiling: a clip up to 1 MiB rides the lane; anything
 /// larger is a Transfer, not a clip, so it is **not** folded here (never
 /// truncated) — it belongs to the WL-FUNC-006 transfer path.
-const MAX_CLIP_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_CLIP_BYTES: u64 = MAX_CLIPBOARD_TEXT_BYTES as u64;
 
 /// The name of the node's own **system space** — a per-node space the worker owns
 /// that holds its folded node-level facts (alerts + clipboard captures), so those
@@ -594,6 +595,15 @@ impl CollabWorker {
         let space = env.space_id;
         if !state.own_logs.contains_key(&space) {
             let log = FileActorLog::open(&self.log_root, space, &self.self_actor)?;
+            if log.rejected_line_count() > 0 {
+                tracing::warn!(
+                    target: "mackesd::collab",
+                    %space,
+                    actor = %self.self_actor,
+                    rejected_lines = log.rejected_line_count(),
+                    "isolated malformed actor-log records; valid collaboration history remains writable",
+                );
+            }
             state.own_logs.insert(space, log);
         }
         let log = state
@@ -2586,7 +2596,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_start_then_control_projects_the_shared_ledger_state() {
+    fn transfer_start_then_cancel_projects_the_shared_ledger_state() {
         // WL-FUNC-011 — a linked file's transfer flows through the shared ledger:
         // StartTransfer projects the control handle (Queued); ControlTransfer moves
         // its state. Byte progress (moved/total) is mirrored from WL-FUNC-006, not
@@ -2640,21 +2650,21 @@ mod tests {
             "byte progress is mirrored from WL-FUNC-006, not owned here"
         );
 
-        // Pause → the state machine moves; still no second progress authority.
+        // A queued transfer may be canceled; still no second progress authority.
         write_command(
             &w,
             &persist,
             &CollabCommand::ControlTransfer {
                 transfer,
-                control: TransferControl::Pause,
+                control: TransferControl::Cancel,
             },
         );
         w.tick_once(&persist, &mut state, 500);
         let jobs = read_jobs(&persist);
         assert_eq!(
             jobs.jobs[0].state,
-            TransferState::Paused,
-            "ControlTransfer::Pause moved the shared transfer to Paused"
+            TransferState::Canceled,
+            "ControlTransfer::Cancel moved the shared transfer to Canceled"
         );
     }
 
@@ -2976,7 +2986,7 @@ mod tests {
         assert_eq!(item.len, 10);
         assert_eq!(item.sha256_hex, sha256_hex(b"hello mesh"));
         assert_eq!(item.source, "falcon");
-        // The >100MB → Transfers gate is a pure boundary (no 100MB fixture needed).
+        // The >1 MiB → Transfers gate is a pure boundary (no large fixture needed).
         assert!(clip_fits_lane(MAX_CLIP_BYTES));
         assert!(!clip_fits_lane(MAX_CLIP_BYTES + 1));
     }

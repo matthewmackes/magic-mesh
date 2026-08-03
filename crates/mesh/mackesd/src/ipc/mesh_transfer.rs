@@ -961,8 +961,10 @@ Total transferred file size: 4,096 bytes
         assert_eq!(v["op_id"], 9);
         // The plan the backend saw is a real oak→birch rsync.
         let plan = backend.seen.lock().unwrap().clone().expect("ran");
-        assert_eq!(plan.ssh_target, "root@oak.mesh");
-        assert!(plan.remote_command.contains("root@birch.mesh:incoming/"));
+        assert_eq!(plan.ssh_target, "MDE-MESH@oak.mesh");
+        assert!(plan
+            .remote_command
+            .contains("MDE-MESH@birch.mesh:incoming/"));
     }
 
     #[test]

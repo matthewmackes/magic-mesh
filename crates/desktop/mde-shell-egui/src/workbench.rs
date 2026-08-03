@@ -85,8 +85,9 @@ impl Plane {
 /// (WB-Provisioning) — every plane renders live status. The Provisioning plane
 /// additionally hosts two Bus-driven onboarding flows: the Spawn Lighthouse flow
 /// (`spawn_lighthouse`, OW-7) — promote a LAN-only mesh by standing up its first
-/// lighthouse + migrating the CA — and the day-2 Services flow (`services`,
-/// OW-11): pick Music/Files/Voice, preview the daemon's plan, apply over the Bus.
+/// lighthouse + migrating the CA. Service discovery and configuration live only
+/// in the universal resource browser, so Provisioning does not expose a second
+/// service catalog.
 // One state struct per mounted plane view — the Workbench is the single place
 // they all meet, so the arity IS the plane count, not a design smell.
 #[allow(clippy::too_many_arguments)]
@@ -114,10 +115,7 @@ pub fn show(
     // embeds a controller view).
     controller: &crate::controller::ControllerState,
     provisioning: &crate::provisioning::ProvisioningState,
-    // Mutable like `datacenter`: the Services flow publishes service-add
-    // requests onto the Bus and holds the daemon's typed answer.
-    services: &mut crate::services_flow::ServicesFlowState,
-    // Mutable like `services`: the Spawn Lighthouse flow (OW-7) publishes
+    // Mutable: the Spawn Lighthouse flow (OW-7) publishes
     // spawn-lighthouse requests onto the Bus and holds the daemon's typed answer.
     spawn_lighthouse: &mut crate::spawn_lighthouse_flow::SpawnLighthouseFlowState,
 ) {
@@ -203,8 +201,8 @@ pub fn show(
                 // WB-Provisioning — the mesh's live deployment posture (per-node
                 // tier + role rollup, the fleet version target vs each node's build
                 // + update flag, per-node enrollment readiness) off the same
-                // snapshot — plus the OW-11 Services flow (day-2 service adds are
-                // provisioning work: `onboard service-add` over the Bus).
+                // snapshot. Service configuration is intentionally absent here:
+                // the resource browser is its one source of truth.
                 Plane::Provisioning => {
                     provisioning.show(ui);
                     ui.add_space(Style::SP_M);
@@ -214,10 +212,6 @@ pub fn show(
                     // migrate the CA (the durable off-desktop CA home is provisioning
                     // work), over the Bus against the spawn_lighthouse_onboard worker.
                     spawn_lighthouse.show(ui);
-                    ui.add_space(Style::SP_M);
-                    ui.separator();
-                    ui.add_space(Style::SP_M);
-                    services.show(ui);
                 }
             }
         });
@@ -644,7 +638,6 @@ mod tests {
         let network = crate::network::NetworkState::default();
         let controller = crate::controller::ControllerState::default();
         let provisioning = crate::provisioning::ProvisioningState::default();
-        let mut services = crate::services_flow::ServicesFlowState::default();
         let mut spawn_lighthouse =
             crate::spawn_lighthouse_flow::SpawnLighthouseFlowState::default();
         let input = egui::RawInput {
@@ -664,7 +657,6 @@ mod tests {
                     &network,
                     &controller,
                     &provisioning,
-                    &mut services,
                     &mut spawn_lighthouse,
                 );
             });

@@ -1,5 +1,15 @@
 # F44 builder + physical-seat deploy (ffmpeg soname epoch skew)
 
+> **CURRENT DEPLOYMENT AUTHORITY — 2026-08-03:** the Fedora 44 Workstation
+> target is exactly five physical seats: T480 `172.20.146.138`, Eagle
+> `172.20.146.145`, Basement seat 15 `172.20.0.15`, Dell `172.20.146.225`, and
+> Microsoft Surface `172.20.146.79`. Their current overlay assignments are in
+> §2 and §7. The earlier `.13`, `.2`, and `.216` seat addresses and the July
+> mesh map are historical and **must not be used for deployment**. Reconcile
+> future inventory changes first in [BUILD-ENVIRONMENT.md](BUILD-ENVIRONMENT.md)
+> and preserve live rollout evidence in
+> [the 2026-08-03 seat record](ops/f44-seat-rollout-surface-2026-08-03.md).
+
 > **Why this doc exists (operator directive 2026-07-12):** *"Add all learned
 > information so that no other AI need to discover it."* Everything below was
 > discovered live while cutting the 12.0.0 RPM and deploying it to the physical
@@ -51,31 +61,56 @@ does **not** help — F44's mpv-libs is built against ffmpeg-8, so it provides
 
 ## 2. Seat inventory + access (the deploy targets)
 
-All seats are **Fedora 44**, physical (not the VDI VMs), and already carry
-`magic-mesh-12.0.0-1` **built on F42 without media-mpv** (so the running shell
-does not link libmpv). Password auth (`$LAB_PW`, operator-provided for this
-deploy) — key auth is not set up on the seats:
+All five targets are physical Fedora 44 Workstations, not build-farm or VDI
+VMs. This is the canonical target set as of 2026-08-03:
+
+| seat | LAN address | current overlay | deployment notes |
+|---|---:|---:|---|
+| **T480** | `172.20.146.138` | `10.42.0.8` | Direct-DRM seat; current-mesh enrollment corrected on 2026-08-03 |
+| **Eagle** | `172.20.146.145` | `10.42.0.6` | T470S Workstation; exclude from bench testing, but include in fleet deployment |
+| **Basement seat 15** | `172.20.0.15` | `10.42.0.5` | Low free-space condition; no `/dev/kvm`, so client/non-KVM placement only |
+| **Dell** | `172.20.146.225` | `10.42.0.4` | Preserve its existing Browser VM domain during package deployment |
+| **Microsoft Surface** | `172.20.146.79` | `10.42.0.7` | Distinct from seat 15; current Browser VM baseline exceeds its local capacity |
+
+These overlay addresses are observed identity assignments, **not inputs to a
+manual allocator**. Never hand-issue a duplicate address or copy another seat's
+Nebula identity. Surface is not seat 15, and no physical seat belongs in the
+build-farm inventory.
+
+The same verified `magic-mesh-12.1.6-1` review RPM was installed on all five
+targets on 2026-08-03. Its recorded SHA-256 is
+`edb32a228e823a16c12383792b1da63c65326cb1d3f61e3832e8adaf288c9f54`;
+consult the rollout record for embedded binary hashes and limitations. This is
+rollout evidence, not permission to reuse that artifact as a future release.
+
+The historical addresses `172.20.146.13`, `172.20.146.2`, and
+`172.20.146.216` are not current deployment targets. Likewise, `.144` and `.54`
+were Alpine VDI test endpoints, not desktop seats. Do not substitute any of
+them when a current seat is unreachable; stop and reconcile live inventory.
+
+No credential is stored in this repository. Use the operator-authorized account
+for each seat and keep the password in the existing root-only credential file.
+When password authentication is required, avoid putting the secret on the
+command line:
 
 ```sh
-SSHPW='-o PreferredAuthentications=password -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new'
-sshpass -p $LAB_PW ssh $SSHPW <user>@<ip>
+SEAT_USER='<verified seat account>'
+SEAT_IP='<address from the canonical table>'
+sshpass -f /root/.mcnf-xapi-cred ssh \
+  -o PreferredAuthentications=password \
+  -o PubkeyAuthentication=no \
+  -o StrictHostKeyChecking=accept-new \
+  "${SEAT_USER}@${SEAT_IP}"
 ```
 
-| seat | IP | user | notes |
-|---|---|---|---|
-| **.138** | 172.20.146.138 | `root` | physical F44, DRM-capable Construct seat, `libmpv.so.2` present |
-| **Eagle** | 172.20.146.13 | `mm`   | F44 workstation (`UNIT-EAGLE`); root is rejected → use `mm` |
-| **.2** | 172.20.146.2 | `mm`   | F44; also on the current mesh |
-| ~~.216~~ | 172.20.146.216 | — | **OFFLINE** ("No route to host"); power on before deploying |
-
-**NOT seats — skip:** `.144` / `.54` are Alpine **VDI test endpoints** (RDP:3389 /
-Spice:5930 / VNC:5900), reached as `root` with the farm key. They are RDP/Spice/VNC
-targets, not desktop seats — the operator said *"Skip VDIs for now."*
-
-**Version-collision gotcha:** the seats already have `12.0.0-1`. `dnf install`
-of the same VR says *"Nothing to do."* Force-replace instead:
+**Version-collision gotcha:** query every seat with `rpm -q magic-mesh` rather
+than assuming its installed NVR. `dnf install` of the same version-release says
+*"Nothing to do."* After the artifact hash and dependency transaction have been
+proved independently on every target, force-replace a same-NVR review build:
 ```sh
-rpm -Uvh --replacepkgs --force --nosignature /tmp/magic-mesh-12.0.0-1.x86_64.rpm
+RPM=/tmp/magic-mesh-review.rpm
+rpm -Uvh --test --replacepkgs --force --nosignature "$RPM"
+rpm -Uvh        --replacepkgs --force --nosignature "$RPM"
 #            ^ rpm uses --nosignature, NOT --nogpgcheck (that is a dnf-only flag)
 ```
 `rpm` does **not** resolve deps — pre-install any missing runtime deps with dnf
@@ -97,8 +132,8 @@ management network UUID `8dee4afc-4fc7-60e5-0a3f-7b9b94954631`.
   `/var/lib/mcnf-minio` (29 G object store — real data).
 
 **RAM contention (important):** BigBoy runs the F42 farm VM `mcnf-build-52`
-(~21.5 G). With it up, only ~9 G is free — not enough for the Servo
-(`mde-web-preview`) link. The classifier **gates** stopping a shared farm VM;
+(~21.5 G). With it up, only ~9 G is free — not enough for the full native F44
+release link. The classifier **gates** stopping a shared farm VM;
 the operator authorized it per-op. `xe vm-shutdown` frees the RAM but the
 `memory-free` metric **lags ~10 s** (it read 12 G then settled at 31 G). Restart
 `mcnf-build-52` after the cut (`xe vm-start`; it has `auto_poweron=true`).
@@ -130,6 +165,11 @@ Give it at least a minute and verify with SSH before treating it as a dark VM.
 After the cut, shut down `mcnf-build-f44` and restart `mcnf-build-52` so the
 normal BigBoy farm capacity returns.
 
+**Current handoff state recorded 2026-08-03:** after the five-seat artifact was
+cut, `mcnf-build-f44` (`.131`) was halted and the canonical BigBoy farm VM
+`mcnf-build-52` (`.130`) was restored. This is a dated observation, not a reason
+to skip the live VM-state and active-slot checks before the next handoff.
+
 ## 4. Toolchain + build + cut
 
 **Toolchain gap found live (2026-07-12):** the DRM shell links `-linput`/`-lgbm`/
@@ -141,18 +181,19 @@ systemd-devel`); if you hit it on an older builder, `dnf install -y libinput-dev
 ```sh
 # 1. bake the toolchain (rust 1.94 + mpv-libs-devel + the -devel set):
 ./install-helpers/setup-build-vm-toolchain.sh --host 172.20.0.131 --user mm
-# 2. cut the RPM natively on F44 (xcp-build drives sync + release + Servo + CEF +
-#    DRM-shell relink + generate-rpm, then pulls the RPM to ~/mcnf-release-artifacts):
+# 2. cut the RPM natively on F44 (xcp-build drives sync + the workspace release,
+#    DRM/live-VDI/media shell relink, and generate-rpm, then pulls the RPM):
 MCNF_BUILD_HOST=172.20.0.131 ./install-helpers/xcp-build.sh rpm
 ```
-- Canonical features: `MDE_RPM_SHELL_FEATURES="drm,live-helper,live-vdi,media-mpv"`,
+- Canonical features: `MDE_RPM_SHELL_FEATURES="drm,live-vdi,media-mpv"`,
   `MDE_RPM_LOCKED="--locked"` (`install-helpers/rpm-features.sh`).
-- `mde-web-preview` (Servo) is **workspace-excluded** and MUST build separately
-  **before** `generate-rpm` (the `rpm` subcommand already does this) — else
-  *"Asset file not found: target/release/mde-web-preview"*.
+- The host CEF/Servo Browser helpers are retired and are not RPM assets. Guest
+  Chromium is delivered only through `browser-vm`; do not restore those host
+  binaries to satisfy an obsolete payload expectation.
 - DoD for a media build: `rpm -qpR <rpm> | grep swresample` must show `.so.6`
-  (ffmpeg-8), and `rpm -qlp <rpm>` must list all four binaries
-  (`mackesd`, `mde-shell-egui`, `mde-web-cef`, `mde-web-preview`).
+  (ffmpeg-8), `verify-rpm-payload.sh payload <rpm>` must pass, and `rpm -qlp
+  <rpm>` must include `mackesd` plus `mde-shell-egui` without either retired
+  host Browser helper.
 - Artifact-name gotcha found during the 2026-07-15 browser deploy: a native F44
   `xcp-build.sh rpm` may pull a fresh `magic-mesh-12.0.0-1.x86_64.rpm` while an
   older `magic-mesh-12.0.0-1.f44.x86_64.rpm` is still present in
@@ -169,11 +210,13 @@ one per dom0 — the `../` XO root is **deprecated**). VMs are a shape-model
 `var.golden_template_name` (`MDE-VM-golden`, **F42**). BigBoy = dom0 key
 `xen-bigboy`, provider alias `big`, `ip_base 172.20.0.130`.
 
-**State backend is DOWN:** `http://10.42.0.99:8390/state/xen-xapi` (the overlay
-control-VM etcd backend) is unreachable, so `tofu apply` cannot lock state right
-now. Therefore the F44 builder is handled exactly like the **`.170` VM already
-is** in `build-vms.tf`: present in config, **adopt-pending via `tofu import`**
-when the backend returns:
+**Historical backend state (2026-07-12):**
+`http://10.42.0.99:8390/state/xen-xapi` (the overlay control-VM etcd backend)
+was unreachable, so `tofu apply` could not lock state. Re-probe it before every
+plan, import, or apply; do not treat this dated outage as current fact. While
+the backend is unavailable, the F44 builder remains adopt-pending like the
+`.170` VM in `build-vms.tf`. When the backend returns, the recorded import form
+is:
 ```
 tofu import 'xenserver_vm.build_big["xen-bigboy-f44"]' <vm-uuid>
 ```
@@ -193,76 +236,96 @@ override** (the golden is global today) — add an F44 golden
 |---|---|
 | BigBoy dom0 root | `root@172.20.145.165`, pw in `/root/.mcnf-xapi-cred` |
 | farm build VMs | `mm@` + `/root/.ssh/mackes_mesh_ed25519` (passwordless sudo) |
-| seats (.138/Eagle/.2) | password auth as user per §2, pw = `$LAB_PW` |
+| five canonical seats | operator-authorized account per seat; use the root-only credential source from §2 when password auth is required |
 | XO (deprecated) | `ws://172.20.145.192:8080`, `admin@mcnf.local`, see `/root/.mcnf-xo-admin` |
 | dev-host mesh pubkey | `ssh-ed25519 AAAAC3…jY1 mcnf-build-farm@rocky9-kvm2` |
 
 ## 7. Adding a seat to the mesh (Nebula overlay)
 
-The live overlay is a **Nebula V2 mesh named `magic-mesh`**, subnet **10.42.0.0/17**.
-Lighthouses: **`10.42.0.1` → 165.227.188.238:4242** (also the **CA** + `/enroll`
-listener) and **`10.42.0.2` → 104.131.64.207:4242**. Assigned overlay IPs:
-`.1` LH1, `.2` LH2, `.3` Eagle, `.4` mcnf-ow-testnode, **`.5` seat-138, `.6` seat-2**.
+The final 2026-08-03 post-reboot snapshot has eight online nodes: three
+lighthouses at `10.42.0.1`–`.3` and the five Workstations below. It reports
+seven healthy, seat 15 degraded by its known disk-headroom alarm, zero
+unreachable, and `ha_ok=true`. Seat 15 still reaches every overlay node and all
+five Workstations report four of four Syncthing folder peers connected.
+
+| overlay | current Workstation identity | LAN address |
+|---:|---|---:|
+| `10.42.0.4` | Dell | `172.20.146.225` |
+| `10.42.0.5` | Basement seat 15 | `172.20.0.15` |
+| `10.42.0.6` | Eagle | `172.20.146.145` |
+| `10.42.0.7` | Surface (`peer:SURFACE`) | `172.20.146.79` |
+| `10.42.0.8` | T480 (`peer:T480`) | `172.20.146.138` |
+
+The current CA SHA-256 recorded on T480, Surface, and the lighthouses is
+`0b359a2378a0407ec824631a153aaaec62485e20f4220061bd3ea383e829bc6c`.
+The July two-lighthouse map, the `magic-mesh` name, and its public endpoint
+mapping are historical. Do not copy them into a token or configuration. Obtain
+a fresh, fingerprint-pinned, single-use token from a currently healthy
+lighthouse; the token itself is the authority for the current mesh name and
+enrollment endpoint.
 
 **Designed path — `mackesd join` (preferred, boot-durable, registers the node):**
 ```sh
 # on a lighthouse (mackesd must be `serve`-ing — the /enroll listener is on :4243):
-mackesd add-peer --role workstation          # prints  mesh:magic-mesh@<lh-pub-ip>:4243#<bearer>?fp=<sha256>
+mackesd add-peer --role workstation          # emits the current single-use token
 # on the seat (after installing the RPM — install alone does NOT join):
-mackesd join 'mesh:magic-mesh@<lh-pub-ip>:4243#<bearer>?fp=<sha256>' --role workstation
+mackesd join '<fresh-token-from-current-lighthouse>' --role workstation
 ```
 `mackesd join` does a fingerprint-pinned TLS `POST /enroll`, materializes
 `/etc/nebula/{ca.crt,host.crt,host.key,config.yaml}`, **removes the stock
 `config.yml`**, pins the role, and enables+starts `nebula.service` +
-`mackesd.service` + `mesh-health.timer`. Canonical one-shot:
-`install-helpers/rejoin-v11-mesh.sh <lh-PUBLIC-ip> workstation '<token>'` (override
-its stale default LH IP). Code: `crates/mesh/mackesd/src/cli/join.rs`,
+`mackesd.service` + `mesh-health.timer`. Do not trust a helper's embedded
+default lighthouse address: use the endpoint carried by the fresh token. Code:
+`crates/mesh/mackesd/src/cli/join.rs`,
 `nebula_enroll_client.rs`, `workers/nebula_supervisor.rs:394` (config write + stock
 removal), `nebula_enroll_endpoint.rs` (:4243 signer).
 
-**Manual path (fallback — overlay-only, used 2026-07-12 to bridge .138/.2):** sign a
-V2 peer cert on LH1 and place the bundle by hand. Gets the seat on the overlay but
-does NOT pin the role / register with mackesd — prefer `mackesd join`.
-```sh
-# on LH1 (the CA):
-nebula-cert sign -ca-crt /etc/nebula/ca.crt -ca-key /var/lib/mackesd/nebula-ca/ca.key \
-  -name "peer:<name>" -networks "10.42.0.<n>/17" -groups "role:peer" \
-  -out-crt /tmp/<name>.crt -out-key /tmp/<name>.key
-# on the seat: put ca.crt + host.crt + host.key + a member config.yaml in /etc/nebula/,
-# move the stock config.yml aside (nebula -config loads the WHOLE dir), then
-# systemctl restart nebula.  Member config = Eagle's minus the router unsafe_routes.
-```
-Verify: `ip -4 -o addr show nebula1` (a 10.42.0.x addr), `ping -c2 10.42.0.1`, and
-seat↔seat (`ping 10.42.0.6` from .138). Note: a brand-new peer's FIRST ICMP can drop
-during hole-punch — use `-c2+`.
+**Historical manual-path lesson — do not execute it on the current mesh:** the
+2026-07-12 bridge manually signed and copied Nebula material to two seats. That
+created overlay-only nodes without the role and registration state maintained
+by `mackesd join`. Do not copy another seat's config, hand-select an address, or
+manually sign a current Workstation merely because enrollment is inconvenient.
 
-**Enrollment gotchas (learned live 2026-07-12 joining seat-138 + seat-2):**
-- **Set a distinct hostname BEFORE `mackesd join`.** Both seats shipped as
-  `localhost.localdomain`; the enroll endpoint keys identity on the cert name, so
-  the second join **deduped onto the first's identity + overlay IP** (a collision).
-  `hostnamectl set-hostname seat-138` / `seat-2` first. `--name` is ignored once the
-  role is already pinned, so the hostname is what actually names the cert.
-- **If a seat's path to the public `:4243` endpoint hangs** (TCP opens but the TLS
-  `POST /enroll` times out — a path-MTU issue on that seat's internet route),
-  **retarget the token at the lighthouse's OVERLAY IP**: `sed 's/@<lh-pub-ip>:/@10.42.0.1:/'`
-  — the fingerprint pin ignores hostname, and a seat already on the overlay reaches
-  `10.42.0.1:4243` fine. This unblocked seat-2.
-- **`mackesd peers` will NOT list a freshly-joined node** — the presence plane is
-  *integration-gated* in this build (the daemon logs "session store integration-gated
-  — needs the live etcd session-directory reader over Nebula"). Overlay membership
-  (reachable from the lighthouse + peers) is the real, verifiable state; the peers
-  view populates only for already-established members.
+Verify the joined seat's unique `nebula1` address, current CA hash, services,
+and control-plane health from all three lighthouses. A first ICMP can drop while
+Nebula establishes a path, so use more than one packet; do not treat ping alone
+as enrollment proof.
+
+**Enrollment lessons retained from live operations:**
+
+- **Set a distinct hostname before `mackesd join`.** Two July seats shipped as
+  `localhost.localdomain`; the endpoint deduplicated them onto one identity and
+  overlay address. Normalize and verify the hostname before consuming a token.
+- A July seat's public `:4243` route hit a path-MTU timeout. Diagnose the live
+  route and use a current, fingerprint-pinned endpoint under operator control;
+  do not rewrite a new token to a dated lighthouse address by rote.
+- T480's former `10.42.0.7` belonged to a different obsolete CA. On 2026-08-03
+  that state was backed up, left through the supported path, and T480 joined the
+  current authority as `10.42.0.8`; Surface legitimately owns current `.7`.
+  Compare CA hashes before diagnosing an apparent duplicate address.
+- A stale relay trust-authority pin correctly refused T480's first cross-mesh
+  enrollment. Preserve old identity material in a root-only backup and perform
+  explicit supported identity teardown; never overwrite a trust pin in place.
 - **After join, `systemctl restart nebula mackesd`** to converge the running
   interface IP to the newly-issued cert and clear the "circuit breaker tripped"
-  transient. A full reboot (what the operator does) achieves the same.
+  transient. A full reboot can also converge it, but the physical seats can
+  require encrypted-disk intervention; do not reboot them without explicit
+  operator coordination.
 - **Same-LAN peers that enrolled at different times may fail to hole-punch each
   other directly** (e.g. new seats ↔ the long-lived Eagle) even though both reach
-  the lighthouse — a NAT-hairpin quirk; a coordinated reboot re-establishes it.
+  the lighthouse — a NAT-hairpin quirk. A coordinated reboot historically
+  re-established the path, but service-level recovery and live diagnosis come
+  first; do not turn that lesson into a default fleet-reboot procedure.
 
-## 8. Activating a FRESH seat: role-pin before anything runs (learned live 2026-07-12, seat .15)
+## 8. Historical fresh-seat activation lesson (learned live 2026-07-12, seat 15)
+
+> **Historical, not a current seat-15 procedure:** Basement seat 15 is now an
+> enrolled Workstation at `172.20.0.15` / `10.42.0.5` and belongs in the five-seat
+> deployment set. Do not rerun fresh-seat activation during a routine RPM
+> replacement. The steps remain here for a genuinely new or reimaged seat.
 
 Installing the RPM does **not** make a seat run — the node is **role-gated fail-closed**.
-On a brand-new seat (`172.20.0.15` "Basement-Test-Workstation", F44, `mm`/`$LAB_PW`):
+The original observation was made on seat 15 while it was still brand new:
 
 1. **`mackesd` refuses to start unpinned** — `serve` exits with *"no deployment role
    pinned (/var/lib/mde/role.toml absent) — refuses to start its worker pool (ENT-2
@@ -288,8 +351,9 @@ takes `sudo dnf install -y /tmp/<rpm>` directly — dnf resolves **all** deps fr
 RPM Fusion (enable it first: `dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm`,
 then `dnf install -y mpv-libs` to pre-stage the ffmpeg-8 sonames). The `rpm -Uvh
 --replacepkgs --force` dance in §2 is only for seats that already carry the same VR.
-DoD after install: `ldd /usr/bin/{mackesd,mde-shell-egui,mde-web-cef,mde-web-preview} |
-grep 'not found'` returns **nothing** (all ffmpeg-8/mpv sonames resolve).
+DoD after install: `ldd /usr/bin/{mackesd,mde-shell-egui} | grep 'not found'`
+returns **nothing** (all ffmpeg-8/mpv sonames resolve), and neither retired
+host Browser binary is present.
 
 **Still standalone after this** — role-pin activates the local seat but does NOT join the
 mesh. For overlay membership (chat/peers), follow §7 (`mackesd join`) after the shell is up.

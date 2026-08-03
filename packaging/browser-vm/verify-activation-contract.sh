@@ -26,7 +26,7 @@ require() {
 require 'const VM_WORKLOAD: &str = "browser-vm"' "$WEB"
 require 'workload: VM_WORKLOAD' "$WEB"
 require 'preferred: BrowserVmTransport::Rdp' "$WEB"
-require 'alternate: Some(BrowserVmTransport::Spice)' "$WEB"
+require 'alternate: Some(BrowserVmTransport::Sunshine)' "$WEB"
 require 'resume: true' "$WEB"
 require 'BrowserVmRoute::select_resume()' "$WEB"
 require 'Surface::Browser' "$SURFACES"

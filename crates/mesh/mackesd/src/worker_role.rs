@@ -30,6 +30,437 @@ pub enum RestartPolicy {
 }
 use mde_role::{Capability, Role, RoleClass};
 
+const MIB: u64 = 1024 * 1024;
+
+/// WL-ARCH-009 — the six independently supervised process groups.
+///
+/// This enum is the process-isolation boundary: every registered worker owns
+/// exactly one value, and the values map one-to-one to the governed systemd
+/// service names. Keeping the mapping typed prevents ad-hoc group strings from
+/// drifting between the registry, status projection, and future entrypoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkerGroup {
+    /// Coordination, shared configuration, and persistent-state authority.
+    Control,
+    /// Read-only probes, health reconciliation, and telemetry projection.
+    Observation,
+    /// Privileged or operator-requested mutation executors.
+    Actions,
+    /// Replication, durable collections, and bounded data movement.
+    Data,
+    /// Workload placement, VM/container lifecycle, and VDI brokering.
+    Compute,
+    /// Optional LAN, device, media, and external-provider adapters.
+    Integrations,
+}
+
+impl WorkerGroup {
+    /// Stable order used by process launchers and status renderers.
+    pub const ALL: [Self; 6] = [
+        Self::Control,
+        Self::Observation,
+        Self::Actions,
+        Self::Data,
+        Self::Compute,
+        Self::Integrations,
+    ];
+
+    /// Stable wire/config name for this group.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Observation => "observation",
+            Self::Actions => "actions",
+            Self::Data => "data",
+            Self::Compute => "compute",
+            Self::Integrations => "integrations",
+        }
+    }
+
+    /// Governed systemd service that will own this group at the hard cut.
+    #[must_use]
+    pub const fn service_name(self) -> &'static str {
+        match self {
+            Self::Control => "mackesd-control.service",
+            Self::Observation => "mackesd-observation.service",
+            Self::Actions => "mackesd-actions.service",
+            Self::Data => "mackesd-data.service",
+            Self::Compute => "mackesd-compute.service",
+            Self::Integrations => "mackesd-integrations.service",
+        }
+    }
+
+    /// Typed state namespace owned by the group. A worker's stable `name` is
+    /// appended by the runtime projection.
+    #[must_use]
+    pub const fn state_topic_prefix(self) -> &'static str {
+        match self {
+            Self::Control => "state/mackesd/control/workers",
+            Self::Observation => "state/mackesd/observation/workers",
+            Self::Actions => "state/mackesd/actions/workers",
+            Self::Data => "state/mackesd/data/workers",
+            Self::Compute => "state/mackesd/compute/workers",
+            Self::Integrations => "state/mackesd/integrations/workers",
+        }
+    }
+
+    /// Typed health-key prefix owned by the group.
+    #[must_use]
+    pub const fn health_key_prefix(self) -> &'static str {
+        match self {
+            Self::Control => "mackesd.control",
+            Self::Observation => "mackesd.observation",
+            Self::Actions => "mackesd.actions",
+            Self::Data => "mackesd.data",
+            Self::Compute => "mackesd.compute",
+            Self::Integrations => "mackesd.integrations",
+        }
+    }
+
+    /// Typed action namespace owned by the group.
+    #[must_use]
+    pub const fn action_namespace(self) -> &'static str {
+        match self {
+            Self::Control => "action/mackesd/control",
+            Self::Observation => "action/mackesd/observation",
+            Self::Actions => "action/mackesd/actions",
+            Self::Data => "action/mackesd/data",
+            Self::Compute => "action/mackesd/compute",
+            Self::Integrations => "action/mackesd/integrations",
+        }
+    }
+
+    const fn defaults(self) -> GroupDefaults {
+        match self {
+            Self::Control => GroupDefaults {
+                criticality: Criticality::Essential,
+                cadence: CadencePolicy::Continuous,
+                queue: QueuePolicy::Bounded {
+                    max_items: 256,
+                    max_bytes: 2 * MIB,
+                    overflow: QueueOverflow::RejectNew,
+                },
+                cache: CachePolicy::Bounded {
+                    max_items: 256,
+                    max_bytes: 4 * MIB,
+                    ttl_secs: 300,
+                },
+                resources: ResourceBudget {
+                    memory_high_bytes: 96 * MIB,
+                    memory_max_bytes: 128 * MIB,
+                    cpu_millis_per_second: 250,
+                    max_tasks: 16,
+                },
+                cleanup: CleanupPolicy {
+                    owner: CleanupOwner::GroupSupervisor,
+                    grace_secs: 10,
+                    pending: PendingWorkPolicy::Reject,
+                },
+            },
+            Self::Observation => GroupDefaults {
+                criticality: Criticality::Important,
+                cadence: CadencePolicy::Periodic {
+                    min_interval_secs: 5,
+                    max_interval_secs: 300,
+                },
+                queue: QueuePolicy::Bounded {
+                    max_items: 32,
+                    max_bytes: MIB,
+                    overflow: QueueOverflow::LatestWins,
+                },
+                cache: CachePolicy::Bounded {
+                    max_items: 1_024,
+                    max_bytes: 16 * MIB,
+                    ttl_secs: 300,
+                },
+                resources: ResourceBudget {
+                    memory_high_bytes: 64 * MIB,
+                    memory_max_bytes: 96 * MIB,
+                    cpu_millis_per_second: 150,
+                    max_tasks: 12,
+                },
+                cleanup: CleanupPolicy {
+                    owner: CleanupOwner::Worker,
+                    grace_secs: 5,
+                    pending: PendingWorkPolicy::Discard,
+                },
+            },
+            Self::Actions => GroupDefaults {
+                criticality: Criticality::Essential,
+                cadence: CadencePolicy::OnDemand,
+                queue: QueuePolicy::Bounded {
+                    max_items: 128,
+                    max_bytes: 2 * MIB,
+                    overflow: QueueOverflow::RejectNew,
+                },
+                cache: CachePolicy::Disabled,
+                resources: ResourceBudget {
+                    memory_high_bytes: 128 * MIB,
+                    memory_max_bytes: 192 * MIB,
+                    cpu_millis_per_second: 500,
+                    max_tasks: 32,
+                },
+                cleanup: CleanupPolicy {
+                    owner: CleanupOwner::Worker,
+                    grace_secs: 30,
+                    pending: PendingWorkPolicy::Reject,
+                },
+            },
+            Self::Data => GroupDefaults {
+                criticality: Criticality::Important,
+                cadence: CadencePolicy::EventDriven,
+                queue: QueuePolicy::Bounded {
+                    max_items: 512,
+                    max_bytes: 8 * MIB,
+                    overflow: QueueOverflow::RejectNew,
+                },
+                cache: CachePolicy::Bounded {
+                    max_items: 4_096,
+                    max_bytes: 64 * MIB,
+                    ttl_secs: 86_400,
+                },
+                resources: ResourceBudget {
+                    memory_high_bytes: 128 * MIB,
+                    memory_max_bytes: 192 * MIB,
+                    cpu_millis_per_second: 250,
+                    max_tasks: 24,
+                },
+                cleanup: CleanupPolicy {
+                    owner: CleanupOwner::Worker,
+                    grace_secs: 30,
+                    pending: PendingWorkPolicy::Drain,
+                },
+            },
+            Self::Compute => GroupDefaults {
+                criticality: Criticality::Important,
+                cadence: CadencePolicy::OnDemand,
+                queue: QueuePolicy::Bounded {
+                    max_items: 64,
+                    max_bytes: 2 * MIB,
+                    overflow: QueueOverflow::RejectNew,
+                },
+                cache: CachePolicy::Bounded {
+                    max_items: 256,
+                    max_bytes: 16 * MIB,
+                    ttl_secs: 900,
+                },
+                resources: ResourceBudget {
+                    memory_high_bytes: 384 * MIB,
+                    memory_max_bytes: 512 * MIB,
+                    cpu_millis_per_second: 800,
+                    max_tasks: 64,
+                },
+                cleanup: CleanupPolicy {
+                    owner: CleanupOwner::GroupSupervisor,
+                    grace_secs: 60,
+                    pending: PendingWorkPolicy::Reject,
+                },
+            },
+            Self::Integrations => GroupDefaults {
+                criticality: Criticality::Optional,
+                cadence: CadencePolicy::Periodic {
+                    min_interval_secs: 15,
+                    max_interval_secs: 900,
+                },
+                queue: QueuePolicy::Bounded {
+                    max_items: 16,
+                    max_bytes: 2 * MIB,
+                    overflow: QueueOverflow::LatestWins,
+                },
+                cache: CachePolicy::Bounded {
+                    max_items: 1_024,
+                    max_bytes: 32 * MIB,
+                    ttl_secs: 900,
+                },
+                resources: ResourceBudget {
+                    memory_high_bytes: 128 * MIB,
+                    memory_max_bytes: 192 * MIB,
+                    cpu_millis_per_second: 300,
+                    max_tasks: 24,
+                },
+                cleanup: CleanupPolicy {
+                    owner: CleanupOwner::Worker,
+                    grace_secs: 15,
+                    pending: PendingWorkPolicy::Discard,
+                },
+            },
+        }
+    }
+}
+
+/// Operational importance used for restart-storm and degraded-mode decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Criticality {
+    /// Required for safe baseline operation; failure degrades the node.
+    Essential,
+    /// Product function remains available in a clearly degraded state.
+    Important,
+    /// Optional provider/function may remain unavailable without harming core.
+    Optional,
+}
+
+/// Capability part of the activation predicate. `AnyNode` is explicit rather
+/// than an absent value so every registry row has a complete predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityPredicate {
+    /// No capability tag beyond the role-rank gate is required.
+    AnyNode,
+    /// Activation requires the named, resolved role capability.
+    Requires(Capability),
+}
+
+/// Configuration part of the activation predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPredicate {
+    /// No optional configuration is required.
+    Always,
+    /// The named environment setting must be present and non-empty.
+    EnvironmentPresent(&'static str),
+    /// Enabled by default; the named setting can explicitly disable the worker.
+    EnvironmentUnlessFalse(&'static str),
+    /// A typed runtime/provider record must be available before activation.
+    RuntimeAvailable(&'static str),
+}
+
+/// Complete capability + configuration activation gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationPolicy {
+    /// Capability-tag requirement.
+    pub capability: CapabilityPredicate,
+    /// Effective-configuration/provider requirement.
+    pub config: ConfigPredicate,
+}
+
+/// How work reaches a long-running worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CadencePolicy {
+    /// Long-lived listener or supervisor loop.
+    Continuous,
+    /// Work is triggered by a typed bus/file/provider event.
+    EventDriven,
+    /// Work starts only after an admitted command.
+    OnDemand,
+    /// Polling cadence constrained to this inclusive range.
+    Periodic {
+        /// Fastest permitted interval.
+        min_interval_secs: u32,
+        /// Slowest permitted normal interval, excluding failure backoff.
+        max_interval_secs: u32,
+    },
+}
+
+/// Behavior when a bounded queue is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOverflow {
+    /// Reject the incoming item and return explicit backpressure.
+    RejectNew,
+    /// Evict the oldest queued item before accepting the new item.
+    DropOldest,
+    /// Coalesce queued telemetry to the newest value.
+    LatestWins,
+}
+
+/// Queue bounds. There is deliberately no unbounded variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePolicy {
+    /// Worker accepts no queued messages.
+    Disabled,
+    /// Queue has explicit item/byte ceilings and overflow behavior.
+    Bounded {
+        /// Maximum queued messages/items.
+        max_items: u32,
+        /// Maximum aggregate serialized bytes.
+        max_bytes: u64,
+        /// Behavior at either ceiling.
+        overflow: QueueOverflow,
+    },
+}
+
+/// Cache bounds. There is deliberately no unbounded variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Worker retains no process-local cache.
+    Disabled,
+    /// Cache has explicit item, byte, and age ceilings.
+    Bounded {
+        /// Maximum retained entries.
+        max_items: u32,
+        /// Maximum aggregate retained bytes.
+        max_bytes: u64,
+        /// Maximum entry age before eviction.
+        ttl_secs: u32,
+    },
+}
+
+/// Per-worker admission budget; group cgroups may impose a tighter aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceBudget {
+    /// Soft memory-pressure threshold used for warning/profile capture.
+    pub memory_high_bytes: u64,
+    /// Hard per-worker admission ceiling inside the group budget.
+    pub memory_max_bytes: u64,
+    /// CPU budget in milliseconds available per wall-clock second.
+    pub cpu_millis_per_second: u16,
+    /// Maximum worker-owned tasks/threads admitted at once.
+    pub max_tasks: u16,
+}
+
+/// Component responsible for releasing subscriptions, sockets, child handles,
+/// and external leases before the cleanup deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupOwner {
+    /// The worker must release its own resources before returning.
+    Worker,
+    /// The group supervisor owns final cancellation and handle reclamation.
+    GroupSupervisor,
+}
+
+/// What happens to queued work after shutdown begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingWorkPolicy {
+    /// Finish already-admitted work within the cleanup grace period.
+    Drain,
+    /// Reject queued/not-yet-started work with an explicit shutdown result.
+    Reject,
+    /// Discard replaceable telemetry/provider refresh work.
+    Discard,
+}
+
+/// Bounded shutdown and cleanup contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupPolicy {
+    /// Component accountable for cleanup completion.
+    pub owner: CleanupOwner,
+    /// Maximum graceful-cleanup interval.
+    pub grace_secs: u16,
+    /// Treatment of pending work once shutdown starts.
+    pub pending: PendingWorkPolicy,
+}
+
+/// Typed ownership for the three runtime namespaces and shutdown cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeOwnership {
+    /// Group that publishes the worker's state projection.
+    pub state: WorkerGroup,
+    /// Group that publishes and clears the worker health key.
+    pub health: WorkerGroup,
+    /// Group that admits typed actions for the worker.
+    pub actions: WorkerGroup,
+    /// Bounded resource-release responsibility.
+    pub cleanup: CleanupPolicy,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupDefaults {
+    criticality: Criticality,
+    cadence: CadencePolicy,
+    queue: QueuePolicy,
+    cache: CachePolicy,
+    resources: ResourceBudget,
+    cleanup: CleanupPolicy,
+}
+
 /// MEDIA-1 — the deployment **class** that gates worker spawns.
 ///
 /// The role rank plus its capability tags. `run_serve` resolves this once and
@@ -65,15 +496,17 @@ impl DeployClass {
     }
 }
 
-/// WL-ARCH-004 — one declarative registration for each supervised, role-tiered
-/// worker: its **name**, its **minimum role rank** (the rank/class gate), and its
-/// **restart policy**. This single table is the source of truth BOTH the role
-/// census AND the `run_serve` spawner derive from, so the two can never drift
-/// (the historical BUG-STORAGE-1 / ARCH-5 failure mode): [`workers_for_class`] /
-/// [`min_rank`] read the gate here, and `spawn_tiered` (bin/mackesd/spawn.rs)
-/// reads the policy + gate here for every spawn — the constructor is bound at the
-/// spawn site (workers carry heterogeneous, order-sensitive construction), so the
-/// entry declares the *what/when*, the site supplies the *how*.
+/// WL-ARCH-004 / WL-ARCH-009 — one declarative runtime contract for each
+/// supervised, role-tiered worker. Rank and restart policy remain the live spawn
+/// inputs; group, activation, bounded buffers/resources, namespace ownership, and
+/// cleanup policy form the first process-isolation contract slice. This single
+/// table is the source of truth BOTH the role census AND the `run_serve` spawner
+/// derive from, so the two can never drift (the historical BUG-STORAGE-1 / ARCH-5
+/// failure mode): [`workers_for_class`] / [`min_rank`] read the gate here, and
+/// `spawn_tiered` (bin/mackesd/spawn.rs) reads the policy + gate here for every
+/// spawn — the constructor is bound at the spawn site (workers carry
+/// heterogeneous, order-sensitive construction), so the entry declares the
+/// *what/when/where*, while the site supplies the *how*.
 ///
 /// The census MUST list every role-tiered worker `run_serve` spawns (a unit test
 /// pins the count) — a worker missing from the table defaults to rank 0 (runs
@@ -88,61 +521,237 @@ pub struct WorkerSpec {
     pub min_rank: u8,
     /// Restart policy the supervisor applies when this worker returns/panics.
     pub policy: RestartPolicy,
+    /// Exactly one of the six governed process groups.
+    pub group: WorkerGroup,
+    /// Importance used for degraded-mode and restart-storm decisions.
+    pub criticality: Criticality,
+    /// Capability and effective-configuration activation predicate.
+    pub activation: ActivationPolicy,
+    /// Continuous/event/command/poll cadence contract.
+    pub cadence: CadencePolicy,
+    /// Explicitly bounded inbound queue policy.
+    pub queue: QueuePolicy,
+    /// Explicitly bounded retained-cache policy.
+    pub cache: CachePolicy,
+    /// Per-worker admission budget within the owning group.
+    pub resources: ResourceBudget,
+    /// State, health, action, and cleanup ownership.
+    pub ownership: RuntimeOwnership,
 }
 
 impl WorkerSpec {
     /// A rank-tiered worker registration.
     #[must_use]
-    const fn tier(name: &'static str, min_rank: u8, policy: RestartPolicy) -> Self {
+    const fn tier(
+        name: &'static str,
+        min_rank: u8,
+        policy: RestartPolicy,
+        group: WorkerGroup,
+    ) -> Self {
+        let defaults = group.defaults();
         Self {
             name,
             min_rank,
             policy,
+            group,
+            criticality: defaults.criticality,
+            activation: ActivationPolicy {
+                capability: CapabilityPredicate::AnyNode,
+                config: ConfigPredicate::Always,
+            },
+            cadence: defaults.cadence,
+            queue: defaults.queue,
+            cache: defaults.cache,
+            resources: defaults.resources,
+            ownership: RuntimeOwnership {
+                state: group,
+                health: group,
+                actions: group,
+                cleanup: defaults.cleanup,
+            },
         }
+    }
+
+    /// Override the group's default activation predicate for an optional
+    /// provider without weakening the role/restart behavior.
+    #[must_use]
+    const fn with_config(mut self, config: ConfigPredicate) -> Self {
+        self.activation.config = config;
+        self
+    }
+
+    /// Override the group's cadence when a long-lived integration is a listener
+    /// rather than a polling provider.
+    #[must_use]
+    const fn with_cadence(mut self, cadence: CadencePolicy) -> Self {
+        self.cadence = cadence;
+        self
     }
 }
 
 const WORKER_REGISTRY: &[WorkerSpec] = &[
     // ── Lighthouse (rank 0) — the relay control plane: Nebula, mde-bus,
     //    mesh routing/discovery, leader, health, security baseline.
-    WorkerSpec::tier("nebula_supervisor", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("heartbeat", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("health_reconciler", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("mesh_router", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("stun_gather", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("mdns_relay", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("mesh_latency", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "nebula_supervisor",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::tier(
+        "heartbeat",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "health_reconciler",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "mesh_router",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::tier(
+        "stun_gather",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "mdns_relay",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_cadence(CadencePolicy::Continuous),
+    WorkerSpec::tier(
+        "mesh_latency",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // MESHMAP-6 — per-link byte-counter collector (nftables accounting on
     // the Nebula iface). A control-plane traffic observer that runs on
     // every node, like mesh_latency.
-    WorkerSpec::tier("link-traffic", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("mesh_dns", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("hardware_probe", 0, RestartPolicy::Always),
-    WorkerSpec::tier("bus_supervisor", 0, RestartPolicy::Always),
-    WorkerSpec::tier("firewall_preset", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("sshd_overlay_bind", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("ssh_pubkey_gossip", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("fleet_reconcile", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("presence_watch", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("etcd_watch", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("lifecycle_exec", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "link-traffic",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "mesh_dns",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::tier(
+        "hardware_probe",
+        0,
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "bus_supervisor",
+        0,
+        RestartPolicy::Always,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::tier(
+        "firewall_preset",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "sshd_overlay_bind",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "ssh_pubkey_gossip",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    ),
+    WorkerSpec::tier(
+        "fleet_reconcile",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::tier(
+        "presence_watch",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "etcd_watch",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    )
+    .with_cadence(CadencePolicy::Continuous),
+    WorkerSpec::tier(
+        "lifecycle_exec",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
     // DEVMGR-8 — the device-control executor: privileged hardware ops
     // (enable/disable, reload module, rescan bus) the Device-Manager surface
     // dispatches to a target node. UNIVERSAL (rank 0) like hardware_probe /
     // lifecycle_exec — every node can be an action target and drains only its
     // own replicated fleet/device-control/<self> request dir.
-    WorkerSpec::tier("device_control", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "device_control",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
     // WL-RUN-006 — the router-action executor: the privileged firewall-edit seam
     // the Device-Manager surface dispatches to the node behind a router. UNIVERSAL
     // (rank 0) like device_control — every node can sit behind its own
     // router/firewall and drains ONLY its own replicated `action/router/<self>`
     // dir (typed-confirm + Vyatta commit-confirm auto-revert + hash-chain audit).
     // The live mutation itself is operator-gated (MDE_ROUTER_ACTION_LIVE).
-    WorkerSpec::tier("router_action", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("reconcile", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("netstate_apply", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("validation_suite", 0, RestartPolicy::OnFailure),
-    WorkerSpec::tier("metrics_exporter", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "router_action",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "reconcile",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::tier(
+        "netstate_apply",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "validation_suite",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "metrics_exporter",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // BUG-STORAGE-1 — the E12-20 storage worker: a UNIVERSAL per-node topology
     // mirror (read-only UDisks2 enumerate → `state/storage/<node>`). Pinned at
     // rank 0 so it provably publishes on EVERY role — a Workstation has local
@@ -152,7 +761,12 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // it from this census, so `workers_for_rank` / `mackesd role-workers` wrongly
     // reported the Workstation as NOT running storage. Only the READ/publish path
     // is enabled here; the live UDisks2Executor stays IntegrationGated as-is.
-    WorkerSpec::tier("storage", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "storage",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
     // explorer (unit-explorer.md #18). UNIVERSAL (rank 0) like storage: every
     // node folds its OWN unit view (self-first #23) — the mesh mirror it already
@@ -161,14 +775,24 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // #20: "no center"); a lighthouse publishes an honest units view too. A
     // deliberate rank-0 entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
-    WorkerSpec::tier("unit_aggregator", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "unit_aggregator",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // WL-FUNC-008 — the service_aggregator worker: the unified service
     // provenance/health view. UNIVERSAL (rank 0) like unit_aggregator/storage
     // — every node folds its OWN mesh-wide merge of the three service
     // sources (published KDC directory + probe inventory + Explorer enrichment) and
     // publishes `state/services/<node>`; there is no center. A deliberate rank-0
     // census entry (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
-    WorkerSpec::tier("service_aggregator", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "service_aggregator",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // CHAT-FIX-2 — the local-notification producer worker: watches this node's
     // OWN event sources (mesh peer join/leave, dnf/platform updates, systemctl
     // --failed, df/SMART, journal WARN+) and publishes typed notifications the
@@ -178,21 +802,36 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // disks / a journal / peers to report on, and its notifications ride the same
     // bus the chat worker folds on every role. A deliberate rank-0 census entry
     // (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
-    WorkerSpec::tier("notify", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "notify",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // WL-SEC-002 — the federation runtime-enforcement worker. UNIVERSAL (rank 0):
     // a Lighthouse RELAYS cross-mesh traffic so it especially must enforce the
     // cross-mesh boundary (default-deny grant-gated routing + trust-cert lifecycle),
     // and a Workstation enforces its own foreign-mesh ingress too. A deliberate
     // rank-0 census entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
-    WorkerSpec::tier("federation_enforcer", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "federation_enforcer",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
     // NODE-GRADE-1 (node-grade.md #11) — the per-node self-grade worker. UNIVERSAL
     // (rank 0): every node computes + publishes its OWN A–F capability grade
     // (`<workgroup_root>/node-grade/<hostname>.json`) from the telemetry the
     // platform already gathers, so a lighthouse grades itself too. A deliberate
     // rank-0 census entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
-    WorkerSpec::tier("node_grade", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "node_grade",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // KDC-MESH-3 (kdc-mesh.md #15) — the KDE Connect host is UNIVERSAL (rank 0):
     // it runs on EVERY node incl. lighthouses/headless so the mesh-wide "every
     // node recognizes the phone" (#5) + "all nodes serve the phone at once" (#6)
@@ -201,7 +840,13 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // the public NIC, so `kdc_host` on a lighthouse opens NO public port (the
     // firewall preset opens 1716 on the overlay/trusted zone only; public stays
     // default-deny). Was Workstation-only (rank 1) pre-KDC-MESH-3.
-    WorkerSpec::tier("kdc_host", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "kdc_host",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_cadence(CadencePolicy::Continuous),
     // CHAT-FIX-1 — the mesh chat worker: folds every node's chat/notification
     // traffic off the bus into the Chat surface's feed. UNIVERSAL (rank 0): it
     // ALREADY ran on every node — a lighthouse included — via the silent
@@ -211,7 +856,7 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // A deliberate rank-0 census entry now (the BUG-STORAGE-1 lesson) — same rank
     // it always had, now EXPLICIT + counted. Pairs with `notify` (CHAT-FIX-2), the
     // producer whose events it folds.
-    WorkerSpec::tier("chat", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("chat", 0, RestartPolicy::OnFailure, WorkerGroup::Data),
     // WL-FUNC-011 Phase 2 — the mesh `collab` worker: the live spine that makes the
     // headless mde-collab-core CollabEngine real (drain action/collab/* → sign +
     // project + publish state/collab/* + live events → converge). UNIVERSAL (rank
@@ -219,7 +864,7 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // runs ALONGSIDE chat for now): every node, headless Lighthouse included,
     // participates in the Communications suite. A deliberate rank-0 census entry
     // (the BUG-STORAGE-1 lesson), spawned via spawn_tiered like chat.
-    WorkerSpec::tier("collab", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("collab", 0, RestartPolicy::OnFailure, WorkerGroup::Data),
     // WL-ARCH-001 Phase B — the `cloud` worker: the OpenTofu + Ansible cloud
     // backend that succeeds the deleted OpenStack worker tree. UNIVERSAL (rank 0)
     // like service_aggregator/storage — every node publishes its OWN
@@ -228,7 +873,7 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // on their explicit node, and live mutations require a short-lived,
     // body-bound, single-use capability. A deliberate rank-0 census entry (the
     // BUG-STORAGE-1 lesson), spawned via spawn_tiered.
-    WorkerSpec::tier("cloud", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier("cloud", 0, RestartPolicy::OnFailure, WorkerGroup::Compute),
     // Rolling Node — the `vehicle` worker: the workstation-side adapter that
     // SSH/HTTP-polls a mobile Sierra AirLink MG90 gateway and publishes a per-node
     // `state/vehicle/<node>` mirror. UNIVERSAL (rank 0) like `cloud` — every node
@@ -236,40 +881,134 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // have no gateway attached (`MDE_VEHICLE_GATEWAY` unset ⇒ the worker idles).
     // A deliberate rank-0 census entry (the BUG-STORAGE-1 lesson), spawned via
     // spawn_tiered.
-    WorkerSpec::tier("vehicle", 0, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "vehicle",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentPresent("MDE_VEHICLE_GATEWAY")),
     // WL-FUNC-012 / MG90 airspace — workstation-side typed scanner mirror.
     // The default worker publishes an explicit no-source state until a proven
     // MG90 survey probe is configured; it never invents a scanner endpoint.
-    WorkerSpec::tier("airspace", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "airspace",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentPresent("MDE_VEHICLE_GATEWAY")),
     // WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake feed adapter.
     // Workstation-tier: external overlay bandwidth stays on the seated adapter
     // host. This zero-cost public feed is default-on and can be explicitly
     // disabled with MDE_OVERLAY_USGS_EARTHQUAKES=0/false/no/off.
-    WorkerSpec::tier("earthquake_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "earthquake_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_USGS_EARTHQUAKES",
+    )),
     // WL-FUNC-012 / OVERLAY-1 — point-scoped keyless NWS alert adapter with
     // affected-zone geometry fallback. Workstation-tier, explicit opt-in.
-    WorkerSpec::tier("nws_alert_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "nws_alert_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_NWS_ALERTS",
+    )),
     // WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated NEXRAD tiles.
-    WorkerSpec::tier("iem_radar_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "iem_radar_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_IEM_RADAR",
+    )),
     // WL-FUNC-012 / OVERLAY-6 — keyless NIFC WFIGS wildfire perimeters.
-    WorkerSpec::tier("wildfire_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "wildfire_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_NIFC_WILDFIRE",
+    )),
     // WL-FUNC-012 / OVERLAY-3 — keyless NCDOT TIMS current traffic events.
-    WorkerSpec::tier("traffic_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "traffic_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_NCDOT_TRAFFIC",
+    )),
     // WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI stations.
     // Workstation-tier; a missing sealed key publishes honest unconfigured state.
-    WorkerSpec::tier("air_quality_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "air_quality_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("sealed-airnow-api-key")),
     // WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS hotspot feed.
     // Workstation-tier; a missing sealed key or fresh vehicle fix is explicit.
-    WorkerSpec::tier("firms_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "firms_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("sealed-firms-api-key")),
     // WL-FUNC-012 / OVERLAY-4 — keyless NWS hourly current/drive-ahead forecast.
-    WorkerSpec::tier("nws_forecast_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "nws_forecast_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_NWS_FORECAST",
+    )),
     // WL-FUNC-012 / OVERLAY-8 — point-scoped keyless adsb.lol aircraft feed.
     // Workstation-tier, explicit opt-in, fresh local vehicle fix required.
-    WorkerSpec::tier("aircraft_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "aircraft_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_ADSB_LOL",
+    )),
     // WL-FUNC-012 / OVERLAY-9 — keyless MBTA GTFS-Realtime transit vehicles.
-    WorkerSpec::tier("transit_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "transit_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentUnlessFalse(
+        "MDE_OVERLAY_MBTA_TRANSIT",
+    )),
     // WL-FUNC-012 / OVERLAY-5 — keyless Caltrans CWWP2 traffic-camera stills.
-    WorkerSpec::tier("caltrans_camera_overlay", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "caltrans_camera_overlay",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("caltrans-district")),
     // ── ARCH-5 (drift guard) — universal (rank-0) workers that were spawned in
     //    `run_serve` gated on `worker_role::runs(...)` but OMITTED from this census,
     //    so they silently rode the "unknown worker ⇒ rank 0" default: they DID run
@@ -281,75 +1020,214 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     //    so runtime behavior is UNCHANGED; they are now EXPLICIT + listed. Each spawn
     //    site documents its own "rank-0 / runs-everywhere / universal" intent
     //    (self-marker-gated where relevant).
-    WorkerSpec::tier("boot_readiness", 0, RestartPolicy::OnFailure), // BOOT-STATUS-1 — fabric bring-up snapshot, all roles
-    WorkerSpec::tier("xcp_host", 0, RestartPolicy::OnFailure), // XCP-6 — hypervisor-capacity advertiser, self-gates on the dom0 marker
-    WorkerSpec::tier("kvm_health", 0, RestartPolicy::OnFailure), // MV-2 — per-node KVM service health, universal virt stack
-    WorkerSpec::tier("vm_lifecycle", 0, RestartPolicy::OnFailure), // MV — per-node libvirt VM executor, every node hosts VMs
-    WorkerSpec::tier("container", 0, RestartPolicy::OnFailure), // MV — per-node Podman container executor, every node hosts containers
-    WorkerSpec::tier("scheduler", 0, RestartPolicy::OnFailure), // MV-5 — placement scheduler (single-actor election), runs everywhere
-    WorkerSpec::tier("session_broker", 0, RestartPolicy::OnFailure), // VDI — session-roster broker, leader-gated internally, runs everywhere
-    WorkerSpec::tier("session_roaming", 0, RestartPolicy::OnFailure), // VDI — roaming-session reconciler, runs everywhere
-    WorkerSpec::tier("console_broker", 0, RestartPolicy::OnFailure), // VDI — live-console overlay relay, serving-peer-gated, runs everywhere
-    WorkerSpec::tier("clipboard_bridge", 0, RestartPolicy::OnFailure), // VDI — per-session clipboard relay, node-local, runs everywhere
-    WorkerSpec::tier("service_onboard", 0, RestartPolicy::OnFailure), // onboard — action/onboard/service-add engine, leader-gated, runs everywhere
-    WorkerSpec::tier("spawn_lighthouse_onboard", 0, RestartPolicy::OnFailure), // onboard — action/onboard/spawn-lighthouse engine, leader-gated
-    WorkerSpec::tier("onboard_apply", 0, RestartPolicy::OnFailure), // onboard — addressed remote-bundle applier, runs everywhere
-    WorkerSpec::tier("lighthouse_probe", 0, RestartPolicy::OnFailure), // LIGHTHOUSE-8 — per-lighthouse deep-probe lane (gated in workers/mod.rs), rank-0
+    // BOOT-STATUS-1 — fabric bring-up snapshot, all roles.
+    WorkerSpec::tier(
+        "boot_readiness",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    // XCP-6 — hypervisor-capacity advertiser, self-gates on the dom0 marker.
+    WorkerSpec::tier(
+        "xcp_host",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("xcp-dom0-marker")),
+    // MV-2 — per-node KVM service health, universal virt stack.
+    WorkerSpec::tier(
+        "kvm_health",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    // MV — per-node libvirt VM executor, every node hosts VMs.
+    WorkerSpec::tier(
+        "vm_lifecycle",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Compute,
+    ),
+    // MV — per-node Podman container executor, every node hosts containers.
+    WorkerSpec::tier(
+        "container",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Compute,
+    ),
+    // MV-5 — placement scheduler (single-actor election), runs everywhere.
+    WorkerSpec::tier(
+        "scheduler",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Compute,
+    ),
+    // VDI — session-roster broker, leader-gated internally, runs everywhere.
+    WorkerSpec::tier(
+        "session_broker",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Compute,
+    ),
+    // VDI — roaming-session reconciler, runs everywhere.
+    WorkerSpec::tier(
+        "session_roaming",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    ),
+    // VDI — live-console overlay relay, serving-peer-gated, runs everywhere.
+    WorkerSpec::tier(
+        "console_broker",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Compute,
+    ),
+    // VDI — per-session clipboard relay, node-local, runs everywhere.
+    WorkerSpec::tier(
+        "clipboard_bridge",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    ),
+    // Onboarding action engines, leader/address-gated internally.
+    WorkerSpec::tier(
+        "service_onboard",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "spawn_lighthouse_onboard",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "onboard_apply",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    // LIGHTHOUSE-8 — per-lighthouse deep-probe lane.
+    WorkerSpec::tier(
+        "lighthouse_probe",
+        0,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
     //    gracefully without a local display).
-    WorkerSpec::tier("ansible-pull", 1, RestartPolicy::OnFailure),
-    WorkerSpec::tier("app-sync", 1, RestartPolicy::OnFailure),
-    WorkerSpec::tier("job_exec", 1, RestartPolicy::OnFailure),
-    WorkerSpec::tier("clipboard_sync", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "ansible-pull",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("mesh-ansible-inventory")),
+    WorkerSpec::tier("app-sync", 1, RestartPolicy::OnFailure, WorkerGroup::Data),
+    WorkerSpec::tier(
+        "job_exec",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::tier(
+        "clipboard_sync",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    ),
     // WL-UX-005 — the peer_app_launch executor: drains the shell Front Door's
     // `action/apps/launch` publishes and actually launches the requested app on
     // the target node, allowlisted against that node's own advertised app catalog
     // (never an arbitrary wire command). A desktop feature — you launch apps onto
     // a seat — so Workstation-tier; it idles gracefully on a headless box (no
     // launch requests land) and OnFailure-restarts like the other action executors.
-    WorkerSpec::tier("peer_app_launch", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "peer_app_launch",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
     // BOOKMARKS-2 — the mesh-synced bookmarks worker. A desktop feature (the
     // seated user edits the Bookmarks surface), so Workstation-tier; it idles
     // gracefully on a headless box (no action/bookmarks/* requests) while still
     // replaying peers' Syncthing segments into the shared collection.
-    WorkerSpec::tier("bookmarks", 1, RestartPolicy::Always),
+    WorkerSpec::tier("bookmarks", 1, RestartPolicy::Always, WorkerGroup::Data),
     // BOOKMARKS-7 — the mesh-wide ad-blocker worker. A desktop feature (it feeds
     // the shared policy engine), so Workstation-tier; it idles gracefully on a
     // headless box (no action/adfilter/* requests)
     // while still replicating peers' filter-store blobs over Syncthing and, when
     // leader, compiling the shared engine blob.
-    WorkerSpec::tier("adfilter", 1, RestartPolicy::Always),
+    WorkerSpec::tier("adfilter", 1, RestartPolicy::Always, WorkerGroup::Data),
     // KDC-MESH-6 — phone-as-touchpad/keyboard seat consumer. Drains KDC
     // worker's action/seat/remote-input handoffs and invokes the configured
     // local uinput/seat helper when present. Workstation-tier; idles on
     // headless nodes.
-    WorkerSpec::tier("seat_remote_input", 1, RestartPolicy::Always),
+    WorkerSpec::tier(
+        "seat_remote_input",
+        1,
+        RestartPolicy::Always,
+        WorkerGroup::Actions,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("seat-input-helper")),
     // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
     // (the seated user browses peers), so Workstation-tier; it idles gracefully
     // with no mount requests on a headless box.
-    WorkerSpec::tier("mesh_mount", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("mesh_mount", 1, RestartPolicy::OnFailure, WorkerGroup::Data),
     // CHOOSER-1 — the desktop-source discovery aggregator behind the Chooser
     // surface. A desktop feature (the seated user picks a desktop to connect
     // to), so Workstation-tier; it idles gracefully on a headless box (the
     // aggregation is cheap and the verbs simply never arrive).
-    WorkerSpec::tier("desktop_sources", 1, RestartPolicy::OnFailure),
-    WorkerSpec::tier("remmina-sync", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "desktop_sources",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::tier(
+        "remmina-sync",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    ),
     // MEDIA-8 — Workstation music auto-config: a desktop consumer of versioned
     // Media server records published by any participating Media node. It
     // resolves credential refs locally and writes only the seated user's creds.
-    WorkerSpec::tier("music_autoconfig", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "music_autoconfig",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("media-server-record")),
     // MEDIA-14 — the mesh media-source discovery aggregator behind the
     // mde-media Sources panel. A desktop feature (the seated user picks a media
     // source to play), so Workstation-tier; it idles gracefully on a headless
     // box (the aggregation is cheap and simply publishes an empty roster).
-    WorkerSpec::tier("media_sources", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "media_sources",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_cadence(CadencePolicy::EventDriven),
     // MEDIA-15 — the mesh media server + DLNA/UPnP + aggregation (the PRODUCER
     // half MEDIA-14 discovers). A desktop feature (the seated user shares their
     // media folders), so Workstation-tier; it idles gracefully on a headless
     // box (empty share manifest, empty aggregated library).
-    WorkerSpec::tier("media_server", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "media_server",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::EnvironmentPresent("MDE_MEDIA_SHARE_DIRS"))
+    .with_cadence(CadencePolicy::Continuous),
     // WL-FUNC-014 — the AirSonic/Subsonic gateway proxy responder. A desktop/media
     // gateway feature: it binds the mesh proxy port on a node that has been
     // registered as a LAN AirSonic gateway, resolves the sealed read-only
@@ -357,7 +1235,14 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // `/rest/...` without exposing credentials to clients. Workstation-tier like
     // media_sources/media_server; headless workstations can still run it, stock
     // lighthouses do not open the media proxy port.
-    WorkerSpec::tier("media_airsonic_proxy", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "media_airsonic_proxy",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("airsonic-gateway-record"))
+    .with_cadence(CadencePolicy::Continuous),
     // WL-FUNC-015 — the Jellyfin gateway proxy responder. A desktop/media
     // gateway feature: it binds the mesh proxy port on a node that has been
     // registered as a LAN Jellyfin gateway, resolves the sealed read-only token
@@ -365,12 +1250,24 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // clients. Workstation-tier like media_sources/media_server; headless
     // workstations can still run it, stock lighthouses do not open the media
     // proxy port.
-    WorkerSpec::tier("media_jellyfin_proxy", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "media_jellyfin_proxy",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_config(ConfigPredicate::RuntimeAvailable("jellyfin-gateway-record"))
+    .with_cadence(CadencePolicy::Continuous),
     // TERM-7 — the mesh PTY-broker: opens remote shells on peers over the
     // overlay for the mde-term-egui terminal surface. A desktop feature (the
     // seated user opens a terminal on a mesh node), so Workstation-tier; it
     // idles gracefully on a headless box (no action/pty/* requests arrive).
-    WorkerSpec::tier("pty_broker", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier(
+        "pty_broker",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
     // TRANSFERS-1 — the transfers worker: the daemon-owned queue/ledger/verb spine
     // of the Transfers surface (docs/design/transfers-surface.md). A desktop feature
     // fronted by the File Browser (Q1), the sibling of pty_broker/mesh_mount, so
@@ -378,7 +1275,7 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // (an empty inbox + empty ledger, no transfer.submit verbs arrive). A deliberate
     // census entry (the BUG-STORAGE-1 lesson — a worker absent from the census
     // silently never runs).
-    WorkerSpec::tier("transfers", 1, RestartPolicy::OnFailure),
+    WorkerSpec::tier("transfers", 1, RestartPolicy::OnFailure, WorkerGroup::Data),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -423,6 +1320,23 @@ pub fn spec(worker: &str) -> Option<&'static WorkerSpec> {
     WORKER_REGISTRY.iter().find(|s| s.name == worker)
 }
 
+/// WL-ARCH-009 — the complete role-tiered runtime-contract registry.
+///
+/// Process entrypoints and status projections consume this view instead of
+/// maintaining group-local worker lists.
+#[must_use]
+pub const fn worker_specs() -> &'static [WorkerSpec] {
+    WORKER_REGISTRY
+}
+
+/// WL-ARCH-009 — contracts owned by one governed process group, in stable
+/// registry order.
+pub fn specs_for_group(group: WorkerGroup) -> impl Iterator<Item = &'static WorkerSpec> + Clone {
+    WORKER_REGISTRY
+        .iter()
+        .filter(move |worker| worker.group == group)
+}
+
 /// WL-ARCH-004 — the restart policy declared for a role-tiered `worker`. `None`
 /// for a worker absent from [`WORKER_REGISTRY`]; `spawn_tiered` treats that as a
 /// hard error (an unregistered tiered spawn), which the drift test also catches.
@@ -452,11 +1366,10 @@ pub fn required_capability(worker: &str) -> Option<Capability> {
         .map(|(_, c)| *c)
 }
 
-/// BOOKMARKS-8 — the canonical role name for a resolved `rank`.
+/// The canonical role name for a resolved `rank`.
 ///
-/// The browser-policy worker folds its per-role fleet policy by this name. An
-/// unknown rank falls back to the top tier, matching the tolerant [`resolve_rank`]
-/// posture.
+/// An unknown rank falls back to the top tier, matching the tolerant
+/// [`resolve_rank`] posture.
 #[must_use]
 pub fn role_name(rank: u8) -> &'static str {
     Role::all()
@@ -822,6 +1735,239 @@ mod tests {
         set
     }
 
+    fn valid_worker_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && name
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+    }
+
+    fn valid_runtime_key(key: &str) -> bool {
+        !key.is_empty()
+            && key.len() <= 64
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }
+
+    #[test]
+    fn runtime_contract_is_total_unique_and_bounded() {
+        use std::collections::BTreeSet;
+
+        let mut names = BTreeSet::new();
+        assert_eq!(worker_specs().len(), WORKER_REGISTRY.len());
+
+        for worker in worker_specs() {
+            assert!(
+                valid_worker_name(worker.name),
+                "WL-ARCH-009: invalid stable worker name {:?}",
+                worker.name
+            );
+            assert!(
+                names.insert(worker.name),
+                "WL-ARCH-009: duplicate worker contract for {}",
+                worker.name
+            );
+            assert!(
+                worker.min_rank <= Role::Workstation.rank(),
+                "WL-ARCH-009: {} has invalid role rank {}",
+                worker.name,
+                worker.min_rank
+            );
+
+            match worker.activation.capability {
+                CapabilityPredicate::AnyNode | CapabilityPredicate::Requires(Capability::Media) => {
+                }
+            }
+            match worker.activation.config {
+                ConfigPredicate::Always => {}
+                ConfigPredicate::EnvironmentPresent(key)
+                | ConfigPredicate::EnvironmentUnlessFalse(key) => assert!(
+                    key.starts_with("MDE_")
+                        && key.len() <= 64
+                        && key.bytes().all(|byte| byte.is_ascii_uppercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'_'),
+                    "WL-ARCH-009: {} has invalid environment gate {key:?}",
+                    worker.name
+                ),
+                ConfigPredicate::RuntimeAvailable(key) => assert!(
+                    valid_runtime_key(key),
+                    "WL-ARCH-009: {} has invalid runtime gate {key:?}",
+                    worker.name
+                ),
+            }
+
+            if let CadencePolicy::Periodic {
+                min_interval_secs,
+                max_interval_secs,
+            } = worker.cadence
+            {
+                assert!(
+                    min_interval_secs > 0
+                        && min_interval_secs <= max_interval_secs
+                        && max_interval_secs <= 86_400,
+                    "WL-ARCH-009: {} has invalid cadence {:?}",
+                    worker.name,
+                    worker.cadence
+                );
+            }
+
+            if let QueuePolicy::Bounded {
+                max_items,
+                max_bytes,
+                ..
+            } = worker.queue
+            {
+                assert!(
+                    max_items > 0 && max_items <= 4_096 && max_bytes > 0 && max_bytes <= 64 * MIB,
+                    "WL-ARCH-009: {} has invalid queue bound {:?}",
+                    worker.name,
+                    worker.queue
+                );
+            }
+            if let CachePolicy::Bounded {
+                max_items,
+                max_bytes,
+                ttl_secs,
+            } = worker.cache
+            {
+                assert!(
+                    max_items > 0
+                        && max_items <= 4_096
+                        && max_bytes > 0
+                        && max_bytes <= 64 * MIB
+                        && ttl_secs > 0
+                        && ttl_secs <= 86_400,
+                    "WL-ARCH-009: {} has invalid cache bound {:?}",
+                    worker.name,
+                    worker.cache
+                );
+            }
+
+            let budget = worker.resources;
+            assert!(
+                budget.memory_high_bytes > 0
+                    && budget.memory_high_bytes <= budget.memory_max_bytes
+                    && budget.memory_max_bytes <= 512 * MIB
+                    && (1..=1_000).contains(&budget.cpu_millis_per_second)
+                    && (1..=64).contains(&budget.max_tasks),
+                "WL-ARCH-009: {} has invalid resource budget {:?}",
+                worker.name,
+                budget
+            );
+            assert!(
+                (1..=60).contains(&worker.ownership.cleanup.grace_secs),
+                "WL-ARCH-009: {} has invalid cleanup deadline {:?}",
+                worker.name,
+                worker.ownership.cleanup
+            );
+
+            // A singular enum field makes double-group assignment impossible;
+            // these ownership assertions keep every derived namespace on that
+            // same process boundary.
+            assert_eq!(
+                worker.ownership.state, worker.group,
+                "{} state owner",
+                worker.name
+            );
+            assert_eq!(
+                worker.ownership.health, worker.group,
+                "{} health owner",
+                worker.name
+            );
+            assert_eq!(
+                worker.ownership.actions, worker.group,
+                "{} action owner",
+                worker.name
+            );
+            assert!(worker
+                .group
+                .state_topic_prefix()
+                .starts_with("state/mackesd/"));
+            assert!(worker.group.health_key_prefix().starts_with("mackesd."));
+            assert!(worker
+                .group
+                .action_namespace()
+                .starts_with("action/mackesd/"));
+            assert_eq!(
+                spec(worker.name).map(|entry| entry.group),
+                Some(worker.group)
+            );
+        }
+    }
+
+    #[test]
+    fn six_group_coverage_and_spawn_behavior_are_stable() {
+        use std::collections::BTreeSet;
+
+        let expected = [
+            (WorkerGroup::Control, 7),
+            (WorkerGroup::Observation, 20),
+            (WorkerGroup::Actions, 14),
+            (WorkerGroup::Data, 12),
+            (WorkerGroup::Compute, 6),
+            (WorkerGroup::Integrations, 20),
+        ];
+        let mut services = BTreeSet::new();
+        let mut covered = 0;
+        for (group, count) in expected {
+            assert_eq!(
+                specs_for_group(group).count(),
+                count,
+                "WL-ARCH-009: {} group coverage drifted",
+                group.as_str()
+            );
+            assert!(services.insert(group.service_name()));
+            covered += count;
+        }
+        assert_eq!(
+            WorkerGroup::ALL.map(WorkerGroup::as_str),
+            [
+                "control",
+                "observation",
+                "actions",
+                "data",
+                "compute",
+                "integrations",
+            ]
+        );
+        assert_eq!(services.len(), WorkerGroup::ALL.len());
+        assert_eq!(covered, WORKER_REGISTRY.len());
+
+        let mut on_failure = 0;
+        let mut always = 0;
+        let mut never = 0;
+        for worker in WORKER_REGISTRY {
+            match worker.policy {
+                RestartPolicy::OnFailure => on_failure += 1,
+                RestartPolicy::Always => always += 1,
+                RestartPolicy::Never => never += 1,
+            }
+        }
+        assert_eq!((on_failure, always, never), (74, 5, 0));
+        assert_eq!(
+            WORKER_REGISTRY
+                .iter()
+                .filter(|worker| worker.min_rank == 0)
+                .count(),
+            49
+        );
+        assert_eq!(
+            WORKER_REGISTRY
+                .iter()
+                .filter(|worker| worker.min_rank == 1)
+                .count(),
+            30
+        );
+    }
+
     #[test]
     fn worker_spawns_and_the_census_do_not_drift() {
         use std::collections::BTreeSet;
@@ -982,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn the_table_is_the_full_17_worker_census() {
+    fn the_table_is_the_current_role_tiered_worker_census() {
         // Guards against a worker added to run_serve without a deliberate tier
         // (it would silently default to Lighthouse). 31 originally; -1 redundant
         // python `clipboard` (RETIRE-PY.3), -1 broken python
@@ -1099,8 +2245,11 @@ mod tests {
         // OVERLAY-4 adds NWS hourly guidance => 81; OVERLAY-5 adds Caltrans
         // traffic cameras => 82; OVERLAY-2 adds IEM NEXRAD radar => 83;
         // OVERLAY-6 adds keyless NIFC WFIGS perimeters => 84; OVERLAY-3 adds
-        // keyless NCDOT TIMS events => 85; AirNow AQI => 86.
-        assert_eq!(WORKER_REGISTRY.len(), 88);
+        // keyless NCDOT TIMS events => 85; AirNow AQI => 86. AirSonic and
+        // Jellyfin gateway proxies brought the pre-cutover census to 90; the
+        // Chromium Browser VM hard cut removed all 11 host Browser workers,
+        // leaving the current 79 role-tiered workers.
+        assert_eq!(WORKER_REGISTRY.len(), 79);
     }
 
     #[test]
@@ -1133,8 +2282,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            40,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + media_airsonic_proxy (WL-FUNC-014) + pty_broker (TERM-7) + transfers (TRANSFERS-1) + airspace + earthquake_overlay + nws_alert_overlay + nws_forecast_overlay + iem_radar_overlay + wildfire_overlay + traffic_overlay + air_quality_overlay + firms_overlay + aircraft_overlay + transit_overlay + caltrans_camera_overlay (WL-FUNC-012 adapters) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
+            30,
+            "Workstation = fleet/actions + desktop data + seat input + media gateways + the WL-FUNC-012 provider adapters; all retired host Browser workers are absent after the Chromium VM cutover"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -1328,8 +2477,7 @@ mod tests {
 
     #[test]
     fn role_name_maps_each_rank_to_its_canonical_name() {
-        // BOOKMARKS-8 — the browser-policy worker folds its per-role policy by
-        // this name, so it MUST match the role.toml canonical names.
+        // Keep diagnostics and role-file projections on canonical names.
         assert_eq!(role_name(Role::Lighthouse.rank()), "lighthouse");
         assert_eq!(role_name(Role::Workstation.rank()), "workstation");
         // An out-of-range rank falls back to the top tier (tolerant posture).
@@ -1401,9 +2549,11 @@ mod tests {
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 wildfire_overlay => ws 84.
         // WL-FUNC-012 OVERLAY-3 +1 rank-1 traffic_overlay => ws 85.
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
-        // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88.
+        // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
+        // gateway proxies brought the real pre-cutover count to 90; removing all
+        // 11 host Browser workers for the Chromium VM cutover leaves ws 79.
         assert_eq!(lh.len(), 49);
-        assert_eq!(ws.len(), 88);
+        assert_eq!(ws.len(), 79);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

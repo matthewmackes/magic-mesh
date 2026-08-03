@@ -49,6 +49,10 @@
 //! credential drive THIS session in-memory; it simply isn't persisted, and the
 //! Chooser says so plainly rather than faking "remembered".
 
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
 use crate::vdi::VdiProtocol;
 
 /// A secret string (a credential password / VNC RFB secret / Spice ticket) that
@@ -317,16 +321,15 @@ pub(crate) trait CredentialStore {
     fn seal(&self, store_ref: &str, credential: &Credential) -> SealOutcome;
 }
 
-/// The production credential store — honest-gated (§7).
+/// The production credential store.
 ///
-/// The audited seal (`mackesd::ca::backup::seal_bytes`) and the mesh age identity
-/// that keys it live in the `mackesd` daemon (behind `async-services`), which the
-/// desktop-shell tier must not link (§6). So a desktop-tier seal path is brokered
-/// mesh-side by a secret-store worker — not shipped in this unit — and is gated
-/// here: [`Self::get`] honestly reports nothing sealed on the desktop tier yet,
-/// and [`Self::seal`] returns [`SealOutcome::Gated`] rather than faking
-/// persistence. The credential the operator enters still drives the (itself gated,
-/// E12-4) live connect in-memory; nothing plaintext is written.
+/// Generic desktop credential sealing remains honestly gated on the mesh-side
+/// secret-store worker. The dedicated Browser VM RDP account is the narrow live
+/// exception: a provisioning helper rotates the guest password and seals the same
+/// value as a host-bound systemd encrypted credential. systemd decrypts that one
+/// record into this service's private read-only credential directory; this reader
+/// accepts only the exact Browser VM store key and never scans or derives a path
+/// from untrusted input.
 pub(crate) struct MeshCredentialStore;
 
 /// The honest gate message — named once so the note and any log agree.
@@ -334,11 +337,117 @@ const GATED_REASON: &str =
     "sealing external desktop credentials is brokered by the mesh secret store \
      (FILEMGR-6) mesh-side; the desktop-tier seal path is gated";
 
+/// Stable auth-store identity used by `BrowserVmTarget.workload == "browser-vm"`.
+const BROWSER_VM_RDP_STORE_REF: &str = "desktop/browser-vm/rdp";
+/// Name exposed by `LoadCredentialEncrypted=` to the shell service.
+const BROWSER_VM_RDP_CREDENTIAL: &str = "browser-vm-rdp";
+const BROWSER_VM_RDP_USERNAME: &str = "mcnf-browser";
+/// The JSON record is tiny. Keep bounded headroom while refusing an unexpected
+/// credential leaf from becoming an unbounded allocation in the root shell.
+const MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES: usize = 4 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserVmRdpCredentialFile {
+    schema_version: u8,
+    username: String,
+    password: String,
+}
+
+/// Resolve the one host-bound credential without turning `store_ref` into a
+/// filesystem path. An absent systemd credential is a normal `None` so a
+/// development shell can still present the one-time prompt; a malformed or
+/// unreadable credential is an explicit fault and must not silently prompt.
+fn browser_vm_rdp_credential(
+    store_ref: &str,
+    credentials_directory: Option<&Path>,
+) -> Result<Option<Credential>, String> {
+    if store_ref != BROWSER_VM_RDP_STORE_REF {
+        return Ok(None);
+    }
+    let Some(directory) = credentials_directory else {
+        return Ok(None);
+    };
+    if !directory.is_absolute() {
+        return Err("The systemd credential directory is not absolute.".to_string());
+    }
+    let Some(raw) = read_browser_vm_rdp_credential(&directory.join(BROWSER_VM_RDP_CREDENTIAL))?
+    else {
+        return Ok(None);
+    };
+    let record: BrowserVmRdpCredentialFile = serde_json::from_slice(&raw)
+        .map_err(|_| "The Browser VM RDP credential is not valid JSON.".to_string())?;
+    if record.schema_version != 1 {
+        return Err("The Browser VM RDP credential schema is unsupported.".to_string());
+    }
+    if record.username != BROWSER_VM_RDP_USERNAME {
+        return Err("The Browser VM RDP credential names an unexpected guest account.".to_string());
+    }
+    if record.password.is_empty()
+        || record.password.len() > 512
+        || record.password.chars().any(char::is_control)
+    {
+        return Err("The Browser VM RDP credential contains an invalid password.".to_string());
+    }
+    Ok(Some(Credential::new(record.username, record.password)))
+}
+
+/// Bounded, final-leaf-non-following read of the private systemd credential.
+fn read_browser_vm_rdp_credential(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000); // O_NOFOLLOW
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !std::fs::symlink_metadata(path)
+        .map_err(|_| "Could not inspect the Browser VM RDP credential.".to_string())?
+        .file_type()
+        .is_file()
+    {
+        return Err("The Browser VM RDP credential is not a regular file.".to_string());
+    }
+
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Could not read the Browser VM RDP credential.".to_string()),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Could not inspect the Browser VM RDP credential.".to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("The Browser VM RDP credential is not a regular file.".to_string());
+    }
+    if metadata.len() > MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES as u64 {
+        return Err(format!(
+            "The Browser VM RDP credential exceeds {MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES} bytes."
+        ));
+    }
+
+    let mut raw = Vec::with_capacity(
+        MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES
+            .min(usize::try_from(metadata.len()).unwrap_or(MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES)),
+    );
+    file.take((MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .map_err(|_| "Could not read the Browser VM RDP credential.".to_string())?;
+    if raw.len() > MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES {
+        return Err(format!(
+            "The Browser VM RDP credential exceeds {MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES} bytes."
+        ));
+    }
+    Ok(Some(raw))
+}
+
 impl CredentialStore for MeshCredentialStore {
-    fn get(&self, _store_ref: &str) -> Result<Option<Credential>, String> {
-        // Nothing is sealed on the desktop tier yet (the sealed vault is mesh-side,
-        // reached by the gated worker) — an honest "not stored", never a fault.
-        Ok(None)
+    fn get(&self, store_ref: &str) -> Result<Option<Credential>, String> {
+        let directory = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+        browser_vm_rdp_credential(store_ref, directory.as_deref())
     }
 
     fn seal(&self, _store_ref: &str, _credential: &Credential) -> SealOutcome {
@@ -634,7 +743,7 @@ mod tests {
     #[test]
     fn the_production_store_is_honestly_gated_never_a_fake_success() {
         let store = MeshCredentialStore;
-        // Honestly nothing sealed on the desktop tier yet (not a fault).
+        // Generic desktop credentials remain mesh-side and absent here.
         assert_eq!(store.get("desktop/host/rdp").expect("honest none"), None);
         // A seal is gated, not faked as persisted.
         let cred = Credential::new("u", "p");
@@ -642,6 +751,69 @@ mod tests {
             unreachable!("expected an honest gate")
         };
         assert!(reason.contains("mesh-side"));
+    }
+
+    #[test]
+    fn browser_vm_systemd_credential_resolves_without_an_operator_prompt() {
+        let directory = tempfile::tempdir().expect("credential directory");
+        assert_eq!(
+            browser_vm_rdp_credential(BROWSER_VM_RDP_STORE_REF, Some(directory.path()))
+                .expect("absent credential is not a store fault"),
+            None
+        );
+        std::fs::write(
+            directory.path().join(BROWSER_VM_RDP_CREDENTIAL),
+            r#"{"schema_version":1,"username":"mcnf-browser","password":"host-bound-secret"}"#,
+        )
+        .expect("credential");
+
+        let credential =
+            browser_vm_rdp_credential(BROWSER_VM_RDP_STORE_REF, Some(directory.path()))
+                .expect("valid credential")
+                .expect("present credential");
+        assert_eq!(credential.username, BROWSER_VM_RDP_USERNAME);
+        assert_eq!(credential.secret.expose(), "host-bound-secret");
+        assert!(format!("{credential:?}").contains("<redacted>"));
+        assert!(!format!("{credential:?}").contains("host-bound-secret"));
+    }
+
+    #[test]
+    fn browser_vm_systemd_credential_fails_closed_on_bad_shape_or_size() {
+        let directory = tempfile::tempdir().expect("credential directory");
+        let path = directory.path().join(BROWSER_VM_RDP_CREDENTIAL);
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"username":"root","password":"wrong-account"}"#,
+        )
+        .expect("credential");
+        assert!(
+            browser_vm_rdp_credential(BROWSER_VM_RDP_STORE_REF, Some(directory.path())).is_err()
+        );
+
+        std::fs::write(&path, vec![b'x'; MAX_BROWSER_VM_RDP_CREDENTIAL_BYTES + 1])
+            .expect("oversized credential");
+        assert!(
+            browser_vm_rdp_credential(BROWSER_VM_RDP_STORE_REF, Some(directory.path())).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_vm_systemd_credential_does_not_follow_a_replaced_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("credential directory");
+        let target = directory.path().join("target");
+        std::fs::write(
+            &target,
+            r#"{"schema_version":1,"username":"mcnf-browser","password":"secret"}"#,
+        )
+        .expect("target credential");
+        symlink(&target, directory.path().join(BROWSER_VM_RDP_CREDENTIAL))
+            .expect("credential symlink");
+        assert!(
+            browser_vm_rdp_credential(BROWSER_VM_RDP_STORE_REF, Some(directory.path())).is_err()
+        );
     }
 
     #[test]

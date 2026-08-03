@@ -1742,6 +1742,7 @@ mod tests {
             serving_peer: serving_peer.to_string(),
             vm_id: format!("uuid-{id}"),
             client_peer: client_peer.to_string(),
+            profile: None,
             state,
             opened_at_ms: 100,
             updated_at_ms: 100,

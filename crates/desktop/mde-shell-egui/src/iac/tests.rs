@@ -474,6 +474,48 @@ fn run_route_uses_dense_resource_table_before_configure_lens() {
 }
 
 #[test]
+fn android_apps_catalog_renders_in_active_plan_and_run_routes() {
+    for route in [WorkloadsRoute::Plan, WorkloadsRoute::Run] {
+        let mut state = state_on(DeliveryView::AndroidVm, route);
+        state.states[0]
+            .workloads
+            .push(workload("android-1", DeliveryType::AndroidVm, "running"));
+
+        // The production panel wraps this route in a vertical ScrollArea. Give
+        // the headless proof enough height to paint the complete scrollable
+        // catalog so the last governed row is asserted too.
+        let text = rendered_text_at_height(1_400.0, |ui| route_body(ui, &mut state));
+        assert!(text.contains("AOSP starter apps"), "{route:?}: {text}");
+        assert!(
+            text.contains("Scoped to Android VM android-1 on eagle"),
+            "{route:?}: {text}"
+        );
+        for package_id in [
+            "com.android.browser",
+            "com.android.calendar",
+            "com.android.camera2",
+            "com.android.deskclock",
+            "com.android.contacts",
+            "com.android.documentsui",
+            "com.android.gallery3d",
+            "com.android.calculator2",
+            "com.android.settings",
+        ] {
+            assert!(
+                text.contains(package_id),
+                "{route:?} omitted {package_id}: {text}"
+            );
+        }
+        assert!(text.contains("inventory pending"), "{route:?}: {text}");
+        assert!(text.contains("guest pending"), "{route:?}: {text}");
+        assert!(
+            text.contains("launch integration pending"),
+            "{route:?}: {text}"
+        );
+    }
+}
+
+#[test]
 fn drift_route_uses_dense_resource_table_with_plan_only_row_actions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Drift);
@@ -1356,7 +1398,11 @@ fn carbon_icons_are_registered_for_every_view_and_route() {
 /// Drive `run` in a headless frame and collect every text run painted — the
 /// pixel-feed proof a fixture decode actually renders (the same `Context::run`
 /// path the DRM runner drives, minus the GPU).
-fn rendered_text(mut run: impl FnMut(&mut egui::Ui)) -> String {
+fn rendered_text(run: impl FnMut(&mut egui::Ui)) -> String {
+    rendered_text_at_height(720.0, run)
+}
+
+fn rendered_text_at_height(height: f32, mut run: impl FnMut(&mut egui::Ui)) -> String {
     fn collect(shape: &egui::epaint::Shape, out: &mut String) {
         match shape {
             egui::epaint::Shape::Text(t) => {
@@ -1374,7 +1420,7 @@ fn rendered_text(mut run: impl FnMut(&mut egui::Ui)) -> String {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let input = egui::RawInput {
-        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 720.0))),
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, height))),
         ..Default::default()
     };
     let out = ctx.run(input, |ctx| {

@@ -11,9 +11,10 @@
 //! 2. **Leave the roster** — remove our own published files
 //!    (PeerRecord, bundle, ssh pubkey, media-registry row): own-row
 //!    authority applies to departure too.
-//! 3. **Wipe local state** — `/etc/nebula/*`, the published
-//!    overlay-ip/role markers, and `role.toml` (the box returns to
-//!    the ENT-2 fail-closed unpinned state).
+//! 3. **Wipe local state** — `/etc/nebula/*`, the authenticated relay
+//!    authority pin (plus its private signing key on a Lighthouse), the
+//!    published overlay-ip/role markers, and `role.toml` (the box returns
+//!    to the ENT-2 fail-closed unpinned state).
 //!
 //! Deliberately **no ban**: a ban blocks future enrollment
 //! (`sign_pending_csr` refuses banned node-ids), and ENT-5's
@@ -22,8 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// What `leave` accomplished — printed by the CLI; every field is
-/// honest (false = that step found nothing / failed best-effort).
+/// What `leave` accomplished — printed by the CLI. Trust-material removal
+/// records failures separately so an already-absent file remains idempotent
+/// while an unsafe or failed unlink cannot be reported as a successful leave.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LeaveReport {
     /// Own cert fingerprinted into the replicated blocklist.
@@ -36,6 +38,16 @@ pub struct LeaveReport {
     pub ssh_key_removed: bool,
     /// `/etc/nebula` contents wiped.
     pub nebula_config_wiped: bool,
+    /// Enrollment-authenticated relay authority pin removed.
+    pub relay_trust_authority_pin_removed: bool,
+    /// The relay authority pin could not be safely removed or confirmed absent.
+    /// Idempotent absence leaves this `false`.
+    pub relay_trust_authority_pin_removal_failed: bool,
+    /// Lighthouse-only relay authority private key removed.
+    pub relay_trust_authority_key_removed: bool,
+    /// The Lighthouse relay authority private key could not be safely removed
+    /// or confirmed absent. Idempotent absence leaves this `false`.
+    pub relay_trust_authority_key_removal_failed: bool,
     /// `role.toml` removed (box is unpinned again).
     pub role_unpinned: bool,
     /// Own `<host>/media-registry.json` removed from the shared media
@@ -43,15 +55,35 @@ pub struct LeaveReport {
     pub media_registry_removed: bool,
 }
 
-/// Execute the voluntary exit. Every step is best-effort and
-/// reported; nothing panics on partial state (a half-enrolled box
-/// can still leave cleanly).
+/// Execute the voluntary exit. Every step is attempted and reported; nothing
+/// panics on partial state (a half-enrolled box can still leave cleanly). The
+/// CLI treats a reported trust-material removal failure as fatal.
 pub fn leave(
     workgroup_root: &Path,
     hostname: &str,
     node_id: &str,
     nebula_config_dir: &Path,
     role_toml_path: &Path,
+) -> LeaveReport {
+    leave_with_relay_authority_paths(
+        workgroup_root,
+        hostname,
+        node_id,
+        nebula_config_dir,
+        role_toml_path,
+        Path::new(crate::ca::bundle::RELAY_TRUST_AUTHORITY_PIN_PATH),
+        Path::new(crate::ca::bundle::RELAY_TRUST_AUTHORITY_KEY_PATH),
+    )
+}
+
+fn leave_with_relay_authority_paths(
+    workgroup_root: &Path,
+    hostname: &str,
+    node_id: &str,
+    nebula_config_dir: &Path,
+    role_toml_path: &Path,
+    relay_trust_authority_pin_path: &Path,
+    relay_trust_authority_key_path: &Path,
 ) -> LeaveReport {
     let mut report = LeaveReport::default();
 
@@ -108,9 +140,104 @@ pub fn leave(
 
     // 3. Local teardown.
     report.nebula_config_wiped = wipe_dir_contents(nebula_config_dir);
+    // Remove the private signer first. If teardown is interrupted between the
+    // two unlinks, the old public pin still fails closed instead of leaving an
+    // unpinned old-mesh signing key active on a former Lighthouse.
+    let relay_key_removal = remove_local_trust_material(
+        relay_trust_authority_key_path,
+        "relay trust authority private key",
+    );
+    report.relay_trust_authority_key_removed = relay_key_removal.removed;
+    report.relay_trust_authority_key_removal_failed = relay_key_removal.failed;
+    let relay_pin_removal =
+        remove_local_trust_material(relay_trust_authority_pin_path, "relay trust authority pin");
+    report.relay_trust_authority_pin_removed = relay_pin_removal.removed;
+    report.relay_trust_authority_pin_removal_failed = relay_pin_removal.failed;
     report.role_unpinned = std::fs::remove_file(role_toml_path).is_ok();
 
     report
+}
+
+/// Unlink one active local trust anchor without following the final path or a
+/// symlink substituted for its parent directory. The parent descriptor anchors
+/// the unlink across rename races; a final symlink is itself removed, never its
+/// target. Missing material is an honest `false`, matching the other report
+/// fields, while unexpected filesystem failures are logged without secret
+/// contents. `removed=false, failed=false` means the material was already
+/// absent and is therefore an idempotent success.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TrustMaterialRemoval {
+    removed: bool,
+    failed: bool,
+}
+
+fn remove_local_trust_material(path: &Path, description: &'static str) -> TrustMaterialRemoval {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    let Some(parent) = path.parent() else {
+        tracing::warn!(path = %path.display(), "leave: {description} path has no parent");
+        return TrustMaterialRemoval {
+            removed: false,
+            failed: true,
+        };
+    };
+    let Some(file_name) = path.file_name() else {
+        tracing::warn!(path = %path.display(), "leave: {description} path has no filename");
+        return TrustMaterialRemoval {
+            removed: false,
+            failed: true,
+        };
+    };
+    let directory = match rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(rustix::io::Errno::NOENT) => return TrustMaterialRemoval::default(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "leave: refusing unsafe or unavailable parent for {description}"
+            );
+            return TrustMaterialRemoval {
+                removed: false,
+                failed: true,
+            };
+        }
+    };
+    match rustix::fs::unlinkat(&directory, file_name, AtFlags::empty()) {
+        Ok(()) => {
+            let directory: std::fs::File = directory.into();
+            let failed = if let Err(error) = directory.sync_all() {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "leave: removed {description}, but could not sync its parent directory"
+                );
+                true
+            } else {
+                false
+            };
+            TrustMaterialRemoval {
+                removed: true,
+                failed,
+            }
+        }
+        Err(rustix::io::Errno::NOENT) => TrustMaterialRemoval::default(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "leave: could not remove {description}"
+            );
+            TrustMaterialRemoval {
+                removed: false,
+                failed: true,
+            }
+        }
+    }
 }
 
 /// Remove every entry inside `dir` (not the dir itself). `true` when
@@ -136,6 +263,20 @@ fn wipe_dir_contents(dir: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn relay_bundle(authority: &str) -> crate::ca::bundle::NebulaBundle {
+        crate::ca::bundle::NebulaBundle {
+            mesh_id: "mesh-test".into(),
+            epoch: 1,
+            ca_cert_pem: "ca".into(),
+            peer_cert_pem: "peer".into(),
+            overlay_ip: "10.42.0.9".into(),
+            mesh_cidr: "10.42.0.0/16".into(),
+            lighthouses: Vec::new(),
+            relay_trust_authority: Some(authority.into()),
+            created_at: 1,
+        }
+    }
+
     #[test]
     fn leave_tears_down_roster_bundle_ssh_config_and_role() {
         let tmp = tempfile::tempdir().unwrap();
@@ -157,8 +298,18 @@ mod tests {
         std::fs::write(nebula.join("host.key"), "secret").unwrap();
         let role = tmp.path().join("role.toml");
         std::fs::write(&role, "role = \"workstation\"\n").unwrap();
+        let relay_pin = tmp.path().join("state/relay-trust-authority.pub");
+        let relay_key = tmp.path().join("state/relay-trust-authority.ed25519");
 
-        let report = leave(root, "pine", "peer:pine", &nebula, &role);
+        let report = leave_with_relay_authority_paths(
+            root,
+            "pine",
+            "peer:pine",
+            &nebula,
+            &role,
+            &relay_pin,
+            &relay_key,
+        );
 
         assert!(report.roster_record_removed && !pdir.join("pine.json").exists());
         assert!(report.bundle_removed && !bpath.exists());
@@ -175,6 +326,10 @@ mod tests {
         );
         // No host.crt seeded → no fingerprint → eviction honestly false.
         assert!(!report.data_plane_evicted);
+        assert!(!report.relay_trust_authority_pin_removed);
+        assert!(!report.relay_trust_authority_key_removed);
+        assert!(!report.relay_trust_authority_pin_removal_failed);
+        assert!(!report.relay_trust_authority_key_removal_failed);
     }
 
     #[test]
@@ -182,12 +337,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nebula = tmp.path().join("etc-nebula");
         std::fs::create_dir_all(&nebula).unwrap();
-        let _ = leave(
+        let _ = leave_with_relay_authority_paths(
             tmp.path(),
             "pine",
             "peer:pine",
             &nebula,
             &tmp.path().join("role.toml"),
+            &tmp.path().join("state/relay-trust-authority.pub"),
+            &tmp.path().join("state/relay-trust-authority.ed25519"),
         );
         assert!(
             !crate::ca::ban_list::is_banned(tmp.path(), "peer:pine"),
@@ -198,13 +355,125 @@ mod tests {
     #[test]
     fn leave_on_a_bare_box_reports_all_false_without_panicking() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = leave(
+        let report = leave_with_relay_authority_paths(
             tmp.path(),
             "ghost",
             "peer:ghost",
             &tmp.path().join("nope"),
             &tmp.path().join("role.toml"),
+            &tmp.path().join("state/relay-trust-authority.pub"),
+            &tmp.path().join("state/relay-trust-authority.ed25519"),
         );
         assert_eq!(report, LeaveReport::default());
+    }
+
+    #[test]
+    fn leave_clears_relay_trust_material_and_allows_a_different_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let relay_pin = state.join("relay-trust-authority.pub");
+        let relay_key = state.join("relay-trust-authority.ed25519");
+        let old_bundle = relay_bundle(&"11".repeat(32));
+        let new_bundle = relay_bundle(&"22".repeat(32));
+        crate::ca::bundle::write_relay_trust_authority_pin(&old_bundle, &relay_pin)
+            .expect("seed old authority pin");
+        crate::ca::seal::write_sealed(&relay_key, &[7_u8; 32])
+            .expect("seed lighthouse authority key");
+
+        let error = crate::ca::bundle::write_relay_trust_authority_pin(&new_bundle, &relay_pin)
+            .expect_err("join must not replace an active authority pin");
+        assert!(error.to_string().contains("refusing to replace"));
+
+        let nebula = tmp.path().join("etc-nebula");
+        std::fs::create_dir_all(&nebula).unwrap();
+        let report = leave_with_relay_authority_paths(
+            tmp.path(),
+            "pine",
+            "peer:pine",
+            &nebula,
+            &tmp.path().join("role.toml"),
+            &relay_pin,
+            &relay_key,
+        );
+
+        assert!(report.relay_trust_authority_key_removed);
+        assert!(report.relay_trust_authority_pin_removed);
+        assert!(!relay_key.exists());
+        assert!(!relay_pin.exists());
+        crate::ca::bundle::write_relay_trust_authority_pin(&new_bundle, &relay_pin)
+            .expect("fresh join may pin a different authenticated authority after leave");
+        assert!(crate::ca::bundle::relay_trust_authority_matches_pin(
+            &new_bundle,
+            &relay_pin
+        ));
+    }
+
+    #[test]
+    fn relay_trust_teardown_unlinks_leaf_symlinks_without_following_targets() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let pin_target = tmp.path().join("pin-target");
+        let key_target = tmp.path().join("key-target");
+        std::fs::write(&pin_target, "keep-pin").unwrap();
+        std::fs::write(&key_target, "keep-key").unwrap();
+        let relay_pin = state.join("relay-trust-authority.pub");
+        let relay_key = state.join("relay-trust-authority.ed25519");
+        symlink(&pin_target, &relay_pin).unwrap();
+        symlink(&key_target, &relay_key).unwrap();
+        let nebula = tmp.path().join("etc-nebula");
+        std::fs::create_dir_all(&nebula).unwrap();
+
+        let report = leave_with_relay_authority_paths(
+            tmp.path(),
+            "pine",
+            "peer:pine",
+            &nebula,
+            &tmp.path().join("role.toml"),
+            &relay_pin,
+            &relay_key,
+        );
+
+        assert!(report.relay_trust_authority_pin_removed);
+        assert!(report.relay_trust_authority_key_removed);
+        assert!(!report.relay_trust_authority_pin_removal_failed);
+        assert!(!report.relay_trust_authority_key_removal_failed);
+        assert_eq!(std::fs::read_to_string(pin_target).unwrap(), "keep-pin");
+        assert_eq!(std::fs::read_to_string(key_target).unwrap(), "keep-key");
+    }
+
+    #[test]
+    fn relay_trust_teardown_refuses_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_state = tmp.path().join("real-state");
+        std::fs::create_dir_all(&real_state).unwrap();
+        let relay_pin = real_state.join("relay-trust-authority.pub");
+        std::fs::write(&relay_pin, "keep-pin").unwrap();
+        let linked_state = tmp.path().join("linked-state");
+        symlink(&real_state, &linked_state).unwrap();
+        let safe_state = tmp.path().join("safe-state");
+        std::fs::create_dir_all(&safe_state).unwrap();
+        let nebula = tmp.path().join("etc-nebula");
+        std::fs::create_dir_all(&nebula).unwrap();
+
+        let report = leave_with_relay_authority_paths(
+            tmp.path(),
+            "pine",
+            "peer:pine",
+            &nebula,
+            &tmp.path().join("role.toml"),
+            &linked_state.join("relay-trust-authority.pub"),
+            &safe_state.join("relay-trust-authority.ed25519"),
+        );
+
+        assert!(!report.relay_trust_authority_pin_removed);
+        assert!(report.relay_trust_authority_pin_removal_failed);
+        assert!(!report.relay_trust_authority_key_removed);
+        assert!(!report.relay_trust_authority_key_removal_failed);
+        assert_eq!(std::fs::read_to_string(relay_pin).unwrap(), "keep-pin");
     }
 }

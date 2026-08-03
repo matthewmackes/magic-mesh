@@ -22,7 +22,7 @@ use crate::construct::ConstructChrome;
 use crate::front_door::{FrontDoorPeerAppFavorites, FrontDoorPeerAppTarget};
 use crate::status::StatusSegments;
 use crate::status_bar::{self, bottom_tray_rect, StatusBarEnv, BOTTOM_TRAY_GAP, STATUS_BAR_H};
-use crate::surfaces::{icon_texture, Surface};
+use crate::surfaces::{icon_texture, SessionRailEntry, Surface};
 
 /// The reserved left-rail width in docked mode.
 pub(crate) const DOCKED_W: f32 = 56.0;
@@ -70,14 +70,13 @@ static NAV_LAYER_ID_MAP_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Ordered first-boot and personalization catalog. The public labels for the
 /// two consolidated surfaces deliberately differ from their internal enum
 /// names so migrated/deep-link compatibility never leaks into the taskbar UI.
-const PIN_CATALOG: [Surface; 13] = [
+const PIN_CATALOG: [Surface; 12] = [
     Surface::FleetMesh,
     Surface::InfraCode,
     Surface::Desktop,
     Surface::Terminal,
     Surface::MapsLocation,
     Surface::Communications,
-    Surface::Files,
     Surface::Music,
     Surface::Media,
     Surface::Browser,
@@ -109,6 +108,8 @@ pub(crate) enum Action {
     /// Open a chooser-pinned remote desktop source through the normal chooser
     /// authentication and VDI hand-off path.
     DesktopSource(String),
+    /// Focus one already-connected remote desktop or App VM session directly.
+    RemoteSession(String),
 }
 
 /// Borrowed bottom-tray state painted inside the taskbar's foreground Area.
@@ -211,11 +212,17 @@ fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
         Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
             Some(Surface::ThisNode)
         }
+        // Standalone Files is a compatibility deep link only; persisted pins
+        // migrate to the one Mesh Teams collaboration destination.
+        Surface::Files => Some(Surface::Communications),
         Surface::AutoHome | Surface::Timers => None,
         surface if Surface::ALL.contains(&surface) => Some(surface),
         _ => None,
     }?;
-    pin_catalog_surface(canonical).then_some(canonical)
+    // Tool-tray workspaces deliberately have no duplicate taskbar marker. The
+    // fixed Workloads and merged Home/Sessions controls do, however, need the
+    // canonical surface to reach `focused_control_index`.
+    (!crate::surfaces::is_tool_tray_surface(canonical)).then_some(canonical)
 }
 
 /// Surfaces owned by the right-side tool tray are not valid center-nav pins.
@@ -223,11 +230,16 @@ fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
 /// profiles instead of allowing duplicate workspace affordances to survive.
 const fn pin_catalog_surface(surface: Surface) -> bool {
     !crate::surfaces::is_tool_tray_surface(surface)
+        && !matches!(surface, Surface::InfraCode | Surface::Desktop)
 }
 
 fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
     let mut surfaces = Vec::with_capacity(keys.len().min(MAX_PINNED_SURFACES));
-    for surface in keys.iter().filter_map(|key| surface_from_key(key)) {
+    for surface in keys
+        .iter()
+        .filter_map(|key| surface_from_key(key))
+        .filter_map(canonical_taskbar_surface)
+    {
         if !surfaces.contains(&surface) {
             surfaces.push(surface);
         }
@@ -582,12 +594,15 @@ impl State {
             .iter()
             .copied()
             .filter(|surface| pin_catalog_contains(*surface))
-            .fold(Vec::with_capacity(MAX_PINNED_SURFACES), |mut selected, surface| {
-                if selected.len() < MAX_PINNED_SURFACES && !selected.contains(&surface) {
-                    selected.push(surface);
-                }
-                selected
-            })
+            .fold(
+                Vec::with_capacity(MAX_PINNED_SURFACES),
+                |mut selected, surface| {
+                    if selected.len() < MAX_PINNED_SURFACES && !selected.contains(&surface) {
+                        selected.push(surface);
+                    }
+                    selected
+                },
+            )
     }
 
     fn complete_first_boot(&mut self) {
@@ -634,7 +649,7 @@ impl State {
         pinned_sources: &[crate::surfaces::DesktopRailSource],
         active_surface: Option<Surface>,
     ) -> Option<Action> {
-        self.mount_with_active_inner(ctx, pinned_sources, active_surface, None)
+        self.mount_with_active_inner(ctx, pinned_sources, active_surface, None, &[], None)
     }
 
     /// Render bottom-placement navigation and the clock/tray as one taskbar.
@@ -652,6 +667,39 @@ impl State {
             ctx,
             pinned_sources,
             active_surface,
+            None,
+            &[],
+            Some(BottomTray {
+                construct,
+                segments,
+                opacity: tray_opacity,
+                env: tray_env,
+                active_surface,
+            }),
+        )
+    }
+
+    /// Render the bottom taskbar with transient connected-session targets.
+    /// These entries are supplied by the shell's live session projection and
+    /// are deliberately excluded from nav-bar persistence and pin menus.
+    pub(crate) fn mount_with_active_and_bottom_tray_and_sessions(
+        &mut self,
+        ctx: &egui::Context,
+        pinned_sources: &[crate::surfaces::DesktopRailSource],
+        active_surface: Option<Surface>,
+        active_session_id: Option<&str>,
+        connected_sessions: &[SessionRailEntry],
+        construct: &mut ConstructChrome,
+        segments: &StatusSegments,
+        tray_opacity: f32,
+        tray_env: StatusBarEnv,
+    ) -> Option<Action> {
+        self.mount_with_active_inner(
+            ctx,
+            pinned_sources,
+            active_surface,
+            active_session_id,
+            connected_sessions,
             Some(BottomTray {
                 construct,
                 segments,
@@ -667,6 +715,8 @@ impl State {
         ctx: &egui::Context,
         pinned_sources: &[crate::surfaces::DesktopRailSource],
         active_surface: Option<Surface>,
+        active_session_id: Option<&str>,
+        connected_sessions: &[SessionRailEntry],
         mut bottom_tray: Option<BottomTray<'_>>,
     ) -> Option<Action> {
         let active_surface = active_surface.and_then(canonical_taskbar_surface);
@@ -685,11 +735,21 @@ impl State {
             );
         }
         let pinned_sources = &pinned_sources[..pinned_sources.len().min(MAX_PINNED_SOURCES)];
-        let geometry = self.geometry_for(screen, Instant::now(), pinned_sources.len());
+        let geometry = self.geometry_for_with_sessions(
+            screen,
+            Instant::now(),
+            pinned_sources.len(),
+            connected_sessions,
+        );
         // Resolve focus once against the rendered controls. This makes the
         // underline a singular semantic marker even if stale/corrupt state
         // ever presents duplicate canonical entries during a frame.
-        let focused_index = focused_control_index(&geometry.controls, active_surface);
+        let focused_index = focused_control_index_with_sessions(
+            &geometry.controls,
+            active_surface,
+            connected_sessions,
+            active_session_id,
+        );
         if geometry.finished {
             self.transition = None;
         } else {
@@ -798,7 +858,7 @@ impl State {
                             |overflow| overflow_label(overflow.items.len()),
                         )
                     } else {
-                        control_label(*control, pinned_sources)
+                        control_label(*control, pinned_sources, connected_sessions)
                     };
                     install_accessibility(
                         ctx,
@@ -821,7 +881,7 @@ impl State {
                             ctx.memory_mut(|memory| memory.toggle_popup(overflow_popup_id));
                         }
                     } else if clicked {
-                        action = Some(control_action(*control, pinned_sources));
+                        action = Some(control_action(*control, pinned_sources, connected_sessions));
                     }
                     if control.kind != ControlKind::Overflow {
                         if let Some(menu_action) =
@@ -836,15 +896,15 @@ impl State {
                 // its clock and system targets remain anchored in the bar and
                 // take the final hit-test priority in their reserved lane.
                 if let Some(tray) = bottom_tray.as_mut() {
-            status_bar::paint_bottom_tray_with_active(
-                ui,
-                screen,
-                tray.construct,
-                tray.segments,
-                tray.opacity,
-                tray.env,
-                tray.active_surface,
-            );
+                    status_bar::paint_bottom_tray_with_active(
+                        ui,
+                        screen,
+                        tray.construct,
+                        tray.segments,
+                        tray.opacity,
+                        tray.env,
+                        tray.active_surface,
+                    );
                 }
 
                 if let (Some(anchor), Some(overflow)) =
@@ -865,6 +925,7 @@ impl State {
                                 anchor.rect,
                                 &items,
                                 pinned_sources,
+                                connected_sessions,
                                 &mut action,
                             );
                         },
@@ -1037,8 +1098,28 @@ impl State {
     }
 
     fn geometry_for(&self, screen: egui::Rect, now: Instant, pinned_count: usize) -> Geometry {
-        let floating = floating_geometry_for_catalog(screen, pinned_count, &self.pinned_surfaces);
-        let docked = docked_geometry_for_catalog(screen, pinned_count, &self.pinned_surfaces);
+        self.geometry_for_with_sessions(screen, now, pinned_count, &[])
+    }
+
+    fn geometry_for_with_sessions(
+        &self,
+        screen: egui::Rect,
+        now: Instant,
+        pinned_count: usize,
+        connected_sessions: &[SessionRailEntry],
+    ) -> Geometry {
+        let floating = floating_geometry_for_catalog_with_sessions(
+            screen,
+            pinned_count,
+            &self.pinned_surfaces,
+            connected_sessions,
+        );
+        let docked = docked_geometry_for_catalog_with_sessions(
+            screen,
+            pinned_count,
+            &self.pinned_surfaces,
+            connected_sessions,
+        );
         let Some(transition) = self.transition else {
             return match self.mode {
                 DockMode::Floating => floating,
@@ -1198,6 +1279,7 @@ enum ControlKind {
     Overflow,
     SurfaceLauncher,
     PinnedDesktop,
+    RemoteSession,
 }
 
 impl ControlKind {
@@ -1211,6 +1293,7 @@ impl ControlKind {
             Self::Overflow => "overflow",
             Self::SurfaceLauncher => "surface",
             Self::PinnedDesktop => "pinned-desktop",
+            Self::RemoteSession => "remote-session",
         }
     }
 
@@ -1220,13 +1303,14 @@ impl ControlKind {
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Editor => IconId::Editor,
-            // The placement toggle lives at the far edge of both layouts;
-            // the desktop-outline treatment reads like Windows' Show Desktop
-            // affordance while retaining the existing Pin action semantics.
-            Self::Pin => IconId::Desktop,
+            // The placement toggle lives at the far edge of both layouts; the
+            // Carbon application-menu glyph reads as a panel/layout control
+            // without implying that the button opens a desktop surface.
+            Self::Pin => IconId::Menu,
             Self::Overflow => IconId::MoreHorizontal,
             Self::SurfaceLauncher => IconId::Mark,
             Self::PinnedDesktop => IconId::Desktop,
+            Self::RemoteSession => IconId::Desktop,
         }
     }
 
@@ -1234,12 +1318,13 @@ impl ControlKind {
         match self {
             Self::Start => "Start - Search",
             Self::Back => "Back",
-            Self::Home => "Home",
+            Self::Home => "Home / Sessions — Desktop, restore, sessions",
             Self::Editor => "Editor - Workspace",
-            Self::Pin => "Show Desktop — Taskbar placement",
+            Self::Pin => "Taskbar placement menu",
             Self::Overflow => "More taskbar apps",
             Self::SurfaceLauncher => "Open app",
             Self::PinnedDesktop => "Open pinned desktop",
+            Self::RemoteSession => "Open remote session",
         }
     }
 
@@ -1255,6 +1340,7 @@ impl ControlKind {
             Self::Overflow => Action::Home,
             Self::SurfaceLauncher => Action::Home,
             Self::PinnedDesktop => Action::Home,
+            Self::RemoteSession => Action::Home,
         }
     }
 }
@@ -1270,6 +1356,7 @@ struct Control {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverflowItem {
     Surface(Surface),
+    RemoteSession(usize),
     PinnedDesktop(usize),
 }
 
@@ -1302,11 +1389,11 @@ fn dock_launcher_count() -> usize {
 }
 
 fn dock_control_capacity(pinned_count: usize) -> usize {
-    5 + dock_launcher_count() + pinned_count
+    6 + dock_launcher_count() + pinned_count
 }
 
 fn dock_control_capacity_for(pinned_count: usize, surface_count: usize) -> usize {
-    5 + surface_count + pinned_count
+    6 + surface_count + pinned_count
 }
 
 fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
@@ -1318,13 +1405,25 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 }
 
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
-    let left_start = screen.left();
-    let left_cluster_end = left_start + control_span(4, CONTROL_EDGE, gap);
-    let right_start = bottom_tray_rect(screen).left()
-        - BOTTOM_TRAY_GAP
-        - CONTROL_EDGE
-        - (Style::SP_L - Style::SP_S).max(0.0);
-    (left_cluster_end + gap, right_start - gap)
+    let left_cluster_end = screen.left() + control_span(4, CONTROL_EDGE, gap);
+    let left_safe_edge = left_cluster_end + gap;
+    // Placement occupies the tray's reserved final 40px lane; do not reserve
+    // a phantom second placement target to the left of that tray.
+    let right_safe_edge = bottom_tray_rect(screen).left() - BOTTOM_TRAY_GAP;
+
+    // The center lane is anchored to the physical screen, not to whatever
+    // asymmetric space happens to remain between navigation and the tray.
+    // Mirror the larger side reservation so either cluster can grow without
+    // shifting the user's workspace strip away from the display midpoint.
+    let left_reservation = (left_safe_edge - screen.left()).max(0.0);
+    let right_reservation = (screen.right() - right_safe_edge).max(0.0);
+    let symmetric_reservation = left_reservation
+        .max(right_reservation)
+        .min((screen.width() / 2.0).max(0.0));
+    (
+        screen.left() + symmetric_reservation,
+        screen.right() - symmetric_reservation,
+    )
 }
 
 fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
@@ -1341,12 +1440,28 @@ fn catalog_selection(
     pinned_count: usize,
     capacity: usize,
 ) -> (usize, usize, Option<OverflowGeometry>) {
+    let (surface_count, _session_count, pinned_count, overflow) =
+        catalog_selection_with_sessions(surfaces, 0, pinned_count, capacity);
+    (surface_count, pinned_count, overflow)
+}
+
+fn catalog_selection_with_sessions(
+    surfaces: &[Surface],
+    session_count: usize,
+    pinned_count: usize,
+    capacity: usize,
+) -> (usize, usize, usize, Option<OverflowGeometry>) {
     let pinned_count = pinned_count.min(MAX_PINNED_SOURCES);
-    let total = surfaces.len() + pinned_count;
+    let total = surfaces.len() + session_count + pinned_count;
     let has_overflow = total > capacity && capacity > 0;
     let visible_capacity = capacity.saturating_sub(usize::from(has_overflow));
     let visible_surface_count = surfaces.len().min(visible_capacity);
-    let visible_pinned_count = pinned_count.min(visible_capacity - visible_surface_count);
+    let visible_session_count = session_count.min(visible_capacity - visible_surface_count);
+    let visible_pinned_count = pinned_count.min(
+        visible_capacity
+            .saturating_sub(visible_surface_count)
+            .saturating_sub(visible_session_count),
+    );
 
     let mut overflow_items = Vec::new();
     overflow_items.extend(
@@ -1356,10 +1471,12 @@ fn catalog_selection(
             .skip(visible_surface_count)
             .map(OverflowItem::Surface),
     );
+    overflow_items.extend((visible_session_count..session_count).map(OverflowItem::RemoteSession));
     overflow_items.extend((visible_pinned_count..pinned_count).map(OverflowItem::PinnedDesktop));
 
     (
         visible_surface_count,
+        visible_session_count,
         visible_pinned_count,
         (!overflow_items.is_empty()).then_some(OverflowGeometry {
             items: overflow_items,
@@ -1376,9 +1493,19 @@ fn floating_geometry_for_catalog(
     pinned_count: usize,
     surfaces: &[Surface],
 ) -> Geometry {
+    floating_geometry_for_catalog_with_sessions(screen, pinned_count, surfaces, &[])
+}
+
+fn floating_geometry_for_catalog_with_sessions(
+    screen: egui::Rect,
+    pinned_count: usize,
+    surfaces: &[Surface],
+    connected_sessions: &[SessionRailEntry],
+) -> Geometry {
     let gap = FLOATING_GAP;
-    let (surface_count, pinned_count, overflow) = catalog_selection(
+    let (surface_count, session_count, pinned_count, overflow) = catalog_selection_with_sessions(
         surfaces,
+        connected_sessions.len(),
         pinned_count,
         floating_center_capacity(screen, gap).saturating_sub(1),
     );
@@ -1396,19 +1523,26 @@ fn floating_geometry_for_catalog(
     let right_x = (outer.right() - Style::SP_S - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let mut cursor_x = left_start;
-    // Search is the first affordance in the left cluster. Keep the same
-    // semantic order in Bottom and Left modes so the taskbar is predictable
-    // across placement changes and Home remains the third, icon-only control.
-    for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
+    // Search leads the left cluster. Workloads is the one fixed workspace
+    // immediately after it, followed by Back and the merged Home/Sessions
+    // control. This keeps the high-frequency controls grouped and identical in
+    // bottom and left-rail placements.
+    for (kind, surface) in [
+        (ControlKind::Start, None),
+        (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
+        (ControlKind::Back, None),
+        (ControlKind::Home, None),
+    ] {
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
-            surface: None,
+            surface,
             source_index: None,
         });
         cursor_x += edge + gap;
     }
-    let center_count = 1 + surface_count + pinned_count + usize::from(overflow.is_some());
+    let center_count =
+        1 + surface_count + session_count + pinned_count + usize::from(overflow.is_some());
     let center_span = control_span(center_count, edge, gap);
     let (center_left, center_right) = floating_center_bounds(screen, gap);
     let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
@@ -1426,6 +1560,15 @@ fn floating_geometry_for_catalog(
             rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
             surface: Some(surface),
             source_index: None,
+        });
+        cursor_x += edge + gap;
+    }
+    for session_index in 0..session_count {
+        controls.push(Control {
+            kind: ControlKind::RemoteSession,
+            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
+            surface: None,
+            source_index: Some(session_index),
         });
         cursor_x += edge + gap;
     }
@@ -1489,20 +1632,37 @@ fn docked_geometry_for_catalog(
     pinned_count: usize,
     surfaces: &[Surface],
 ) -> Geometry {
+    docked_geometry_for_catalog_with_sessions(screen, pinned_count, surfaces, &[])
+}
+
+fn docked_geometry_for_catalog_with_sessions(
+    screen: egui::Rect,
+    pinned_count: usize,
+    surfaces: &[Surface],
+    connected_sessions: &[SessionRailEntry],
+) -> Geometry {
     let outer = egui::Rect::from_min_size(
         egui::pos2(screen.left(), screen.top() + STATUS_BAR_H),
         egui::vec2(DOCKED_W, (screen.height() - STATUS_BAR_H).max(0.0)),
     );
-    let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surfaces.len()));
+    let mut controls = Vec::with_capacity(dock_control_capacity_for(
+        pinned_count,
+        surfaces.len() + connected_sessions.len(),
+    ));
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
-    for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
+    for (kind, surface) in [
+        (ControlKind::Start, None),
+        (ControlKind::SurfaceLauncher, Some(Surface::InfraCode)),
+        (ControlKind::Back, None),
+        (ControlKind::Home, None),
+    ] {
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(
                 egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
                 egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
             ),
-            surface: None,
+            surface,
             source_index: None,
         });
         cursor_y += CONTROL_EDGE + Style::SP_XS;
@@ -1515,8 +1675,12 @@ fn docked_geometry_for_catalog(
         slot_y += CONTROL_EDGE + Style::SP_XS;
     }
     // Keep the placement control available when the rail has room for it.
-    let (surface_count, pinned_count, overflow) =
-        catalog_selection(surfaces, pinned_count, available_slots.saturating_sub(2));
+    let (surface_count, session_count, pinned_count, overflow) = catalog_selection_with_sessions(
+        surfaces,
+        connected_sessions.len(),
+        pinned_count,
+        available_slots.saturating_sub(2),
+    );
     if docked_control_fits(screen, cursor_y) {
         controls.push(Control {
             kind: ControlKind::Editor,
@@ -1541,6 +1705,18 @@ fn docked_geometry_for_catalog(
             ),
             surface: Some(surface),
             source_index: None,
+        });
+        cursor_y += CONTROL_EDGE + Style::SP_XS;
+    }
+    for session_index in 0..session_count {
+        controls.push(Control {
+            kind: ControlKind::RemoteSession,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
+                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+            ),
+            surface: None,
+            source_index: Some(session_index),
         });
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
@@ -1741,6 +1917,12 @@ fn overflow_item_control(item: OverflowItem, rect: egui::Rect) -> Control {
             surface: Some(surface),
             source_index: None,
         },
+        OverflowItem::RemoteSession(session_index) => Control {
+            kind: ControlKind::RemoteSession,
+            rect,
+            surface: None,
+            source_index: Some(session_index),
+        },
         OverflowItem::PinnedDesktop(source_index) => Control {
             kind: ControlKind::PinnedDesktop,
             rect,
@@ -1791,6 +1973,7 @@ fn paint_overflow_popup(
     anchor: egui::Rect,
     items: &[OverflowItem],
     pinned_sources: &[crate::surfaces::DesktopRailSource],
+    connected_sessions: &[SessionRailEntry],
     action: &mut Option<Action>,
 ) {
     let layout = overflow_layout_for(anchor, ui.ctx().screen_rect(), items.len());
@@ -1802,7 +1985,7 @@ fn paint_overflow_popup(
     for (item, row) in items.iter().copied().zip(layout.rows) {
         let (row, response) = ui.allocate_exact_size(row.size(), egui::Sense::click());
         let control = overflow_item_control(item, row);
-        let label = control_label(control, pinned_sources);
+        let label = control_label(control, pinned_sources, connected_sessions);
         if response.hovered() {
             ui.painter()
                 .rect_filled(row, egui::CornerRadius::same(Style::RADIUS_S as u8), hover);
@@ -1853,7 +2036,7 @@ fn paint_overflow_popup(
                 input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
             });
         if response.clicked() || keyboard_activate {
-            *action = Some(control_action(control, pinned_sources));
+            *action = Some(control_action(control, pinned_sources, connected_sessions));
             ui.memory_mut(|memory| memory.close_popup());
         }
     }
@@ -1954,7 +2137,33 @@ fn control_icon(control: Control) -> IconId {
 /// choosing by position guarantees one underline rather than one per stale
 /// duplicate in a malformed in-memory catalog.
 fn focused_control_index(controls: &[Control], active_surface: Option<Surface>) -> Option<usize> {
+    focused_control_index_with_sessions(controls, active_surface, &[], None)
+}
+
+fn focused_control_index_with_sessions(
+    controls: &[Control],
+    active_surface: Option<Surface>,
+    connected_sessions: &[SessionRailEntry],
+    active_session_id: Option<&str>,
+) -> Option<usize> {
+    if let Some(active_session_id) = active_session_id {
+        if let Some(index) = controls.iter().position(|control| {
+            control.kind == ControlKind::RemoteSession
+                && control
+                    .source_index
+                    .and_then(|session_index| connected_sessions.get(session_index))
+                    .and_then(SessionRailEntry::session_id)
+                    == Some(active_session_id)
+        }) {
+            return Some(index);
+        }
+    }
     let active_surface = active_surface.and_then(canonical_taskbar_surface)?;
+    if active_surface == Surface::Desktop {
+        return controls
+            .iter()
+            .position(|control| control.kind == ControlKind::Home);
+    }
     controls
         .iter()
         .position(|control| control.surface == Some(active_surface))
@@ -1963,7 +2172,17 @@ fn focused_control_index(controls: &[Control], active_surface: Option<Surface>) 
 fn control_label(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
+    connected_sessions: &[SessionRailEntry],
 ) -> String {
+    if control.kind == ControlKind::RemoteSession {
+        return control
+            .source_index
+            .and_then(|index| connected_sessions.get(index))
+            .map_or_else(
+                || "Open remote session".to_owned(),
+                |session| format!("Open {}", session.label()),
+            );
+    }
     if let Some(source) = control
         .source_index
         .and_then(|index| pinned_sources.get(index))
@@ -1974,7 +2193,7 @@ fn control_label(
         return format!("Open {}", taskbar_surface_label(surface));
     }
     if control.kind == ControlKind::Pin {
-        "Show Desktop — Taskbar placement".to_owned()
+        "Taskbar placement menu".to_owned()
     } else {
         control.kind.tooltip().to_owned()
     }
@@ -1983,7 +2202,18 @@ fn control_label(
 fn control_action(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
+    connected_sessions: &[SessionRailEntry],
 ) -> Action {
+    if control.kind == ControlKind::RemoteSession {
+        if let Some(id) = control
+            .source_index
+            .and_then(|index| connected_sessions.get(index))
+            .and_then(SessionRailEntry::session_id)
+        {
+            return Action::RemoteSession(id.to_owned());
+        }
+        return Action::Home;
+    }
     if let Some(source) = control
         .source_index
         .and_then(|index| pinned_sources.get(index))
@@ -2256,8 +2486,8 @@ mod tests {
             surface: Some(Surface::Files),
             source_index: None,
         };
-        assert_eq!(control_label(desktop, &[]), "Open Remote Sessions");
-        assert_eq!(control_label(files, &[]), "Open Files");
+        assert_eq!(control_label(desktop, &[], &[]), "Open Remote Sessions");
+        assert_eq!(control_label(files, &[], &[]), "Open Files");
     }
 
     #[test]
@@ -2276,7 +2506,7 @@ mod tests {
         };
         assert_eq!(control_icon(start), IconId::Grid);
         assert_eq!(control_icon(home), IconId::FileHome);
-        assert_eq!(control_action(start, &[]), Action::OpenSearch);
+        assert_eq!(control_action(start, &[], &[]), Action::OpenSearch);
     }
 
     #[test]
@@ -2313,6 +2543,48 @@ mod tests {
             "bottom taskbar must drop excess chooser pins instead of painting controls past the screen"
         );
         assert_hit_targets_inside_backing("floating narrow screen".to_string(), &geometry);
+    }
+
+    #[test]
+    fn bottom_workspace_strip_tracks_the_physical_screen_center() {
+        for screen in [
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 480.0)),
+            egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(800.0, 600.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)),
+            egui::Rect::from_min_size(egui::pos2(120.0, 80.0), egui::vec2(1920.0, 1080.0)),
+        ] {
+            let (center_left, center_right) = floating_center_bounds(screen, FLOATING_GAP);
+            assert!(
+                ((center_left - screen.left()) - (screen.right() - center_right)).abs() < 0.001,
+                "center gutters must be symmetric for {screen:?}"
+            );
+
+            let geometry = floating_geometry_for(screen, MAX_PINNED_SOURCES);
+            let centered_controls = geometry.controls.iter().filter(|control| {
+                !matches!(
+                    control.kind,
+                    ControlKind::Start | ControlKind::Back | ControlKind::Home | ControlKind::Pin
+                ) && control.surface != Some(Surface::InfraCode)
+            });
+            let (strip_left, strip_right, count) = centered_controls.fold(
+                (f32::INFINITY, f32::NEG_INFINITY, 0_usize),
+                |(left, right, count), control| {
+                    (
+                        left.min(control.rect.left()),
+                        right.max(control.rect.right()),
+                        count + 1,
+                    )
+                },
+            );
+            assert!(
+                count > 0,
+                "the centered workspace lane must remain reachable"
+            );
+            assert!(
+                ((strip_left + strip_right) / 2.0 - screen.center().x).abs() < 0.001,
+                "workspace strip drifted away from the physical center for {screen:?}"
+            );
+        }
     }
 
     #[test]
@@ -2425,8 +2697,14 @@ mod tests {
                 "tool-tray-owned aliases must not focus a duplicate center control"
             );
         }
-        assert_eq!(focused_control_index(&controls, Some(Surface::Browser)), Some(2));
-        assert_eq!(focused_control_index(&controls, Some(Surface::MapsLocation)), None);
+        assert_eq!(
+            focused_control_index(&controls, Some(Surface::Browser)),
+            Some(2)
+        );
+        assert_eq!(
+            focused_control_index(&controls, Some(Surface::MapsLocation)),
+            None
+        );
     }
 
     #[test]
@@ -2441,8 +2719,12 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,],
-            "search, back, and Home must remain first even when app launchers overflow"
+            vec![
+                ControlKind::Start,
+                ControlKind::SurfaceLauncher,
+                ControlKind::Back,
+            ],
+            "search, Workloads, and Back must remain first even when app launchers overflow"
         );
         assert!(
             geometry
@@ -2476,6 +2758,55 @@ mod tests {
     }
 
     #[test]
+    fn connected_remote_sessions_share_the_center_lane_and_overflow_cleanly() {
+        let sessions = vec![
+            SessionRailEntry::with_session_id("s1", "Oak desktop", "LIVE"),
+            SessionRailEntry::with_session_id("s2", "Writer on Ash", "LIVE"),
+            SessionRailEntry::with_session_id("s3", "Cedar desktop", "LIVE"),
+            SessionRailEntry::with_session_id("s4", "Media on Birch", "LIVE"),
+        ];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 480.0));
+        let geometry = floating_geometry_for_catalog_with_sessions(screen, 0, &[], &sessions);
+        let visible = geometry
+            .controls
+            .iter()
+            .filter(|control| control.kind == ControlKind::RemoteSession)
+            .count();
+        let overflow = geometry.overflow.clone().expect("narrow taskbar overflow");
+
+        assert!(visible < sessions.len());
+        assert_eq!(
+            overflow
+                .items
+                .iter()
+                .filter(|item| matches!(item, OverflowItem::RemoteSession(_)))
+                .count(),
+            sessions.len() - visible
+        );
+        assert_hit_targets_inside_backing("connected remote sessions".to_owned(), &geometry);
+    }
+
+    #[test]
+    fn connected_remote_session_controls_open_by_session_name_and_id() {
+        let sessions = vec![
+            SessionRailEntry::with_session_id("s1", "Oak desktop", "LIVE"),
+            SessionRailEntry::with_session_id("s2", "Writer on Ash", "LIVE"),
+        ];
+        let control = Control {
+            kind: ControlKind::RemoteSession,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: Some(1),
+        };
+
+        assert_eq!(control_label(control, &[], &sessions), "Open Writer on Ash");
+        assert_eq!(
+            control_action(control, &[], &sessions),
+            Action::RemoteSession("s2".to_owned())
+        );
+    }
+
+    #[test]
     fn overflow_layout_keeps_rows_inside_the_screen_at_40px() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
         let anchor = egui::Rect::from_min_size(egui::pos2(272.0, 192.0), egui::vec2(40.0, 40.0));
@@ -2502,20 +2833,17 @@ mod tests {
                 Surface::Terminal,
                 Surface::MapsLocation,
                 Surface::Communications,
-                Surface::Files,
                 Surface::Music,
                 Surface::Media,
                 Surface::Browser,
+                Surface::Bookmarks,
             ]
         );
         assert_eq!(taskbar_surface_label(Surface::FleetMesh), "Fleet & Mesh");
         assert_eq!(taskbar_surface_label(Surface::InfraCode), "Workloads");
-        assert_eq!(
-            filtered_pin_catalog("fleet & mesh"),
-            Vec::<Surface>::new()
-        );
-        assert_eq!(filtered_pin_catalog("workloads"), vec![Surface::InfraCode]);
-        assert_eq!(filtered_pin_catalog("infra-code"), vec![Surface::InfraCode]);
+        assert_eq!(filtered_pin_catalog("fleet & mesh"), Vec::<Surface>::new());
+        assert_eq!(filtered_pin_catalog("workloads"), Vec::<Surface>::new());
+        assert_eq!(filtered_pin_catalog("infra-code"), Vec::<Surface>::new());
     }
 
     #[test]
@@ -2526,18 +2854,12 @@ mod tests {
         assert!(state.pin_selector.selected.is_empty());
 
         state.toggle_pin_selector_surface(Surface::InfraCode);
-        state.toggle_pin_selector_surface(Surface::FleetMesh);
-        assert_eq!(
-            state.pin_selector.selected,
-            vec![Surface::InfraCode]
-        );
+        state.toggle_pin_selector_surface(Surface::Browser);
+        assert_eq!(state.pin_selector.selected, vec![Surface::Browser]);
 
         state.complete_first_boot();
         assert!(!state.is_new_profile());
-        assert_eq!(
-            state.pinned_surfaces(),
-            &[Surface::InfraCode]
-        );
+        assert_eq!(state.pinned_surfaces(), &[Surface::Browser]);
         assert!(state.pin_selector.selected.is_empty());
     }
 
@@ -2790,10 +3112,7 @@ mod tests {
         // Legacy Fleet & Mesh and This Node aliases collapse to one canonical
         // entry each, while the user's order and intentional profile state
         // remain authoritative.
-        assert_eq!(
-            state.pinned_surfaces(),
-            &[Surface::Browser]
-        );
+        assert_eq!(state.pinned_surfaces(), &[Surface::Browser]);
         assert!(!state.is_new_profile());
         assert_ne!(state.pinned_surfaces(), default_taskbar_pins().as_slice());
     }
@@ -2971,8 +3290,11 @@ mod tests {
             for (kind, expected_label) in [
                 (ControlKind::Start, "Start - Search"),
                 (ControlKind::Back, "Back"),
-                (ControlKind::Home, "Home"),
-                (ControlKind::Pin, "Show Desktop — Taskbar placement"),
+                (
+                    ControlKind::Home,
+                    "Home / Sessions — Desktop, restore, sessions",
+                ),
+                (ControlKind::Pin, "Taskbar placement menu"),
             ] {
                 let node = update
                     .nodes
@@ -3442,11 +3764,9 @@ mod tests {
             }
 
             for surface in [
-                Surface::Desktop,
-                Surface::Terminal,
+                Surface::InfraCode,
                 Surface::MapsLocation,
                 Surface::Communications,
-                Surface::Files,
                 Surface::Browser,
             ] {
                 let control = geometry
@@ -3632,7 +3952,10 @@ mod tests {
         assert_eq!(pinned.source_index, Some(0));
         let tray = bottom_tray_rect(screen);
         let clock = egui::Rect::from_min_max(
-            egui::pos2(tray.right() - 85.8 - CONTROL_EDGE - BOTTOM_TRAY_GAP, tray.top()),
+            egui::pos2(
+                tray.right() - 85.8 - CONTROL_EDGE - BOTTOM_TRAY_GAP,
+                tray.top(),
+            ),
             egui::pos2(tray.right() - CONTROL_EDGE - BOTTOM_TRAY_GAP, tray.bottom()),
         );
         assert!(
@@ -3793,20 +4116,30 @@ mod tests {
             floating
                 .controls
                 .iter()
-                .take(3)
+                .take(4)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,],
+            vec![
+                ControlKind::Start,
+                ControlKind::SurfaceLauncher,
+                ControlKind::Back,
+                ControlKind::Home,
+            ],
             "the taskbar must lead with search-first navigation controls"
         );
         assert_eq!(
             floating
                 .controls
                 .iter()
-                .take(3)
+                .take(4)
                 .map(|control| control_icon(*control))
                 .collect::<Vec<_>>(),
-            vec![IconId::Grid, IconId::ArrowLeft, IconId::FileHome,]
+            vec![
+                IconId::Grid,
+                IconId::Server,
+                IconId::ArrowLeft,
+                IconId::FileHome,
+            ]
         );
         assert_eq!(
             floating
@@ -3816,13 +4149,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 Surface::InfraCode,
-                Surface::Desktop,
-                Surface::Terminal,
                 Surface::MapsLocation,
                 Surface::Communications,
-                Surface::Files,
                 Surface::Browser,
                 Surface::Bookmarks,
+                Surface::Phones,
             ],
             "the taskbar must use the searchable pin catalog order"
         );
@@ -3897,14 +4228,19 @@ mod tests {
             settled
                 .controls
                 .iter()
-                .take(3)
+                .take(4)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,]
+            vec![
+                ControlKind::Start,
+                ControlKind::SurfaceLauncher,
+                ControlKind::Back,
+                ControlKind::Home,
+            ]
         );
         assert!(settled.controls[0].rect.top() < settled.controls[1].rect.top());
         assert!(settled.controls[1].rect.top() < settled.controls[2].rect.top());
-        assert_eq!(settled.controls[2].kind, ControlKind::Home);
+        assert_eq!(settled.controls[3].kind, ControlKind::Home);
     }
 
     fn tempfile_dir() -> PathBuf {

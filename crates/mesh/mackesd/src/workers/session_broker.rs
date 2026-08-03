@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mackes_mesh_types::cloud::{
-    cloud_request_digest, CloudArmedToken, CloudArmSigner, CLOUD_ACTION_SCHEMA_VERSION,
+    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ACTION_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -137,6 +137,11 @@ pub struct VdiSession {
     pub vm_id: VmId,
     /// The peer whose shell is driving the desktop (a scheduler [`NodeId`]).
     pub client_peer: NodeId,
+    /// Typed desktop intent retained with the roaming session. A Browser VM
+    /// profile also fixes the selected transport: `BrowserVm` is Sunshine and
+    /// `BrowserVmRdp` is the explicit one-session alternate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<mackes_mesh_types::vdi_session::DesktopSessionProfile>,
     /// The current lifecycle state.
     pub state: SessionState,
     /// When the session was first opened (ms since the Unix epoch, passed in).
@@ -171,8 +176,9 @@ pub struct VdiSession {
 /// byte-identical: the broker's [`SessionId`] / [`NodeId`] / [`VmId`] are all
 /// `= String` aliases, so the shared `String`-typed fields serialise the same.
 pub use mackes_mesh_types::vdi_session::{
-    AppVmLaunchRequest, AppVmLifecycleState, AppVmRuntimeEvidence, SessionRequest,
-    APP_VM_RUNTIME_TOPIC,
+    AppVmLaunchRequest, AppVmLifecycleState, AppVmRuntimeEvidence, BrowserVmProfileError,
+    BrowserVmTransport, DesktopSessionProfile, SessionRequest, APP_VM_RUNTIME_TOPIC,
+    BROWSER_VM_WORKLOAD_ID,
 };
 
 /// Parse a [`SessionRequest`] body.
@@ -219,6 +225,13 @@ pub enum SessionError {
         /// The bounded reason for refusing the replay.
         reason: &'static str,
     },
+    /// A Browser VM workload/profile pairing failed validation.
+    InvalidDesktopProfile {
+        /// The VM identity carried by the rejected request.
+        vm_id: VmId,
+        /// The exact fail-closed validation reason.
+        reason: BrowserVmProfileError,
+    },
 }
 
 impl std::fmt::Display for SessionError {
@@ -238,6 +251,10 @@ impl std::fmt::Display for SessionError {
             Self::ConflictingAppSession { id, reason } => {
                 write!(f, "conflicting App VM session `{id}`: {reason}")
             }
+            Self::InvalidDesktopProfile { vm_id, reason } => write!(
+                f,
+                "invalid Browser VM session request for `{vm_id}`: {reason}"
+            ),
         }
     }
 }
@@ -256,11 +273,24 @@ pub const fn open_session(
     client_peer: NodeId,
     now_ms: u64,
 ) -> VdiSession {
+    open_session_with_profile(id, serving_peer, vm_id, client_peer, None, now_ms)
+}
+
+/// Build a fresh session while retaining its typed desktop profile.
+const fn open_session_with_profile(
+    id: SessionId,
+    serving_peer: NodeId,
+    vm_id: VmId,
+    client_peer: NodeId,
+    profile: Option<DesktopSessionProfile>,
+    now_ms: u64,
+) -> VdiSession {
     VdiSession {
         id,
         serving_peer,
         vm_id,
         client_peer,
+        profile,
         state: SessionState::Requested,
         opened_at_ms: now_ms,
         updated_at_ms: now_ms,
@@ -297,6 +327,7 @@ pub fn open_app_session(
         serving_peer,
         vm_id,
         client_peer,
+        profile: None,
         state: SessionState::Requested,
         opened_at_ms: now_ms,
         updated_at_ms: now_ms,
@@ -377,15 +408,27 @@ pub fn apply_request(
     req: SessionRequest,
     now_ms: u64,
 ) -> Result<(), SessionError> {
+    let browser_transport = req.browser_transport();
     match req {
         SessionRequest::Open {
             id,
             serving_peer,
             vm_id,
             client_peer,
-            ..
+            profile,
         } => {
-            let session = open_session(id.clone(), serving_peer, vm_id, client_peer, now_ms);
+            browser_transport.map_err(|reason| SessionError::InvalidDesktopProfile {
+                vm_id: vm_id.clone(),
+                reason,
+            })?;
+            let session = open_session_with_profile(
+                id.clone(),
+                serving_peer,
+                vm_id,
+                client_peer,
+                profile,
+                now_ms,
+            );
             roster.insert(id, session);
             Ok(())
         }
@@ -1671,6 +1714,7 @@ mod tests {
             serving_peer: "peer:host".to_string(),
             vm_id: "uuid-1".to_string(),
             client_peer: "peer:client".to_string(),
+            profile: None,
             state,
             opened_at_ms: 100,
             updated_at_ms: 100,
@@ -1797,6 +1841,88 @@ mod tests {
     }
 
     #[test]
+    fn browser_transport_profile_is_retained_and_never_defaults_to_rdp() {
+        let mut roster = BTreeMap::new();
+        for (id, transport) in [
+            ("browser-sunshine", BrowserVmTransport::Sunshine),
+            ("browser-rdp", BrowserVmTransport::Rdp),
+        ] {
+            apply_request(
+                &mut roster,
+                SessionRequest::Open {
+                    id: id.into(),
+                    serving_peer: "peer:dell".into(),
+                    vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+                    client_peer: "peer:surface".into(),
+                    profile: Some(transport.session_profile()),
+                },
+                10,
+            )
+            .expect("typed Browser VM open");
+            assert_eq!(
+                roster[id]
+                    .profile
+                    .map(DesktopSessionProfile::browser_transport),
+                Some(transport)
+            );
+        }
+        assert_eq!(
+            roster["browser-sunshine"]
+                .profile
+                .map(DesktopSessionProfile::browser_transport),
+            Some(BrowserVmTransport::Sunshine)
+        );
+    }
+
+    #[test]
+    fn browser_profile_cannot_retarget_an_arbitrary_vm() {
+        let mut roster = BTreeMap::new();
+        let result = apply_request(
+            &mut roster,
+            SessionRequest::Open {
+                id: "wrong-vm".into(),
+                serving_peer: "peer:dell".into(),
+                vm_id: "unrelated-vm".into(),
+                client_peer: "peer:surface".into(),
+                profile: Some(DesktopSessionProfile::BrowserVm),
+            },
+            10,
+        );
+        assert_eq!(
+            result,
+            Err(SessionError::InvalidDesktopProfile {
+                vm_id: "unrelated-vm".into(),
+                reason: BrowserVmProfileError::WrongWorkload,
+            })
+        );
+        assert!(roster.is_empty());
+    }
+
+    #[test]
+    fn browser_vm_without_a_profile_is_rejected_before_roster_admission() {
+        let mut roster = BTreeMap::new();
+        let result = apply_request(
+            &mut roster,
+            SessionRequest::Open {
+                id: "untyped-browser".into(),
+                serving_peer: "peer:dell".into(),
+                vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+                client_peer: "peer:surface".into(),
+                profile: None,
+            },
+            10,
+        );
+        assert_eq!(
+            result,
+            Err(SessionError::InvalidDesktopProfile {
+                vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+                reason: BrowserVmProfileError::MissingProfile,
+            })
+        );
+        assert!(roster.is_empty());
+    }
+
+    #[test]
     fn apply_request_unknown_and_illegal_ops_error() {
         let mut roster = BTreeMap::new();
         // A transition on an id the roster never opened.
@@ -1901,7 +2027,10 @@ mod tests {
         let session = &roster["app-s"];
         assert_eq!(session.state, SessionState::Requested);
         assert_eq!(session.app_state, Some(AppVmLifecycleState::StartingApp));
-        assert_eq!(session.app_state_reason.as_deref(), Some("compositor ready"));
+        assert_eq!(
+            session.app_state_reason.as_deref(),
+            Some("compositor ready")
+        );
         assert_eq!(session.updated_at_ms, 44);
         let app = session.app.as_ref().expect("app declaration");
         assert_eq!(app.catalog_revision, "catalog-2");

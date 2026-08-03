@@ -128,19 +128,25 @@ impl Surface {
 /// Workspaces owned by the notification/tool tray. These remain fully
 /// launchable through direct routes and keyboard shortcuts, but are not
 /// duplicated in the central launcher taxonomy.
-pub(crate) const TOOL_TRAY_SURFACES: [Surface; 5] = [
+pub(crate) const TOOL_TRAY_SURFACES: [Surface; 6] = [
     Surface::FleetMesh,
     Surface::Music,
     Surface::Media,
     Surface::Phones,
     Surface::ThisNode,
+    Surface::Terminal,
 ];
 
 #[must_use]
 pub(crate) const fn is_tool_tray_surface(surface: Surface) -> bool {
     matches!(
         surface,
-        Surface::FleetMesh | Surface::Music | Surface::Media | Surface::Phones | Surface::ThisNode
+        Surface::FleetMesh
+            | Surface::Music
+            | Surface::Media
+            | Surface::Phones
+            | Surface::ThisNode
+            | Surface::Terminal
     )
 }
 
@@ -249,7 +255,7 @@ const PARTIAL_CONSTRUCT_VISUAL: SurfaceVisualInventory = SurfaceVisualInventory 
 /// the shared system. Only the three named visual boundaries depart from the
 /// normal Construct workspace rule.
 #[allow(dead_code)]
-pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 13] = [
+pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 12] = [
     PARTIAL_CONSTRUCT_VISUAL,
     SurfaceVisualInventory {
         surface: Surface::InfraCode,
@@ -267,10 +273,6 @@ pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 13] = [
     },
     SurfaceVisualInventory {
         surface: Surface::Media,
-        ..PARTIAL_CONSTRUCT_VISUAL
-    },
-    SurfaceVisualInventory {
-        surface: Surface::Files,
         ..PARTIAL_CONSTRUCT_VISUAL
     },
     SurfaceVisualInventory {
@@ -324,7 +326,7 @@ pub(crate) struct LauncherGroup {
 /// The central launcher taxonomy. Tool-tray-owned workspaces are intentionally
 /// omitted so the center launcher does not duplicate the notification tray;
 /// the single Springboard desktop uses this flattened order.
-pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 6] = [
+pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 4] = [
     LauncherGroup {
         label: "Mesh Control",
         accent: Style::ACCENT_MESH,
@@ -336,19 +338,9 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 6] = [
         surfaces: &[Surface::Desktop, Surface::MapsLocation],
     },
     LauncherGroup {
-        label: "Files & Data",
-        accent: Style::ACCENT_SYSTEM,
-        surfaces: &[Surface::Files],
-    },
-    LauncherGroup {
         label: "Web",
         accent: Style::ACCENT_WEB,
         surfaces: &[Surface::Browser, Surface::Bookmarks],
-    },
-    LauncherGroup {
-        label: "Developer Tools",
-        accent: Style::ACCENT_TERMINALS,
-        surfaces: &[Surface::Terminal],
     },
     LauncherGroup {
         label: "Mesh Teams",
@@ -373,11 +365,7 @@ pub(crate) const DOCK_LAUNCHER_GROUPS: [LauncherGroup; 3] = [
     LauncherGroup {
         label: "Ops",
         accent: Style::ACCENT_MESH,
-        surfaces: &[
-            Surface::MapsLocation,
-            Surface::Communications,
-            Surface::Files,
-        ],
+        surfaces: &[Surface::MapsLocation, Surface::Communications],
     },
     LauncherGroup {
         label: "Life",
@@ -412,7 +400,13 @@ const _: () = {
             }
             group += 1;
         }
-        let expected = if is_tool_tray_surface(Surface::ALL[i]) { 0 } else { 1 };
+        let expected = if is_tool_tray_surface(Surface::ALL[i])
+            || matches!(Surface::ALL[i], Surface::Files)
+        {
+            0
+        } else {
+            1
+        };
         assert!(
             count == expected,
             "central launcher must contain non-tray surfaces once and tray-owned surfaces zero times",
@@ -724,6 +718,7 @@ mod tests {
                 Surface::Media,
                 Surface::Phones,
                 Surface::ThisNode,
+                Surface::Terminal,
             ]
         );
         assert!(!Surface::ALL.contains(&Surface::System));
@@ -791,14 +786,7 @@ mod tests {
                 // Operator survey wording: "VMs and Terminal" — the shipped
                 // VM/session launcher is `Surface::Desktop` ("Remote Sessions").
                 ("Infra", vec![Surface::Desktop, Surface::Terminal]),
-                (
-                    "Ops",
-                    vec![
-                        Surface::MapsLocation,
-                        Surface::Communications,
-                        Surface::Files,
-                    ],
-                ),
+                ("Ops", vec![Surface::MapsLocation, Surface::Communications]),
                 (
                     "Life",
                     vec![Surface::Music, Surface::Media, Surface::Browser],
@@ -813,6 +801,7 @@ mod tests {
         for surface in [
             Surface::FleetMesh,
             Surface::InfraCode,
+            Surface::Files,
             Surface::Bookmarks,
             Surface::Phones,
             Surface::ThisNode,
@@ -827,7 +816,6 @@ mod tests {
         assert_eq!(dock_launcher_group_label(Surface::Browser), "Life");
         assert_eq!(dock_launcher_group_label(Surface::FleetMesh), "");
         assert_eq!(dock_launcher_surface_label(Surface::Desktop), "VMs");
-        assert_eq!(dock_launcher_surface_label(Surface::Files), "File Manager");
         assert_eq!(
             dock_launcher_surface_label(Surface::MapsLocation),
             "Maps & Location"
@@ -863,11 +851,16 @@ mod tests {
 
     #[test]
     fn app_status_keeps_reason_and_guidance_separate_from_transport_badge() {
-        let entry = SessionRailEntry::with_session_id("s1", "Writer", "OFFLINE")
-            .with_app_status(Some("guest is unavailable".to_owned()), Some("Retry from Desktop"));
+        let entry = SessionRailEntry::with_session_id("s1", "Writer", "OFFLINE").with_app_status(
+            Some("guest is unavailable".to_owned()),
+            Some("Retry from Desktop"),
+        );
         assert_eq!(entry.protocol(), "OFFLINE");
         assert_eq!(entry.reason(), Some("guest is unavailable"));
         assert_eq!(entry.retry_guidance(), Some("Retry from Desktop"));
-        assert_eq!(entry.status_detail().as_deref(), Some("guest is unavailable · Retry from Desktop"));
+        assert_eq!(
+            entry.status_detail().as_deref(),
+            Some("guest is unavailable · Retry from Desktop")
+        );
     }
 }

@@ -4,8 +4,10 @@
 This verifier accepts only evidence collected from a booted Browser VM and its
 VDI session.  It does not run a local benchmark or synthesize live readiness.
 The passing record must cover five concurrent 1080p tabs for at least fifteen
-minutes, the frame/stall threshold, focused pointer activity, navigation and
-session latency, partial uploads, hidden repaint, and reconnect recovery.
+minutes, the frame/stall threshold, focused pointer activity, bounded navigation
+and session latency, partial uploads, hidden-state repaint quiescence, and
+reconnect recovery. Sunshine/Moonlight is the default transport; RDP must be
+selected explicitly.
 
 Usage:
   verify-browser-vm-performance.py validate performance-evidence.json
@@ -24,7 +26,7 @@ import sys
 from typing import Any, NoReturn
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_FILE_BYTES = 64 * 1024
 MAX_DURATION_SECONDS = 24 * 60 * 60
 MAX_TABS = 16
@@ -32,7 +34,18 @@ MAX_DIMENSION = 16_384
 MAX_FPS = 240
 MAX_STALL_MS = 60_000
 MAX_LATENCY_MS = 600_000
+MAX_LATENCY_SAMPLES = 10_000
+MAX_SAMPLE_INTERVALS = 4096
 MAX_COUNTER = 10_000_000
+LATENCY_P95_LIMIT_MS = 100
+LATENCY_MAX_LIMIT_MS = 250
+MIN_NAVIGATION_LATENCY_SAMPLES = 15
+MIN_SESSION_LATENCY_SAMPLES = 15
+HIDDEN_QUIESCENT_WINDOW_MS = 5 * 60 * 1000
+MAX_HIDDEN_REPAINT_BURST_MS = 20_000
+MAX_HIDDEN_REPAINT_ACTIVE_FRACTION = 0.05
+DEFAULT_TRANSPORT = "sunshine"
+ADMITTED_TRANSPORTS = (DEFAULT_TRANSPORT, "rdp")
 EXPECTED_FIELDS = frozenset(
     {
         "schema_version",
@@ -51,10 +64,18 @@ EXPECTED_FIELDS = frozenset(
         "min_fps",
         "max_stall_ms",
         "pointer_updates",
+        "navigation_latency_sample_count",
         "navigation_p95_ms",
+        "navigation_max_ms",
+        "session_latency_sample_count",
         "session_latency_p95_ms",
+        "session_latency_max_ms",
         "partial_uploads",
         "hidden_repaints",
+        "hidden_repaint_active_intervals",
+        "hidden_repaint_interval_count",
+        "hidden_repaint_longest_burst_ms",
+        "hidden_repaint_quiescent_ms",
         "reconnects",
         "recovery_observed",
         "recorded_at",
@@ -69,8 +90,8 @@ CREDENTIAL_FIELD_RE = re.compile(
     r"identity[_-]?file|pem)",
     re.IGNORECASE,
 )
-SHA256_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
-COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class EvidenceError(Exception):
@@ -177,10 +198,14 @@ def validate_document(data: Any) -> dict[str, Any]:
         fail("status must be passed, failed, or unavailable")
     if data["source"] != "live-browser-vm-acceptance":
         fail("source must identify the live Browser VM acceptance harness")
-    require_string(data, "source_commit", COMMIT_RE)
-    require_string(data, "image_digest", SHA256_RE)
-    if data["transport"] not in {"rdp", "spice"}:
-        fail("transport must be rdp or spice")
+    source_commit = require_string(data, "source_commit", COMMIT_RE)
+    image_digest = require_string(data, "image_digest", SHA256_RE)
+    if source_commit == "0" * 40:
+        fail("source_commit must be non-null")
+    if image_digest == "sha256:" + "0" * 64:
+        fail("image_digest must be non-null")
+    if data["transport"] not in ADMITTED_TRANSPORTS:
+        fail("transport must be sunshine or explicit rdp")
     duration = bounded_uint(data, "duration_seconds", MAX_DURATION_SECONDS)
     tabs = bounded_uint(data, "tab_count", MAX_TABS)
     width = bounded_uint(data, "viewport_width", MAX_DIMENSION)
@@ -188,15 +213,66 @@ def validate_document(data: Any) -> dict[str, Any]:
     min_fps = bounded_uint(data, "min_fps", MAX_FPS)
     max_stall = bounded_uint(data, "max_stall_ms", MAX_STALL_MS)
     pointers = bounded_uint(data, "pointer_updates", MAX_COUNTER)
+    nav_samples = bounded_uint(
+        data, "navigation_latency_sample_count", MAX_LATENCY_SAMPLES
+    )
     nav_p95 = bounded_uint(data, "navigation_p95_ms", MAX_LATENCY_MS)
+    nav_max = bounded_uint(data, "navigation_max_ms", MAX_LATENCY_MS)
+    session_samples = bounded_uint(
+        data, "session_latency_sample_count", MAX_LATENCY_SAMPLES
+    )
     session_p95 = bounded_uint(data, "session_latency_p95_ms", MAX_LATENCY_MS)
+    session_max = bounded_uint(data, "session_latency_max_ms", MAX_LATENCY_MS)
     partial = bounded_uint(data, "partial_uploads", MAX_COUNTER)
     hidden = bounded_uint(data, "hidden_repaints", MAX_COUNTER)
+    hidden_active = bounded_uint(
+        data, "hidden_repaint_active_intervals", MAX_SAMPLE_INTERVALS
+    )
+    hidden_intervals = bounded_uint(
+        data, "hidden_repaint_interval_count", MAX_SAMPLE_INTERVALS
+    )
+    hidden_burst = bounded_uint(
+        data,
+        "hidden_repaint_longest_burst_ms",
+        MAX_DURATION_SECONDS * 1000,
+    )
+    hidden_quiescent = bounded_uint(
+        data,
+        "hidden_repaint_quiescent_ms",
+        MAX_DURATION_SECONDS * 1000,
+    )
     reconnects = bounded_uint(data, "reconnects", MAX_COUNTER)
     recovery = data["recovery_observed"]
     if not isinstance(recovery, bool):
         fail("recovery_observed must be boolean")
     validate_timestamp(data["recorded_at"])
+
+    if nav_samples == 0:
+        if nav_p95 != 0 or nav_max != 0:
+            fail("navigation latency metrics require samples")
+    elif nav_p95 == 0 or nav_max == 0:
+        fail("navigation latency samples require nonzero metrics")
+    if nav_p95 > nav_max:
+        fail("navigation_p95_ms cannot exceed navigation_max_ms")
+    if session_samples == 0:
+        if session_p95 != 0 or session_max != 0:
+            fail("session latency metrics require samples")
+    elif session_p95 == 0 or session_max == 0:
+        fail("session latency samples require nonzero metrics")
+    if session_p95 > session_max:
+        fail("session_latency_p95_ms cannot exceed session_latency_max_ms")
+    if hidden_active > hidden_intervals:
+        fail("hidden repaint active intervals cannot exceed all intervals")
+    if hidden_active > hidden:
+        fail("hidden repaint active intervals cannot exceed repaint events")
+    if (hidden == 0) != (hidden_active == 0):
+        fail("hidden repaint events and active intervals are inconsistent")
+    if hidden_active == 0 and hidden_burst != 0:
+        fail("hidden repaint burst requires an active interval")
+    if hidden_active > 0 and hidden_burst == 0:
+        fail("hidden repaint active intervals require a nonzero burst")
+    if hidden_intervals == 0 and hidden_quiescent != 0:
+        fail("hidden repaint quiescence requires observed intervals")
 
     if status == "passed":
         requirements = {
@@ -206,10 +282,24 @@ def validate_document(data: Any) -> dict[str, Any]:
             "min_fps": min_fps >= 30,
             "max_stall_ms": max_stall <= 500,
             "pointer_updates": pointers > 0,
-            "navigation_p95_ms": nav_p95 > 0,
-            "session_latency_p95_ms": session_p95 > 0,
+            "navigation_latency_sample_count": nav_samples
+            >= MIN_NAVIGATION_LATENCY_SAMPLES,
+            "navigation_p95_ms": 0 < nav_p95 <= LATENCY_P95_LIMIT_MS,
+            "navigation_max_ms": 0 < nav_max <= LATENCY_MAX_LIMIT_MS,
+            "session_latency_sample_count": session_samples
+            >= MIN_SESSION_LATENCY_SAMPLES,
+            "session_latency_p95_ms": 0
+            < session_p95
+            <= LATENCY_P95_LIMIT_MS,
+            "session_latency_max_ms": 0 < session_max <= LATENCY_MAX_LIMIT_MS,
             "partial_uploads": partial > 0,
-            "hidden_repaints": hidden > 0,
+            "hidden_repaint_longest_burst_ms": hidden_burst
+            <= MAX_HIDDEN_REPAINT_BURST_MS,
+            "hidden_repaint_frequency": hidden_intervals > 0
+            and hidden_active / hidden_intervals
+            <= MAX_HIDDEN_REPAINT_ACTIVE_FRACTION,
+            "hidden_repaint_quiescent_ms": hidden_quiescent
+            >= HIDDEN_QUIESCENT_WINDOW_MS,
             "reconnects": reconnects > 0,
             "recovery_observed": recovery,
         }
@@ -229,6 +319,16 @@ def validate_document(data: Any) -> dict[str, Any]:
         "tab_count": tabs,
         "min_fps": min_fps,
         "max_stall_ms": max_stall,
+        "navigation_latency_sample_count": nav_samples,
+        "navigation_p95_ms": nav_p95,
+        "navigation_max_ms": nav_max,
+        "session_latency_sample_count": session_samples,
+        "session_latency_p95_ms": session_p95,
+        "session_latency_max_ms": session_max,
+        "hidden_repaint_active_intervals": hidden_active,
+        "hidden_repaint_interval_count": hidden_intervals,
+        "hidden_repaint_longest_burst_ms": hidden_burst,
+        "hidden_repaint_quiescent_ms": hidden_quiescent,
         "reconnects": reconnects,
         "reason": (
             "all Browser VM performance acceptance criteria were observed"
@@ -238,9 +338,9 @@ def validate_document(data: Any) -> dict[str, Any]:
     }
 
 
-def valid_record() -> dict[str, Any]:
+def valid_record(transport: str = DEFAULT_TRANSPORT) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "kind": "browser_vm_performance",
         "profile": "browser-vm-chromium",
         "image": "browser-vm-chromium",
@@ -248,7 +348,7 @@ def valid_record() -> dict[str, Any]:
         "source": "live-browser-vm-acceptance",
         "source_commit": "0123456789abcdef0123456789abcdef01234567",
         "image_digest": "sha256:" + "a" * 64,
-        "transport": "rdp",
+        "transport": transport,
         "duration_seconds": 900,
         "tab_count": 5,
         "viewport_width": 1920,
@@ -256,10 +356,18 @@ def valid_record() -> dict[str, Any]:
         "min_fps": 30,
         "max_stall_ms": 500,
         "pointer_updates": 1,
-        "navigation_p95_ms": 1,
-        "session_latency_p95_ms": 1,
+        "navigation_latency_sample_count": 15,
+        "navigation_p95_ms": 80,
+        "navigation_max_ms": 200,
+        "session_latency_sample_count": 15,
+        "session_latency_p95_ms": 90,
+        "session_latency_max_ms": 225,
         "partial_uploads": 1,
         "hidden_repaints": 1,
+        "hidden_repaint_active_intervals": 1,
+        "hidden_repaint_interval_count": 180,
+        "hidden_repaint_longest_burst_ms": 5_000,
+        "hidden_repaint_quiescent_ms": 895_000,
         "reconnects": 1,
         "recovery_observed": True,
         "recorded_at": "2020-01-02T03:04:05Z",
@@ -276,16 +384,63 @@ def assert_rejected(data: Any, needle: str) -> None:
 
 
 def self_test() -> None:
-    result = validate_document(valid_record())
-    assert result["status"] == "validated"
-    assert result["live_proof"] == "observed"
+    sunshine_result = validate_document(valid_record())
+    assert sunshine_result["status"] == "validated"
+    assert sunshine_result["live_proof"] == "observed"
+    assert sunshine_result["transport"] == DEFAULT_TRANSPORT
+    rdp_result = validate_document(valid_record("rdp"))
+    assert rdp_result["status"] == "validated"
+    assert rdp_result["transport"] == "rdp"
+    assert_rejected(valid_record("spice"), "transport")
+    assert_rejected(dict(valid_record(), schema_version=1), "schema_version")
     assert_rejected(dict(valid_record(), extra="no"), "unexpected evidence fields")
     assert_rejected(dict(valid_record(), password="no"), "credential-shaped field")
     assert_rejected(dict(valid_record(), duration_seconds=899), "duration_seconds")
     assert_rejected(dict(valid_record(), min_fps=29), "min_fps")
     assert_rejected(dict(valid_record(), max_stall_ms=501), "max_stall_ms")
+    assert_rejected(dict(valid_record(), navigation_p95_ms=101), "navigation_p95_ms")
+    assert_rejected(dict(valid_record(), navigation_max_ms=251), "navigation_max_ms")
+    assert_rejected(
+        dict(valid_record(), navigation_latency_sample_count=14),
+        "navigation_latency_sample_count",
+    )
+    assert_rejected(
+        dict(valid_record(), session_latency_p95_ms=101),
+        "session_latency_p95_ms",
+    )
+    assert_rejected(
+        dict(valid_record(), session_latency_max_ms=251),
+        "session_latency_max_ms",
+    )
+    assert_rejected(
+        dict(valid_record(), session_latency_sample_count=14),
+        "session_latency_sample_count",
+    )
+    assert_rejected(
+        dict(
+            valid_record(),
+            hidden_repaints=180,
+            hidden_repaint_active_intervals=180,
+            hidden_repaint_interval_count=180,
+            hidden_repaint_longest_burst_ms=900_000,
+            hidden_repaint_quiescent_ms=0,
+        ),
+        "hidden_repaint",
+    )
+    no_hidden_repaints = dict(
+        valid_record(),
+        hidden_repaints=0,
+        hidden_repaint_active_intervals=0,
+        hidden_repaint_longest_burst_ms=0,
+        hidden_repaint_quiescent_ms=900_000,
+    )
+    assert validate_document(no_hidden_repaints)["status"] == "validated"
     assert_rejected(dict(valid_record(), recovery_observed=False), "recovery_observed")
     assert_rejected(dict(valid_record(), source_commit="short"), "source_commit")
+    assert_rejected(dict(valid_record(), source_commit="0" * 40), "non-null")
+    assert_rejected(
+        dict(valid_record(), image_digest="sha256:" + "0" * 64), "non-null"
+    )
     assert_rejected(dict(valid_record(), recorded_at="2026-99-99T00:00:00Z"), "real UTC")
     unavailable = dict(valid_record(), status="unavailable", duration_seconds=0, tab_count=0)
     assert validate_document(unavailable)["status"] == "unavailable"

@@ -29,7 +29,8 @@ use std::path::Path;
 
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mackes_mesh_types::vdi_session::{
-    AppVmLaunchRequest, AppVmLifecycleState, DesktopSessionProfile, SessionRequest,
+    AppVmLaunchRequest, AppVmLifecycleState, BrowserVmTransport, DesktopSessionProfile,
+    SessionRequest,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -156,13 +157,34 @@ pub(crate) fn publish_browser_vm_open_record(
     vm_id: &str,
     client_peer: &str,
 ) -> OpenPublication {
+    publish_browser_vm_open_record_with_transport(
+        bus_root,
+        last_error,
+        serving_peer,
+        vm_id,
+        client_peer,
+        BrowserVmTransport::Sunshine,
+    )
+}
+
+/// Build + publish a Browser VM `Open` with an exact transport selection. The
+/// default caller passes Sunshine; RDP reaches this seam only after the operator
+/// explicitly selects the one-session alternate.
+pub(crate) fn publish_browser_vm_open_record_with_transport(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    serving_peer: &str,
+    vm_id: &str,
+    client_peer: &str,
+    transport: BrowserVmTransport,
+) -> OpenPublication {
     publish_open_record_with_profile(
         bus_root,
         last_error,
         serving_peer,
         vm_id,
         client_peer,
-        Some(DesktopSessionProfile::BrowserVm),
+        Some(transport.session_profile()),
     )
 }
 
@@ -228,9 +250,7 @@ fn session_auth_context(request: &SessionRequest) -> (&'static str, String) {
             ("vdi-session-open", format!("session:{id}"))
         }
         SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
-        SessionRequest::AppState { id, .. } => {
-            ("vdi-session-app-state", format!("session:{id}"))
-        }
+        SessionRequest::AppState { id, .. } => ("vdi-session-app-state", format!("session:{id}")),
         SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
         SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
     }
@@ -440,6 +460,35 @@ mod tests {
                 .is_some_and(|e| e.contains("No mesh Bus")),
             "no Bus dir surfaces an error, not a panic"
         );
+    }
+
+    #[test]
+    fn browser_open_defaults_to_sunshine_and_rdp_requires_explicit_selection() {
+        let mut last_error = None;
+        let default =
+            publish_browser_vm_open_record(None, &mut last_error, "dell", "browser-vm", "surface");
+        let default_request: SessionRequest =
+            serde_json::from_str(&default.body).expect("default Browser request");
+        assert_eq!(
+            default_request.browser_transport(),
+            Ok(Some(BrowserVmTransport::Sunshine))
+        );
+
+        let explicit = publish_browser_vm_open_record_with_transport(
+            None,
+            &mut last_error,
+            "dell",
+            "browser-vm",
+            "surface",
+            BrowserVmTransport::Rdp,
+        );
+        let explicit_request: SessionRequest =
+            serde_json::from_str(&explicit.body).expect("explicit RDP request");
+        assert_eq!(
+            explicit_request.browser_transport(),
+            Ok(Some(BrowserVmTransport::Rdp))
+        );
+        assert!(explicit.body.contains("browser_vm_rdp"));
     }
 
     #[test]

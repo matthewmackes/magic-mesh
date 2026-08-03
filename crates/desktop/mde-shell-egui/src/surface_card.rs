@@ -16,7 +16,7 @@
 //!
 //! ## One wire contract, no daemon dependency (§6 glue)
 //!
-//! Exactly as [`crate::services_flow`] mirrors the onboard worker, this module
+//! Like the other Bus-backed provisioning surfaces, this module
 //! leans inward only on `mde-bus` and mirrors the surface workers' wire
 //! contracts with local serde structs: it **reads** the typed state the workers
 //! publish under `state/hardware/surface/<node>/*` and **publishes** the typed

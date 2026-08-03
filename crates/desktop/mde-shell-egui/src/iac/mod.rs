@@ -1716,8 +1716,7 @@ impl WorkloadsState {
             .iter()
             .flat_map(|state| state.workloads.iter())
             .find(|workload| {
-                workload.name == "browser-vm"
-                    && workload.delivery_type == DeliveryType::DesktopVm
+                workload.name == "browser-vm" && workload.delivery_type == DeliveryType::DesktopVm
             })
             .map(|workload| {
                 (
@@ -2129,9 +2128,28 @@ fn lifecycle_resource_route_for_filter(
     );
     ui.add_space(Style::SP_S);
     resource_table(ui, state, mode, delivery_type);
+    let effective_view = delivery_type
+        .map(DeliveryView::from_delivery_type)
+        .unwrap_or(state.view);
+    if should_show_android_starter_catalog(mode, effective_view) {
+        let mut vm_scopes = state
+            .workloads_of(DeliveryView::AndroidVm)
+            .map(|row| format!("{} on {}", row.name, row.node))
+            .collect::<Vec<_>>();
+        vm_scopes.sort_unstable();
+        vm_scopes.dedup();
+        android_apps::catalog_panel(ui, &vm_scopes);
+    }
     if matches!(mode, ResourceTableMode::Plan | ResourceTableMode::Run) {
         console_section(ui, state);
     }
+}
+
+/// The starter catalog belongs to lifecycle review, not to the retired
+/// delivery-view renderer. Drift and container routes remain inventory-only.
+const fn should_show_android_starter_catalog(mode: ResourceTableMode, view: DeliveryView) -> bool {
+    matches!(mode, ResourceTableMode::Plan | ResourceTableMode::Run)
+        && matches!(view, DeliveryView::AndroidVm)
 }
 
 fn resource_table(
@@ -2927,6 +2945,7 @@ pub(super) fn render_audit(ui: &mut egui::Ui, audit: &[AuditEntry]) {
 
 // ─────────────────────────── the seam module layout ─────────────────────────
 
+mod android_apps;
 mod menubar;
 
 mod placement;

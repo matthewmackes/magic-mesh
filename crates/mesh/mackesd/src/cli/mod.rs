@@ -70,6 +70,7 @@ pub mod role_workers;
 pub mod rotate_passcode;
 pub mod route_trace;
 pub mod secret;
+pub mod service_card;
 pub mod set_external_addr;
 pub mod show_passcode;
 pub mod state_restore;

@@ -338,6 +338,17 @@ mod tests {
             "base RPM post-install must grant known non-root seat users the audio group so PipeWire can open /dev/snd on DRM seats without logind ACLs"
         );
         assert!(
+            post_install.contains("loginctl enable-linger \"$user\"")
+                && post_install.contains("systemctl start \"user@$uid.service\""),
+            "base RPM post-install must keep the primary seat PipeWire user manager boot-durable"
+        );
+        let seat_unit = include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service");
+        assert!(
+            seat_unit.contains("Environment=XDG_RUNTIME_DIR=/run/user/1000")
+                && seat_unit.contains("Wants=user@1000.service"),
+            "the root DRM shell must connect to the persistent primary seat PipeWire graph"
+        );
+        assert!(
             post_install.contains("/etc/systemd/system/mde-shell.service")
                 && post_install.contains("grep -q '/usr/bin/mde-shell-egui'")
                 && post_install.contains("systemctl disable --now mde-shell.service"),
@@ -594,12 +605,6 @@ mod tests {
         }
     }
 
-
-
-
-
-
-
     #[test]
     fn full_rpm_ships_seat_remote_input_helper_but_server_variant_does_not() {
         let manifest: toml::Value =
@@ -747,11 +752,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     #[test]
     fn lighthouse_caddy_provisioning_is_timeout_bounded() {
         let helper = include_str!("../../../../../install-helpers/setup-caddy.sh");
@@ -830,7 +830,6 @@ mod tests {
             "the DRM seat unit must be wanted by multi-user.target for RPM-installed seats and graphical.target for bootc seats"
         );
     }
-
 
     #[test]
     fn mackesd_unit_raises_the_process_fd_budget() {

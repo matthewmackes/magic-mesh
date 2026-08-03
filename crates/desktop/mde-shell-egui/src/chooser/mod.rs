@@ -54,6 +54,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::vdi_session::BrowserVmTransport;
 use mde_egui::egui::{
     self, FontId, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
 };
@@ -1282,7 +1283,7 @@ struct ConnectDraft {
 /// re-enter the typed Browser VM VDI path without putting a credential in the
 /// Workloads/session record.
 struct BrowserVmAuthPrompt {
-    target: crate::web::BrowserVmTarget,
+    connect: crate::web::BrowserVmConnect,
     prompt: CredentialPrompt,
 }
 
@@ -1301,6 +1302,9 @@ pub(crate) struct ChooserState {
     /// Desktop-client Bus spool for the broker `Open` publish (the same
     /// resolved-once root the E12-5b picker held).
     bus_root: Option<PathBuf>,
+    /// Validated universal service/resource catalog rendered in the same browser
+    /// as desktop cards.
+    resources: ResourceBrowserState,
     /// This node's peer name — the session's `client_peer` (resolved once).
     client_peer: String,
     /// The last published roster, if any.
@@ -1393,6 +1397,7 @@ impl ChooserState {
         let mut state = Self {
             client,
             creds,
+            resources: ResourceBrowserState::new(bus_root.clone()),
             bus_root,
             client_peer,
             state: None,
@@ -1565,6 +1570,7 @@ impl ChooserState {
     /// CHOOSER-9 prefs cache is re-merged so a pin/recent/manual change roamed from
     /// another seat surfaces even when the roster itself didn't change.
     fn refresh(&mut self) {
+        self.resources.refresh();
         if let Some(state) = self.client.latest() {
             self.fold_sources(state);
         } else {
@@ -1709,26 +1715,27 @@ impl ChooserState {
         self.connect.take()
     }
 
-    /// Resolve the guest credential for the typed Browser VM route. Browser is a
-    /// mesh-brokered source, but xrdp still requires an account/password inside
-    /// the guest; the broker's mesh authorization is carried by the session
-    /// record separately. Keeping this fold here makes the Browser shortcut use
-    /// the same auth seam as the full Chooser without ever placing credentials in
-    /// the Workloads record.
+    /// Resolve authentication for the exact typed Browser transport. Sunshine
+    /// uses mesh identity only. The explicit RDP alternate requires a guest
+    /// account/password, resolved through the existing sealed-credential seam.
     pub(crate) fn browser_vm_auth(
         &mut self,
-        target: &crate::web::BrowserVmTarget,
+        connect: &crate::web::BrowserVmConnect,
     ) -> Result<Option<DesktopAuth>, String> {
         if self
             .browser_vm_prompt
             .as_ref()
-            .is_some_and(|pending| pending.target.workload != target.workload)
+            .is_some_and(|pending| &pending.connect != connect)
         {
             self.browser_vm_prompt = None;
         }
+        if connect.transport == BrowserVmTransport::Sunshine {
+            self.browser_vm_prompt = None;
+            return Ok(Some(DesktopAuth::mesh_identity(&self.client_peer)));
+        }
         match auth::resolve_guest(
             &self.client_peer,
-            &target.workload,
+            &connect.target.workload,
             VdiProtocol::Rdp,
             self.creds.as_ref(),
         )? {
@@ -1736,7 +1743,7 @@ impl ChooserState {
             AuthStage::Prompt(prompt) => {
                 if self.browser_vm_prompt.is_none() {
                     self.browser_vm_prompt = Some(BrowserVmAuthPrompt {
-                        target: target.clone(),
+                        connect: connect.clone(),
                         prompt,
                     });
                 }
@@ -1751,7 +1758,7 @@ impl ChooserState {
     pub(crate) fn render_browser_vm_auth_prompt(
         &mut self,
         ui: &mut egui::Ui,
-    ) -> Option<(crate::web::BrowserVmTarget, DesktopAuth)> {
+    ) -> Option<(crate::web::BrowserVmConnect, DesktopAuth)> {
         let pending = self.browser_vm_prompt.as_mut()?;
         ui.group(|ui| {
             ui.label(RichText::new("Browser VM guest sign-in").size(Style::BODY));
@@ -1779,7 +1786,7 @@ impl ChooserState {
                         format!("Browser VM credential persistence failed: {reason}")
                     }
                 });
-                Some((pending.target, auth))
+                Some((pending.connect, auth))
             }
             Some(false) => {
                 self.browser_vm_prompt = None;
@@ -2497,6 +2504,15 @@ enum CardAction {
 /// grid — lock 6), then the node-grouped card grid, the CHOOSER-4 confirm
 /// affordance when raised, and the degraded-lane notes.
 pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
+    let has_resources = state.resources.show(ui);
+    if has_resources {
+        ui.add_space(Style::SP_M);
+        ui.separator();
+        ui.add_space(Style::SP_S);
+    }
+    if !state.resources.show_desktops() {
+        return;
+    }
     let sources = state.sources_snapshot();
     let empty = sources.is_empty();
 
@@ -2636,6 +2652,8 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
 
 mod render;
 use render::*;
+mod resources;
+use resources::ResourceBrowserState;
 
 #[cfg(test)]
 mod tests;

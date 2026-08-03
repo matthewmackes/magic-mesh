@@ -1,0 +1,2 @@
+{"schema_version":1,"kind":"browser_vm_performance_stream","source":"live-browser-vm-session-endpoint","profile":"browser-vm-chromium","image":"browser-vm-chromium","workload":"browser-vm","session_id":"fixture-browser-vm-unavailable","source_commit":"0123456789abcdef0123456789abcdef01234567","image_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","transport":"sunshine"}
+{"type":"complete","status":"unavailable"}

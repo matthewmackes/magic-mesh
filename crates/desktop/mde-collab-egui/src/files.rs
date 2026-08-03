@@ -36,7 +36,7 @@
 //!   ledger mirror.
 
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui;
@@ -188,6 +188,12 @@ impl CommunicationsSurface {
         // The linked-reference list.
         let refs = data.file_references(space);
         let jobs = data.transfer_jobs();
+        let member_count = data
+            .space_directory()
+            .spaces
+            .iter()
+            .find(|summary| summary.id == space)
+            .map(|summary| summary.members);
         match refs {
             Some(refs) if !refs.files.is_empty() => {
                 egui::ScrollArea::vertical()
@@ -197,7 +203,15 @@ impl CommunicationsSurface {
                         for view in &refs.files {
                             let job =
                                 jobs.and_then(|j| j.jobs.iter().find(|job| job.file == view.file));
-                            self.file_row(ui, sink, space, view, job, data.now_unix_ms());
+                            self.file_row(
+                                ui,
+                                sink,
+                                space,
+                                view,
+                                job,
+                                data.now_unix_ms(),
+                                member_count,
+                            );
                             ui.add_space(Style::SP_XS);
                         }
                     });
@@ -229,6 +243,7 @@ impl CommunicationsSurface {
         view: &FileReferenceView,
         job: Option<&TransferJobView>,
         now_unix_ms: i64,
+        member_count: Option<u32>,
     ) {
         mde_egui::card()
             .show(ui, |ui| {
@@ -328,6 +343,11 @@ impl CommunicationsSurface {
                     );
                 });
 
+                ui.label(
+                    egui::RichText::new(autofill_destination_label(member_count))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
                 self.transfer_controls(ui, sink, space, view.file, job);
             });
     }
@@ -625,13 +645,19 @@ impl CommunicationsSurface {
     /// Read + hash `path` into a [`FileRef`] and emit
     /// [`LinkFile`](CollabCommand::LinkFile) for `space`, closing the picker on
     /// success. The one place a canonical file becomes a space reference.
-    pub(crate) fn link_file_from_path(
+    pub fn link_file_from_path(
         &mut self,
         sink: &mut CommandSink,
         space: SpaceId,
         path: &Path,
     ) -> std::io::Result<()> {
-        let (file, reference) = file_ref_of_path(path)?;
+        let workgroup_root = std::env::var_os("MDE_WORKGROUP_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"));
+        let content_root = workgroup_root
+            .join("collab")
+            .join("content");
+        let (file, reference) = link_file_at_content_root(path, &content_root)?;
         sink.emit(CollabCommand::LinkFile {
             space,
             file,
@@ -651,7 +677,7 @@ impl CommunicationsSurface {
     /// space's members over the default mesh transport (outbound from this seat).
     /// The byte-moving engine + progress are WL-FUNC-006's; this only mints the
     /// control handle the ledger mirror is then keyed by.
-    pub(crate) fn start_transfer_to_members(
+    pub fn start_transfer_to_members(
         &self,
         sink: &mut CommandSink,
         space: SpaceId,
@@ -737,6 +763,14 @@ impl CommunicationsSurface {
     }
 }
 
+fn autofill_destination_label(member_count: Option<u32>) -> String {
+    match member_count {
+        Some(1) => "Destination · 1 space member (autofilled)".to_owned(),
+        Some(count) => format!("Destination · all {count} space members (autofilled)"),
+        None => "Destination · all space members (autofilled)".to_owned(),
+    }
+}
+
 /// Read `path`'s bytes and build a stable [`FileRef`] for it: the file name, its
 /// exact byte size, and the SHA-256 content address (the platform content-address
 /// convention). Mints a fresh [`FileRefId`] — the opaque, stable handle the space
@@ -746,6 +780,10 @@ impl CommunicationsSurface {
 /// file, and a fleet-scale version would stream the hash off the paint thread.
 pub fn file_ref_of_path(path: &Path) -> io::Result<(FileRefId, FileRef)> {
     let bytes = read_regular_file_bounded(path)?;
+    Ok(file_ref_from_bytes(path, &bytes))
+}
+
+fn file_ref_from_bytes(path: &Path, bytes: &[u8]) -> (FileRefId, FileRef) {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -756,7 +794,62 @@ pub fn file_ref_of_path(path: &Path) -> io::Result<(FileRefId, FileRef)> {
         sha256_hex: mde_collab_types::value::sha256_hex(&bytes),
         mime: mime_hint(path),
     };
-    Ok((FileRefId::new(), reference))
+    (FileRefId::new(), reference)
+}
+
+/// Materialize the exact bytes used to build the content address into the
+/// Syncthing-replicated collab content store before publishing the reference.
+/// A same-hash payload is idempotent; a conflicting file fails closed.
+fn link_file_at_content_root(
+    path: &Path,
+    content_root: &Path,
+) -> io::Result<(FileRefId, FileRef)> {
+    let bytes = read_regular_file_bounded(path)?;
+    let (file, reference) = file_ref_from_bytes(path, &bytes);
+    let prefix = reference
+        .sha256_hex
+        .get(..2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid content address"))?;
+    let directory = content_root.join(prefix);
+    fs::create_dir_all(&directory)?;
+    let target = directory.join(&reference.sha256_hex);
+    if target.exists() {
+        let existing = read_regular_file_bounded(&target)?;
+        if existing != bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "content-address collision or corrupted canonical payload",
+            ));
+        }
+        return Ok((file, reference));
+    }
+
+    let temp = directory.join(format!(".{}.{}.part", reference.sha256_hex, file));
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    match fs::hard_link(&temp, &target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing = read_regular_file_bounded(&target)?;
+            if existing != bytes {
+                let _ = fs::remove_file(&temp);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "content-address collision or corrupted canonical payload",
+                ));
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    fs::remove_file(&temp)?;
+    Ok((file, reference))
 }
 
 /// Read a local link candidate without following an untrusted final symlink or
@@ -930,7 +1023,22 @@ pub(crate) fn fmt_bytes(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_ref_of_path, safe_display_text, MAX_FILE_REF_BYTES};
+    use super::{
+        autofill_destination_label, file_ref_of_path, link_file_at_content_root,
+        safe_display_text, MAX_FILE_REF_BYTES,
+    };
+
+    #[test]
+    fn transfer_destination_is_explicitly_autofilled_from_space_membership() {
+        assert_eq!(
+            autofill_destination_label(Some(5)),
+            "Destination · all 5 space members (autofilled)"
+        );
+        assert_eq!(
+            autofill_destination_label(None),
+            "Destination · all space members (autofilled)"
+        );
+    }
 
     #[test]
     fn safe_display_text_replaces_control_and_bidi_format_characters() {
@@ -963,6 +1071,27 @@ mod tests {
         let error = file_ref_of_path(&path).expect_err("oversized file reference");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn linking_materializes_the_exact_content_address_idempotently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("report.txt");
+        let content = dir.path().join("content");
+        std::fs::write(&source, b"mesh transfer payload").expect("write source");
+
+        let (_, first) =
+            link_file_at_content_root(&source, &content).expect("materialize first link");
+        let (_, second) =
+            link_file_at_content_root(&source, &content).expect("idempotent second link");
+        assert_eq!(first.sha256_hex, second.sha256_hex);
+        let canonical = content
+            .join(&first.sha256_hex[..2])
+            .join(&first.sha256_hex);
+        assert_eq!(
+            std::fs::read(canonical).expect("read canonical payload"),
+            b"mesh transfer payload"
+        );
     }
 
     #[cfg(unix)]

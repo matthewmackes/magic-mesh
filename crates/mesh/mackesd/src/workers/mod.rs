@@ -671,6 +671,8 @@ pub mod unit_aggregator;
 // pure fold, so the whole merge folds headless. Universal (rank 0) like
 // unit_aggregator — every node publishes its own mesh-wide service view, no center.
 pub mod service_aggregator;
+/// Generic first-class service-card projection over the unified service mirror.
+pub mod service_catalog;
 // E12-20 — the storage worker: the privileged owner of the Workbench Storage plane
 // (GParted for the mesh, docs/design/workbench-storage-plane.md). Owns a typed
 // StorageOp pending-queue executor over a live UDisks2 zbus topology — stage-time

@@ -5,6 +5,432 @@
 //! CA-backup provisioning helpers are join-exclusive and kept private here.
 use crate::*;
 
+const SETUP_ETCD: &str = "/usr/libexec/mackesd/setup-etcd";
+const SETUP_SYNCTHING: &str = "/usr/libexec/mackesd/setup-syncthing";
+const WORKSTATION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const SETUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const SETUP_TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_SETUP_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+const MAX_WORKSTATION_LIGHTHOUSE_ANCHORS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupCommandFailure {
+    Spawn(String),
+    Wait(String),
+    TimedOut {
+        seconds: u64,
+    },
+    Exited {
+        code: Option<i32>,
+        diagnostic: String,
+    },
+}
+
+impl std::fmt::Display for SetupCommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "could not start: {error}"),
+            Self::Wait(error) => write!(f, "could not observe completion: {error}"),
+            Self::TimedOut { seconds } => {
+                write!(f, "exceeded the bounded {seconds}s execution window")
+            }
+            Self::Exited { code, diagnostic } => {
+                let code = code.map_or_else(|| "by signal".to_string(), |value| value.to_string());
+                write!(f, "exited {code}: {diagnostic}")
+            }
+        }
+    }
+}
+
+trait SetupCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<(), SetupCommandFailure>;
+}
+
+struct SystemSetupCommandRunner;
+
+struct CapturedSetupStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_setup_stream(mut stream: impl std::io::Read) -> std::io::Result<CapturedSetupStream> {
+    let mut bytes = Vec::with_capacity(MAX_SETUP_DIAGNOSTIC_BYTES);
+    let mut buffer = [0_u8; 4096];
+    let mut truncated = false;
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let keep = read.min(MAX_SETUP_DIAGNOSTIC_BYTES.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(CapturedSetupStream { bytes, truncated })
+}
+
+fn redact_setup_diagnostic(raw: &str) -> String {
+    let mut redacted = Vec::new();
+    for word in raw.split_whitespace() {
+        let token_like = (word.contains("mesh:") && word.contains('#'))
+            || word.contains("MDEINV1-")
+            || word.contains("mde-invite:");
+        redacted.push(if token_like { "<redacted-token>" } else { word });
+    }
+    redacted.join(" ")
+}
+
+fn materialize_setup_stream(captured: CapturedSetupStream) -> String {
+    let mut text = redact_setup_diagnostic(&String::from_utf8_lossy(&captured.bytes));
+    if captured.truncated {
+        text.push_str(" [output truncated]");
+    }
+    text
+}
+
+fn signal_setup_process_group(pid: u32, signal: &str) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{pid}");
+        let _ = std::process::Command::new("/usr/bin/kill")
+            .args([signal, "--", &process_group])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = (pid, signal);
+}
+
+fn terminate_setup_child(child: &mut std::process::Child) {
+    signal_setup_process_group(child.id(), "-TERM");
+    let deadline = std::time::Instant::now() + SETUP_TERMINATE_GRACE;
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(SETUP_POLL_INTERVAL);
+    }
+    // The shell may exit before a dnf/systemctl descendant. Signal the group
+    // even after the direct child is reaped so no helper subprocess escapes.
+    signal_setup_process_group(child.id(), "-KILL");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn join_setup_stream(
+    name: &str,
+    reader: std::thread::JoinHandle<std::io::Result<CapturedSetupStream>>,
+) -> Result<String, SetupCommandFailure> {
+    let captured = reader
+        .join()
+        .map_err(|_| SetupCommandFailure::Wait(format!("{name} reader panicked")))?
+        .map_err(|error| SetupCommandFailure::Wait(format!("reading {name}: {error}")))?;
+    Ok(materialize_setup_stream(captured))
+}
+
+impl SetupCommandRunner for SystemSetupCommandRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<(), SetupCommandFailure> {
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            // A helper may be waiting on dnf/systemctl. Give it a fresh process
+            // group so the timeout reaps descendants too, not just the shell.
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| SetupCommandFailure::Spawn(error.to_string()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            terminate_setup_child(&mut child);
+            SetupCommandFailure::Wait("stdout pipe unavailable".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            terminate_setup_child(&mut child);
+            SetupCommandFailure::Wait("stderr pipe unavailable".to_string())
+        })?;
+        let stdout_reader = std::thread::spawn(move || read_setup_stream(stdout));
+        let stderr_reader = std::thread::spawn(move || read_setup_stream(stderr));
+
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() >= timeout => {
+                    terminate_setup_child(&mut child);
+                    let _ = join_setup_stream("stdout", stdout_reader);
+                    let _ = join_setup_stream("stderr", stderr_reader);
+                    return Err(SetupCommandFailure::TimedOut {
+                        seconds: timeout.as_secs(),
+                    });
+                }
+                Ok(None) => std::thread::sleep(SETUP_POLL_INTERVAL),
+                Err(error) => {
+                    terminate_setup_child(&mut child);
+                    let _ = join_setup_stream("stdout", stdout_reader);
+                    let _ = join_setup_stream("stderr", stderr_reader);
+                    return Err(SetupCommandFailure::Wait(error.to_string()));
+                }
+            }
+        };
+        let stdout = join_setup_stream("stdout", stdout_reader)?;
+        let stderr = join_setup_stream("stderr", stderr_reader)?;
+        if status.success() {
+            return Ok(());
+        }
+        let diagnostic = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        Err(SetupCommandFailure::Exited {
+            code: status.code(),
+            diagnostic: if diagnostic.trim().is_empty() {
+                "no diagnostic output".to_string()
+            } else {
+                diagnostic
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkstationSetupPlan {
+    anchors_csv: String,
+    anchor_count: usize,
+    overlay_ip: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkstationSetupState {
+    Ready,
+    Degraded { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JoinRoleResolution {
+    effective: mde_role::Role,
+    pin_required: bool,
+}
+
+fn parse_requested_join_role(role: Option<&str>) -> anyhow::Result<Option<mde_role::Role>> {
+    role.map(|value| {
+        value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unknown role value — expected lighthouse|workstation"))
+    })
+    .transpose()
+}
+
+fn resolve_join_role(
+    pinned: Option<mde_role::Role>,
+    requested: Option<mde_role::Role>,
+) -> Result<JoinRoleResolution, String> {
+    match (pinned, requested) {
+        (Some(effective), Some(requested)) if effective != requested => Err(format!(
+            "role is already pinned as `{effective}`; refusing conflicting `--role {requested}`. Re-role the node explicitly before joining"
+        )),
+        (Some(effective), _) => Ok(JoinRoleResolution {
+            effective,
+            pin_required: false,
+        }),
+        (None, requested) => Ok(JoinRoleResolution {
+            effective: requested.unwrap_or(mde_role::Role::Workstation),
+            pin_required: true,
+        }),
+    }
+}
+
+fn load_join_role(requested: Option<mde_role::Role>) -> anyhow::Result<JoinRoleResolution> {
+    let pinned = match mde_role::load() {
+        Ok(existing) => Some(existing),
+        Err(mde_role::LoadError::NotPinned) => None,
+        Err(error) => anyhow::bail!("reading role: {error}"),
+    };
+    resolve_join_role(pinned, requested).map_err(anyhow::Error::msg)
+}
+
+fn persist_join_role(resolution: JoinRoleResolution) -> anyhow::Result<()> {
+    if resolution.pin_required {
+        mde_role::pin(resolution.effective)
+            .map_err(|error| anyhow::anyhow!("pinning role: {error}"))?;
+        println!("role pinned: {}", resolution.effective.as_str());
+    } else {
+        println!("role already pinned: {}", resolution.effective);
+    }
+    Ok(())
+}
+
+fn parse_ipv4_cidr(cidr: &str) -> Result<(u32, u32), String> {
+    let (network, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("mesh CIDR `{cidr}` has no prefix"))?;
+    let network = network
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| format!("mesh CIDR `{cidr}` is not IPv4"))?;
+    let prefix = prefix
+        .parse::<u32>()
+        .map_err(|_| format!("mesh CIDR `{cidr}` has an invalid prefix"))?;
+    if prefix > 32 {
+        return Err(format!("mesh CIDR `{cidr}` has an invalid prefix"));
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ok((u32::from(network) & mask, mask))
+}
+
+fn workstation_setup_plan(
+    bundle: &mackesd_core::ca::bundle::NebulaBundle,
+) -> Result<WorkstationSetupPlan, String> {
+    if bundle.lighthouses.is_empty() {
+        return Err("the signed lighthouse overlay roster is empty".to_string());
+    }
+    if bundle.lighthouses.len() > MAX_WORKSTATION_LIGHTHOUSE_ANCHORS {
+        return Err(format!(
+            "the signed lighthouse overlay roster has {} entries (maximum {MAX_WORKSTATION_LIGHTHOUSE_ANCHORS})",
+            bundle.lighthouses.len()
+        ));
+    }
+    let (network, mask) = parse_ipv4_cidr(&bundle.mesh_cidr)?;
+    let overlay_ip = bundle
+        .overlay_ip
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "the signed Workstation overlay address is not IPv4".to_string())?;
+    if u32::from(overlay_ip) & mask != network {
+        return Err("the signed Workstation overlay address is outside the mesh CIDR".to_string());
+    }
+
+    let mut anchors = std::collections::BTreeSet::new();
+    for (index, lighthouse) in bundle.lighthouses.iter().enumerate() {
+        let anchor = lighthouse
+            .overlay_ip
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|_| {
+                format!(
+                    "signed lighthouse roster entry {} has a non-IPv4 overlay address",
+                    index + 1
+                )
+            })?;
+        if u32::from(anchor) & mask != network {
+            return Err(format!(
+                "signed lighthouse roster entry {} is outside the mesh CIDR",
+                index + 1
+            ));
+        }
+        if anchor == overlay_ip {
+            return Err(format!(
+                "signed lighthouse roster entry {} reuses the Workstation overlay address",
+                index + 1
+            ));
+        }
+        anchors.insert(anchor);
+    }
+    let anchors_csv = anchors
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(WorkstationSetupPlan {
+        anchors_csv,
+        anchor_count: anchors.len(),
+        overlay_ip: overlay_ip.to_string(),
+    })
+}
+
+fn setup_workstation_substrate<R: SetupCommandRunner>(
+    bundle: &mackesd_core::ca::bundle::NebulaBundle,
+    runner: &R,
+) -> anyhow::Result<WorkstationSetupState> {
+    let plan = workstation_setup_plan(bundle).map_err(|reason| {
+        anyhow::anyhow!(
+            "workstation fleet activation failed closed after network enrollment: {reason}; no setup helper was run. Recovery requires a corrected signed roster and a newly minted enrollment token after the signer is repaired"
+        )
+    })?;
+    let etcd_args = vec![
+        "--client-only".to_string(),
+        "--anchors".to_string(),
+        plan.anchors_csv.clone(),
+    ];
+    runner
+        .run(SETUP_ETCD, &etcd_args, WORKSTATION_SETUP_TIMEOUT)
+        .map_err(|failure| {
+            anyhow::anyhow!(
+                "workstation fleet activation failed closed after network enrollment: client-only etcd setup {failure}; Syncthing was not attempted. Recover without re-enrollment: fix the packaged-helper or systemd error, then rerun `{SETUP_ETCD} --client-only --anchors {}` followed by `{SETUP_SYNCTHING} --listen {}`; both helpers are idempotent and receive no enrollment token",
+                plan.anchors_csv,
+                plan.overlay_ip,
+            )
+        })?;
+    println!(
+        "workstation fleet: etcd client configured from {} signed lighthouse anchor(s)",
+        plan.anchor_count
+    );
+
+    let syncthing_args = vec!["--listen".to_string(), plan.overlay_ip.clone()];
+    match runner.run(
+        SETUP_SYNCTHING,
+        &syncthing_args,
+        WORKSTATION_SETUP_TIMEOUT,
+    ) {
+        Ok(()) => Ok(WorkstationSetupState::Ready),
+        Err(failure) => Ok(WorkstationSetupState::Degraded {
+            reason: format!(
+                "Syncthing setup {failure}; overlay and etcd coordination remain configured, and the single-use enrollment token is consumed. Recover without re-enrollment by fixing the packaged-helper or systemd error and rerunning `{SETUP_SYNCTHING} --listen {}`; the helper is idempotent and receives no enrollment token",
+                plan.overlay_ip,
+            ),
+        }),
+    }
+}
+
+fn finish_network_enrollment<R, E>(
+    role: mde_role::Role,
+    bundle: &mackesd_core::ca::bundle::NebulaBundle,
+    runner: &R,
+    mut enable_service: E,
+) -> anyhow::Result<Option<WorkstationSetupState>>
+where
+    R: SetupCommandRunner,
+    E: FnMut(&str),
+{
+    // Once network enrollment succeeds, its bearer cannot be reused. Bring up
+    // the control daemon and health watchdog before optional role-specific
+    // helpers so a helper failure cannot strand a signed node without its
+    // essential recovery services.
+    enable_service("mackesd.service");
+    enable_service("mesh-health.timer");
+
+    if role != mde_role::Role::Workstation {
+        return Ok(None);
+    }
+
+    setup_workstation_substrate(bundle, runner)
+        .map(Some)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "network enrollment succeeded and the single-use enrollment token was consumed; do not retry that token. Activation of mackesd and mesh-health was attempted before Workstation setup, but Workstation activation is incomplete: {error}"
+            )
+        })
+}
+
 /// OW-4 — redeem a wizard-minted `MDEINV1-…` invite (or its `mde-invite:` QR
 /// twin) on the join side. Validates the presented code — mesh-scope + TTL
 /// offline, then the bearer ledger — and maps it to the same v3 CSR the
@@ -16,7 +442,7 @@ use crate::*;
 /// endpoint-bearing v3 token from `mackesd found`.
 fn cmd_join_invite(
     raw_token: &str,
-    parsed: mde_role::Role,
+    requested_role: Option<mde_role::Role>,
     _name: Option<String>,
     workgroup_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -40,6 +466,10 @@ fn cmd_join_invite(
         decoded.mesh_id
     };
 
+    // Resolve a pre-existing pin before the invite ledger is mutated. A
+    // conflicting explicit role is refused while the invite remains usable.
+    let role = load_join_role(requested_role)?;
+
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -49,15 +479,9 @@ fn cmd_join_invite(
     let redeemed = invite::validate_for_redeem(&root, raw_token, now_ms, &expected_mesh)
         .map_err(|e| anyhow::anyhow!("invite refused ({}): {e}", e.reason()))?;
 
-    // Pin the role when unpinned, matching the v3 join.
-    match mde_role::load() {
-        Ok(existing) => println!("role already pinned: {existing}"),
-        Err(mde_role::LoadError::NotPinned) => {
-            mde_role::pin(parsed).map_err(|e| anyhow::anyhow!("pinning role: {e}"))?;
-            println!("role pinned: {}", parsed.as_str());
-        }
-        Err(e) => anyhow::bail!("reading role: {e}"),
-    }
+    // Validation records the one-time invite redemption. Pin only after it
+    // succeeds; invalid invites must not mutate the local role.
+    persist_join_role(role)?;
 
     // Validated — but the envelope has no `/enroll` endpoint, so the live enroll
     // leg needs the lighthouse address the invite cannot supply. Gate it
@@ -78,7 +502,7 @@ fn cmd_join_invite(
 /// fingerprint-pinned network-enroll + materialize /etc/nebula.
 pub fn run(
     token: Option<String>,
-    role: &str,
+    role: Option<&str>,
     name: Option<String>,
     workgroup_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -94,9 +518,7 @@ pub fn run(
         };
     };
 
-    let parsed: mde_role::Role = role
-        .parse()
-        .map_err(|_| anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation"))?;
+    let requested_role = parse_requested_join_role(role)?;
 
     // OW-4 — a wizard-minted `MDEINV1-…` invite (or its `mde-invite:` QR twin) is
     // a DIFFERENT token type than the v3 `mesh:<id>@<ip>:<port>#<bearer>` join
@@ -104,7 +526,7 @@ pub fn run(
     // validate mesh-scope + TTL + the bearer ledger, then gate the endpoint-
     // needing live leg (the envelope is endpoint-less by design).
     if mackesd_core::onboard::invite::looks_like_invite(&raw_token) {
-        return cmd_join_invite(&raw_token, parsed, name, workgroup_root);
+        return cmd_join_invite(&raw_token, requested_role, name, workgroup_root);
     }
 
     let token = mackesd_core::nebula_enroll::parse_join_token(&raw_token).ok_or_else(|| {
@@ -119,15 +541,12 @@ pub fn run(
             .to_string()
     });
 
-    // Pin the role when unpinned (an already-pinned box keeps its role).
-    match mde_role::load() {
-        Ok(existing) => println!("role already pinned: {existing}"),
-        Err(mde_role::LoadError::NotPinned) => {
-            mde_role::pin(parsed).map_err(|e| anyhow::anyhow!("pinning role: {e}"))?;
-            println!("role pinned: {}", parsed.as_str());
-        }
-        Err(e) => anyhow::bail!("reading role: {e}"),
-    }
+    // The on-disk pin is authoritative during rejoin. Role omission defaults
+    // to Workstation only for a genuinely fresh node; an explicit conflict is
+    // rejected before either legacy or network enrollment can consume a token.
+    let role = load_join_role(requested_role)?;
+    persist_join_role(role)?;
+    let effective_role = role.effective;
 
     if token.fp.is_none() {
         // No fingerprint → legacy co-located QNM-Shared flow (the network
@@ -160,6 +579,10 @@ pub fn run(
         &display_name,
         token,
     ))?;
+    // The bearer has completed its single use. Drop the only remaining encoded
+    // copy before any setup subprocess is spawned; helpers receive overlay IPs
+    // only, and no token can reach argv, stdout, or diagnostics.
+    drop(raw_token);
 
     // Bring the peer fully live + boot-durable (ONBOARD-9): the overlay, the
     // worker daemon, and the health watchdog — not just nebula. A `join` now
@@ -168,13 +591,13 @@ pub fn run(
     enable_now_service("nebula.service");
 
     // CONNECT-4 — if this peer joined as a Lighthouse, it's an ingress node too.
-    provision_caddy_if_lighthouse(parsed);
+    provision_caddy_if_lighthouse(effective_role);
 
     // LIGHTHOUSE-10 — an ADDITIONAL lighthouse (the 2nd–5th) persists its own
     // public underlay address so its heartbeat publishes it to the directory and
     // every node's enroll roster includes it (full redundancy). Auto-detect the
     // primary public IPv4 (override later with `mackesd set-external-addr`).
-    if parsed == mde_role::Role::Lighthouse {
+    if effective_role == mde_role::Role::Lighthouse {
         match detect_primary_ipv4() {
             Ok(ip) => {
                 if let Err(e) =
@@ -203,7 +626,7 @@ pub fn run(
         // LoadCredentialEncrypted drop-in so the upcoming mackesd restart
         // picks it up. Best-effort: a miss logs an actionable line but
         // never aborts the join.
-        provision_ca_backup_passphrase_if_lighthouse(parsed);
+        provision_ca_backup_passphrase_if_lighthouse(effective_role);
     }
 
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
@@ -213,16 +636,35 @@ pub fn run(
         .iter()
         .map(|lh| lh.overlay_ip.clone())
         .collect();
-    emit_site_yml_best_effort(parsed.as_str(), &bundle.mesh_id, roster);
+    emit_site_yml_best_effort(effective_role.as_str(), &bundle.mesh_id, roster);
 
-    enable_now_service("mackesd.service");
-    enable_now_service("mesh-health.timer");
+    // A Workstation is not a fleet member merely because Nebula has a signed
+    // identity. Materialize its etcd client endpoints from the signer-provided
+    // overlay roster, then stand up the Syncthing file plane. Both packaged
+    // helpers are idempotent; execution is timeout-bounded and never receives
+    // the enrollment token. Coordination fails closed. A file-plane miss is
+    // reported as degraded while the usable overlay/control plane comes up.
+    let workstation_setup = finish_network_enrollment(
+        effective_role,
+        &bundle,
+        &SystemSetupCommandRunner,
+        enable_now_service,
+    )?;
 
     println!(
         "joined `{}` as {} (overlay {})",
         bundle.mesh_id, node_id, bundle.overlay_ip
     );
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
+    match workstation_setup {
+        Some(WorkstationSetupState::Ready) => {
+            println!("workstation fleet: etcd client + Syncthing configured (boot-durable)");
+        }
+        Some(WorkstationSetupState::Degraded { reason }) => {
+            eprintln!("workstation fleet: DEGRADED — {reason}");
+        }
+        None => {}
+    }
     Ok(())
 }
 
@@ -333,5 +775,304 @@ fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
              warn SEC-7/ENT-11 until you provision it by hand (see the EFF-15 comment in the \
              mackesd.service unit)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Invocation {
+        program: String,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    }
+
+    struct FakeRunner {
+        outcomes: RefCell<VecDeque<Result<(), SetupCommandFailure>>>,
+        invocations: RefCell<Vec<Invocation>>,
+    }
+
+    impl FakeRunner {
+        fn new(outcomes: Vec<Result<(), SetupCommandFailure>>) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes.into()),
+                invocations: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SetupCommandRunner for FakeRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<(), SetupCommandFailure> {
+            self.invocations.borrow_mut().push(Invocation {
+                program: program.to_string(),
+                args: args.to_vec(),
+                timeout,
+            });
+            self.outcomes
+                .borrow_mut()
+                .pop_front()
+                .expect("fake runner needs one outcome per invocation")
+        }
+    }
+
+    fn bundle(lighthouses: &[(&str, &str)]) -> mackesd_core::ca::bundle::NebulaBundle {
+        mackesd_core::ca::bundle::NebulaBundle {
+            mesh_id: "surface-mesh".to_string(),
+            epoch: 7,
+            ca_cert_pem: "public-ca".to_string(),
+            peer_cert_pem: "public-peer".to_string(),
+            overlay_ip: "10.42.0.79".to_string(),
+            mesh_cidr: "10.42.0.0/16".to_string(),
+            lighthouses: lighthouses
+                .iter()
+                .map(
+                    |(node_id, overlay_ip)| mackesd_core::ca::bundle::LighthouseEntry {
+                        node_id: (*node_id).to_string(),
+                        overlay_ip: (*overlay_ip).to_string(),
+                        external_addr: "203.0.113.10:4242".to_string(),
+                        relay_tls: None,
+                    },
+                )
+                .collect(),
+            relay_trust_authority: None,
+            created_at: 1_786_000_000,
+        }
+    }
+
+    #[test]
+    fn omitted_role_preserves_a_pinned_lighthouse_and_runs_no_workstation_helper() {
+        let resolved = resolve_join_role(Some(mde_role::Role::Lighthouse), None)
+            .expect("the existing pin is authoritative");
+        assert_eq!(resolved.effective, mde_role::Role::Lighthouse);
+        assert!(!resolved.pin_required);
+
+        let runner = FakeRunner::new(vec![]);
+        let mut services = Vec::new();
+        let state = finish_network_enrollment(
+            resolved.effective,
+            &bundle(&[("peer:lh1", "10.42.0.1")]),
+            &runner,
+            |service| services.push(service.to_string()),
+        )
+        .expect("Lighthouse finalization");
+        assert_eq!(state, None);
+        assert!(runner.invocations.borrow().is_empty());
+        assert_eq!(
+            services,
+            vec![
+                "mackesd.service".to_string(),
+                "mesh-health.timer".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn conflicting_explicit_role_is_refused_before_enrollment() {
+        let error = resolve_join_role(
+            Some(mde_role::Role::Lighthouse),
+            Some(mde_role::Role::Workstation),
+        )
+        .expect_err("an explicit role cannot override the pin");
+        assert!(error.contains("already pinned as `lighthouse`"), "{error}");
+        assert!(error.contains("refusing conflicting"), "{error}");
+    }
+
+    #[test]
+    fn omitted_role_defaults_to_workstation_only_when_unpinned() {
+        assert_eq!(
+            resolve_join_role(None, None).expect("fresh-node default"),
+            JoinRoleResolution {
+                effective: mde_role::Role::Workstation,
+                pin_required: true,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_role_diagnostic_never_echoes_token_shaped_input() {
+        let token_shaped = "mesh:test@192.0.2.1:4243#bearer-value?fp=abcd";
+        let error = parse_requested_join_role(Some(token_shaped))
+            .expect_err("invalid role")
+            .to_string();
+        assert!(error.contains("unknown role value"), "{error}");
+        assert!(!error.contains("bearer-value"), "{error}");
+        assert!(!error.contains("mesh:"), "{error}");
+    }
+
+    #[test]
+    fn helper_failure_after_enrollment_keeps_essential_activation_and_reports_recovery() {
+        let runner = FakeRunner::new(vec![Err(SetupCommandFailure::Exited {
+            code: Some(1),
+            diagnostic: "etcd unit failed".to_string(),
+        })]);
+        let mut services = Vec::new();
+        let error = finish_network_enrollment(
+            mde_role::Role::Workstation,
+            &bundle(&[("peer:lh1", "10.42.0.1")]),
+            &runner,
+            |service| services.push(service.to_string()),
+        )
+        .expect_err("required etcd setup fails")
+        .to_string();
+
+        assert_eq!(
+            services,
+            vec![
+                "mackesd.service".to_string(),
+                "mesh-health.timer".to_string()
+            ]
+        );
+        assert_eq!(runner.invocations.borrow().len(), 1);
+        assert!(error.contains("network enrollment succeeded"), "{error}");
+        assert!(
+            error.contains("single-use enrollment token was consumed"),
+            "{error}"
+        );
+        assert!(error.contains("do not retry that token"), "{error}");
+        assert!(error.contains("Recover without re-enrollment"), "{error}");
+        assert!(error.contains(SETUP_ETCD), "{error}");
+        assert!(error.contains(SETUP_SYNCTHING), "{error}");
+        assert!(
+            !error.contains("mesh:"),
+            "diagnostic exposed a token shape: {error}"
+        );
+    }
+
+    #[test]
+    fn workstation_setup_uses_signed_roster_then_syncthing() {
+        let runner = FakeRunner::new(vec![Ok(()), Ok(())]);
+        let state = setup_workstation_substrate(
+            &bundle(&[
+                ("peer:lh3", "10.42.0.3"),
+                ("peer:lh1", "10.42.0.1"),
+                ("peer:lh3-duplicate", "10.42.0.3"),
+            ]),
+            &runner,
+        )
+        .expect("setup");
+        assert_eq!(state, WorkstationSetupState::Ready);
+        assert_eq!(
+            *runner.invocations.borrow(),
+            vec![
+                Invocation {
+                    program: SETUP_ETCD.to_string(),
+                    args: vec![
+                        "--client-only".to_string(),
+                        "--anchors".to_string(),
+                        "10.42.0.1,10.42.0.3".to_string(),
+                    ],
+                    timeout: WORKSTATION_SETUP_TIMEOUT,
+                },
+                Invocation {
+                    program: SETUP_SYNCTHING.to_string(),
+                    args: vec!["--listen".to_string(), "10.42.0.79".to_string()],
+                    timeout: WORKSTATION_SETUP_TIMEOUT,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_or_empty_signed_roster_fails_before_subprocesses() {
+        for candidate in [
+            bundle(&[]),
+            bundle(&[("peer:bad", "not-an-ip")]),
+            bundle(&[("peer:foreign", "10.43.0.1")]),
+            bundle(&[("peer:collision", "10.42.0.79")]),
+        ] {
+            let runner = FakeRunner::new(vec![]);
+            let error = setup_workstation_substrate(&candidate, &runner)
+                .expect_err("malformed roster must fail closed")
+                .to_string();
+            assert!(error.contains("failed closed"), "{error}");
+            assert!(runner.invocations.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn etcd_failure_is_fail_closed_and_skips_syncthing() {
+        let runner = FakeRunner::new(vec![Err(SetupCommandFailure::TimedOut { seconds: 300 })]);
+        let error = setup_workstation_substrate(&bundle(&[("peer:lh1", "10.42.0.1")]), &runner)
+            .expect_err("etcd is required")
+            .to_string();
+        assert!(error.contains("failed closed"), "{error}");
+        assert!(error.contains("Syncthing was not attempted"), "{error}");
+        assert!(error.contains("bounded 300s"), "{error}");
+        assert!(error.contains("Recover without re-enrollment"), "{error}");
+        assert_eq!(runner.invocations.borrow().len(), 1);
+        assert_eq!(runner.invocations.borrow()[0].program, SETUP_ETCD);
+    }
+
+    #[test]
+    fn syncthing_failure_reports_degraded_but_keeps_coordination() {
+        let runner = FakeRunner::new(vec![
+            Ok(()),
+            Err(SetupCommandFailure::Exited {
+                code: Some(1),
+                diagnostic: "syncthing package unavailable".to_string(),
+            }),
+        ]);
+        let state = setup_workstation_substrate(&bundle(&[("peer:lh1", "10.42.0.1")]), &runner)
+            .expect("etcd succeeded");
+        let WorkstationSetupState::Degraded { reason } = state else {
+            panic!("expected degraded file plane");
+        };
+        assert!(reason.contains("syncthing package unavailable"));
+        assert!(reason.contains("etcd coordination remain configured"));
+        assert!(reason.contains("single-use enrollment token is consumed"));
+        assert!(reason.contains("Recover without re-enrollment"));
+        assert_eq!(runner.invocations.borrow().len(), 2);
+    }
+
+    #[test]
+    fn workstation_setup_is_repeatable_with_identical_idempotent_commands() {
+        let runner = FakeRunner::new(vec![Ok(()), Ok(()), Ok(()), Ok(())]);
+        let signed = bundle(&[("peer:lh1", "10.42.0.1"), ("peer:lh2", "10.42.0.2")]);
+        assert_eq!(
+            setup_workstation_substrate(&signed, &runner).unwrap(),
+            WorkstationSetupState::Ready
+        );
+        assert_eq!(
+            setup_workstation_substrate(&signed, &runner).unwrap(),
+            WorkstationSetupState::Ready
+        );
+        let calls = runner.invocations.borrow();
+        assert_eq!(&calls[..2], &calls[2..]);
+    }
+
+    #[test]
+    fn production_runner_enforces_timeout_and_reaps_the_child() {
+        let started = std::time::Instant::now();
+        let result = SystemSetupCommandRunner.run(
+            "/usr/bin/sleep",
+            &["30".to_string()],
+            std::time::Duration::from_millis(100),
+        );
+        assert!(
+            matches!(result, Err(SetupCommandFailure::TimedOut { .. })),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "timeout did not bound execution"
+        );
+    }
+
+    #[test]
+    fn helper_diagnostics_redact_token_shaped_values() {
+        let diagnostic = redact_setup_diagnostic(
+            "helper failed token=mesh:test@192.0.2.1:4243#bearer-value?fp=abcd; retry",
+        );
+        assert!(!diagnostic.contains("bearer-value"));
+        assert!(diagnostic.contains("<redacted-token>"));
     }
 }

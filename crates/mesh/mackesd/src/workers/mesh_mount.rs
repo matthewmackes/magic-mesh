@@ -73,10 +73,9 @@ pub const MESH_SSH_KEY_REF: &str = "mesh-ssh-key";
 /// The mesh SSH login user for the overlay sshfs session.
 ///
 /// The shared key authenticates as this user (FILEMGR-6 installs it into the
-/// user's `authorized_keys`, overlay-bound). `root` matches the fleet's
-/// passwordless overlay-SSH baseline (`ssh_pubkey_gossip` / `sshd_overlay_bind`);
-/// overridable so FILEMGR-6 can pin a dedicated mesh user.
-pub const DEFAULT_MESH_USER: &str = "root";
+/// user's `authorized_keys`, overlay-bound). The password-locked account is
+/// reconciled only on joined nodes; its key comes from the mesh secret store.
+pub const DEFAULT_MESH_USER: &str = crate::ipc::mesh_service_account::MESH_SERVICE_USER;
 
 /// Default poll cadence on the request topics + the health/idle/reconnect tick.
 ///

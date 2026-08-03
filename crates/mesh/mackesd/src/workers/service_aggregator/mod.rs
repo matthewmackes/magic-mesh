@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::service_record::ServicesState;
+use mackes_mesh_types::resources::RESOURCE_CATALOG_TOPIC;
 
 use aggregate::{aggregate, ProbeInput, PublishedInput};
 
@@ -173,6 +174,8 @@ impl ProbeSource for InventoryProbe {
 pub struct ServiceAggregatorWorker {
     /// This node's id — the mirror `host` stamp + topic namespace.
     host: String,
+    /// Shared root holding non-secret desired service configuration.
+    workgroup_root: PathBuf,
     /// The published-directory half.
     published: Arc<dyn PublishedSource>,
     /// The probe-inventory half.
@@ -195,6 +198,7 @@ impl ServiceAggregatorWorker {
     pub fn new(host: String, workgroup_root: PathBuf) -> Self {
         Self {
             host,
+            workgroup_root: workgroup_root.clone(),
             published: Arc::new(DirectoryPublished::new(workgroup_root.clone())),
             probe: Arc::new(InventoryProbe::new(workgroup_root)),
             bus_root: default_bus_root(),
@@ -269,6 +273,21 @@ impl ServiceAggregatorWorker {
         let heartbeat_due = last_pub_at.is_none_or(|at| now.duration_since(at) >= self.heartbeat);
         if changed || heartbeat_due {
             publish_json(self.bus_root.as_deref(), &state_topic(&self.host), &state);
+            match super::service_catalog::catalog_from_services_with_root(
+                &state,
+                &self.workgroup_root,
+            ) {
+                Ok(catalog) => publish_json(
+                    self.bus_root.as_deref(),
+                    RESOURCE_CATALOG_TOPIC,
+                    &catalog,
+                ),
+                Err(error) => tracing::error!(
+                    host = %self.host,
+                    error = %error,
+                    "refusing to publish an invalid universal resource catalog"
+                ),
+            }
             *last_pub_at = Some(now);
         }
         *last = Some(state);
@@ -304,6 +323,7 @@ impl Worker for ServiceAggregatorWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::resources::ResourceCatalog;
     use mackes_mesh_types::service_record::{ServiceHealth, ServiceProvenance};
 
     struct FakePublished(Vec<PublishedInput>);
@@ -366,6 +386,26 @@ mod tests {
         assert!(r.attested_by(ServiceProvenance::Published));
         assert!(r.attested_by(ServiceProvenance::Probe));
         assert!(r.attested_by(ServiceProvenance::Enrichment));
+    }
+
+    #[test]
+    fn publish_cycle_writes_the_validated_universal_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = worker_with(vec![], vec![]).with_bus_root(Some(dir.path().to_path_buf()));
+        let mut last = None;
+        let mut last_pub_at = None;
+
+        worker.cycle_and_publish(&mut last, &mut last_pub_at);
+
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
+        let body = persist
+            .read_latest(RESOURCE_CATALOG_TOPIC)
+            .expect("read catalog")
+            .and_then(|message| message.body)
+            .expect("catalog body");
+        let catalog = ResourceCatalog::from_json(&body).expect("validated catalog");
+        assert_eq!(catalog.publisher, "me");
+        assert!(catalog.cards.iter().any(|card| card.display_name == "Jellyfin"));
     }
 
     #[tokio::test]

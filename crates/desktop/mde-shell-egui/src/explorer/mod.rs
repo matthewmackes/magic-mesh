@@ -655,7 +655,7 @@ trait ActionSink {
 }
 
 /// The production sink: append the request to the desktop-client Bus spool — the
-/// SAME persist-first path [`crate::services_flow`] and [`crate::storage`] publish
+/// SAME persist-first path the provisioning and [`crate::storage`] surfaces publish
 /// their actions through.
 struct BusActions {
     /// The desktop-client Bus spool root (`None` ⇒ no Bus ⇒ an honest "no Bus"

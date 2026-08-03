@@ -25,7 +25,8 @@
 set -euo pipefail
 
 LISTEN=""; FOLDER=/mnt/mesh-storage; HOME_DIR=/var/lib/mcnf-syncthing; FOLDER_ID=mcnf-mesh
-ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
+ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
+SYSTEMD_DIR="${MCNF_SYSTEMD_DIR:-/etc/systemd/system}"
 
 while [ $# -gt 0 ]; do case "$1" in
   --listen) LISTEN="$2"; shift 2;;
@@ -72,6 +73,7 @@ log "device id: $DEVICE_ID"
 # ---- read peer device IDs from the etcd registry (best-effort) -------------
 # Format passed to the python editor: "host=DEVICEID" lines.
 PEER_DEVICES=""
+REGISTRY_SNAPSHOT_NONEMPTY=0
 if command -v etcdctl >/dev/null 2>&1 && [ -s "$ENDPOINTS_FILE" ]; then
   EPS="$(tr '\n' ',' < "$ENDPOINTS_FILE" | sed 's/,$//')"
   # Publish our ID + overlay IP so peers can dial us explicitly (discovery is off).
@@ -82,14 +84,23 @@ if command -v etcdctl >/dev/null 2>&1 && [ -s "$ENDPOINTS_FILE" ]; then
   # suppresses the keys the awk needed, and -w fields base64-encodes; the
   # SUBSTRATE-14 rehearsal caught the registry yielding 0 peers despite both
   # devices being present.)
-  PEER_DEVICES="$(ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/null \
-    | awk 'NR%2==1{sub(/.*\/mesh\/syncthing\//,"",$0); k=$0; next} {print k"="$0}' || true)"
+  # A failed or empty read is NOT an authoritative empty registry. Preserve all
+  # existing folder shares and global devices in that case; otherwise a brief
+  # etcd outage during setup could destructively erase a healthy file plane.
+  REGISTRY_RAW=""
+  if REGISTRY_RAW="$(ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/null)" \
+     && [ -n "$(printf '%s' "$REGISTRY_RAW" | tr -d '[:space:]')" ]; then
+    PEER_DEVICES="$(printf '%s\n' "$REGISTRY_RAW" \
+      | awk 'NR%2==1{sub(/.*\/mesh\/syncthing\//,"",$0); k=$0; next} {print k"="$0}')"
+    REGISTRY_SNAPSHOT_NONEMPTY=1
+  fi
 fi
 
 # ---- apply overlay-only config + the shared folder + peers (XML edit) ------
 # Offline config edit (the `syncthing cli` config API needs a running daemon),
 # done with real XML parsing so it's schema-tolerant across syncthing versions.
-PEER_DEVICES="$PEER_DEVICES" python3 - "$HOME_DIR/config.xml" "$DEVICE_ID" "$HOST" "$FOLDER" "$FOLDER_ID" "$LISTEN" <<'PY'
+PEER_DEVICES="$PEER_DEVICES" REGISTRY_SNAPSHOT_NONEMPTY="$REGISTRY_SNAPSHOT_NONEMPTY" \
+python3 - "$HOME_DIR/config.xml" "$DEVICE_ID" "$HOST" "$FOLDER" "$FOLDER_ID" "$LISTEN" <<'PY'
 import os, re, sys, xml.etree.ElementTree as ET
 cfg, my_id, my_host, folder, folder_id, listen = sys.argv[1:7]
 tree = ET.parse(cfg); root = tree.getroot()
@@ -149,6 +160,9 @@ def ensure_device(dev_id, name, addr='dynamic'):
 
 ensure_device(my_id, my_host)
 peers = []
+seen_peers = set()
+valid_registry_entries = 0
+saw_self_in_registry = False
 for line in os.environ.get('PEER_DEVICES','').splitlines():
     line = line.strip()
     if '=' not in line: continue
@@ -158,11 +172,26 @@ for line in os.environ.get('PEER_DEVICES','').splitlines():
     # peer address); tolerate a bare id (no @) by falling back to dynamic.
     dev, _, ip = val.partition('@')
     dev, ip = dev.strip(), ip.strip()
-    if not dev or dev == my_id: continue
+    if not dev: continue
     if not DEV_RE.match(dev):
         sys.stderr.write(f'skipping malformed device id for {host!r}\n'); continue
+    valid_registry_entries += 1
+    if dev == my_id:
+        saw_self_in_registry = True
+        continue
+    if dev in seen_peers: continue
     ensure_device(dev, host, f'tcp://{ip}:22000' if ip else 'dynamic')
+    seen_peers.add(dev)
     peers.append(dev)
+
+# Destructive reconciliation is permitted only from a successful, non-empty
+# registry snapshot containing this node's just-published identity. A failed,
+# empty, stale, or wholly malformed snapshot is unknown state, never "no peers".
+registry_authoritative = (
+    os.environ.get('REGISTRY_SNAPSHOT_NONEMPTY') == '1'
+    and valid_registry_entries > 0
+    and saw_self_in_registry
+)
 
 # The shared folder at <folder>, full-mesh to every known device, with
 # trash-can versioning (lock #4).
@@ -175,18 +204,46 @@ if fol is None:
 fol.set('label', 'Mesh Sync')
 fol.set('path', folder)
 fol.set('type', 'sendreceive')
-# Reset device shares + versioning to the desired set.
-for d in fol.findall('device'): fol.remove(d)
-ET.SubElement(fol, 'device', {'id': my_id})
-for dev in peers:
-    ET.SubElement(fol, 'device', {'id': dev})
+# Reset the managed folder only from an authoritative registry snapshot. When
+# the registry is offline/empty, preserve every existing share and merely make
+# sure this node remains associated with its own folder.
+if registry_authoritative:
+    for d in fol.findall('device'): fol.remove(d)
+    ET.SubElement(fol, 'device', {'id': my_id})
+    for dev in peers:
+        ET.SubElement(fol, 'device', {'id': dev})
+elif not any(d.get('id') == my_id for d in fol.findall('device')):
+    ET.SubElement(fol, 'device', {'id': my_id})
 for v in fol.findall('versioning'): fol.remove(v)
 ver = ET.SubElement(fol, 'versioning', {'type': 'trashcan'})
 ET.SubElement(ver, 'cleanupIntervalS').text = '3600'
 ET.SubElement(ver, 'param', {'key': 'cleanoutDays', 'val': '30'})
 
+# A full setup can remove stale global devices, but only after the guarded
+# managed-folder reconciliation above. Keep self, every desired registry peer,
+# and every device referenced by ANY folder (including non-MCNF folders). This
+# safely removes stale unshared Lighthouse entries without damaging unrelated
+# shares. The timer reconciler remains strictly additive and never runs this.
+pruned = []
+if registry_authoritative:
+    desired = {my_id, *peers}
+    referenced = {
+        d.get('id')
+        for shared_folder in root.findall('folder')
+        for d in shared_folder.findall('device')
+        if d.get('id')
+    }
+    for device in list(root.findall('device')):
+        dev_id = device.get('id')
+        if dev_id and dev_id not in desired and dev_id not in referenced:
+            root.remove(device)
+            pruned.append(dev_id)
+
 tree.write(cfg, encoding='UTF-8', xml_declaration=True)
-print(f'configured folder {folder_id} at {folder} with {len(peers)} peer device(s)')
+if registry_authoritative:
+    print(f'configured folder {folder_id} at {folder} with {len(peers)} peer device(s); pruned {len(pruned)} stale unshared global device(s)')
+else:
+    print(f'configured folder {folder_id} at {folder}; registry unavailable/empty, preserved existing device shares')
 PY
 
 # ---- boot-durable unit ----------------------------------------------------
@@ -195,7 +252,8 @@ PY
 # from /usr/libexec/mackesd, so the unit was never installed and syncthing never
 # started; the SUBSTRATE-14 rehearsal caught it). Works identically from a git
 # checkout, the RPM, or the installed libexec path.
-cat > /etc/systemd/system/syncthing.service <<'UNIT'
+mkdir -p "$SYSTEMD_DIR"
+cat > "$SYSTEMD_DIR/syncthing.service" <<'UNIT'
 [Unit]
 Description=MCNF Mesh Sync (Syncthing) — overlay file replication
 After=network-online.target nebula.service
@@ -220,8 +278,8 @@ WantedBy=multi-user.target
 UNIT
 # The unit runs `syncthing serve --home <HOME_DIR>`; pin the home via a drop-in
 # so a custom --home survives.
-mkdir -p /etc/systemd/system/syncthing.service.d
-cat > /etc/systemd/system/syncthing.service.d/10-home.conf <<EOF
+mkdir -p "$SYSTEMD_DIR/syncthing.service.d"
+cat > "$SYSTEMD_DIR/syncthing.service.d/10-home.conf" <<EOF
 [Service]
 Environment=MCNF_SYNCTHING_HOME=$HOME_DIR
 # HOME too — syncthing v1.30.0 panics without it under systemd (see the unit).
@@ -238,7 +296,7 @@ systemctl restart syncthing.service 2>/dev/null || true
 # to the RUNNING daemon LIVE (no restart; idempotent no-op at steady state), so the
 # file plane self-heals like the etcd peer directory. Units written inline (same
 # reason as syncthing.service above — a path-relative cp from /usr/libexec fails).
-cat > /etc/systemd/system/syncthing-reconcile.service <<UNIT
+cat > "$SYSTEMD_DIR/syncthing-reconcile.service" <<UNIT
 [Unit]
 Description=MCNF Mesh Sync — reconcile Syncthing peer devices from the etcd registry
 After=syncthing.service etcd.service
@@ -247,7 +305,7 @@ Type=oneshot
 Environment=MCNF_SYNCTHING_HOME=$HOME_DIR
 ExecStart=/usr/libexec/mackesd/syncthing-reconcile
 UNIT
-cat > /etc/systemd/system/syncthing-reconcile.timer <<'UNIT'
+cat > "$SYSTEMD_DIR/syncthing-reconcile.timer" <<'UNIT'
 [Unit]
 Description=MCNF Mesh Sync — periodic Syncthing device reconcile (SUBSTRATE-5)
 [Timer]

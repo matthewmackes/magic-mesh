@@ -5,6 +5,53 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Latest live state at 10:38 EDT: Dell is running the Fedora 44
+production-feature shell built natively on `.131` with
+`drm,live-vdi,media-mpv`. The installed `/usr/bin/mde-shell-egui` SHA-256 is
+`8560999ebec43d0738c55ee5223d9e7afb3d68fcf7ca2ed8dfed0a7fb5cbddc5`;
+`mde-shell-egui.service` is active with zero restarts and
+`XDG_RUNTIME_DIR=/run/user/1000`. The prior binary and unit are recoverable at
+`/var/lib/mcnf-release-backups/dell-r1-20260803-8560999e`.
+
+Dell received the mandatory update warning as Bus receipt
+`01KZ40SV1388BQ6V5FBGA0R7BB`, followed by the full five-second delay before
+any release file changed. The new shell then consumed persistent Critical test
+receipt `01KZ40VHZ90NE068QC6EQXTW0G`, whose exact flag is
+`AI-GENERATED-ALERT`; it requests the dedicated red, centered, constrained
+card and stays visible until acknowledged. The alert's focused farm tests pass
+exact-flag routing, operator-alert preemption, and wide/narrow centered
+geometry. Dell's root shell can also open the primary seat user's real
+PipeWire graph: a live `pw-cat` probe linked to both ALC3246 playback channels,
+and `/usr/share/sounds/alsa/Front_Center.wav` completed with exit zero.
+Audibility still needs the operator's physical confirmation.
+
+The `browser-vm` libvirt domain is running and QEMU guest-agent responds. The
+next mutation is deliberately held behind acknowledgment of the persistent
+Dell test card so the credential rotation's exact five-second warning is the
+visible foreground alert. The host-bound RDP credential is therefore not yet
+installed, the desired Workloads row is not yet admitted, and no RDP
+frame/input/reconnect claim is made. After acknowledgment, the ordered R1 path
+is credential rotation, authorized `browser-provision`, typed RDP attachment,
+then Chromium frame/input/audio/reconnect proof.
+
+Earlier live state at 07:59 EDT: the native Fedora 44 review RPM completed,
+passed its real-payload and size gates, and was installed by digest on T480,
+Eagle, seat 15, Dell, and the newly onboarded Microsoft Surface Pro 6. Surface
+is now the healthy Workstation `SURFACE` at overlay `10.42.0.7`. T480's
+separate old-mesh identity was archived and cleanly re-enrolled into the current
+mesh as `peer:T480` at `10.42.0.8`; its etcd-client, Syncthing, role services,
+and QEMU/KVM runtime are active. Eagle's missing QEMU/KVM runtime was also
+installed. All three lighthouses then reported eight healthy nodes and HA
+green. This closed the seat-package and Surface/T480 enrollment prerequisites,
+not Browser VM acceptance. Full evidence and exact artifact digests are in
+[`f44-seat-rollout-surface-2026-08-03.md`](f44-seat-rollout-surface-2026-08-03.md).
+
+## Earlier progression
+
+The entries below preserve intermediate observations in chronological build
+order. When an older reachability or fleet statement conflicts with the
+timestamped current state above, the current state is authoritative.
+
 Mesh recovery evidence at 05:05 EDT: the three reachable public lighthouses
 (`104.236.118.177`, `46.101.219.245`, and `64.23.131.57`) had regressed to
 self-only Nebula bundles. I backed up each bundle, restored the known three-
@@ -16,9 +63,9 @@ lighthouse public roster and peer records, and promoted the tested
 lighthouses, and can query etcd health. This clears the mesh-control-plane
 blocker, but it does not create a VM on seat-15 or Dell.
 
-The Dell overlay target `10.42.0.4` still drops ping and times out on SSH,
-RDP, SPICE, and VNC ports from the restored mesh; Dell `.225` and `.2` remain
-unavailable from the orchestrator. Seat-15 still has no `/dev/kvm`, Browser VM
+At the 05:05 checkpoint, the Dell overlay target `10.42.0.4` still dropped ping
+and timed out on SSH, RDP, SPICE, and VNC ports from the restored mesh; Dell
+`.225` and `.2` were unavailable from the orchestrator. Seat-15 had no `/dev/kvm`, Browser VM
 workload, or VDI listener. Therefore access to Chromium on Dell has no honest
 time-of-day ETA yet: it begins after Dell is reachable and its host/KVM is
 recovered, followed by image publication and live guest-frame/input checks.
@@ -28,22 +75,23 @@ supported` and `/dev/kvm` remained absent. No package, domain, or image
 installation mutation was attempted because this host is not exposing a
 KVM-capable execution path.
 
-Rollout handoff at 07:05 EDT (source tree `a7b26cec`): the farm/Fedora 42
+Earlier rollout handoff at 07:05 EDT (source tree `a7b26cec`, superseded by the
+latest state above): the farm/Fedora 42
 RPM `magic-mesh-12.1.6-1.x86_64.rpm` was built on BigBoy, but its transaction
 was rejected on T480 `.138`, Eagle `.145`, seat-15, and Dell because the
 Fedora 42 multimedia sonames are not present on Fedora 44. No workstation
 upgrade was accepted. The documented Fedora 44 builder `mcnf-build-f44` was
 started on BigBoy after confirming the regular F42 builder had no active job;
-the native F44 container build is still running at
+the native F44 container build was then running at
 `/home/mm/magic-mesh-farm-seat-fleet-f44-20260803` and has not produced an RPM
-yet.
+at that handoff point.
 
 The current workstation rollout targets are T480 `.138`
 (`172.20.146.138`), Eagle `.145` (`172.20.146.145`), seat-15
-(`172.20.0.15`), and Dell (`172.20.146.225`). The separate Microsoft Surface
-Pro 6 target is `172.20.146.79`; the stored operator SSH credential was
-rejected there, so Surface has not been modified or included in the rollout.
-No seat currently has live Browser VM acceptance evidence.
+(`172.20.0.15`), Dell (`172.20.146.225`), and the separate Microsoft Surface
+Pro 6 (`172.20.146.79`). All five now carry the same verified Fedora 44 review
+RPM; Surface is enrolled separately and is not seat 15. No seat currently has
+live Browser VM acceptance evidence.
 
 Continuation evidence at 04:36 EDT: the current Fedora 44 workstation RPM was
 built on BigBoy `.130` in slot `seat15-base-f44-20260803`, passed the 90-MiB
@@ -67,7 +115,7 @@ the qcow2 after KVM, qemu-img, sudo, path, and digest checks. The package
 contract, extraction manifest, and worklist self-tests pass locally and the
 Browser contract passes on farm `.50`.
 
-The latest target inventory remains negative: seat-15 (`172.20.0.15`) is SSH
+Earlier target inventory at that point was negative: seat-15 (`172.20.0.15`) was SSH
 reachable with no VDI listener and no readable `/dev/kvm`; Dell
 (`172.20.146.225`), its direct address (`172.20.146.2`), and overlay
 (`10.42.0.4`) are unavailable. No image publication or live acceptance was
@@ -112,7 +160,7 @@ footprint. It is retained historical evidence only: the deployment preflight
 now rejects it because the typed Browser VM contract requires a 64-GiB virtual
 disk.
 
-Latest image-contract evidence: the image builder now binds its disk output to
+Image-contract evidence from that build sequence: the image builder binds its disk output to
 `BROWSER_VM_DISK_GB=64` and resizes raw/qcow2 artifacts to that virtual size.
 After the profile pin advanced in `3fbf2223` to corrected source
 `dd973836` (which includes the guest-readable NoCloud permissions fix), a
@@ -124,8 +172,9 @@ Its SHA-256 is
 virtual size with a 1.72-GiB compressed footprint. The image carries source
 label `dd973836` (container image ID
 `3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`); the old
-10-GiB artifact is rejected by preflight. This is the current publish
-candidate, but remains uninstalled because Dell is unreachable.
+10-GiB artifact is rejected by preflight. This remains the publish candidate.
+It was uninstalled at that checkpoint because Dell was unreachable; Dell later
+returned, as recorded in the current state, but live publication is still open.
 
 The new `install-helpers/verify-browser-vm-performance.py` gate is now wired
 into the Browser contract and farm-verified on `.50`. It accepts only a
@@ -158,9 +207,10 @@ code `101` and no accepted framebuffer marker; the validated bounded record is
 `f8ee07239ad8b4745f2b0ba1b09dcd4141ca094a2d2aca64ac537d1c1d7268d5`). This is
 negative reachability evidence, not live guest readiness.
 
-It has not been installed on Dell: `172.20.146.225` currently returns no route
-and overlay `10.42.0.4` times out. Seat 15 (`172.20.0.15`) is reachable but
-has no libvirt domain or RDP/SPICE/VNC listener. Therefore no current live
+The rebuilt RDP image has not been installed on Dell. Dell is reachable again,
+but its current `browser-vm` remains the historical QXL/SPICE domain rather
+than the new RDP candidate. Seat 15 (`172.20.0.15`) is reachable but has no
+usable `/dev/kvm`, libvirt domain, or RDP/SPICE/VNC listener. Therefore no current live
 guest-frame, focused-input, GPU-video, guest-audio, reconnect, performance, or
 six-node acceptance claim is made here.
 
@@ -371,8 +421,9 @@ On BigBoy (`172.20.0.130`):
   passed 5 focused Browser surface tests and 5 focused brokered VDI protocol
   resolution tests, including authoritative broker protocol selection and
   old-record compatibility.
-- Seat 15 (`172.20.0.15`) remains untouched; its low free-space condition makes
-  it unsuitable for this image without operator capacity work.
+- Seat 15 (`172.20.0.15`) received the F44 base review RPM, but its Browser
+  image remains untouched; low free space and absent KVM make it unsuitable for
+  this image without capacity/hypervisor work.
 
 ## Still unproven
 

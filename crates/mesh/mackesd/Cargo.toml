@@ -481,6 +481,11 @@ assets = [
     { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
+    # Browser VM RDP login is rotated per serving seat and sealed by systemd.
+    # The warning helper is the mandatory five-second pre-update operator notice.
+    { source = "install-helpers/seat-update-warning.sh", dest = "/usr/libexec/mackesd/seat-update-warning", mode = "755" },
+    { source = "install-helpers/provision-browser-vm-rdp-credential.sh", dest = "/usr/libexec/mackesd/provision-browser-vm-rdp-credential", mode = "755" },
+    { source = "packaging/systemd/browser-vm-rdp-credential.conf", dest = "/usr/libexec/mackesd/browser-vm-rdp-credential.conf", mode = "644" },
     # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
@@ -782,6 +787,12 @@ if getent group audio >/dev/null 2>&1; then
   for user in mm mde; do
     if id "$user" >/dev/null 2>&1; then
       usermod -aG audio "$user" >/dev/null 2>&1 || :
+      # The compositor-less root DRM shell consumes the primary seat user's
+      # PipeWire policy graph. Keep that user manager and its runtime directory
+      # boot-durable so VM/RDP audio does not depend on an interactive login.
+      loginctl enable-linger "$user" >/dev/null 2>&1 || :
+      uid="$(id -u "$user" 2>/dev/null || :)"
+      [ -z "$uid" ] || systemctl start "user@$uid.service" >/dev/null 2>&1 || :
     fi
   done
 fi
@@ -989,11 +1000,15 @@ xdg-utils = "*"
 #     full libvirt meta so the daemon + all drivers + the virbr0 NAT (dnsmasq) are
 #     present, plus the pieces the compute worker actually invokes:
 #       libvirt                        — full daemon + all drivers + dnsmasq NAT
+#       qemu-kvm                       — Fedora's KVM-capable QEMU system emulator
+#       libvirt-daemon-kvm             — Fedora's libvirt QEMU/KVM daemon runtime
 #       libvirt-daemon-driver-storage  — the `virsh pool-define-as dir` backend
 #       guestfs-tools                  — virt-customize/sysprep/guestfish golden-image ops
 #       genisoimage                    — the NoCloud cloud-init seed ISO virt-install --cloud-init needs
 #       virtiofsd                      — the virtiofs daemon libvirt launches for the MeshFS share
 libvirt = "*"
+qemu-kvm = "*"
+libvirt-daemon-kvm = "*"
 libvirt-daemon-driver-storage = "*"
 guestfs-tools = "*"
 genisoimage = "*"

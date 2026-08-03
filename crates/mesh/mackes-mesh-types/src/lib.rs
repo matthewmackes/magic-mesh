@@ -20,6 +20,8 @@ pub mod air_quality;
 /// WL-FUNC-012 / OVERLAY-8 — point-scoped adsb.lol aircraft snapshots shared
 /// by the workstation adapter and Maps & Location.
 pub mod aircraft;
+/// Typed AOSP starter-app catalog and per-Android-VM inventory contracts.
+pub mod android_apps;
 /// WL-FUNC-018 — versioned, signed-provenance Flatpak catalog records for App VMs.
 pub mod app_catalog;
 /// WL-FUNC-012 / OVERLAY-5 — Caltrans CWWP2 camera snapshots shared by the
@@ -89,6 +91,9 @@ pub mod peer_probe;
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
 // (reader) use one path; docs/design/v2.7-peer-data-convergence.md.
 pub mod peers;
+/// WL-FUNC-019 — versioned universal resource identity, capability, transport,
+/// provenance, auth/health, catalog, and bounded-action contracts.
+pub mod resources;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
 // WL-RUN-006 (2026-07-19) — the router firewall-edit verb (`action/router/*`
@@ -138,9 +143,22 @@ pub mod vpn_egress;
 /// + the generic "paste WG config" / "import .ovpn" config-generation paths.
 pub mod vpn_providers;
 
+pub use android_apps::{
+    AndroidAppAvailability, AndroidAppCategory, AndroidAppInventory, AndroidAppInventoryEntry,
+    AndroidAppReadiness, AndroidLaunchIntent, AndroidLaunchReadiness, AndroidStarterAppDescriptor,
+    AospPackageId, AospStarterApp, AospStarterCatalog,
+};
 pub use connect::{BatterySnapshot, ConnectFacts, PairingState, PeerKind};
 pub use nebula::{NebulaFacts, NebulaRole};
 pub use peer_probe::{BusTopology, Descriptors, KernelDriver, NatClass, PeerProbe, PowerThermal};
+pub use resources::{
+    ActionAvailability, ActionAvailabilityStatus, AuthState, ClientCapability, HealthState,
+    ResourceAction, ResourceActionTarget, ResourceActionVerb, ResourceCard, ResourceCatalog,
+    ResourceClass, ResourceIdentity, ResourceOperatingRole, ServiceCategory,
+    LocalServiceStack, ServiceConfigurationField, ServiceConfigurationFieldKind,
+    ServiceInterface, ServiceLifecycleStatus, ServiceStackPlane, ServiceStackTier,
+    SourceProvenance, TransportCandidate, RESOURCE_CATALOG_TOPIC,
+};
 pub use tags::{Tag, TagFlavor, TagMember, TagStore, TagStoreError};
 
 use serde::{Deserialize, Serialize};

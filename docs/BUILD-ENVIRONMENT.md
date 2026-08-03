@@ -55,16 +55,24 @@ currently report **Fedora 42**. Therefore `xcp-build.sh rpm` produces a native
 F42-linked RPM, even when the target workstation is Fedora 44. Do not install a
 native farm RPM on an F44 Workstation seat unless `rpm -Uvh --test` passes; media
 and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). For an F44
-workstation deploy, use the container lane with an explicit Fedora argument:
-`install-helpers/build-rpm-fedora43.sh 44` from a farm checkout, then copy the
-RPM from `target-f43/generate-rpm/`. The directory name is historical; the first
-positional argument controls the Fedora container tag. For the split Browser
-package, copy and install the base and Browser RPMs together and always run the
-transaction test first:
+workstation deploy, use the native F44 BigBoy builder handoff documented in
+`docs/F44-BUILDER-AND-SEAT-DEPLOY.md`; the Fedora 44 container lane is a
+supplemental compatibility path, not the current physical-seat release cut.
+For any retained split Browser artifact, copy and install the base and Browser
+RPMs together and always run the transaction test first:
 `rpm -Uvh --test --replacepkgs --force --nosignature magic-mesh-*.rpm magic-mesh-browser-*.rpm`.
-The live `.15` proof on 2026-07-15 used exactly this lane and produced F44 RPMs
+The historical `.15` proof on 2026-07-15 used the container lane and produced F44 RPMs
 at 70.0 MiB (`magic-mesh`) and 39.1 MiB (`magic-mesh-browser`), both under the
 90 MiB channel guard.
+
+**Host Browser retirement lock (current):** `mde-web-cef`,
+`mde-web-cef-renderer`, `mde-web-preview`, and the split
+`magic-mesh-browser` package are retired from the active host/RPM architecture.
+Chromium now belongs inside the dedicated `browser-vm` and reaches Construct
+through the typed VDI session path. The July CEF/Servo inspection, SELinux,
+cgroup, split-package, and nested-workspace notes below are retained only as
+historical diagnostics for old artifacts; they are not current build or
+deployment instructions and must not be used to reintroduce host Browser code.
 
 **F44 locked-resolve note (learned 2026-07-17):** if
 `install-helpers/build-rpm-fedora43.sh 44` exits before compile with
@@ -234,18 +242,20 @@ testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
 unless a reboot is genuinely required for the test or recovery path.
 
-**Direct-DRM validation seat (onboarded 2026-07-30):** `172.20.146.138`
-(`test-seat-172-20-146-138`, Fedora 44) is an enrolled Workstation with
-`/dev/dri/card1`, the Construct DRM shell, and a Nebula overlay address of
-`10.42.0.7`. Include it in direct-render validation alongside the primary
+**Direct-DRM validation seat (onboarded 2026-07-30, current-mesh enrollment
+corrected 2026-08-03):** T480 at `172.20.146.138` is an enrolled Fedora 44
+Workstation with `/dev/dri/card1`, the Construct DRM shell, and Nebula overlay
+`10.42.0.8`. Include it in direct-render validation alongside the primary
 Basement seat. It is a test seat, not a farm worker: do not add it to
 `install-helpers/farm.sh`, and do not use it for heavy build/test gates.
 
-**Active Workstation seat inventory (operator 2026-08-01):** use all four
+**Active Workstation seat inventory (operator 2026-08-03):** use all five
 enrolled seats for workstation deployment and seat verification: T480
-`172.20.146.138`, T470S Eagle `172.20.146.145`, Basement seat `172.20.0.15`,
-and Dell `172.20.146.225`. The historical Eagle address `172.20.146.13` is
-not a current deployment target.
+`172.20.146.138` (`10.42.0.8`), T470S Eagle `172.20.146.145` (`10.42.0.6`),
+Basement seat 15 `172.20.0.15` (`10.42.0.5`), Dell `172.20.146.225`
+(`10.42.0.4`), and Microsoft Surface Pro 6 `172.20.146.79` (`10.42.0.7`).
+Surface is a seat, not seat 15 and not a farm worker. The historical Eagle
+address `172.20.146.13` is not a current deployment target.
 
 ---
 

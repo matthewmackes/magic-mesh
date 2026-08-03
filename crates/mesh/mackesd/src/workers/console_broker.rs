@@ -51,8 +51,8 @@
 
 #![cfg(feature = "async-services")]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use mackes_mesh_types::cloud::CloudArmedToken;
 use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
-use mackes_mesh_types::vdi_session::DesktopSessionProfile;
+use mackes_mesh_types::vdi_session::{BrowserVmTransport, BROWSER_VM_WORKLOAD_ID};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -98,10 +98,8 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// topic still finds a live console record while a connect is pending.
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
 
-/// Stable Workloads identity for the Chromium guest. Browser is the one
-/// application route whose preferred transport is the guest-owned RDP service;
-/// other VM consoles continue to resolve their libvirt graphics endpoint.
-pub const BROWSER_VM_ID: &str = "browser-vm";
+/// Stable Workloads identity for the Chromium guest.
+pub const BROWSER_VM_ID: &str = BROWSER_VM_WORKLOAD_ID;
 
 /// The guest xrdp listener admitted by the Browser VM image contract.
 pub const BROWSER_VM_RDP_PORT: u16 = 3389;
@@ -399,16 +397,18 @@ pub trait ConsoleRelay: Send + Sync {
     /// [`ConsoleBrokerError::Resolve`] when the console can't be resolved.
     fn resolve(&self, vm_id: &str) -> Result<ConsoleAddr, ConsoleBrokerError>;
 
-    /// Resolve a preferred transport when one is available, falling back to the
-    /// VM's native graphics console. The default preserves the old broker seam
-    /// for non-Browser VMs and for test fakes.
-    fn resolve_preferred(
+    /// Resolve the exact operator-selected Browser transport. Failure is
+    /// terminal for this attempt: implementations must not call [`Self::resolve`]
+    /// to substitute the native graphics console.
+    fn resolve_browser_transport(
         &self,
         vm_id: &str,
-        preferred: Option<DesktopProtocol>,
+        selected: BrowserVmTransport,
     ) -> Result<ConsoleAddr, ConsoleBrokerError> {
-        let _ = preferred;
-        self.resolve(vm_id)
+        Err(ConsoleBrokerError::Resolve(format!(
+            "selected Browser transport {} is unavailable for `{vm_id}`",
+            selected.label()
+        )))
     }
 
     /// This node's Nebula overlay address (empty when the overlay isn't up).
@@ -541,22 +541,23 @@ impl ConsoleRelay for LiveConsoleRelay {
         })
     }
 
-    fn resolve_preferred(
+    fn resolve_browser_transport(
         &self,
         vm_id: &str,
-        preferred: Option<DesktopProtocol>,
+        selected: BrowserVmTransport,
     ) -> Result<ConsoleAddr, ConsoleBrokerError> {
-        if preferred == Some(DesktopProtocol::Rdp) && vm_id == BROWSER_VM_ID {
-            match Self::resolve_browser_rdp(vm_id) {
-                Ok(endpoint) => return Ok(endpoint),
-                Err(error) => tracing::debug!(
-                    vm = vm_id,
-                    %error,
-                    "browser-vm RDP endpoint unavailable; trying native graphics console"
-                ),
-            }
+        if vm_id != BROWSER_VM_ID {
+            return Err(ConsoleBrokerError::Resolve(format!(
+                "Browser transport selection requires `{BROWSER_VM_ID}`, got `{vm_id}`"
+            )));
         }
-        self.resolve(vm_id)
+        match selected {
+            BrowserVmTransport::Rdp => Self::resolve_browser_rdp(vm_id),
+            BrowserVmTransport::Sunshine => Err(ConsoleBrokerError::Gated(
+                "Sunshine/Moonlight is selected, but the guest Sunshine endpoint and host Moonlight adapter are not yet available; RDP was not attempted"
+                    .to_string(),
+            )),
+        }
     }
 
     fn overlay_addr(&self) -> String {
@@ -621,28 +622,64 @@ pub fn broker_console(
     relay: &dyn ConsoleRelay,
     vm_id: &str,
 ) -> (ConsoleStatus, Option<RelayHandle>) {
-    broker_console_with_preference(relay, vm_id, None)
+    broker_console_with_transport(relay, vm_id, None)
 }
 
-/// Broker one VM console while honoring an optional preferred protocol. The
-/// preference is a serving-side policy decision, not an endpoint or credential
-/// supplied by the client. Browser uses this to attempt guest RDP before its
-/// native SPICE compatibility console.
+/// Broker one VM console while honoring an exact Browser transport selection.
+/// Generic desktop sessions continue to use their native graphics console. A
+/// Browser transport failure is published as unavailable and never falls back
+/// to another protocol.
 #[must_use]
-pub fn broker_console_with_preference(
+pub fn broker_console_with_transport(
     relay: &dyn ConsoleRelay,
     vm_id: &str,
-    preferred: Option<DesktopProtocol>,
+    selected: Option<BrowserVmTransport>,
 ) -> (ConsoleStatus, Option<RelayHandle>) {
-    let console = match relay.resolve_preferred(vm_id, preferred) {
+    let resolved = match (vm_id == BROWSER_VM_ID, selected) {
+        (true, Some(transport)) => relay.resolve_browser_transport(vm_id, transport),
+        (true, None) => Err(ConsoleBrokerError::Gated(
+            "browser-vm requires an explicit browser_vm or browser_vm_rdp profile; native SPICE/VNC resolution was not attempted"
+                .to_string(),
+        )),
+        (false, Some(_)) => Err(ConsoleBrokerError::Gated(format!(
+            "Browser VM transport selection requires `{BROWSER_VM_ID}`, got `{vm_id}`"
+        ))),
+        (false, None) => relay.resolve(vm_id),
+    };
+    let console = match resolved {
         Ok(c) => c,
         Err(e) => return (ConsoleStatus::Unbrokerable { reason: e.reason() }, None),
     };
+    match selected {
+        Some(BrowserVmTransport::Rdp) if console.protocol != DesktopProtocol::Rdp => {
+            return (
+                ConsoleStatus::Unbrokerable {
+                    reason: format!(
+                        "browser_vm_rdp resolved unexpected {} transport; SPICE/VNC was rejected",
+                        console.protocol.tag()
+                    ),
+                },
+                None,
+            );
+        }
+        Some(BrowserVmTransport::Sunshine) => {
+            return (
+                ConsoleStatus::Unbrokerable {
+                    reason: format!(
+                        "browser_vm resolved unexpected {} transport; RDP/SPICE/VNC substitution was rejected",
+                        console.protocol.tag()
+                    ),
+                },
+                None,
+            );
+        }
+        Some(BrowserVmTransport::Rdp) | None => {}
+    }
     // A guest RDP address is normally a libvirt-private address (for example
     // 192.168.122.0/24), not a Nebula address. It must still cross the serving
     // host's overlay relay even though it is not loopback. Other non-loopback
     // console addresses retain the old direct-publication behavior.
-    let guest_rdp_needs_relay = preferred == Some(DesktopProtocol::Rdp)
+    let guest_rdp_needs_relay = selected == Some(BrowserVmTransport::Rdp)
         && vm_id == BROWSER_VM_ID
         && console.protocol == DesktopProtocol::Rdp;
     if !is_loopback(&console.host) && !guest_rdp_needs_relay {
@@ -686,7 +723,7 @@ pub fn broker_console_with_preference(
 /// it up (dropped on session close).
 struct BrokerEntry {
     record: BrokeredConsole,
-    preferred: Option<DesktopProtocol>,
+    selected: Option<BrowserVmTransport>,
     _relay: Option<RelayHandle>,
 }
 
@@ -805,9 +842,7 @@ fn session_auth_target(request: &SessionRequest) -> (&'static str, String) {
             ("vdi-session-open", format!("session:{id}"))
         }
         SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
-        SessionRequest::AppState { id, .. } => {
-            ("vdi-session-app-state", format!("session:{id}"))
-        }
+        SessionRequest::AppState { id, .. } => ("vdi-session-app-state", format!("session:{id}")),
         SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
         SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
     }
@@ -948,13 +983,7 @@ impl ConsoleBrokerWorker {
     /// Apply one drained session op to the live broker state. Returns whether the
     /// brokered set changed (so the caller republishes). Pure over the relay seam.
     fn apply(&mut self, req: &SessionRequest) -> bool {
-        let browser_profile = matches!(
-            req,
-            SessionRequest::Open {
-                profile: Some(DesktopSessionProfile::BrowserVm),
-                ..
-            }
-        );
+        let browser_transport = req.browser_transport();
         match req {
             SessionRequest::Open {
                 id,
@@ -971,12 +1000,20 @@ impl ConsoleBrokerWorker {
                 if self.brokered.contains_key(id) || !self.serves(serving_peer) {
                     return false;
                 }
-                let preferred = browser_profile.then_some(DesktopProtocol::Rdp);
-                let (status, handle) = broker_console_with_preference(
-                    self.relay.as_ref(),
-                    vm_id,
-                    preferred,
-                );
+                let browser_transport = match browser_transport {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %id,
+                            vm = %vm_id,
+                            %error,
+                            "console_broker: rejected invalid Browser VM profile before console resolution"
+                        );
+                        return false;
+                    }
+                };
+                let (status, handle) =
+                    broker_console_with_transport(self.relay.as_ref(), vm_id, browser_transport);
                 match &status {
                     ConsoleStatus::Brokered { host, port, .. } => tracing::info!(
                         session = %id, vm = %vm_id, overlay = %host, port,
@@ -996,7 +1033,7 @@ impl ConsoleBrokerWorker {
                             vm_id: vm_id.clone(),
                             status,
                         },
-                        preferred,
+                        selected: browser_transport,
                         _relay: handle,
                     },
                 );
@@ -1035,10 +1072,10 @@ impl ConsoleBrokerWorker {
                 let Some(entry) = self.brokered.get(&id) else {
                     continue;
                 };
-                broker_console_with_preference(
+                broker_console_with_transport(
                     self.relay.as_ref(),
                     &entry.record.vm_id,
-                    entry.preferred,
+                    entry.selected,
                 )
             };
             let Some(entry) = self.brokered.get_mut(&id) else {
@@ -1171,7 +1208,10 @@ mod tests {
             " vnet0     52:54:00:aa:bb:cc  ipv6         ::1/128\n",
             " vnet0     52:54:00:aa:bb:cc  ipv4         192.168.122.113/24\n",
         );
-        assert_eq!(parse_guest_ipv4(raw), Some(Ipv4Addr::new(192, 168, 122, 113)));
+        assert_eq!(
+            parse_guest_ipv4(raw),
+            Some(Ipv4Addr::new(192, 168, 122, 113))
+        );
         assert_eq!(parse_guest_ipv4("vnet0 mac ipv4 127.0.0.1/8\n"), None);
         assert_eq!(parse_guest_ipv4("vnet0 mac ipv4 not-an-address\n"), None);
     }
@@ -1220,7 +1260,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRelay {
         resolve: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
-        preferred: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
+        selected: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
         overlay: String,
         relay_ok: bool,
         started: Arc<Mutex<Vec<(String, u16, u16)>>>, // (overlay_addr, overlay_port, target_port)
@@ -1232,15 +1272,16 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| Err(ConsoleBrokerError::Resolve("no fake".into())))
         }
-        fn resolve_preferred(
+        fn resolve_browser_transport(
             &self,
             vm_id: &str,
-            preferred: Option<DesktopProtocol>,
+            _selected: BrowserVmTransport,
         ) -> Result<ConsoleAddr, ConsoleBrokerError> {
-            if preferred.is_some() {
-                return self.preferred.clone().unwrap_or_else(|| self.resolve(vm_id));
-            }
-            self.resolve(vm_id)
+            self.selected.clone().unwrap_or_else(|| {
+                Err(ConsoleBrokerError::Resolve(format!(
+                    "selected Browser transport unavailable for `{vm_id}`"
+                )))
+            })
         }
         fn overlay_addr(&self) -> String {
             self.overlay.clone()
@@ -1306,7 +1347,7 @@ mod tests {
     #[test]
     fn browser_guest_rdp_is_relayed_even_when_the_guest_address_is_private() {
         let relay = FakeRelay {
-            preferred: Some(Ok(ConsoleAddr {
+            selected: Some(Ok(ConsoleAddr {
                 protocol: DesktopProtocol::Rdp,
                 host: "192.168.122.113".into(),
                 port: BROWSER_VM_RDP_PORT,
@@ -1315,11 +1356,8 @@ mod tests {
             relay_ok: true,
             ..FakeRelay::default()
         };
-        let (status, handle) = broker_console_with_preference(
-            &relay,
-            BROWSER_VM_ID,
-            Some(DesktopProtocol::Rdp),
-        );
+        let (status, handle) =
+            broker_console_with_transport(&relay, BROWSER_VM_ID, Some(BrowserVmTransport::Rdp));
         assert!(handle.is_some());
         assert_eq!(
             status,
@@ -1338,6 +1376,73 @@ mod tests {
                 BROWSER_VM_RDP_PORT,
             )]
         );
+    }
+
+    #[test]
+    fn browser_vm_without_a_profile_never_reaches_native_console_resolution() {
+        let relay = FakeRelay {
+            // This SPICE endpoint would be accepted for a generic VM. The
+            // reserved Browser identity must reject before using it.
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        };
+        let (status, handle) = broker_console(&relay, BROWSER_VM_ID);
+        assert!(matches!(
+            status,
+            ConsoleStatus::Unbrokerable { ref reason }
+                if reason.contains("requires an explicit")
+                    && reason.contains("SPICE/VNC resolution was not attempted")
+        ));
+        assert!(handle.is_none());
+        assert!(relay.started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn browser_transport_on_another_vm_is_rejected_before_resolution() {
+        let relay = FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            selected: Some(Ok(ConsoleAddr {
+                protocol: DesktopProtocol::Rdp,
+                host: "192.168.122.113".into(),
+                port: BROWSER_VM_RDP_PORT,
+            })),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        };
+        let (status, handle) =
+            broker_console_with_transport(&relay, "unrelated-vm", Some(BrowserVmTransport::Rdp));
+        assert!(matches!(status, ConsoleStatus::Unbrokerable { .. }));
+        assert!(handle.is_none());
+        assert!(relay.started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sunshine_profile_cannot_turn_into_an_rdp_override() {
+        let relay = FakeRelay {
+            selected: Some(Ok(ConsoleAddr {
+                protocol: DesktopProtocol::Rdp,
+                host: "192.168.122.113".into(),
+                port: BROWSER_VM_RDP_PORT,
+            })),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        };
+        let (status, handle) = broker_console_with_transport(
+            &relay,
+            BROWSER_VM_ID,
+            Some(BrowserVmTransport::Sunshine),
+        );
+        assert!(matches!(
+            status,
+            ConsoleStatus::Unbrokerable { ref reason }
+                if reason.contains("RDP/SPICE/VNC substitution was rejected")
+        ));
+        assert!(handle.is_none());
+        assert!(relay.started.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1429,13 +1534,13 @@ mod tests {
         }
     }
 
-    fn browser_open(id: &str, serving_peer: &str) -> SessionRequest {
+    fn browser_open(id: &str, serving_peer: &str, transport: BrowserVmTransport) -> SessionRequest {
         SessionRequest::Open {
             id: id.into(),
             serving_peer: serving_peer.into(),
             vm_id: BROWSER_VM_ID.into(),
             client_peer: "peer:elm".into(),
-            profile: Some(DesktopSessionProfile::BrowserVm),
+            profile: Some(transport.session_profile()),
         }
     }
 
@@ -1486,7 +1591,7 @@ mod tests {
     #[test]
     fn typed_browser_profile_selects_guest_rdp_in_the_worker_fold() {
         let mut w = worker_with(FakeRelay {
-            preferred: Some(Ok(ConsoleAddr {
+            selected: Some(Ok(ConsoleAddr {
                 protocol: DesktopProtocol::Rdp,
                 host: "192.168.122.113".into(),
                 port: BROWSER_VM_RDP_PORT,
@@ -1495,7 +1600,7 @@ mod tests {
             relay_ok: true,
             ..FakeRelay::default()
         });
-        assert!(w.apply(&browser_open("browser", "oak")));
+        assert!(w.apply(&browser_open("browser", "oak", BrowserVmTransport::Rdp)));
         assert!(matches!(
             w.brokered["browser"].record.status,
             ConsoleStatus::Brokered {
@@ -1504,6 +1609,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn default_browser_profile_is_sunshine_and_never_uses_native_console_fallback() {
+        let mut w = worker_with(FakeRelay {
+            // A native SPICE console exists, but the exact Sunshine selection is
+            // unavailable. The broker must publish the gate, not substitute it.
+            resolve: Some(Ok(spice(5900))),
+            selected: Some(Err(ConsoleBrokerError::Gated(
+                "Sunshine endpoint unavailable".into(),
+            ))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        });
+        assert!(w.apply(&browser_open(
+            "browser-sunshine",
+            "oak",
+            BrowserVmTransport::Sunshine
+        )));
+        let entry = &w.brokered["browser-sunshine"];
+        assert_eq!(entry.selected, Some(BrowserVmTransport::Sunshine));
+        assert!(matches!(
+            entry.record.status,
+            ConsoleStatus::Unbrokerable { .. }
+        ));
+        assert!(
+            entry._relay.is_none(),
+            "no SPICE/RDP relay may be created after Sunshine fails"
+        );
+    }
+
+    #[test]
+    fn profileless_browser_open_is_rejected_before_worker_brokering() {
+        let mut w = worker_with(FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        });
+        assert!(!w.apply(&open("profileless-browser", "oak", BROWSER_VM_ID)));
+        assert!(!w.brokered.contains_key("profileless-browser"));
+    }
+
+    #[test]
+    fn explicit_rdp_failure_never_falls_back_to_spice() {
+        let relay = FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            selected: Some(Err(ConsoleBrokerError::Resolve(
+                "xrdp is not reachable".into(),
+            ))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        };
+        let (status, handle) =
+            broker_console_with_transport(&relay, BROWSER_VM_ID, Some(BrowserVmTransport::Rdp));
+        assert!(matches!(status, ConsoleStatus::Unbrokerable { .. }));
+        assert!(handle.is_none());
+        assert!(relay.started.lock().unwrap().is_empty());
     }
 
     #[test]

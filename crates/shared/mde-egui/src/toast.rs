@@ -31,7 +31,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use egui::{pos2, vec2, Align2, Color32, Context, FontId, Rect, Sense, Ui};
+use egui::text::{LayoutJob, TextFormat};
+use egui::{pos2, vec2, Align, Align2, Color32, Context, FontId, Rect, Sense, Ui};
 
 use crate::carbon::paint_carbon;
 use crate::motion::Spring;
@@ -44,6 +45,10 @@ pub const DWELL_INFO: Duration = Duration::from_secs(4);
 pub const DWELL_WARNING: Duration = Duration::from_secs(7);
 /// Dwell for the centered OSD pill — a quick hardware-feedback flash.
 pub const DWELL_OSD: Duration = Duration::from_millis(1500);
+
+/// Stable flag for operator-originated AI deployment notices. These alerts use
+/// the centered, red, constrained presentation instead of the ambient banner.
+pub const AI_GENERATED_ALERT_FLAG: &str = "AI-GENERATED-ALERT";
 
 // Stable egui ids for the two floating areas + their motion animations. String
 // keys (not style values), so they carry no palette/spacing meaning.
@@ -228,6 +233,14 @@ impl Toast {
         self
     }
 
+    /// Whether this alert requests the dedicated centered operator presentation.
+    /// Matching is ASCII-case-insensitive so wire producers cannot accidentally
+    /// lose the safety treatment through capitalization drift.
+    #[must_use]
+    pub fn is_ai_generated_alert(&self) -> bool {
+        self.flag.eq_ignore_ascii_case(AI_GENERATED_ALERT_FLAG)
+    }
+
     /// Override the default dwell (e.g. to hold a Warning longer).
     #[must_use]
     pub const fn with_dwell(mut self, dwell: Dwell) -> Self {
@@ -349,9 +362,14 @@ impl ToastHost {
             return;
         }
         let incoming_critical = matches!(toast.tier, Tier::Alert(Severity::Critical));
+        let incoming_operator_notice = toast.is_ai_generated_alert();
         match &self.current {
             None => self.current = Some(Active::new(toast)),
-            Some(cur) if incoming_critical && !cur.is_critical() => {
+            Some(cur)
+                if (incoming_critical || incoming_operator_notice)
+                    && !cur.is_critical()
+                    && !cur.toast.is_ai_generated_alert() =>
+            {
                 if let Some(displaced) = self.current.take() {
                     self.pending.push_front(displaced.toast);
                 }
@@ -467,8 +485,9 @@ impl ToastHost {
 
     // ── renders (over Style + Motion) ─────────────────────────────────────────
 
-    /// Paint the top-center **HIG banner** card for the current alert (a spring
-    /// drop in on [`Spring::SNAPPY`], a fade back out as the dwell expires —
+    /// Paint the current alert as either the top-center **HIG banner** or the
+    /// centered red operator alert selected by [`AI_GENERATED_ALERT_FLAG`] (a
+    /// spring in on [`Spring::SNAPPY`], a fade back out as the dwell expires —
     /// WL-UX-006/U13, PLATFORM-INTERFACES Q14) and return the clicked action
     /// verb, if any.
     ///
@@ -508,7 +527,11 @@ impl ToastHost {
         egui::Area::new(egui::Id::new(CHYRON_AREA_ID))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                band = paint_banner(ui, &toast, backlog, remaining, t);
+                band = if toast.is_ai_generated_alert() {
+                    paint_ai_generated_alert(ui, &toast, backlog, remaining, t)
+                } else {
+                    paint_banner(ui, &toast, backlog, remaining, t)
+                };
             });
 
         self.set_hover(band.hovered);
@@ -567,6 +590,15 @@ const BANNER_GONE: f32 = 0.02;
 /// The severity glyph's square plate, on the spacing ladder.
 const BANNER_GLYPH_PLATE: f32 = Style::SP_XL;
 
+/// The AI-generated deployment alert is intentionally compact: a readable
+/// desktop modal, not a full-screen takeover or an unconstrained message panel.
+const AI_ALERT_MAX_W: f32 = 460.0;
+const AI_ALERT_H: f32 = 224.0;
+const AI_ALERT_MARGIN: f32 = Style::SP_L;
+const AI_ALERT_BUTTON_W: f32 = 132.0;
+const AI_ALERT_BUTTON_H: f32 = 36.0;
+const AI_ALERT_BLOCKER_ID: &str = "kiron-ai-alert-blocker";
+
 /// The banner card's rect at drop progress `t`: `0` parks it fully above the
 /// screen, `1` rests it top-center ([`BANNER_MARGIN`] below the edge), and a
 /// spring's overshoot past `1` reads as the drop's bounce.
@@ -577,6 +609,16 @@ fn banner_rect(screen: Rect, t: f32) -> Rect {
     let resting = screen.top() + BANNER_MARGIN;
     let y = (resting - parked).mul_add(t, parked);
     Rect::from_min_size(pos2(x, y), vec2(w, BANNER_H))
+}
+
+/// Centered constrained alert geometry. Motion is a restrained scale/fade from
+/// 96% to full size; the card never changes center or exceeds the safe margins.
+fn ai_alert_rect(screen: Rect, t: f32) -> Rect {
+    let available_w = (screen.width() - 2.0 * AI_ALERT_MARGIN).max(1.0);
+    let available_h = (screen.height() - 2.0 * AI_ALERT_MARGIN).max(1.0);
+    let base = vec2(AI_ALERT_MAX_W.min(available_w), AI_ALERT_H.min(available_h));
+    let scale = 0.96 + 0.04 * t.clamp(0.0, 1.0);
+    Rect::from_center_size(screen.center(), base * scale)
 }
 
 /// The banner title face — the shared [`TypographyRole::Body`] role (Q14 HIG
@@ -670,6 +712,177 @@ fn paint_banner(
 
     // Right: dismiss/ack button, optional action button, then countdown + "N more".
     paint_banner_controls(ui, &painter, card, toast, backlog, remaining)
+}
+
+/// Paint the dedicated AI operator alert: a centered, red, constrained card
+/// over a quiet scrim. It uses the same queue, dwell, hover, action, and
+/// acknowledge semantics as every other alert; only the presentation differs.
+fn paint_ai_generated_alert(
+    ui: &mut Ui,
+    toast: &Toast,
+    backlog: usize,
+    remaining: Option<Duration>,
+    t: f32,
+) -> BandOutcome {
+    let Tier::Alert(severity) = toast.tier else {
+        return BandOutcome::default();
+    };
+    let alpha = t.clamp(0.0, 1.0);
+    let screen = ui.ctx().screen_rect();
+    let card = ai_alert_rect(screen, t);
+    let painter = ui.painter().clone();
+
+    // The full-screen interaction layer prevents an underlying control from
+    // receiving the same click while the centered deployment notice is visible.
+    let _blocker = ui.interact(
+        screen,
+        egui::Id::new(AI_ALERT_BLOCKER_ID),
+        Sense::click_and_drag(),
+    );
+    painter.rect_filled(screen, 0.0, Style::SCRIM_REGULAR.gamma_multiply(alpha));
+
+    let radius = Style::RADIUS_XL;
+    let mut shadow = Elevation::Overlay.egui_shadow();
+    shadow.color = shadow.color.gamma_multiply(alpha);
+    painter.add(shadow.as_shape(card, radius));
+    painter.rect_filled(card, radius, Style::SUPPORT_ERROR.gamma_multiply(alpha));
+    painter.rect_stroke(
+        card,
+        radius,
+        egui::Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.22 * alpha)),
+        egui::StrokeKind::Inside,
+    );
+
+    let white = Color32::WHITE.gamma_multiply(alpha);
+    let muted_white = Color32::WHITE.gamma_multiply(0.78 * alpha);
+    let plate = Rect::from_center_size(
+        pos2(card.center().x, card.top() + 42.0),
+        vec2(BANNER_GLYPH_PLATE, BANNER_GLYPH_PLATE),
+    );
+    painter.circle_filled(
+        plate.center(),
+        plate.width() * 0.5,
+        Color32::WHITE.gamma_multiply(0.16 * alpha),
+    );
+    if !paint_carbon(
+        &painter,
+        plate.shrink(Style::SP_XS),
+        severity.glyph_name(),
+        white,
+    ) {
+        painter.circle_filled(plate.center(), Style::SP_XS, white);
+    }
+
+    painter.text(
+        pos2(card.center().x, plate.bottom() + Style::SP_S),
+        Align2::CENTER_TOP,
+        AI_GENERATED_ALERT_FLAG,
+        Style::typography_font_with_size(TypographyRole::Label, Style::TYPE_FOOTNOTE),
+        muted_white,
+    );
+
+    let headline_width = (card.width() - 2.0 * Style::SP_XL).max(1.0);
+    let mut headline = LayoutJob::single_section(
+        toast.headline.clone(),
+        TextFormat::simple(
+            Style::typography_font_with_size(TypographyRole::Title, Style::TYPE_TITLE3),
+            white,
+        ),
+    );
+    headline.wrap.max_width = headline_width;
+    headline.wrap.max_rows = 2;
+    headline.halign = Align::Center;
+    let galley = ui.fonts(|fonts| fonts.layout_job(headline));
+    painter.galley(
+        pos2(card.center().x - galley.size().x * 0.5, card.top() + 92.0),
+        galley,
+        white,
+    );
+
+    let mut meta = if toast.source_host.is_empty() {
+        String::new()
+    } else {
+        toast.source_host.clone()
+    };
+    if let Some(rem) = remaining {
+        if !meta.is_empty() {
+            meta.push_str("  ·  ");
+        }
+        meta.push_str(&format!("{:.0}s", rem.as_secs_f32().ceil()));
+    } else if matches!(severity, Severity::Critical) {
+        if !meta.is_empty() {
+            meta.push_str("  ·  ");
+        }
+        meta.push_str("Acknowledgement required");
+    }
+    if backlog > 0 {
+        if !meta.is_empty() {
+            meta.push_str("  ·  ");
+        }
+        meta.push_str(&format!("{backlog} more"));
+    }
+    painter.text(
+        pos2(card.center().x, card.bottom() - 58.0),
+        Align2::CENTER_BOTTOM,
+        meta,
+        Style::typography_font_with_size(TypographyRole::Label, Style::TYPE_FOOTNOTE),
+        muted_white,
+    );
+
+    let critical = matches!(severity, Severity::Critical);
+    let button_count = if toast.action.is_some() { 2 } else { 1 };
+    let gap = Style::SP_S;
+    let total_w = AI_ALERT_BUTTON_W * button_count as f32 + gap * (button_count - 1) as f32;
+    let mut x = card.center().x - total_w * 0.5;
+    let button_y = card.bottom() - Style::SP_M - AI_ALERT_BUTTON_H;
+    let mut out = BandOutcome::default();
+
+    if let Some(action) = &toast.action {
+        let rect = Rect::from_min_size(
+            pos2(x, button_y),
+            vec2(AI_ALERT_BUTTON_W, AI_ALERT_BUTTON_H),
+        );
+        let response = ui.put(
+            rect,
+            egui::Button::new(
+                Style::typography_text(&action.label, TypographyRole::Label).color(white),
+            )
+            .fill(Color32::WHITE.gamma_multiply(0.14 * alpha))
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::WHITE.gamma_multiply(0.34 * alpha),
+            )),
+        );
+        if response.clicked() {
+            out.action = Some(action.verb.clone());
+        }
+        out.hovered |= response.hovered();
+        x = rect.right() + gap;
+    }
+
+    let label = if critical { "Acknowledge" } else { "Dismiss" };
+    let rect = Rect::from_min_size(
+        pos2(x, button_y),
+        vec2(AI_ALERT_BUTTON_W, AI_ALERT_BUTTON_H),
+    );
+    let response = ui.put(
+        rect,
+        egui::Button::new(
+            Style::typography_text(label, TypographyRole::Label).color(Style::SUPPORT_ERROR),
+        )
+        .fill(white),
+    );
+    if response.clicked() {
+        if critical {
+            out.acknowledged = true;
+        } else {
+            out.dismissed = true;
+        }
+    }
+    out.hovered |= response.hovered();
+    let hover = ui.interact(card, egui::Id::new(CHYRON_HOVER_ID), Sense::hover());
+    out.hovered |= hover.hovered();
+    out
 }
 
 /// Paint the card's right-hand controls (dismiss/acknowledge + optional action +
@@ -971,6 +1184,23 @@ mod tests {
         assert_eq!(host.backlog(), 1);
     }
 
+    #[test]
+    fn ai_generated_operator_notice_preempts_an_ambient_alert() {
+        let mut host = ToastHost::new();
+        host.enqueue(info("chat-peer"));
+        host.enqueue(Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "Update begins in 5 seconds",
+        ));
+        assert!(
+            host.current().is_some_and(Toast::is_ai_generated_alert),
+            "the operator notice must be visible immediately"
+        );
+        assert_eq!(host.backlog(), 1, "the displaced alert remains queued");
+    }
+
     // ── queue: dismiss + hover-pause ──────────────────────────────────────────
 
     #[test]
@@ -1053,6 +1283,25 @@ mod tests {
         let action = toast.action.expect("action set");
         assert_eq!(action.label, "Open");
         assert_eq!(action.verb, "chat/open/a");
+    }
+
+    #[test]
+    fn ai_generated_alert_flag_selects_the_dedicated_presentation() {
+        let exact = Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "Update begins in 5 seconds",
+        );
+        let mixed_case = Toast::alert(
+            Severity::Warning,
+            "controller",
+            "ai-generated-alert",
+            "Update begins in 5 seconds",
+        );
+        assert!(exact.is_ai_generated_alert());
+        assert!(mixed_case.is_ai_generated_alert());
+        assert!(!info("controller").is_ai_generated_alert());
     }
 
     // ── renders (headless tessellate) ─────────────────────────────────────────
@@ -1146,6 +1395,21 @@ mod tests {
         // A narrow screen insets rather than overflowing.
         let narrow = Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0));
         assert!(banner_rect(narrow, 1.0).width() <= narrow.width() - 2.0 * Style::SP_L);
+    }
+
+    #[test]
+    fn ai_generated_alert_is_centered_and_constrained_on_wide_and_narrow_screens() {
+        for screen in [
+            Rect::from_min_size(egui::Pos2::ZERO, vec2(1920.0, 1080.0)),
+            Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0)),
+        ] {
+            let card = ai_alert_rect(screen, 1.0);
+            assert!((card.center().x - screen.center().x).abs() < f32::EPSILON);
+            assert!((card.center().y - screen.center().y).abs() < f32::EPSILON);
+            assert!(card.width() <= AI_ALERT_MAX_W);
+            assert!(card.width() <= screen.width() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
+            assert!(card.height() <= screen.height() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
+        }
     }
 
     #[test]

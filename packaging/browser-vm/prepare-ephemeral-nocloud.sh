@@ -101,6 +101,11 @@ write_files:
     permissions: "0644"
     content: |
       browser-vm-chromium
+  - path: /etc/mackesd/browser-vm/image-id
+    owner: root:root
+    permissions: "0644"
+    content: |
+      browser-vm-chromium
   - path: /etc/mackesd/browser-vm/image-digest
     owner: root:root
     permissions: "0644"
@@ -309,7 +314,9 @@ self_test() {
     grep -Fq 'transport-health' "$fixture/user-data" || fail "self-test seed omitted transport health"
     grep -Fq 'unavailable' "$fixture/user-data" || fail "self-test seed is not fail-closed"
     grep -Fq 'chmod, "0755"' "$fixture/user-data" || fail "self-test seed directory is not runtime-readable"
-    [[ "$(grep -Fc 'permissions: "0644"' "$fixture/user-data")" -eq 5 ]] || \
+    grep -Fq '/etc/mackesd/browser-vm/image-id' "$fixture/user-data" || \
+        fail "self-test seed omitted the runtime image identity"
+    [[ "$(grep -Fc 'permissions: "0644"' "$fixture/user-data")" -eq 6 ]] || \
         fail "self-test seed inputs are not all runtime-readable and non-writable"
     if grep -Eiq 'password|passwd|secret|credential|token|ssh' "$fixture/user-data" "$fixture/meta-data" "$fixture/network-config"; then
         fail "self-test found a credential-shaped field in the seed"

@@ -121,11 +121,9 @@ impl AppVmRuntimeEvidence {
                 return Err("invalid App VM runtime identity");
             }
         }
-        if self
-            .reason
-            .as_ref()
-            .is_some_and(|reason| reason.len() > MAX_APP_VM_FIELD_BYTES || reason.chars().any(char::is_control))
-        {
+        if self.reason.as_ref().is_some_and(|reason| {
+            reason.len() > MAX_APP_VM_FIELD_BYTES || reason.chars().any(char::is_control)
+        }) {
             return Err("invalid App VM runtime reason");
         }
         Ok(())
@@ -174,14 +172,25 @@ impl AppVmLifecycleState {
         }
         matches!(
             (self, next),
-            (WaitingForPlacement, Installing | StartingGuest | Denied | StaleCatalog | Failed)
-                | (Installing, StartingGuest | Denied | StaleCatalog | Failed)
-                | (StartingGuest, Installing | StartingApp | Unavailable | Failed)
+            (
+                WaitingForPlacement,
+                Installing | StartingGuest | Denied | StaleCatalog | Failed
+            ) | (Installing, StartingGuest | Denied | StaleCatalog | Failed)
+                | (
+                    StartingGuest,
+                    Installing | StartingApp | Unavailable | Failed
+                )
                 | (StartingApp, Connected | Unavailable | Failed)
                 | (Connected, Paused | Reconnecting | Unavailable | Failed)
                 | (Paused, StartingGuest | Reconnecting | Connected | Failed)
-                | (Reconnecting, StartingGuest | StartingApp | Connected | Unavailable | Failed)
-                | (Unavailable, WaitingForPlacement | Installing | StartingGuest | Failed)
+                | (
+                    Reconnecting,
+                    StartingGuest | StartingApp | Connected | Unavailable | Failed
+                )
+                | (
+                    Unavailable,
+                    WaitingForPlacement | Installing | StartingGuest | Failed
+                )
                 | (Denied, WaitingForPlacement | Installing)
                 | (StaleCatalog, WaitingForPlacement | Installing)
                 | (Failed, WaitingForPlacement | Installing | StartingGuest)
@@ -247,7 +256,7 @@ impl AppVmLaunchRequest {
                 || value.chars().any(|c| c.is_control())
                 || value.contains('/')
                 || value.contains('\\')
-        {
+            {
                 return Err(AppVmLaunchRequestError::InvalidField(field));
             }
             if value.len() > MAX_APP_VM_FIELD_BYTES {
@@ -280,6 +289,89 @@ impl AppVmLaunchRequest {
     }
 }
 
+/// Stable Workloads identity for the guest-owned Chromium VM.
+pub const BROWSER_VM_WORKLOAD_ID: &str = "browser-vm";
+
+/// The operator-selected Browser VM display path.
+///
+/// RDP is the released default because the shell has an in-process IronRDP
+/// client. Sunshine remains an explicit performance transport and must not be
+/// selected until a seat-side Moonlight adapter is available.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserVmTransport {
+    /// Guest Sunshine streamed to a seat-side Moonlight client.
+    Sunshine,
+    /// Guest RDP rendered by the shell's live IronRDP transport.
+    #[default]
+    Rdp,
+}
+
+impl BrowserVmTransport {
+    /// Human-readable transport label used by the shell.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sunshine => "Sunshine/Moonlight",
+            Self::Rdp => "RDP",
+        }
+    }
+
+    /// Session profile encoding for this transport selection.
+    #[must_use]
+    pub const fn session_profile(self) -> DesktopSessionProfile {
+        match self {
+            Self::Sunshine => DesktopSessionProfile::BrowserVm,
+            Self::Rdp => DesktopSessionProfile::BrowserVmRdp,
+        }
+    }
+}
+
+/// Typed desktop profile carried by a brokered session open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSessionProfile {
+    /// The guest-owned Chromium Browser VM route using its default
+    /// Sunshine/Moonlight transport.
+    BrowserVm,
+    /// The same Browser VM route with an explicit operator-selected RDP
+    /// alternate for this session. This is never synthesized as a fallback.
+    BrowserVmRdp,
+}
+
+impl DesktopSessionProfile {
+    /// The exact Browser VM transport selected by this profile.
+    #[must_use]
+    pub const fn browser_transport(self) -> BrowserVmTransport {
+        match self {
+            Self::BrowserVm => BrowserVmTransport::Sunshine,
+            Self::BrowserVmRdp => BrowserVmTransport::Rdp,
+        }
+    }
+}
+
+/// Why a desktop session's Browser VM profile/identity pairing is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserVmProfileError {
+    /// The reserved Browser VM workload omitted its required typed profile.
+    MissingProfile,
+    /// A Browser VM profile was attached to a different VM identity.
+    WrongWorkload,
+}
+
+impl core::fmt::Display for BrowserVmProfileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingProfile => {
+                f.write_str("browser-vm requires an explicit browser_vm or browser_vm_rdp profile")
+            }
+            Self::WrongWorkload => f.write_str("a Browser VM profile may target only browser-vm"),
+        }
+    }
+}
+
+impl std::error::Error for BrowserVmProfileError {}
+
 /// A session lifecycle request drained off the `action/vdi/session` topic — the
 /// wire verb the shell / connect flow publishes. Internally tagged on `op`.
 ///
@@ -287,13 +379,6 @@ impl AppVmLaunchRequest {
 /// `VmId` are all `= String` aliases, so this is byte-identical to the daemon's
 /// former definition and to the shell's former `String`-typed mirrors (a variant's
 /// tag plus its fields serialise in declaration order — see the wire-shape tests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DesktopSessionProfile {
-    /// The guest-owned Chromium Browser VM route.
-    BrowserVm,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SessionRequest {
@@ -372,6 +457,34 @@ fn is_zero_generation(generation: &u64) -> bool {
 }
 
 impl SessionRequest {
+    /// Validate the Browser VM identity/profile pairing and return its exact
+    /// transport. Generic desktop opens return `Ok(None)`; `browser-vm` without
+    /// a profile and Browser profiles attached to another VM fail closed.
+    /// `browser_vm` always means Sunshine, never RDP.
+    ///
+    /// # Errors
+    /// [`BrowserVmProfileError`] when a Browser workload/profile is incomplete
+    /// or attached to the wrong workload identity.
+    #[must_use]
+    pub fn browser_transport(&self) -> Result<Option<BrowserVmTransport>, BrowserVmProfileError> {
+        match self {
+            Self::Open {
+                vm_id,
+                profile: Some(profile),
+                ..
+            } if vm_id == BROWSER_VM_WORKLOAD_ID => Ok(Some(profile.browser_transport())),
+            Self::Open {
+                vm_id,
+                profile: None,
+                ..
+            } if vm_id == BROWSER_VM_WORKLOAD_ID => Err(BrowserVmProfileError::MissingProfile),
+            Self::Open {
+                profile: Some(_), ..
+            } => Err(BrowserVmProfileError::WrongWorkload),
+            _ => Ok(None),
+        }
+    }
+
     /// Serialise to the `action/vdi/session` request body. A fixed derive-backed
     /// shape ⇒ serialisation can't realistically fail; an empty body (never
     /// produced here) would simply be rejected by the broker's parser.
@@ -470,10 +583,7 @@ mod tests {
             session_id: "../escape".into(),
             ..evidence
         };
-        assert_eq!(
-            invalid.validate(),
-            Err("invalid App VM runtime identity")
-        );
+        assert_eq!(invalid.validate(), Err("invalid App VM runtime identity"));
     }
 
     #[test]
@@ -484,10 +594,9 @@ mod tests {
         .expect("legacy runtime evidence");
         assert_eq!(legacy_evidence.generation, 0);
 
-        let legacy_state: SessionRequest = serde_json::from_str(
-            r#"{"op":"app_state","id":"session-1","state":"connected"}"#,
-        )
-        .expect("legacy app state");
+        let legacy_state: SessionRequest =
+            serde_json::from_str(r#"{"op":"app_state","id":"session-1","state":"connected"}"#)
+                .expect("legacy app state");
         assert!(matches!(
             legacy_state,
             SessionRequest::AppState { generation: 0, .. }
@@ -544,6 +653,67 @@ mod tests {
             serde_json::from_str::<SessionRequest>(&req.to_body()).expect("browser profile"),
             req
         );
+        assert_eq!(
+            req.browser_transport(),
+            Ok(Some(BrowserVmTransport::Sunshine)),
+            "the legacy browser_vm profile is the Sunshine/Moonlight default"
+        );
+    }
+
+    #[test]
+    fn browser_rdp_is_a_distinct_explicit_wire_profile() {
+        let req = SessionRequest::Open {
+            id: "vdi-browser-rdp".into(),
+            serving_peer: "dell".into(),
+            vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+            client_peer: "seat-15".into(),
+            profile: Some(BrowserVmTransport::Rdp.session_profile()),
+        };
+        assert_eq!(
+            req.to_body(),
+            r#"{"op":"open","id":"vdi-browser-rdp","serving_peer":"dell","vm_id":"browser-vm","client_peer":"seat-15","profile":"browser_vm_rdp"}"#
+        );
+        assert_eq!(req.browser_transport(), Ok(Some(BrowserVmTransport::Rdp)));
+        assert_eq!(
+            serde_json::from_str::<SessionRequest>(&req.to_body()).expect("RDP alternate"),
+            req
+        );
+    }
+
+    #[test]
+    fn browser_profile_pairing_fails_closed() {
+        let missing_profile = SessionRequest::Open {
+            id: "vdi-browser-untyped".into(),
+            serving_peer: "dell".into(),
+            vm_id: BROWSER_VM_WORKLOAD_ID.into(),
+            client_peer: "seat-15".into(),
+            profile: None,
+        };
+        assert_eq!(
+            missing_profile.browser_transport(),
+            Err(BrowserVmProfileError::MissingProfile)
+        );
+
+        let wrong_workload = SessionRequest::Open {
+            id: "vdi-wrong-workload".into(),
+            serving_peer: "dell".into(),
+            vm_id: "unrelated-vm".into(),
+            client_peer: "seat-15".into(),
+            profile: Some(DesktopSessionProfile::BrowserVmRdp),
+        };
+        assert_eq!(
+            wrong_workload.browser_transport(),
+            Err(BrowserVmProfileError::WrongWorkload)
+        );
+
+        let generic = SessionRequest::Open {
+            id: "vdi-generic".into(),
+            serving_peer: "dell".into(),
+            vm_id: "unrelated-vm".into(),
+            client_peer: "seat-15".into(),
+            profile: None,
+        };
+        assert_eq!(generic.browser_transport(), Ok(None));
     }
 
     /// Pins the three single-field lifecycle verbs.

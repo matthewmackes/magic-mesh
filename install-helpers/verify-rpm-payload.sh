@@ -31,6 +31,8 @@
 #   install-helpers/verify-rpm-payload.sh all            # same as no args
 #   install-helpers/verify-rpm-payload.sh payload        # RPM-payload check, dry-run (no RPM)
 #   install-helpers/verify-rpm-payload.sh payload a.rpm  # validate a REAL built RPM's file list (also size-checks it)
+#   install-helpers/verify-rpm-payload.sh requirements            # pin source metadata for base VDI-host hard Requires
+#   install-helpers/verify-rpm-payload.sh requirements a.rpm      # also inspect a built RPM's actual Requires header
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
 #   install-helpers/verify-rpm-payload.sh surfaces       # surface-reachability check only
 #   install-helpers/verify-rpm-payload.sh --self-test    # exercise the parser on good+broken fixtures
@@ -66,7 +68,9 @@
 #
 # Real-RPM semantics (`payload <rpm>`): runs `rpm -qlp <rpm>` and asserts every
 # expected install path is in the payload (globs are checked best-effort by dest
-# prefix; the key bins are checked exactly), then ALSO size-checks the file.
+# prefix; the key bins are checked exactly), runs `rpm -qp --requires <rpm>` on
+# the base package to prove its required KVM host packages reached the actual
+# header, then ALSO size-checks the file.
 #
 # Size semantics (`size <rpm>`, build-deploy-12): the public dnf channel is served
 # from GitHub Pages (packaging/repo/magic-mesh.repo), a git branch, so the pushed
@@ -95,6 +99,8 @@
 #   DESKTOP_DIR  surface-crate dir    (default crates/desktop)
 #   REPO_ROOT    tree root for assets (default: the git worktree this script is in)
 #   MCNF_FAKE_RPM_LIST  a file whose lines stand in for `rpm -qlp` (real-RPM test hook)
+#   MCNF_FAKE_RPM_REQUIRES  a file whose lines stand in for `rpm -qp --requires`
+#                           (self-test hook only)
 #   MCNF_RPM_SIZE_LIMIT_MIB  size-gate ceiling in MiB (default 90; build-deploy-12)
 set -uo pipefail
 shopt -s globstar nullglob
@@ -113,6 +119,16 @@ EXEMPT_SURFACES=("mde-panel-egui")
 readonly BASE_KEY_BINS=("mde-shell-egui" "mackesd")
 readonly SERVER_KEY_BINS=("mackesd")
 readonly LIGHTHOUSE_KEY_BINS=("mackesd")
+readonly BASE_VDI_HOST_REQUIRES=(
+  "libvirt"
+  "qemu-kvm"
+  "libvirt-daemon-kvm"
+  "libvirt-daemon-driver-storage"
+)
+readonly BUILT_RPM_KVM_REQUIRES=(
+  "qemu-kvm"
+  "libvirt-daemon-kvm"
+)
 
 # build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
 # so the pushed .rpm file hits GitHub's ~100 MiB hard per-file block. Fail a cut with
@@ -154,6 +170,79 @@ parse_lighthouse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm
 parse_all_shipped_assets() {
   parse_assets "$1"
   parse_lighthouse_assets "$1"
+}
+
+# Emit each direct key in a TOML table. This intentionally stops at the next
+# table so a package present only in Recommends cannot satisfy a hard-Requires
+# assertion.
+parse_table_keys() {
+  awk '
+    $0 == "[" section "]" { in_table = 1; next }
+    in_table && /^\[/ { exit }
+    in_table {
+      line = $0
+      sub(/[[:space:]]*#.*/, "", line)
+      if (line ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+        sub(/^[[:space:]]*/, "", line)
+        sub(/[[:space:]]*=.*/, "", line)
+        print line
+      }
+    }
+  ' section="$2" "$1"
+}
+
+check_vdi_host_requires() {
+  hdr "VDI host runtime — base RPM hard Requires"
+  local -A seen=()
+  local package
+  while IFS= read -r package; do
+    [ -n "$package" ] && seen["$package"]=1
+  done < <(parse_table_keys "$CARGO_TOML" "package.metadata.generate-rpm.requires")
+
+  for package in "${BASE_VDI_HOST_REQUIRES[@]}"; do
+    if [ -n "${seen["$package"]:-}" ]; then
+      ok "hard-requires  $package"
+    else
+      fail "hard-requires  $package MISSING from [package.metadata.generate-rpm.requires]"
+    fi
+  done
+}
+
+# Read the actual RPM Requires header (or the self-test fixture). Production
+# validation intentionally uses the exact query form required by the gate.
+rpm_requires_header() {
+  if [ -n "${MCNF_FAKE_RPM_REQUIRES:-}" ]; then
+    cat "$MCNF_FAKE_RPM_REQUIRES"
+  else
+    rpm -qp --requires "$1"
+  fi
+}
+
+check_built_rpm_vdi_host_requires() {
+  local rpm="$1"
+  hdr "VDI host runtime — built RPM Requires header: $rpm"
+  if [ -z "${MCNF_FAKE_RPM_REQUIRES:-}" ] && [ ! -f "$rpm" ]; then
+    fail "actual-requires RPM not found: $rpm"
+    return
+  fi
+
+  local requires
+  if ! requires="$(rpm_requires_header "$rpm" 2>/dev/null)"; then
+    fail "actual-requires could not read the built RPM Requires header with rpm -qp --requires"
+    return
+  fi
+
+  local package
+  for package in "${BUILT_RPM_KVM_REQUIRES[@]}"; do
+    # Match the dependency name as the first RPM expression token. This accepts
+    # normal versioned hard requirements (`name >= version`) but rejects a
+    # similarly named capability or a package present only as a weak dependency.
+    if awk -v wanted="$package" '$1 == wanted { found = 1 } END { exit !found }' <<<"$requires"; then
+      ok "actual-requires $package present in rpm -qp --requires"
+    else
+      fail "actual-requires $package MISSING from the built RPM Requires header"
+    fi
+  done
 }
 
 # Does a path contain a glob metacharacter?
@@ -240,6 +329,8 @@ check_payload_dryrun() {
       fail "key-bin        target/release/$kb  is NOT in the asset set (the exact 'compiles ≠ ships' regression)"
     fi
   done
+
+  check_vdi_host_requires
 }
 
 # Read the RPM file list (real, or a fake listing for --self-test).
@@ -342,6 +433,12 @@ check_payload_rpm() {
     fi
   done < <($asset_stream "$CARGO_TOML")
 
+  if [ "$shape" = "base" ]; then
+    check_built_rpm_vdi_host_requires "$rpm"
+  else
+    info "actual-requires KVM host check applies to the base RPM (shape is $shape)"
+  fi
+
   # Validating a REAL RPM also asserts it fits the channel ceiling (build-deploy-12).
   # Skip under the fake-list self-test hook (no real file to measure).
   if [ -z "${MCNF_FAKE_RPM_LIST:-}" ] && [ -f "$rpm" ]; then
@@ -413,7 +510,7 @@ check_surfaces() {
 # ═════════════════════════════════════════════════════════════════════════════
 self_test() {
   hdr "SELF-TEST"
-  local tmp rc
+  local tmp rc out
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   local st_fail=0
@@ -428,6 +525,11 @@ assets = [
     { source = "target/release/mackesd",        dest = "/usr/bin/mackesd",        mode = "755" },
     { source = "packaging/x.service",           dest = "/usr/lib/systemd/system/x.service", mode = "644" },
 ]
+[package.metadata.generate-rpm.requires]
+libvirt = "*"
+qemu-kvm = "*"
+libvirt-daemon-kvm = "*"
+libvirt-daemon-driver-storage = "*"
 [package.metadata.generate-rpm.variants.server]
 assets = [
     { source = "target/release/should-be-ignored", dest = "/usr/bin/should-be-ignored", mode = "755" },
@@ -450,6 +552,85 @@ TOML
   else
     ok "self-test: parser does NOT leak server-variant assets"
   fi
+  out="$(CARGO_TOML="$good" bash "$0" requirements 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "self-test: the complete Fedora VDI-host hard-Requires set passes"
+  else
+    fail "self-test: complete Fedora VDI-host hard Requires did not pass"; st_fail=1
+  fi
+
+  # A weak dependency is not sufficient: both Fedora KVM packages must remain
+  # in the base RPM's hard-Requires table alongside the existing libvirt pins.
+  local bad_requires="$tmp/bad-requires.toml"
+  cat >"$bad_requires" <<'TOML'
+[package.metadata.generate-rpm.requires]
+libvirt = "*"
+libvirt-daemon-driver-storage = "*"
+[package.metadata.generate-rpm.recommends]
+qemu-kvm = "*"
+libvirt-daemon-kvm = "*"
+TOML
+  out="$(CARGO_TOML="$bad_requires" bash "$0" requirements 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "qemu-kvm MISSING" <<<"$out" \
+      && grep -q "libvirt-daemon-kvm MISSING" <<<"$out"; then
+    ok "self-test: weak-only Fedora KVM dependencies fail the hard-Requires gate"
+  else
+    fail "self-test: weak-only Fedora KVM dependencies were not rejected"; st_fail=1
+  fi
+
+  # Source metadata is not release evidence. Exercise the actual Requires-header
+  # parser with exact and versioned package expressions, then prove similarly
+  # named capabilities cannot satisfy the two mandatory KVM package names.
+  local good_rpm_requires="$tmp/good-rpm-requires"
+  cat >"$good_rpm_requires" <<'REQUIRES'
+qemu-kvm
+libvirt-daemon-kvm >= 10.0
+rpmlib(CompressedFileNames) <= 3.0.4-1
+REQUIRES
+  out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_REQUIRES="$good_rpm_requires" \
+      bash "$0" requirements "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] \
+      && grep -q "actual-requires qemu-kvm present" <<<"$out" \
+      && grep -q "actual-requires libvirt-daemon-kvm present" <<<"$out"; then
+    ok "self-test: a built RPM header with both mandatory KVM Requires passes"
+  else
+    fail "self-test: complete built RPM KVM Requires header did not pass"; st_fail=1
+  fi
+
+  local bad_rpm_requires="$tmp/bad-rpm-requires"
+  cat >"$bad_rpm_requires" <<'REQUIRES'
+qemu-kvm-helper
+libvirt-daemon-kvm-tools
+REQUIRES
+  out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_REQUIRES="$bad_rpm_requires" \
+      bash "$0" requirements "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "actual-requires qemu-kvm MISSING" <<<"$out" \
+      && grep -q "actual-requires libvirt-daemon-kvm MISSING" <<<"$out"; then
+    ok "self-test: similarly named capabilities cannot satisfy built RPM KVM Requires"
+  else
+    fail "self-test: built RPM Requires gate accepted similarly named capabilities"; st_fail=1
+  fi
+
+  # Real payload validation must invoke the header gate too; otherwise a caller
+  # could get a green file-list verdict for an RPM missing one hard dependency.
+  local fake_rpm_list="$tmp/fake-rpm-list"
+  cat >"$fake_rpm_list" <<'LISTING'
+/usr/bin/mde-shell-egui
+/usr/bin/mackesd
+/usr/lib/systemd/system/x.service
+LISTING
+  printf '%s\n' 'qemu-kvm' >"$bad_rpm_requires"
+  out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_LIST="$fake_rpm_list" \
+      MCNF_FAKE_RPM_REQUIRES="$bad_rpm_requires" \
+      bash "$0" payload "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] \
+      && grep -q "actual-requires libvirt-daemon-kvm MISSING" <<<"$out"; then
+    ok "self-test: real-RPM payload mode enforces the actual Requires header"
+  else
+    fail "self-test: real-RPM payload mode skipped the actual Requires header"; st_fail=1
+  fi
 
   # ---- fixture B: a SYNTHETICALLY-BROKEN manifest ---------------------------
   # Drops the shell key-bin, adds a bin nothing builds, adds a missing file.
@@ -464,7 +645,6 @@ assets = [
 ]
 TOML
   # Run the dry-run against the broken fixture; it MUST fail and name the issues.
-  local out
   out="$(CARGO_TOML="$bad" FAILS=0 bash "$0" payload 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     ok "self-test: broken manifest makes the payload check EXIT NON-ZERO ($rc)"
@@ -564,6 +744,11 @@ main() {
     -h|--help|help) usage; exit 0 ;;
     --self-test|self-test) self_test; exit $? ;;
     payload)  shift; check_payload "${1:-}" ;;
+    requirements)
+      shift
+      check_vdi_host_requires
+      [ -z "${1:-}" ] || check_built_rpm_vdi_host_requires "$1"
+      ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")   check_payload_dryrun; check_surfaces ;;

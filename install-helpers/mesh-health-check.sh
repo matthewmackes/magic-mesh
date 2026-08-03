@@ -18,7 +18,9 @@
 # journal so `journalctl -u mesh-health` shows what recovered and why.
 set -u
 
-ETC_NEBULA="/etc/nebula"
+ETC_NEBULA="${MCNF_NEBULA_DIR:-/etc/nebula}"
+ROLE_FILE="${MCNF_ROLE_FILE:-/var/lib/mde/role.toml}"
+HEALTH_RUN_DIR="${MCNF_HEALTH_RUN_DIR:-/run/mesh-health}"
 log() { echo "mesh-health: $*"; }       # journal via the unit's StandardOutput
 
 # Only manage a node that has actually been enrolled.
@@ -28,7 +30,7 @@ if [ ! -f "$ETC_NEBULA/host.crt" ] &&
     exit 0
 fi
 # A role must be pinned, else mackesd fails closed by design — don't fight it.
-[ -f /var/lib/mde/role.toml ] || { log "no role pinned; leaving services alone"; exit 0; }
+[ -f "$ROLE_FILE" ] || { log "no role pinned; leaving services alone"; exit 0; }
 
 MESH_ALERT_BIN="${MESH_ALERT_BIN:-/usr/libexec/mackesd/mesh-alert}"
 
@@ -36,8 +38,8 @@ MESH_ALERT_BIN="${MESH_ALERT_BIN:-/usr/libexec/mackesd/mesh-alert}"
 # spam) that the watchdog had to act. systemd's OnFailure= covers clean
 # crashes; this covers the wedged-but-not-failed cases the watchdog catches.
 alert() {
-    local stamp="/run/mesh-health/$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_').alerted"
-    mkdir -p /run/mesh-health 2>/dev/null
+    local stamp="$HEALTH_RUN_DIR/$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_').alerted"
+    mkdir -p "$HEALTH_RUN_DIR" 2>/dev/null
     if [ -z "$(find "$stamp" -newermt '-10 minutes' 2>/dev/null)" ]; then
         [ -x "$MESH_ALERT_BIN" ] && "$MESH_ALERT_BIN" "$1" crit "watchdog recovering $1 on $(hostname): $2" || true
         : > "$stamp"
@@ -54,7 +56,8 @@ restart() {
 #    + Syncthing (files). When this node is on the etcd coordination plane
 #    (setup-etcd wrote the endpoints file), assert etcd quorum health + the
 #    Syncthing daemon.
-ETCD_ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
+ETCD_ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
+SYNCTHING_FOLDER_ID="${MCNF_SYNCTHING_FOLDER_ID:-mcnf-mesh}"
 QNM="${MDE_WORKGROUP_ROOT:-${QNM_PATH:-/mnt/mesh-storage}}"
 if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
     # etcd coordination plane: quorum health (any reachable client endpoint).
@@ -73,15 +76,52 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
     # configured peers is silently OUT OF SYNC — service-active isn't enough.
     # This is the exact failure the reconciler addresses (a peer device-id not
     # yet wired → "unknown device" rejection, syncthing up but no connection) and
-    # also catches an overlay partition. Compare configured peer devices (minus
-    # self) to live connections and alert if short, so a stuck file plane is
-    # visible instead of silently diverging.
+    # also catches an overlay partition. Compare ONLY devices shared on the
+    # managed folder (minus self) with the connected-device map. Unrelated global
+    # devices are valid Syncthing state and must not inflate either count.
     if systemctl is-active --quiet syncthing.service 2>/dev/null && command -v syncthing >/dev/null 2>&1; then
         ST_HOME="${MCNF_SYNCTHING_HOME:-/var/lib/mcnf-syncthing}"
-        st_peers=$(( $(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" config devices list 2>/dev/null | grep -c .) - 1 ))
-        st_conn=$(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" show connections 2>/dev/null | grep -c '"connected": true')
-        if [ "${st_peers:-0}" -gt 0 ] && [ "${st_conn:-0}" -lt "$st_peers" ]; then
-            alert "syncthing-out-of-sync" "Mesh Sync OUT OF SYNC on $(hostname): ${st_conn}/${st_peers} peer device(s) connected (reconcile pending or overlay partition)"
+        st_folder_devices="$(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" config folders "$SYNCTHING_FOLDER_ID" devices list 2>/dev/null || true)"
+        st_system="$(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" show system 2>/dev/null || true)"
+        st_connections="$(HOME="$ST_HOME" syncthing cli --home="$ST_HOME" show connections 2>/dev/null || true)"
+        if st_counts="$(ST_FOLDER_DEVICES="$st_folder_devices" ST_SYSTEM="$st_system" ST_CONNECTIONS="$st_connections" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+device_re = re.compile(r'^[A-Z2-7]{7}(?:-[A-Z2-7]{7}){7}$')
+folder_lines = [line.strip() for line in os.environ['ST_FOLDER_DEVICES'].splitlines() if line.strip()]
+if not folder_lines or any(not device_re.fullmatch(device) for device in folder_lines):
+    raise SystemExit(1)
+
+try:
+    system = json.loads(os.environ['ST_SYSTEM'])
+    connection_document = json.loads(os.environ['ST_CONNECTIONS'])
+except (KeyError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+self_id = system.get('myID')
+connections = connection_document.get('connections')
+if not isinstance(self_id, str) or not device_re.fullmatch(self_id) or not isinstance(connections, dict):
+    raise SystemExit(1)
+
+folder_peers = set(folder_lines)
+folder_peers.discard(self_id)
+connected = {
+    device_id
+    for device_id, state in connections.items()
+    if isinstance(state, dict) and state.get('connected') is True
+}
+print(len(folder_peers & connected), len(folder_peers))
+PY
+)"; then
+            read -r st_conn st_peers <<<"$st_counts"
+            if [ "${st_peers:-0}" -gt 0 ] && [ "${st_conn:-0}" -lt "$st_peers" ]; then
+                alert "syncthing-out-of-sync" "Mesh Sync OUT OF SYNC on $(hostname): ${st_conn}/${st_peers} managed-folder peer device(s) connected (reconcile pending or overlay partition)"
+            fi
+        else
+            log "WARN: unable to evaluate Syncthing folder-scoped connections for $SYNCTHING_FOLDER_ID"
         fi
     fi
 fi

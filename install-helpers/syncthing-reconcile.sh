@@ -14,9 +14,9 @@
 set -uo pipefail
 
 H="${MCNF_SYNCTHING_HOME:-/var/lib/mcnf-syncthing}"
-ENDPOINTS_FILE=/etc/mackesd/etcd-endpoints
+ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
 FOLDER_ID="${MCNF_SYNCTHING_FOLDER_ID:-mcnf-mesh}"
-HOST="$(hostname)"
+HOST="${MCNF_HOSTNAME:-$(hostname -s)}"
 DEV_RE='^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$'
 
 [ -s "$ENDPOINTS_FILE" ] || exit 0                       # no etcd substrate → nothing to do
@@ -29,6 +29,9 @@ cli() { HOME="$H" syncthing cli --home="$H" "$@"; }
 
 # Devices already in the running config (one base32 id per line, incl. self).
 CURRENT="$(cli config devices list 2>/dev/null || true)"
+# Folder membership is independent of the global device roster. A peer can be
+# globally known yet absent from mcnf-mesh, so reconcile both sets additively.
+FOLDER_CURRENT="$(cli config folders "$FOLDER_ID" devices list 2>/dev/null || true)"
 
 # Registry → "host<TAB>device-id@overlay-ip" pairs (clean alternating key/value
 # lines from etcdctl, paired by awk — matching setup-syncthing.sh's parser).
@@ -39,10 +42,14 @@ ETCDCTL_API=3 etcdctl --endpoints="$EPS" get --prefix /mesh/syncthing/ 2>/dev/nu
       dev="${val%@*}"; ip="${val#*@}"
       [ -z "$dev" ] && continue
       printf '%s' "$dev" | grep -qE "$DEV_RE" || continue   # skip a corrupt registry id
-      printf '%s\n' "$CURRENT" | grep -qF "$dev" && continue # already present → no-op, no restart
       addr="dynamic"; [ -n "$ip" ] && [ "$ip" != "$dev" ] && addr="tcp://${ip}:22000"
-      logger -t syncthing-reconcile "adding mesh peer device $rhost ($dev) addr=$addr"
-      cli config devices add --device-id "$dev" --name "$rhost" --addresses "$addr" --compression metadata 2>/dev/null || true
-      cli config folders "$FOLDER_ID" devices add --device-id "$dev" 2>/dev/null || true
+      if ! printf '%s\n' "$CURRENT" | grep -qxF "$dev"; then
+        logger -t syncthing-reconcile "adding mesh peer device $rhost ($dev) addr=$addr"
+        cli config devices add --device-id "$dev" --name "$rhost" --addresses "$addr" --compression metadata 2>/dev/null || true
+      fi
+      if ! printf '%s\n' "$FOLDER_CURRENT" | grep -qxF "$dev"; then
+        logger -t syncthing-reconcile "sharing $FOLDER_ID with mesh peer $rhost ($dev)"
+        cli config folders "$FOLDER_ID" devices add --device-id "$dev" 2>/dev/null || true
+      fi
     done
 exit 0

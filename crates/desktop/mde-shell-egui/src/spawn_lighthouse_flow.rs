@@ -10,7 +10,7 @@
 //!
 //! ## One wire contract, no daemon dependency (§6 glue)
 //!
-//! Exactly as [`crate::services_flow`] mirrors the `service_onboard` worker, this
+//! Like the other Bus-backed provisioning surfaces, this
 //! module leans inward only on `mde-bus` and mirrors the worker's wire contract
 //! with local serde structs: the [`SpawnLighthouseAction`] it publishes on
 //! `action/onboard/spawn-lighthouse` serialises to the identical body the
@@ -269,7 +269,7 @@ impl SpawnLighthouseFlowState {
 
     /// Build the wire action for the current pick. Pure + deterministic given
     /// `now_ms` (its only entropy) so the emitted shape is unit-testable —
-    /// mirroring `services_flow::build_action`.
+    /// mirroring the shared typed-action authorization path.
     fn build_action(&self, dry_run: bool, now_ms: u64) -> SpawnLighthouseAction {
         SpawnLighthouseAction {
             id: format!("lh-{now_ms}-{}", self.target.wire()),

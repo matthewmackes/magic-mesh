@@ -943,6 +943,14 @@ impl CommunicationsState {
         self.surface.open_editor();
     }
 
+    /// Open the canonical Files app inside Mesh Teams. Legacy `Surface::Files`
+    /// deep links call this compatibility route; there is no second file app or
+    /// state authority.
+    pub(crate) fn open_files(&mut self) {
+        self.surface.set_app(mde_collab_egui::MeshTeamsApp::Files);
+        self.surface.set_mode(Mode::Files);
+    }
+
     /// Re-fold the `state/collab/*` mirrors on the poll cadence (the shell calls
     /// this while Communications is the surface in view).
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
@@ -1166,6 +1174,40 @@ fn publish_command(
         .write(topic, Priority::Default, None, Some(&authorized))
         .map_err(|e| format!("Bus write failed: {e}"))?;
     Ok(())
+}
+
+/// Headless acceptance seam that drives the exact signed command path used by
+/// the visible Communications surface. It is intentionally crate-private: the
+/// root shell's hidden acceptance CLI can exercise a five-seat matrix without
+/// creating a second mint authority or an unauthenticated Bus shortcut.
+pub(crate) fn publish_acceptance_command(command: &CollabCommand) -> Result<(), String> {
+    let topic = mde_collab_types::topics::command_topic(command.verb());
+    publish_command(
+        mde_bus::client_data_dir().as_deref(),
+        &topic,
+        command,
+    )
+}
+
+/// Publish one clipboard acceptance value through the native DRM provider's
+/// real opt-in lane. This covers the toggle gate as well as the canonical event
+/// shape; it does not write directly around the provider.
+pub(crate) fn publish_acceptance_clipboard(text: &str) -> Result<bool, String> {
+    let mut clipboard = BusTextClipboard::for_shell(mde_bus::client_data_dir());
+    clipboard.set_local_publishing_enabled(true);
+    clipboard.write_text_checked(text)
+}
+
+/// Materialize the current native clipboard through the same DRM provider and
+/// return only content evidence, never the clipboard text itself.
+pub(crate) fn read_acceptance_clipboard() -> Result<Option<(String, usize)>, String> {
+    let mut clipboard = BusTextClipboard::for_shell(mde_bus::client_data_dir());
+    clipboard.read_text_checked().map(|text| {
+        text.map(|text| {
+            let len = text.len();
+            (mde_collab_types::value::sha256_hex(text.as_bytes()), len)
+        })
+    })
 }
 
 #[cfg(test)]

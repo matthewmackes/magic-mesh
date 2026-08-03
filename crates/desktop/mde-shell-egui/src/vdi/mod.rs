@@ -19,6 +19,7 @@
 //! wire transport is the gated E12-4 layer) the panel shows an honest "no desktop"
 //! EmptyState, never a placeholder render of a fake desktop (§7).
 
+use mackes_mesh_types::vdi_session::BrowserVmTransport;
 use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
 
 use mde_vdi_core::{sub_color_image, FrameDamage};
@@ -28,7 +29,7 @@ use mde_vdi_vnc::VncSession;
 
 use crate::auth::DesktopAuth;
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 #[cfg(feature = "live-vdi")]
 use {
@@ -182,10 +183,41 @@ pub(crate) enum ConsoleResolution {
 
 fn broker_protocol(value: Option<&str>) -> Option<VdiProtocol> {
     match value {
+        Some("sunshine") => Some(VdiProtocol::Moonlight),
         Some("rdp") => Some(VdiProtocol::Rdp),
         Some("vnc") => Some(VdiProtocol::Vnc),
         Some("spice") => Some(VdiProtocol::Spice),
         _ => None,
+    }
+}
+
+/// Admit a serving-broker protocol without weakening a Browser transport lock.
+/// Generic desktops retain the broker-authoritative behavior; Browser sessions
+/// require an exact match and fail closed on missing, stale, or alternate
+/// records.
+#[cfg(any(test, feature = "live-vdi"))]
+fn admit_broker_protocol(
+    selected: Option<BrowserVmTransport>,
+    offered: Option<VdiProtocol>,
+) -> Result<Option<VdiProtocol>, String> {
+    let Some(selected) = selected else {
+        return Ok(offered);
+    };
+    let expected = match selected {
+        BrowserVmTransport::Sunshine => VdiProtocol::Moonlight,
+        BrowserVmTransport::Rdp => VdiProtocol::Rdp,
+    };
+    match offered {
+        Some(protocol) if protocol == expected => Ok(Some(protocol)),
+        Some(protocol) => Err(format!(
+            "selected {} but the broker offered {}; no transport fallback was attached",
+            selected.label(),
+            protocol.label()
+        )),
+        None => Err(format!(
+            "selected {} but the broker omitted its protocol; no transport fallback was attached",
+            selected.label()
+        )),
     }
 }
 
@@ -299,12 +331,24 @@ impl BrokerSessionLifecycle {
     }
 }
 
+/// Shell surface that owns a retained broker session when it is focused.
+/// Browser sessions return to the guest-Chromium boundary; every other desktop
+/// session returns to the ordinary Desktop surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionFocusSurface {
+    Browser,
+    Desktop,
+}
+
 /// The desktop protocol a connect routes to — the VDI tier's *routable* set. The
 /// Chooser's wire [`crate::chooser::Protocol`] additionally carries an `Unknown`
 /// badge for a tag this build can't render; only a routable protocol reaches a
 /// [`ConnectRequest`], so this enum has no unknown arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VdiProtocol {
+    /// Sunshine stream consumed by Moonlight. The typed route exists now; the
+    /// host decoder remains honestly gated until its live adapter is present.
+    Moonlight,
     /// Remote Desktop Protocol — `mde-vdi-rdp` (the primary).
     Rdp,
     /// VNC / RFB — `mde-vdi-vnc` (the universal console fallback).
@@ -317,6 +361,7 @@ impl VdiProtocol {
     /// The decoder crate this protocol renders through.
     pub(crate) const fn client_crate(self) -> &'static str {
         match self {
+            Self::Moonlight => "Moonlight adapter",
             Self::Rdp => "mde-vdi-rdp",
             Self::Vnc => "mde-vdi-vnc",
             Self::Spice => "mde-vdi-spice",
@@ -331,6 +376,7 @@ impl VdiProtocol {
     /// The short picker / caption label.
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::Moonlight => "Sunshine/Moonlight",
             Self::Rdp => "RDP",
             Self::Vnc => "VNC",
             Self::Spice => "Spice",
@@ -343,6 +389,7 @@ impl VdiProtocol {
     /// cut-text is wired; RDP CLIPRDR and SPICE vdagent remain explicit gaps.
     pub(crate) const fn clipboard_summary(self) -> &'static str {
         match self {
+            Self::Moonlight => "clipboard unavailable: Moonlight adapter is not attached",
             Self::Rdp => "clipboard unavailable: RDP CLIPRDR is not implemented",
             Self::Vnc => "clipboard: bidirectional RFB cut text",
             Self::Spice => "clipboard unavailable: SPICE vdagent is not implemented",
@@ -422,6 +469,10 @@ pub(crate) struct ConnectRequest {
     /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
     /// off-mesh endpoints leave this empty.
     pub broker_session: Option<BrokerSessionLifecycle>,
+    /// Exact Browser VM transport lock. Generic desktops leave this unset and
+    /// may follow their native console protocol. Browser sessions reject any
+    /// broker response that differs from this selection.
+    pub browser_transport: Option<BrowserVmTransport>,
     /// vdi-vm-8 — the guest desktop size hint in **device pixels** (the shell's real
     /// output size at connect time, [`body_device_px`]), so an RDP/SPICE guest renders
     /// at near-native resolution instead of a hardcoded 1024×768 that egui upscales
@@ -462,6 +513,7 @@ impl ConnectRequest {
             auth,
             app_id: None,
             broker_session: None,
+            browser_transport: None,
             preferred_size: None,
         }
     }
@@ -469,6 +521,13 @@ impl ConnectRequest {
     /// Attach the broker session lifecycle id minted by discovery.
     pub(crate) fn with_broker_session(mut self, broker: BrokerSessionLifecycle) -> Self {
         self.broker_session = Some(broker);
+        self
+    }
+
+    /// Lock a Browser VM request to the exact operator/default selection.
+    #[must_use]
+    pub(crate) const fn with_browser_transport(mut self, transport: BrowserVmTransport) -> Self {
+        self.browser_transport = Some(transport);
         self
     }
 
@@ -486,6 +545,14 @@ impl ConnectRequest {
     pub(crate) const fn with_preferred_size(mut self, size: Option<(u16, u16)>) -> Self {
         self.preferred_size = size;
         self
+    }
+}
+
+const fn request_focus_surface(request: &ConnectRequest) -> SessionFocusSurface {
+    if request.browser_transport.is_some() {
+        SessionFocusSurface::Browser
+    } else {
+        SessionFocusSurface::Desktop
     }
 }
 
@@ -1269,8 +1336,7 @@ fn read_host_gpu_busy_permille() -> Option<u32> {
         if !name.starts_with("card") || name.contains('-') {
             continue;
         }
-        let Ok(value) =
-            std::fs::read_to_string(entry.path().join("device/gpu_busy_percent"))
+        let Ok(value) = std::fs::read_to_string(entry.path().join("device/gpu_busy_percent"))
         else {
             continue;
         };
@@ -1289,9 +1355,8 @@ impl VdiMetrics {
     fn note_frame(&mut self) {
         let now = std::time::Instant::now();
         if let Some(previous) = self.previous_frame_at {
-            self.snapshot.last_frame_interval_us = Some(
-                u64::try_from(now.duration_since(previous).as_micros()).unwrap_or(u64::MAX),
-            );
+            self.snapshot.last_frame_interval_us =
+                Some(u64::try_from(now.duration_since(previous).as_micros()).unwrap_or(u64::MAX));
         }
         self.previous_frame_at = Some(now);
         self.queued_frame_at = Some(now);
@@ -1299,13 +1364,10 @@ impl VdiMetrics {
     }
 
     fn note_upload(&mut self, kind: FrameUpload, elapsed: std::time::Duration) {
-        self.snapshot.last_upload_us = Some(
-            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-        );
+        self.snapshot.last_upload_us = Some(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
         if let Some(queued) = self.queued_frame_at.take() {
-            self.snapshot.last_frame_to_upload_us = Some(
-                u64::try_from(queued.elapsed().as_micros()).unwrap_or(u64::MAX),
-            );
+            self.snapshot.last_frame_to_upload_us =
+                Some(u64::try_from(queued.elapsed().as_micros()).unwrap_or(u64::MAX));
         }
         match kind {
             FrameUpload::Full => {
@@ -1313,10 +1375,8 @@ impl VdiMetrics {
             }
             FrameUpload::Partial { rects } => {
                 self.snapshot.partial_uploads = self.snapshot.partial_uploads.saturating_add(1);
-                self.snapshot.partial_rects = self
-                    .snapshot
-                    .partial_rects
-                    .saturating_add(u64::from(rects));
+                self.snapshot.partial_rects =
+                    self.snapshot.partial_rects.saturating_add(u64::from(rects));
             }
         }
     }
@@ -1492,6 +1552,10 @@ pub(crate) struct VdiState {
     /// `session`. Drives the honest "connecting" caption (which names the chosen
     /// protocol + display) and tells the shell to show the Desktop surface.
     requested: Option<ConnectRequest>,
+    /// Exact brokered requests retained while another session has focus. The
+    /// request is the authority for Browser profile/transport and authentication;
+    /// roster labels are never used to reconstruct a connection.
+    retained_requests: BTreeMap<String, ConnectRequest>,
     /// Live in-shell RDP transport for a direct endpoint. Kept separate from
     /// `session`, which remains the single-threaded decoder used by tests and VNC.
     #[cfg(feature = "live-vdi")]
@@ -1597,10 +1661,46 @@ impl VdiState {
         ))
     }
 
+    /// Focus a broker session already owned by this shell.
+    ///
+    /// The current session is a strict no-op. A previously parked session is
+    /// restored from its exact retained request; no roster-derived VNC request,
+    /// replacement `Open`, or terminal `Close` is emitted. A different current
+    /// session is parked as nonterminal first so it remains available for a later
+    /// focus switch.
+    pub(crate) fn focus_broker_session(&mut self, id: &str) -> Option<SessionFocusSurface> {
+        if self.requested_session_id() == Some(id) {
+            return self.requested.as_ref().map(request_focus_surface);
+        }
+
+        let request = self.retained_requests.remove(id)?;
+        self.park_current_request();
+        let surface = request_focus_surface(&request);
+        self.install_request(request);
+        Some(surface)
+    }
+
     /// Record the connect the Chooser's picker chose (CHOOSER-4). The surface then
     /// shows a "connecting" state naming the target + chosen protocol until the
     /// gated wire transport attaches the live decoder session.
     pub(crate) fn request_connect(&mut self, request: ConnectRequest) {
+        if request
+            .broker_session
+            .as_ref()
+            .is_some_and(|broker| self.requested_session_id() == Some(broker.id.as_str()))
+        {
+            // Re-selecting the exact broker identity is focus, not reconnect. Keep
+            // the original request and live transport because the incoming value
+            // may have been reconstructed from lossy roster presentation data.
+            return;
+        }
+        self.park_current_request();
+        self.install_request(request);
+    }
+
+    /// Install one exact request after any prior session has already been parked
+    /// or explicitly closed. This never publishes broker lifecycle records.
+    fn install_request(&mut self, request: ConnectRequest) {
         #[cfg(feature = "live-vdi")]
         {
             self.live_status = None;
@@ -1616,7 +1716,6 @@ impl VdiState {
             // in-flight resize re-dial and the prior dialed size.
             self.pending_resize = None;
             self.negotiated_size = None;
-            self.publish_broker_close_if_active();
             if let Some(live) = self.live_rdp.take() {
                 live.stop();
             }
@@ -1648,6 +1747,48 @@ impl VdiState {
         self.requested = Some(request);
     }
 
+    /// Park the current brokered request without terminally closing its roster
+    /// record. A live transport is disconnected before the exact request is
+    /// retained; direct/off-mesh requests have no stable broker identity and are
+    /// simply released.
+    fn park_current_request(&mut self) {
+        let Some(request) = self.requested.take() else {
+            return;
+        };
+
+        #[cfg(feature = "live-vdi")]
+        {
+            self.publish_broker_disconnect_if_active();
+            if let Some(live) = self.live_rdp.take() {
+                live.stop();
+            }
+            if let Some(live) = self.live_vnc.take() {
+                live.stop();
+            }
+            if let Some(live) = self.live_spice.take() {
+                live.stop();
+            }
+            self.live_status = None;
+            self.broker_resolution_gated = false;
+            self.broker_resolve_at = None;
+            self.session_phase = SessionPhase::Live;
+            self.reconnect_at = None;
+            self.pending_resize = None;
+            self.negotiated_size = None;
+            self.texture = None;
+            self.incoming = None;
+            self.incoming_damage = None;
+        }
+
+        if let Some(id) = request
+            .broker_session
+            .as_ref()
+            .map(|broker| broker.id.clone())
+        {
+            self.retained_requests.insert(id, request);
+        }
+    }
+
     /// Attach the stable Browser VM workload to the existing brokered VDI
     /// transport. Browser uses the same session lifecycle as every other
     /// Desktop VM; the guest identity is the workload name and no host Browser
@@ -1655,29 +1796,36 @@ impl VdiState {
     pub(crate) fn request_browser_vm_connect(
         &mut self,
         target: crate::web::BrowserVmTarget,
+        transport: BrowserVmTransport,
         client_peer: &str,
         bus_root: Option<PathBuf>,
         preferred_size: Option<(u16, u16)>,
         auth: DesktopAuth,
     ) -> Result<(), String> {
         let mut last_error = None;
-        let publication = crate::discovery::publish_browser_vm_open_record(
+        let publication = crate::discovery::publish_browser_vm_open_record_with_transport(
             bus_root.as_deref(),
             &mut last_error,
             &target.serving_peer,
             &target.workload,
             client_peer,
+            transport,
         );
         if let Some(error) = last_error {
             return Err(format!("could not request browser-vm VDI session: {error}"));
         }
+        let protocol = match transport {
+            BrowserVmTransport::Sunshine => VdiProtocol::Moonlight,
+            BrowserVmTransport::Rdp => VdiProtocol::Rdp,
+        };
         let request = ConnectRequest::new(
             RequestedTarget::new(target.serving_peer, target.workload),
-            VdiProtocol::Rdp,
+            protocol,
             DisplayMode::Fullscreen,
             MonitorSpan::Single,
             auth,
         )
+        .with_browser_transport(transport)
         .with_broker_session(BrokerSessionLifecycle::new(publication.id, bus_root))
         .with_preferred_size(preferred_size);
         self.request_connect(request);
@@ -1718,6 +1866,13 @@ impl VdiState {
         // doesn't re-arm for a geometry already requested (see `note_resize_target`).
         self.negotiated_size = request.preferred_size;
         match request.protocol {
+            VdiProtocol::Moonlight => {
+                self.live_status = Some(
+                    "Sunshine/Moonlight selected; the host Moonlight adapter is unavailable. RDP was not attempted."
+                        .to_string(),
+                );
+                self.broker_resolution_gated = true;
+            }
             VdiProtocol::Rdp => match LiveRdpHandle::spawn(request) {
                 Ok(handle) => {
                     self.live_status = Some("Opening live RDP transport".to_string());
@@ -1785,6 +1940,18 @@ impl VdiState {
         let bodies = read_console_bodies(broker.bus_root.as_deref());
         match resolve_brokered_console(&bodies, &broker.id) {
             ConsoleResolution::Ready { endpoint, protocol } => {
+                let selected = self
+                    .requested
+                    .as_ref()
+                    .and_then(|request| request.browser_transport);
+                let protocol = match admit_broker_protocol(selected, protocol) {
+                    Ok(protocol) => protocol,
+                    Err(reason) => {
+                        self.live_status = Some(reason);
+                        self.broker_resolution_gated = true;
+                        return;
+                    }
+                };
                 if let Some(request) = self.requested.as_mut() {
                     request.target.endpoint = Some(endpoint);
                     if let Some(protocol) = protocol {
@@ -1815,9 +1982,22 @@ impl VdiState {
         self.requested.as_ref().map(|r| &r.target)
     }
 
+    /// The broker session identity currently attached to the Desktop surface,
+    /// when the live request came from the mesh session roster.
+    pub(crate) fn requested_session_id(&self) -> Option<&str> {
+        self.requested
+            .as_ref()
+            .and_then(|request| request.broker_session.as_ref())
+            .map(|broker| broker.id.as_str())
+    }
+
     /// Clear the pending connect — the operator backed out before a live session
     /// attached, so the Desktop surface falls back to the Chooser.
     pub(crate) fn clear_target(&mut self) {
+        // `Requested` is already a real broker roster record. Close the current
+        // identity whether or not a transport reached Active so an unavailable
+        // Sunshine attempt cannot leak when the operator chooses explicit RDP.
+        self.publish_broker_close_current();
         #[cfg(feature = "live-vdi")]
         {
             if let Some(live) = self.live_rdp.take() {
@@ -1829,7 +2009,6 @@ impl VdiState {
             if let Some(live) = self.live_spice.take() {
                 live.stop();
             }
-            self.publish_broker_close_if_active();
             self.live_status = None;
             self.broker_resolution_gated = false;
             self.broker_resolve_at = None;
@@ -2209,6 +2388,41 @@ impl VdiState {
         }
     }
 
+    /// Publish the terminal close for the currently focused broker identity.
+    /// Unlike the transport-active helper, this also covers a request that never
+    /// advanced beyond `Requested`.
+    fn publish_broker_close_current(&mut self) {
+        #[cfg(any(test, feature = "live-vdi"))]
+        {
+            #[cfg(feature = "live-vdi")]
+            let active = self.active_broker_session.take();
+            #[cfg(not(feature = "live-vdi"))]
+            let active: Option<BrokerSessionLifecycle> = None;
+
+            let Some(broker) = active.or_else(|| {
+                self.requested
+                    .as_ref()
+                    .and_then(|request| request.broker_session.clone())
+            }) else {
+                return;
+            };
+            let mut last_error = None;
+            crate::discovery::publish_close(
+                broker.bus_root.as_deref(),
+                &mut last_error,
+                broker.id.as_str(),
+            );
+            if let Some(reason) = last_error {
+                #[cfg(feature = "live-vdi")]
+                {
+                    self.live_status = Some(format!("Broker lifecycle gated: {reason}"));
+                }
+                #[cfg(not(feature = "live-vdi"))]
+                let _ = reason;
+            }
+        }
+    }
+
     #[cfg(feature = "live-vdi")]
     fn publish_broker_active(&mut self) {
         if self.active_broker_session.is_some() {
@@ -2241,22 +2455,6 @@ impl VdiState {
         };
         let mut last_error = None;
         crate::discovery::publish_disconnect(
-            broker.bus_root.as_deref(),
-            &mut last_error,
-            broker.id.as_str(),
-        );
-        if let Some(reason) = last_error {
-            self.live_status = Some(format!("Broker lifecycle gated: {reason}"));
-        }
-    }
-
-    #[cfg(feature = "live-vdi")]
-    fn publish_broker_close_if_active(&mut self) {
-        let Some(broker) = self.active_broker_session.take() else {
-            return;
-        };
-        let mut last_error = None;
-        crate::discovery::publish_close(
             broker.bus_root.as_deref(),
             &mut last_error,
             broker.id.as_str(),
@@ -2723,7 +2921,13 @@ fn desktop_a11y_value(state: &VdiState) -> String {
     match state.requested.as_ref() {
         Some(req) => req.app_id.as_ref().map_or_else(
             || format!("{} via {}", req.target.name, req.protocol.label()),
-            |app_id| format!("{app_id} on {} via {}", req.target.name, req.protocol.label()),
+            |app_id| {
+                format!(
+                    "{app_id} on {} via {}",
+                    req.target.name,
+                    req.protocol.label()
+                )
+            },
         ),
         None => "Connected desktop".to_string(),
     }

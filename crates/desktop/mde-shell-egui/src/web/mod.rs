@@ -6,6 +6,7 @@
 //! layer. Chromium, browser chrome, page execution, and guest failures remain
 //! inside `browser-vm`.
 
+use mackes_mesh_types::vdi_session::BrowserVmTransport;
 use mde_egui::egui::{self, RichText};
 use mde_egui::search_omnibox::SearchItem;
 
@@ -29,21 +30,6 @@ pub(crate) enum MediaTransportAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserVmTransport {
-    Rdp,
-    Spice,
-}
-
-impl BrowserVmTransport {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Rdp => "RDP",
-            Self::Spice => "SPICE",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BrowserVmRoute {
     workload: &'static str,
     preferred: BrowserVmTransport,
@@ -55,12 +41,15 @@ impl BrowserVmRoute {
     const fn select_resume() -> Self {
         Self {
             workload: VM_WORKLOAD,
+            // RDP is the first released transport: the in-shell IronRDP client,
+            // Dell console broker, and guest xrdp endpoint are all live. Keep
+            // Sunshine visible as the performance milestone, but never select an
+            // unavailable Moonlight adapter ahead of a usable service.
             preferred: BrowserVmTransport::Rdp,
-            alternate: Some(BrowserVmTransport::Spice),
+            alternate: Some(BrowserVmTransport::Sunshine),
             resume: true,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +84,17 @@ pub(crate) struct BrowserVmTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrowserVmConnect {
     pub(crate) target: BrowserVmTarget,
+    /// Exact transport for this handoff. The Browser route selects the released
+    /// RDP service; a future performance milestone may select Sunshine only once
+    /// its seat-side adapter is live.
+    pub(crate) transport: BrowserVmTransport,
+}
+
+/// The Workloads producer's canonical running-domain status is `active`.
+/// Accept the older shell-side `running` spelling during mixed-version rollout,
+/// but require the producer's independent reachability proof in both cases.
+fn browser_vm_ready(target: &BrowserVmTarget) -> bool {
+    target.reachable && matches!(target.status.trim(), "active" | "running")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +108,7 @@ struct BrowserVmDiagnostic {
 pub(crate) struct WebState {
     route: BrowserVmRoute,
     diagnostic: BrowserVmDiagnostic,
+    latest_target: Option<BrowserVmTarget>,
     requested_target: Option<String>,
     browser_vm_connect: Option<BrowserVmConnect>,
     browser_vm_request_issued: bool,
@@ -125,6 +126,7 @@ impl Default for WebState {
                 detail: "The guest Browser VM is selected; attach its VDI transport to continue."
                     .to_owned(),
             },
+            latest_target: None,
             requested_target: None,
             browser_vm_connect: None,
             browser_vm_request_issued: false,
@@ -165,6 +167,7 @@ impl WebState {
     /// is not yet reachable remains unavailable; this path never starts a host
     /// helper as a fallback.
     pub(crate) fn sync_browser_vm_target(&mut self, target: Option<BrowserVmTarget>) {
+        self.latest_target = target.clone();
         if self.browser_vm_request_issued || self.browser_vm_connect.is_some() {
             return;
         }
@@ -176,7 +179,7 @@ impl WebState {
             };
             return;
         };
-        if !target.reachable || target.status != "running" {
+        if !browser_vm_ready(&target) {
             self.diagnostic = BrowserVmDiagnostic {
                 state: BrowserVmConnectionState::WaitingForWorkload,
                 detail: format!(
@@ -190,7 +193,10 @@ impl WebState {
             state: BrowserVmConnectionState::WaitingForVdi,
             detail: "The Browser VM is ready; requesting its brokered VDI session.".to_owned(),
         };
-        self.browser_vm_connect = Some(BrowserVmConnect { target });
+        self.browser_vm_connect = Some(BrowserVmConnect {
+            target,
+            transport: self.route.preferred,
+        });
     }
 
     /// Consume the one-shot handoff. Once consumed, Browser remains bound to
@@ -256,8 +262,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         ui.heading("Browser VM");
         ui.add_space(8.0);
         ui.label(
-            RichText::new("Guest-owned Chromium is available through the dedicated VM.")
-                .strong(),
+            RichText::new("Guest-owned Chromium is available through the dedicated VM.").strong(),
         );
         ui.add_space(4.0);
         ui.label(format!("Workload: {}", route.workload));
@@ -265,12 +270,18 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         if let Some(alternate) = route.alternate {
             ui.label(format!("Alternate transport: {}", alternate.label()));
         } else {
-            ui.label("Alternate transport: unavailable until a real guest endpoint and decoder exist");
+            ui.label(
+                "Alternate transport: unavailable until a real guest endpoint and decoder exist",
+            );
         }
         ui.add_space(8.0);
         ui.colored_label(
             mde_egui::Style::TEXT_DIM,
-            format!("{}: {}", state.diagnostic().state.label(), state.diagnostic().detail),
+            format!(
+                "{}: {}",
+                state.diagnostic().state.label(),
+                state.diagnostic().detail
+            ),
         );
         if let Some(target) = state.requested_target.as_deref() {
             ui.add_space(4.0);
@@ -300,6 +311,8 @@ mod tests {
         let state = WebState::default();
         assert_eq!(state.route, BrowserVmRoute::select_resume());
         assert_eq!(state.route.workload, VM_WORKLOAD);
+        assert_eq!(state.route.preferred, BrowserVmTransport::Rdp);
+        assert_eq!(state.route.alternate, Some(BrowserVmTransport::Sunshine));
         assert!(state.route.resume);
         assert_eq!(
             state.diagnostic().state,
@@ -322,7 +335,10 @@ mod tests {
     fn front_door_target_is_retained_until_guest_attachment() {
         let mut state = WebState::default();
         state.open_search_omnibox_target("  https://example.test/  ");
-        assert_eq!(state.requested_target.as_deref(), Some("https://example.test/"));
+        assert_eq!(
+            state.requested_target.as_deref(),
+            Some("https://example.test/")
+        );
     }
 
     #[test]
@@ -337,17 +353,18 @@ mod tests {
     }
 
     #[test]
-    fn reachable_running_browser_vm_crosses_only_the_typed_vdi_seam() {
+    fn reachable_active_browser_vm_crosses_only_the_typed_vdi_seam() {
         let mut state = WebState::default();
         let target = BrowserVmTarget {
             serving_peer: "eagle".to_owned(),
             workload: "browser-vm".to_owned(),
-            status: "running".to_owned(),
+            status: "active".to_owned(),
             reachable: true,
         };
         state.sync_browser_vm_target(Some(target.clone()));
         let request = state.take_browser_vm_connect().expect("VDI handoff");
         assert_eq!(request.target.workload, "browser-vm");
+        assert_eq!(request.transport, BrowserVmTransport::Rdp);
         assert!(state.browser_vm_connect.is_none());
 
         state.note_vdi_session_detached();
@@ -360,5 +377,39 @@ mod tests {
                 .workload,
             "browser-vm"
         );
+    }
+
+    #[test]
+    fn rdp_is_the_automatic_first_release_transport() {
+        let mut state = WebState::default();
+        state.sync_browser_vm_target(Some(BrowserVmTarget {
+            serving_peer: "dell".to_owned(),
+            workload: "browser-vm".to_owned(),
+            status: "active".to_owned(),
+            reachable: true,
+        }));
+        let automatic = state.take_browser_vm_connect().expect("default handoff");
+        assert_eq!(automatic.transport, BrowserVmTransport::Rdp);
+        assert_eq!(
+            state.route.preferred,
+            BrowserVmTransport::Rdp,
+            "the usable transport must not depend on a fallback click"
+        );
+    }
+
+    #[test]
+    fn browser_vm_readiness_accepts_mixed_version_running_but_rejects_unreachable() {
+        let mut target = BrowserVmTarget {
+            serving_peer: "dell".to_owned(),
+            workload: "browser-vm".to_owned(),
+            status: "running".to_owned(),
+            reachable: true,
+        };
+        assert!(browser_vm_ready(&target));
+        target.reachable = false;
+        assert!(!browser_vm_ready(&target));
+        target.reachable = true;
+        target.status = "defined".to_owned();
+        assert!(!browser_vm_ready(&target));
     }
 }

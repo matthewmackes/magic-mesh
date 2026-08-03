@@ -78,7 +78,10 @@ do_sync() {
   # syncing a worktree's .git-file (a broken gitdir pointer) or colliding with a
   # stale clone is how the working tree got reverted mid-build. A git-free build
   # dir cannot be `git reset` out from under a build.
-  rsync -az --delete -e "${SSH[*]}" \
+  # Agent/model handoffs can restore a file with the same size and timestamp as
+  # an older farm copy. Content checksums prevent rsync's quick-check heuristic
+  # from silently compiling that stale source as if it were authoritative.
+  rsync -az --checksum --delete -e "${SSH[*]}" \
     --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
     --exclude '/.claude' \
     --exclude '/.git' \

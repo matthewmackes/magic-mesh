@@ -28,6 +28,7 @@ mod car_motion_policy;
 // path (`ChatState::show` + the render submodule) is now unreachable — allow it dead
 // pending the mde-chat → mde-collab-core migration tracked in the parity ledger,
 // rather than leaving a ~215-warning cascade.
+mod acceptance_cli;
 #[allow(dead_code)]
 mod chat;
 mod chooser;
@@ -70,7 +71,6 @@ mod provisioning;
 mod screenshot;
 mod seat_pump;
 mod seat_remote_input_consent;
-mod services_flow;
 mod session_rail;
 mod spawn_lighthouse_flow;
 mod splash;
@@ -92,12 +92,12 @@ mod workbench;
 
 use std::time::{Duration, Instant};
 
+use mde_egui::nav_chrome::AppFrame;
 use mde_egui::search_omnibox::SearchItem;
 use mde_egui::{eframe, egui, run_client, LayoutProfile, Motion, Style};
-use mde_egui::nav_chrome::AppFrame;
-use mde_theme::brand::icons::IconId;
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
+use mde_theme::brand::icons::IconId;
 
 use mde_bookmarks_egui::{
     bookmarks_panel, real_manager, BookmarksBus, Manager as BookmarksManager,
@@ -117,23 +117,22 @@ use web::MediaTransportAction;
 use lock_signal::LockSignals;
 use workbench::Plane;
 
-/// perf-11 — the seven Workbench planes share a 5 s `last_poll: None` + `REFRESH`
+/// perf-11 — the six Workbench data planes share a 5 s `last_poll: None` + `REFRESH`
 /// gate. Polled cold on one frame they all fire together AND re-expire in lockstep
-/// every 5 s: seven back-to-back `Persist::open` + `list_topics` + full-read frame
-/// spikes. Delaying each plane's FIRST poll by a distinct prime offset (all under
+/// every 5 s: six back-to-back `Persist::open` + `list_topics` + full-read frame
+/// spikes. Delaying each plane's FIRST poll by a distinct offset (all under
 /// one `REFRESH` period) phase-shifts its otherwise-identical 5 s cadence so the
 /// reads interleave instead of piling onto one frame — without touching the 5 s
 /// period or any poll body. Ordered to match the poll sequence in `render`; the
 /// first offset is 0 so the Fleet roster still reads immediately on open. Distinct
 /// by construction (asserted in the tests).
-const WORKBENCH_POLL_STAGGER: [Duration; 7] = [
+const WORKBENCH_POLL_STAGGER: [Duration; 6] = [
     Duration::from_millis(0),
     Duration::from_millis(700),
     Duration::from_millis(1400),
     Duration::from_millis(2100),
     Duration::from_millis(2800),
     Duration::from_millis(3500),
-    Duration::from_millis(4200),
 ];
 const MENU_BAR_MINIMIZE_DURATION: Duration = Duration::from_millis(180);
 /// A discoverable long-press (the platform touch convention, matching
@@ -167,6 +166,27 @@ struct Nav {
     surface: Surface,
     /// The Workbench plane shown when the Workbench surface is active.
     plane: Plane,
+}
+
+/// The merged Home/Sessions control walks one stable cycle: clean desktop,
+/// restore the last session/workspace, then open the Remote Sessions chooser.
+/// The stage lives in the shell so bottom, docked, narrow, and large-text
+/// layouts all share the same interaction contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HomeCycleStage {
+    #[default]
+    Active,
+    CleanDesktop,
+    Restored,
+    Sessions,
+}
+
+const fn home_cycle_stage_after_click(stage: HomeCycleStage) -> HomeCycleStage {
+    match stage {
+        HomeCycleStage::Active | HomeCycleStage::Sessions => HomeCycleStage::CleanDesktop,
+        HomeCycleStage::CleanDesktop => HomeCycleStage::Restored,
+        HomeCycleStage::Restored => HomeCycleStage::Sessions,
+    }
 }
 
 /// The three views folded into the single Fleet & Mesh interface. The legacy
@@ -733,7 +753,12 @@ fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: Option<
 /// edge — the affordance that the slot is one of the driver's *selected*
 /// readouts, tappable to cycle (PLATFORM-INTERFACES Q33). Returns whether it
 /// was tapped — the driver cycling that slot's readout.
-fn fit_car_status_text(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
+fn fit_car_status_text(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    max_width: f32,
+) -> String {
     let max_width = max_width.max(1.0);
     let full = painter.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
     if full.size().x <= max_width {
@@ -886,9 +911,7 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         // carries only the single Foreground copy. MapsLocation keeps the
         // fallback only for its governed Car full-bleed path, and AutoHome
         // likewise has no shared menubar.
-        Surface::Browser
-        | Surface::MapsLocation
-        | Surface::AutoHome => true,
+        Surface::Browser | Surface::MapsLocation | Surface::AutoHome => true,
     }
 }
 
@@ -1004,10 +1027,6 @@ struct Shell {
     /// the same world-readable mesh-status snapshot (WB-Provisioning). Reads no
     /// `mackesd` IPC.
     provisioning: provisioning::ProvisioningState,
-    /// The Services flow (OW-11) — the Provisioning plane's day-2 service adds:
-    /// pick Music/Files/Voice, preview the daemon's plan (dry-run), apply over
-    /// the Bus, and render the `service_onboard` worker's typed answer.
-    services: services_flow::ServicesFlowState,
     /// The Spawn Lighthouse flow (OW-7) — the Provisioning plane's promote-to-
     /// lighthouse action: pick a cloud target, optionally an HA pair, preview the
     /// daemon's plan (dry-run), spawn over the Bus, and render the
@@ -1081,6 +1100,9 @@ struct Shell {
     /// rail. Falls back to the pending `VdiState` request until the broker log has
     /// a matching session for this seat.
     session_rail: session_rail::SessionRailState,
+    /// Shows the Remote Sessions chooser without destroying a live VDI target;
+    /// the Home/Sessions cycle can restore that target on its next pass.
+    sessions_picker_open: bool,
     /// The Infra as Code (`IaC`) surface — the cloud `IaaS` control plane
     /// (IAC-2). Consumes the cloud service catalog + per-service API health off
     /// the Bus read verb `action/cloud/get-catalog` (no shell→mackesd dep, §6) and renders
@@ -1252,6 +1274,9 @@ struct Shell {
     /// minimize control animates the active workspace toward that button, then routes
     /// to [`Surface::Desktop`] ("Remote Sessions").
     menu_bar_minimize: Option<MenuBarMinimizeEffect>,
+    /// State and saved location for the merged Home/Sessions toolbar control.
+    home_cycle_stage: HomeCycleStage,
+    home_cycle_restore: Option<(NavLocation, bool)>,
     /// Last central workspace rect, captured from the active [`CentralPanel`] so the
     /// minimize cue starts from the actual workspace area.
     last_workspace_rect: Option<egui::Rect>,
@@ -1366,7 +1391,6 @@ impl Shell {
             network: network::NetworkState::default(),
             controller: controller::ControllerState::default(),
             provisioning: provisioning::ProvisioningState::default(),
-            services: services_flow::ServicesFlowState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
             notify_status: status::StatusState::default(),
@@ -1385,6 +1409,7 @@ impl Shell {
             vdi: vdi::VdiState::default(),
             chooser: chooser::ChooserState::default(),
             session_rail: session_rail::SessionRailState::new(),
+            sessions_picker_open: false,
             infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
             communications: communications::CommunicationsState::default(),
@@ -1419,6 +1444,8 @@ impl Shell {
             lock_signal: lock_signal::LogindLockSource::new(ctx),
             workbench_poll_epoch: None,
             menu_bar_minimize: None,
+            home_cycle_stage: HomeCycleStage::Active,
+            home_cycle_restore: None,
             last_workspace_rect: None,
             layout_mode: LayoutModeControl::default(),
         };
@@ -1607,6 +1634,60 @@ impl Shell {
         self.last_nav_location = Some(location);
     }
 
+    fn current_nav_location(&self) -> NavLocation {
+        NavLocation {
+            expanded: self.nav.expanded,
+            surface: self.nav.surface,
+            plane: self.nav.plane,
+            fleet_mesh_tab: self.fleet_mesh_tab,
+            this_node_tab: self.this_node_tab,
+            this_node_section: self.this_node_section,
+            this_node_page: self.this_node_page,
+        }
+    }
+
+    fn reset_home_cycle(&mut self) {
+        self.home_cycle_stage = HomeCycleStage::Active;
+        self.home_cycle_restore = None;
+    }
+
+    /// Drive the merged Home/Sessions toolbar control. A clean desktop only
+    /// collapses Construct chrome; it never closes a VDI session. The third
+    /// step exposes the chooser while preserving that session for restoration.
+    fn cycle_home_sessions(&mut self) {
+        match self.home_cycle_stage {
+            HomeCycleStage::Active | HomeCycleStage::Sessions => {
+                self.home_cycle_restore =
+                    Some((self.current_nav_location(), self.sessions_picker_open));
+                self.sessions_picker_open = false;
+                self.front_door.close();
+                self.construct.switcher_open = false;
+                self.construct.notification_center_open = false;
+                self.construct.control_center_open = false;
+                self.nav.expanded = false;
+                self.nav.surface = Surface::Desktop;
+                self.home_cycle_stage = home_cycle_stage_after_click(self.home_cycle_stage);
+            }
+            HomeCycleStage::CleanDesktop => {
+                if let Some((location, picker_open)) = self.home_cycle_restore {
+                    self.apply_nav_location(location);
+                    self.sessions_picker_open = picker_open;
+                } else {
+                    self.nav.expanded = true;
+                    self.nav.surface = Surface::Desktop;
+                    self.sessions_picker_open = true;
+                }
+                self.home_cycle_stage = home_cycle_stage_after_click(self.home_cycle_stage);
+            }
+            HomeCycleStage::Restored => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Desktop;
+                self.sessions_picker_open = true;
+                self.home_cycle_stage = home_cycle_stage_after_click(self.home_cycle_stage);
+            }
+        }
+    }
+
     /// Collapse legacy surface aliases into their new public interface while
     /// preserving the selected internal tab.
     fn normalize_surface_aliases(&mut self) {
@@ -1642,9 +1723,11 @@ impl Shell {
         let action_label = nav_bar_action_label(&action);
         match action {
             nav_bar::Action::OpenSearch => {
+                self.reset_home_cycle();
                 self.open_front_door_panel();
             }
             nav_bar::Action::Back => {
+                self.reset_home_cycle();
                 if let Some(previous) = self.nav_history.pop() {
                     self.apply_nav_location(previous);
                 } else {
@@ -1653,10 +1736,10 @@ impl Shell {
                 }
             }
             nav_bar::Action::Home => {
-                self.nav.expanded = false;
-                self.nav.surface = Surface::Desktop;
+                self.cycle_home_sessions();
             }
             nav_bar::Action::OpenEditor => {
+                self.reset_home_cycle();
                 self.nav.expanded = true;
                 self.nav.surface = Surface::Communications;
                 self.communications.open_editor();
@@ -1665,18 +1748,29 @@ impl Shell {
                 self.nav_bar.toggle(Instant::now(), Motion::mode());
             }
             nav_bar::Action::OpenSurface(surface) => {
+                self.reset_home_cycle();
                 self.nav.expanded = true;
                 self.nav.surface = surface;
+                self.sessions_picker_open = surface == Surface::Desktop;
                 self.normalize_surface_aliases();
             }
             nav_bar::Action::PinSurface(surface) => {
+                self.reset_home_cycle();
                 self.nav_bar.pin_surface(surface);
             }
             nav_bar::Action::UnpinSurface(surface) => {
+                self.reset_home_cycle();
                 self.nav_bar.unpin_surface(surface);
             }
             nav_bar::Action::DesktopSource(id) => {
+                self.reset_home_cycle();
                 self.connect_front_door_desktop_source(ctx, &id);
+            }
+            nav_bar::Action::RemoteSession(id) => {
+                self.reset_home_cycle();
+                if self.session_rail.focus_session(&id) {
+                    self.drain_focused_session_handoffs(ctx);
+                }
             }
         }
         tracing::info!(
@@ -1709,16 +1803,20 @@ impl Shell {
     /// app overlays, but before the lock curtain's absolute top layer.
     fn mount_navigation_bar(&mut self, ctx: &egui::Context) {
         let pinned_sources = self.chooser.pinned_rail_sources();
+        let connected_sessions = self.session_rail.connected_entries(&self.local_host);
+        let active_session_id = self.vdi.requested_session_id();
         let (bottom_alpha, _) = self.nav_bar.chrome_alphas(Instant::now());
         let env = status_bar::StatusBarEnv {
             curtain_engaged: self.curtain.engaged(),
             car: self.system.layout_profile() == LayoutProfile::Car,
             immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
         };
-        if let Some(action) = self.nav_bar.mount_with_active_and_bottom_tray(
+        if let Some(action) = self.nav_bar.mount_with_active_and_bottom_tray_and_sessions(
             ctx,
             &pinned_sources,
             Some(self.nav.surface),
+            active_session_id,
+            &connected_sessions,
             &mut self.construct,
             self.notify_status.segments(),
             bottom_alpha,
@@ -1762,6 +1860,7 @@ impl Shell {
             Some(self.nav.surface),
         );
         if let Some(surface) = self.construct.take_workspace_tray_target() {
+            self.reset_home_cycle();
             self.nav.expanded = true;
             self.nav.surface = surface;
             self.normalize_surface_aliases();
@@ -1818,10 +1917,14 @@ impl Shell {
             },
         );
 
-        // A focused App VM rail entry is a typed handoff into the existing VDI
-        // surface. Keep this after the Control Center mount so the action is
-        // consumed exactly once and the Desktop surface owns the connection
-        // lifecycle from this point onward.
+        self.drain_focused_session_handoffs(ctx);
+    }
+
+    /// Consume one direct-focus intent from either kind of connected remote
+    /// session. App VM readiness still enters through its typed handoff. Ordinary
+    /// desktops resolve only against VDI's exact retained request, never against a
+    /// roster-derived VNC/mesh reconstruction.
+    fn drain_focused_session_handoffs(&mut self, ctx: &egui::Context) {
         if let Some(handoff) = self.session_rail.take_app_handoff() {
             self.vdi.request_app_connect(
                 handoff,
@@ -1831,7 +1934,19 @@ impl Shell {
             );
             self.nav.surface = Surface::Desktop;
             self.nav.expanded = true;
+            self.sessions_picker_open = false;
             self.construct.control_center_open = false;
+        }
+        if let Some(focus) = self.session_rail.take_desktop_focus() {
+            if let Some(surface) = self.vdi.focus_broker_session(&focus.id) {
+                self.nav.surface = match surface {
+                    vdi::SessionFocusSurface::Browser => Surface::Browser,
+                    vdi::SessionFocusSurface::Desktop => Surface::Desktop,
+                };
+                self.nav.expanded = true;
+                self.sessions_picker_open = false;
+                self.construct.control_center_open = false;
+            }
         }
     }
 
@@ -1853,6 +1968,7 @@ impl Shell {
                 // surface rather than silently doing nothing.
                 self.nav.expanded = true;
                 self.nav.surface = Surface::Desktop;
+                self.sessions_picker_open = false;
             }
             HotkeyAction::ReturnToChrome => {
                 // Leave a fullscreen guest for the mesh-control chrome — release any
@@ -1987,7 +2103,6 @@ impl Shell {
                         &self.network,
                         &self.controller,
                         &self.provisioning,
-                        &mut self.services,
                         &mut self.spawn_lighthouse,
                     );
                 }
@@ -2115,28 +2230,28 @@ impl Shell {
             {
                 self.thisnode.set_actions_selected(false);
             }
-            if ui
-                .selectable_label(actions_selected, "Actions")
-                .clicked()
-            {
+            if ui.selectable_label(actions_selected, "Actions").clicked() {
                 self.thisnode.set_actions_selected(true);
             }
         });
         if self.thisnode.actions_selected() {
             ui.separator();
-            self.thisnode
-                .show_actions_with_system(ui, &mut self.system);
+            self.thisnode.show_actions_with_system(ui, &mut self.system);
             return;
         }
         mde_egui::card().show(ui, |ui| {
-            ui.label(egui::RichText::new(section.label()).strong().size(Style::TITLE));
+            ui.label(
+                egui::RichText::new(section.label())
+                    .strong()
+                    .size(Style::TITLE),
+            );
             ui.label(
                 egui::RichText::new(section.description())
                     .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
             );
         });
-        if let Some(settings_section) = this_node_system_route(page.route)
-            .and_then(|_| this_node_system_section(*section))
+        if let Some(settings_section) =
+            this_node_system_route(page.route).and_then(|_| this_node_system_section(*section))
         {
             *tab = ThisNodeTab::System;
             let system = &mut self.system;
@@ -2242,7 +2357,9 @@ impl Shell {
                         for page in this_node_catalog::page_index()
                             .iter()
                             .copied()
-                            .filter(|page| page.section == candidate && page.route != "this-node/overview")
+                            .filter(|page| {
+                                page.section == candidate && page.route != "this-node/overview"
+                            })
                         {
                             if !query.trim().is_empty() && !page.matches(query) {
                                 continue;
@@ -2351,7 +2468,7 @@ impl Shell {
                 // (protocol + display + monitors) to `vdi`, and the surface flips
                 // to the desktop (connecting caption until the gated E12-4 wire
                 // transport attaches the live decoder).
-                if self.vdi.requested_target().is_none() {
+                if self.sessions_picker_open || self.vdi.requested_target().is_none() {
                     let chooser = &mut self.chooser;
                     let picked = ui
                         .push_id("shell-chooser", |ui| {
@@ -2360,6 +2477,7 @@ impl Shell {
                         })
                         .inner;
                     if let Some(request) = picked {
+                        self.sessions_picker_open = false;
                         // vdi-vm-8 — negotiate the guest desktop at the seat's real
                         // device-pixel size instead of a hardcoded 1024×768.
                         let request =
@@ -2382,6 +2500,7 @@ impl Shell {
                         self.web.note_vdi_session_detached();
                         self.vdi.clear_target();
                         self.nav.surface = Surface::Workbench;
+                        self.sessions_picker_open = false;
                     }
                     // WL-PERF-002 — keep the frame loop ticking while a live VDI
                     // transport is actually streaming so its incoming guest frames
@@ -2438,9 +2557,13 @@ impl Shell {
                 }
             }
             Surface::Files => {
-                let files = &mut self.files;
-                ui.push_id("shell-files", |ui| {
-                    files_panel(ui, files);
+                // Compatibility-only deep link: standalone Files was merged
+                // into Mesh Teams. Preserve old pins/toasts while rendering the
+                // one collaboration destination and one files authority.
+                let communications = &mut self.communications;
+                communications.open_files();
+                ui.push_id("shell-communications-files", |ui| {
+                    communications.show(ui);
                 });
             }
             Surface::Browser => {
@@ -2454,10 +2577,11 @@ impl Shell {
                 );
                 self.web.sync_browser_vm_target(target);
                 if let Some(connect) = self.web.take_browser_vm_connect() {
-                    match self.chooser.browser_vm_auth(&connect.target) {
+                    match self.chooser.browser_vm_auth(&connect) {
                         Ok(Some(auth)) => {
                             if let Err(error) = self.vdi.request_browser_vm_connect(
                                 connect.target,
+                                connect.transport,
                                 &self.local_host,
                                 mde_bus::client_data_dir(),
                                 Some(vdi::body_device_px(ui.ctx())),
@@ -2470,9 +2594,10 @@ impl Shell {
                         Err(error) => self.web.browser_vm_unavailable(error),
                     }
                 }
-                if let Some((target, auth)) = self.chooser.render_browser_vm_auth_prompt(ui) {
+                if let Some((connect, auth)) = self.chooser.render_browser_vm_auth_prompt(ui) {
                     if let Err(error) = self.vdi.request_browser_vm_connect(
-                        target,
+                        connect.target,
+                        connect.transport,
                         &self.local_host,
                         mde_bus::client_data_dir(),
                         Some(vdi::body_device_px(ui.ctx())),
@@ -2814,11 +2939,6 @@ impl Shell {
             if due(5) {
                 self.provisioning.poll(ctx);
             }
-            if due(6) {
-                // The Services flow only actually reads while a request is in
-                // flight (it self-gates on `pending`), so this is free otherwise.
-                self.services.poll(ctx);
-            }
             // Keep frames flowing through the stagger warm-up so each plane's first
             // poll actually lands at its own offset instead of collapsing onto the
             // 5 s heartbeat the first-polled plane requests.
@@ -2831,7 +2951,7 @@ impl Shell {
             self.spawn_lighthouse.poll(ctx);
         } else {
             // perf-11: re-arm the stagger so the next Workbench open re-interleaves
-            // the seven planes from a fresh epoch.
+            // the six planes from a fresh epoch.
             self.workbench_poll_epoch = None;
         }
 
@@ -2886,9 +3006,7 @@ impl Shell {
         // turn a valid workspace readback into a desktop backdrop.
         let proof_route_active = std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some()
             || std::env::var_os("MDE_DRM_PROOF_READBACK").is_some();
-        if self.chooser.take_popup()
-            && !proof_route_active
-            && self.vdi.requested_target().is_none()
+        if self.chooser.take_popup() && !proof_route_active && self.vdi.requested_target().is_none()
         {
             // A new desktop source surfaces the Chooser through the same
             // central-view switch the hotkeys/chyron drive — but never over a
@@ -3727,6 +3845,7 @@ impl Shell {
     fn connect_front_door_desktop_source(&mut self, ctx: &egui::Context, id: &str) {
         self.nav.expanded = true;
         self.nav.surface = Surface::Desktop;
+        self.sessions_picker_open = false;
         if let Some(request) = self.chooser.connect_source_id(id) {
             self.vdi
                 .request_connect(request.with_preferred_size(Some(vdi::body_device_px(ctx))));
@@ -4026,6 +4145,8 @@ impl Shell {
         let Some(source) = mde_egui::menubar::take_remote_sessions_request(ctx) else {
             return;
         };
+        self.reset_home_cycle();
+        self.sessions_picker_open = true;
         self.front_door.close();
         self.nav.expanded = true;
         if ctx.style().animation_time <= 0.0 {
@@ -4171,6 +4292,7 @@ fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
         nav_bar::Action::PinSurface(_) => "pin_surface",
         nav_bar::Action::UnpinSurface(_) => "unpin_surface",
         nav_bar::Action::DesktopSource(_) => "desktop_source",
+        nav_bar::Action::RemoteSession(_) => "remote_session",
     }
 }
 
@@ -4201,6 +4323,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         println!("{}", mde_theme::brand::build::full());
         return Ok(());
+    }
+    if let Some(result) = acceptance_cli::maybe_run() {
+        return result.map_err(|error| std::io::Error::other(error).into());
     }
 
     // test-obs-3 — stand up the ONE process-wide structured logger before the seat
@@ -4262,25 +4387,23 @@ mod tests {
     use super::{
         car_home, car_home_vehicle_glance, car_keymap, chat, complete_menu_bar_minimize, console,
         construct, datacenter, desktop_reconnect_should_query_recents, files_panel, front_door,
-        front_door_peer_apps, install_layout_mode_button_accessibility,
-        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
-        layout_mode_button_rect, layout_mode_control_visible, layout_mode_menu_rect,
-        layout_mode_primary_toggle,
-        layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
+        front_door_peer_apps, home_cycle_stage_after_click,
+        install_layout_mode_button_accessibility, install_layout_profile_row_accessibility,
+        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_control_visible,
+        layout_mode_menu_rect, layout_mode_primary_toggle, layout_profile_row_accesskit_value,
+        layout_profile_tooltip, matching_this_node_groups, media_header, media_panel,
         menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, paint_car_speedometer,
         paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
-        matching_this_node_groups, this_node_search_is_compact, this_node_system_route,
-        this_node_system_section, vdi,
-        Boot, MenuBarMinimizeEffect,
-        Nav, Plane, Shell, Surface,
-        ThisNodeTab, VideoTextureCache, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
-        LAYOUT_MODE_MIN_FLOATING_W,
-        LAYOUT_MODE_HOLD, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
-        MENU_BAR_MINIMIZE_DURATION,
+        this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
+        HomeCycleStage, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
+        VideoTextureCache, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
+        LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
+        LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
     };
+    use crate::this_node_catalog::{Section, SectionGroup};
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use mde_chat::{
@@ -4299,7 +4422,6 @@ mod tests {
         TransfersClient,
     };
     use mde_seat::HotkeyAction;
-    use crate::this_node_catalog::{Section, SectionGroup};
     use std::path::{Path, PathBuf};
 
     struct ShellFilesBackend {
@@ -4410,6 +4532,19 @@ mod tests {
     }
 
     #[test]
+    fn merged_home_sessions_button_has_the_three_step_cycle() {
+        let first = home_cycle_stage_after_click(HomeCycleStage::Active);
+        let second = home_cycle_stage_after_click(first);
+        let third = home_cycle_stage_after_click(second);
+        let fourth = home_cycle_stage_after_click(third);
+
+        assert_eq!(first, HomeCycleStage::CleanDesktop);
+        assert_eq!(second, HomeCycleStage::Restored);
+        assert_eq!(third, HomeCycleStage::Sessions);
+        assert_eq!(fourth, HomeCycleStage::CleanDesktop);
+    }
+
+    #[test]
     fn this_node_search_stacks_before_narrow_or_large_text_can_overlap() {
         assert!(!this_node_search_is_compact(960.0, 1.0));
         assert!(this_node_search_is_compact(320.0, 1.0));
@@ -4435,10 +4570,7 @@ mod tests {
         let groups = matching_this_node_groups("wifi");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, SectionGroup::Devices);
-        assert_eq!(
-            groups[0].1,
-            vec![Section::Connectivity]
-        );
+        assert_eq!(groups[0].1, vec![Section::Connectivity]);
     }
 
     #[test]
@@ -5784,7 +5916,7 @@ mod tests {
 
     #[test]
     fn workbench_poll_stagger_first_deadlines_are_distinct() {
-        // perf-11: the seven planes' first-poll offsets must all differ so their
+        // perf-11: the six planes' first-poll offsets must all differ so their
         // shared 5 s cadences interleave instead of firing on one frame.
         let offsets = super::WORKBENCH_POLL_STAGGER;
         for i in 0..offsets.len() {
@@ -6339,8 +6471,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.push_id("shell-files", |ui| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.push_id("shell-files", |ui| {
                     files_panel(ui, &mut files);
                 });
             });
@@ -6365,8 +6497,8 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.push_id("shell-files", |ui| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.push_id("shell-files", |ui| {
                             files_panel(ui, &mut files);
                         });
                     });
@@ -7504,8 +7636,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.push_id("shell-media", |ui| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.push_id("shell-media", |ui| {
                     media_header(ui, &mut media);
                     ui.separator();
                     media_panel(ui, &mut media, &mut media_video);

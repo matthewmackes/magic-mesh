@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use mde_collab_types::ids::{EventId, SpaceId};
@@ -93,6 +93,10 @@ pub struct FileActorLog {
     // Append order as loaded/written, so `read_all` matches disk order.
     order: Vec<EventId>,
     envelopes: BTreeMap<EventId, CollabEventEnvelope>,
+    // Malformed/torn lines rejected while opening this log. A single crash-torn
+    // append must not poison the actor's entire durable history forever; the
+    // signed-envelope verifier remains the authority for every admitted line.
+    rejected_lines: usize,
 }
 
 impl FileActorLog {
@@ -115,6 +119,7 @@ impl FileActorLog {
             seen: std::collections::HashSet::new(),
             order: Vec::new(),
             envelopes: BTreeMap::new(),
+            rejected_lines: 0,
         };
         log.load()?;
         Ok(log)
@@ -131,11 +136,48 @@ impl FileActorLog {
             if line.trim().is_empty() {
                 continue;
             }
-            let env: CollabEventEnvelope = serde_json::from_str(&line)?;
+            let Ok(env) = serde_json::from_str::<CollabEventEnvelope>(&line) else {
+                // Crash-torn JSONL and Syncthing conflict artifacts are
+                // untrusted input. Reject only the malformed record so later
+                // valid, signed records remain reachable and new events can be
+                // appended. Callers can surface the count through diagnostics.
+                self.rejected_lines = self.rejected_lines.saturating_add(1);
+                continue;
+            };
             if self.seen.insert(env.event_id) {
                 self.order.push(env.event_id);
                 self.envelopes.insert(env.event_id, env);
             }
+        }
+        Ok(())
+    }
+
+    /// Number of malformed records rejected while the file was opened.
+    #[must_use]
+    pub const fn rejected_line_count(&self) -> usize {
+        self.rejected_lines
+    }
+
+    /// Ensure a prior crash-torn final record cannot be glued to the next JSON
+    /// object. The torn bytes remain as one rejected forensic record; the new
+    /// append starts on a clean JSONL boundary.
+    fn ensure_append_boundary(&self) -> Result<()> {
+        let mut file = match OpenOptions::new().read(true).open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(());
+        }
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0_u8; 1];
+        file.read_exact(&mut tail)?;
+        if tail[0] != b'\n' {
+            let mut append = OpenOptions::new().append(true).open(&self.path)?;
+            append.write_all(b"\n")?;
+            append.flush()?;
         }
         Ok(())
     }
@@ -146,6 +188,7 @@ impl ActorLog for FileActorLog {
         if self.seen.contains(&envelope.event_id) {
             return Ok(false);
         }
+        self.ensure_append_boundary()?;
         let mut line = serde_json::to_string(envelope)?;
         line.push('\n');
         // Append + flush so a crash leaves at most a torn trailing line, which
@@ -172,5 +215,75 @@ impl ActorLog for FileActorLog {
 
     fn len(&self) -> usize {
         self.order.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mde_collab_types::{ActorClock, CollabEventKind, SpaceKind};
+
+    fn event(id: u128, space: SpaceId) -> CollabEventEnvelope {
+        CollabEventEnvelope::new(
+            EventId::from_uuid(uuid::Uuid::from_u128(id)),
+            space,
+            ActorId::new("seat-15"),
+            ActorClock {
+                wall_ms: id as u64,
+                counter: 0,
+            },
+            id as i64,
+            CollabEventKind::SpaceCreated {
+                kind: SpaceKind::Team,
+                name: "System · seat-15".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn corrupt_middle_line_is_isolated_and_valid_history_remains_appendable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(7));
+        let actor = ActorId::new("seat-15");
+        let path = FileActorLog::path_for(root.path(), space, &actor);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let first = serde_json::to_string(&event(1, space)).expect("serialize first");
+        let second = serde_json::to_string(&event(2, space)).expect("serialize second");
+        std::fs::write(
+            &path,
+            format!("{first}\n{{\"event_id\":\"torn{{\"schema_version\":1}}\n{second}\n"),
+        )
+        .expect("write fixture");
+
+        let mut log = FileActorLog::open(root.path(), space, &actor).expect("open resiliently");
+        assert_eq!(log.rejected_line_count(), 1);
+        assert_eq!(log.len(), 2);
+        assert!(log
+            .append(&event(3, space))
+            .expect("append after corruption"));
+
+        let reopened = FileActorLog::open(root.path(), space, &actor).expect("reopen");
+        assert_eq!(reopened.rejected_line_count(), 1);
+        assert_eq!(reopened.len(), 3);
+    }
+
+    #[test]
+    fn torn_final_line_gets_a_boundary_before_the_next_append() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(8));
+        let actor = ActorId::new("seat-15");
+        let path = FileActorLog::path_for(root.path(), space, &actor);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "{\"schema_version\":1").expect("write torn tail");
+
+        let mut log = FileActorLog::open(root.path(), space, &actor).expect("open torn tail");
+        assert_eq!(log.rejected_line_count(), 1);
+        assert!(log
+            .append(&event(9, space))
+            .expect("append after torn tail"));
+
+        let reopened = FileActorLog::open(root.path(), space, &actor).expect("reopen");
+        assert_eq!(reopened.rejected_line_count(), 1);
+        assert_eq!(reopened.len(), 1);
     }
 }

@@ -77,7 +77,7 @@ pub(crate) const RIGHT_SEGMENTS: [StatusSegment; 4] = [
 
 /// Construct-owned workspaces promoted into the persistent notification/tool
 /// tray. The navigation rail remains intact in both placement modes.
-pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 5] = TOOL_TRAY_SURFACES;
+pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 6] = TOOL_TRAY_SURFACES;
 const WORKSPACE_TRAY_ICON_W: f32 = STATUS_BAR_H;
 const WORKSPACE_TRAY_GAP: f32 = Style::SP_XS;
 
@@ -660,12 +660,8 @@ fn paint_workspace_tray(
         if response.hovered() {
             painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
         }
-        if let Some(texture) = icon_texture(
-            ui.ctx(),
-            surface.icon_id(),
-            Style::ICON_M,
-            foreground,
-        ) {
+        if let Some(texture) = icon_texture(ui.ctx(), surface.icon_id(), Style::ICON_M, foreground)
+        {
             let draw = egui::Rect::from_center_size(
                 rect.center(),
                 egui::vec2(Style::ICON_M, Style::ICON_M),
@@ -785,7 +781,10 @@ fn bottom_tray(
 
     let workspace_rect = egui::Rect::from_min_max(
         panel.left_top(),
-        egui::pos2((panel.left() + workspace_tray_width()).min(clock.left()), panel.bottom()),
+        egui::pos2(
+            (panel.left() + workspace_tray_width()).min(clock.left()),
+            panel.bottom(),
+        ),
     );
     paint_workspace_tray(
         ui,
@@ -796,7 +795,10 @@ fn bottom_tray(
         Style::NAV_BAR_ICON,
     );
 
-    let health = egui::pos2(panel.left() + workspace_rect.width() + 8.0, panel.center().y);
+    let health = egui::pos2(
+        panel.left() + workspace_rect.width() + 8.0,
+        panel.center().y,
+    );
     let mesh_color = severity_color(segments.get(StatusSegment::Mesh));
     painter.circle_filled(health, 4.4, mesh_color.gamma_multiply(opacity));
     let health_response = ui.interact(
@@ -1306,10 +1308,7 @@ mod tests {
         // The bottom tray is painted over the shared black taskbar, so it must
         // not inherit the page's Light-mode dark text token.
         assert_eq!(
-            Style::resolve_color_for_scheme(
-                mde_egui::StyleColorScheme::Light,
-                Style::NAV_BAR_ICON,
-            ),
+            Style::resolve_color_for_scheme(mde_egui::StyleColorScheme::Light, Style::NAV_BAR_ICON,),
             egui::Color32::WHITE
         );
         assert_eq!(Style::NAV_BAR_ICON, egui::Color32::WHITE);
@@ -1512,14 +1511,12 @@ mod tests {
         // crate for the minute to roll between the before/after samples, so
         // assert the rendered HH:MM contract instead of a stale snapshot.
         assert!(
-            texts
-                .iter()
-                .any(|t| {
-                    t.len() == 5
-                        && t.as_bytes().get(2) == Some(&b':')
-                        && t.as_bytes()[..2].iter().all(u8::is_ascii_digit)
-                        && t.as_bytes()[3..].iter().all(u8::is_ascii_digit)
-                }),
+            texts.iter().any(|t| {
+                t.len() == 5
+                    && t.as_bytes().get(2) == Some(&b':')
+                    && t.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+                    && t.as_bytes()[3..].iter().all(u8::is_ascii_digit)
+            }),
             "no clock text painted: {texts:?}"
         );
         // At least one rollup cell + the grade letter.
