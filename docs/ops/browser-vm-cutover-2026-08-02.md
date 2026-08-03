@@ -6,11 +6,18 @@ not a second active worklist.
 ## Current state — 2026-08-03
 
 The source-side cutover and standalone provenance are current through
-`3f97dd56`; the extraction verifier passes for 84 paths and the public
+`9e7697b5`; the extraction verifier passes for 84 paths and the public
 standalone repository is at `996d3d27cfc4c52776c2289a0069d92e2bede66d`. A
 corrected guest image containing the explicit `Virtual-1` output configuration
 was built on farm `.90`, passed static image verification, and has SHA-256
 `99614eaace96365fe4527ad65e3239f76923cb58905c9580b0af266aa40ba7e0`.
+
+A fresh current-source Fedora 44 Browser VM image was also built and statically
+verified on BigBoy `.130`; its qcow2 artifact is retained at
+`/home/mm/browser-vm-chromium-qcow2-cutover-20260803/qcow2/disk.qcow2` with
+SHA-256 `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
+`qemu-img info` reports a non-corrupt 10-GiB qcow2 with a 1.72-GiB compressed
+footprint. This is artifact readiness, not live guest or seat acceptance.
 
 It has not been installed on Dell: `172.20.146.225` currently returns no route
 and overlay `10.42.0.4` times out. Seat 15 (`172.20.0.15`) is reachable but
@@ -93,15 +100,11 @@ On BigBoy (`172.20.0.130`):
   network-enabled locked run.
 - `verify-browser-extraction.sh --check` passed for 85 paths: 18
   browser-owned, 25 mixed-purpose, and 42 shared.
-- The checked-in Browser VM image contract has not yet been rebuilt with this
-  payload. The current farm rebuild attempt reached the supported builder but
-  stopped at the unavailable `quay.io/fedora/fedora-bootc:44` base registry;
-  its temporary farm workspace and RPM were removed. The existing Pixman
-  candidate at `/home/mm/browser-vm-chromium-qcow2-pixman-20260802/qcow2/disk.qcow2`
-  has SHA-256
-  `f7376cb8892cec011ca5c8651e5fa68e0a3a1ba7607df5694bbfb84a1a09ff1a` and is
-  retained as prior evidence only; it must not be treated as proof of the
-  current RDP/PipeWire guest payload.
+- The current-source Browser VM container and qcow2 build both passed their
+  static gates. The artifact remains uninstalled on Dell because the target
+  and its overlay address are unreachable from the orchestrator and every
+  farm build VM; the current image therefore must not be treated as live VDI
+  proof.
 
 ## Historical Dell live evidence (not current)
 

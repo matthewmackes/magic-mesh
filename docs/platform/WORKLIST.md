@@ -365,7 +365,11 @@ remains here under a completed status.
   until a real guest endpoint is supplied. The VDI seam now records bounded
   frame cadence, full/partial upload counts, upload timing, reconnects, and
   shell repaint counts; its focused metrics test and the 64-test VDI set pass
-  on BigBoy. Live read-only audit on 2026-08-01
+  on BigBoy. A fresh current-source Fedora 44 Browser VM container and qcow2
+  were built and statically verified on BigBoy `.130`; the retained qcow2
+  artifact has SHA-256
+  `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
+  Live read-only audit on 2026-08-01
   found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
   `.225` has shell services but no VDI listener, Eagle is unreachable, and
   `.138` has a host-key conflict requiring operator resolution.
