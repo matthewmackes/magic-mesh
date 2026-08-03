@@ -21,9 +21,10 @@ footprint. This is artifact readiness, not live guest or seat acceptance.
 
 The bounded live-proof runner now also supports the Browser VM's primary RDP
 path by invoking the existing ignored `mde-vdi-rdp` integration test. It records
-only the initial guest `FRAME OK` marker, bounded input observation, and the
-probe-log digest; RDP credentials are accepted only as process-local target
-input and are omitted from evidence. The self-test and farm compile passed on
+only the initial guest `FRAME OK` marker, bounded input observation, explicit
+tier-reconnect observation, and the probe-log digest; RDP credentials are
+accepted only as process-local target input and are omitted from evidence. The
+self-test and farm compile passed on
 `.50` slot `vdi-proof-rdp-helper-20260803`, but no RDP target is currently
 reachable to execute it.
 
