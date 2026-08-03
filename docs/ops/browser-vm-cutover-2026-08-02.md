@@ -12,12 +12,19 @@ left and escaped its bounds. The failed-acceptance PNG SHA-256 is
 `7340d2ef9b85c468be6c188dc78535b6667b80de6d78a3f6de28fa7550b06222`, and
 live receipt `01KZ4PT1QW367W31BSDZ933WM5` carries the exact body shown in it.
 Commit `18a1dfab` removes the duplicate half-width translation and adds a
-containment regression; all 279 focused `mde-egui` tests pass. A second physical
-readback is still required before presentation acceptance. Cleanup receipt
-`01KZ4PV88VY069ABFPJHP5A0EC` preceded removal of the temporary proof hook and
-the final restart by the full five seconds. The normal shell remains on SHA
-`982d4c2d...` with zero restarts and can be rolled back from
-`/var/lib/mcnf-release-backups/seat15-alert-lock-20260803T205812Z/`.
+containment regression; all 279 focused `mde-egui` tests pass. The corrected
+second physical readback at 17:41 EDT passes presentation acceptance: the red
+rounded card is centered above the lock curtain and the centered
+`AI-GENERATED-ALERT` headline is fully contained. Its PNG SHA-256 is
+`9a67da3593a91cd2580bf816e920a2ada08d1f1dd847e58556cf7fad8d9c0ad2`, and
+capture receipt `01KZ4S66889QKKMS8PQ13YAZF6` carries the exact rendered body.
+Seat 15 now runs corrected binary SHA-256
+`5f2f1a9822d5c9e8ce5b5d220da6e71c1fc82eae65e122be35563d975a2f03ce`.
+Cleanup receipt `01KZ4S94E48T9FHC0B35D2Z1DW` preceded removal of the temporary
+proof hook and final restart by the full five seconds; the normal shell is
+active as PID 132767 with zero restarts. The installed binary can be rolled
+back from
+`/var/lib/mcnf-release-backups/seat15-alert-headline-20260803T214040Z/`.
 
 Dell's post-reboot alert preemption retest at 16:27 EDT published receipt
 `01KZ4MX1CN3FM5A5MY3K4XNDMH` from production-feature shell SHA-256
