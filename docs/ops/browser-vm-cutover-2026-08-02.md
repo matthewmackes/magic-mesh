@@ -5,6 +5,16 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Dell alert retest at 12:16 EDT published urgent receipt
+`01KZ46JC1GQYBKP69G797ZF58J` with the exact `AI-GENERATED-ALERT` flag and
+headline `DELL ALERT RETEST: centered red alert and sound.` The receipt is
+present verbatim in Dell's local Bus history. A concurrent live PipeWire
+monitor observed the shell-created `pw-play` WAV node and both `output_FL` and
+`output_FR` ports; the shell remained active as PID `320874` with zero
+restarts. This proves local receipt consumption and routing into Dell's real
+audio graph. Physical screen presentation and speaker audibility still require
+operator confirmation.
+
 Dell alert retest at 11:56 EDT: the shell now includes a deterministic built-in
 notification chime fallback and is running production-feature binary SHA-256
 `51db5548780f342eb5450a28e464a7a39a5cc3b13dcad66583d51edb8cdada52`
