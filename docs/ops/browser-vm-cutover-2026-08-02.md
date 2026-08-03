@@ -146,8 +146,11 @@ On BigBoy (`172.20.0.130`):
   workspace test; the native helper checks and strict clippy gates passed on the
   farm after the initial offline cache miss for `tokio-macros` was resolved by a
   network-enabled locked run.
-- `verify-browser-extraction.sh --check` passed for 85 paths: 18
-  browser-owned, 25 mixed-purpose, and 42 shared.
+- The 2026-08-03 clean clone was pinned to public `main`
+  `996d3d27cfc4c52776c2289a0069d92e2bede66d`; its root test, native helper
+  checks, and strict clippy gates passed on BigBoy. The extraction verifier on
+  the pushed cutover branch passed for 84 paths: 18 browser-owned, 25
+  mixed-purpose, and 41 shared.
 - The current-source Browser VM container and qcow2 build both passed their
   static gates. The artifact remains uninstalled on Dell because the target
   and its overlay address are unreachable from the orchestrator and every
