@@ -91,31 +91,34 @@ NETWORK_CONFIG
 #cloud-config
 bootcmd:
   - [mkdir, -p, /etc/mackesd/browser-vm]
-  - [chmod, "0700", /etc/mackesd/browser-vm]
+  # The image runtime is deliberately unprivileged (mcnf-browser). Keep the
+  # root-owned identity records non-writable but readable by that account;
+  # validate-runtime-inputs.sh still rejects every group/other-writable mode.
+  - [chmod, "0755", /etc/mackesd/browser-vm]
 write_files:
   - path: /etc/mackesd/browser-vm/profile-id
     owner: root:root
-    permissions: "0600"
+    permissions: "0644"
     content: |
       browser-vm-chromium
   - path: /etc/mackesd/browser-vm/image-digest
     owner: root:root
-    permissions: "0600"
+    permissions: "0644"
     content: |
       $image_digest
   - path: /etc/mackesd/browser-vm/session-id
     owner: root:root
-    permissions: "0600"
+    permissions: "0644"
     content: |
       $session_id
   - path: /etc/mackesd/browser-vm/transport
     owner: root:root
-    permissions: "0600"
+    permissions: "0644"
     content: |
       $transport
   - path: /etc/mackesd/browser-vm/transport-health
     owner: root:root
-    permissions: "0600"
+    permissions: "0644"
     content: |
       unavailable
 USER_DATA
@@ -305,6 +308,9 @@ self_test() {
     write_seed_files "$fixture" "$digest" "$session" spice
     grep -Fq 'transport-health' "$fixture/user-data" || fail "self-test seed omitted transport health"
     grep -Fq 'unavailable' "$fixture/user-data" || fail "self-test seed is not fail-closed"
+    grep -Fq 'chmod, "0755"' "$fixture/user-data" || fail "self-test seed directory is not runtime-readable"
+    [[ "$(grep -Fc 'permissions: "0644"' "$fixture/user-data")" -eq 5 ]] || \
+        fail "self-test seed inputs are not all runtime-readable and non-writable"
     if grep -Eiq 'password|passwd|secret|credential|token|ssh' "$fixture/user-data" "$fixture/meta-data" "$fixture/network-config"; then
         fail "self-test found a credential-shaped field in the seed"
     fi
