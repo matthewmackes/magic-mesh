@@ -34,6 +34,8 @@ SCHEMA_VERSION = 1
 MAX_FILE_BYTES = 64 * 1024
 MAX_ENDPOINTS = 32
 MAX_FUTURE_SKEW_SECONDS = 300
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 EXPECTED_FIELDS = frozenset(
     {
@@ -41,6 +43,8 @@ EXPECTED_FIELDS = frozenset(
         "kind",
         "profile",
         "image",
+        "source_commit",
+        "image_digest",
         "transport",
         "transport_health",
         "gpu_status",
@@ -197,6 +201,16 @@ def validate_document(data: Any) -> dict[str, Any]:
         fail("profile is not browser-vm-chromium")
     if data["image"] != "browser-vm-chromium":
         fail("image is not browser-vm-chromium")
+    source_commit = data.get("source_commit")
+    if not isinstance(source_commit, str) or COMMIT_RE.fullmatch(source_commit) is None:
+        fail("source_commit must be a 40-character lowercase Git revision")
+    if source_commit == "0" * 40:
+        fail("source_commit must not be the null revision")
+    image_digest = data.get("image_digest")
+    if not isinstance(image_digest, str) or IMAGE_DIGEST_RE.fullmatch(image_digest) is None:
+        fail("image_digest must be an immutable sha256 digest")
+    if image_digest == "sha256:" + "0" * 64:
+        fail("image_digest must not be the null digest")
 
     transport = require_string(data, "transport", ALLOWED_TRANSPORTS)
     transport_health = require_string(data, "transport_health", ALLOWED_TRANSPORT_HEALTH)
@@ -220,6 +234,8 @@ def validate_document(data: Any) -> dict[str, Any]:
         "evidence_class": "endpoint_wiring",
         "endpoint_wiring": endpoint_wiring,
         "live_proof": "unavailable",
+        "source_commit": source_commit,
+        "image_digest": image_digest,
         "transport": transport,
         "transport_health": transport_health,
         "gpu_status": gpu_status,
@@ -244,6 +260,8 @@ def make_valid() -> dict[str, Any]:
         "kind": "browser_vm_runtime_evidence",
         "profile": "browser-vm-chromium",
         "image": "browser-vm-chromium",
+        "source_commit": "0123456789abcdef0123456789abcdef01234567",
+        "image_digest": "sha256:" + "a" * 64,
         "transport": "rdp",
         "transport_health": "connected",
         "gpu_status": "unavailable",

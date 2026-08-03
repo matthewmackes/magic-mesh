@@ -127,6 +127,15 @@ pointer activity, navigation/session latency, partial uploads, hidden repaint,
 and reconnect recovery. The verifier never creates a local or farm-only pass;
 Dell/seat evidence is still required.
 
+The final Browser VM promotion boundary is
+`install-helpers/verify-browser-vm-live-acceptance.py`. It binds observed VDI
+frame/input/reconnect, connected guest runtime with GPU readiness, Chromium
+decode, performance, and sample-backed playback/capture audio to one exact
+source commit and image digest. It rejects endpoint-only audio, guest-local
+media alone, missing reconnect/input observations, stale or symlinked artifacts,
+and credential-shaped fields. Its self-test validates the boundary; it does not
+claim Dell or seat-15 readiness until a real bundle is collected.
+
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source
 record rather than silently reusing a host image.

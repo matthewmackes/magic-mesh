@@ -18,6 +18,28 @@ log 'starting guest-owned runtime'
 log 'runtime inputs validated'
 input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
 transport=$(cat "$input_root/transport")
+source_commit=$(cat /usr/share/mcnf/browser-vm/source-commit)
+image_digest=$(cat "$input_root/image-digest" | tr 'A-F' 'a-f')
+case "$source_commit" in ''|*[!0-9a-f]*)
+    echo 'FATAL: Browser VM source provenance is malformed' >&2
+    exit 1
+esac
+[ "${#source_commit}" -eq 40 ] || {
+    echo 'FATAL: Browser VM source provenance has the wrong length' >&2
+    exit 1
+}
+case "$image_digest" in
+    sha256:*) image_digest_hex=${image_digest#sha256:} ;;
+    *) echo 'FATAL: Browser VM image provenance is malformed' >&2; exit 1 ;;
+esac
+case "$image_digest_hex" in ''|*[!0-9a-f]*)
+    echo 'FATAL: Browser VM image provenance is malformed' >&2
+    exit 1
+esac
+[ "${#image_digest_hex}" -eq 64 ] || {
+    echo 'FATAL: Browser VM image provenance has the wrong length' >&2
+    exit 1
+}
 case "$transport" in
     rdp)
         # The system unit is enabled for boot ordering, but the actual desktop
@@ -120,7 +142,7 @@ fi
 runtime_evidence=/var/lib/mcnf-browser/runtime-evidence.json
 recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cat >"$runtime_evidence" <<EOF
-{"schema_version":1,"kind":"browser_vm_runtime_evidence","profile":"browser-vm-chromium","image":"browser-vm-chromium","transport":"$transport","transport_health":"$(cat "$input_root/transport-health")","gpu_status":"$gpu_status","audio_status":"$audio_status","audio_playback_endpoints":$audio_sink_count,"audio_capture_endpoints":$audio_source_count,"recorded_at":"$recorded_at"}
+{"schema_version":1,"kind":"browser_vm_runtime_evidence","profile":"browser-vm-chromium","image":"browser-vm-chromium","source_commit":"$source_commit","image_digest":"$image_digest","transport":"$transport","transport_health":"$(cat "$input_root/transport-health")","gpu_status":"$gpu_status","audio_status":"$audio_status","audio_playback_endpoints":$audio_sink_count,"audio_capture_endpoints":$audio_source_count,"recorded_at":"$recorded_at"}
 EOF
 chmod 0600 "$runtime_evidence"
 log "bounded runtime evidence written: gpu=$gpu_status audio=$audio_status"

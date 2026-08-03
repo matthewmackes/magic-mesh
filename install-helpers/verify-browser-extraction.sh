@@ -55,6 +55,7 @@ path_is_named_candidate() {
     install-helpers/install-cef-runtime.sh|install-helpers/install-widevine-cdm.sh|\
     install-helpers/mirror-cef-runtime-to-spaces.sh|\
     install-helpers/setup-selinux-web-cef.sh|install-helpers/setup-selinux-web-preview.sh|\
+    install-helpers/verify-browser-vm-live-acceptance.py|\
     install-helpers/build-rpm-fedora43.sh|install-helpers/rpm-features.sh|\
     install-helpers/verify-rpm-payload.sh|install-helpers/lint-layered-tiers.sh|\
     install-helpers/lint-style-leaks.sh|install-helpers/xcp-build.sh|\
@@ -130,6 +131,7 @@ class_for_path() {
     crates/mesh/mde-seal/*|crates/mesh/mde-worker-core/*|\
     crates/mesh/mackes-mesh-types/src/lib.rs|crates/mesh/mackes-mesh-types/src/mesh_storage.rs|\
     packaging/browser-vm/*|\
+    install-helpers/verify-browser-vm-live-acceptance.py|\
     crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs|\
     crates/mesh/mackesd/src/ca/backup.rs|crates/mesh/mackesd/src/ipc/secret_store.rs|\
     crates/mesh/mackesd/src/lib.rs|crates/mesh/mackesd/src/workers/storage.rs|\
@@ -187,6 +189,7 @@ reason_for_path() {
     crates/mesh/mde-seal/*) printf '%s\n' shared-secret-contract ;;
     crates/mesh/mde-worker-core/*) printf '%s\n' shared-worker-contract ;;
     crates/mesh/mackes-mesh-types/*) printf '%s\n' shared-mesh-contract ;;
+    install-helpers/verify-browser-vm-live-acceptance.py) printf '%s\n' browser-vm-acceptance-gate ;;
     crates/mesh/mackesd/src/ca/backup.rs|crates/mesh/mackesd/src/ipc/secret_store.rs)
       printf '%s\n' shared-secret-consumer
       ;;
@@ -492,6 +495,11 @@ self_test() {
   path='packaging/browser-vm/README.md'
   check "$(class_for_path "$path")" shared
   check "$(destination_for "$path")" "retain-in-magic-mesh:$path#shared-contract-or-reference"
+
+  path='install-helpers/verify-browser-vm-live-acceptance.py'
+  check "$(class_for_path "$path")" shared
+  check "$(destination_for "$path")" "retain-in-magic-mesh:$path#shared-contract-or-reference"
+  check "$(reason_for_path "$path")" browser-vm-acceptance-gate
 
   if path_is_named_candidate install-helpers/verify-browser-extraction.sh; then
     echo 'FAIL: verifier classified itself as a source candidate' >&2

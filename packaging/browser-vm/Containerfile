@@ -5,6 +5,7 @@ ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:effcf2fc509730f77a2e36253
 FROM ${BROWSER_VM_BASE}
 
 ARG MCNF_RPM_LANE=repo
+ARG BROWSER_VM_SOURCE_COMMIT
 COPY packaging/browser-vm/validate-runtime-inputs.sh /tmp/mcnf-browser-vm-validate
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtime
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service
@@ -53,6 +54,7 @@ RUN set -eux; \
     done; \
     install -d -o mcnf-browser -g mcnf-browser -m 0700 /var/lib/mcnf-browser; \
     install -d -m 0755 /usr/share/mcnf/browser-vm; \
+    printf '%s\n' "$BROWSER_VM_SOURCE_COMMIT" > /usr/share/mcnf/browser-vm/source-commit; \
     printf '%s\n' \
         '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","control_plane":"magic-mesh-lighthouse","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
         > /usr/share/mcnf/browser-vm/image-contract.json; \

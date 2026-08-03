@@ -25,6 +25,8 @@ EXPECTED_FIELDS = frozenset(
         "kind",
         "profile",
         "image",
+        "source_commit",
+        "image_digest",
         "status",
         "source",
         "video_ready_state",
@@ -39,6 +41,8 @@ EXPECTED_FIELDS = frozenset(
 MAX_FILE_BYTES = 64 * 1024
 MAX_COUNTER = 1_000_000
 MAX_DIMENSION = 16_384
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
@@ -142,6 +146,16 @@ def validate_document(data: Any) -> dict[str, Any]:
         fail("kind is not the admitted Browser VM media evidence kind")
     if data["profile"] != "browser-vm-chromium" or data["image"] != "browser-vm-chromium":
         fail("profile and image must identify browser-vm-chromium")
+    source_commit = data.get("source_commit")
+    if not isinstance(source_commit, str) or COMMIT_RE.fullmatch(source_commit) is None:
+        fail("source_commit must be a 40-character lowercase Git revision")
+    if source_commit == "0" * 40:
+        fail("source_commit must not be the null revision")
+    image_digest = data.get("image_digest")
+    if not isinstance(image_digest, str) or IMAGE_DIGEST_RE.fullmatch(image_digest) is None:
+        fail("image_digest must be an immutable sha256 digest")
+    if image_digest == "sha256:" + "0" * 64:
+        fail("image_digest must not be the null digest")
     if data["status"] not in {"passed", "unavailable"}:
         fail("status must be passed or unavailable")
     if data["source"] != "guest-local-fixed-mkv":
@@ -159,6 +173,8 @@ def validate_document(data: Any) -> dict[str, Any]:
         "status": "validated" if data["status"] == "passed" else "unavailable",
         "evidence_class": "guest_media_decode",
         "live_proof": "unavailable",
+        "source_commit": source_commit,
+        "image_digest": image_digest,
         "video_ready_state": ready,
         "video_total_frames": total,
         "video_dropped_frames": dropped,
@@ -178,6 +194,8 @@ def valid_record() -> dict[str, Any]:
         "kind": "browser_vm_media_probe",
         "profile": "browser-vm-chromium",
         "image": "browser-vm-chromium",
+        "source_commit": "0123456789abcdef0123456789abcdef01234567",
+        "image_digest": "sha256:" + "a" * 64,
         "status": "passed",
         "source": "guest-local-fixed-mkv",
         "video_ready_state": 4,

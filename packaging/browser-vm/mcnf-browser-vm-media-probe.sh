@@ -7,10 +7,13 @@ set -eu
 evidence=/var/lib/mcnf-browser/media-evidence.json
 log_file=/var/lib/mcnf-browser/media-probe.log
 chromium_bin=${1:-}
+input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
+source_commit=$(cat /usr/share/mcnf/browser-vm/source-commit 2>/dev/null || printf '%s' 0000000000000000000000000000000000000000)
+image_digest=$(cat "$input_root/image-digest" 2>/dev/null | tr 'A-F' 'a-f' || printf '%s' sha256:0000000000000000000000000000000000000000000000000000000000000000)
 
 fail_closed() {
     recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    printf '%s\n' "{\"schema_version\":1,\"kind\":\"browser_vm_media_probe\",\"profile\":\"browser-vm-chromium\",\"image\":\"browser-vm-chromium\",\"status\":\"unavailable\",\"source\":\"guest-local-fixed-mkv\",\"video_ready_state\":0,\"video_total_frames\":0,\"video_dropped_frames\":0,\"video_width\":0,\"video_height\":0,\"audio_ready_state\":0,\"recorded_at\":\"$recorded_at\"}" > "$evidence"
+    printf '%s\n' "{\"schema_version\":1,\"kind\":\"browser_vm_media_probe\",\"profile\":\"browser-vm-chromium\",\"image\":\"browser-vm-chromium\",\"source_commit\":\"$source_commit\",\"image_digest\":\"$image_digest\",\"status\":\"unavailable\",\"source\":\"guest-local-fixed-mkv\",\"video_ready_state\":0,\"video_total_frames\":0,\"video_dropped_frames\":0,\"video_width\":0,\"video_height\":0,\"audio_ready_state\":0,\"recorded_at\":\"$recorded_at\"}" > "$evidence"
     chmod 0600 "$evidence"
 }
 
@@ -89,5 +92,5 @@ for value in "$ready" "$total" "$dropped" "$width" "$height" "$audio"; do
 done
 
 recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-printf '%s\n' "{\"schema_version\":1,\"kind\":\"browser_vm_media_probe\",\"profile\":\"browser-vm-chromium\",\"image\":\"browser-vm-chromium\",\"status\":\"$status\",\"source\":\"guest-local-fixed-mkv\",\"video_ready_state\":$ready,\"video_total_frames\":$total,\"video_dropped_frames\":$dropped,\"video_width\":$width,\"video_height\":$height,\"audio_ready_state\":$audio,\"recorded_at\":\"$recorded_at\"}" > "$evidence"
+printf '%s\n' "{\"schema_version\":1,\"kind\":\"browser_vm_media_probe\",\"profile\":\"browser-vm-chromium\",\"image\":\"browser-vm-chromium\",\"source_commit\":\"$source_commit\",\"image_digest\":\"$image_digest\",\"status\":\"$status\",\"source\":\"guest-local-fixed-mkv\",\"video_ready_state\":$ready,\"video_total_frames\":$total,\"video_dropped_frames\":$dropped,\"video_width\":$width,\"video_height\":$height,\"audio_ready_state\":$audio,\"recorded_at\":\"$recorded_at\"}" > "$evidence"
 chmod 0600 "$evidence"

@@ -68,7 +68,7 @@ if [[ ! "$base_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
 fi
 [[ "$base_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || { echo 'FATAL: base image has no immutable digest' >&2; exit 2; }
 
-args=(--build-arg "MCNF_RPM_LANE=$LANE")
+args=(--build-arg "MCNF_RPM_LANE=$LANE" --build-arg "BROWSER_VM_SOURCE_COMMIT=$SOURCE_COMMIT")
 [ -n "$BASE" ] && args+=(--build-arg "BROWSER_VM_BASE=$BASE")
 podman build "${args[@]}" \
     --label 'org.mcnf.browser-vm.profile=browser-vm-chromium-v1' \
