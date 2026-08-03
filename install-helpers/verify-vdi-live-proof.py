@@ -42,6 +42,7 @@ UNCHANGED_RE = re.compile(r"live-shell-(?:vnc|spice): INPUT sent; framebuffer un
 RDP_FRAME_RE = re.compile(r"^live: FRAME OK ([1-9][0-9]{0,4})x([1-9][0-9]{0,4})\b.*?fnv1a64=(0x[0-9a-fA-F]{16})\b.*$", re.MULTILINE)
 RDP_ECHO_RE = re.compile(r"^live: INPUT ECHOED .*?before=(0x[0-9a-fA-F]{16}) after=(0x[0-9a-fA-F]{16})$", re.MULTILINE)
 RDP_UNCHANGED_RE = re.compile(r"^live: INPUT sent OK; framebuffer UNCHANGED .*?fnv1a64=(0x[0-9a-fA-F]{16}).*$", re.MULTILINE)
+RDP_RECONNECT_RE = re.compile(r"^live: RECONNECTED\b.*$", re.MULTILINE)
 TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9_.:-]+):(?P<port>[0-9]{1,5})(?P<credentials>(?:,[^,]*){0,2})?$")
 
 
@@ -92,6 +93,8 @@ def parse_probe(log: str, protocol: str, returncode: int) -> dict[str, Any]:
         return {"status": "failed", "reason": f"probe exited {returncode}"}
     if len(frame_matches) != 1:
         return {"status": "unavailable", "reason": "exactly one non-empty guest FRAME OK marker was not observed"}
+    if protocol == "rdp" and len(RDP_RECONNECT_RE.findall(log)) != 1:
+        return {"status": "unavailable", "reason": "RDP tier reconnect marker was not observed exactly once"}
 
     frame = frame_matches[0]
     input_observation = "not-reported"
@@ -101,7 +104,7 @@ def parse_probe(log: str, protocol: str, returncode: int) -> dict[str, Any]:
         input_observation = "echoed"
     elif unchanged:
         input_observation = "unchanged"
-    return {
+    parsed = {
         "status": "observed",
         "frame": {
             "width": int(frame.group(1)),
@@ -110,6 +113,9 @@ def parse_probe(log: str, protocol: str, returncode: int) -> dict[str, Any]:
         },
         "input_observation": input_observation,
     }
+    if protocol == "rdp":
+        parsed["reconnect_observation"] = "tier-reconnected"
+    return parsed
 
 
 def make_evidence(
@@ -137,6 +143,8 @@ def make_evidence(
     if parsed["status"] == "observed":
         evidence["frame"] = parsed["frame"]
         evidence["input_observation"] = parsed["input_observation"]
+        if protocol == "rdp":
+            evidence["reconnect_observation"] = parsed["reconnect_observation"]
     else:
         evidence["reason"] = parsed["reason"]
     return evidence
@@ -176,6 +184,10 @@ def validate_evidence(data: Any) -> None:
             die("observed evidence has no bounded framebuffer digest")
         if data.get("input_observation") not in {"echoed", "unchanged", "not-reported"}:
             die("invalid input observation")
+        if data["protocol"] == "rdp" and data.get("reconnect_observation") != "tier-reconnected":
+            die("RDP evidence has no tier-reconnect observation")
+        if data["protocol"] != "rdp" and "reconnect_observation" in data:
+            die("non-RDP evidence has an RDP reconnect observation")
     elif not isinstance(data.get("reason"), str) or not data["reason"]:
         die("non-observed evidence must explain why proof is unavailable")
 
@@ -272,6 +284,7 @@ def self_test() -> None:
     assert rdp_evidence["target"] == {"host": "127.0.0.1", "port": 13389}
     assert "mde-live-proof" not in json.dumps(rdp_evidence)
     assert rdp_evidence["input_observation"] == "unchanged"
+    assert rdp_evidence["reconnect_observation"] == "tier-reconnected"
     for log, code in (("", 0), ("live-shell-vnc: FRAME OK 0x0 fnv1a64=0x0123456789abcdef", 0), (valid_log, 1)):
         rejected = make_evidence("vnc", "127.0.0.1:15903", code, log, source_commit)
         assert rejected["status"] != "observed"
