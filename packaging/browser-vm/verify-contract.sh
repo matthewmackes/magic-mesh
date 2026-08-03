@@ -56,6 +56,10 @@ grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
 grep -Fq 'mcnf-browser-vm-media-probe' "$RUNTIME" || fail "guest runtime omits Chromium media probe"
+grep -Fq "DefaultWindowManager=startwm.sh" "$BROWSER_VM/Containerfile" \
+    || fail "Browser image does not route authenticated xrdp sessions into its runtime"
+grep -Fq 'xrdp-selinux' "$BROWSER_VM/Containerfile" \
+    || fail "Browser image omits the Fedora xrdp SELinux policy package"
 grep -Fq 'BROWSER_VM_DISK_GB' "$IMAGE_BUILD" || fail "image builder does not bind disk size to the profile"
 grep -Fq 'qemu-img resize' "$IMAGE_BUILD" || fail "image builder does not resize the disk output"
 grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce the 64-GiB image floor"

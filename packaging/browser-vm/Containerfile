@@ -21,7 +21,6 @@ RUN set -eux; \
     install -D -m 0755 /tmp/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-validate; \
     install -D -m 0755 /tmp/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-runtime; \
     install -D -m 0644 /tmp/mcnf-browser-vm-runtime.service /etc/systemd/system/mcnf-browser-vm-runtime.service; \
-    install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /etc/xrdp/startwm.sh; \
     install -D -m 0755 /tmp/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-session; \
     install -D -m 0755 /tmp/mcnf-browser-vm-media-probe /usr/local/libexec/mcnf-browser-vm-media-probe; \
     install -D -m 0644 /tmp/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html; \
@@ -41,7 +40,14 @@ RUN set -eux; \
         pulseaudio-utils \
         mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
         libva-utils libinput libxkbcommon xorg-x11-server-Xwayland \
-        xrdp xorgxrdp qemu-guest-agent; \
+        xrdp xrdp-selinux xorgxrdp qemu-guest-agent; \
+    # Install the image-owned entrypoint after the xrdp RPM lays down its
+    # defaults, then select it as sesman's fallback. Fedora 44 otherwise names
+    # a non-existent startwm-bash.sh and an authenticated session exits before
+    # the Browser runtime, Chromium, or evidence writer can start.
+    install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /etc/xrdp/startwm.sh; \
+    sed -i 's/^DefaultWindowManager=.*/DefaultWindowManager=startwm.sh/' /etc/xrdp/sesman.ini; \
+    grep -Fxq 'DefaultWindowManager=startwm.sh' /etc/xrdp/sesman.ini; \
     useradd --create-home --shell /bin/bash mcnf-browser; \
     for group in video input audio seat render; do \
         if ! grep -q "^${group}:" /etc/group; then \

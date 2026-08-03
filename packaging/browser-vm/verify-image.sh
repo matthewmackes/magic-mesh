@@ -49,6 +49,15 @@ grep -Fq "\"host_browser\":false" /usr/share/mcnf/browser-vm/image-contract.json
 grep -Fq "\"transports\":[\"rdp\",\"spice\"]" /usr/share/mcnf/browser-vm/image-contract.json \
   && ok "contract admits RDP and SPICE" \
   || bad "contract does not admit the typed Browser VM transport set"
+grep -Fxq 'DefaultWindowManager=startwm.sh' /etc/xrdp/sesman.ini \
+  && ok "xrdp authenticated sessions enter the Browser runtime" \
+  || bad "xrdp authenticated sessions do not enter the Browser runtime"
+rpm -q xrdp-selinux >/dev/null 2>&1 \
+  && ok "Fedora xrdp SELinux policy package is installed" \
+  || bad "Fedora xrdp SELinux policy package is missing"
+semodule -l 2>/dev/null | awk '$1 == "xrdp" { found = 1 } END { exit(found ? 0 : 1) }' \
+  && ok "xrdp SELinux policy module is active" \
+  || bad "xrdp SELinux policy module is inactive"
 if rpm -q magic-mesh magic-mesh-browser >/dev/null 2>&1; then
   bad "host workstation/browser RPM is installed"
 else
