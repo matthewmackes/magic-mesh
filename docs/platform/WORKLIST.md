@@ -484,6 +484,19 @@ remains here under a completed status.
   Fresh VDI discovery still reports no seat-15 endpoint and Dell unavailable;
   this is mesh recovery evidence only, not Browser VM, GPU, audio, reconnect,
   performance, or six-node acceptance.
+- Mesh quorum recovery update (2026-08-03): the three reachable public
+  lighthouses (`104.236.118.177`, `46.101.219.245`, and `64.23.131.57`) were
+  found with self-only Nebula bundles and no usable replicated lighthouse
+  directory. Root-only recovery backups were taken, the known three-entry
+  public roster and peer records were restored atomically, and the tested
+  `magic-mesh-lighthouse-12.1.6-1.x86_64` package was promoted across all
+  three. `mackesd`, Nebula, and etcd are active on every lighthouse;
+  `etcdctl endpoint health --cluster` reports all three healthy with a
+  three-member quorum. Seat-15 now reaches all three overlay lighthouses and
+  etcd health through Nebula `10.42.0.5`. Dell overlay `.4` still drops ping
+  and times out on SSH/RDP/SPICE/VNC, and seat-15 still has no KVM or VDI
+  endpoint. This clears the mesh-control-plane blocker only; Chromium VM
+  publication and live guest acceptance remain open.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

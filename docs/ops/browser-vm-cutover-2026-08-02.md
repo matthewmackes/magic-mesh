@@ -5,6 +5,24 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Mesh recovery evidence at 05:05 EDT: the three reachable public lighthouses
+(`104.236.118.177`, `46.101.219.245`, and `64.23.131.57`) had regressed to
+self-only Nebula bundles. I backed up each bundle, restored the known three-
+lighthouse public roster and peer records, and promoted the tested
+`magic-mesh-lighthouse-12.1.6-1.x86_64` package on all three nodes. All three
+`mackesd`, Nebula, and etcd services are active; `etcdctl endpoint health
+--cluster` reports all three endpoints healthy, with a three-member quorum and
+`10.42.0.2` leader. Seat-15 now has Nebula `10.42.0.5`, reaches all three
+lighthouses, and can query etcd health. This clears the mesh-control-plane
+blocker, but it does not create a VM on seat-15 or Dell.
+
+The Dell overlay target `10.42.0.4` still drops ping and times out on SSH,
+RDP, SPICE, and VNC ports from the restored mesh; Dell `.225` and `.2` remain
+unavailable from the orchestrator. Seat-15 still has no `/dev/kvm`, Browser VM
+workload, or VDI listener. Therefore access to Chromium on Dell has no honest
+time-of-day ETA yet: it begins after Dell is reachable and its host/KVM is
+recovered, followed by image publication and live guest-frame/input checks.
+
 Continuation evidence at 04:36 EDT: the current Fedora 44 workstation RPM was
 built on BigBoy `.130` in slot `seat15-base-f44-20260803`, passed the 90-MiB
 payload gate at 82.0 MiB, and was installed on seat-15 after a successful
