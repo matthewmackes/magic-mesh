@@ -289,8 +289,8 @@ pub fn default_qnm_shared_root() -> std::path::PathBuf {
 
 // arch-7 (2026-07-11) — the canonical shared-storage mount constant + the
 // AUDIT-MESH-15 write-safety guard moved into `mackes-mesh-types::mesh_storage`
-// so worker crates factored out of this daemon (`mde-browser-workers`) reuse
-// the one audited guard rather than re-deriving it. Re-exported here so the
+// so daemon and guest-policy workers reuse the one audited guard rather than
+// re-deriving it. Re-exported here so the
 // ~17 in-crate `crate::CANONICAL_QNM_MOUNT` / `crate::shared_root_writable`
 // call sites resolve unchanged.
 pub use mackes_mesh_types::mesh_storage::{

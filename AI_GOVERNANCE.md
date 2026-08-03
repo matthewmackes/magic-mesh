@@ -129,17 +129,12 @@ workload-provider APIs are never exposed as a second public control plane.
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use
   the shared `Style`. *(Deliberate §0-Simple lever: there is **no** raw-literal /
   Carbon-token lint gate — the shared `Style` module is the discipline.)*
-- **Browser workspace exception (operator 2026-07-15).** Browser chrome,
-  Bookmarks, engine controls, tabs, toolbar, menus, and Browser page/action
-  surfaces may apply Material
-  Design 3 principles locally: adaptive layouts, clear top-app-bar/tab hierarchy,
-  tonal surfaces/elevation, explicit interaction states, accessible focus/contrast,
-  and purposeful motion. This is a Browser-only design direction, not permission
-  to migrate unrelated shell/workspace surfaces away from `mde-egui::Style`.
-  It is a temporary host-controller boundary while WL-ARCH-008 cuts over to
-  `browser-vm`: Construct styles only the connection, unavailable, and
-  diagnostic surfaces around that guest. Guest Chromium pixels and chrome are
-  outside Construct styling and must never be wrapped or restyled.
+- **Browser VM boundary (operator 2026-07-15, cutover 2026-08-02).** Guest
+  Chromium owns Browser chrome, bookmarks, engine controls, tabs, toolbar,
+  menus, and page/action surfaces. Construct styles only the connection,
+  unavailable, and diagnostic surfaces around the typed `browser-vm` VDI
+  session. Guest Chromium pixels and chrome are outside Construct styling and
+  must never be wrapped or restyled.
 - **Motion** is governed by the operator-locked **MOTION-DRM** epic
   (2026-07-15). The old `animate_bool`-only guidance is superseded: `mde-egui`
   owns a centralized, DRM-aware motion subsystem with shared durations, easing,
@@ -381,12 +376,12 @@ at the start of every run for a **verified** utilization table — it probes all
 nodes and **fails if one is missing** (XEN-194/.170 sat idle a whole session once,
 under a stale 3-node roster). Never hardcode the node list or chart from memory.
 Stale `10.0.0.x` farm pins are invalid; the build VMs live on the `172.20.0.x`
-lanes above. Browser/CEF live probes are not generic farm assumptions: use the
-packaged `/opt/mde/cef` runtime only where installation has staged it, or the
-known warm `.50` bundle at `$HOME/mde-cef-active`. Cold Servo/browser test
-builds can exhaust small-node slot disks through Rust incremental caches; put
-those long-pole jobs on BigBoy and use `CARGO_INCREMENTAL=0` after any ENOSPC
-failure.
+lanes above. Legacy host CEF/Servo probes are retired with the host Browser
+stack and must not be staged on a workstation. Current Browser validation uses
+the guest image contract and the approved live VDI proof runner; cold guest
+image/browser builds can exhaust small-node slot disks through Rust or image
+incremental caches, so put those long-pole jobs on BigBoy and use
+`CARGO_INCREMENTAL=0` after any ENOSPC failure.
 
 ---
 

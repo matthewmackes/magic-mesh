@@ -1,6 +1,6 @@
 //! [`Engine`] — the compiled request matcher (BOOKMARKS-7).
 //!
-//! The glue point the `mde-web-preview` Servo browser calls: build an [`Engine`]
+//! The guest Browser policy boundary consumes this engine: build an [`Engine`]
 //! from a [`crate::FilterListStore`] (or straight from [`crate::FilterList`]s),
 //! then for every outgoing request call [`Engine::match_request`] to get a
 //! [`Decision`] (block before fetch, or allow), and once per page call

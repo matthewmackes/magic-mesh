@@ -7,8 +7,8 @@
 //! request against it — ad/tracker requests are blocked before fetch and
 //! cosmetic filters hide leftover ad frames. This crate is the **headless
 //! model** both the mackesd `adfilter` worker (the Syncthing replication +
-//! leader compile) and the `mde-web-preview` Servo browser (the in-page network
-//! + cosmetic blocking) import — no Servo, no Syncthing, no Bus, no I/O.
+//! leader compile) and the guest Browser policy boundary consume — no browser
+//! engine, Syncthing, Bus, or I/O is linked into this crate.
 //!
 //! The pieces:
 //!
@@ -46,9 +46,9 @@
 //!     breakdown by domain and by matched filter; no persistence, no Bus
 //!     (tally.rs).
 //!
-//! **Zero I/O**: no Servo, no Syncthing, no Bus, no wall clock, no network — the
+//! **Zero I/O**: no browser engine, Syncthing, Bus, wall clock, or network —
 //! live filter-list replication is the mackesd `adfilter` worker (BOOKMARKS-7
-//! wiring) and the in-browser request/cosmetic blocking is `mde-web-preview`'s.
+//! wiring), while request/cosmetic enforcement belongs to the guest Browser.
 //! Timestamps are passed in (`now_ms`), never read. Services tier: no
 //! desktop-shell dep (the layered-tiers gate).
 
