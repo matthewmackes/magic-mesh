@@ -27,6 +27,13 @@ input and are omitted from evidence. The self-test and farm compile passed on
 `.50` slot `vdi-proof-rdp-helper-20260803`, but no RDP target is currently
 reachable to execute it.
 
+The first bounded real-worker RDP attempt was run on `.50` against Dell
+`172.20.146.225:3389` on 2026-08-03. It returned `failed` with worker exit
+code `101` and no accepted framebuffer marker; the validated bounded record is
+`/tmp/browser-vm-rdp-proof-20260803.json` (SHA-256
+`f8ee07239ad8b4745f2b0ba1b09dcd4141ca094a2d2aca64ac537d1c1d7268d5`). This is
+negative reachability evidence, not live guest readiness.
+
 It has not been installed on Dell: `172.20.146.225` currently returns no route
 and overlay `10.42.0.4` times out. Seat 15 (`172.20.0.15`) is reachable but
 has no libvirt domain or RDP/SPICE/VNC listener. Therefore no current live

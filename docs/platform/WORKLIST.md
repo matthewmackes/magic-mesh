@@ -364,8 +364,10 @@ remains here under a completed status.
   also binds the existing input and tier-reconnect output while ignoring its
   separate `TIER FRAME OK` marker. Its self-test, farm Python check, and farm
   compile of the real RDP test pass on `.50` slot
-  `vdi-proof-rdp-helper-20260803`; actual target execution remains unavailable
-  until a real guest endpoint is supplied. The VDI seam now records bounded
+  `vdi-proof-rdp-helper-20260803`; a bounded real-worker attempt against Dell
+  on 2026-08-03 returned `failed` with no framebuffer marker, so actual target
+  execution remains unavailable until a real guest endpoint is supplied. The
+  VDI seam now records bounded
   frame cadence, full/partial upload counts, upload timing, reconnects, and
   shell repaint counts; its focused metrics test and the 64-test VDI set pass
   on BigBoy. A fresh current-source Fedora 44 Browser VM container and qcow2
