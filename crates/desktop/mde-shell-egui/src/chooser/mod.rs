@@ -1709,12 +1709,12 @@ impl ChooserState {
         self.connect.take()
     }
 
-    /// Resolve the optional remembered guest credential for the typed Browser VM
-    /// route.  Browser is a mesh-brokered source, so the normal result is mesh
-    /// identity SSO; a credential already sealed under the workload name is
-    /// carried only in the in-memory VDI request for guest OS login.  Keeping
-    /// this fold here makes the Browser shortcut use the same auth seam as the
-    /// full Chooser without ever placing credentials in the Workloads record.
+    /// Resolve the guest credential for the typed Browser VM route. Browser is a
+    /// mesh-brokered source, but xrdp still requires an account/password inside
+    /// the guest; the broker's mesh authorization is carried by the session
+    /// record separately. Keeping this fold here makes the Browser shortcut use
+    /// the same auth seam as the full Chooser without ever placing credentials in
+    /// the Workloads record.
     pub(crate) fn browser_vm_auth(
         &mut self,
         target: &crate::web::BrowserVmTarget,
@@ -1726,8 +1726,7 @@ impl ChooserState {
         {
             self.browser_vm_prompt = None;
         }
-        match auth::resolve(
-            true,
+        match auth::resolve_guest(
             &self.client_peer,
             &target.workload,
             VdiProtocol::Rdp,

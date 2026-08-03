@@ -381,6 +381,20 @@ pub(crate) fn resolve(
     }
 }
 
+/// Resolve credentials for a guest protocol that does not implement mesh-identity
+/// SSO. The broker still authorizes the VM session separately, but protocols such
+/// as xrdp require an account/password inside the guest before they can render.
+/// Keeping this as a named path prevents a brokered Browser VM from accidentally
+/// carrying a bare [`DesktopAuth::MeshIdentity`] into the RDP decoder.
+pub(crate) fn resolve_guest(
+    node: &str,
+    host: &str,
+    protocol: VdiProtocol,
+    store: &dyn CredentialStore,
+) -> Result<AuthStage, String> {
+    resolve(false, node, host, protocol, store)
+}
+
 /// Seal the one-time credential the operator entered for an external endpoint,
 /// then hand back the resolved [`DesktopAuth::Sealed`] — used for THIS connect
 /// in-memory regardless of the seal outcome, so a gated store still connects (the
@@ -521,6 +535,22 @@ mod tests {
         }
         .summary()
         .contains("sealed guest credential"));
+    }
+
+    #[test]
+    fn a_brokered_browser_guest_rdp_requires_a_guest_credential() {
+        // Mesh authorization opens the brokered session, but xrdp still needs
+        // an account inside the guest. A missing credential must therefore
+        // prompt instead of producing a bare mesh identity that RDP cannot use.
+        let store = FakeStore::default();
+        let stage = resolve_guest("this-node", "browser-vm", VdiProtocol::Rdp, &store)
+            .expect("guest auth resolves");
+        let AuthStage::Prompt(prompt) = stage else {
+            unreachable!("Browser VM RDP must prompt for its guest account")
+        };
+        assert_eq!(prompt.store_ref, "desktop/browser-vm/rdp");
+        assert!(prompt.username.is_empty() && prompt.password.is_empty());
+        assert_eq!(store.seal_count(), 0, "resolving must not seal anything");
     }
 
     #[test]

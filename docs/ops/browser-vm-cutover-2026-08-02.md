@@ -18,6 +18,13 @@ has no libvirt domain or RDP/SPICE/VNC listener. Therefore no current live
 guest-frame, focused-input, GPU-video, guest-audio, reconnect, performance, or
 six-node acceptance claim is made here.
 
+The Browser shell's RDP auth path is now fail-closed and deployable: broker
+authorization remains on the typed session record, while xrdp guest login is
+resolved separately from a remembered sealed credential or a one-time masked
+prompt. A bare mesh identity can no longer reach the RDP decoder and fail later
+without an actionable login path. Farm `.130` passed the focused auth module
+(20 tests, including the Browser VM regression).
+
 ## Landed
 
 - `magic-mesh-browser-stack` is public and history-bearing at
