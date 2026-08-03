@@ -357,11 +357,14 @@ remains here under a completed status.
   `failed`, or `unavailable`) and rejects missing, malformed, path-shaped,
   symlinked, or extra inputs; its farm contract suite passes on `.50` slot
   `browser-contract-230`. The new `install-helpers/verify-vdi-live-proof.py`
-  runner invokes only the approved ignored live VNC/SPICE worker tests through
-  an explicit farm host/slot and records `observed` only for an exact
-  non-empty guest `FRAME OK` marker, with bounded dimensions/hash and no ticket
-  or raw-log retention. Its self-test and farm syntax/self-test pass on `.50`
-  slot `vdi-proof-helper-231`; actual target execution remains unavailable
+  runner invokes the approved ignored live VNC/SPICE worker tests or the
+  existing ignored RDP integration test through an explicit farm host/slot and
+  records `observed` only for an exact non-empty guest `FRAME OK` marker, with
+  bounded dimensions/hash and no credential or raw-log retention. RDP evidence
+  also binds the existing input and tier-reconnect output while ignoring its
+  separate `TIER FRAME OK` marker. Its self-test, farm Python check, and farm
+  compile of the real RDP test pass on `.50` slot
+  `vdi-proof-rdp-helper-20260803`; actual target execution remains unavailable
   until a real guest endpoint is supplied. The VDI seam now records bounded
   frame cadence, full/partial upload counts, upload timing, reconnects, and
   shell repaint counts; its focused metrics test and the 64-test VDI set pass

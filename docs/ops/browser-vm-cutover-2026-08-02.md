@@ -19,6 +19,14 @@ SHA-256 `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
 `qemu-img info` reports a non-corrupt 10-GiB qcow2 with a 1.72-GiB compressed
 footprint. This is artifact readiness, not live guest or seat acceptance.
 
+The bounded live-proof runner now also supports the Browser VM's primary RDP
+path by invoking the existing ignored `mde-vdi-rdp` integration test. It records
+only the initial guest `FRAME OK` marker, bounded input observation, and the
+probe-log digest; RDP credentials are accepted only as process-local target
+input and are omitted from evidence. The self-test and farm compile passed on
+`.50` slot `vdi-proof-rdp-helper-20260803`, but no RDP target is currently
+reachable to execute it.
+
 It has not been installed on Dell: `172.20.146.225` currently returns no route
 and overlay `10.42.0.4` times out. Seat 15 (`172.20.0.15`) is reachable but
 has no libvirt domain or RDP/SPICE/VNC listener. Therefore no current live
@@ -167,10 +175,10 @@ evidenced. The current Dell domain is still QXL/SPICE and is not the newly
 rebuilt RDP image. RDP endpoint publication/authentication and live proof, GPU
 video, guest Chromium audio playback, five-session performance,
 signed publication/install/upgrade, reconnect/failover,
-and six-node acceptance remain open. The image rebuild is also blocked by the
-unavailable Fedora base registry; separately, Fedora 44's enabled repositories
+and six-node acceptance remain open. Fedora 44's enabled repositories still
 lack the multimedia RPM dependencies required by the repository-only image
-lane. Seat 15 still needs operator capacity work. This change does not claim
-that the Chromium App VM is production-ready. The broker and wire gates are
-green; the live guest remains not ready for RDP because Dell currently refuses
-TCP 3389 and the running image is the stale Pixman/QXL candidate.
+lane, so GPU video remains a live hardware gate. Seat 15 still needs operator
+capacity work. This change does not claim that the Chromium App VM is
+production-ready. The broker and wire gates are green; the live guest remains
+not ready for RDP because Dell currently refuses TCP 3389 and the running
+image is the stale Pixman/QXL candidate.

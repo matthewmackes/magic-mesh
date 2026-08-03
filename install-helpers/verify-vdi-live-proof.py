@@ -2,10 +2,11 @@
 """Run and record the narrow, real VDI framebuffer proof.
 
 This helper is intentionally fail-closed.  It only invokes the two existing
-ignored shell tests (live VNC or live SPICE) through ``xcp-build.sh`` and only
-records ``observed`` when the test prints its exact non-empty ``FRAME OK``
-marker.  A reachable TCP port, a requested session, a fixture, or a failed
-decoder never becomes framebuffer evidence.
+ignored shell tests (live VNC or live SPICE), or the existing ignored RDP
+integration test, through ``xcp-build.sh`` and only records ``observed`` when
+the test prints its exact non-empty ``FRAME OK`` marker.  A reachable TCP
+port, a requested session, a fixture, or a failed decoder never becomes
+framebuffer evidence.
 
 The output contains no endpoint ticket and no raw probe log; it records the
 protocol, bounded frame dimensions/hash, input observation, command result,
@@ -13,7 +14,7 @@ and a digest of the captured log for later correlation.
 
 Usage:
   verify-vdi-live-proof.py discover --seat NAME=HOST [--seat NAME=HOST ...]
-  verify-vdi-live-proof.py run --protocol vnc --target HOST:PORT \
+  verify-vdi-live-proof.py run --protocol rdp --target HOST:PORT[,user,pass] \
     --source-commit <git-sha> --host 172.20.0.90 --slot vdi-proof-1 --out evidence.json
   verify-vdi-live-proof.py validate evidence.json
   verify-vdi-live-proof.py --self-test
@@ -38,7 +39,10 @@ MAX_LOG_BYTES = 4 * 1024 * 1024
 FRAME_RE = re.compile(r"live-shell-(?:vnc|spice): FRAME OK ([1-9][0-9]{0,4})x([1-9][0-9]{0,4}) fnv1a64=(0x[0-9a-fA-F]{16})")
 ECHO_RE = re.compile(r"live-shell-(?:vnc|spice): INPUT ECHOED before=(0x[0-9a-fA-F]{16}) after=(0x[0-9a-fA-F]{16})")
 UNCHANGED_RE = re.compile(r"live-shell-(?:vnc|spice): INPUT sent; framebuffer unchanged fnv1a64=(0x[0-9a-fA-F]{16})")
-TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9_.:-]+):(?P<port>[0-9]{1,5})(?:,(?P<ticket>[^,]*))?$")
+RDP_FRAME_RE = re.compile(r"^live: FRAME OK ([1-9][0-9]{0,4})x([1-9][0-9]{0,4})\b.*?fnv1a64=(0x[0-9a-fA-F]{16})\b.*$", re.MULTILINE)
+RDP_ECHO_RE = re.compile(r"^live: INPUT ECHOED .*?before=(0x[0-9a-fA-F]{16}) after=(0x[0-9a-fA-F]{16})$", re.MULTILINE)
+RDP_UNCHANGED_RE = re.compile(r"^live: INPUT sent OK; framebuffer UNCHANGED .*?fnv1a64=(0x[0-9a-fA-F]{16}).*$", re.MULTILINE)
+TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9_.:-]+):(?P<port>[0-9]{1,5})(?P<credentials>(?:,[^,]*){0,2})?$")
 
 
 class ProofError(Exception):
@@ -62,6 +66,12 @@ def parse_target(raw: str) -> tuple[str, int]:
     return host, port
 
 
+def source_for_protocol(protocol: str) -> str:
+    if protocol == "rdp":
+        return "mde-vdi-rdp ignored live integration test"
+    return "mde-shell-egui ignored live worker test"
+
+
 def bounded_log(stdout: bytes, stderr: bytes) -> str:
     combined = stdout + (b"\n" if stdout and stderr else b"") + stderr
     if len(combined) > MAX_LOG_BYTES:
@@ -70,7 +80,14 @@ def bounded_log(stdout: bytes, stderr: bytes) -> str:
 
 
 def parse_probe(log: str, protocol: str, returncode: int) -> dict[str, Any]:
-    frame_matches = [match for match in FRAME_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
+    if protocol == "rdp":
+        frame_matches = list(RDP_FRAME_RE.finditer(log))
+        echo_matches = list(RDP_ECHO_RE.finditer(log))
+        unchanged_matches = list(RDP_UNCHANGED_RE.finditer(log))
+    else:
+        frame_matches = [match for match in FRAME_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
+        echo_matches = [match for match in ECHO_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
+        unchanged_matches = [match for match in UNCHANGED_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
     if returncode != 0:
         return {"status": "failed", "reason": f"probe exited {returncode}"}
     if len(frame_matches) != 1:
@@ -78,8 +95,8 @@ def parse_probe(log: str, protocol: str, returncode: int) -> dict[str, Any]:
 
     frame = frame_matches[0]
     input_observation = "not-reported"
-    echo = next((m for m in ECHO_RE.finditer(log) if m.group(0).startswith(f"live-shell-{protocol}:")), None)
-    unchanged = next((m for m in UNCHANGED_RE.finditer(log) if m.group(0).startswith(f"live-shell-{protocol}:")), None)
+    echo = echo_matches[0] if echo_matches else None
+    unchanged = unchanged_matches[0] if unchanged_matches else None
     if echo:
         input_observation = "echoed"
     elif unchanged:
@@ -113,7 +130,7 @@ def make_evidence(
         "probe": {
             "returncode": returncode,
             "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
-            "source": "mde-shell-egui ignored live worker test",
+            "source": source_for_protocol(protocol),
         },
         "recorded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
@@ -136,7 +153,7 @@ def validate_evidence(data: Any) -> None:
         or not re.fullmatch(r"[0-9a-fA-F]{7,64}", source_commit)
     ):
         die("source_commit is missing or malformed")
-    if data.get("protocol") not in {"vnc", "spice"}:
+    if data.get("protocol") not in {"rdp", "vnc", "spice"}:
         die("invalid evidence protocol")
     target = data.get("target")
     if not isinstance(target, dict) or not isinstance(target.get("host"), str):
@@ -145,7 +162,7 @@ def validate_evidence(data: Any) -> None:
     probe = data.get("probe")
     if not isinstance(probe, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(probe.get("log_sha256", ""))):
         die("probe log digest is missing or malformed")
-    if probe.get("source") != "mde-shell-egui ignored live worker test":
+    if probe.get("source") != source_for_protocol(data["protocol"]):
         die("evidence source is not the approved real-worker test")
     if not isinstance(data.get("recorded_at"), str) or not data["recorded_at"].endswith("Z"):
         die("recorded_at must be a UTC timestamp")
@@ -175,24 +192,24 @@ def run_probe(args: argparse.Namespace) -> int:
     test_name = {
         "vnc": "live_vnc_worker_renders_real_console_and_accepts_input",
         "spice": "live_spice_worker_renders_real_console_and_accepts_input",
+        "rdp": "live_rdp_renders_accepts_input_and_applies_tier_on_reconnect",
     }[args.protocol]
     env = os.environ.copy()
     env["MCNF_BUILD_HOST"] = args.host
     env["MCNF_BUILD_SLOT"] = args.slot
     env[f"MDE_{args.protocol.upper()}_LIVE_TARGET"] = args.target
-    command = [
-        str(Path(__file__).with_name("xcp-build.sh")),
-        "cargo",
-        "test",
-        "-p",
-        "mde-shell-egui",
-        "--features",
-        "live-vdi",
-        test_name,
-        "--",
-        "--ignored",
-        "--nocapture",
-    ]
+    if args.protocol == "rdp":
+        command = [
+            str(Path(__file__).with_name("xcp-build.sh")),
+            "cargo", "test", "-p", "mde-vdi-rdp", "--features", "live-connect",
+            "--test", "live_rdp", "--", "--ignored", "--nocapture",
+        ]
+    else:
+        command = [
+            str(Path(__file__).with_name("xcp-build.sh")),
+            "cargo", "test", "-p", "mde-shell-egui", "--features", "live-vdi",
+            test_name, "--", "--ignored", "--nocapture",
+        ]
     completed = subprocess.run(command, cwd=Path(__file__).parent.parent, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     log = bounded_log(completed.stdout, completed.stderr)
     evidence = make_evidence(
@@ -241,6 +258,20 @@ def self_test() -> None:
     validate_evidence(evidence)
     assert evidence["status"] == "observed"
     assert evidence["frame"]["width"] == 1024
+    rdp_log = (
+        "live: CONNECTED tier=Full desktop=1024x768\n"
+        "live: FRAME OK 1024x768 rects=1 fnv1a64=0x0123456789abcdef distinct_colors=42\n"
+        "live: INPUT sent OK; framebuffer UNCHANGED after keystroke (fnv1a64=0x0123456789abcdef)\n"
+        "live: RECONNECTED tier=Compressed desktop=1024x768\n"
+        "live: TIER FRAME OK 1024x768 rects=1 fnv1a64=0xfedcba9876543210 distinct_colors=43\n"
+    )
+    rdp_evidence = make_evidence("rdp", "127.0.0.1:13389,mde,mde-live-proof", 0, rdp_log, source_commit)
+    validate_evidence(rdp_evidence)
+    assert rdp_evidence["status"] == "observed"
+    assert rdp_evidence["protocol"] == "rdp"
+    assert rdp_evidence["target"] == {"host": "127.0.0.1", "port": 13389}
+    assert "mde-live-proof" not in json.dumps(rdp_evidence)
+    assert rdp_evidence["input_observation"] == "unchanged"
     for log, code in (("", 0), ("live-shell-vnc: FRAME OK 0x0 fnv1a64=0x0123456789abcdef", 0), (valid_log, 1)):
         rejected = make_evidence("vnc", "127.0.0.1:15903", code, log, source_commit)
         assert rejected["status"] != "observed"
@@ -263,8 +294,8 @@ def main() -> int:
     discover = sub.add_parser("discover")
     discover.add_argument("--seat", action="append", required=True)
     run = sub.add_parser("run")
-    run.add_argument("--protocol", choices=("vnc", "spice"), required=True)
-    run.add_argument("--target", required=True, help="HOST:PORT[,ticket]; ticket is never written to evidence")
+    run.add_argument("--protocol", choices=("rdp", "vnc", "spice"), required=True)
+    run.add_argument("--target", required=True, help="HOST:PORT[,ticket] or RDP HOST:PORT[,user,pass]; credentials are never written to evidence")
     run.add_argument("--source-commit", required=True, help="candidate source commit bound into evidence")
     run.add_argument("--host", required=True, help="explicit farm build host")
     run.add_argument("--slot", required=True, help="isolated farm build slot")
