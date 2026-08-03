@@ -467,6 +467,12 @@ remains here under a completed status.
   This supersedes the earlier `d41b322a…` candidate, but is not published or
   live-accepted because Dell remains unreachable and seat-15 has no KVM/VDI
   endpoint.
+- VDI-provenance hardening update (2026-08-03):
+  `verify-vdi-live-proof.py` now requires and validates the exact 40-character
+  source revision and immutable qcow2/image SHA-256 digest on every live probe;
+  the composite gate rejects VDI evidence whose digest differs from its
+  acceptance bundle. The Browser VM contract runs both VDI and composite
+  self-tests.
 - Coordination-fallback hardening update (2026-08-03): the Nebula supervisor
   now records whether its peer directory came from etcd or filesystem fallback
   and refuses to shrink an existing lighthouse roster when etcd is configured

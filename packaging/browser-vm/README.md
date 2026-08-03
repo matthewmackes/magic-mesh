@@ -136,6 +136,11 @@ media alone, missing reconnect/input observations, stale or symlinked artifacts,
 and credential-shaped fields. Its self-test validates the boundary; it does not
 claim Dell or seat-15 readiness until a real bundle is collected.
 
+The underlying `install-helpers/verify-vdi-live-proof.py` runner requires both
+`--source-commit` and `--image-digest sha256:<64-hex>` on every live probe. A
+VDI frame marker without those immutable artifact bindings is rejected and
+cannot enter the composite acceptance bundle.
+
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source
 record rather than silently reusing a host image.

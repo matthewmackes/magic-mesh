@@ -20,6 +20,7 @@ MEDIA_PROBE="$BROWSER_VM/mcnf-browser-vm-media-probe.sh"
 MEDIA_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-media-evidence.py"
 PERFORMANCE_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-performance.py"
 LIVE_ACCEPTANCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-live-acceptance.py"
+VDI_LIVE_PROOF_VERIFY="$ROOT/install-helpers/verify-vdi-live-proof.py"
 EPHEMERAL_NOCLOUD="$BROWSER_VM/prepare-ephemeral-nocloud.sh"
 DEPLOY_IMAGE="$BROWSER_VM/deploy-image.sh"
 
@@ -42,12 +43,13 @@ fail() {
 [ -x "$MEDIA_EVIDENCE_VERIFY" ] || fail "media evidence verifier is not executable"
 [ -x "$PERFORMANCE_EVIDENCE_VERIFY" ] || fail "performance evidence verifier is not executable"
 [ -x "$LIVE_ACCEPTANCE_VERIFY" ] || fail "live acceptance verifier is not executable"
+[ -x "$VDI_LIVE_PROOF_VERIFY" ] || fail "VDI live proof verifier is not executable"
 [ -x "$EPHEMERAL_NOCLOUD" ] || fail "ephemeral NoCloud helper is not executable"
 [ -x "$DEPLOY_IMAGE" ] || fail "image deploy helper is not executable"
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
-python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY"
+python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
@@ -59,6 +61,7 @@ grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce th
 "$RUNTIME_EVIDENCE_VERIFY" --self-test >/dev/null
 "$MEDIA_EVIDENCE_VERIFY" --self-test >/dev/null
 "$PERFORMANCE_EVIDENCE_VERIFY" --self-test >/dev/null
+"$VDI_LIVE_PROOF_VERIFY" --self-test >/dev/null
 "$LIVE_ACCEPTANCE_VERIFY" --self-test >/dev/null
 "$EPHEMERAL_NOCLOUD" --self-test >/dev/null
 "$DEPLOY_IMAGE" --self-test >/dev/null

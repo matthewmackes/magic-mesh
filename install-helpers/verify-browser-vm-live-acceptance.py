@@ -331,6 +331,8 @@ def validate(
         fail("vdi_evidence must be observed")
     if vdi_data.get("source_commit") != source_commit:
         fail("vdi_evidence source_commit does not match acceptance")
+    if vdi_data.get("image_digest") != image_digest:
+        fail("vdi_evidence image_digest does not match acceptance")
     validate_fresh_timestamp(vdi_data.get("recorded_at"), "vdi_evidence.recorded_at")
     if vdi_data.get("protocol") != transport:
         fail("vdi_evidence protocol does not match acceptance transport")
@@ -464,7 +466,7 @@ def _fixture(root: Path) -> dict[str, Any]:
         "live: RECONNECTED tier=Compressed desktop=1024x768\n"
         "live: TIER FRAME OK 1024x768 rects=1 fnv1a64=0xfedcba9876543210 distinct_colors=43\n"
     )
-    vdi_data = vdi.make_evidence("rdp", "127.0.0.1:13389", 0, rdp_log, source_commit)
+    vdi_data = vdi.make_evidence("rdp", "127.0.0.1:13389", 0, rdp_log, source_commit, image_digest)
     runtime_data = runtime.make_valid()
     runtime_data.update(
         {

@@ -15,7 +15,8 @@ and a digest of the captured log for later correlation.
 Usage:
   verify-vdi-live-proof.py discover --seat NAME=HOST [--seat NAME=HOST ...]
   verify-vdi-live-proof.py run --protocol rdp --target HOST:PORT[,user,pass] \
-    --source-commit <git-sha> --host 172.20.0.90 --slot vdi-proof-1 --out evidence.json
+    --source-commit <git-sha> --image-digest sha256:<64-hex> \
+    --host 172.20.0.90 --slot vdi-proof-1 --out evidence.json
   verify-vdi-live-proof.py validate evidence.json
   verify-vdi-live-proof.py --self-test
 """
@@ -44,6 +45,8 @@ RDP_ECHO_RE = re.compile(r"^live: INPUT ECHOED .*?before=(0x[0-9a-fA-F]{16}) aft
 RDP_UNCHANGED_RE = re.compile(r"^live: INPUT sent OK; framebuffer UNCHANGED .*?fnv1a64=(0x[0-9a-fA-F]{16}).*$", re.MULTILINE)
 RDP_RECONNECT_RE = re.compile(r"^live: RECONNECTED\b.*$", re.MULTILINE)
 TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9_.:-]+):(?P<port>[0-9]{1,5})(?P<credentials>(?:,[^,]*){0,2})?$")
+SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class ProofError(Exception):
@@ -123,13 +126,15 @@ def make_evidence(
     target: str,
     returncode: int,
     log: str,
-    source_commit: str | None = None,
+    source_commit: str,
+    image_digest: str,
 ) -> dict[str, Any]:
     host, port = parse_target(target)
     parsed = parse_probe(log, protocol, returncode)
     evidence: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "source_commit": source_commit,
+        "image_digest": image_digest,
         "status": parsed["status"],
         "protocol": protocol,
         "target": {"host": host, "port": port},
@@ -156,11 +161,15 @@ def validate_evidence(data: Any) -> None:
     if data.get("status") not in {"observed", "unavailable", "failed"}:
         die("invalid evidence status")
     source_commit = data.get("source_commit")
-    if source_commit is not None and (
-        not isinstance(source_commit, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{7,64}", source_commit)
-    ):
-        die("source_commit is missing or malformed")
+    if not isinstance(source_commit, str) or SOURCE_COMMIT_RE.fullmatch(source_commit) is None:
+        die("source_commit must be a 40-character lowercase Git revision")
+    if source_commit == "0" * 40:
+        die("source_commit must not be the null revision")
+    image_digest = data.get("image_digest")
+    if not isinstance(image_digest, str) or IMAGE_DIGEST_RE.fullmatch(image_digest) is None:
+        die("image_digest must be an immutable sha256 digest")
+    if image_digest == "sha256:" + "0" * 64:
+        die("image_digest must not be the null digest")
     if data.get("protocol") not in {"rdp", "vnc", "spice"}:
         die("invalid evidence protocol")
     target = data.get("target")
@@ -199,8 +208,8 @@ def write_evidence(path: Path, evidence: dict[str, Any]) -> None:
 
 def run_probe(args: argparse.Namespace) -> int:
     parse_target(args.target)
-    if not args.host or not args.slot or not args.source_commit:
-        die("run requires explicit --source-commit, --host, and --slot; local execution is not proof")
+    if not args.host or not args.slot or not args.source_commit or not args.image_digest:
+        die("run requires explicit --source-commit, --image-digest, --host, and --slot; local execution is not proof")
     test_name = {
         "vnc": "live_vnc_worker_renders_real_console_and_accepts_input",
         "spice": "live_spice_worker_renders_real_console_and_accepts_input",
@@ -225,7 +234,7 @@ def run_probe(args: argparse.Namespace) -> int:
     completed = subprocess.run(command, cwd=Path(__file__).parent.parent, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     log = bounded_log(completed.stdout, completed.stderr)
     evidence = make_evidence(
-        args.protocol, args.target, completed.returncode, log, args.source_commit
+        args.protocol, args.target, completed.returncode, log, args.source_commit, args.image_digest
     )
     validate_evidence(evidence)
     write_evidence(Path(args.out), evidence)
@@ -266,7 +275,8 @@ def discover_targets(args: argparse.Namespace) -> int:
 def self_test() -> None:
     valid_log = "live-shell-vnc: FRAME OK 1024x768 fnv1a64=0x0123456789abcdef\nlive-shell-vnc: INPUT ECHOED before=0x0123456789abcdef after=0xfedcba9876543210\n"
     source_commit = "0123456789abcdef0123456789abcdef01234567"
-    evidence = make_evidence("vnc", "127.0.0.1:15903", 0, valid_log, source_commit)
+    image_digest = "sha256:" + "a" * 64
+    evidence = make_evidence("vnc", "127.0.0.1:15903", 0, valid_log, source_commit, image_digest)
     validate_evidence(evidence)
     assert evidence["status"] == "observed"
     assert evidence["frame"]["width"] == 1024
@@ -277,7 +287,7 @@ def self_test() -> None:
         "live: RECONNECTED tier=Compressed desktop=1024x768\n"
         "live: TIER FRAME OK 1024x768 rects=1 fnv1a64=0xfedcba9876543210 distinct_colors=43\n"
     )
-    rdp_evidence = make_evidence("rdp", "127.0.0.1:13389,mde,mde-live-proof", 0, rdp_log, source_commit)
+    rdp_evidence = make_evidence("rdp", "127.0.0.1:13389,mde,mde-live-proof", 0, rdp_log, source_commit, image_digest)
     validate_evidence(rdp_evidence)
     assert rdp_evidence["status"] == "observed"
     assert rdp_evidence["protocol"] == "rdp"
@@ -286,7 +296,7 @@ def self_test() -> None:
     assert rdp_evidence["input_observation"] == "unchanged"
     assert rdp_evidence["reconnect_observation"] == "tier-reconnected"
     for log, code in (("", 0), ("live-shell-vnc: FRAME OK 0x0 fnv1a64=0x0123456789abcdef", 0), (valid_log, 1)):
-        rejected = make_evidence("vnc", "127.0.0.1:15903", code, log, source_commit)
+        rejected = make_evidence("vnc", "127.0.0.1:15903", code, log, source_commit, image_digest)
         assert rejected["status"] != "observed"
     broken = dict(evidence)
     broken["frame"] = dict(evidence["frame"])
@@ -310,6 +320,7 @@ def main() -> int:
     run.add_argument("--protocol", choices=("rdp", "vnc", "spice"), required=True)
     run.add_argument("--target", required=True, help="HOST:PORT[,ticket] or RDP HOST:PORT[,user,pass]; credentials are never written to evidence")
     run.add_argument("--source-commit", required=True, help="candidate source commit bound into evidence")
+    run.add_argument("--image-digest", required=True, help="immutable qcow2/image digest bound into evidence")
     run.add_argument("--host", required=True, help="explicit farm build host")
     run.add_argument("--slot", required=True, help="isolated farm build slot")
     run.add_argument("--out", required=True, type=Path)
