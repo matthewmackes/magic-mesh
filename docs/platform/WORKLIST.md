@@ -331,7 +331,7 @@ remains here under a completed status.
   public `magic-mesh-browser-stack` repository and removed from `magic-mesh` by
   `15695dd5`; the remaining `Surface::Browser` is a thin typed guest route.
   Workloads provision `DeliveryType::DesktopVm`, while VDI supports
-  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 84-path
+  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 85-path
   source/destination inventory and
   fail-closed verifier remain under `docs/design/browser-stack-extraction/` and
   `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
@@ -410,6 +410,17 @@ remains here under a completed status.
   read-only jump probe through seat-15's Nebula address `10.42.0.5` also
   timed out to Dell overlay `10.42.0.4` on SSH and RDP, so seat-15 cannot
   currently provide a deployment path.
+- Continuation update (2026-08-03): the checked-in cutover now includes
+  explicit host-local Browser qcow2 source propagation through the cloud
+  renderer, a credential-free KVM/NoCloud seat preflight, and an RDPSND client
+  plus bounded PipeWire sink path that remains fail-closed until live PCM is
+  observed. The cloud suite passes 236/236 and the live-connect RDP suite
+  passes 88/88 on the farm; commits `7816f781` and `ef1dc5ed` are pushed.
+  The extraction manifest is current at 85 paths (18 browser-owned, 25
+  mixed-purpose, 42 shared). A fresh discovery still reports seat-15
+  reachable but without a VM or VDI listener, and Dell `.225`, `.2`, and
+  overlay `.4` unavailable; no live guest, GPU, audio, performance, or
+  six-node acceptance is claimed.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

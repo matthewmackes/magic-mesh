@@ -5,6 +5,14 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Continuation evidence: the current cutover commits are `7816f781` (typed
+Browser image-source propagation, seat preflight/NoCloud preparation, and
+RDPSND/PipeWire audio wiring) and `ef1dc5ed` (85-path extraction manifest
+refresh). Farm verification passes `mackesd` cloud 236/236 and
+`mde-vdi-rdp --features live-connect` 88/88 plus loopback tests. The audio
+capability is intentionally endpoint/PCM evidence only; it does not claim
+audible playback without a live host capture.
+
 The guest-image artifact is bound to source commit `9e7697b5`; the source-side
 cutover and VDI metrics are current through `25fb1cc1`. The extraction verifier
 passes for 84 paths and the public
