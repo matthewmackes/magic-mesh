@@ -337,7 +337,10 @@ remains here under a completed status.
   `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
   baseline and tests; `packaging/browser-vm/profile.env` fixes guest identity,
   provenance, Chromium/Sway ownership, transport preference, and the resource
-  floor with a fail-closed verifier; its source provenance now requires a pinned
+  floor with a fail-closed verifier. The verb now admits only the stable
+  workload name `browser-vm`, which is the name Surface::Browser selects; an
+  alias cannot create a Browser workload invisible to the surface. Its source
+  provenance now requires a pinned
   40-character commit, explicit fail-closed runtime policy, and terminal
   `failed`/`unavailable` guest states; the profile verifier passes once and the
   focused runtime contract passes 17 assertions on farm `.90`. Front Door/AccessKit expose truthful guest

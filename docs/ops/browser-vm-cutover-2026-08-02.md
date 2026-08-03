@@ -88,6 +88,9 @@ gates for user access and production acceptance.
 
 - `magic-mesh-browser-stack` is public and history-bearing at
   `https://github.com/matthewmackes/magic-mesh-browser-stack`.
+- The typed `browser-provision` verb now rejects workload aliases and admits only
+  the stable name `browser-vm`, matching the name consumed by `Surface::Browser`;
+  the focused farm test passes with four tests and no failures.
 - Standalone publication provenance is recorded through commit `3b06da0d`.
   The public root workspace contains the extracted wire, policy, preview
   client, worker core, Bus, seal, mesh-type, and Browser worker crates; the

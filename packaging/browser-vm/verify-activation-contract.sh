@@ -32,6 +32,7 @@ require 'BrowserVmRoute::select_resume()' "$WEB"
 require 'Surface::Browser' "$SURFACES"
 require 'VisualBoundary::BrowserVmGuest' "$SURFACES"
 require 'DeliveryType::DesktopVm' "$WORKLOAD"
+require 'const BROWSER_VM_WORKLOAD_NAME: &str = "browser-vm"' "$WORKLOAD"
 require 'BrowserVmProfile::default().workload_spec(node, name)' "$WORKLOAD"
 
 # The reachable shell Browser surface must contain no host helper seam.

@@ -16,6 +16,8 @@ use super::super::reconcile;
 use super::super::CloudWorker;
 use super::CloudActionBody;
 
+const BROWSER_VM_WORKLOAD_NAME: &str = "browser-vm";
+
 /// Handle one `action/cloud/browser-provision` request.
 pub(super) fn handle(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -> CloudReply {
     build_reply(&w.state_root, verb_name, body)
@@ -81,6 +83,11 @@ fn validated_target(body: &CloudActionBody) -> Result<(&str, &str, &str), String
         .as_deref()
         .ok_or_else(|| "`browser-provision` requires an explicit workload `name`".to_string())?;
     let name = super::super::path_key::file_stem("name", name, ".json")?;
+    if name != BROWSER_VM_WORKLOAD_NAME {
+        return Err(format!(
+            "`browser-provision` workload `name` must be `{BROWSER_VM_WORKLOAD_NAME}` so Surface::Browser can select the stable route"
+        ));
+    }
     let image_digest = body.image_digest.as_deref().ok_or_else(|| {
         "`browser-provision` requires an immutable `image_digest` (sha256:<64-hex>)".to_string()
     })?;
@@ -144,28 +151,45 @@ mod tests {
     #[test]
     fn browser_provision_persists_the_typed_desired_spec_deterministically() {
         let tmp = tempdir().unwrap();
-        let request = body("eagle", Some("browser-eagle"));
+        let request = body("eagle", Some(BROWSER_VM_WORKLOAD_NAME));
         let reply = build_reply(tmp.path(), "browser-provision", &request);
         assert!(reply.ok, "error: {:?}", reply.error);
         assert_eq!(
             reply.desired.as_ref().unwrap(),
-            &[browser_spec("eagle", "browser-eagle", DIGEST)]
+            &[browser_spec("eagle", BROWSER_VM_WORKLOAD_NAME, DIGEST)]
         );
         assert_eq!(
             reconcile::read_desired_slice(tmp.path(), "eagle"),
-            vec![browser_spec("eagle", "browser-eagle", DIGEST)]
+            vec![browser_spec("eagle", BROWSER_VM_WORKLOAD_NAME, DIGEST)]
         );
     }
 
     #[test]
     fn browser_provision_requires_explicit_node_and_name() {
         let tmp = tempdir().unwrap();
-        for request in [body("", Some("browser")), body("eagle", None)] {
+        for request in [body("", Some(BROWSER_VM_WORKLOAD_NAME)), body("eagle", None)] {
             let reply = build_reply(tmp.path(), "browser-provision", &request);
             assert!(!reply.ok);
             assert!(reply.desired.is_none());
             assert!(reply.error.is_some());
         }
+        assert!(!tmp.path().join("mcnf").exists());
+    }
+
+    #[test]
+    fn browser_provision_rejects_an_alias_that_surface_browser_cannot_select() {
+        let tmp = tempdir().unwrap();
+        let reply = build_reply(
+            tmp.path(),
+            "browser-provision",
+            &body("eagle", Some("browser-eagle")),
+        );
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must be `browser-vm`")));
+        assert!(reply.desired.is_none());
         assert!(!tmp.path().join("mcnf").exists());
     }
 
@@ -204,7 +228,7 @@ mod tests {
         .with_bus_root(None);
         let reply = worker.handle(
             "browser-provision",
-            r#"{"schema_version":1,"node":"eagle","name":"browser-eagle","image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+            r#"{"schema_version":1,"node":"eagle","name":"browser-vm","image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
         );
         assert!(!reply.ok);
         assert!(reply.gated.as_deref().is_some_and(|reason| {
