@@ -38,6 +38,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
+use mde_egui::fonts::{FontSelection, PlatformFont};
 use mde_egui::nav_chrome::{AppFrame, Sidebar, SidebarRow, SidebarSection};
 use mde_egui::style::Elevation;
 use mde_egui::{
@@ -587,9 +588,11 @@ impl SystemState {
         // PLATFORM-INTERFACES Q42: the profile's anchor density, refined by the
         // seat's hardware formfactor within Construct (see `layout_density`).
         let want_density = self.layout_density();
+        let want_fonts = self.appearance.fonts;
         if Style::color_scheme(ctx) != want_scheme
             || Style::density(ctx) != want_density
             || ctx.style().visuals.hyperlink_color != want_live_accent
+            || mde_egui::fonts::installed_selection(ctx) != want_fonts
         {
             tracing::info!(
                 target: "shell::appearance",
@@ -599,7 +602,12 @@ impl SystemState {
                 motion = ?self.appearance.motion_mode,
                 "applied persisted appearance to live shell context"
             );
-            Style::install_color_scheme_with_density(ctx, want_scheme, want_density);
+            Style::install_color_scheme_with_density_and_fonts(
+                ctx,
+                want_scheme,
+                want_density,
+                want_fonts,
+            );
             Style::set_accent(ctx, want_accent);
         }
         // Text-scale — capture the seat's DPI zoom base once (what the DRM runner set
@@ -1740,6 +1748,9 @@ impl SystemState {
         // real change writes; the live re-tint/zoom lands on the next poll.
         if self.appearance != appearance_before {
             self.appearance.save();
+            // Font picks should be visible in the same frame as the card click;
+            // this also reapplies the selected roles after any Theme reinstall.
+            self.apply_appearance(ui.ctx());
         }
         if self.clock != clock_before {
             self.clock.save();
@@ -3828,6 +3839,9 @@ struct AppearanceConfig {
     /// outside Normal.
     #[serde(default)]
     motion_mode: AppearanceMotionMode,
+    /// The selected Construct font for each semantic typography role.
+    #[serde(default)]
+    fonts: FontSelection,
 }
 
 impl<'de> Deserialize<'de> for AppearanceConfig {
@@ -3848,6 +3862,8 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             #[serde(default)]
             motion_mode: Option<AppearanceMotionMode>,
             #[serde(default)]
+            fonts: FontSelection,
+            #[serde(default)]
             reduce_motion: bool,
         }
 
@@ -3862,6 +3878,7 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             } else {
                 AppearanceMotionMode::Normal
             }),
+            fonts: wire.fonts,
         })
     }
 }
@@ -4280,6 +4297,128 @@ fn settings_choice_tile(
                     .font(Style::typography_font(TypographyRole::Caption)),
             );
         }
+    });
+    clicked
+}
+
+/// The role currently being browsed in the Theme font catalog. This is transient
+/// UI state, while the selected faces live in [`AppearanceConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ThemeFontRole {
+    #[default]
+    Interface,
+    Display,
+    Monospace,
+}
+
+impl ThemeFontRole {
+    const ALL: [Self; 3] = [Self::Interface, Self::Display, Self::Monospace];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Interface => "Interface",
+            Self::Display => "Display",
+            Self::Monospace => "Monospace",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Interface => "Navigation, prose, and browser chrome",
+            Self::Display => "Titles, headlines, and hero text",
+            Self::Monospace => "Code, IDs, logs, and telemetry",
+        }
+    }
+
+    const fn selected(self, fonts: FontSelection) -> PlatformFont {
+        match self {
+            Self::Interface => fonts.interface,
+            Self::Display => fonts.display,
+            Self::Monospace => fonts.monospace,
+        }
+    }
+
+    const fn set(self, fonts: &mut FontSelection, font: PlatformFont) {
+        match self {
+            Self::Interface => fonts.interface = font,
+            Self::Display => fonts.display = font,
+            Self::Monospace => fonts.monospace = font,
+        }
+    }
+}
+
+/// A catalog card that uses the candidate face for its preview while retaining
+/// the shared Theme tile selected-state treatment.
+fn font_choice_card(
+    ui: &mut egui::Ui,
+    selected: bool,
+    font: PlatformFont,
+    assignment: &str,
+    accent: egui::Color32,
+) -> bool {
+    let mut clicked = false;
+    tile(ui, |ui| {
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), Style::CONTROL_H_L),
+            egui::Sense::click(),
+        );
+        if ui.is_rect_visible(rect) {
+            let colors = settings_choice_colors(ui.ctx(), selected, response.hovered(), accent);
+            ui.painter().rect(
+                rect,
+                Style::RADIUS,
+                colors.fill,
+                egui::Stroke::new(1.0, colors.stroke),
+                egui::StrokeKind::Inside,
+            );
+            let text_rect = rect.shrink2(egui::vec2(Style::SP_S, 0.0));
+            ui.painter().with_clip_rect(text_rect).text(
+                text_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                font.label(),
+                egui::FontId::new(Style::BODY, mde_egui::fonts::preview_family(font)),
+                colors.text,
+            );
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                selected,
+                font.label(),
+            )
+        });
+        if response.clicked() {
+            clicked = true;
+        }
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new("Aa Bb Cc · 0123")
+                .font(egui::FontId::new(
+                    Style::BODY,
+                    mde_egui::fonts::preview_family(font),
+                ))
+                .color(Style::TEXT_STRONG),
+        );
+        ui.label(
+            RichText::new(font.description())
+                .font(Style::typography_font(TypographyRole::Caption))
+                .color(Style::TEXT_DIM),
+        );
+        ui.label(
+            RichText::new(if assignment.is_empty() {
+                "Not assigned"
+            } else {
+                assignment
+            })
+            .font(Style::typography_font(TypographyRole::Caption))
+            .color(if assignment.is_empty() {
+                Style::TEXT_DIM
+            } else {
+                accent
+            }),
+        );
     });
     clicked
 }
@@ -5995,6 +6134,57 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
             Style::SP_XL,
         ) {
             appearance.layout_profile = profile;
+        }
+    });
+    ui.add_space(Style::SP_M);
+    // Fonts — role tabs keep the immutable six-face catalog compact while every
+    // card still lays out a real live preview. A pick mutates AppearanceConfig in
+    // place; SystemState persists and reapplies it immediately after this frame.
+    ui.label(
+        RichText::new("Fonts")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    let role_id = egui::Id::new("theme-font-role");
+    let mut role = ui.ctx().data_mut(|data| {
+        data.get_persisted::<ThemeFontRole>(role_id)
+            .unwrap_or_default()
+    });
+    across_grid(ui, &ThemeFontRole::ALL, 3, |ui, &candidate| {
+        let selected = role == candidate;
+        if settings_choice_tile(
+            ui,
+            selected,
+            candidate.label(),
+            Some(candidate.description()),
+            SettingsGroup::Personalization.accent(),
+            Style::CONTROL_H_M,
+        ) {
+            role = candidate;
+            ui.ctx()
+                .data_mut(|data| data.insert_persisted(role_id, role));
+        }
+    });
+    ui.add_space(Style::SP_S);
+    let selected_fonts = appearance.fonts;
+    across_grid(ui, &PlatformFont::ALL, 3, |ui, &font| {
+        let selected = role.selected(selected_fonts) == font;
+        let assignment = ThemeFontRole::ALL
+            .iter()
+            .filter(|candidate| candidate.selected(selected_fonts) == font)
+            .map(|candidate| candidate.label())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if font_choice_card(
+            ui,
+            selected,
+            font,
+            &assignment,
+            SettingsGroup::Personalization.accent(),
+        ) {
+            role.set(&mut appearance.fonts, font);
         }
     });
     ui.add_space(Style::SP_M);

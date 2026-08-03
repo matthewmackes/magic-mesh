@@ -19,6 +19,12 @@ The adapter is deliberately pinned to the MG90 SSH host key and uses the MG90's
 legacy SSH algorithms only where required. It does not enable `ssh-dss`, disable
 host-key verification, or put a password in a command argument.
 
+Live reconciliation (2026-08-02): proof seat `.15` has both root-only files
+installed at `/etc/mackesd/mg90-root-password` and
+`/etc/mackesd/mg90-http-password`, plus the pinned host key. The pinned SSH
+probe, MG-LCI reads, and application API reads were verified against the live
+unit. Credential contents remain out of band.
+
 ## Provisioning
 
 Run these as root on the node that will call the adapter. Supply the current
@@ -62,7 +68,9 @@ sudo ./install-helpers/mg90-access.sh gps-udp-listen
 sudo ./install-helpers/mg90-access.sh gps-tcp-connect
 ```
 
-`app-get` is a read surface. The returned pages advertise the device-specific
+`app-get` is a read surface. Its CherryPy login is a separate `do_login` form
+and requires a same-origin `Referer`; it is not the Tomcat `j_security_check`
+login used by MG-LCI. The returned pages advertise the device-specific
 JSON calls (`odoStatus`, `adapterStatus`, `currentStatus`, `historyStatus`, and
 `updateStatus`); callers must parse and validate those responses before adding
 them to the mesh mirror. Configuration or calibration calls remain separate,

@@ -10,29 +10,34 @@ reconciliation text, is preserved at
 
 ## Current Snapshot - 2026-08-01 mackesd architecture evaluation integration
 
-- **10 active epics:** 10 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **12 active epics:** 12 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **P0:** WL-ARCH-008 (standalone old Browser repo plus VM Browser cutover),
   WL-ARCH-009 (process-isolated mackesd and Advanced administration),
   WL-FUNC-011 (Mesh Teams completion and one-product cutover), WL-FUNC-016
   (native text clipboard across seat/mesh/VDI), WL-FUNC-017 (complete Maps,
   navigation, and MG90 radio health), WL-UX-011 (unified This Node hardware
-  center), and WL-CRIT-006 (production evidence, six-node acceptance, and
-  corrected-forward recovery).
+  center), WL-CRIT-006 (production evidence, six-node acceptance, and
+  corrected-forward recovery), WL-CRIT-007 (boot/sleep recovery and fleet
+  peer return), and WL-FUNC-019 (universal resource/session discovery and
+  client browser).
 - **P1:** WL-UX-009 (shared Quazar theme and design-language completion),
   WL-UX-012 (full-width Construct taskbar and search-first Home), and
   WL-FUNC-018 (seamless Flatpak Front Door backed by App VMs).
 - **First parallel wave:** preserve/extract the old Browser stack; implement the
   DRM/mesh/VDI clipboard foundation; repair MG90 cadence and introduce the
   complete radio-health contract; finish shared visual primitives and taskbar
-  authority; close open Mesh Teams contract rows; and establish typed This Node
-  capability adapters.
+  authority; close open Mesh Teams contract rows; establish typed This Node
+  capability adapters; and establish the universal resource identity,
+  capability, discovery, and transport-adapter contracts.
 - **Integration wave:** cut Construct over to `browser-vm`; finish Mesh Teams
   against the shared clipboard/theme contracts; complete the real navigation
   and offline-map cutover; complete This Node using the same state and visual
   primitives; cut Construct over to the full-width search-first taskbar; and
-  make Flatpak applications appear as Front Door apps backed by App VMs.
+  make Flatpak applications appear as Front Door apps backed by App VMs; and
+  cut Remote Sessions over to the primary universal resource browser and
+  native session adapters.
 - **Delivery policy:** build one integrated engineering-preview release from the
-  nine epics. Publish the preview with unavailable live evidence documented;
+  twelve active epics. Publish the preview with unavailable live evidence documented;
   production promotion is a separate decision and requires every selected live
   gate to pass. The preview is not a production-readiness claim.
 - **Rollout policy:** deploy the preview to Dell, Eagle, and seat 15
@@ -1053,6 +1058,26 @@ remains here under a completed status.
   replace placeholders. Carbon requirements retire while egui, shared `Style`,
   Construct, Car, and direct DRM remain governed.
 - Current state: `mackesd` still assumes one managed MG90/direct Ethernet; the live unit reports LTE/WAN and power but no GNSS fix, and OBD parsing is absent.
+  Operator update (2026-08-02): a real MG90 and its management credentials are
+  confirmed available for live validation. Credentials remain out-of-band and
+  must be provisioned only into the root-owned files described by
+  `docs/ops/mg90-access.md`; they are not recorded here. This reclassifies the
+  live-adapter work from hardware-unavailable to access/proof-ready, but does
+  not claim a fresh probe, 30-minute cadence run, or production evidence until
+  the pinned host is reached from the selected workstation and the sanitized
+  capture is attached.
+  Live handoff update (2026-08-02): `.15` is actively publishing a direct-gateway
+  v2 mirror for ESN `ND84720078011035` (firmware `4.3.0.1`) with fresh 2-second
+  and 5-second records, LTE A active, LTE B standby, GNSS acquiring/no-fix,
+  reported power/ignition, and explicit OBD `not_installed`. The complete
+  control-plane inventory and sanitized next-AI instructions are in
+  [`docs/ops/mg90-live-handoff-2026-08-02.md`](../ops/mg90-live-handoff-2026-08-02.md).
+  The unit is online and platform-owned. Credential reconciliation on `.15`
+  now passes the pinned SSH probe, MG-LCI general/WAN reads, and all five
+  authenticated CherryPy application surfaces; `mackesd` is enabled for
+  `/obdii_status/` and receives the response, but correctly reports the payload
+  as unsupported until its schema is verified. The detailed credential-safe
+  record is in the linked live handoff.
   Raster MBTiles/FTS5 serves one region; Maps owns basemap/search, while Valhalla, route/lane/speed helpers, bearing, and admin actions remain unwired.
   Typed v2 identity/radio/freshness/provenance dual-publishes beside v1; Maps/Car project bounded radio and mirror states, with 13 consumer tests passing.
   The MG90/manager roster has independent poll/heartbeat plans, latest-wins/no-source behavior, and 44 vehicle tests pass. Cached observations heartbeat every
@@ -1479,6 +1504,200 @@ remains here under a completed status.
   provider, Workloads contracts, session broker, VDI transport, and Flatpak /
   Wayland / xdg-desktop-portal upstream contracts.
 
+### WL-FUNC-019 - Make Remote Sessions the universal resource browser
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: Construct's Remote Sessions view is currently a narrow desktop
+  chooser. It does not provide one durable identity for local, mesh, LAN,
+  gateway, media, file, VM, container, cloud, or network resources, and its
+  supported client transports are not admitted from a typed capability
+  registry. Sunshine/Moonlight, SSH, SSH X11 applications, full remote X11
+  desktops, Jellyfin, and Subsonic/OpenSubsonic therefore cannot reliably be
+  discovered, authenticated, browsed, and opened from the Thin Client's main
+  interface. A resource that is visible through one worker but unsupported by
+  the shell is misleading; a control that launches arbitrary commands would
+  violate the bounded client boundary.
+- Required outcome: Remote Sessions is always Construct's primary onboarding
+  and resource-browsing surface. It shows one deduplicated card per resource,
+  with source, protocol/client capabilities, health, last-seen state, auth
+  state, and safe actions. Every resource for which Construct has a native
+  client or an explicitly approved typed adapter is exposed here, including
+  resources discovered locally, over mesh, on the trusted LAN, through
+  configured gateways, or from typed manual sources. Selecting a card hands
+  off to the existing native session/client surface while preserving card and
+  session state; no arbitrary shell command, plaintext credential, public
+  exposure, or UI-only fake capability is introduced.
+- Current state: `desktop_sources` publishes mesh and mDNS desktop sources for
+  RDP, VNC, and SPICE; the shell chooser and VDI layer know those three types.
+  `media_sources` publishes a separate media topic with mesh, gateway, and
+  Jellyfin mDNS lanes, and `mde-jellyfin` already provides a client/store.
+  Peer descriptors expose SSH/RDP/VNC and fixed media probes, while remote
+  proofing can manage a user-scoped Sunshine service. There is no shared
+  resource identity, capability admission registry, SSDP/UPnP lane, SSH/X11
+  session model, Moonlight client, Subsonic adapter, or universal primary
+  landing surface; the four-seat Sunshine rollout is not yet live evidence.
+- Remaining work:
+
+  1. Define a versioned shared `ResourceIdentity`, `ResourceCard`,
+     `TransportCandidate`, `ClientCapability`, `AuthState`, `HealthState`,
+     `SourceProvenance`, and bounded action model in mesh types. Publish a
+     canonical resource topic (for example `state/resources/catalog`) with
+     stable IDs, aliases, last-seen timestamps, failure reasons, and
+     capability fingerprints. Keep desktop/media topics as compatibility
+     projections during migration, not competing identities.
+  2. Build an automatic typed client-capability registry. Admission must be
+     based on a registered native client or approved platform adapter, with
+     protocol version, OS/guest boundary, auth requirements, feature limits,
+     and safe action policy. Adding a supported client must automatically make
+     matching discovered resources visible without a new hard-coded chooser
+     branch; unsupported or malformed advertisements remain visible as
+     unavailable evidence only when useful, never as launchable controls.
+  3. Normalize all discovery lanes into that catalog: replicated mesh peer
+     descriptors; existing mDNS/DNS-SD; local service/session enumeration;
+     trusted-LAN SSDP/UPnP; configured gateway registries; and typed manual
+     sources. Use resource identity plus endpoint/capability fingerprints to
+     deduplicate one service found by multiple lanes. Bound TTLs, retries,
+     interface scope, packet sizes, and concurrency; do not turn discovery
+     into an unbounded port scan.
+  4. Use the existing Rust `mdns-sd` lane for mDNS/DNS-SD. Add `rupnp` for
+     async SSDP/UPnP discovery and control, with explicit interface/trust
+     policy. Do not switch to `mdns-sd-discovery` unless an OS-native resolver
+     gap is demonstrated. Keep the adapter boundary protocol-agnostic so
+     future clients can register without rewriting workers or the shell.
+  5. Add native in-shell Sunshine/Moonlight transport support. Use the
+     official `moonlight-common-c` core through a narrowly owned Rust FFI
+     adapter, bundling and testing its exact ENet dependency; use
+     `moonlight-embedded` as a protocol/reference oracle, not as an
+     unbounded application embedding. Record the GPL-3-compatible packaging,
+     ABI, cross-build, hardware decode, audio, input, pairing, suspend,
+     reconnect, and frame-pacing obligations before enabling the client.
+  6. Complete the all-seat Sunshine server rollout for T480, Eagle/T470S,
+     Basement seat 15, and Dell. Make typed remote-proofing settings the
+     source of truth: enabled, LAN plus Nebula/mesh exposure, KMS capture,
+     automatic encoder, pairing and local approval, visible shadowing/input
+     indicator, remote input, VNC fallback, and 30 FPS. Add the missing
+     combined LAN+mesh policy to settings, generated lifecycle/firewall
+     policy, status descriptors, and UI. Allow TCP 47984, 47989, 48010 and
+     local-only web management on 47990 plus the required UDP 47998-48010
+     transport range on LAN and mesh; deny public exposure, disable Sunshine
+     UPnP port mapping, and verify listeners/firewall/pairing on every seat
+     without rebooting encrypted seats.
+  7. Add SSH and X11 adapters. Use `russh` plus `russh-config` for typed SSH
+     discovery/session/auth and its X11 forwarding primitives. Use `x11rb`
+     only for a local X11 protocol client/display integration. Model both SSH
+     X11 application sessions and full existing remote X11 desktop sessions;
+     require an explicit display/session endpoint for the latter and never
+     infer one by blind scanning. State clearly when a DRM seat lacks a local
+     X server and cannot render an X11-forwarded application.
+  8. Unify media admission without losing domain-specific clients. Expose
+     Jellyfin resources through the existing client and its server OpenAPI
+     contract; use a hand-written auth/policy facade and optionally
+     `progenitor` for bounded generated OpenAPI transport code. Add an
+     `mde-subsonic` adapter for the OpenSubsonic REST JSON/XML contract using
+     the `opensubsonic` crate where suitable, covering Navidrome, Airsonic,
+     and compatible Subsonic servers. Retain distinct typed adapters for
+     DLNA/UPnP, MPD, file shares, and mesh media rather than falsely labeling
+     music-only services as Jellyfin.
+  9. Replace the chooser-only landing with a browse-first Remote Sessions
+     catalog. Cards must show resource class, origin (local/mesh/LAN/gateway),
+     available native clients, transport health, trust/auth state, and
+     actions such as inspect, pair, connect, retry, forget, or request
+     approval. Keep offline cards with last-seen and failed transports; make
+     LAN resources visible immediately but action-gated until trust/auth is
+     approved. Embed native Construct clients and preserve reconnect/session
+     context; typed platform adapters may delegate rendering but may not
+     accept arbitrary command or URL execution.
+  10. Store credentials/tokens/keys only in the approved secret store and
+      pass opaque references to adapters. Add pairing/approval expiry,
+      revocation, audit events, per-resource trust, mesh-vs-LAN policy, and
+      redaction tests. Expose capability and health reasons without leaking
+      secrets. Add migration/versioning for existing desktop/media records,
+      operator diagnostics, onboarding copy, and a deterministic unavailable
+      state for absent hardware, provider, display, codec, or credentials.
+- Scope: In scope are the shared catalog contract, identity/deduplication,
+  mesh/LAN/local/gateway/manual discovery, typed client registry, primary
+  Remote Sessions UI, Sunshine server rollout and native Moonlight client,
+  SSH/X11 modes, Jellyfin, Subsonic/OpenSubsonic, DLNA/UPnP, MPD, file-share,
+  auth/trust/secrets, offline retention, and migration of existing desktop and
+  media projections. Out of scope are a general-purpose arbitrary protocol
+  launcher, public Internet exposure, automatic router port mapping, blind
+  network scanning, replacing the existing Jellyfin/media/VDI clients, or
+  making every advertised protocol launchable without an approved adapter.
+- Relevant files/components: `crates/mesh/mackes-mesh-types/src/peers.rs`,
+  `crates/mesh/mackesd/src/workers/desktop_sources.rs`,
+  `crates/mesh/mackesd/src/workers/media_sources.rs`,
+  `crates/mesh/mackesd/src/descriptors.rs`,
+  `crates/desktop/mde-shell-egui/src/chooser/` and `vdi/`,
+  `crates/desktop/mde-shell-egui/src/system/mesh.rs`,
+  `install-helpers/mde-remote-proofing-apply.py`,
+  `packaging/systemd/mde-remote-proofing-plan.*`, `mde-jellyfin`, and the
+  existing `docs/design/desktop-chooser.md` / media-source contracts.
+- Dependencies: WL-ARCH-008 owns the Browser VM cutover and remains a
+  transport consumer; this epic owns the universal resource/session surface
+  and its adapter admission. Coordinate with the existing Remote Proofing,
+  VDI, media, peer-descriptor, secret-store, systemd, and firewalld contracts;
+  do not create separate backend or UI worklist epics for those lanes.
+- Acceptance criteria:
+
+  1. Remote Sessions is the first and always-available Construct onboarding
+     surface and renders a browseable catalog with one card per deduplicated
+     resource, honest unavailable/offline states, and preserved session state.
+  2. Mesh, mDNS, local, trusted-LAN SSDP/UPnP, configured gateway, and typed
+     manual sources converge into the versioned catalog with bounded retries,
+     provenance, TTL/last-seen, health, and capability metadata.
+  3. A capability registry automatically exposes every supported native client
+     or typed platform adapter and rejects arbitrary commands and unsupported
+     launch actions.
+  4. All four named seats advertise and serve Sunshine; Dell and every seat
+     discover the service over the allowed LAN and Nebula paths, pair with
+     local approval, connect through the native Moonlight path, and recover
+     from reconnect/suspend/input/audio/frame failures. Public listeners and
+     UPnP port mapping remain absent.
+  5. SSH resources, SSH-forwarded X11 applications, and explicit full X11
+     desktop endpoints are separately labeled, authenticated, and launchable
+     only when the corresponding local/client capability is present.
+  6. Jellyfin, Subsonic/OpenSubsonic (including Navidrome/Airsonic), and the
+     supported DLNA/UPnP, MPD, file-share, and mesh-media resources are
+     detected and exposed through the correct typed client or unavailable
+     explanation.
+  7. Credentials never appear in discovery records/logs; trust, approval,
+     revocation, secret references, and LAN-vs-mesh policy are testable and
+     visible at the action boundary.
+  8. Existing desktop/media consumers remain compatible during migration and
+     no duplicate card or stale launch path survives the cutover.
+  9. Focused unit/property/contract tests, package/license/ABI checks, and
+     farm workspace gates pass; live GUI/transport evidence is captured on
+     reachable seats, with every unavailable provider or hardware dependency
+     recorded explicitly rather than implied by tests.
+- Verification method: Add mesh-type schema, identity/deduplication,
+  capability-admission, discovery TTL/retry, mDNS/SSDP fixtures, descriptor,
+  secret-redaction, trust, offline-retention, migration, and UI-state tests.
+  Add adapter tests for Moonlight pairing/session/reconnect, SSH auth and both
+  X11 modes, Jellyfin OpenAPI/auth, OpenSubsonic JSON/XML, DLNA/UPnP, MPD, and
+  file shares. Run focused jobs on the build farm plus workspace fmt/clippy,
+  worklist/doc/architecture/secret/package gates; put the longest
+  moonlight/codec/VDI integration build on BigBoy. Finish with live captures
+  from all four seats, LAN+Nebula firewall/listener inspection, pair/connect/
+  reconnect/input/audio proof, and honest unavailable-hardware/provider
+  records. Use `mdns-sd` and `rupnp`, official `moonlight-common-c`,
+  `russh`/`russh-config`, `x11rb`, `opensubsonic`, `progenitor`, `zbus`,
+  systemd, and firewalld D-Bus documentation as the implementation references.
+- Origin or merged source IDs: User decisions from the Remote Sessions
+  discovery interview: native plus approved adapters; all client-capable
+  resources; mesh/LAN/local/gateway discovery; browse-first cards; one card
+  with many transports; secret-store credentials; offline retention; visible
+  but action-gated LAN trust; embedded native handoff; and automatic typed
+  capability admission. Absorbs the Sunshine/Moonlight, SSH/X11, Jellyfin,
+  Subsonic, and universal-resource-browser request into one epic. Existing
+  lineage is `docs/design/desktop-chooser.md`, `docs/design/peer-directory.md`,
+  `docs/design/mesh-media-player.md`, WL-ARCH-008, and the Remote Proofing
+  evidence. External research references are `mdns-sd`, `rupnp`,
+  `moonlight-common-c`, `moonlight-embedded`, `russh`, `x11rb`, Jellyfin
+  OpenAPI, OpenSubsonic, `opensubsonic`, `progenitor`, `zbus`, systemd, and
+  firewalld upstream documentation.
+
 ### WL-CRIT-006 - Production evidence, six-node acceptance, and corrected-forward recovery
 
 - Status: Remaining
@@ -1640,6 +1859,79 @@ remains here under a completed status.
 - Origin or merged source IDs: Fit-for-purpose audit 2026-07-30 (`AUD-01`
   through `AUD-07`, `AUD-09`, and `AUD-17` through `AUD-25`); operator-selected
   production gate, topology, recovery, trust, retention, and testbed decisions.
+
+### WL-CRIT-007 - Boot, sleep/resume, and fleet peer return recovery
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: Mesh members can boot or return from laptop sleep with stale Nebula
+  state, missing lighthouse maps, duplicate overlay identities, or an
+  unavailable coordination quorum. Peers then remain absent or report errors
+  even when the local services appear active. The recovery watchdog also
+  ignored migrated identities stored under `identity/current`.
+- Required outcome: Every enrolled seat and lighthouse returns to a unique
+  overlay identity, current lighthouse roster, healthy etcd coordination,
+  active mackesd/Syncthing health, and visible peer presence after boot,
+  suspend/resume, underlay changes, and one lighthouse loss. Recovery must be
+  corrected-forward and must not require credential disclosure or manual
+  certificate editing.
+- Current state: Live recovery on 2026-08-02 restored the current three-member
+  lighthouse quorum (`104.236.118.177`, `46.101.219.245`, and
+  `64.23.131.57`), repaired missing cross-lighthouse maps, re-enrolled seat 15
+  as `10.42.0.5`, and repaired Dell `.225` as `10.42.0.4`. Seat 15 reports
+  Dell and Eagle online and healthy. The watchdog now recognizes both legacy
+  and `identity/current` certificates, and `mackesd.service` is ordered after
+  Nebula. Live boot-recovery passes the mesh, file-plane, etcd, and bus checks;
+  the remaining failure is an unrelated missing `/home/mm/Documents` bind
+  mount plus a low disk-headroom alarm. A physical suspend/resume proof and
+  six-node corrected-forward evidence bundle are still missing.
+- Remaining work:
+  1. Add a durable enrollment/overlay identity collision check that refuses to
+     start a node when its certificate address is already claimed by another
+     active peer or lighthouse.
+  2. Make current lighthouse roster materialization boot- and resume-safe;
+     stale retired underlay addresses must not overwrite a healthy roster.
+  3. Add explicit post-resume recovery for Nebula, etcd clients, mackesd, and
+     Syncthing with bounded backoff and no restart storm.
+  4. Run a physical boot, suspend/resume, underlay reconnect, lighthouse-loss,
+     and corrected-forward re-enrollment drill on Dell, Eagle, and seat 15.
+  5. Resolve the seat's Documents bind-mount gate and disk-headroom warning,
+     then regenerate node-bound evidence for production acceptance.
+- Scope: Nebula identity/configuration, systemd ordering, mesh-health recovery,
+  etcd/Syncthing coordination and peer presence, enrollment/re-enrollment,
+  and six-node live evidence. It does not own MG90 telemetry semantics, which
+  remain under WL-FUNC-017.
+- Relevant files/components: `packaging/systemd/mackesd.service`,
+  `packaging/systemd/nebula.service.d/10-mesh-recovery.conf`,
+  `install-helpers/mesh-health-check.sh`, `install-helpers/verify-boot-recovery.sh`,
+  `install-helpers/setup-etcd.sh`, Nebula enrollment/materialization,
+  `docs/ops/mesh-boot-resume-diagnosis-2026-08-02.md`, and the live six-node
+  topology verifier.
+- Dependencies: WL-CRIT-006 production evidence and corrected-forward
+  recovery; the current etcd/Syncthing substrate; Nebula enrollment and CA
+  authority; physical Dell, Eagle, and seat hardware.
+- Acceptance criteria:
+  1. A fresh boot and a suspend/resume cycle leave each node with the same
+     unique overlay address, current lighthouse maps, and active Nebula.
+  2. etcd endpoint health, leader election, peer heartbeats, and Syncthing
+     connections recover without manual service intervention.
+  3. `mackesd peers` reports all available seats and lighthouses online with
+     no duplicate overlay addresses or retired lighthouse endpoints.
+  4. The recovery watchdog acts on current-generation identities and remains
+     bounded under repeated underlay loss and resume events.
+  5. A node can be corrected-forward re-enrolled with preserved evidence and
+     no credentials in logs, Git, or worklist records.
+  6. The six-node boot/resume/lighthouse-loss evidence bundle passes the
+     production verifier and documents any unavailable physical proof.
+- Verification method: Run the worklist self-test and shell syntax checks;
+  use farm lanes for code/build gates; use real Dell, Eagle, and seat hardware
+  for reboot and suspend/resume; capture systemd, Nebula, etcd, Syncthing,
+  peer-directory, overlay-reachability, and node-bound evidence before and
+  after each transition.
+- Origin or merged source IDs: Operator-reported boot/sleep peer-return bug
+  (2026-08-02); live recovery evidence in
+  `docs/ops/mesh-boot-resume-diagnosis-2026-08-02.md`.
 
 ## User Interface And Experience
 
@@ -3566,6 +3858,33 @@ remains here under a completed status.
       escalation; guided recovery actions with expected-impact confirmation;
       role-gated health policy and overrides; explicit live/on-demand refresh
       and stale intervals; and redacted, audit-backed history export.
+  16. Onboard and close the Microsoft Surface physical validation seat
+      `172.20.146.79` (Surface Pro 6, Fedora 44 Server) against the current
+      workstation-seat baseline. The seat currently has DRM nodes but no
+      `magic-mesh` package, no pinned Workstation role, and inactive `mackesd`
+      and `mde-shell-egui` services; the live reference seat `.138` is on
+      `magic-mesh-12.1.6-1` with the Workstation role and both services active.
+      First cut a native Fedora 44 workstation RPM on the farm's halted
+      `mcnf-build-f44` builder after BigBoy capacity is available; do not
+      interrupt active BigBoy jobs or install the existing F42-linked artifact
+      whose FFmpeg sonames are incompatible with Fedora 44. Verify the new RPM
+      has the Fedora 44 FFmpeg sonames and ships the complete shell/daemon/
+      Browser/media payload, then deploy it, pin/provision the Workstation
+      role, join or enroll the seat through the typed onboarding path, and
+      verify zero-restart `mackesd` plus stable DRM shell scanout. Exercise
+      every Surface-relevant This Node capability and safe action that the
+      hardware exposes: display/modeset/brightness, keyboard backlight,
+      pointer/touch/pen/gestures, Wi-Fi/Ethernet/Bluetooth, PipeWire audio and
+      capture privacy, camera presence/privacy, battery/AC/charge limit,
+      lid/sleep/thermal/performance telemetry, storage, sensors, firmware,
+      docks/Thunderbolt, mesh reachability, and audit/recovery behavior.
+      Record each absent provider or unsupported Surface feature as an honest
+      disabled/unavailable result; never infer capability from DMI alone or
+      fabricate a successful write. Capture desktop, narrow, large-text,
+      stale/provider-loss, refusal, recovery, and physical-input proof, restore
+      secure login-at-boot state after destructive or proof-only batches, and
+      add the seat to the enrolled Workstation inventory only after evidence is
+      complete.
 - Scope: Local workstation hardware state, typed node-local mutation,
   admin-authorized trusted-session remote mutation, diagnostics, settings
   consolidation, capability discovery, quick controls, and safe OEM adapters.
@@ -3625,7 +3944,12 @@ remains here under a completed status.
   gates, and workspace build/clippy/fmt with the longest shell job on BigBoy.
   Complete physical proof for reachable connectivity, audio, brightness, input,
   power, firmware/docks, and one safe action per reachable OEM; record explicit
-  unavailability for hardware that cannot be exercised.
+  unavailability for hardware that cannot be exercised. For the Surface seat,
+  additionally require a native Fedora 44 RPM dependency/payload audit,
+  role-provision and zero-restart service evidence, direct-DRM scanout, and a
+  capability-by-capability proof ledger covering the Surface hardware matrix
+  and all typed refusal/audit/recovery paths before declaring the seat
+  baseline complete.
 - Origin or merged source IDs: 2026-07-26 local-node GUI audit and operator
   decisions: one This Node center, full connectivity, progressive disclosure,
   complete laptop depth, safe OEM writes, and first-class Surface, Dell, Lenovo,

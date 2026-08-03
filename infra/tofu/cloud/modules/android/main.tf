@@ -55,6 +55,9 @@ resource "libvirt_domain" "this" {
   memory    = local.memory_mb
   vcpu      = local.vcpu
   cloudinit = libvirt_cloudinit_disk.this.id
+  # Android L1 workloads follow the same declarative boot contract as the
+  # desktop/service/app VM families.
+  autostart = true
 
   # Nested virtualization: pass the host CPU through so the guest sees vmx/svm.
   cpu {

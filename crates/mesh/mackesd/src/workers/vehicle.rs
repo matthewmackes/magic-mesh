@@ -344,8 +344,8 @@ impl SshHttpProbe {
     }
 
     /// Perform the MG90 form-authenticated GET on either the LCI or application
-    /// HTTP service. `auth_prefix` is fixed by the service (`MG-LCI` for port 80,
-    /// absent for the application service); callers never supply it from input.
+    /// HTTP service. Tomcat LCI uses `j_security_check`; the CherryPy
+    /// application plane uses `do_login` and requires a Referer header.
     fn http_authed_get_at(
         &self,
         port: u16,
@@ -365,24 +365,38 @@ impl SshHttpProbe {
         } else {
             format!("{base}{prefix}/")
         };
-        let login = format!("{login_base}j_security_check");
+        let app_plane = port == 11532;
+        let login = if app_plane {
+            format!("{base}do_login")
+        } else {
+            format!("{login_base}j_security_check")
+        };
         let page = format!("{base}{}", page_url.trim_start_matches('/'));
         // 1) prime the Tomcat session (sets JSESSIONID in the jar).
         Self::curl(&["-s", "-c", &jar_str, "-b", &jar_str, "-L", &login_base])?;
         // 2) FORM auth — follow the 303 back to the app.
-        Self::curl(&[
-            "-s",
-            "-c",
-            &jar_str,
-            "-b",
-            &jar_str,
-            "-L",
-            "--data-urlencode",
-            "j_username=admin",
-            "--data-urlencode",
-            "j_password=admin",
-            &login,
-        ])?;
+        let mut login_args = vec!["-s", "-c", &jar_str, "-b", &jar_str, "-L"];
+        if app_plane {
+            login_args.extend([
+                "-e",
+                &login_base,
+                "--data-urlencode",
+                "username=admin",
+                "--data-urlencode",
+                "password=admin",
+                "--data-urlencode",
+                "from_page=http://172.20.0.25:11532/",
+            ]);
+        } else {
+            login_args.extend([
+                "--data-urlencode",
+                "j_username=admin",
+                "--data-urlencode",
+                "j_password=admin",
+            ]);
+        }
+        login_args.push(&login);
+        Self::curl(&login_args)?;
         // 3) the authed page fetch.
         Self::curl(&["-s", "-b", &jar_str, &page])
     }

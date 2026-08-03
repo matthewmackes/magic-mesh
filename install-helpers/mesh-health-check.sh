@@ -9,7 +9,10 @@
 #   * a peer whose tunnel has wedged (iface up, but the lighthouse is
 #     unreachable over the overlay) → bounce nebula so it re-handshakes.
 #
-# Fail-safe: it only acts on an ENROLLED node (one with /etc/nebula/host.crt).
+# Fail-safe: it only acts on an ENROLLED node.  Newer enrollment stores the
+# active identity under identity/current; retain the flat path for older nodes.
+# The old flat-only check made the watchdog silently exit on migrated laptops,
+# exactly when suspend/resume most needs the overlay recovery path.
 # An un-enrolled or role-less box is left alone (mackesd fails closed on
 # purpose there — see the unit's ENT-2 note). All actions are logged to the
 # journal so `journalctl -u mesh-health` shows what recovered and why.
@@ -19,7 +22,11 @@ ETC_NEBULA="/etc/nebula"
 log() { echo "mesh-health: $*"; }       # journal via the unit's StandardOutput
 
 # Only manage a node that has actually been enrolled.
-[ -f "$ETC_NEBULA/host.crt" ] || { log "node not enrolled (no host.crt); nothing to manage"; exit 0; }
+if [ ! -f "$ETC_NEBULA/host.crt" ] &&
+   [ ! -f "$ETC_NEBULA/identity/current/host.crt" ]; then
+    log "node not enrolled (no active host certificate); nothing to manage"
+    exit 0
+fi
 # A role must be pinned, else mackesd fails closed by design — don't fight it.
 [ -f /var/lib/mde/role.toml ] || { log "no role pinned; leaving services alone"; exit 0; }
 

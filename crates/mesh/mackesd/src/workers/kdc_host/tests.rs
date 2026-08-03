@@ -345,13 +345,12 @@ fn mpris_request_player_list_maps_playerctl_list_to_report() {
         .unwrap()
         .insert(vec!["-l".into()], "mde-music\nvlc\n".into());
 
-    let reports = mpris_response_bodies_for_request_with_browser(
+    let reports = mpris_response_bodies_for_request(
         &control,
         &MprisRequestBody {
             request_player_list: true,
             ..Default::default()
         },
-        None,
     );
 
     assert_eq!(reports.len(), 1);
@@ -388,7 +387,7 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
     );
     drop(outputs);
 
-    let reports = mpris_response_bodies_for_request_with_browser(
+    let reports = mpris_response_bodies_for_request(
         &control,
         &MprisRequestBody {
             player: "mde-music".into(),
@@ -396,7 +395,6 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
             request_volume: true,
             ..Default::default()
         },
-        None,
     );
 
     assert_eq!(reports.len(), 1);

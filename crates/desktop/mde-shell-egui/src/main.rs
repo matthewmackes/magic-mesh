@@ -2027,114 +2027,165 @@ impl Shell {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.push_id("shell-this-node", |ui| {
-            // WL-UX-009 — This Node is the central local-operations workspace;
-            // give it the same shared frame/header contract as Workbench,
-            // System, Timers, Phones, and Bookmarks. The searchable section
-            // tree remains domain-owned below the frame, while the title and
-            // responsive header geometry come from the platform primitive.
-            let _ = AppFrame::new("This Node").leading_title().show(ui);
-            ui.add_space(Style::SP_XS);
-            Self::show_this_node_search(ui, &mut self.this_node_search);
-            Self::show_this_node_tree(
-                ui,
-                &mut section,
-                &mut page,
-                &self.this_node_search,
-                &self.thisnode,
-            );
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new("Workspace")
-                        .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM))
-                        .size(Style::SMALL),
-                );
-                let actions_selected = self.thisnode.actions_selected();
-                if ui
-                    .selectable_label(!actions_selected, "Inventory")
-                    .clicked()
-                {
-                    self.thisnode.set_actions_selected(false);
-                }
-                if ui
-                    .selectable_label(actions_selected, "Actions")
-                    .clicked()
-                {
-                    self.thisnode.set_actions_selected(true);
-                }
-            });
-            if self.thisnode.actions_selected() {
-                ui.separator();
-                self.thisnode
-                    .show_actions_with_system(ui, &mut self.system);
-                return;
-            }
-            mde_egui::card().show(ui, |ui| {
-                ui.label(egui::RichText::new(section.label()).strong().size(Style::TITLE));
-                ui.label(
-                    egui::RichText::new(section.description())
-                        .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
-                );
-            });
-            if let Some(settings_section) = this_node_system_route(page.route)
-                .and_then(|_| this_node_system_section(section))
-            {
-                tab = ThisNodeTab::System;
-                let system = &mut self.system;
-                system.open_settings_section(settings_section);
-                ui.push_id("this-node-system-provider", |ui| system.show(ui));
-                return;
-            }
-            ui.horizontal(|ui| {
-                for (candidate, label) in [
-                    (ThisNodeTab::System, "System"),
-                    (ThisNodeTab::Storage, "Storage"),
-                    (ThisNodeTab::About, "About"),
-                ] {
-                    if ui.selectable_label(tab == candidate, label).clicked() {
-                        tab = candidate;
-                        section = match candidate {
-                            ThisNodeTab::System => this_node_catalog::Section::Overview,
-                            ThisNodeTab::Storage | ThisNodeTab::About => {
-                                this_node_catalog::Section::Hardware
-                            }
-                        };
-                        page = this_node_catalog::first_page_for_section(section).unwrap_or(page);
-                    }
-                }
-            });
-            ui.separator();
-            match (page.route, tab) {
-                ("this-node/storage", _) => {
-                    let storage = &mut self.storage;
-                    ui.push_id("this-node-storage", |ui| storage.show(ui));
-                }
-                ("this-node/hardware" | "this-node/peripherals", _) => {
-                    tab = ThisNodeTab::About;
-                    let dm = &mut self.device_manager;
-                    ui.push_id("this-node-about", |ui| dm.show(ui));
-                }
-                ("this-node/overview" | "this-node/system", _) => {
-                    tab = ThisNodeTab::System;
-                    let system = &mut self.system;
-                    ui.push_id("this-node-system", |ui| system.show(ui));
-                }
-                (_, _) => {
-                    self.thisnode.set_detail_page(page);
-                    ui.push_id("this-node-detail", |ui| {
-                        self.thisnode.show_with_system_and_alerts(
+                    // Follow the State of the Mesh composition: one stable
+                    // surface header, then a navigation rail beside the active
+                    // workspace. This keeps the tree from pushing alerts and
+                    // actions above the content they belong to.
+                    let _ = AppFrame::new("This Node").leading_title().show(ui);
+                    ui.add_space(Style::SP_XS);
+                    ui.colored_label(
+                        Style::TEXT_DIM,
+                        "Local operations — select a governed area to inspect its provider state.",
+                    );
+                    ui.add_space(Style::SP_S);
+                    ui.separator();
+                    ui.add_space(Style::SP_S);
+
+                    let compact = ui.available_width() < 900.0 || ui.ctx().zoom_factor() > 1.1;
+                    if compact {
+                        Self::show_this_node_search(ui, &mut self.this_node_search);
+                        Self::show_this_node_tree(
                             ui,
-                            Some(&mut self.system),
-                            Some(&self.communications),
+                            &mut section,
+                            &mut page,
+                            &self.this_node_search,
+                            &self.thisnode,
                         );
-                    });
-                }
-            }
+                        ui.separator();
+                        self.show_this_node_workspace(ui, &mut tab, &mut section, &mut page);
+                    } else {
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_min_width(Style::SP_XL * 7.0);
+                                Self::show_this_node_search(ui, &mut self.this_node_search);
+                                ui.add_space(Style::SP_XS);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("this-node-navigation-rail")
+                                    .max_height(ui.available_height())
+                                    .show(ui, |ui| {
+                                        Self::show_this_node_tree(
+                                            ui,
+                                            &mut section,
+                                            &mut page,
+                                            &self.this_node_search,
+                                            &self.thisnode,
+                                        );
+                                    });
+                            });
+                            ui.add_space(Style::SP_M);
+                            ui.separator();
+                            ui.add_space(Style::SP_M);
+                            ui.vertical(|ui| {
+                                self.show_this_node_workspace(
+                                    ui,
+                                    &mut tab,
+                                    &mut section,
+                                    &mut page,
+                                );
+                            });
+                        });
+                    }
                 });
             });
         self.this_node_tab = tab;
         self.this_node_section = section;
         self.this_node_page = page;
+    }
+
+    fn show_this_node_workspace(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab: &mut ThisNodeTab,
+        section: &mut this_node_catalog::Section,
+        page: &mut this_node_catalog::PageEntry,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Workspace")
+                    .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM))
+                    .size(Style::SMALL),
+            );
+            let actions_selected = self.thisnode.actions_selected();
+            if ui
+                .selectable_label(!actions_selected, "Inventory")
+                .clicked()
+            {
+                self.thisnode.set_actions_selected(false);
+            }
+            if ui
+                .selectable_label(actions_selected, "Actions")
+                .clicked()
+            {
+                self.thisnode.set_actions_selected(true);
+            }
+        });
+        if self.thisnode.actions_selected() {
+            ui.separator();
+            self.thisnode
+                .show_actions_with_system(ui, &mut self.system);
+            return;
+        }
+        mde_egui::card().show(ui, |ui| {
+            ui.label(egui::RichText::new(section.label()).strong().size(Style::TITLE));
+            ui.label(
+                egui::RichText::new(section.description())
+                    .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
+            );
+        });
+        if let Some(settings_section) = this_node_system_route(page.route)
+            .and_then(|_| this_node_system_section(*section))
+        {
+            *tab = ThisNodeTab::System;
+            let system = &mut self.system;
+            system.open_settings_section(settings_section);
+            ui.push_id("this-node-system-provider", |ui| system.show(ui));
+            return;
+        }
+        ui.horizontal(|ui| {
+            for (candidate, label) in [
+                (ThisNodeTab::System, "System"),
+                (ThisNodeTab::Storage, "Storage"),
+                (ThisNodeTab::About, "About"),
+            ] {
+                if ui.selectable_label(*tab == candidate, label).clicked() {
+                    *tab = candidate;
+                    *section = match candidate {
+                        ThisNodeTab::System => this_node_catalog::Section::Overview,
+                        ThisNodeTab::Storage | ThisNodeTab::About => {
+                            this_node_catalog::Section::Hardware
+                        }
+                    };
+                    *page = this_node_catalog::first_page_for_section(*section).unwrap_or(*page);
+                }
+            }
+        });
+        ui.separator();
+        match (page.route, *tab) {
+            ("this-node/storage", _) => {
+                let storage = &mut self.storage;
+                ui.push_id("this-node-storage", |ui| storage.show(ui));
+            }
+            ("this-node/hardware" | "this-node/peripherals", _) => {
+                *tab = ThisNodeTab::About;
+                let dm = &mut self.device_manager;
+                ui.push_id("this-node-about", |ui| dm.show(ui));
+            }
+            ("this-node/overview" | "this-node/system", _) => {
+                *tab = ThisNodeTab::System;
+                let system = &mut self.system;
+                ui.push_id("this-node-system", |ui| system.show(ui));
+            }
+            (_, _) => {
+                self.thisnode.set_detail_page(*page);
+                ui.push_id("this-node-detail", |ui| {
+                    self.thisnode.show_with_system_and_alerts(
+                        ui,
+                        Some(&mut self.system),
+                        Some(&self.communications),
+                    );
+                });
+            }
+        }
     }
 
     fn show_this_node_tree(
@@ -2146,8 +2197,11 @@ impl Shell {
     ) {
         for (group, sections) in matching_this_node_groups(query) {
             egui::CollapsingHeader::new(group.label())
-                .id_salt(("this-node-tree", group.label()))
-                .default_open(true)
+                .id_salt(("this-node-tree-v2", group.label()))
+                .default_open(
+                    !query.trim().is_empty()
+                        || sections.iter().any(|candidate| *selected == *candidate),
+                )
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(group.description())

@@ -460,6 +460,7 @@ assets = [
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     # ONBOARD-9 — the service manager: a health watchdog (recovery) + a
     # failure-notification handler. mesh-health.timer drives the watchdog;
@@ -722,7 +723,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
 # the mackesd supervisor. (mackesd self-gates on a pinned role, so enabling
 # it pre-enrollment is safe — it idles until `found`/`join` pins a role.)
-systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mackesd.service mcnf-cloud-arm-credential.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
 # MESHSHELL — the mesh-status snapshot timer feeds the bash prompt + greeting
 # on every role.
 systemctl enable --now mesh-status.timer >/dev/null 2>&1 || :
@@ -1090,6 +1091,9 @@ assets = [
     { source = "target/release/mackesd", dest = "/usr/bin/mackesd", mode = "755" },
     { source = "target/release/meshctl", dest = "/usr/bin/meshctl", mode = "755" },
     { source = "packaging/systemd/mackesd.service", dest = "/usr/lib/systemd/system/mackesd.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
+    { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
+    { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
     { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service", dest = "/usr/lib/systemd/system/mesh-health.service", mode = "644" },
     { source = "packaging/systemd/mesh-health.timer", dest = "/usr/lib/systemd/system/mesh-health.timer", mode = "644" },
@@ -1118,7 +1122,7 @@ assets = [
 ]
 post_install_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
-systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mackesd.service mcnf-cloud-arm-credential.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
 systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
 timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 install -d -m 0700 /etc/mackesd >/dev/null 2>&1 || :
@@ -1178,6 +1182,9 @@ assets = [
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     # PKG-3 — the self-gating daemon unit + the health/alert watchdog.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
+    { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
+    { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
     { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
     { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },

@@ -153,7 +153,7 @@ ssh_exec() {
 }
 
 http_get() {
-    local port="$1" path="$2" jar post base login
+    local port="$1" path="$2" jar post base login login_kind
     need curl
     need python3
     password_file "$MG90_HTTP_PASSWORD_FILE" "MG90 HTTP password file"
@@ -164,23 +164,39 @@ http_get() {
     chmod 600 -- "$post"
     trap 'rm -f -- "$jar" "$post"' RETURN
     base="http://$MG90_HOST:$port"
-    login="$base/j_security_check"
+    if [[ "$port" == 11532 ]]; then
+        # CherryPy application plane: unlike MG-LCI/Tomcat it requires its
+        # own do_login form and rejects login requests without Referer.
+        login="$base/do_login"
+        login_kind=app
+    else
+        login="$base/j_security_check"
+        login_kind=lci
+    fi
     curl --silent --show-error --fail --max-time 12 --max-redirs 3 \
         -c "$jar" -b "$jar" -L "$base/" >/dev/null
     # Build the form from the password file so the password is neither in argv
     # nor sent with a trailing newline from the credential file.
-    python3 - "$MG90_HTTP_USER" "$MG90_HTTP_PASSWORD_FILE" "$post" <<'PY'
+    python3 - "$MG90_HTTP_USER" "$MG90_HTTP_PASSWORD_FILE" "$post" "$login_kind" "$base/" <<'PY'
 import pathlib
 import sys
 import urllib.parse
 
-user, password_file, output_file = sys.argv[1:]
+user, password_file, output_file, login_kind, from_page = sys.argv[1:]
 password = pathlib.Path(password_file).read_text().splitlines()[0]
-payload = urllib.parse.urlencode({"j_username": user, "j_password": password})
+if login_kind == "app":
+    payload = urllib.parse.urlencode({
+        "username": user,
+        "password": password,
+        "from_page": from_page,
+    })
+else:
+    payload = urllib.parse.urlencode({"j_username": user, "j_password": password})
 pathlib.Path(output_file).write_text(payload)
 PY
     curl --silent --show-error --fail --max-time 12 --max-redirs 3 \
         -c "$jar" -b "$jar" -L \
+        -e "$base/" \
         --data-binary "@$post" \
         "$login" >/dev/null
     # The target itself is not followed: login redirects are expected, but a

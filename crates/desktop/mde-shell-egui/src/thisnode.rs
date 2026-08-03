@@ -85,6 +85,8 @@ const MAX_APP_ROWS: usize = 256;
 const MAX_VENDOR_PACKS: usize = 8;
 const MAX_VENDOR_CAPABILITIES: usize = 8;
 const MAX_VENDOR_TEXT_CHARS: usize = 96;
+const MAX_LINKED_ALERTS: usize = 8;
+const MAX_ALERT_ACTIONS: usize = 4;
 
 #[derive(Default)]
 struct LocalFreshness {
@@ -1578,7 +1580,7 @@ impl ConnectivityFacts {
             && (!self.lighthouses.is_empty() || !self.dns_servers.is_empty())
         {
             ConnectivityAvailability::Available(
-                "Mesh overlay interface and CIDR are published with reachability evidence.",
+                "Mesh interface, CIDR, and reachability are published.",
             )
         } else {
             ConnectivityAvailability::Degraded(
@@ -2061,7 +2063,7 @@ impl NodeStatus {
                 || !self.connectivity.dns_servers.is_empty());
         if mesh_ready || underlay_ready {
             return ConnectivityAvailability::Available(
-                "A typed connectivity provider and mesh reachability or DNS facts are published.",
+                "Typed provider, mesh reachability, or DNS facts are published.",
             );
         }
         ConnectivityAvailability::Degraded(
@@ -3510,8 +3512,8 @@ fn local_hostname() -> String {
 
 // ──────────────────────────── render ────────────────────────────
 
-/// Render this node's live status: the connecting state before the first snapshot,
-/// else the identity / services / mesh cards over an honest telemetry note.
+/// Render this node's live status: a compact inventory-first landing surface with
+/// progressive disclosure into the governed provider detail routes.
 fn show_status(
     ui: &mut egui::Ui,
     status: &NodeStatus,
@@ -3521,27 +3523,33 @@ fn show_status(
 ) -> Option<PageEntry> {
     let mut selected = None;
     if !status.seen {
-        ui.add_space(Style::SP_S);
-        ui.colored_label(Style::TEXT_DIM, "Reading this node's status…");
-        ui.add_space(Style::SP_XS);
-        ui.label(
-            RichText::new(
-                "This node's role, overlay address, and daemon health fold from the \
-                 world-readable mesh-status snapshot.",
-            )
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL),
-        );
-        let dashboard = status.health_dashboard();
-        selected = show_inventory_summary(ui, status, dashboard, local_freshness);
-        ui.add_space(Style::SP_S);
-        show_health_dashboard(ui, status, dashboard);
-        if let (Some(alert_inbox), Some(communications)) = (alert_inbox, communications) {
-            show_linked_health_alerts(ui, status, alert_inbox, communications);
-        }
-        ui.add_space(Style::SP_S);
-        selected = selected.or_else(|| show_section_hierarchy(ui, status, dashboard));
-        show_capability_surface(ui, status);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(Style::SP_S);
+                ui.colored_label(Style::TEXT_DIM, "Reading this node's status…");
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(
+                        "This node's role, overlay address, and daemon health fold from the \
+                         world-readable mesh-status snapshot.",
+                    )
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+                );
+                let dashboard = status.health_dashboard();
+                selected = show_inventory_summary(ui, status, dashboard, local_freshness);
+                ui.add_space(Style::SP_S);
+                show_health_dashboard(ui, status, dashboard);
+                if let (Some(alert_inbox), Some(communications)) =
+                    (alert_inbox, communications)
+                {
+                    show_linked_health_alerts(ui, status, alert_inbox, communications);
+                }
+                ui.add_space(Style::SP_S);
+                selected = selected.or_else(|| show_section_hierarchy(ui, status, dashboard));
+                show_capability_surface(ui, status);
+            });
         return selected;
     }
 
@@ -3574,60 +3582,10 @@ fn show_status(
             ui.add_space(Style::SP_S);
             selected = selected.or_else(|| show_section_hierarchy(ui, status, dashboard));
             ui.add_space(Style::SP_S);
-            mde_egui::card().show(ui, |ui| show_identity(ui, status));
-            ui.add_space(Style::SP_S);
-
-            ui.label(
-                RichText::new("Connectivity")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
+            mde_egui::muted_note(
+                ui,
+                "Select a row or use Open detail for the full provider view. The landing page stays compact so health and navigation remain usable at every size.",
             );
-            mde_egui::card().show(ui, |ui| show_connectivity(ui, status));
-            ui.add_space(Style::SP_S);
-
-            ui.label(
-                RichText::new("Display & sound")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            mde_egui::card().show(ui, |ui| {
-                show_display(ui, status);
-                ui.add_space(Style::SP_S);
-                show_audio(ui, status);
-            });
-            ui.add_space(Style::SP_S);
-
-            ui.label(
-                RichText::new("Node services")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            mde_egui::card().show(ui, |ui| show_services(ui, status));
-            ui.add_space(Style::SP_S);
-
-            ui.label(
-                RichText::new("Mesh")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            mde_egui::card().show(ui, |ui| show_mesh(ui, status));
-            ui.add_space(Style::SP_S);
-
-            ui.label(
-                RichText::new("Power & performance")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            mde_egui::card().show(ui, |ui| show_power_profile(ui, status));
-            ui.add_space(Style::SP_S);
-
-            ui.label(
-                RichText::new("Resource telemetry")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            mde_egui::card().show(ui, |ui| show_telemetry(ui, status));
-            ui.add_space(Style::SP_S);
             show_capability_surface(ui, status);
     });
     selected
@@ -4635,11 +4593,15 @@ fn show_linked_health_alerts(
     inbox: &AlertInbox,
     communications: &crate::communications::CommunicationsState,
 ) {
-    let alerts = inbox
+    let matching_alerts = inbox
         .alerts
         .iter()
         .filter(|row| row.alert.source == status.hostname || row.alert.source == "this-node")
-        .take(8)
+        .collect::<Vec<_>>();
+    let total_alerts = matching_alerts.len();
+    let alerts = matching_alerts
+        .into_iter()
+        .take(MAX_LINKED_ALERTS)
         .collect::<Vec<_>>();
     if alerts.is_empty() {
         return;
@@ -4650,16 +4612,36 @@ fn show_linked_health_alerts(
             ui.label(RichText::new("This Node alerts").strong());
             ui.colored_label(
                 Style::TEXT_DIM,
-                "Linked from the shared Notification authority",
+                format!(
+                    "{} linked · {} critical · {} warning",
+                    total_alerts,
+                    alerts
+                        .iter()
+                        .filter(|row| row.alert.severity == Severity::Critical)
+                        .count(),
+                    alerts
+                        .iter()
+                        .filter(|row| row.alert.severity == Severity::Warning)
+                        .count(),
+                ),
             );
         });
         ui.label(
             RichText::new(
-                "Acknowledgement and snooze are durable alert commands; this view does not keep a parallel local copy.",
+                "Expand an alert for details and guided recovery. Acknowledgement and snooze remain durable commands owned by the shared Notification authority.",
             )
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
         );
+        if total_alerts > MAX_LINKED_ALERTS {
+            ui.colored_label(
+                Style::TEXT_DIM,
+                format!(
+                    "{} additional alerts are available in Notifications.",
+                    total_alerts - MAX_LINKED_ALERTS
+                ),
+            );
+        }
         for row in alerts {
             let tone = match row.alert.severity {
                 Severity::Critical => Style::DANGER,
@@ -4675,8 +4657,8 @@ fn show_linked_health_alerts(
                 },
                 row.alert.headline
             ))
-            .id_salt(("this-node-alert", row.event_id))
-            .default_open(row.alert.severity == Severity::Critical)
+            .id_salt(("this-node-alert-v2", row.event_id))
+            .default_open(false)
             .show(ui, |ui| {
                 ui.colored_label(tone, format!("Source: {}", row.alert.source));
                 for (label, aliases) in [
@@ -4709,10 +4691,15 @@ fn show_linked_health_alerts(
                 if !row.alert.actions.is_empty() {
                     ui.add_space(Style::SP_XS);
                     ui.label(RichText::new("Guided recovery actions").strong());
-                    for action in &row.alert.actions {
-                        if matches!(action.kind, AlertActionKind::Ack | AlertActionKind::Snooze) {
-                            continue;
-                        }
+                    for action in row
+                        .alert
+                        .actions
+                        .iter()
+                        .filter(|action| {
+                            !matches!(action.kind, AlertActionKind::Ack | AlertActionKind::Snooze)
+                        })
+                        .take(MAX_ALERT_ACTIONS)
+                    {
                         let action_id = egui::Id::new((
                             "this-node-alert-action-armed",
                             row.event_id,
@@ -4742,6 +4729,21 @@ fn show_linked_health_alerts(
                                 }
                             }
                         }
+                    }
+                    let hidden_actions = row
+                        .alert
+                        .actions
+                        .iter()
+                        .filter(|action| {
+                            !matches!(action.kind, AlertActionKind::Ack | AlertActionKind::Snooze)
+                        })
+                        .count()
+                        .saturating_sub(MAX_ALERT_ACTIONS);
+                    if hidden_actions > 0 {
+                        ui.colored_label(
+                            Style::TEXT_DIM,
+                            format!("{hidden_actions} additional recovery actions omitted here."),
+                        );
                     }
                     ui.label(
                         RichText::new("Destructive actions require a visible arm-and-confirm step; execution remains in the signed notification authority.")
@@ -4833,8 +4835,8 @@ fn show_section_hierarchy(
             ))
             .color(group_health.tone()),
         )
-        .id_salt(("this-node-hierarchy", group.label()))
-        .open(Some(true))
+        .id_salt(("this-node-hierarchy-v2", group.label()))
+        .default_open(false)
         .show(ui, |ui| {
             ui.label(
                 RichText::new(group.description())
@@ -8230,7 +8232,10 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
     // painted viewport rather than laying out one line that later overflows it.
     let zoom = ui.ctx().zoom_factor().max(1.0);
     if zoom > 1.0 {
-        ui.set_max_width(ui.available_width() / zoom);
+        let width = (ui.available_width() / zoom - Style::SP_M).max(1.0);
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        ui.set_width(width);
     }
     let availability = status.connectivity_availability();
     ui.horizontal_wrapped(|ui| {
@@ -8827,6 +8832,37 @@ mod tests {
     /// the GPU. Returns whether it produced any draw primitives.
     fn renders(status: &NodeStatus) -> bool {
         renders_at(status, 960.0, 1.0)
+    }
+
+    fn landing_texts(status: &NodeStatus) -> Vec<String> {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_status(ui, status, None, None, LocalFreshnessSummary::default())
+            });
+        });
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
     }
 
     fn renders_at(status: &NodeStatus, width: f32, zoom: f32) -> bool {
@@ -9470,6 +9506,28 @@ mod tests {
             "interface nebula1"
         );
         assert!(renders(&live), "inventory-first landing must remain renderable");
+    }
+
+    #[test]
+    fn inventory_landing_uses_progressive_disclosure_instead_of_duplicate_details() {
+        let live = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        let texts = landing_texts(&live);
+
+        assert!(texts.iter().any(|text| text == "Node inventory"));
+        for duplicated_heading in [
+            "Node services",
+            "Display & sound",
+            "Resource telemetry",
+        ] {
+            assert!(
+                !texts.iter().any(|text| text == duplicated_heading),
+                "landing view must not repeat the full {duplicated_heading} detail card"
+            );
+        }
+        assert!(
+            renders_at(&live, 520.0, 1.4),
+            "compact landing must remain renderable at narrow large-text size"
+        );
     }
 
     #[test]

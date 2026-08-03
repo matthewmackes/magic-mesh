@@ -1660,6 +1660,11 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         layout_profile: LayoutProfile::Car,
         text_scale: TextScale::Larger,
         motion_mode: AppearanceMotionMode::Disabled,
+        fonts: FontSelection {
+            interface: PlatformFont::Inter,
+            display: PlatformFont::KdamThmorPro,
+            monospace: PlatformFont::IbmPlexMono,
+        },
     };
     cfg.save_to(&path).expect("save");
     let back = AppearanceConfig::load_from(&path);
@@ -1680,6 +1685,15 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         back.color_scheme,
         AppearanceColorScheme::Light,
         "the color-mode pick round-trips through disk"
+    );
+    assert_eq!(
+        back.fonts,
+        FontSelection {
+            interface: PlatformFont::Inter,
+            display: PlatformFont::KdamThmorPro,
+            monospace: PlatformFont::IbmPlexMono,
+        },
+        "font role picks round-trip through disk"
     );
     let json = std::fs::read_to_string(&path).expect("appearance json");
     assert!(
@@ -1736,6 +1750,11 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
         cfg.motion_mode,
         AppearanceMotionMode::Normal,
         "the absent motion-mode field folds to Normal"
+    );
+    assert_eq!(
+        cfg.fonts,
+        FontSelection::default(),
+        "the absent font fields fold to the Mozilla/Intel defaults"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1921,6 +1940,7 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
             layout_profile: LayoutProfile::Construct,
             text_scale: TextScale::Default,
             motion_mode: AppearanceMotionMode::Normal,
+            fonts: FontSelection::default(),
         },
         ..SystemState::default()
     };
@@ -1935,6 +1955,71 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
         Style::pressed_fill(Style::ACCENT_MESH),
         "the pressed fill re-tinted to the darkened chosen accent"
     );
+}
+
+#[test]
+fn the_theme_font_roles_apply_to_the_live_context_on_poll() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let fonts = FontSelection {
+        interface: PlatformFont::Roboto,
+        display: PlatformFont::KdamThmorPro,
+        monospace: PlatformFont::IbmPlexMono,
+    };
+    let mut st = SystemState {
+        appearance: AppearanceConfig {
+            fonts,
+            ..AppearanceConfig::default()
+        },
+        ..SystemState::default()
+    };
+    st.poll(&ctx);
+    assert_eq!(mde_egui::fonts::installed_selection(&ctx), fonts);
+    assert_eq!(
+        ctx.style().text_styles[&egui::TextStyle::Body].family,
+        egui::FontFamily::Proportional
+    );
+    assert_eq!(
+        ctx.style().text_styles[&egui::TextStyle::Monospace].family,
+        egui::FontFamily::Monospace
+    );
+    let out = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label(
+                RichText::new("interface")
+                    .font(egui::FontId::new(16.0, egui::FontFamily::Proportional)),
+            );
+            ui.label(RichText::new("display").font(egui::FontId::new(
+                24.0,
+                egui::FontFamily::Name(std::sync::Arc::from(mde_egui::fonts::HEADING_FAMILY)),
+            )));
+            ui.monospace("monospace");
+        });
+    });
+    assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
+}
+
+#[test]
+fn the_theme_font_catalog_lays_out_at_desktop_narrow_and_large_text_sizes() {
+    for (width, zoom) in [(1440.0, 1.0), (720.0, 1.0), (1440.0, 1.5)] {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.set_zoom_factor(zoom);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 900.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut appearance = AppearanceConfig::default();
+                theme_section(ui, &mut appearance);
+            });
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "Theme font catalog should render at width {width} and zoom {zoom}"
+        );
+    }
 }
 
 #[test]
@@ -2007,6 +2092,7 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
             layout_profile: LayoutProfile::Construct,
             text_scale: TextScale::Larger,
             motion_mode: AppearanceMotionMode::Normal,
+            fonts: FontSelection::default(),
         },
         ..SystemState::default()
     };

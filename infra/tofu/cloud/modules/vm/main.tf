@@ -31,6 +31,11 @@ resource "libvirt_domain" "this" {
   memory    = var.memory_mb
   vcpu      = var.vcpu
   cloudinit = libvirt_cloudinit_disk.this.id
+  # A declared workload is a durable service, not a one-boot experiment.  Keep
+  # every VM-family domain (including Browser/App variants using this module)
+  # enabled in libvirt's boot set so a host restart does not strand the desired
+  # workload in SHUTOFF until an operator clicks Start.
+  autostart = true
 
   network_interface {
     network_id     = var.network_id

@@ -1,8 +1,11 @@
 [Unit]
 Description=MCNF control-plane daemon (mackesd)
 Documentation=https://github.com/matthewmackes/magic-mesh
-After=network-online.target
-Wants=network-online.target
+# Start only after the overlay manager has been started.  This does not make
+# Nebula a hard dependency (a client can still come up degraded), but avoids
+# racing enrollment/peer publication against creation of nebula1 at boot.
+After=network-online.target nebula.service mcnf-cloud-arm-credential.service
+Wants=network-online.target nebula.service mcnf-cloud-arm-credential.service
 # Service-manager policy: keep retrying across a generous window (a fixed role
 # / mount brings it up without manual help) but don't tight-loop forever; the
 # mesh-health watchdog is the backstop if the start limit is ever hit.

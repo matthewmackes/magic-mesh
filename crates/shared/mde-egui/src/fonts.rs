@@ -1,224 +1,383 @@
-//! Default fonts for every E12 surface (governance §4: the shared `Style` is the
-//! single source of look, and the font set is part of it).
+//! Bundled Construct fonts and the role-based font installation contract.
 //!
-//! The platform is **Kdam Thmor Pro-first**: **Kdam Thmor Pro** (SIL OFL-1.1 —
-//! `assets/fonts/KdamThmorPro-OFL.txt`) is the primary Construct UI face across
-//! shell, workspace chrome, headings, nav, prose, and Browser chrome. **Inter**
-//! (SIL OFL-1.1 — `assets/fonts/Inter-OFL.txt`) remains embedded as the broad
-//! proportional fallback behind Kdam Thmor Pro. **IBM Plex Mono** (SIL OFL-1.1 —
-//! `assets/fonts/IBMPlexMono-OFL.txt`) is kept for terminals, code, logs, IDs,
-//! metrics, and other fixed-width roles. **Roboto** (SIL OFL-1.1 —
-//! `assets/fonts/Roboto-OFL.txt`) remains embedded only as a fallback for older
-//! Browser-family references. **Intel One Mono** (SIL OFL-1.1) is kept as the
-//! monospace fallback rung for any glyph Plex lacks. All faces embed on the
-//! immutable bootc image, so every surface renders identically with no
-//! system-installed-font dependency; egui's built-in fonts stay last for emoji /
-//! CJK coverage.
-//!
-//! Named families [`FontFamily::Name("heading")`] / [`FontFamily::Name("nav")`]
-//! both resolve to Kdam Thmor Pro, so a surface can name a role without leaving
-//! the shared Construct UI face.
+//! Every face is embedded in the immutable platform image.  The catalog is
+//! deliberately finite: Personalization can choose among these faces, while
+//! egui's built-in families remain at the end of every stack for emoji, CJK,
+//! and other glyphs a selected face does not contain.
 
 use std::sync::Arc;
 
-use egui::{Context, FontData, FontDefinitions, FontFamily};
+use egui::{Context, FontData, FontDefinitions, FontFamily, Id};
+use serde::{Deserialize, Serialize};
 
-/// The embedded Kdam Thmor Pro face (SIL OFL-1.1), a TrueType `.ttf`.
 const KDAM_THMOR_PRO: &[u8] = include_bytes!("../assets/fonts/KdamThmorPro-Regular.ttf");
-
-/// The embedded Inter variable face (SIL OFL-1.1), a TrueType `.ttf`.
 const INTER: &[u8] = include_bytes!("../assets/fonts/Inter.ttf");
-
-/// The embedded **IBM Plex Mono** face (SIL OFL-1.1), a TrueType `.ttf` — the
-/// mono-first platform identity face (design lock #3).
 const IBM_PLEX_MONO: &[u8] = include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf");
-
-/// The embedded Roboto face (SIL OFL-1.1), retained as a fallback for old
-/// Browser-family references.
 const ROBOTO: &[u8] = include_bytes!("../assets/fonts/Roboto-Regular.ttf");
-
-/// The embedded Intel One Mono face (SIL OFL-1.1), an OpenType/CFF `.otf` — kept
-/// as the monospace fallback rung behind IBM Plex Mono.
 const INTEL_ONE_MONO: &[u8] = include_bytes!("../assets/fonts/IntelOneMono-Regular.otf");
+const MOZILLA_HEADLINE: &[u8] = include_bytes!("../assets/fonts/MozillaHeadline.ttf");
 
-/// Key for the Kdam Thmor Pro face in egui's font map.
-const KDAM_THMOR_PRO_KEY: &str = "KdamThmorPro";
-
-/// Key for the Inter face in egui's font map.
+const KDAM_KEY: &str = "KdamThmorPro";
 const INTER_KEY: &str = "Inter";
-
-/// Key for the IBM Plex Mono face in egui's font map.
-const IBM_PLEX_MONO_KEY: &str = "IBMPlexMono";
-
-/// Key for the Roboto face in egui's font map.
+const IBM_KEY: &str = "IBMPlexMono";
 const ROBOTO_KEY: &str = "Roboto";
+const INTEL_KEY: &str = "IntelOneMono";
+const MOZILLA_KEY: &str = "MozillaHeadline";
 
-/// Key for the Intel One Mono face in egui's font map.
-const INTEL_ONE_MONO_KEY: &str = "IntelOneMono";
-
-/// The named families a surface can opt a role into without minting a bespoke family
-/// name. Both resolve to Kdam Thmor Pro, the shared Construct UI face.
-pub const HEADING_FAMILY: &str = "heading";
-/// See [`HEADING_FAMILY`].
-pub const NAV_FAMILY: &str = "nav";
-/// Browser chrome family name. It resolves to Kdam Thmor Pro first so the Browser
-/// uses the same Construct UI face as the rest of the platform.
-pub const BROWSER_CHROME_FAMILY: &str = "browser-chrome";
-
-/// Install the platform font set on `ctx`. Called from [`crate::Style::install`],
-/// so every surface that uses the shared `Style` gets it for free.
-pub fn install(ctx: &Context) {
-    ctx.set_fonts(definitions());
+/// The six immutable fonts available to Construct surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformFont {
+    /// Expressive geometric platform face.
+    KdamThmorPro,
+    /// Neutral proportional interface face.
+    Inter,
+    /// IBM's fixed-width workhorse face.
+    IbmPlexMono,
+    /// Compact proportional fallback face.
+    Roboto,
+    /// Intel's fixed-width utility face.
+    IntelOneMono,
+    /// Mozilla's variable display/headline face.
+    MozillaHeadline,
 }
 
-fn definitions() -> FontDefinitions {
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        KDAM_THMOR_PRO_KEY.to_owned(),
-        Arc::new(FontData::from_static(KDAM_THMOR_PRO)),
-    );
-    fonts
-        .font_data
-        .insert(INTER_KEY.to_owned(), Arc::new(FontData::from_static(INTER)));
-    fonts.font_data.insert(
-        IBM_PLEX_MONO_KEY.to_owned(),
-        Arc::new(FontData::from_static(IBM_PLEX_MONO)),
-    );
-    fonts.font_data.insert(
-        ROBOTO_KEY.to_owned(),
-        Arc::new(FontData::from_static(ROBOTO)),
-    );
-    fonts.font_data.insert(
-        INTEL_ONE_MONO_KEY.to_owned(),
-        Arc::new(FontData::from_static(INTEL_ONE_MONO)),
-    );
+impl PlatformFont {
+    /// Every bundled platform font in the order shown by Personalization.
+    pub const ALL: [Self; 6] = [
+        Self::KdamThmorPro,
+        Self::Inter,
+        Self::IbmPlexMono,
+        Self::Roboto,
+        Self::IntelOneMono,
+        Self::MozillaHeadline,
+    ];
 
-    // Proportional/UI copy is Kdam Thmor Pro first; Inter remains the broad
-    // proportional fallback rung behind it.
-    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
-    proportional.insert(0, INTER_KEY.to_owned());
-    proportional.insert(0, KDAM_THMOR_PRO_KEY.to_owned());
-
-    // Monospace is now IBM Plex Mono primary (mono-first identity), Intel One Mono
-    // second as the glyph fallback, then egui's built-in mono.
-    let mono = fonts.families.entry(FontFamily::Monospace).or_default();
-    mono.insert(0, IBM_PLEX_MONO_KEY.to_owned());
-    mono.insert(1, INTEL_ONE_MONO_KEY.to_owned());
-
-    // Named role families → Kdam Thmor Pro. Fixed-width content must choose
-    // Monospace.
-    for role in [HEADING_FAMILY, NAV_FAMILY] {
-        fonts.families.insert(
-            FontFamily::Name(Arc::from(role)),
-            vec![
-                KDAM_THMOR_PRO_KEY.to_owned(),
-                INTER_KEY.to_owned(),
-                IBM_PLEX_MONO_KEY.to_owned(),
-            ],
-        );
+    /// The human-readable catalog name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::KdamThmorPro => "Kdam Thmor Pro",
+            Self::Inter => "Inter",
+            Self::IbmPlexMono => "IBM Plex Mono",
+            Self::Roboto => "Roboto",
+            Self::IntelOneMono => "Intel One Mono",
+            Self::MozillaHeadline => "Mozilla Headline",
+        }
     }
+
+    /// A short preview description for the Theme card.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::KdamThmorPro => "Expressive platform display",
+            Self::Inter => "Neutral everyday interface",
+            Self::IbmPlexMono => "Technical monospace classic",
+            Self::Roboto => "Familiar compact sans",
+            Self::IntelOneMono => "Crisp fixed-width utility",
+            Self::MozillaHeadline => "Editorial variable headline",
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::KdamThmorPro => KDAM_KEY,
+            Self::Inter => INTER_KEY,
+            Self::IbmPlexMono => IBM_KEY,
+            Self::Roboto => ROBOTO_KEY,
+            Self::IntelOneMono => INTEL_KEY,
+            Self::MozillaHeadline => MOZILLA_KEY,
+        }
+    }
+
+    /// The named family used for this font's preview card.
+    #[must_use]
+    pub fn preview_family(self) -> FontFamily {
+        FontFamily::Name(Arc::from(format!("preview-{}", self.key())))
+    }
+}
+
+/// The three semantic font roles exposed by Personalization → Theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FontSelection {
+    /// Proportional copy, navigation, and browser chrome.
+    #[serde(default = "default_interface_font")]
+    pub interface: PlatformFont,
+    /// Display, title, and headline typography.
+    #[serde(default = "default_display_font")]
+    pub display: PlatformFont,
+    /// Fixed-width code, telemetry, and terminal-adjacent content.
+    #[serde(default = "default_monospace_font")]
+    pub monospace: PlatformFont,
+}
+
+fn default_interface_font() -> PlatformFont {
+    PlatformFont::MozillaHeadline
+}
+
+fn default_display_font() -> PlatformFont {
+    PlatformFont::MozillaHeadline
+}
+
+fn default_monospace_font() -> PlatformFont {
+    PlatformFont::IntelOneMono
+}
+
+impl Default for FontSelection {
+    fn default() -> Self {
+        Self {
+            interface: PlatformFont::MozillaHeadline,
+            display: PlatformFont::MozillaHeadline,
+            monospace: PlatformFont::IntelOneMono,
+        }
+    }
+}
+
+/// Named family for display/headline typography.
+pub const HEADING_FAMILY: &str = "heading";
+/// Named family for navigation typography.
+pub const NAV_FAMILY: &str = "nav";
+/// Named family for Browser chrome typography.
+pub const BROWSER_CHROME_FAMILY: &str = "browser-chrome";
+
+fn selection_id() -> Id {
+    Id::new("mde-egui-font-selection")
+}
+
+/// Install the default role selection. This remains the compatibility API used
+/// by unrelated callers and by standalone surfaces.
+pub fn install(ctx: &Context) {
+    install_with_selection(ctx, FontSelection::default());
+}
+
+/// Return the selection last installed on `ctx`, falling back to platform defaults
+/// for a fresh context.
+#[must_use]
+pub fn installed_selection(ctx: &Context) -> FontSelection {
+    ctx.data_mut(|data| data.get_persisted(selection_id()).unwrap_or_default())
+}
+
+/// Return the named family used to preview one catalog face.
+#[must_use]
+pub fn preview_family(font: PlatformFont) -> FontFamily {
+    font.preview_family()
+}
+
+/// Install all bundled faces and map the selected roles to complete fallback stacks.
+pub fn install_with_selection(ctx: &Context, selection: FontSelection) {
+    ctx.set_fonts(definitions(selection));
+    ctx.data_mut(|data| data.insert_persisted(selection_id(), selection));
+}
+
+fn definitions(selection: FontSelection) -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
+    let builtin_proportional = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mut builtin_fallbacks = builtin_proportional.clone();
+    if let Some(builtin_mono) = fonts.families.get(&FontFamily::Monospace) {
+        append_unique(&mut builtin_fallbacks, builtin_mono);
+    }
+    for (key, bytes) in [
+        (KDAM_KEY, KDAM_THMOR_PRO),
+        (INTER_KEY, INTER),
+        (IBM_KEY, IBM_PLEX_MONO),
+        (ROBOTO_KEY, ROBOTO),
+        (INTEL_KEY, INTEL_ONE_MONO),
+        (MOZILLA_KEY, MOZILLA_HEADLINE),
+    ] {
+        fonts
+            .font_data
+            .insert(key.to_owned(), Arc::new(FontData::from_static(bytes)));
+    }
+
+    let interface = stack_with_fallbacks(
+        selection.interface,
+        [
+            PlatformFont::MozillaHeadline,
+            PlatformFont::Inter,
+            PlatformFont::Roboto,
+            PlatformFont::KdamThmorPro,
+            PlatformFont::IbmPlexMono,
+            PlatformFont::IntelOneMono,
+        ],
+        &builtin_fallbacks,
+    );
+    let display = stack_with_fallbacks(
+        selection.display,
+        [
+            PlatformFont::MozillaHeadline,
+            PlatformFont::KdamThmorPro,
+            PlatformFont::Inter,
+            PlatformFont::Roboto,
+            PlatformFont::IbmPlexMono,
+            PlatformFont::IntelOneMono,
+        ],
+        &builtin_fallbacks,
+    );
+    let monospace = stack_with_fallbacks(
+        selection.monospace,
+        [
+            PlatformFont::IntelOneMono,
+            PlatformFont::IbmPlexMono,
+            PlatformFont::Inter,
+            PlatformFont::Roboto,
+            PlatformFont::KdamThmorPro,
+            PlatformFont::MozillaHeadline,
+        ],
+        &builtin_fallbacks,
+    );
+
+    fonts
+        .families
+        .insert(FontFamily::Proportional, interface.clone());
+    fonts.families.insert(FontFamily::Monospace, monospace);
+    fonts
+        .families
+        .insert(FontFamily::Name(Arc::from(HEADING_FAMILY)), display.clone());
+    fonts
+        .families
+        .insert(FontFamily::Name(Arc::from(NAV_FAMILY)), interface.clone());
     fonts.families.insert(
         FontFamily::Name(Arc::from(BROWSER_CHROME_FAMILY)),
-        vec![
-            KDAM_THMOR_PRO_KEY.to_owned(),
-            INTER_KEY.to_owned(),
-            ROBOTO_KEY.to_owned(),
-        ],
+        interface,
     );
 
+    // Every catalog card can lay out its own sample without changing the active
+    // role. Its selected face is first, followed by the same complete fallback set.
+    for font in PlatformFont::ALL {
+        fonts.families.insert(
+            font.preview_family(),
+            stack_with_fallbacks(font, PlatformFont::ALL, &builtin_fallbacks),
+        );
+    }
     fonts
+}
+
+fn stack<const N: usize>(first: PlatformFont, fallback: [PlatformFont; N]) -> Vec<String> {
+    let mut result = Vec::with_capacity(N);
+    result.push(first.key().to_owned());
+    for font in fallback {
+        if font != first {
+            result.push(font.key().to_owned());
+        }
+    }
+    result
+}
+
+fn stack_with_fallbacks<const N: usize>(
+    first: PlatformFont,
+    fallback: [PlatformFont; N],
+    builtins: &[String],
+) -> Vec<String> {
+    let mut result = stack(first, fallback);
+    append_unique(&mut result, builtins);
+    result
+}
+
+fn append_unique(result: &mut Vec<String>, candidates: &[String]) {
+    for candidate in candidates {
+        if !result.contains(candidate) {
+            result.push(candidate.clone());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use egui::{FontFamily, FontId};
-    use std::sync::Arc;
+    use super::*;
+    use egui::{FontFamily, FontId, RichText};
 
     #[test]
-    fn platform_fonts_are_embedded_and_valid() {
-        // include_bytes! resolved real, non-empty font files — not stray/missing
-        // paths. Kdam Thmor Pro, Inter, and IBM Plex Mono are TrueType faces
-        // (`0x00010000`); Intel One Mono is an OpenType/CFF face (`OTTO`).
-        assert!(
-            super::KDAM_THMOR_PRO.len() > 80_000,
-            "Kdam Thmor Pro TTF looks too small ({} bytes)",
-            super::KDAM_THMOR_PRO.len()
-        );
-        assert_eq!(&super::KDAM_THMOR_PRO[0..4], &[0x00, 0x01, 0x00, 0x00]);
-        assert!(
-            super::INTER.len() > 500_000,
-            "Inter TTF looks too small ({} bytes)",
-            super::INTER.len()
-        );
-        assert_eq!(&super::INTER[0..4], &[0x00, 0x01, 0x00, 0x00]);
-        assert!(
-            super::IBM_PLEX_MONO.len() > 100_000,
-            "IBM Plex Mono TTF looks too small ({} bytes)",
-            super::IBM_PLEX_MONO.len()
-        );
-        assert_eq!(&super::IBM_PLEX_MONO[0..4], &[0x00, 0x01, 0x00, 0x00]);
-        assert!(
-            super::ROBOTO.len() > 150_000,
-            "Roboto TTF looks too small ({} bytes)",
-            super::ROBOTO.len()
-        );
-        assert_eq!(&super::ROBOTO[0..4], &[0x00, 0x01, 0x00, 0x00]);
-        assert!(
-            super::INTEL_ONE_MONO.len() > 50_000,
-            "Intel One Mono OTF looks too small ({} bytes)",
-            super::INTEL_ONE_MONO.len()
-        );
-        assert_eq!(&super::INTEL_ONE_MONO[0..4], b"OTTO");
+    fn all_six_platform_fonts_are_embedded_and_valid() {
+        let assets = [
+            (KDAM_THMOR_PRO, &[0x00, 0x01, 0x00, 0x00][..]),
+            (INTER, &[0x00, 0x01, 0x00, 0x00][..]),
+            (IBM_PLEX_MONO, &[0x00, 0x01, 0x00, 0x00][..]),
+            (ROBOTO, &[0x00, 0x01, 0x00, 0x00][..]),
+            (INTEL_ONE_MONO, b"OTTO"),
+            (MOZILLA_HEADLINE, &[0x00, 0x01, 0x00, 0x00][..]),
+        ];
+        for (bytes, tag) in assets {
+            assert!(bytes.len() > 50_000, "font asset is unexpectedly small");
+            assert_eq!(&bytes[..4], tag);
+        }
+        assert_eq!(PlatformFont::ALL.len(), 6);
     }
 
     #[test]
-    fn install_sets_kdam_thmor_pro_as_the_platform_ui_face() {
-        let fonts = super::definitions();
+    fn defaults_are_mozilla_for_ui_and_intel_for_monospace() {
+        let selection = FontSelection::default();
+        assert_eq!(selection.interface, PlatformFont::MozillaHeadline);
+        assert_eq!(selection.display, PlatformFont::MozillaHeadline);
+        assert_eq!(selection.monospace, PlatformFont::IntelOneMono);
+        let fonts = definitions(selection);
+        assert_eq!(fonts.families[&FontFamily::Proportional][0], MOZILLA_KEY);
         assert_eq!(
-            fonts
-                .families
-                .get(&FontFamily::Proportional)
-                .expect("proportional family")[0],
-            super::KDAM_THMOR_PRO_KEY,
-            "proportional UI copy should start with Kdam Thmor Pro"
+            fonts.families[&FontFamily::Name(Arc::from(HEADING_FAMILY))][0],
+            MOZILLA_KEY
         );
-        assert_eq!(
-            fonts
-                .families
-                .get(&FontFamily::Name(Arc::from(super::HEADING_FAMILY)))
-                .expect("heading family")[0],
-            super::KDAM_THMOR_PRO_KEY,
-            "heading/nav roles should stay on the platform UI face"
-        );
-        assert_eq!(
-            fonts
-                .families
-                .get(&FontFamily::Name(Arc::from(super::BROWSER_CHROME_FAMILY)))
-                .expect("browser chrome family")[0],
-            super::KDAM_THMOR_PRO_KEY,
-            "Browser chrome should inherit the platform UI face"
-        );
+        assert_eq!(fonts.families[&FontFamily::Monospace][0], INTEL_KEY);
     }
 
     #[test]
-    fn install_parses_and_lays_out_headless() {
-        // Registering the font set must work without a GPU (CPU-only Context), and a
-        // frame that lays out text in the proportional, monospace, AND the Kdam-first
-        // named "heading" family must succeed — this forces egui to actually parse
-        // the embedded faces (set_fonts alone defers parsing to the first frame).
-        let ctx = egui::Context::default();
-        super::install(&ctx);
+    fn each_role_maps_to_the_selected_face_and_keeps_fallbacks() {
+        let selection = FontSelection {
+            interface: PlatformFont::Roboto,
+            display: PlatformFont::KdamThmorPro,
+            monospace: PlatformFont::IbmPlexMono,
+        };
+        let fonts = definitions(selection);
+        assert_eq!(fonts.families[&FontFamily::Proportional][0], ROBOTO_KEY);
+        assert_eq!(
+            fonts.families[&FontFamily::Name(Arc::from(NAV_FAMILY))][0],
+            ROBOTO_KEY
+        );
+        assert_eq!(
+            fonts.families[&FontFamily::Name(Arc::from(BROWSER_CHROME_FAMILY))][0],
+            ROBOTO_KEY
+        );
+        assert_eq!(
+            fonts.families[&FontFamily::Name(Arc::from(HEADING_FAMILY))][0],
+            KDAM_KEY
+        );
+        assert_eq!(fonts.families[&FontFamily::Monospace][0], IBM_KEY);
+        for font in PlatformFont::ALL {
+            let family = fonts.families.get(&font.preview_family()).unwrap();
+            assert_eq!(family[0], font.key());
+            assert!(family.len() > 6, "egui built-in fallback is missing");
+        }
+    }
+
+    #[test]
+    fn selected_fonts_layout_headlessly_for_every_role_and_preview() {
+        let ctx = Context::default();
+        install_with_selection(
+            &ctx,
+            FontSelection {
+                interface: PlatformFont::Inter,
+                display: PlatformFont::MozillaHeadline,
+                monospace: PlatformFont::IntelOneMono,
+            },
+        );
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.label("proportional prose glyphs");
-                ui.monospace("monospace glyphs");
-                let heading = FontId::new(16.0, FontFamily::Name(Arc::from(super::HEADING_FAMILY)));
-                ui.label(egui::RichText::new("mono heading").font(heading));
-                let browser = FontId::new(
-                    13.0,
-                    FontFamily::Name(Arc::from(super::BROWSER_CHROME_FAMILY)),
+                ui.label(
+                    RichText::new("interface navigation browser")
+                        .font(FontId::new(16.0, FontFamily::Proportional)),
                 );
-                ui.label(egui::RichText::new("Browser chrome").font(browser));
+                ui.label(RichText::new("display headline").font(FontId::new(
+                    24.0,
+                    FontFamily::Name(Arc::from(HEADING_FAMILY)),
+                )));
+                ui.monospace("fixed-width telemetry");
+                for font in PlatformFont::ALL {
+                    ui.label(
+                        RichText::new(font.label()).font(FontId::new(16.0, preview_family(font))),
+                    );
+                }
             });
         });
     }
