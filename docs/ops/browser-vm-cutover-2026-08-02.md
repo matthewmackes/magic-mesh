@@ -25,6 +25,13 @@ supervisor repeatedly reported that `nebula-lighthouse.service` was missing.
 This is an operator/fleet recovery blocker in addition to the seat's missing
 KVM and VDI endpoint; no service restart or network repair was attempted.
 
+Recovery hardening added after that audit makes the optional lighthouse-unit
+reload best-effort once the base `nebula.service` reload succeeds. The farm
+`.90` `mackesd` regression
+`missing_lighthouse_unit_does_not_block_base_config_acknowledgement` passes;
+the fix still needs to be deployed and observed on seat-15 before it can count
+as live mesh recovery evidence.
+
 Continuation evidence: the current cutover commits are `7816f781` (typed
 Browser image-source propagation, seat preflight/NoCloud preparation, and
 RDPSND/PipeWire audio wiring) and `ef1dc5ed` (85-path extraction manifest

@@ -464,6 +464,13 @@ remains here under a completed status.
   or network mutation was attempted; Dell remains unreachable and the Browser
   VM cannot be published or accepted until the fleet/control-plane recovery is
   operator-resolved.
+- Nebula recovery hardening update (2026-08-03): `mackesd` now treats the
+  role-specific `nebula-lighthouse.service` reload as best-effort after the
+  base `nebula.service` config reload succeeds. This keeps a missing optional
+  lighthouse unit from leaving the base transport bundle pending while still
+  emitting an operator-visible warning. The new regression passes in the farm
+  `mackesd` test on `.90` (`missing_lighthouse_unit_does_not_block_base_config_acknowledgement`);
+  this is a recovery fix, not live Dell or six-node acceptance evidence.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

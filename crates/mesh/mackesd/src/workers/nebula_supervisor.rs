@@ -387,8 +387,19 @@ impl NebulaSupervisor {
         systemctl_reload(&self.systemctl_path, "nebula.service")
             .map_err(|e| format!("reload nebula.service: {e}"))?;
         if self.last_is_leader {
-            systemctl_reload(&self.systemctl_path, "nebula-lighthouse.service")
-                .map_err(|e| format!("reload nebula-lighthouse.service: {e}"))?;
+            // The base Nebula service is the transport dependency for every
+            // node.  A role-specific lighthouse unit may be absent on a
+            // partially upgraded or thin workstation; do not hold a valid
+            // peer config hostage to that optional unit.  Promotion already
+            // treats starting the auxiliary units as best-effort, so keep the
+            // same boundary here while leaving an explicit diagnostic for the
+            // operator/fleet readiness evidence.
+            if let Err(e) = systemctl_reload(&self.systemctl_path, "nebula-lighthouse.service") {
+                tracing::warn!(
+                    error = %e,
+                    "nebula-supervisor: lighthouse auxiliary reload unavailable; base Nebula config applied"
+                );
+            }
         }
         Ok(())
     }
@@ -2650,6 +2661,27 @@ exit 0
     }
 
     #[cfg(unix)]
+    fn fake_systemctl_lighthouse_fails(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("systemctl");
+        std::fs::write(
+            &path,
+            br####"#!/bin/sh
+if [ "$1" = "reload-or-restart" ] && [ "$2" = "nebula-lighthouse.service" ]; then
+    echo "simulated missing optional lighthouse unit" >&2
+    exit 1
+fi
+exit 0
+"####,
+        )
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake systemctl executable");
+        path
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_nebula_reload_keeps_bundle_pending_for_reconnect() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2701,6 +2733,48 @@ exit 0
         assert!(
             systemctl_path.with_file_name("systemctl.failed").exists(),
             "the fixture must exercise the failed-reload branch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_lighthouse_unit_does_not_block_base_config_acknowledgement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let bundle_path = root.join("nebula-bundle.json");
+        let bundle = sample_bundle();
+        crate::ca::bundle::write_bundle(&bundle_path, &bundle).expect("seed bundle");
+        let config_dir = root.join("nebula");
+        materialize_config(
+            &config_dir,
+            &bundle,
+            ConfigRole::Peer,
+            &[],
+            root,
+            Some(b"local-key"),
+        )
+        .expect("seed local identity");
+
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path,
+        )
+        .with_workgroup_root(root.to_path_buf())
+        .with_role_marker(root.join("role.host"))
+        .with_config_dir(config_dir)
+        .with_overlay_ip_path(root.join("overlay-ip"))
+        .with_leadership_endpoints(Vec::new())
+        .with_systemctl_path(fake_systemctl_lighthouse_fails(root));
+        supervisor.last_is_leader = true;
+
+        supervisor.tick().await;
+
+        assert!(
+            supervisor.last_bundle_mtime.is_some(),
+            "a missing optional lighthouse unit must not leave base Nebula config pending"
         );
     }
 
