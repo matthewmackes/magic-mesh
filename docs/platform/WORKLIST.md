@@ -421,6 +421,12 @@ remains here under a completed status.
   reachable but without a VM or VDI listener, and Dell `.225`, `.2`, and
   overlay `.4` unavailable; no live guest, GPU, audio, performance, or
   six-node acceptance is claimed.
+- Operator-path update (2026-08-03): `8bc40ea5` adds the credential-free
+  `packaging/browser-vm/deploy-image.sh` path. Its default preflight is
+  read-only; only `publish --apply` can upload, back up, atomically install,
+  and digest-verify the qcow2 after remote KVM/qemu-img/sudo/path checks. The
+  Browser contract and extraction verifier pass; the live target inventory is
+  unchanged, so no publication or live acceptance is claimed.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

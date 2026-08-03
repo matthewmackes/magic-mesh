@@ -11,6 +11,13 @@ Build a signed/recorded ext4-rootfs disk artifact on the build farm with the Fed
 pass the resulting image digest in the typed `browser-provision` request. A
 missing or malformed digest is refused before desired state is written.
 
+The checked-in `deploy-image.sh` is the bounded operator path for a direct KVM
+host. `preflight` verifies the local qcow2 and remote KVM/qemu-img/passwordless
+sudo prerequisites without changing files. `publish` is dry-run by default;
+only `publish --apply` uploads the image, backs up an existing regular image,
+atomically installs the new root-owned image, and verifies the remote SHA-256.
+It accepts no guest password, token, or credential.
+
 `profile.env` is the small, reviewable contract at the Construct/Browser VM
 boundary. It identifies the guest image and immutable source provenance
 (repository, path, and pinned commit), fixes the Arch-008

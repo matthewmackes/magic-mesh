@@ -5,6 +5,19 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Continuation evidence: commit `8bc40ea5` adds the credential-free
+`packaging/browser-vm/deploy-image.sh` operator path. Its default preflight is
+read-only; only an explicit `publish --apply` can upload and atomically install
+the qcow2 after KVM, qemu-img, sudo, path, and digest checks. The package
+contract, extraction manifest, and worklist self-tests pass locally and the
+Browser contract passes on farm `.50`.
+
+The latest target inventory remains negative: seat-15 (`172.20.0.15`) is SSH
+reachable with no VDI listener and no readable `/dev/kvm`; Dell
+(`172.20.146.225`), its direct address (`172.20.146.2`), and overlay
+(`10.42.0.4`) are unavailable. No image publication or live acceptance was
+attempted against those targets.
+
 Continuation evidence: the current cutover commits are `7816f781` (typed
 Browser image-source propagation, seat preflight/NoCloud preparation, and
 RDPSND/PipeWire audio wiring) and `ef1dc5ed` (85-path extraction manifest
@@ -15,7 +28,7 @@ audible playback without a live host capture.
 
 The guest-image artifact is bound to source commit `9e7697b5`; the source-side
 cutover and VDI metrics are current through `25fb1cc1`. The extraction verifier
-passes for 84 paths and the public
+passes for 85 paths and the public
 standalone repository is at `996d3d27cfc4c52776c2289a0069d92e2bede66d`. A
 corrected guest image containing the explicit `Virtual-1` output configuration
 was built on farm `.90`, passed static image verification, and has SHA-256
@@ -177,8 +190,8 @@ On BigBoy (`172.20.0.130`):
 - The 2026-08-03 clean clone was pinned to public `main`
   `996d3d27cfc4c52776c2289a0069d92e2bede66d`; its root test, native helper
   checks, and strict clippy gates passed on BigBoy. The extraction verifier on
-  the pushed cutover branch passed for 84 paths: 18 browser-owned, 25
-  mixed-purpose, and 41 shared.
+  the pushed cutover branch passed for 85 paths: 18 browser-owned, 25
+  mixed-purpose, and 42 shared.
 - The current-source Browser VM container and qcow2 build both passed their
   static gates. The artifact remains uninstalled on Dell because the target
   and its overlay address are unreachable from the orchestrator and every
