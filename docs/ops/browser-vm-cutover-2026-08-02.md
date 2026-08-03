@@ -216,6 +216,13 @@ SSH and RDP, so seat-15 cannot currently serve as a deployment jump path.
 These are the remaining external gates for user access and production
 acceptance.
 
+The current standalone repository revision was rechecked on BigBoy `.130`:
+the admitted root workspace passed `cargo test --workspace --locked` with 424
+tests, and the native sandbox/CEF/Servo check plus workspace/client clippy
+boundary passed in a separate farm slot. The source review copy is staged on
+seat-15 at `/home/mm/browser-vm-review/6eca9b79`; this is source review only,
+not a VM installation.
+
 ## Landed
 
 - `magic-mesh-browser-stack` is public and history-bearing at

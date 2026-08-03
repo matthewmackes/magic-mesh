@@ -331,7 +331,7 @@ remains here under a completed status.
   public `magic-mesh-browser-stack` repository and removed from `magic-mesh` by
   `15695dd5`; the remaining `Surface::Browser` is a thin typed guest route.
   Workloads provision `DeliveryType::DesktopVm`, while VDI supports
-  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 85-path
+  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 86-path
   source/destination inventory and
   fail-closed verifier remain under `docs/design/browser-stack-extraction/` and
   `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
@@ -480,6 +480,14 @@ remains here under a completed status.
   local/remote image digests; the composite gate rejects audio or guest records
   whose provenance differs from the bundle. The stale VDI release fixture was
   refreshed, and the release-evidence self-test now passes again.
+- Review-delivery update (2026-08-03): the current source was pushed as
+  `6eca9b79` and staged on seat-15 at
+  `/home/mm/browser-vm-review/6eca9b79`; its deployment/composite self-tests
+  pass. The authorized Browser VM receipt/preflight attempt against seat-15
+  stopped before mutation because `/dev/kvm` and every VDI listener are absent.
+  BigBoy `.130` independently passed the standalone root workspace (`424`
+  tests) and native Servo/CEF/sandbox check/clippy boundary for the published
+  standalone repository.
 - Coordination-fallback hardening update (2026-08-03): the Nebula supervisor
   now records whether its peer directory came from etcd or filesystem fallback
   and refuses to shrink an existing lighthouse roster when etcd is configured
