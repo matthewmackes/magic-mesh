@@ -6,7 +6,7 @@ not a second active worklist.
 ## Current state — 2026-08-03
 
 The source-side cutover and standalone provenance are current through
-`30c98399`; the extraction verifier passes for 84 paths and the public
+`3f97dd56`; the extraction verifier passes for 84 paths and the public
 standalone repository is at `996d3d27cfc4c52776c2289a0069d92e2bede66d`. A
 corrected guest image containing the explicit `Virtual-1` output configuration
 was built on farm `.90`, passed static image verification, and has SHA-256
@@ -25,6 +25,10 @@ prompt. A bare mesh identity can no longer reach the RDP decoder and fail later
 without an actionable login path. Farm `.130` passed the focused auth module
 (20 tests, including the Browser VM regression), and the Browser resume seam
 now re-arms the typed VDI handoff after an explicit return to shell chrome.
+The VDI seam now exposes bounded local metrics for frame cadence, full/partial
+uploads, upload timing, reconnects, and shell repaints; the focused metrics
+test and the 64-test VDI regression set pass on BigBoy. These measurements do
+not stand in for the still-missing guest GPU, audio, or live endpoint evidence.
 
 ## Landed
 

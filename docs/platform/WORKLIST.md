@@ -362,7 +362,10 @@ remains here under a completed status.
   non-empty guest `FRAME OK` marker, with bounded dimensions/hash and no ticket
   or raw-log retention. Its self-test and farm syntax/self-test pass on `.50`
   slot `vdi-proof-helper-231`; actual target execution remains unavailable
-  until a real guest endpoint is supplied. Live read-only audit on 2026-08-01
+  until a real guest endpoint is supplied. The VDI seam now records bounded
+  frame cadence, full/partial upload counts, upload timing, reconnects, and
+  shell repaint counts; its focused metrics test and the 64-test VDI set pass
+  on BigBoy. Live read-only audit on 2026-08-01
   found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
   `.225` has shell services but no VDI listener, Eagle is unreachable, and
   `.138` has a host-key conflict requiring operator resolution.

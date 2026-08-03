@@ -1149,6 +1149,74 @@ enum SessionPhase {
     Failed { reason: String },
 }
 
+/// Bounded, log-safe VDI measurements exposed to diagnostics and acceptance
+/// tooling. These counters describe the local decode/texture seam; they do not
+/// masquerade as guest GPU, CPU, or audio evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VdiMetricsSnapshot {
+    pub(crate) frames_received: u64,
+    pub(crate) full_uploads: u64,
+    pub(crate) partial_uploads: u64,
+    pub(crate) partial_rects: u64,
+    pub(crate) reconnects: u64,
+    pub(crate) shell_repaints: u64,
+    pub(crate) last_frame_interval_us: Option<u64>,
+    pub(crate) last_frame_to_upload_us: Option<u64>,
+    pub(crate) last_upload_us: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct VdiMetrics {
+    snapshot: VdiMetricsSnapshot,
+    previous_frame_at: Option<std::time::Instant>,
+    queued_frame_at: Option<std::time::Instant>,
+}
+
+impl VdiMetrics {
+    fn note_frame(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(previous) = self.previous_frame_at {
+            self.snapshot.last_frame_interval_us = Some(
+                u64::try_from(now.duration_since(previous).as_micros()).unwrap_or(u64::MAX),
+            );
+        }
+        self.previous_frame_at = Some(now);
+        self.queued_frame_at = Some(now);
+        self.snapshot.frames_received = self.snapshot.frames_received.saturating_add(1);
+    }
+
+    fn note_upload(&mut self, kind: FrameUpload, elapsed: std::time::Duration) {
+        self.snapshot.last_upload_us = Some(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        );
+        if let Some(queued) = self.queued_frame_at.take() {
+            self.snapshot.last_frame_to_upload_us = Some(
+                u64::try_from(queued.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
+        match kind {
+            FrameUpload::Full => {
+                self.snapshot.full_uploads = self.snapshot.full_uploads.saturating_add(1);
+            }
+            FrameUpload::Partial { rects } => {
+                self.snapshot.partial_uploads = self.snapshot.partial_uploads.saturating_add(1);
+                self.snapshot.partial_rects = self
+                    .snapshot
+                    .partial_rects
+                    .saturating_add(u64::from(rects));
+            }
+        }
+    }
+
+    fn note_reconnect(&mut self) {
+        self.snapshot.reconnects = self.snapshot.reconnects.saturating_add(1);
+    }
+
+    fn note_shell_repaint(&mut self) {
+        self.snapshot.shell_repaints = self.snapshot.shell_repaints.saturating_add(1);
+    }
+}
+
 /// vdi-vm-4 — capped exponential backoff before reconnect `attempt` (1-based): 0.5s,
 /// 1s, 2s, 4s, then held at 8s. Bounds the reconnect storm against a flapping peer.
 #[cfg(feature = "live-vdi")]
@@ -1299,6 +1367,9 @@ pub(crate) struct VdiState {
     /// parallel slot so the existing `incoming` writers/tests that don't carry damage
     /// still compile and safely fall back to a full upload.
     incoming_damage: Option<FrameDamage>,
+    /// Local frame/texture/reconnect/repaint measurements. Guest hardware
+    /// capability evidence remains a separate live-proof concern.
+    metrics: VdiMetrics,
     /// Raised when the operator presses the reserved Esc chord over the desktop —
     /// the shell reads it to release the fullscreen desktop back to the chrome.
     return_to_chrome: bool,
@@ -1360,6 +1431,18 @@ pub(crate) struct VdiState {
 }
 
 impl VdiState {
+    /// Return the current bounded VDI measurements without exposing transport
+    /// credentials, endpoints, or raw decoder state.
+    pub(crate) fn metrics_snapshot(&self) -> VdiMetricsSnapshot {
+        self.metrics.snapshot
+    }
+
+    fn queue_frame(&mut self, img: egui::ColorImage, damage: FrameDamage) {
+        self.metrics.note_frame();
+        self.incoming = Some(img);
+        self.incoming_damage = Some(damage);
+    }
+
     /// Take (and clear) the "return to chrome" request raised by the Esc chord.
     /// The shell calls this after mounting the panel to leave the surface.
     pub(crate) fn take_return_to_chrome(&mut self) -> bool {
@@ -1658,6 +1741,7 @@ impl VdiState {
     /// and stops retrying. The caller has already taken the dead handle.
     #[cfg(feature = "live-vdi")]
     fn on_transport_drop(&mut self, reason: String) {
+        self.metrics.note_reconnect();
         let next = next_phase_on_drop(&self.session_phase, reason, MAX_RECONNECT_ATTEMPTS);
         match &next {
             SessionPhase::Reconnecting { attempt, .. } => {
@@ -1879,6 +1963,7 @@ impl VdiState {
                 LiveRdpEvent::Frame(frame, damage) => {
                     self.incoming = Some(frame);
                     self.incoming_damage = Some(damage);
+                    self.metrics.note_frame();
                     got_frame = true;
                 }
                 LiveRdpEvent::CertWarning(message) => {
@@ -1929,6 +2014,7 @@ impl VdiState {
                 LiveVncEvent::Frame(frame, damage) => {
                     self.incoming = Some(frame);
                     self.incoming_damage = Some(damage);
+                    self.metrics.note_frame();
                     got_frame = true;
                 }
                 LiveVncEvent::Clipboard(clip) => clipboard_events.push(clip),
@@ -1983,6 +2069,7 @@ impl VdiState {
                 LiveSpiceEvent::Frame(frame, damage) => {
                     self.incoming = Some(frame);
                     self.incoming_damage = Some(damage);
+                    self.metrics.note_frame();
                     got_frame = true;
                 }
                 LiveSpiceEvent::Error(reason) => {
@@ -2085,16 +2172,23 @@ const DESKTOP_TEX: TextureOptions = TextureOptions::LINEAR;
 /// path degrades to it and no upload a full `set` would have done is ever skipped.
 /// The `(offset, sub_image)` pairs handed to `set_partial` come from the same
 /// [`sub_color_image`] slice the unit tests prove pixel-identical to a full upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameUpload {
+    Full,
+    Partial { rects: u32 },
+}
+
 fn upload_frame(
     ctx: &egui::Context,
     texture: &mut Option<TextureHandle>,
     img: egui::ColorImage,
     damage: Option<FrameDamage>,
-) {
+) -> FrameUpload {
     match texture.as_mut() {
         // First frame / freshly-(re)allocated texture: allocate from the whole image.
         None => {
             *texture = Some(ctx.load_texture("vdi-desktop", img, DESKTOP_TEX));
+            FrameUpload::Full
         }
         Some(handle) => {
             // Partial-upload only with concrete rectangles AND a matching texture
@@ -2108,15 +2202,20 @@ fn upload_frame(
                 }
                 _ => {
                     handle.set(img, DESKTOP_TEX);
-                    return;
+                    return FrameUpload::Full;
                 }
             };
+            let mut uploaded_rects = 0u32;
             for rect in rects {
                 // Each rect is clamped to the frame bounds; a fully-clipped one
                 // yields None and is skipped (a full `set` would not draw it either).
                 if let Some((offset, sub)) = sub_color_image(&img, *rect) {
                     handle.set_partial(offset, sub, DESKTOP_TEX);
+                    uploaded_rects = uploaded_rects.saturating_add(1);
                 }
+            }
+            FrameUpload::Partial {
+                rects: uploaded_rects,
             }
         }
     }
@@ -2126,6 +2225,7 @@ fn upload_frame(
 /// fill the body, and forward this frame's egui input to the guest. With no
 /// session attached it draws the honest "no desktop" EmptyState instead.
 pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
+    state.metrics.note_shell_repaint();
     #[cfg(feature = "live-vdi")]
     {
         // VDI-VM-1 — resolve a mesh-brokered console endpoint from the session
@@ -2147,8 +2247,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     //    off the live session into the upload slot.
     if let Some(session) = state.session.as_mut() {
         if let Some((img, damage)) = session.frame_with_damage() {
-            state.incoming = Some(img);
-            state.incoming_damage = Some(damage);
+            state.queue_frame(img, damage);
         }
     }
 
@@ -2159,7 +2258,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
     //    damage info) falls back to a full `set` — never a skipped upload.
     if let Some(img) = state.incoming.take() {
         let damage = state.incoming_damage.take();
-        upload_frame(ui.ctx(), &mut state.texture, img, damage);
+        let started = std::time::Instant::now();
+        let upload = upload_frame(ui.ctx(), &mut state.texture, img, damage);
+        state.metrics.note_upload(upload, started.elapsed());
     }
 
     // 3. Paint the desktop (or the EmptyState) and drive input.

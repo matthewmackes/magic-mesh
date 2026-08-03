@@ -823,6 +823,42 @@ fn upload_frame_allocates_then_partial_updates_then_resizes() {
 }
 
 #[test]
+fn vdi_metrics_capture_frame_damage_upload_and_repaint_activity() {
+    use egui::Color32;
+    use mde_vdi_core::DamageRect;
+
+    let solid = |w: usize, h: usize, c: Color32| egui::ColorImage {
+        size: [w, h],
+        pixels: vec![c; w * h],
+    };
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut state = VdiState::default();
+
+    state.queue_frame(solid(4, 3, Color32::BLACK), FrameDamage::Full);
+    let _ = ctx.run(body_input(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| vdi_panel(ui, &mut state));
+    });
+    state.queue_frame(
+        solid(4, 3, Color32::WHITE),
+        FrameDamage::Rects(vec![DamageRect::new(1, 1, 2, 1)]),
+    );
+    let _ = ctx.run(body_input(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| vdi_panel(ui, &mut state));
+    });
+
+    let metrics = state.metrics_snapshot();
+    assert_eq!(metrics.frames_received, 2);
+    assert_eq!(metrics.full_uploads, 1);
+    assert_eq!(metrics.partial_uploads, 1);
+    assert_eq!(metrics.partial_rects, 1);
+    assert_eq!(metrics.shell_repaints, 2);
+    assert!(metrics.last_frame_interval_us.is_some());
+    assert!(metrics.last_frame_to_upload_us.is_some());
+    assert!(metrics.last_upload_us.is_some());
+}
+
+#[test]
 fn a_live_rdp_session_frame_flows_to_the_texture() {
     // Proves the shell is a real caller of `mde-vdi-rdp`: a fresh session marks
     // its framebuffer dirty, so the panel pulls a `frame()` and uploads it with
