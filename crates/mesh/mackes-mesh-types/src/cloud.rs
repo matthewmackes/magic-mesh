@@ -2470,6 +2470,33 @@ mod tests {
         assert!(signer.verify_payload(&parsed.signing_payload(), &parsed.signature));
     }
 
+    #[test]
+    fn browser_workload_operator_helper_vector_matches_the_wire_contract() {
+        let signer = CloudArmSigner::new((0_u8..32).collect::<Vec<_>>()).unwrap();
+        let request = r#"{"schema_version":1,"node":"DELL-LAPTOP","name":"browser-vm","image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#;
+        let digest = cloud_request_digest(request).unwrap();
+        assert_eq!(
+            digest,
+            "070acdcb32515efc52cd878e5c7ba9e920baa9d61aec11b81b2a09284becd415"
+        );
+        let token = CloudArmedToken::mint(
+            &signer,
+            "00112233445566778899aabbccddeeff",
+            1_893_456_000_123,
+            VERB_BROWSER_PROVISION,
+            "DELL-LAPTOP",
+            "browser-vm",
+            &digest,
+        );
+        assert_eq!(
+            token.encode(),
+            "v2|00112233445566778899aabbccddeeff|1893456000123|browser-provision|\
+             DELL-LAPTOP|browser-vm|\
+             070acdcb32515efc52cd878e5c7ba9e920baa9d61aec11b81b2a09284becd415|\
+             59111ea4b3f0bb55b7d00777b375bfc74aa62d114f9d1c4fee12280e351f9ba2"
+        );
+    }
+
     /// A trimmed but realistic Keystone v3 token response — the shape
     /// `POST /v3/auth/tokens` returns, with a three-interface compute service, a
     /// single-interface identity service, and an image service.

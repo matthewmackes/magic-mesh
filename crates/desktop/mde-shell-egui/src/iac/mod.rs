@@ -274,6 +274,43 @@ pub(super) fn cloud_state_is_fresh(state: &CloudState) -> bool {
     cloud_state_is_fresh_at(state, unix_now_ms())
 }
 
+fn browser_vm_running_status(status: &str) -> bool {
+    matches!(status.trim(), "active" | "running")
+}
+
+fn compare_browser_vm_candidates(
+    a_state: &CloudState,
+    a: &WorkloadRow,
+    b_state: &CloudState,
+    b: &WorkloadRow,
+    local_peer: &str,
+    now_ms: i64,
+) -> Ordering {
+    let a_fresh = cloud_state_is_fresh_at(a_state, now_ms);
+    let b_fresh = cloud_state_is_fresh_at(b_state, now_ms);
+    let a_running = browser_vm_running_status(&a.status);
+    let b_running = browser_vm_running_status(&b.status);
+    let a_ready = a_fresh && a.reachable && a_running;
+    let b_ready = b_fresh && b.reachable && b_running;
+    let local_peer = local_peer.trim();
+    let a_local = a.node.trim().eq_ignore_ascii_case(local_peer);
+    let b_local = b.node.trim().eq_ignore_ascii_case(local_peer);
+
+    // `max_by` consumes this ordering. Service readiness is authoritative;
+    // locality breaks ties among equally usable (or equally unavailable)
+    // duplicates. The remaining health ranks and reversed lexical comparisons
+    // make the diagnostic fallback independent of mirror/row iteration order.
+    a_ready
+        .cmp(&b_ready)
+        .then_with(|| a_local.cmp(&b_local))
+        .then_with(|| a_fresh.cmp(&b_fresh))
+        .then_with(|| a.reachable.cmp(&b.reachable))
+        .then_with(|| a_running.cmp(&b_running))
+        .then_with(|| b.node.cmp(&a.node))
+        .then_with(|| b_state.host.cmp(&a_state.host))
+        .then_with(|| b.status.cmp(&a.status))
+}
+
 /// Serialize the worker's `set-desired` envelope. The worker accepts one `spec`
 /// only under this wrapper; publishing the [`WorkloadSpec`] at the JSON root is
 /// malformed even though the nested spec itself has a placement node.
@@ -1712,20 +1749,36 @@ impl WorkloadsState {
     /// Workloads mirror. Browser activation consumes this read model rather
     /// than guessing a placement node or falling back to a host engine.
     pub(super) fn browser_vm_target(&self) -> Option<(&str, &str, &str, bool)> {
-        self.states
+        let local_peer = crate::discovery::local_peer();
+        self.browser_vm_target_at(&local_peer, unix_now_ms())
+    }
+
+    fn browser_vm_target_at<'a>(
+        &'a self,
+        local_peer: &str,
+        now_ms: i64,
+    ) -> Option<(&'a str, &'a str, &'a str, bool)> {
+        let (state, workload) = self
+            .states
             .iter()
-            .flat_map(|state| state.workloads.iter())
-            .find(|workload| {
+            .flat_map(|state| {
+                state
+                    .workloads
+                    .iter()
+                    .map(move |workload| (state, workload))
+            })
+            .filter(|(_, workload)| {
                 workload.name == "browser-vm" && workload.delivery_type == DeliveryType::DesktopVm
             })
-            .map(|workload| {
-                (
-                    workload.node.as_str(),
-                    workload.name.as_str(),
-                    workload.status.as_str(),
-                    workload.reachable,
-                )
-            })
+            .max_by(|(a_state, a), (b_state, b)| {
+                compare_browser_vm_candidates(a_state, a, b_state, b, local_peer, now_ms)
+            })?;
+        Some((
+            workload.node.as_str(),
+            workload.name.as_str(),
+            workload.status.as_str(),
+            workload.reachable && cloud_state_is_fresh_at(state, now_ms),
+        ))
     }
 
     /// Every workload of a given delivery type, across every node — the idiom a
@@ -2955,6 +3008,90 @@ mod configure;
 mod containers;
 mod images;
 mod status;
+
+#[cfg(test)]
+mod browser_vm_target_tests {
+    use super::*;
+    use mackes_mesh_types::cloud::{CloudProviderAdapter, DriftFlag, DriftSummary, NodeCapacity};
+
+    const NOW_MS: i64 = 1_000_000;
+
+    fn browser_vm(node: &str, status: &str, reachable: bool) -> WorkloadRow {
+        WorkloadRow {
+            name: "browser-vm".to_owned(),
+            delivery_type: DeliveryType::DesktopVm,
+            node: node.to_owned(),
+            status: status.to_owned(),
+            cpu_pct: 0,
+            mem_mb: 0,
+            disk_gb: 0,
+            reachable,
+            drift: DriftFlag::Unknown,
+            app: None,
+        }
+    }
+
+    fn cloud_state(host: &str, published_at_ms: i64, workload: WorkloadRow) -> CloudState {
+        CloudState {
+            host: host.to_owned(),
+            adapter: CloudProviderAdapter::ConstructCloud,
+            health: Vec::new(),
+            resources: Vec::new(),
+            apply_armed: false,
+            published_at_ms,
+            workloads: vec![workload],
+            drift_summary: DriftSummary::default(),
+            node_capacity: NodeCapacity::default(),
+        }
+    }
+
+    #[test]
+    fn ready_local_browser_vm_wins_over_an_earlier_stale_remote_duplicate() {
+        let mut state = WorkloadsState::default();
+        state.states = vec![
+            cloud_state(
+                "aaa-old",
+                NOW_MS - CLOUD_MIRROR_STALE_AFTER_MS - 1,
+                browser_vm("aaa-old", "active", true),
+            ),
+            cloud_state("dell", NOW_MS, browser_vm("dell", "active", true)),
+        ];
+
+        assert_eq!(
+            state.browser_vm_target_at("dell", NOW_MS),
+            Some(("dell", "browser-vm", "active", true))
+        );
+    }
+
+    #[test]
+    fn ready_remote_browser_vm_wins_over_an_unready_local_duplicate() {
+        let mut state = WorkloadsState::default();
+        state.states = vec![
+            cloud_state("dell", NOW_MS, browser_vm("dell", "defined", false)),
+            cloud_state("remote", NOW_MS, browser_vm("remote", "running", true)),
+        ];
+
+        assert_eq!(
+            state.browser_vm_target_at("dell", NOW_MS),
+            Some(("remote", "browser-vm", "running", true))
+        );
+    }
+
+    #[test]
+    fn unavailable_browser_vm_fallback_is_lexical_and_stale_is_not_reachable() {
+        let stale = NOW_MS - CLOUD_MIRROR_STALE_AFTER_MS - 1;
+        let mut state = WorkloadsState::default();
+        state.states = vec![
+            cloud_state("zeta", stale, browser_vm("zeta", "active", true)),
+            cloud_state("alpha", stale, browser_vm("alpha", "active", true)),
+        ];
+
+        assert_eq!(
+            state.browser_vm_target_at("no-local-row", NOW_MS),
+            Some(("alpha", "browser-vm", "active", false))
+        );
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::panic)]

@@ -9,11 +9,13 @@
 use mackes_mesh_types::vdi_session::BrowserVmTransport;
 use mde_egui::egui::{self, RichText};
 use mde_egui::search_omnibox::SearchItem;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use mde_files_egui::transfers::TransfersClient;
 
 const VM_WORKLOAD: &str = "browser-vm";
+const BROWSER_VM_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Shell media-key vocabulary retained at the VM boundary. The guest owns
 /// playback; these actions are intentionally not translated into host controls.
@@ -112,6 +114,7 @@ pub(crate) struct WebState {
     requested_target: Option<String>,
     browser_vm_connect: Option<BrowserVmConnect>,
     browser_vm_request_issued: bool,
+    browser_vm_retry_not_before: Option<Instant>,
     #[cfg(test)]
     _transfers: Option<Box<dyn TransfersClient>>,
 }
@@ -130,6 +133,7 @@ impl Default for WebState {
             requested_target: None,
             browser_vm_connect: None,
             browser_vm_request_issued: false,
+            browser_vm_retry_not_before: None,
             #[cfg(test)]
             _transfers: None,
         }
@@ -167,10 +171,27 @@ impl WebState {
     /// is not yet reachable remains unavailable; this path never starts a host
     /// helper as a fallback.
     pub(crate) fn sync_browser_vm_target(&mut self, target: Option<BrowserVmTarget>) {
+        self.sync_browser_vm_target_at(target, Instant::now());
+    }
+
+    fn sync_browser_vm_target_at(&mut self, target: Option<BrowserVmTarget>, now: Instant) {
+        let target_changed = self.latest_target.as_ref() != target.as_ref();
         self.latest_target = target.clone();
+        if target_changed {
+            // A new projection is new evidence; do not make it inherit an old
+            // target's retry delay.
+            self.browser_vm_retry_not_before = None;
+        }
         if self.browser_vm_request_issued || self.browser_vm_connect.is_some() {
             return;
         }
+        if self
+            .browser_vm_retry_not_before
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        self.browser_vm_retry_not_before = None;
         let Some(target) = target else {
             self.diagnostic = BrowserVmDiagnostic {
                 state: BrowserVmConnectionState::WaitingForWorkload,
@@ -199,12 +220,15 @@ impl WebState {
         });
     }
 
-    /// Consume the one-shot handoff. Once consumed, Browser remains bound to
-    /// this guest session until the user leaves the surface or the VDI layer
-    /// reports a bounded failure.
+    /// Begin the one-shot handoff. The caller either completes credential
+    /// resolution, signing, and Bus publication or reports the failed attempt
+    /// through [`Self::browser_vm_unavailable`]. A reported failure rolls this
+    /// optimistic commit back after a bounded delay; no report leaves the
+    /// successful request committed exactly once.
     pub(crate) fn take_browser_vm_connect(&mut self) -> Option<BrowserVmConnect> {
         let request = self.browser_vm_connect.take()?;
         self.browser_vm_request_issued = true;
+        self.browser_vm_retry_not_before = None;
         Some(request)
     }
 
@@ -215,6 +239,7 @@ impl WebState {
     pub(crate) fn note_vdi_session_detached(&mut self) {
         self.browser_vm_request_issued = false;
         self.browser_vm_connect = None;
+        self.browser_vm_retry_not_before = None;
         self.diagnostic = BrowserVmDiagnostic {
             state: BrowserVmConnectionState::WaitingForVdi,
             detail: "The guest Browser VM is selected; attach its VDI transport to continue."
@@ -222,9 +247,19 @@ impl WebState {
         };
     }
 
-    /// Surface an explicit VDI/broker failure without inventing a page or a
-    /// host-rendered fallback.
+    /// Surface an explicit credential/VDI/broker failure without inventing a
+    /// page or a host-rendered fallback. Every fallible post-take call site
+    /// reports here, so roll back the optimistic one-shot commit and permit one
+    /// new attempt after a short delay rather than consuming Browser activation
+    /// permanently or publishing on every paint frame.
     pub(crate) fn browser_vm_unavailable(&mut self, detail: impl Into<String>) {
+        self.browser_vm_unavailable_at(detail, Instant::now());
+    }
+
+    fn browser_vm_unavailable_at(&mut self, detail: impl Into<String>, now: Instant) {
+        self.browser_vm_request_issued = false;
+        self.browser_vm_connect = None;
+        self.browser_vm_retry_not_before = Some(now + BROWSER_VM_RETRY_DELAY);
         self.diagnostic = BrowserVmDiagnostic {
             state: BrowserVmConnectionState::Unavailable,
             detail: detail.into(),
@@ -366,6 +401,11 @@ mod tests {
         assert_eq!(request.target.workload, "browser-vm");
         assert_eq!(request.transport, BrowserVmTransport::Rdp);
         assert!(state.browser_vm_connect.is_none());
+        state.sync_browser_vm_target(Some(target.clone()));
+        assert!(
+            state.take_browser_vm_connect().is_none(),
+            "a committed handoff must not be published twice"
+        );
 
         state.note_vdi_session_detached();
         state.sync_browser_vm_target(Some(target));
@@ -376,6 +416,40 @@ mod tests {
                 .target
                 .workload,
             "browser-vm"
+        );
+    }
+
+    #[test]
+    fn transient_browser_vm_failure_retries_then_commits_without_duplicates() {
+        let now = Instant::now();
+        let target = BrowserVmTarget {
+            serving_peer: "dell".to_owned(),
+            workload: "browser-vm".to_owned(),
+            status: "active".to_owned(),
+            reachable: true,
+        };
+        let mut state = WebState::default();
+
+        state.sync_browser_vm_target_at(Some(target.clone()), now);
+        assert!(state.take_browser_vm_connect().is_some(), "first attempt");
+        state.browser_vm_unavailable_at("transient credential or Bus failure", now);
+
+        state.sync_browser_vm_target_at(Some(target.clone()), now + BROWSER_VM_RETRY_DELAY / 2);
+        assert!(
+            state.take_browser_vm_connect().is_none(),
+            "retry is bounded instead of running every paint frame"
+        );
+
+        state.sync_browser_vm_target_at(Some(target.clone()), now + BROWSER_VM_RETRY_DELAY);
+        assert!(state.take_browser_vm_connect().is_some(), "retry attempt");
+
+        state.sync_browser_vm_target_at(
+            Some(target),
+            now + BROWSER_VM_RETRY_DELAY + BROWSER_VM_RETRY_DELAY,
+        );
+        assert!(
+            state.take_browser_vm_connect().is_none(),
+            "the successful retry remains committed exactly once"
         );
     }
 
