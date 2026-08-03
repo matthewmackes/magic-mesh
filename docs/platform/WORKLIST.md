@@ -449,6 +449,13 @@ remains here under a completed status.
   container image ID `3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`.
   It is still only a publish candidate because Dell and the live acceptance
   seats remain unavailable.
+- Live mesh blocker update (2026-08-03): a fresh read-only seat-15 audit found
+  its Nebula interface up but no KVM/VM/VDI endpoint, while `mackesd` timed out
+  all three etcd endpoints (`10.42.0.1/.2/.3:2379`) and repeatedly reported a
+  missing `nebula-lighthouse.service` during config refresh. No live service
+  or network mutation was attempted; Dell remains unreachable and the Browser
+  VM cannot be published or accepted until the fleet/control-plane recovery is
+  operator-resolved.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

@@ -18,6 +18,13 @@ reachable with no VDI listener and no readable `/dev/kvm`; Dell
 (`10.42.0.4`) are unavailable. No image publication or live acceptance was
 attempted against those targets.
 
+Fresh seat-15 read-only diagnostics at 2026-08-03 03:36–03:39 EDT show the
+mesh itself is degraded: `mackesd` timed out connecting to etcd at
+`10.42.0.1:2379`, `10.42.0.2:2379`, and `10.42.0.3:2379`, and its Nebula
+supervisor repeatedly reported that `nebula-lighthouse.service` was missing.
+This is an operator/fleet recovery blocker in addition to the seat's missing
+KVM and VDI endpoint; no service restart or network repair was attempted.
+
 Continuation evidence: the current cutover commits are `7816f781` (typed
 Browser image-source propagation, seat preflight/NoCloud preparation, and
 RDPSND/PipeWire audio wiring) and `ef1dc5ed` (85-path extraction manifest
