@@ -3,6 +3,21 @@
 This note records the implementation slice for WL-ARCH-008. It is evidence,
 not a second active worklist.
 
+## Current state — 2026-08-03
+
+The source-side cutover and standalone provenance are current through
+`325ca148`; the extraction verifier passes for 85 paths and the public
+standalone repository is at `996d3d27cfc4c52776c2289a0069d92e2bede66d`. A
+corrected guest image containing the explicit `Virtual-1` output configuration
+was built on farm `.90`, passed static image verification, and has SHA-256
+`99614eaace96365fe4527ad65e3239f76923cb58905c9580b0af266aa40ba7e0`.
+
+It has not been installed on Dell: `172.20.146.225` currently returns no route
+and overlay `10.42.0.4` times out. Seat 15 (`172.20.0.15`) is reachable but
+has no libvirt domain or RDP/SPICE/VNC listener. Therefore no current live
+guest-frame, focused-input, GPU-video, guest-audio, reconnect, performance, or
+six-node acceptance claim is made here.
+
 ## Landed
 
 - `magic-mesh-browser-stack` is public and history-bearing at
