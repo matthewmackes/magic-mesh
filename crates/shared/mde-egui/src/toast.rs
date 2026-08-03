@@ -58,6 +58,18 @@ const CHYRON_HOVER_ID: &str = "kiron-chyron-hover";
 const OSD_AREA_ID: &str = "kiron-osd-area";
 const OSD_ANIM_ID: &str = "kiron-osd-anim";
 
+/// AI deployment warnings must remain visible while the lock curtain owns the
+/// normal foreground layer.  Tooltip is egui's top presentation order (also
+/// used by the direct-DRM software cursor), so the constrained operator card
+/// stays above the curtain without promoting ordinary notifications.
+fn chyron_order(toast: &Toast) -> egui::Order {
+    if toast.is_ai_generated_alert() {
+        egui::Order::Tooltip
+    } else {
+        egui::Order::Foreground
+    }
+}
+
 /// Alert severity — the color + preempt axis for a chyron. Ordered least-severe
 /// first, so a derived comparison reads "`Critical` is the greatest".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -530,7 +542,7 @@ impl ToastHost {
         let remaining = self.remaining();
         let mut band = BandOutcome::default();
         egui::Area::new(egui::Id::new(CHYRON_AREA_ID))
-            .order(egui::Order::Foreground)
+            .order(chyron_order(&toast))
             .show(ctx, |ui| {
                 band = if toast.is_ai_generated_alert() {
                     paint_ai_generated_alert(ui, &toast, backlog, remaining, t)
@@ -1503,6 +1515,18 @@ mod tests {
             assert!(card.width() <= screen.width() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
             assert!(card.height() <= screen.height() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn ai_generated_alert_uses_the_only_layer_above_the_lock_curtain() {
+        let operator_notice = Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "Update begins in 5 seconds",
+        );
+        assert_eq!(chyron_order(&operator_notice), egui::Order::Tooltip);
+        assert_eq!(chyron_order(&info("ordinary")), egui::Order::Foreground);
     }
 
     #[test]
