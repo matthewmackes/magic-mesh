@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_NAME=$(basename "$0")
 DEFAULT_REMOTE_IMAGE=/var/lib/libvirt/images/browser-vm-chromium.qcow2
 DEFAULT_REMOTE_STAGING=/var/tmp/mcnf-browser-vm-chromium.qcow2
-readonly MIN_VIRTUAL_BYTES=$((10 * 1024 * 1024 * 1024))
+readonly MIN_VIRTUAL_BYTES=$((64 * 1024 * 1024 * 1024))
 
 usage() {
     cat <<'USAGE'
@@ -60,7 +60,7 @@ local_image_check() {
     info=$(qemu-img info --force-share --output=json -- "$IMAGE") || fail "qemu-img info failed"
     read -r format virtual backing < <(python3 -c 'import json,sys; x=json.load(sys.stdin); print(x.get("format",""),x.get("virtual-size",0),"yes" if x.get("backing-filename") else "no")' <<<"$info")
     [[ "$format" == qcow2 ]] || fail "image format is not qcow2"
-    [[ "$virtual" =~ ^[0-9]+$ && "$virtual" -ge "$MIN_VIRTUAL_BYTES" ]] || fail "image virtual size is below 10 GiB"
+    [[ "$virtual" =~ ^[0-9]+$ && "$virtual" -ge "$MIN_VIRTUAL_BYTES" ]] || fail "image virtual size is below 64 GiB"
     [[ "$backing" == no ]] || fail "image has an external backing file"
     qemu-img check --force-share -- "$IMAGE" >/dev/null 2>&1 || fail "qemu-img check failed"
     digest=$(local_image_digest)

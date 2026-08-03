@@ -11,6 +11,11 @@ Build a signed/recorded ext4-rootfs disk artifact on the build farm with the Fed
 pass the resulting image digest in the typed `browser-provision` request. A
 missing or malformed digest is refused before desired state is written.
 
+When `--disk qcow2` or `--disk raw` is requested, the image builder binds the
+output virtual size to `BROWSER_VM_DISK_GB` from `profile.env` (currently 64
+GiB). Smaller bootc-image-builder defaults are enlarged before publication;
+`deploy-image.sh` and the seat preflight reject smaller artifacts.
+
 The checked-in `deploy-image.sh` is the bounded operator path for a direct KVM
 host. `preflight` verifies the local qcow2 and remote KVM/qemu-img/passwordless
 sudo prerequisites without changing files. `publish` is dry-run by default;

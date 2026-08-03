@@ -22,6 +22,11 @@ SOURCE_COMMIT="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$DIR/profile.env")"
     echo 'FATAL: Browser VM profile source commit is not a 40-character revision' >&2
     exit 2
 }
+DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$DIR/profile.env")"
+[[ "$DISK_GB" =~ ^[0-9]+$ && "$DISK_GB" -ge 64 ]] || {
+    echo 'FATAL: Browser VM profile disk floor must be at least 64 GiB' >&2
+    exit 2
+}
 
 usage() { echo "Usage: $0 [--rpm PATH]... [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]"; }
 
@@ -79,4 +84,23 @@ if [ -n "$DISK" ]; then
     podman run --rm --privileged --security-opt label=type:unconfined_t \
         -v "$OUT:/output" -v /var/lib/containers/storage:/var/lib/containers/storage \
         "$BIB_IMAGE" --rootfs "$BROWSER_VM_ROOTFS" --type "$DISK" --local "$IMAGE"
+
+    # bootc-image-builder's portable default layout is 10 GiB.  The typed
+    # browser-vm workload contract is 64 GiB, so enlarge the resulting virtual
+    # disk after the filesystem image is built.  This is intentionally a
+    # virtual-size operation: the guest's normal first-boot grow path owns any
+    # partition/filesystem expansion and the image remains sparse/compressed.
+    case "$DISK" in
+        qcow2) disk_path="$OUT/qcow2/disk.qcow2" ;;
+        raw) disk_path="$OUT/raw/disk.raw" ;;
+        anaconda-iso) disk_path='' ;;
+        *) echo "FATAL: unsupported disk output type: $DISK" >&2; exit 2 ;;
+    esac
+    if [ -n "$disk_path" ]; then
+        [ -f "$disk_path" ] || { echo "FATAL: expected disk output is missing: $disk_path" >&2; exit 2; }
+        command -v qemu-img >/dev/null 2>&1 || { echo 'FATAL: qemu-img is required to size the disk output' >&2; exit 2; }
+        qemu-img resize -- "$disk_path" "${DISK_GB}G" >/dev/null
+        qemu-img check -- "$disk_path" >/dev/null
+        echo "Browser VM disk resized to ${DISK_GB} GiB: $disk_path"
+    fi
 fi
