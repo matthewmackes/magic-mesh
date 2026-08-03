@@ -233,6 +233,12 @@ pub fn reserved_overlay_ips_blocking(endpoints: &[String]) -> std::collections::
     .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectorySource {
+    Etcd,
+    Filesystem,
+}
+
 /// The canonical peer directory for this node: the **etcd** substrate when the
 /// coordination plane is provisioned (`/etc/mackesd/etcd-endpoints` non-empty),
 /// else the replicated **fs** union (`<workgroup_root>/peers/*.json`). This is the
@@ -242,15 +248,30 @@ pub fn reserved_overlay_ips_blocking(endpoints: &[String]) -> std::collections::
 /// directory. SUBSTRATE/HA fix: the enroll roster + nebula supervisor reconcile
 /// MUST read through this, not the fs union directly, or they go blind to live
 /// etcd rows (a new lighthouse) on a cut-over node.
+/// Read the canonical peer directory and identify which substrate supplied it.
+/// Filesystem fallback must not be mistaken for authoritative membership when
+/// configured etcd is temporarily unreachable.
 #[must_use]
-pub fn read_directory(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
+pub(crate) fn read_directory_with_source(
+    workgroup_root: &std::path::Path,
+) -> (Vec<PeerRecord>, DirectorySource) {
     let eps = crate::substrate::etcd::default_endpoints();
     if !eps.is_empty() {
         if let Some(rows) = read_peers_blocking(&eps) {
-            return rows;
+            return (rows, DirectorySource::Etcd);
         }
     }
-    mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(workgroup_root))
+    (
+        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(workgroup_root)),
+        DirectorySource::Filesystem,
+    )
+}
+
+/// Read the canonical peer directory using etcd when provisioned and the
+/// replicated filesystem union otherwise.
+#[must_use]
+pub fn read_directory(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
+    read_directory_with_source(workgroup_root).0
 }
 
 #[cfg(test)]

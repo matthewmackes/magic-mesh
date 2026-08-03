@@ -433,7 +433,8 @@ impl NebulaSupervisor {
             );
             return;
         }
-        let peers = crate::substrate::peers::read_directory(&self.workgroup_root);
+        let (peers, directory_source) =
+            crate::substrate::peers::read_directory_with_source(&self.workgroup_root);
         let authority = bundle.relay_trust_authority.clone();
         let mut roster: Vec<crate::ca::bundle::LighthouseEntry> =
             mackes_mesh_types::lighthouse::roster_from_directory(&peers)
@@ -486,6 +487,19 @@ impl NebulaSupervisor {
         // trigger a rewrite/reload every tick, but still rewrite when the
         // stored bundle carries duplicate overlay-IP claims.
         let current = normalize_lighthouse_roster(bundle.lighthouses.clone(), authority.as_deref());
+        if should_preserve_roster_on_fallback(
+            directory_source,
+            !self.leadership_endpoints.is_empty(),
+            current.len(),
+            roster.len(),
+        ) {
+            tracing::warn!(
+                current_count = current.len(),
+                candidate_count = roster.len(),
+                "nebula-supervisor: refusing to shrink lighthouse roster from stale filesystem fallback while etcd is configured but unavailable"
+            );
+            return;
+        }
         if current == roster && bundle.lighthouses == current {
             return;
         }
@@ -503,6 +517,17 @@ impl NebulaSupervisor {
             ),
         }
     }
+}
+
+fn should_preserve_roster_on_fallback(
+    directory_source: crate::substrate::peers::DirectorySource,
+    coordination_configured: bool,
+    current_count: usize,
+    candidate_count: usize,
+) -> bool {
+    directory_source == crate::substrate::peers::DirectorySource::Filesystem
+        && coordination_configured
+        && candidate_count < current_count
 }
 
 /// Replicated bundles may carry the public relay authority, but that value is
@@ -3109,6 +3134,36 @@ exit 0
             1,
             "an empty directory read must NOT wipe the existing roster (anti-strand guard)"
         );
+    }
+
+    #[test]
+    fn stale_filesystem_fallback_cannot_shrink_configured_roster() {
+        use crate::substrate::peers::DirectorySource;
+
+        assert!(should_preserve_roster_on_fallback(
+            DirectorySource::Filesystem,
+            true,
+            3,
+            1,
+        ));
+        assert!(!should_preserve_roster_on_fallback(
+            DirectorySource::Etcd,
+            true,
+            3,
+            1,
+        ));
+        assert!(!should_preserve_roster_on_fallback(
+            DirectorySource::Filesystem,
+            false,
+            3,
+            1,
+        ));
+        assert!(!should_preserve_roster_on_fallback(
+            DirectorySource::Filesystem,
+            true,
+            1,
+            3,
+        ));
     }
 
     #[tokio::test]

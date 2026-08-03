@@ -2,6 +2,18 @@
 
 ## Live evidence
 
+## Current regression audit — 2026-08-03
+
+The earlier recovery below is no longer the live state. The three public
+lighthouses and seat-15 were restored again on 2026-08-03 and now form a
+healthy three-member etcd quorum; seat-15 is `10.42.0.5` and reaches all three
+lighthouse overlays. Dell is not currently present in the etcd peer directory:
+its overlay `10.42.0.4`, LAN `172.20.146.225`, and direct address
+`172.20.146.2` are unreachable, so the prior Dell-online statements must be
+treated as historical evidence. Seat-15 still has no `/dev/kvm` or VDI
+listener. No Dell Browser VM publication or live Chromium acceptance is
+claimed until Dell returns to the mesh.
+
 The affected live workstation (`Basement-Test-Workstation`, `.15`) had
 `nebula.service` and `mackesd.service` running, but all configured etcd
 endpoints were unhealthy. `etcd.service` was skipped because this workstation
@@ -63,7 +75,6 @@ The live recovery was completed on 2026-08-02:
 The seat still reports a degraded disk-headroom alarm; this is independent of
 the overlay return path and should remain visible during testing.
 
-Dell (`DELL-LAPTOP`, LAN `172.20.146.225`, overlay `10.42.0.4`) was online but
-still had retired lighthouse underlay addresses. Its current maps were
-restored and its Nebula restart now reaches all three active lighthouses; the
-peer directory reports Dell online and healthy.
+Dell (`DELL-LAPTOP`, LAN `172.20.146.225`, overlay `10.42.0.4`) was online at
+the time of this earlier recovery, but that condition has since regressed; see
+the current regression audit above.

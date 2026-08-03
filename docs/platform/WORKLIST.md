@@ -449,6 +449,14 @@ remains here under a completed status.
   container image ID `3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`.
   It is still only a publish candidate because Dell and the live acceptance
   seats remain unavailable.
+- Coordination-fallback hardening update (2026-08-03): the Nebula supervisor
+  now records whether its peer directory came from etcd or filesystem fallback
+  and refuses to shrink an existing lighthouse roster when etcd is configured
+  but temporarily unreachable. This directly covers the observed self-only
+  bundle regression without blocking intentional healthy-etcd removals or
+  filesystem-only nodes. The focused regression passes on BigBoy `.90` in slot
+  `nebula-roster-fallback-clean-20260803`; this is recovery hardening, not live
+  Dell or Browser VM acceptance evidence.
 - Performance-evidence update (2026-08-03):
   `install-helpers/verify-browser-vm-performance.py` now provides a
   fail-closed validator for a source/image-bound live acceptance record. A pass
@@ -2025,13 +2033,19 @@ remains here under a completed status.
 - Current state: Live recovery on 2026-08-02 restored the current three-member
   lighthouse quorum (`104.236.118.177`, `46.101.219.245`, and
   `64.23.131.57`), repaired missing cross-lighthouse maps, re-enrolled seat 15
-  as `10.42.0.5`, and repaired Dell `.225` as `10.42.0.4`. Seat 15 reports
-  Dell and Eagle online and healthy. The watchdog now recognizes both legacy
-  and `identity/current` certificates, and `mackesd.service` is ordered after
-  Nebula. Live boot-recovery passes the mesh, file-plane, etcd, and bus checks;
-  the remaining failure is an unrelated missing `/home/mm/Documents` bind
-  mount plus a low disk-headroom alarm. A physical suspend/resume proof and
-  six-node corrected-forward evidence bundle are still missing.
+  as `10.42.0.5`, and repaired Dell `.225` as `10.42.0.4`. The watchdog now
+  recognizes both legacy and `identity/current` certificates, and
+  `mackesd.service` is ordered after Nebula. Live boot-recovery passed the
+  mesh, file-plane, etcd, and bus checks at that time; a physical
+  suspend/resume proof and six-node corrected-forward evidence bundle are
+  still missing.
+- Current regression audit (2026-08-03): the earlier Dell-online state is no
+  longer live. The three lighthouse records and seat-15 (`10.42.0.5`) are
+  healthy in the restored etcd directory, but Dell has no current peer record;
+  overlay `.4`, LAN `.225`, and direct `.2` are unreachable. Seat-15 still
+  lacks `/dev/kvm` and any VDI listener. Treat the earlier Dell repair as
+  historical until the machine reappears and passes a fresh boot/recovery
+  proof.
 - Remaining work:
   1. Add a durable enrollment/overlay identity collision check that refuses to
      start a node when its certificate address is already claimed by another
