@@ -41,6 +41,16 @@ SHA-256 `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
 `qemu-img info` reports a non-corrupt 10-GiB qcow2 with a 1.72-GiB compressed
 footprint. This is artifact readiness, not live guest or seat acceptance.
 
+Latest provenance evidence: after the profile pin advanced in `f930c844` and
+the guest-readable NoCloud permissions fix in `9d880921`, a matching qcow2 was
+rebuilt on farm `.90` at
+`/home/mm/browser-vm-chromium-qcow2-provenance-20260803/qcow2/disk.qcow2`.
+Its SHA-256 is
+`089bbedf259509b60f4aa9ce3fc8582f347d3f73882dd672824499636d68d6d3`.
+`qemu-img check` reports no errors; the image is a 10-GiB qcow2 with a 1.72-GiB
+compressed footprint and carries source label `9d880921`. It is the current
+publish candidate, but remains uninstalled because Dell is unreachable.
+
 The OpenTofu deployment contract now rejects direct Browser VM declarations
 that are not `desktop_vm`, 4 vCPU/8192 MiB/64 GiB, or bound to a full image
 digest. Browser domains bind SPICE to loopback. Host-dependent virtio

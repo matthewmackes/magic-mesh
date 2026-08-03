@@ -427,6 +427,15 @@ remains here under a completed status.
   and digest-verify the qcow2 after remote KVM/qemu-img/sudo/path checks. The
   Browser contract and extraction verifier pass; the live target inventory is
   unchanged, so no publication or live acceptance is claimed.
+- Provenance/image update (2026-08-03): profile pin `f930c844` now points at
+  source `9d880921`, including the guest-readable NoCloud seed-permission fix.
+  A matching Fedora 44 qcow2 was rebuilt and verified on farm `.90` at
+  `/home/mm/browser-vm-chromium-qcow2-provenance-20260803/qcow2/disk.qcow2`
+  with SHA-256
+  `089bbedf259509b60f4aa9ce3fc8582f347d3f73882dd672824499636d68d6d3`;
+  `qemu-img check` found no errors. This is a current publish candidate, not
+  live Dell evidence: Dell remains unreachable and no guest, GPU, audio,
+  performance, reconnect, or six-node acceptance is claimed.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot
