@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# Read-only Browser VM audio wiring evidence.
+# Read-only Browser VM audio wiring and live-sample evidence.
 #
-# This checks the declarative QEMU/libvirt boundary only: one virtio sound card,
-# one Browser-owned Pulse backend on the tracked localhost endpoint, and exactly
-# one guest playback and capture endpoint.
-# It deliberately does not claim that audio is audible, captured, or recovered;
-# those require a booted guest and live media traffic.
+# --xml/--domain check only the declarative QEMU/libvirt boundary. Their output
+# is explicitly wiring-only and cannot support live acceptance. --live-evidence
+# validates actual PCM from playback and capture before and after a transport
+# reconnect. Digital samples still do not prove physical audibility; that
+# remains an operator-confirmed production gate.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SESSION_RUNTIME="$ROOT/packaging/browser-vm/mcnf-browser-vm-session.sh"
 GUEST_RUNTIME="$ROOT/packaging/browser-vm/mcnf-browser-vm-runtime.sh"
+LIVE_AUDIO_VALIDATOR="$ROOT/install-helpers/verify-browser-vm-live-audio.py"
 
 usage() {
     printf '%s\n' \
         'usage: verify-browser-vm-audio.sh --xml FILE|- | --domain NAME' \
+        '       verify-browser-vm-audio.sh --live-evidence FILE' \
         '       verify-browser-vm-audio.sh --self-test' >&2
 }
 
@@ -52,7 +54,10 @@ backend = audio.get("type") if audio is not None else None
 server_name = audio.get("serverName") if audio is not None else None
 
 result = {
-    "status": "ready",
+    "status": "wired",
+    "evidence_class": "browser_vm_audio_wiring_only",
+    "sample_backed": False,
+    "live_acceptance": "not_proven",
     "source": label,
     "sound_device_count": len(sounds),
     "audio_backend_count": len(audios),
@@ -101,7 +106,16 @@ self_test() {
     local missing_capture="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio></devices></domain>"
     local broad_listener="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:0.0.0.0:4713'><input name='browser-vm-capture'/><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio></devices></domain>"
     local duplicate_backend="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input name='browser-vm-capture'/><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio><audio id='2' type='pipewire'><input/><output/></audio></devices></domain>"
-    printf '%s' "$valid" | check_xml self-test-valid >/dev/null
+    local wiring_result
+    wiring_result=$(printf '%s' "$valid" | check_xml self-test-valid)
+    printf '%s' "$wiring_result" | python3 -c '
+import json
+import sys
+
+result = json.load(sys.stdin)
+if result.get("status") != "wired" or result.get("sample_backed") is not False or result.get("live_acceptance") != "not_proven":
+    raise SystemExit("endpoint inventory was not labeled as wiring-only")
+'
     if printf '%s' "$missing_capture" | check_xml self-test-missing-capture >/dev/null 2>&1; then
         echo 'verify-browser-vm-audio: self-test accepted missing capture endpoint' >&2
         exit 1
@@ -116,7 +130,73 @@ self_test() {
     fi
     runtime_evidence_order_self_test
     session_startup_self_test
+    live_sample_evidence_self_test
     echo 'verify-browser-vm-audio: self-test passed'
+}
+
+live_sample_evidence_self_test() {
+    [[ -x "$LIVE_AUDIO_VALIDATOR" && ! -L "$LIVE_AUDIO_VALIDATOR" ]] || {
+        echo "verify-browser-vm-audio: live sample validator is missing, non-executable, or symlinked: $LIVE_AUDIO_VALIDATOR" >&2
+        exit 1
+    }
+    python3 "$LIVE_AUDIO_VALIDATOR" --self-test
+
+    local fixture manifest endpoint_only symlink_manifest validation
+    fixture=$(mktemp -d)
+    self_test_fixture=$fixture
+    trap 'rm -rf "$self_test_fixture"' EXIT
+    manifest=$fixture/audio-evidence.json
+    endpoint_only=$fixture/endpoint-only.json
+    symlink_manifest=$fixture/symlink-evidence.json
+
+    python3 - "$LIVE_AUDIO_VALIDATOR" "$manifest" <<'PY'
+from datetime import datetime, timezone
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+validator_path = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("browser_vm_live_audio_self_test", validator_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load live-audio validator")
+validator = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(validator)
+document = validator.fixture(
+    manifest_path.parent, datetime.now(timezone.utc).replace(microsecond=0)
+)
+manifest_path.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+manifest_path.chmod(0o600)
+PY
+    validation=$("$ROOT/install-helpers/verify-browser-vm-audio.sh" --live-evidence "$manifest")
+    printf '%s' "$validation" | python3 -c '
+import json
+import sys
+
+result = json.load(sys.stdin)
+if result.get("status") != "validated":
+    raise SystemExit("live sample wrapper did not validate sample-backed evidence")
+claims = result.get("claims", {})
+if claims.get("scope") != "digital-pcm-path-only" or claims.get("production_audio_acceptance") != "not-proven-by-this-validator":
+    raise SystemExit("live sample wrapper weakened the evidence scope")
+'
+
+    printf '%s\n' '{"schema_version":1,"playback_endpoint_count":1,"capture_endpoint_count":1,"recovery_observed":true}' >"$endpoint_only"
+    chmod 0600 "$endpoint_only"
+    if "$ROOT/install-helpers/verify-browser-vm-audio.sh" --live-evidence "$endpoint_only" >/dev/null 2>&1; then
+        echo 'verify-browser-vm-audio: live evidence wrapper accepted endpoint-only counters' >&2
+        exit 1
+    fi
+
+    ln -s "$manifest" "$symlink_manifest"
+    if "$ROOT/install-helpers/verify-browser-vm-audio.sh" --live-evidence "$symlink_manifest" >/dev/null 2>&1; then
+        echo 'verify-browser-vm-audio: live evidence wrapper accepted a symlinked manifest' >&2
+        exit 1
+    fi
+
+    rm -rf "$fixture"
+    trap - EXIT
 }
 
 runtime_evidence_order_self_test() {
@@ -386,6 +466,11 @@ case "$1" in
     --domain)
         command -v virsh >/dev/null 2>&1 || { echo 'verify-browser-vm-audio: virsh is required for --domain' >&2; exit 2; }
         virsh dumpxml "$2" | check_xml "virsh:$2"
+        ;;
+    --live-evidence)
+        [[ -f "$2" && ! -L "$2" ]] || { echo "verify-browser-vm-audio: live evidence is missing or symlinked: $2" >&2; exit 2; }
+        [[ -x "$LIVE_AUDIO_VALIDATOR" && ! -L "$LIVE_AUDIO_VALIDATOR" ]] || { echo "verify-browser-vm-audio: live sample validator is missing, non-executable, or symlinked: $LIVE_AUDIO_VALIDATOR" >&2; exit 2; }
+        exec python3 "$LIVE_AUDIO_VALIDATOR" validate "$2"
         ;;
     *)
         usage
