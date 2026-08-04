@@ -13,3 +13,6 @@ publish = false
 mde-vdi-core = { path = "../../crates/desktop/mde-vdi-core" }
 mde-vdi-rdp = { path = "../../crates/desktop/mde-vdi-rdp", features = ["live-connect"] }
 serde_json = "1"
+
+[patch.crates-io]
+ironrdp-session = { path = "../../vendor/ironrdp-session" }

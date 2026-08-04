@@ -16,6 +16,7 @@
 [workspace]
 resolver = "2"
 exclude = [
+    "vendor/ironrdp-session",
 ]
 members = [
     "crates/guest/mde-wayland-workspace",
@@ -89,6 +90,10 @@ anyhow = "1"
 # those fixes land upstream.
 [patch.crates-io]
 spice-client = { path = "vendor/spice-client" }
+# IronRDP 0.10.0 loses the encoded row stride when an RDP bitmap is clipped,
+# which can index beyond the framebuffer. Keep the coherent 0.10 dependency
+# family and carry the narrowly backported upstream bounds fix.
+ironrdp-session = { path = "vendor/ironrdp-session" }
 
 [workspace.lints.rust]
 unsafe_code     = "forbid"
