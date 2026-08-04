@@ -557,6 +557,16 @@ pub fn run_reconnect() -> Result<()> {
     let receipt = absolute_option(&required_env("MCNF_BROWSER_VM_RECONNECT_RECEIPT")?)?;
     let config = HostConfig::load()?;
     let mut driver = RdpDriver::connect(&config)?;
+    // A completed one-shot probe URL is deliberately deleted by the previous
+    // hook. Chromium may reload that URL while xrdp reattaches, replacing the
+    // probe page with a rejection response and defeating visual-identity proof
+    // even though the same Browser session recovered correctly. Establish a
+    // stable, credential-free loopback anchor before taking the baseline; the
+    // post-recovery probe navigates to its own fresh one-shot URL afterwards.
+    let reconnect_anchor = format!("{}/", config.browser_origin());
+    driver
+        .navigate(&reconnect_anchor)
+        .context("navigate Browser to stable reconnect anchor")?;
     driver.request_full_refresh()?;
     let baseline = driver.wait_for_browser_frame(Duration::from_secs(20))?;
     driver.disconnect()?;
