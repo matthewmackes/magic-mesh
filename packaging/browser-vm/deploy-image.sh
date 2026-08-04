@@ -31,8 +31,9 @@ Options:
   --apply                     publish; otherwise the command is dry-run
 
 The remote preflight requires KVM, qemu-img, the qemu group, and passwordless
-sudo. Existing bases are copied to a timestamped backup before atomic
-installation as root:qemu mode 0440. A schema-v2 receipt requires a running
+sudo. Existing bases are moved to a timestamped backup after the replacement
+has been fully staged and verified, then the replacement is atomically installed
+as root:qemu mode 0440. A schema-v2 receipt requires a running
 domain whose sole vda is a writable qcow2 overlay backed directly by this base.
 USAGE
 }
@@ -321,6 +322,13 @@ run_action() {
     "${SSH_ARGS[@]}" -- "$destination" "
         set -eu
         cleanup_publish() {
+            # If publication stopped between moving the old base aside and
+            # installing the verified replacement, restore the old path. This
+            # keeps rollback atomic without temporarily storing three full
+            # additional image copies on a capacity-constrained seat.
+            if ! sudo -n test -e '$REMOTE_IMAGE' && sudo -n test -e '$backup'; then
+                sudo -n mv -T -- '$backup' '$REMOTE_IMAGE'
+            fi
             sudo -n rm -f -- '$remote_tmp' '${REMOTE_IMAGE}.new'
         }
         trap cleanup_publish EXIT
@@ -332,8 +340,13 @@ run_action() {
         sudo -n chmod 0400 '$remote_tmp'
         test \"\$(sudo -n sha256sum -- '$remote_tmp' | awk '{print \"sha256:\" \$1}')\" = '$digest'
         sudo -n qemu-img check --force-share '$remote_tmp'
-        if sudo -n test -e '$REMOTE_IMAGE'; then sudo -n cp -a -- '$REMOTE_IMAGE' '$backup'; fi
         sudo -n install -o root -g qemu -m 0440 '$remote_tmp' '${REMOTE_IMAGE}.new'
+        test \"\$(sudo -n sha256sum -- '${REMOTE_IMAGE}.new' | awk '{print \"sha256:\" \$1}')\" = '$digest'
+        sudo -n qemu-img check --force-share '${REMOTE_IMAGE}.new'
+        if sudo -n test -e '$REMOTE_IMAGE'; then
+            sudo -n test ! -e '$backup'
+            sudo -n mv -T -- '$REMOTE_IMAGE' '$backup'
+        fi
         sudo -n mv -T -- '${REMOTE_IMAGE}.new' '$REMOTE_IMAGE'
         if sudo -n sh -c 'command -v restorecon >/dev/null 2>&1'; then
             sudo -n restorecon -F -- '$REMOTE_IMAGE'
