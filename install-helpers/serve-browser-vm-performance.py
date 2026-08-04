@@ -73,11 +73,11 @@ WIDTH = 1920
 HEIGHT = 1080
 TARGET_FPS = 30
 WINDOW_LAYOUT = (
-    (0, 0, 640, 540),
-    (640, 0, 640, 540),
-    (1280, 0, 640, 540),
-    (0, 540, 960, 540),
-    (960, 540, 960, 540),
+    (0, 0, 384, 216),
+    (384, 0, 384, 216),
+    (768, 0, 384, 216),
+    (1152, 0, 384, 216),
+    (1536, 0, 384, 216),
 )
 TAB_RATE_PROBE_SECONDS = 4.0
 MEDIA_DURATION_SECONDS = 8
@@ -253,7 +253,7 @@ def generate_media_asset(runtime_root: Path) -> MediaAsset:
             "drawtext=font=Sans:text='MCNF 1080p 30 FPS':"
             "fontcolor=white:fontsize=32:x=32:y=36,"
             "drawtext=font=Sans:text='FRAME %{n}':"
-            "fontcolor=0x80cbc4:fontsize=20:x='mod(n*11,500)':y=200"
+            "fontcolor=0x80cbc4:fontsize=20:x='mod(n*11,260)':y=150"
         ),
         "-an",
         "-c:v",
@@ -1441,11 +1441,11 @@ class CdpTab:
 def spread_tabs_across_visible_windows(tabs: list[CdpTab]) -> bool:
     """Keep every measured page active in its own visible headful window.
 
-    Inactive tabs do not submit compositor frames. Five non-overlapping tiles
-    keep every real 1080p source visibly scheduled while limiting composition
-    to the one 1920x1080 desktop, rather than asking a software guest to render
-    five full-desktop surfaces. Return ``True`` when targets changed so the
-    caller can rediscover them.
+    Inactive tabs do not submit compositor frames. Five non-overlapping 384x216
+    viewports keep every real 1080p source visibly scheduled while bounding
+    software composition to one fifth of the 1080p desktop. Source geometry and
+    cadence remain measured independently at 1920x1080/30. Return ``True`` when
+    targets changed so the caller can rediscover them.
     """
     if len(tabs) != MIN_TABS:
         fail("Chromium window spreading requires the exact measured tab set")
@@ -2806,7 +2806,9 @@ def summarize(args: argparse.Namespace) -> int:
 def self_test() -> None:
     assert compact_json({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
     assert len(WINDOW_LAYOUT) == MIN_TABS
-    assert sum(width * height for _, _, width, height in WINDOW_LAYOUT) == WIDTH * HEIGHT
+    assert sum(width * height for _, _, width, height in WINDOW_LAYOUT) == (
+        WIDTH * HEIGHT // 5
+    )
     for index, (left, top, width, height) in enumerate(WINDOW_LAYOUT):
         assert 0 <= left < WIDTH and 0 <= top < HEIGHT
         assert width > 0 and height > 0
