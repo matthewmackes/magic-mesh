@@ -18,6 +18,7 @@ const POINTER_FOCUS_SETTLE: Duration = Duration::from_millis(50);
 const POINTER_BUTTON_HOLD: Duration = Duration::from_millis(75);
 const POST_CLICK_BROWSER_SETTLE: Duration = Duration::from_millis(350);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+const RECONNECT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_BROWSER_COLORS: usize = 24;
 const MIN_BROWSER_NON_DOMINANT: usize = 25_000;
 pub const MIN_RECONNECT_IDENTITY_PER_MILLE: u16 = 850;
@@ -294,6 +295,7 @@ impl RdpDriver {
         self.connection = Some(connection);
         self.request_full_refresh()?;
         let started = Instant::now();
+        let mut last_refresh = Instant::now();
         let mut best_identity = 0_u16;
         let mut coverage = DamageCoverage::new(baseline.size);
         while started.elapsed() < INITIAL_FRAME_TIMEOUT {
@@ -312,6 +314,17 @@ impl RdpDriver {
                 {
                     return Ok(identity);
                 }
+            }
+            // xrdp may deliver identity and repaint coverage in separate frame
+            // updates, then become quiet. Once coverage is sufficient, request
+            // another bounded refresh so success still requires a qualifying
+            // Browser frame observed after the repaint threshold was met.
+            if coverage.per_mille() >= MIN_RECONNECT_DAMAGE_PER_MILLE
+                && last_refresh.elapsed() >= RECONNECT_REFRESH_INTERVAL
+            {
+                self.request_full_refresh()
+                    .context("request coverage-qualified Browser repaint")?;
+                last_refresh = Instant::now();
             }
         }
         bail!(
