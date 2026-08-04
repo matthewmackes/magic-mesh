@@ -16,13 +16,16 @@ usage() {
 Usage:
   prepare-ephemeral-nocloud.sh preflight --image PATH [--run-dir DIR] [--require-gpu]
   prepare-ephemeral-nocloud.sh seed --out DIR --image-digest sha256:HEX64 \
-      --session-id session:ID --transport rdp|spice
+      --session-id session:ID --transport rdp|spice \
+      [--transport-health connected|reconnecting|failed|unavailable]
   prepare-ephemeral-nocloud.sh --self-test
 
 preflight is read-only. It requires KVM and refuses TCG; it does not start
 QEMU or modify libvirt, hosts, images, or network configuration.
 seed creates a new directory containing fixed NoCloud metadata and seed.iso.
 It accepts no user, password, SSH key, token, or other credential input.
+Transport health defaults to unavailable. A caller may seed another typed state
+only when it has independent evidence for that exact immutable image release.
 USAGE
 }
 
@@ -59,6 +62,13 @@ validate_transport() {
     esac
 }
 
+validate_transport_health() {
+    case "$1" in
+        connected|reconnecting|failed|unavailable) ;;
+        *) fail "transport health must be connected, reconnecting, failed, or unavailable" ;;
+    esac
+}
+
 validate_absolute_path() {
     local path=$1
     [[ "$path" == /* ]] || fail "path must be absolute: $path"
@@ -72,6 +82,7 @@ write_seed_files() {
     local image_digest=$2
     local session_id=$3
     local transport=$4
+    local transport_health=$5
 
     printf '%s\n' \
         'instance-id: mcnf-browser-vm-ephemeral' \
@@ -126,7 +137,7 @@ write_files:
     owner: root:root
     permissions: "0644"
     content: |
-      unavailable
+      $transport_health
 USER_DATA
 }
 
@@ -143,6 +154,7 @@ seed() {
     local image_digest=
     local session_id=
     local transport=
+    local transport_health=unavailable
 
     while (($#)); do
         case "$1" in
@@ -166,6 +178,11 @@ seed() {
                 transport=$2
                 shift 2
                 ;;
+            --transport-health)
+                (($# >= 2)) || fail "--transport-health requires a value"
+                transport_health=$2
+                shift 2
+                ;;
             *) fail "unknown seed option: $1" ;;
         esac
     done
@@ -178,6 +195,7 @@ seed() {
     validate_digest "$image_digest"
     validate_session_id "$session_id"
     validate_transport "$transport"
+    validate_transport_health "$transport_health"
     require_command sha256sum
 
     [[ ! -e "$out" && ! -L "$out" ]] || fail "refusing to overwrite existing seed path: $out"
@@ -187,19 +205,25 @@ seed() {
     [[ ! -L "$parent" ]] || fail "seed parent directory must not be a symlink: $parent"
 
     SEED_TMP=$(mktemp -d "$parent/.mcnf-browser-vm-seed.XXXXXX")
-    write_seed_files "$SEED_TMP" "$image_digest" "$session_id" "$transport"
+    write_seed_files \
+        "$SEED_TMP" "$image_digest" "$session_id" "$transport" "$transport_health"
     build_seed_iso "$SEED_TMP"
 
     local seed_sha256
     seed_sha256=$(sha256sum "$SEED_TMP/seed.iso" | awk '{print $1}')
-    printf '{"schema_version":1,"kind":"browser_vm_nocloud_seed","profile":"browser-vm-chromium","image_digest":"%s","session_id":"%s","transport":"%s","transport_health":"unavailable","seed_sha256":"%s"}\n' \
-        "$image_digest" "$session_id" "$transport" "$seed_sha256" > "$SEED_TMP/seed-manifest.json"
+    printf '{"schema_version":1,"kind":"browser_vm_nocloud_seed","profile":"browser-vm-chromium","image_digest":"%s","session_id":"%s","transport":"%s","transport_health":"%s","seed_sha256":"%s"}\n' \
+        "$image_digest" "$session_id" "$transport" "$transport_health" "$seed_sha256" \
+        > "$SEED_TMP/seed-manifest.json"
     chmod 600 "$SEED_TMP/seed-manifest.json"
 
     mv -- "$SEED_TMP" "$out"
     SEED_TMP=
     printf 'seed prepared: %s\n' "$out"
-    printf 'transport health is fail-closed until live proof: unavailable\n'
+    if [[ "$transport_health" == unavailable ]]; then
+        printf 'transport health is fail-closed until live proof: unavailable\n'
+    else
+        printf 'transport health seeded from external release evidence: %s\n' "$transport_health"
+    fi
 }
 
 read_available_memory_kib() {
@@ -311,7 +335,7 @@ self_test() {
     local digest=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     local session=session:00000000-0000-4000-8000-000000000001
 
-    write_seed_files "$fixture" "$digest" "$session" spice
+    write_seed_files "$fixture" "$digest" "$session" spice unavailable
     grep -Fq 'transport-health' "$fixture/user-data" || fail "self-test seed omitted transport health"
     grep -Fq 'unavailable' "$fixture/user-data" || fail "self-test seed is not fail-closed"
     grep -Fq 'chmod, "0755"' "$fixture/user-data" || fail "self-test seed directory is not runtime-readable"
@@ -328,6 +352,15 @@ self_test() {
     build_seed_iso "$fixture"
     [[ -s "$fixture/seed.iso" ]] || fail "self-test seed.iso is empty"
 
+    "$0" seed --out "$fixture/qualified-seed" --image-digest "$digest" \
+        --session-id "$session" --transport rdp --transport-health connected \
+        >/dev/null
+    grep -Fq '      connected' "$fixture/qualified-seed/user-data" ||
+        fail "self-test qualified seed omitted connected transport health"
+    grep -Fq '"transport_health":"connected"' \
+        "$fixture/qualified-seed/seed-manifest.json" ||
+        fail "self-test qualified seed manifest omitted connected transport health"
+
     mkdir "$fixture/existing"
     if "$0" seed --out "$fixture/existing" --image-digest "$digest" --session-id "$session" --transport spice >/dev/null 2>&1; then
         fail "self-test overwrote a pre-existing output directory"
@@ -337,6 +370,9 @@ self_test() {
     fi
     if "$0" seed --out "$fixture/new-seed" --image-digest "$digest" --session-id "$session" --transport sunshine >/dev/null 2>&1; then
         fail "self-test accepted an unsupported transport"
+    fi
+    if "$0" seed --out "$fixture/new-seed" --image-digest "$digest" --session-id "$session" --transport rdp --transport-health healthy >/dev/null 2>&1; then
+        fail "self-test accepted an unsupported transport health"
     fi
     if "$0" seed --out "$fixture/new-seed" --image-digest sha256:not-a-digest --session-id "$session" --transport spice >/dev/null 2>&1; then
         fail "self-test accepted an invalid image digest"
