@@ -3,9 +3,11 @@
 set -euo pipefail
 TAG="${1:-localhost/magic-mesh-browser-vm-chromium:latest}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SESSION_INPUT_VERIFY="$ROOT/packaging/browser-vm/verify-session-input-contract.sh"
 
 if [[ "${1:-}" == "--self-test" ]]; then
     [[ "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
+    "$SESSION_INPUT_VERIFY" --self-test >/dev/null
     echo 'Browser VM image provenance self-tests passed'
     exit 0
 fi
@@ -25,7 +27,7 @@ inner='set -u
 fail=0
 ok(){ echo "  OK   $1"; }
 bad(){ echo "  FAIL $1"; fail=1; }
-for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-media-probe /usr/libexec/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json /usr/share/mcnf/browser-vm/source-commit /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; do
+for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-verify-session-input /usr/local/libexec/mcnf-browser-vm-media-probe /usr/libexec/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json /usr/share/mcnf/browser-vm/source-commit /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; do
   [ -f "$path" ] && ok "image file present: $path" || bad "image file missing: $path"
 done
 guest_source_commit="$(cat /usr/share/mcnf/browser-vm/source-commit 2>/dev/null || true)"
@@ -36,7 +38,7 @@ chromium_bin="$(command -v chromium || command -v chromium-browser || true)"
 for binary in mackesd meshctl nebula sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
   command -v "$binary" >/dev/null 2>&1 && ok "runtime binary present: $binary" || bad "runtime binary missing: $binary"
 done
-for package in magic-mesh-lighthouse chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa pulseaudio-utils alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xrdp-selinux xorgxrdp qemu-guest-agent; do
+for package in magic-mesh-lighthouse chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa pulseaudio-utils alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xrdp-selinux xorgxrdp-glamor qemu-guest-agent; do
   rpm -q "$package" >/dev/null 2>&1 && ok "package installed: $package" || bad "package missing: $package"
 done
 [ -L /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service ] \
@@ -52,6 +54,12 @@ grep -Fq "\"transports\":[\"rdp\",\"spice\"]" /usr/share/mcnf/browser-vm/image-c
 grep -Fxq "DefaultWindowManager=startwm.sh" /etc/xrdp/sesman.ini \
   && ok "xrdp authenticated sessions enter the Browser runtime" \
   || bad "xrdp authenticated sessions do not enter the Browser runtime"
+grep -Fxq "use_fastpath=input" /etc/xrdp/xrdp.ini \
+  && ok "xrdp uses FastPath input with slow-path bitmap graphics" \
+  || bad "xrdp graphics may enter an unsupported FastPath output path"
+/usr/local/libexec/mcnf-browser-vm-verify-session-input --image-root / \
+  && ok "xrdp/Xorg/Sway/Chromium session-input contract" \
+  || bad "xrdp/Xorg/Sway/Chromium session-input contract"
 semodule -l 2>/dev/null | grep -Eq "^xrdp([[:space:]]|$)" \
   && ok "xrdp SELinux policy module is active" \
   || bad "xrdp SELinux policy module is inactive"

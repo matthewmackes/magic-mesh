@@ -16,6 +16,7 @@ RUNTIME="$BROWSER_VM/mcnf-browser-vm-runtime.sh"
 RUNTIME_UNIT="$BROWSER_VM/mcnf-browser-vm-runtime.service"
 XRDP_STARTWM="$BROWSER_VM/mcnf-browser-vm-xrdp-startwm.sh"
 SESSION="$BROWSER_VM/mcnf-browser-vm-session.sh"
+SESSION_INPUT_VERIFY="$BROWSER_VM/verify-session-input-contract.sh"
 MEDIA_PROBE="$BROWSER_VM/mcnf-browser-vm-media-probe.sh"
 MEDIA_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-media-evidence.py"
 PERFORMANCE_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-performance.py"
@@ -40,6 +41,7 @@ fail() {
 [ -x "$RUNTIME" ] || fail "guest runtime is not executable"
 [ -x "$XRDP_STARTWM" ] || fail "xrdp session entrypoint is not executable"
 [ -x "$SESSION" ] || fail "media session supervisor is not executable"
+[ -x "$SESSION_INPUT_VERIFY" ] || fail "session/input contract verifier is not executable"
 [ -x "$MEDIA_PROBE" ] || fail "guest media probe is not executable"
 [ -x "$MEDIA_EVIDENCE_VERIFY" ] || fail "media evidence verifier is not executable"
 [ -x "$PERFORMANCE_EVIDENCE_VERIFY" ] || fail "performance evidence verifier is not executable"
@@ -49,7 +51,7 @@ fail() {
 [ -x "$EPHEMERAL_NOCLOUD" ] || fail "ephemeral NoCloud helper is not executable"
 [ -x "$DEPLOY_IMAGE" ] || fail "image deploy helper is not executable"
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
-bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
+bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$SESSION_INPUT_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
 python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
@@ -63,14 +65,9 @@ for runtime_path in "$VALIDATOR" "$RUNTIME" "$MEDIA_PROBE"; do
         fail "Browser runtime component uses the protected daemon configuration root: $runtime_path"
     fi
 done
-grep -Fq "DefaultWindowManager=startwm.sh" "$BROWSER_VM/Containerfile" \
-    || fail "Browser image does not route authenticated xrdp sessions into its runtime"
-grep -Fq '/usr/libexec/xrdp/startwm.sh' "$BROWSER_VM/Containerfile" \
-    || fail "Browser image does not install its xrdp entrypoint at Fedora's SELinux-admitted path"
-grep -Fq 'export WLR_BACKENDS=x11' "$XRDP_STARTWM" \
-    || fail "Browser xrdp entrypoint does not select the nested X11 backend"
-grep -Fq 'export WLR_RENDERER=pixman' "$XRDP_STARTWM" \
-    || fail "Browser xrdp entrypoint does not select the renderer supported by nested X11"
+"$SESSION_INPUT_VERIFY" --source "$BROWSER_VM" >/dev/null
+grep -Fq "use_fastpath=input" "$BROWSER_VM/Containerfile" \
+    || fail "Browser image does not keep graphics on slow-path bitmap updates"
 grep -Fq 'xrdp-selinux' "$BROWSER_VM/Containerfile" \
     || fail "Browser image omits the Fedora xrdp SELinux policy package"
 grep -Fq 'BROWSER_VM_DISK_GB' "$IMAGE_BUILD" || fail "image builder does not bind disk size to the profile"

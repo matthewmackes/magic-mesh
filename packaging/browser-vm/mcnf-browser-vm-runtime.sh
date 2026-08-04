@@ -260,13 +260,25 @@ default_floating_border none
 # the first safe mode so a fresh guest does not leave the compositor with a
 # connected-but-unconfigured scanout (which presents as a black SPICE frame).
 output * enable
-output * mode 1024x768
+output * mode 1920x1080
+# wlroots' nested X11 backend advertises no modes, so the ordinary wildcard
+# mode request above cannot resize its default 1024x768 window.  The explicit
+# custom mode keeps Sway, Chromium, Xorg, and the negotiated RDP desktop at one
+# geometry; absent output names are ignored by the other transport backend.
+output X11-1 enable
+output X11-1 mode --custom 1920x1080
 # QEMU's virtio-vga connector is named Virtual-1. Keep the wildcard defaults
 # for other display backends, but explicitly configure the live SPICE path so
 # wlroots cannot leave the connected scanout unconfigured.
 output Virtual-1 enable
-output Virtual-1 mode 1024x768
-exec @CHROMIUM_BIN@ --ozone-platform=wayland --enable-features=UseOzonePlatform --start-maximized --no-first-run --disable-session-crashed-bubble --user-data-dir=/var/lib/mcnf-browser/chromium
+output Virtual-1 mode 1920x1080
+# Restore a persisted workload automatically after an unclean seat/VM restart,
+# but keep Chromium's crash-recovery prompt out of the dedicated workspace.
+# The prompt is anchored to the app-menu control and can otherwise obscure the
+# first interaction after a seat or VM reboot. Reduced motion also makes popup
+# surfaces opaque on their first frame, avoiding a stale translucent menu when
+# xrdp's classic-bitmap stream coalesces Chromium's opening animation.
+exec @CHROMIUM_BIN@ --ozone-platform=wayland --enable-features=UseOzonePlatform --start-maximized --no-first-run --restore-last-session --hide-crash-restore-bubble --force-prefers-reduced-motion --user-data-dir=/var/lib/mcnf-browser/chromium
 EOF
 
 # Chromium and the compositor are guest-owned. No URL, command, path, or

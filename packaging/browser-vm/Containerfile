@@ -11,6 +11,7 @@ COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtim
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service
 COPY packaging/browser-vm/mcnf-browser-vm-xrdp-startwm.sh /tmp/mcnf-browser-vm-xrdp-startwm
 COPY packaging/browser-vm/mcnf-browser-vm-session.sh /tmp/mcnf-browser-vm-session
+COPY packaging/browser-vm/verify-session-input-contract.sh /tmp/mcnf-browser-vm-verify-session-input
 COPY packaging/browser-vm/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-fixture.html
 COPY packaging/browser-vm/mcnf-browser-vm-media-probe.sh /tmp/mcnf-browser-vm-media-probe
 COPY crates/desktop/mde-media-core/tests/fixtures/tiny_clip.mkv /tmp/mcnf-browser-vm-tiny_clip.mkv
@@ -22,6 +23,7 @@ RUN set -eux; \
     install -D -m 0755 /tmp/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-runtime; \
     install -D -m 0644 /tmp/mcnf-browser-vm-runtime.service /etc/systemd/system/mcnf-browser-vm-runtime.service; \
     install -D -m 0755 /tmp/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-session; \
+    install -D -m 0755 /tmp/mcnf-browser-vm-verify-session-input /usr/local/libexec/mcnf-browser-vm-verify-session-input; \
     install -D -m 0755 /tmp/mcnf-browser-vm-media-probe /usr/local/libexec/mcnf-browser-vm-media-probe; \
     install -D -m 0644 /tmp/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html; \
     install -D -m 0644 /tmp/mcnf-browser-vm-tiny_clip.mkv /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; \
@@ -40,7 +42,13 @@ RUN set -eux; \
         pulseaudio-utils \
         mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
         libva-utils libinput libxkbcommon xorg-x11-server-Xwayland \
-        xrdp xrdp-selinux xorgxrdp qemu-guest-agent; \
+        xrdp xrdp-selinux xorgxrdp-glamor qemu-guest-agent; \
+    # Fedora's glamor build keeps xrdp's software capture memory synchronized
+    # with the composed Xorg screen pixmap.  The Browser VM presents a virtio
+    # render node, so admit that DRM driver in addition to Fedora's physical-GPU
+    # defaults; otherwise xorgxrdp silently falls back to the stale pfb path.
+    sed -i 's/Option "DRMAllowList" "[^"]*"/Option "DRMAllowList" "amdgpu i915 msm radeon virtio_gpu"/' /etc/X11/xrdp/xorg.conf; \
+    grep -Fq 'Option "DRMAllowList" "amdgpu i915 msm radeon virtio_gpu"' /etc/X11/xrdp/xorg.conf; \
     # Install the image-owned entrypoint after the xrdp RPM lays down its
     # defaults, then replace Fedora's selected /usr/libexec entrypoint in place.
     # Installing the script under /etc gives it etc_t, which xrdp_session_t is
@@ -49,6 +57,13 @@ RUN set -eux; \
     install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /usr/libexec/xrdp/startwm.sh; \
     sed -i 's/^DefaultWindowManager=.*/DefaultWindowManager=startwm.sh/' /etc/xrdp/sesman.ini; \
     grep -Fxq 'DefaultWindowManager=startwm.sh' /etc/xrdp/sesman.ini; \
+    # Keep latency-sensitive input on FastPath, but leave graphics on xrdp's
+    # slow-path bitmap-update transport. IronRDP 0.10 intentionally advertises
+    # no primary drawing orders; xorgxrdp-glamor synchronizes the composed
+    # screen before this compatible painter path captures each dirty region.
+    sed -i 's/^use_fastpath=.*/use_fastpath=input/' /etc/xrdp/xrdp.ini; \
+    grep -Fxq 'use_fastpath=input' /etc/xrdp/xrdp.ini; \
+    /usr/local/libexec/mcnf-browser-vm-verify-session-input --image-root /; \
     useradd --create-home --shell /bin/bash mcnf-browser; \
     for group in video input audio seat render; do \
         if ! grep -q "^${group}:" /etc/group; then \
@@ -70,7 +85,7 @@ RUN set -eux; \
     # explicitly so the guest agent starts when the SPICE channel is present.
     ln -sf /usr/lib/systemd/system/spice-vdagentd.service /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service; \
     systemctl enable xrdp.service; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-verify-session-input /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv; \
     dnf clean all
 
 RUN systemctl enable mcnf-browser-vm-runtime.service
