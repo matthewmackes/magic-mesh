@@ -623,8 +623,8 @@ resolve_short_node() {
     printf '%s\n' "$result"
 }
 
-wait_qemu_stream_on() {
-    local direction=$1 pid=$2 source_id=$3 attempt result stream_id route_id
+move_qemu_stream_to() {
+    local direction=$1 pid=$2 target=$3 source_id=$4 attempt result stream_id route_id
     for ((attempt = 0; attempt < 40; attempt += 1)); do
         if result=$(find_qemu_stream "$direction" "$pid"); then
             IFS=$'\t' read -r stream_id route_id <<<"$result"
@@ -632,6 +632,7 @@ wait_qemu_stream_on() {
                 printf '%s\n' "$stream_id"
                 return 0
             fi
+            host_run "$PACTL_BIN" move-source-output "$stream_id" "$target" >/dev/null 2>&1 || true
         fi
         sleep 0.1
     done
@@ -976,9 +977,7 @@ collect_capture() {
     load_injection_sink "$phase"
     injection_sink_id=$(resolve_short_node sinks "$injection_sink") || die "stimulus sink disappeared"
     injection_monitor_id=$(resolve_short_node sources "$injection_monitor") || die "stimulus monitor disappeared"
-    host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$injection_monitor" >/dev/null ||
-        die "$phase capture could not route the exact QEMU source-output to the stimulus monitor"
-    capture_stream_id=$(wait_qemu_stream_on capture "$qemu_pid" "$injection_monitor_id") ||
+    capture_stream_id=$(move_qemu_stream_to capture "$qemu_pid" "$injection_monitor" "$injection_monitor_id") ||
         die "$phase capture source-output route did not take effect on the exact QEMU stream"
 
     host_async_start 12 "$PW_PLAY_BIN" --target "$injection_sink" --volume 0.25 "$tone_wav"
@@ -990,9 +989,7 @@ collect_capture() {
     private_regular_file "$final_wav" || die "$phase Browser getUserMedia probe did not produce a private WAV"
 
     host_async_wait "$phase host capture stimulus"
-    host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$capture_original_source" >/dev/null ||
-        die "$phase capture could not restore the QEMU source-output"
-    capture_stream_id=$(wait_qemu_stream_on capture "$qemu_pid" "$capture_original_source") ||
+    capture_stream_id=$(move_qemu_stream_to capture "$qemu_pid" "$capture_original_source" "$capture_original_source") ||
         die "$phase capture could not verify the restored exact QEMU source-output"
     capture_stream_id=""
     capture_original_source=""
@@ -1417,17 +1414,6 @@ def warned():
 injection = (state / "injection-name").read_text().strip() if (state / "injection-name").exists() else ""
 current_source = (state / "current-source").read_text().strip() if (state / "current-source").exists() else "12"
 stream_id = (state / "stream-id").read_text().strip() if (state / "stream-id").exists() else "55"
-pending_source = state / "pending-source-restore"
-if args in (["list", "source-outputs"], ["list", "short", "source-outputs"]) and pending_source.exists():
-    remaining = int(pending_source.read_text(encoding="utf-8"))
-    if remaining > 0:
-        pending_source.write_text(f"{remaining - 1}\n", encoding="utf-8")
-    else:
-        current_source = "12"
-        stream_id = str(int(stream_id) + 1)
-        (state / "current-source").write_text(current_source + "\n", encoding="utf-8")
-        (state / "stream-id").write_text(stream_id + "\n", encoding="utf-8")
-        pending_source.unlink()
 if args == ["list", "clients"]:
     print('''Client #88
 \tProperties:
@@ -1515,8 +1501,16 @@ elif len(args) == 3 and args[0] == "move-source-output" and args[1] == stream_id
         source = "12"
     else:
         raise SystemExit(1)
-    if source == "12" and (state / "delayed-source-restore").exists():
-        pending_source.write_text("1\n", encoding="utf-8")
+    ignored_restore = state / "ignore-next-source-restore"
+    if source == "21":
+        (state / "current-source").write_text(source + "\n", encoding="utf-8")
+        if (state / "delayed-source-restore").exists():
+            ignored_restore.touch()
+    elif ignored_restore.exists():
+        ignored_restore.unlink()
+        stream_id = str(int(stream_id) + 1)
+        (state / "stream-id").write_text(stream_id + "\n", encoding="utf-8")
+        event("mutate:pactl-move-ignored:" + source)
     else:
         (state / "current-source").write_text(source + "\n", encoding="utf-8")
     event("mutate:pactl-move:" + source)
