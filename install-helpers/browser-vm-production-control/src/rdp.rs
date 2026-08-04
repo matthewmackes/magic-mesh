@@ -14,7 +14,6 @@ const PRE_NAVIGATION_SETTLE: Duration = Duration::from_millis(150);
 const OMNIBOX_FOCUS_SETTLE: Duration = Duration::from_millis(350);
 const POST_NAVIGATION_BROWSER_SETTLE: Duration = Duration::from_secs(1);
 const BETWEEN_JOB_CONTROLLER_SETTLE: Duration = Duration::from_secs(6);
-const BETWEEN_JOB_NEUTRAL_URL: &str = "about:blank";
 const POINTER_FOCUS_SETTLE: Duration = Duration::from_millis(50);
 const POINTER_BUTTON_HOLD: Duration = Duration::from_millis(75);
 const POST_CLICK_BROWSER_SETTLE: Duration = Duration::from_millis(350);
@@ -257,16 +256,9 @@ impl RdpDriver {
     }
 
     pub fn settle_between_browser_jobs(&mut self) -> Result<()> {
-        // Tear down the completed probe document before opening the next job.
-        // Chromium can otherwise assign a speculative connection retained by
-        // that document to the follow-up top-level navigation; the strict
-        // one-request controller rejects the resulting transport and leaves
-        // the new job correctly untouched. A local about:blank transition
-        // removes the old origin first. Keep servicing RDP frames for longer
-        // than the controller's four-second socket timeout before the caller
-        // navigates to the next one-shot page.
-        self.navigate_location(BETWEEN_JOB_NEUTRAL_URL)
-            .context("leave completed Browser probe page")?;
+        // Keep servicing RDP while the bounded guest controller retires any
+        // idle speculative sockets. The controller handles those sockets on
+        // separate capped workers, so one cannot block the next probe page.
         self.pump_for(BETWEEN_JOB_CONTROLLER_SETTLE)
     }
 

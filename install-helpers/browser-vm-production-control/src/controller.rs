@@ -15,13 +15,21 @@ use crate::{hex_encode, random_bytes};
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 const JOB_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PLAYBACK_OVERRUN_MS: u64 = 5_000;
 const MAX_CAPTURE_OVERRUN_MS: u64 = 5_000;
+// Chromium permits up to six HTTP/1.1 connections per origin. Keep all six
+// speculative/browser lanes plus one authenticated host request and one spare,
+// while retaining a hard process-memory bound.
+const MAX_CONNECTION_WORKERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
@@ -375,13 +383,15 @@ impl Controller {
         })
     }
 
-    pub fn serve(mut self) -> Result<()> {
+    pub fn serve(self) -> Result<()> {
         let address = SocketAddr::new(self.config.listen_address, self.config.listen_port);
         let listener = TcpListener::bind(address)
             .with_context(|| format!("bind Browser probe controller at {address}"))?;
         eprintln!("browser-vm-guest-audio-probe-controller: ready on {address}");
+        let controller = Arc::new(Mutex::new(self));
+        let active_workers = Arc::new(AtomicUsize::new(0));
         for accepted in listener.incoming() {
-            let mut stream = match accepted {
+            let stream = match accepted {
                 Ok(stream) => stream,
                 Err(error) => {
                     eprintln!("browser-vm-guest-audio-probe-controller: accept failed: {error}");
@@ -392,16 +402,24 @@ impl Controller {
                 Ok(peer) => peer,
                 Err(_) => continue,
             };
-            let request = match read_request(&mut stream, MAX_WAV_BODY_BYTES) {
-                Ok(request) => request,
-                Err(_) => {
-                    let response = HttpResponse::error(400, "request-rejected");
-                    let _ignored = write_response(&mut stream, &response);
-                    continue;
-                }
+            let Some(slot) = try_acquire_connection_slot(&active_workers) else {
+                eprintln!(
+                    "browser-vm-guest-audio-probe-controller: connection worker limit reached"
+                );
+                continue;
             };
-            let response = self.handle(peer.ip(), &request);
-            let _ignored = write_response(&mut stream, &response);
+            let shared_controller = Arc::clone(&controller);
+            if let Err(error) = thread::Builder::new()
+                .name("browser-vm-http".to_owned())
+                .spawn(move || {
+                    let _slot = slot;
+                    serve_connection(&shared_controller, stream, peer.ip());
+                })
+            {
+                eprintln!(
+                    "browser-vm-guest-audio-probe-controller: connection worker spawn failed: {error}"
+                );
+            }
         }
         Ok(())
     }
@@ -412,9 +430,12 @@ impl Controller {
             return self.handle_host(peer, request);
         }
         if request.path.starts_with("/probe/") {
-            return self
-                .handle_browser(peer, request)
-                .unwrap_or_else(|_| HttpResponse::error(400, "browser-request-rejected"));
+            return self.handle_browser(peer, request).unwrap_or_else(|error| {
+                eprintln!(
+                    "browser-vm-guest-audio-probe-controller: Browser request rejected: {error:#}"
+                );
+                HttpResponse::error(400, "browser-request-rejected")
+            });
         }
         HttpResponse::error(404, "not-found")
     }
@@ -661,6 +682,77 @@ impl Controller {
     }
 }
 
+struct ConnectionSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_connection_slot(active: &Arc<AtomicUsize>) -> Option<ConnectionSlot> {
+    let mut observed = active.load(Ordering::Acquire);
+    loop {
+        if observed >= MAX_CONNECTION_WORKERS {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            observed,
+            observed + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(ConnectionSlot {
+                    active: Arc::clone(active),
+                });
+            }
+            Err(current) => observed = current,
+        }
+    }
+}
+
+fn serve_connection(
+    controller: &Arc<Mutex<Controller>>,
+    mut stream: std::net::TcpStream,
+    peer: IpAddr,
+) {
+    let request = match read_request(&mut stream, MAX_WAV_BODY_BYTES) {
+        Ok(request) => request,
+        Err(error) if request_read_timed_out(&error) => {
+            // Chromium opens idle speculative sockets to the loopback origin.
+            // No HTTP request was received, so emitting a 400 response would
+            // let Chromium mistake an expired preconnection for the response
+            // to a later top-level navigation. Close it without a response.
+            return;
+        }
+        Err(error) => {
+            eprintln!("browser-vm-guest-audio-probe-controller: HTTP request rejected: {error:#}");
+            let response = HttpResponse::error(400, "request-rejected");
+            let _ignored = write_response(&mut stream, &response);
+            return;
+        }
+    };
+    let response = match controller.lock() {
+        Ok(mut controller) => controller.handle(peer, &request),
+        Err(_) => HttpResponse::error(500, "controller-state-unavailable"),
+    };
+    let _ignored = write_response(&mut stream, &response);
+}
+
+fn request_read_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        })
+    })
+}
+
 impl Drop for Controller {
     fn drop(&mut self) {
         self.secret.zeroize();
@@ -721,8 +813,13 @@ pub fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Job, Stage};
+    use super::{
+        request_read_timed_out, try_acquire_connection_slot, Job, Stage, MAX_CONNECTION_WORKERS,
+    };
     use crate::protocol::{BrowserEvent, JobSpec, Operation};
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn spec(operation: Operation) -> JobSpec {
         JobSpec {
@@ -740,6 +837,33 @@ mod tests {
             image_digest: format!("sha256:{}", "b".repeat(64)),
             transport: "rdp".to_owned(),
         }
+    }
+
+    #[test]
+    fn speculative_connection_workers_are_bounded() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONNECTION_WORKERS {
+            let slot = try_acquire_connection_slot(&active);
+            assert!(slot.is_some());
+            if let Some(slot) = slot {
+                slots.push(slot);
+            }
+        }
+        assert_eq!(active.load(Ordering::Acquire), MAX_CONNECTION_WORKERS);
+        assert!(try_acquire_connection_slot(&active).is_none());
+        assert!(slots.pop().is_some());
+        assert_eq!(active.load(Ordering::Acquire), MAX_CONNECTION_WORKERS - 1);
+        assert!(try_acquire_connection_slot(&active).is_some());
+    }
+
+    #[test]
+    fn speculative_read_timeout_is_closed_without_http_response() {
+        let timeout = anyhow::Error::new(io::Error::from(io::ErrorKind::TimedOut))
+            .context("read HTTP message");
+        assert!(request_read_timed_out(&timeout));
+        let malformed = anyhow::anyhow!("malformed HTTP request");
+        assert!(!request_read_timed_out(&malformed));
     }
 
     #[test]

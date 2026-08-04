@@ -9,10 +9,8 @@ This standalone crate supplies the two trusted executables required by
   one, after the collector's start signal, to start the measured operation. A
   live collection keeps one authenticated RDP transport for the phase's
   playback and capture jobs, replaces the current tab through Chromium's
-  proven omnibox shortcut for each job, crosses a local `about:blank` barrier
-  so the completed page cannot lend a stale speculative connection to the next
-  job, and pumps the bounded controller handoff rather than racing a second
-  xrdp attachment.
+  proven omnibox shortcut for each job, and pumps the bounded controller
+  handoff rather than racing a second xrdp attachment.
 - `browser-vm-reconnect-hook` gracefully closes a real RDP transport, creates a
   new TLS/CredSSP transport to the same endpoint, and requires both at least
   700 per mille unique inbound repaint coverage and 850 per mille visual
@@ -86,6 +84,9 @@ provide a live stereo 48 kHz capture endpoint. A mono endpoint fails closed.
 
 - The production control channel implemented here is RDP. It rejects a
   `sunshine` transport rather than mislabeling it `rdp-webaudio`.
+- The guest HTTP service handles at most eight connections concurrently. Idle
+  speculative Chromium sockets expire without an HTTP response, so they cannot
+  block or become a false 400 response for the next one-shot navigation.
 - QGA remains outside browser control. The collector may still use QGA for its
   existing ping and immutable provenance reads.
 - The hook validates digital PCM only. It does not claim physical speaker

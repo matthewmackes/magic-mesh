@@ -361,7 +361,7 @@ fn run_probe_job(
         transport: environment.transport.clone(),
     };
     spec.validate()?;
-    let control = ProbeControl::register(&config, &spec)?;
+    let control = ProbeControl::register(config, &spec)?;
     let result = run_registered_probe(config, &spec, arguments, &control, driver);
     let retry_registered = result.is_err()
         && control
