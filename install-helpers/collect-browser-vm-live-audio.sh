@@ -55,6 +55,8 @@ host_async_allow_exit_one=0
 injection_module=""
 injection_sink=""
 injection_monitor=""
+playback_stream_id=""
+playback_original_sink=""
 capture_stream_id=""
 capture_original_source=""
 finalized=0
@@ -648,7 +650,12 @@ wait_monitor_for_sink() {
 }
 
 move_qemu_stream_to() {
-    local direction=$1 pid=$2 target=$3 source_id=$4 attempt result stream_id route_id
+    local direction=$1 pid=$2 target=$3 source_id=$4 attempt result stream_id route_id move_command
+    case "$direction" in
+        playback) move_command=move-sink-input ;;
+        capture) move_command=move-source-output ;;
+        *) return 1 ;;
+    esac
     for ((attempt = 0; attempt < 40; attempt += 1)); do
         if result=$(find_qemu_stream "$direction" "$pid"); then
             IFS=$'\t' read -r stream_id route_id <<<"$result"
@@ -656,7 +663,7 @@ move_qemu_stream_to() {
                 printf '%s\n' "$stream_id"
                 return 0
             fi
-            host_run "$PACTL_BIN" move-source-output "$stream_id" "$target" >/dev/null 2>&1 || true
+            host_run "$PACTL_BIN" "$move_command" "$stream_id" "$target" >/dev/null 2>&1 || true
         fi
         sleep 0.1
     done
@@ -895,7 +902,7 @@ collect_playback() {
     local completed="${control}-completed.json" signal="${control}-start"
     local work_wav="$host_runtime/${phase}-playback.wav"
     local final_wav="$stage_dir/samples/${index}-${phase}-playback.wav"
-    local qemu_pid stream sink_id monitor captured_at
+    local qemu_pid stream private_sink_id captured_at
 
     if ((guest_duplex_active == 0)); then
         guest_hook_start_until_ready "$ready" playback \
@@ -914,14 +921,26 @@ collect_playback() {
     qemu_pid=$(read_qemu_pid)
     stream=$(wait_qemu_stream playback "$qemu_pid") ||
         die "$phase playback could not resolve one exact Browser QEMU sink-input"
-    IFS=$'\t' read -r _ sink_id <<<"$stream"
-    monitor=$(resolve_monitor_for_sink "$sink_id") ||
-        die "$phase playback could not resolve the exact monitor of the active QEMU sink"
+    IFS=$'\t' read -r playback_stream_id playback_original_sink <<<"$stream"
+    load_injection_sink "${phase}-playback"
+    private_sink_id=$(wait_short_node sinks "$injection_sink") ||
+        die "$phase playback private sink disappeared"
+    playback_stream_id=$(move_qemu_stream_to playback "$qemu_pid" "$injection_sink" "$private_sink_id") ||
+        die "$phase playback sink-input route did not take effect on the exact QEMU stream"
 
     host_async_start 10 "$PW_RECORD_BIN" \
-        --target "$monitor" --rate "$SAMPLE_RATE" --channels "$SAMPLE_CHANNELS" \
+        --target "$injection_monitor" --rate "$SAMPLE_RATE" --channels "$SAMPLE_CHANNELS" \
         --channel-map FL,FR --format s16 --container wav -n "$SAMPLE_FRAMES" "$work_wav"
     host_async_wait "$phase host playback monitor capture"
+    playback_stream_id=$(move_qemu_stream_to playback "$qemu_pid" "$playback_original_sink" "$playback_original_sink") ||
+        die "$phase playback could not verify the restored exact QEMU sink-input"
+    playback_stream_id=""
+    playback_original_sink=""
+    host_run "$PACTL_BIN" unload-module "$injection_module" >/dev/null ||
+        die "$phase playback could not remove its private evidence sink"
+    injection_module=""
+    injection_sink=""
+    injection_monitor=""
     if ((guest_duplex_active == 0)); then
         guest_hook_wait "$phase playback"
     fi
@@ -940,18 +959,23 @@ load_injection_sink() {
     module_output=$(host_run "$PACTL_BIN" load-module module-null-sink \
         "sink_name=$injection_sink" "rate=$SAMPLE_RATE" "channels=$SAMPLE_CHANNELS" \
         'sink_properties=device.description=MCNF-Live-Audio-Test') ||
-        die "$phase capture could not create its bounded private stimulus sink"
+        die "$phase audio operation could not create its bounded private sink"
     module_output=${module_output//$'\r'/}
     module_output=${module_output//$'\n'/}
-    [[ $module_output =~ ^[0-9]+$ ]] || die "$phase capture received an invalid PipeWire module id"
+    [[ $module_output =~ ^[0-9]+$ ]] || die "$phase audio operation received an invalid PipeWire module id"
     injection_module=$module_output
     sink_id=$(wait_short_node sinks "$injection_sink") ||
-        die "$phase capture could not resolve its exact stimulus sink"
+        die "$phase audio operation could not resolve its exact private sink"
     injection_monitor=$(wait_monitor_for_sink "$sink_id") ||
-        die "$phase capture could not resolve its exact stimulus monitor"
+        die "$phase audio operation could not resolve its exact private monitor"
 }
 
-restore_capture_route() {
+restore_audio_routes() {
+    if [[ -n $playback_stream_id && -n $playback_original_sink ]]; then
+        host_run "$PACTL_BIN" move-sink-input "$playback_stream_id" "$playback_original_sink" >/dev/null 2>&1 || true
+    fi
+    playback_stream_id=""
+    playback_original_sink=""
     if [[ -n $capture_stream_id && -n $capture_original_source ]]; then
         host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$capture_original_source" >/dev/null 2>&1 || true
     fi
@@ -1194,7 +1218,7 @@ cleanup() {
         kill "$host_async_pid" 2>/dev/null
         wait "$host_async_pid" 2>/dev/null
     fi
-    restore_capture_route
+    restore_audio_routes
     if [[ -n $host_runtime && $host_runtime == */mcnf-browser-live-audio.* ]]; then
         rm -rf -- "$host_runtime"
     fi
@@ -1436,6 +1460,7 @@ def warned():
     return (state / "warning-count").exists()
 
 injection = (state / "injection-name").read_text().strip() if (state / "injection-name").exists() else ""
+current_sink = (state / "current-sink").read_text().strip() if (state / "current-sink").exists() else "10"
 current_source = (state / "current-source").read_text().strip() if (state / "current-source").exists() else "12"
 stream_id = (state / "stream-id").read_text().strip() if (state / "stream-id").exists() else "55"
 hide_next_sink_list = state / "hide-next-sink-list"
@@ -1453,9 +1478,9 @@ Client #99
 \t\tapplication.process.binary = "pw-play"''')
 elif args == ["list", "sink-inputs"]:
     if (state / "playback-active").exists():
-        print('''Sink Input #44
+        print(f'''Sink Input #44
 \tClient: 88
-\tSink: 10
+\tSink: {current_sink}
 \tProperties:
 \t\tmedia.name = "MCNF-Browser-VM"''')
         if (state / "ambiguous-playback").exists():
@@ -1504,7 +1529,7 @@ Source #12
 \tMonitor of Sink: {injection}''')
 elif args == ["list", "short", "sink-inputs"]:
     if (state / "playback-active").exists():
-        print("44\t10\t88\tPipeWire\ts16le 2ch 48000Hz")
+        print(f"44\t{current_sink}\t88\tPipeWire\ts16le 2ch 48000Hz")
     if injection and (state / "stimulus-active").exists():
         print("66\t20\t99\tPipeWire\ts16le 2ch 48000Hz")
 elif args == ["list", "short", "source-outputs"]:
@@ -1522,6 +1547,16 @@ elif args[:2] == ["load-module", "module-null-sink"]:
         hide_next_sink_list.touch()
     event("mutate:pactl-load:" + names[0])
     print("77")
+elif len(args) == 3 and args[0] == "move-sink-input" and args[1] == "44":
+    target = args[2]
+    if target == injection:
+        sink = "20"
+    elif target == "10":
+        sink = "10"
+    else:
+        raise SystemExit(1)
+    (state / "current-sink").write_text(sink + "\n", encoding="utf-8")
+    event("mutate:pactl-move-sink:" + sink)
 elif len(args) == 3 and args[0] == "move-source-output" and args[1] == stream_id:
     target = args[2]
     if target.endswith(".monitor"):
@@ -1699,7 +1734,9 @@ if operation == "playback":
     wait_for(options["start-signal"])
     (state / "playback-active").touch()
     receipt(options["started-receipt"], "started")
-    time.sleep(0.7)
+    # Keep the mocked stream alive long enough to exercise private-sink
+    # discovery, a verified move, recording, and a verified restore.
+    time.sleep(2.0)
     receipt(options["completed-receipt"], "completed")
     (state / "playback-active").unlink(missing_ok=True)
 elif operation == "capture":
@@ -1818,6 +1855,10 @@ if not any("guest-capture-ready:before-recovery:719" in value for value in event
     raise SystemExit("before-recovery getUserMedia control was not exercised")
 if not any("guest-capture-ready:after-recovery:1301" in value for value in events):
     raise SystemExit("after-recovery getUserMedia control was not exercised")
+if events.count("mutate:pactl-move-sink:20") != 2:
+    raise SystemExit("both playback captures were not isolated on the private sink")
+if events.count("mutate:pactl-move-sink:10") != 2:
+    raise SystemExit("both playback routes were not restored to their original sink")
 PY
 
     # Domain verification must reject physical Pulse device selectors and any
