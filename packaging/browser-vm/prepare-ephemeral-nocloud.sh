@@ -84,8 +84,12 @@ write_seed_files() {
     local transport=$4
     local transport_health=$5
 
-    printf '%s\n' \
-        'instance-id: mcnf-browser-vm-ephemeral' \
+    # Bind NoCloud's instance identity to the broker session so a newly
+    # qualified seed is observed as a new instance even when the one-edge
+    # runtime overlay is intentionally retained. This makes per-instance
+    # cloud-init modules rewrite the bounded identity records on reboot.
+    printf 'instance-id: "mcnf-browser-vm-%s"\n%s\n' \
+        "${session_id#session:}" \
         'local-hostname: mcnf-browser-vm-ephemeral' > "$dir/meta-data"
 
     cat > "$dir/network-config" <<'NETWORK_CONFIG'
@@ -336,6 +340,8 @@ self_test() {
     local session=session:00000000-0000-4000-8000-000000000001
 
     write_seed_files "$fixture" "$digest" "$session" spice unavailable
+    grep -Fq 'instance-id: "mcnf-browser-vm-00000000-0000-4000-8000-000000000001"' \
+        "$fixture/meta-data" || fail "self-test seed instance identity is not session-bound"
     grep -Fq 'transport-health' "$fixture/user-data" || fail "self-test seed omitted transport health"
     grep -Fq 'unavailable' "$fixture/user-data" || fail "self-test seed is not fail-closed"
     grep -Fq 'chmod, "0755"' "$fixture/user-data" || fail "self-test seed directory is not runtime-readable"
