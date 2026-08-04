@@ -4876,6 +4876,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-wayland-workspace"
+version = "12.1.6"
+dependencies = [
+ "serde",
+ "serde_json",
+ "signal-hook 0.3.18",
+ "tempfile",
+]
+
+[[package]]
 name = "mde-worker-core"
 version = "12.1.6"
 dependencies = [
