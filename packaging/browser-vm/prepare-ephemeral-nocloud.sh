@@ -212,6 +212,10 @@ seed() {
     write_seed_files \
         "$SEED_TMP" "$image_digest" "$session_id" "$transport" "$transport_health"
     build_seed_iso "$SEED_TMP"
+    # The seed contains no credential material and must be traversable by the
+    # confined qemu account after the caller applies its virt_image_t label.
+    # Individual source records retain their explicit modes below.
+    chmod 0755 "$SEED_TMP"
 
     local seed_sha256
     seed_sha256=$(sha256sum "$SEED_TMP/seed.iso" | awk '{print $1}')
@@ -366,6 +370,8 @@ self_test() {
     grep -Fq '"transport_health":"connected"' \
         "$fixture/qualified-seed/seed-manifest.json" ||
         fail "self-test qualified seed manifest omitted connected transport health"
+    [[ "$(stat -c '%a' "$fixture/qualified-seed")" == 755 ]] ||
+        fail "self-test qualified seed directory is not qemu-traversable"
 
     mkdir "$fixture/existing"
     if "$0" seed --out "$fixture/existing" --image-digest "$digest" --session-id "$session" --transport spice >/dev/null 2>&1; then
