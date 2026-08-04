@@ -2567,15 +2567,24 @@ impl Shell {
                 });
             }
             Surface::Browser => {
-                let target = self.infra_code.browser_vm_target().map(
-                    |(serving_peer, workload, status, reachable)| web::BrowserVmTarget {
-                        serving_peer: serving_peer.to_owned(),
-                        workload: workload.to_owned(),
-                        status: status.to_owned(),
-                        reachable,
-                    },
-                );
+                let target = self
+                    .infra_code
+                    .browser_vm_target()
+                    .map(
+                        |(serving_peer, workload, status, reachable)| web::BrowserVmTarget {
+                            serving_peer: serving_peer.to_owned(),
+                            workload: workload.to_owned(),
+                            status: status.to_owned(),
+                            reachable,
+                        },
+                    )
+                    .map(|target| target.with_live_workloads_state(self.infra_code.states()));
                 self.web.sync_browser_vm_target(target);
+                self.web
+                    .drive_browser_vm_lifecycle(mde_bus::client_data_dir().as_deref());
+                if self.web.take_browser_vm_projection_refresh_request() {
+                    self.infra_code.request_refresh();
+                }
                 if let Some(connect) = self.web.take_browser_vm_connect() {
                     match self.chooser.browser_vm_auth(&connect) {
                         Ok(Some(auth)) => {
@@ -2630,6 +2639,9 @@ impl Shell {
                 }
                 if self.web.take_bookmarks_manager_request() {
                     self.nav.surface = Surface::Bookmarks;
+                }
+                if self.web.take_open_workloads_request() {
+                    self.nav.surface = Surface::InfraCode;
                 }
             }
             Surface::Bookmarks => {
