@@ -298,21 +298,39 @@ impl RdpDriver {
         let mut last_refresh = Instant::now();
         let mut best_identity = 0_u16;
         let mut coverage = DamageCoverage::new(baseline.size);
+        let mut observed_frames = 0_u32;
+        let mut browser_frames = 0_u32;
+        let mut coverage_ready_frames = 0_u32;
+        let mut browser_frames_after_coverage = 0_u32;
+        let mut refresh_requests = 1_u32;
+        let mut last_identity = 0_u16;
+        let mut last_colors = 0_usize;
+        let mut last_non_dominant = 0_usize;
         while started.elapsed() < INITIAL_FRAME_TIMEOUT {
             if let Some((frame, damage)) = self.pump_once_with_damage()? {
                 if frame.size != baseline.size {
                     continue;
                 }
+                observed_frames = observed_frames.saturating_add(1);
                 coverage.record(&damage);
-                if !frame_is_browser(&frame) {
+                last_identity = visual_identity_per_mille(baseline, &frame);
+                last_colors = distinct_colors(&frame);
+                last_non_dominant = non_dominant_pixels(&frame);
+                let coverage_ready = coverage.per_mille() >= MIN_RECONNECT_DAMAGE_PER_MILLE;
+                if coverage_ready {
+                    coverage_ready_frames = coverage_ready_frames.saturating_add(1);
+                }
+                if last_colors < MIN_BROWSER_COLORS || last_non_dominant < MIN_BROWSER_NON_DOMINANT
+                {
                     continue;
                 }
-                let identity = visual_identity_per_mille(baseline, &frame);
-                best_identity = best_identity.max(identity);
-                if identity >= MIN_RECONNECT_IDENTITY_PER_MILLE
-                    && coverage.per_mille() >= MIN_RECONNECT_DAMAGE_PER_MILLE
-                {
-                    return Ok(identity);
+                browser_frames = browser_frames.saturating_add(1);
+                if coverage_ready {
+                    browser_frames_after_coverage = browser_frames_after_coverage.saturating_add(1);
+                }
+                best_identity = best_identity.max(last_identity);
+                if last_identity >= MIN_RECONNECT_IDENTITY_PER_MILLE && coverage_ready {
+                    return Ok(last_identity);
                 }
             }
             // xrdp may deliver identity and repaint coverage in separate frame
@@ -325,11 +343,17 @@ impl RdpDriver {
                 self.request_full_refresh()
                     .context("request coverage-qualified Browser repaint")?;
                 last_refresh = Instant::now();
+                refresh_requests = refresh_requests.saturating_add(1);
             }
         }
         bail!(
-            "new RDP transport produced no identity-preserving full Browser repaint (identity={best_identity} damage={} per mille)",
-            coverage.per_mille()
+            "new RDP transport produced no identity-preserving full Browser repaint \
+             (identity={best_identity} damage={} per mille frames={observed_frames} \
+             browser_frames={browser_frames} coverage_ready_frames={coverage_ready_frames} \
+             browser_frames_after_coverage={browser_frames_after_coverage} \
+             refresh_requests={refresh_requests} last_identity={last_identity} \
+             last_colors={last_colors} last_non_dominant={last_non_dominant})",
+            coverage.per_mille(),
         )
     }
 
