@@ -72,12 +72,14 @@ MIN_TABS = 5
 WIDTH = 1920
 HEIGHT = 1080
 TARGET_FPS = 30
+WINDOW_TILE_WIDTH = 500
+WINDOW_TILE_HEIGHT = 216
 WINDOW_LAYOUT = (
-    (0, 0, 384, 216),
-    (384, 0, 384, 216),
-    (768, 0, 384, 216),
-    (1152, 0, 384, 216),
-    (1536, 0, 384, 216),
+    (0, 0, WINDOW_TILE_WIDTH, WINDOW_TILE_HEIGHT),
+    (WINDOW_TILE_WIDTH, 0, WINDOW_TILE_WIDTH, WINDOW_TILE_HEIGHT),
+    (2 * WINDOW_TILE_WIDTH, 0, WINDOW_TILE_WIDTH, WINDOW_TILE_HEIGHT),
+    (0, WINDOW_TILE_HEIGHT, WINDOW_TILE_WIDTH, WINDOW_TILE_HEIGHT),
+    (WINDOW_TILE_WIDTH, WINDOW_TILE_HEIGHT, WINDOW_TILE_WIDTH, WINDOW_TILE_HEIGHT),
 )
 TAB_RATE_PROBE_SECONDS = 4.0
 MEDIA_DURATION_SECONDS = 8
@@ -1441,11 +1443,12 @@ class CdpTab:
 def spread_tabs_across_visible_windows(tabs: list[CdpTab]) -> bool:
     """Keep every measured page active in its own visible headful window.
 
-    Inactive tabs do not submit compositor frames. Five non-overlapping 384x216
-    viewports keep every real 1080p source visibly scheduled while bounding
-    software composition to one fifth of the 1080p desktop. Source geometry and
-    cadence remain measured independently at 1920x1080/30. Return ``True`` when
-    targets changed so the caller can rediscover them.
+    Inactive tabs do not submit compositor frames. Five non-overlapping 500x216
+    viewports (Chromium's admitted minimum outer width) keep every real 1080p
+    source visibly scheduled while bounding software composition to roughly one
+    quarter of the 1080p desktop. Source geometry and cadence remain measured
+    independently at 1920x1080/30. Return ``True`` when targets changed so the
+    caller can rediscover them.
     """
     if len(tabs) != MIN_TABS:
         fail("Chromium window spreading requires the exact measured tab set")
@@ -2807,7 +2810,7 @@ def self_test() -> None:
     assert compact_json({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
     assert len(WINDOW_LAYOUT) == MIN_TABS
     assert sum(width * height for _, _, width, height in WINDOW_LAYOUT) == (
-        WIDTH * HEIGHT // 5
+        WINDOW_TILE_WIDTH * WINDOW_TILE_HEIGHT * MIN_TABS
     )
     for index, (left, top, width, height) in enumerate(WINDOW_LAYOUT):
         assert 0 <= left < WIDTH and 0 <= top < HEIGHT
