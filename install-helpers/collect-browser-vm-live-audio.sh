@@ -632,6 +632,17 @@ source_output_is_on() {
     '
 }
 
+wait_source_output_on() {
+    local stream_id=$1 source_id=$2 attempt
+    for ((attempt = 0; attempt < 40; attempt += 1)); do
+        if source_output_is_on "$stream_id" "$source_id"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 wait_sink_input_on() {
     local sink_id=$1 attempt listing
     for ((attempt = 0; attempt < 40; attempt += 1)); do
@@ -972,7 +983,7 @@ collect_capture() {
     injection_monitor_id=$(resolve_short_node sources "$injection_monitor") || die "stimulus monitor disappeared"
     host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$injection_monitor" >/dev/null ||
         die "$phase capture could not route the exact QEMU source-output to the stimulus monitor"
-    source_output_is_on "$capture_stream_id" "$injection_monitor_id" ||
+    wait_source_output_on "$capture_stream_id" "$injection_monitor_id" ||
         die "$phase capture source-output route did not take effect"
 
     host_async_start 12 "$PW_PLAY_BIN" --target "$injection_sink" --volume 0.25 "$tone_wav"
@@ -986,7 +997,7 @@ collect_capture() {
     host_async_wait "$phase host capture stimulus"
     host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$capture_original_source" >/dev/null ||
         die "$phase capture could not restore the QEMU source-output"
-    source_output_is_on "$capture_stream_id" "$capture_original_source" ||
+    wait_source_output_on "$capture_stream_id" "$capture_original_source" ||
         die "$phase capture could not verify the restored QEMU source-output"
     capture_stream_id=""
     capture_original_source=""
@@ -1410,6 +1421,15 @@ def warned():
 
 injection = (state / "injection-name").read_text().strip() if (state / "injection-name").exists() else ""
 current_source = (state / "current-source").read_text().strip() if (state / "current-source").exists() else "12"
+pending_source = state / "pending-source-restore"
+if args == ["list", "short", "source-outputs"] and pending_source.exists():
+    remaining = int(pending_source.read_text(encoding="utf-8"))
+    if remaining > 0:
+        pending_source.write_text(f"{remaining - 1}\n", encoding="utf-8")
+    else:
+        current_source = "12"
+        (state / "current-source").write_text(current_source + "\n", encoding="utf-8")
+        pending_source.unlink()
 if args == ["list", "clients"]:
     print('''Client #88
 \tProperties:
@@ -1497,7 +1517,10 @@ elif args[:2] == ["move-source-output", "55"] and len(args) == 3:
         source = "12"
     else:
         raise SystemExit(1)
-    (state / "current-source").write_text(source + "\n", encoding="utf-8")
+    if source == "12" and (state / "delayed-source-restore").exists():
+        pending_source.write_text("1\n", encoding="utf-8")
+    else:
+        (state / "current-source").write_text(source + "\n", encoding="utf-8")
     event("mutate:pactl-move:" + source)
 elif args == ["unload-module", "77"]:
     event("mutate:pactl-unload")
@@ -1727,6 +1750,7 @@ PY
     export MCNF_TEST_SOURCE_COMMIT="$source_commit"
     export MCNF_TEST_IMAGE_DIGEST="$image_digest"
     export MCNF_TEST_TRANSPORT="$transport"
+    : >"$test_state/delayed-source-restore"
 
     collect
     trap - EXIT HUP INT TERM
