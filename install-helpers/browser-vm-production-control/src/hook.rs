@@ -567,6 +567,9 @@ pub fn run_reconnect() -> Result<()> {
     driver
         .navigate(&reconnect_anchor)
         .context("navigate Browser to stable reconnect anchor")?;
+    driver
+        .settle_between_browser_jobs()
+        .context("settle stable reconnect anchor")?;
     driver.request_full_refresh()?;
     let baseline = driver.wait_for_browser_frame(Duration::from_secs(20))?;
     driver.disconnect()?;
