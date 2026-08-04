@@ -623,20 +623,15 @@ resolve_short_node() {
     printf '%s\n' "$result"
 }
 
-source_output_is_on() {
-    local stream_id=$1 source_id=$2 listing
-    listing=$(host_run "$PACTL_BIN" list short source-outputs) || return 1
-    printf '%s\n' "$listing" | awk -F '\t' -v stream="$stream_id" -v source="$source_id" '
-        $1 == stream && $2 == source { count += 1 }
-        END { exit(count == 1 ? 0 : 1) }
-    '
-}
-
-wait_source_output_on() {
-    local stream_id=$1 source_id=$2 attempt
+wait_qemu_stream_on() {
+    local direction=$1 pid=$2 source_id=$3 attempt result stream_id route_id
     for ((attempt = 0; attempt < 40; attempt += 1)); do
-        if source_output_is_on "$stream_id" "$source_id"; then
-            return 0
+        if result=$(find_qemu_stream "$direction" "$pid"); then
+            IFS=$'\t' read -r stream_id route_id <<<"$result"
+            if [[ $route_id == "$source_id" ]]; then
+                printf '%s\n' "$stream_id"
+                return 0
+            fi
         fi
         sleep 0.1
     done
@@ -983,8 +978,8 @@ collect_capture() {
     injection_monitor_id=$(resolve_short_node sources "$injection_monitor") || die "stimulus monitor disappeared"
     host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$injection_monitor" >/dev/null ||
         die "$phase capture could not route the exact QEMU source-output to the stimulus monitor"
-    wait_source_output_on "$capture_stream_id" "$injection_monitor_id" ||
-        die "$phase capture source-output route did not take effect"
+    capture_stream_id=$(wait_qemu_stream_on capture "$qemu_pid" "$injection_monitor_id") ||
+        die "$phase capture source-output route did not take effect on the exact QEMU stream"
 
     host_async_start 12 "$PW_PLAY_BIN" --target "$injection_sink" --volume 0.25 "$tone_wav"
     wait_sink_input_on "$injection_sink_id" || die "$phase capture stimulus did not reach its exact sink"
@@ -997,8 +992,8 @@ collect_capture() {
     host_async_wait "$phase host capture stimulus"
     host_run "$PACTL_BIN" move-source-output "$capture_stream_id" "$capture_original_source" >/dev/null ||
         die "$phase capture could not restore the QEMU source-output"
-    wait_source_output_on "$capture_stream_id" "$capture_original_source" ||
-        die "$phase capture could not verify the restored QEMU source-output"
+    capture_stream_id=$(wait_qemu_stream_on capture "$qemu_pid" "$capture_original_source") ||
+        die "$phase capture could not verify the restored exact QEMU source-output"
     capture_stream_id=""
     capture_original_source=""
     host_run "$PACTL_BIN" unload-module "$injection_module" >/dev/null ||
@@ -1421,14 +1416,17 @@ def warned():
 
 injection = (state / "injection-name").read_text().strip() if (state / "injection-name").exists() else ""
 current_source = (state / "current-source").read_text().strip() if (state / "current-source").exists() else "12"
+stream_id = (state / "stream-id").read_text().strip() if (state / "stream-id").exists() else "55"
 pending_source = state / "pending-source-restore"
-if args == ["list", "short", "source-outputs"] and pending_source.exists():
+if args in (["list", "source-outputs"], ["list", "short", "source-outputs"]) and pending_source.exists():
     remaining = int(pending_source.read_text(encoding="utf-8"))
     if remaining > 0:
         pending_source.write_text(f"{remaining - 1}\n", encoding="utf-8")
     else:
         current_source = "12"
+        stream_id = str(int(stream_id) + 1)
         (state / "current-source").write_text(current_source + "\n", encoding="utf-8")
+        (state / "stream-id").write_text(stream_id + "\n", encoding="utf-8")
         pending_source.unlink()
 if args == ["list", "clients"]:
     print('''Client #88
@@ -1466,7 +1464,7 @@ Sink Input #66
 elif args == ["list", "source-outputs"]:
     if (state / "capture-active").exists():
         stream_name = "wrong-capture-stream" if (state / "wrong-capture-stream").exists() else "MCNF-Browser-VM-Capture"
-        print(f'''Source Output #55
+        print(f'''Source Output #{stream_id}
 \tClient: 88
 \tSource: {current_source}
 \tProperties:
@@ -1498,7 +1496,7 @@ elif args == ["list", "short", "sink-inputs"]:
         print("66\t20\t99\tPipeWire\ts16le 2ch 48000Hz")
 elif args == ["list", "short", "source-outputs"]:
     if (state / "capture-active").exists():
-        print(f"55\t{current_source}\t88\tPipeWire\ts16le 2ch 48000Hz")
+        print(f"{stream_id}\t{current_source}\t88\tPipeWire\ts16le 2ch 48000Hz")
 elif args[:2] == ["load-module", "module-null-sink"]:
     if not warned():
         event("forbidden:unwarned-pactl-load")
@@ -1509,7 +1507,7 @@ elif args[:2] == ["load-module", "module-null-sink"]:
     (state / "injection-name").write_text(names[0] + "\n", encoding="utf-8")
     event("mutate:pactl-load:" + names[0])
     print("77")
-elif args[:2] == ["move-source-output", "55"] and len(args) == 3:
+elif len(args) == 3 and args[0] == "move-source-output" and args[1] == stream_id:
     target = args[2]
     if target.endswith(".monitor"):
         source = "21"
@@ -1818,8 +1816,8 @@ PY
         die "self-test resolved a QEMU capture stream before getUserMedia opened"
     fi
     : >"$test_state/capture-active"
-    [[ $(find_qemu_stream capture 4242) == $'55\t12' ]] ||
-        die "self-test did not resolve the exact QEMU capture source-output"
+    [[ $(find_qemu_stream capture 4242) == $'57\t12' ]] ||
+        die "self-test did not re-resolve the exact QEMU capture source-output after index churn"
     : >"$test_state/wrong-capture-stream"
     if find_qemu_stream capture 4242 >/dev/null 2>&1; then
         die "self-test accepted a QEMU capture source-output with the wrong stream identity"
