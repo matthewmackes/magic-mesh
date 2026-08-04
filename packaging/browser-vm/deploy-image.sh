@@ -348,7 +348,7 @@ run_action() {
         # seats then need space for one incoming image, not two.
         sudo -n test ! -e '${REMOTE_IMAGE}.new'
         sudo -n mv -T -- '$remote_tmp' '${REMOTE_IMAGE}.new'
-        sudo -n chown root:"$qemu_gid" '${REMOTE_IMAGE}.new'
+        sudo -n chown root:\"\$qemu_gid\" '${REMOTE_IMAGE}.new'
         sudo -n chmod 0440 '${REMOTE_IMAGE}.new'
         test \"\$(sudo -n sha256sum -- '${REMOTE_IMAGE}.new' | awk '{print \"sha256:\" \$1}')\" = '$digest'
         sudo -n qemu-img check --force-share '${REMOTE_IMAGE}.new'
