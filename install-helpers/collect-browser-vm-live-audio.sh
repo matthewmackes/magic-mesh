@@ -18,6 +18,7 @@ readonly CAPTURE_STREAM_NAME="MCNF-Browser-VM-Capture"
 readonly SAMPLE_RATE=48000
 readonly SAMPLE_CHANNELS=2
 readonly SAMPLE_FRAMES=96000
+readonly SAMPLE_BYTES=$((SAMPLE_FRAMES * SAMPLE_CHANNELS * 2))
 readonly STIMULUS_SECONDS=8
 readonly OPERATION_TIMEOUT_SECONDS=90
 readonly RECONNECT_TIMEOUT_SECONDS=240
@@ -51,7 +52,6 @@ guest_duplex_active=0
 host_async_pid=""
 host_async_unit=""
 host_async_log=""
-host_async_allow_exit_one=0
 injection_module=""
 injection_sink=""
 injection_monitor=""
@@ -68,8 +68,9 @@ VIRSH_BIN=""
 PYTHON_BIN=""
 BASE64_BIN=""
 PACTL_BIN=""
-PW_RECORD_BIN=""
+PARECORD_BIN=""
 PW_PLAY_BIN=""
+HEAD_BIN=""
 SYSTEMD_RUN_BIN=""
 SYSTEMCTL_BIN=""
 JOURNALCTL_BIN=""
@@ -155,15 +156,16 @@ resolve_commands() {
     PYTHON_BIN=$(command -v python3 || true)
     BASE64_BIN=$(command -v base64 || true)
     PACTL_BIN=$(command -v pactl || true)
-    PW_RECORD_BIN=$(command -v pw-record || true)
+    PARECORD_BIN=$(command -v parecord || true)
     PW_PLAY_BIN=$(command -v pw-play || true)
+    HEAD_BIN=$(command -v head || true)
     SYSTEMD_RUN_BIN=$(command -v systemd-run || true)
     SYSTEMCTL_BIN=$(command -v systemctl || true)
     JOURNALCTL_BIN=$(command -v journalctl || true)
     TIMEOUT_BIN=$(command -v timeout || true)
     SHA256SUM_BIN=$(command -v sha256sum || true)
     local name value
-    for name in VIRSH PYTHON BASE64 PACTL PW_RECORD PW_PLAY SYSTEMD_RUN SYSTEMCTL JOURNALCTL TIMEOUT SHA256SUM; do
+    for name in VIRSH PYTHON BASE64 PACTL PARECORD PW_PLAY HEAD SYSTEMD_RUN SYSTEMCTL JOURNALCTL TIMEOUT SHA256SUM; do
         value=${name}_BIN
         [[ -n ${!value} ]] || die "required command is unavailable: ${name,,}"
     done
@@ -301,8 +303,6 @@ host_async_start() {
     seat_uid=$(id -u "$seat_user")
     host_async_unit="mcnf-audio-${run_nonce}-${RANDOM}"
     host_async_log="$host_runtime/${host_async_unit}.log"
-    host_async_allow_exit_one=0
-    [[ $1 == "$PW_RECORD_BIN" ]] && host_async_allow_exit_one=1
     local -a pipe_option=()
     ((test_mode)) && pipe_option=(--pipe)
     "$SYSTEMD_RUN_BIN" --quiet --wait --collect "${pipe_option[@]}" \
@@ -325,14 +325,9 @@ host_async_wait() {
     fi
     host_async_pid=""
     host_async_unit=""
-    if ((rc != 0 && !(host_async_allow_exit_one && rc == 1))); then
-        host_async_allow_exit_one=0
+    if ((rc != 0)); then
         die "$label failed"
     fi
-    # PipeWire 1.6.8 pw-record returns 1 after satisfying --sample-count even
-    # though it closes a complete WAV.  Only that fixed-sample command may use
-    # this exception; private-file and sample/tone validation still gate it.
-    host_async_allow_exit_one=0
 }
 
 qga_call() {
@@ -711,6 +706,42 @@ path.chmod(0o600)
 PY
 }
 
+write_raw_wav() {
+    local raw_path=$1 wav_path=$2
+    "$PYTHON_BIN" - "$raw_path" "$wav_path" "$SAMPLE_FRAMES" \
+        "$SAMPLE_RATE" "$SAMPLE_CHANNELS" <<'PY'
+import os
+import stat
+import sys
+import wave
+
+raw_path, wav_path = sys.argv[1:3]
+frames, rate, channels = map(int, sys.argv[3:6])
+expected = frames * channels * 2
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(raw_path, flags)
+with os.fdopen(descriptor, "rb") as source:
+    metadata = os.fstat(source.fileno())
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("raw Pulse capture is not a regular file")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise SystemExit("raw Pulse capture is not private")
+    data = source.read(expected + 1)
+if len(data) != expected:
+    raise SystemExit("raw Pulse capture has an unexpected byte count")
+
+output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+output = os.open(wav_path, output_flags, 0o600)
+with os.fdopen(output, "wb") as destination:
+    with wave.open(destination, "wb") as encoded:
+        encoded.setnchannels(channels)
+        encoded.setsampwidth(2)
+        encoded.setframerate(rate)
+        encoded.writeframes(data)
+os.chmod(wav_path, 0o600)
+PY
+}
+
 hook_environment() {
     local -n destination=$1
     destination=(
@@ -900,9 +931,10 @@ collect_playback() {
     local control="$stage_dir/control/${index}-${phase}-playback"
     local ready="${control}-ready.json" started="${control}-started.json"
     local completed="${control}-completed.json" signal="${control}-start"
+    local work_raw="$host_runtime/${phase}-playback.raw"
     local work_wav="$host_runtime/${phase}-playback.wav"
     local final_wav="$stage_dir/samples/${index}-${phase}-playback.wav"
-    local qemu_pid stream private_sink_id captured_at
+    local qemu_pid stream private_sink_id raw_size captured_at
 
     if ((guest_duplex_active == 0)); then
         guest_hook_start_until_ready "$ready" playback \
@@ -928,10 +960,28 @@ collect_playback() {
     playback_stream_id=$(move_qemu_stream_to playback "$qemu_pid" "$injection_sink" "$private_sink_id") ||
         die "$phase playback sink-input route did not take effect on the exact QEMU stream"
 
-    host_async_start 10 "$PW_RECORD_BIN" \
-        --target "$injection_monitor" --rate "$SAMPLE_RATE" --channels "$SAMPLE_CHANNELS" \
-        --channel-map FL,FR --format s16 --container wav -n "$SAMPLE_FRAMES" "$work_wav"
+    # Pulse monitor names are not native PipeWire node names. On PipeWire 1.6.8,
+    # passing one to pw-record silently auto-linked the physical microphone.
+    # parecord binds the exact Pulse source. Head owns the successful pipeline
+    # status because parecord is expected to see EPIPE at the exact byte bound;
+    # the private raw file and encoded WAV are both validated below.
+    host_async_start 10 "$TIMEOUT_BIN" --signal=KILL 6 /bin/sh -c '
+        "$1" --device="$2" --raw --format=s16le --rate="$4" --channels="$5" \
+            --channel-map=front-left,front-right \
+            --client-name=MCNF-Browser-VM-Live-Audio \
+            --stream-name=MCNF-Browser-VM-Playback-Evidence |
+            "$3" -c "$6" >"$7"
+    ' mcnf "$PARECORD_BIN" "$injection_monitor" "$HEAD_BIN" \
+        "$SAMPLE_RATE" "$SAMPLE_CHANNELS" "$SAMPLE_BYTES" "$work_raw"
     host_async_wait "$phase host playback monitor capture"
+    private_regular_file "$work_raw" "$SAMPLE_BYTES" ||
+        die "$phase playback monitor did not produce a bounded private raw capture"
+    raw_size=$(stat -Lc '%s' "$work_raw")
+    [[ $raw_size == "$SAMPLE_BYTES" ]] ||
+        die "$phase playback monitor raw capture did not reach the exact byte boundary"
+    write_raw_wav "$work_raw" "$work_wav" ||
+        die "$phase playback monitor raw capture could not be encoded"
+    rm -f -- "$work_raw"
     playback_stream_id=$(move_qemu_stream_to playback "$qemu_pid" "$playback_original_sink" "$playback_original_sink") ||
         die "$phase playback could not verify the restored exact QEMU sink-input"
     playback_stream_id=""
@@ -1585,22 +1635,31 @@ else:
     raise SystemExit("unhandled pactl mock: " + repr(args))
 PY
 
-    cat >"$mock_bin/pw-record" <<'PY'
+    cat >"$mock_bin/parecord" <<'PY'
 #!/usr/bin/env python3
 from array import array
 import math
 import os
 from pathlib import Path
 import sys
-import wave
 
 state = Path(os.environ["MCNF_LIVE_AUDIO_TEST_STATE"])
 if not (state / "warning-count").exists():
     raise SystemExit(1)
-path = Path(sys.argv[-1])
-if "before-recovery" in path.name:
+args = sys.argv[1:]
+devices = [value.split("=", 1)[1] for value in args if value.startswith("--device=")]
+required = {
+    "--raw",
+    "--format=s16le",
+    "--rate=48000",
+    "--channels=2",
+    "--channel-map=front-left,front-right",
+}
+if len(devices) != 1 or not devices[0].endswith(".monitor") or not required.issubset(args):
+    raise SystemExit(1)
+if "before_recovery_playback.monitor" in devices[0]:
     tone = 523
-elif "after-recovery" in path.name:
+elif "after_recovery_playback.monitor" in devices[0]:
     tone = 977
 else:
     raise SystemExit(1)
@@ -1609,17 +1668,9 @@ samples = array("h")
 for frame in range(rate * 2):
     value = round(9000 * math.sin(2 * math.pi * tone * frame / rate))
     samples.extend((value, value))
-with wave.open(str(path), "wb") as out:
-    out.setnchannels(2)
-    out.setsampwidth(2)
-    out.setframerate(rate)
-    out.writeframes(samples.tobytes())
-path.chmod(0o600)
+sys.stdout.buffer.write(samples.tobytes())
 with (state / "events").open("a", encoding="utf-8") as out:
     out.write(f"mutate:host-monitor-record:{tone}\n")
-# Match PipeWire 1.6.8: the fixed sample-count boundary closes a complete WAV
-# but pw-record itself exits 1.  The collector must validate the artifact.
-raise SystemExit(1)
 PY
 
     cat >"$mock_bin/pw-play" <<'PY'
