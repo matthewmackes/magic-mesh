@@ -18,10 +18,11 @@ readonly SAMPLE_RATE=48000
 readonly SAMPLE_CHANNELS=2
 readonly SAMPLE_FRAMES=96000
 readonly STIMULUS_SECONDS=8
-readonly OPERATION_TIMEOUT_SECONDS=30
+readonly OPERATION_TIMEOUT_SECONDS=90
 readonly RECONNECT_TIMEOUT_SECONDS=240
 readonly QGA_TIMEOUT_SECONDS=8
 readonly MAX_QGA_FILE_BYTES=4096
+readonly CONTROL_FILE_WAIT_ATTEMPTS=$((OPERATION_TIMEOUT_SECONDS * 10))
 
 domain="browser-vm"
 seat_user="mm"
@@ -652,7 +653,7 @@ guest_hook_wait() {
 
 wait_private_file() {
     local path=$1 attempt
-    for ((attempt = 0; attempt < 100; attempt += 1)); do
+    for ((attempt = 0; attempt < CONTROL_FILE_WAIT_ATTEMPTS; attempt += 1)); do
         if private_regular_file "$path" 262144; then
             return 0
         fi

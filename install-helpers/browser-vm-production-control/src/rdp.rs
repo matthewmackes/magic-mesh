@@ -10,6 +10,11 @@ use std::env;
 use std::time::{Duration, Instant};
 
 const PUMP_SLICE: Duration = Duration::from_millis(75);
+const PRE_NAVIGATION_SETTLE: Duration = Duration::from_millis(150);
+const OMNIBOX_FOCUS_SETTLE: Duration = Duration::from_millis(350);
+const POINTER_FOCUS_SETTLE: Duration = Duration::from_millis(50);
+const POINTER_BUTTON_HOLD: Duration = Duration::from_millis(75);
+const POST_CLICK_BROWSER_SETTLE: Duration = Duration::from_millis(350);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 const MIN_BROWSER_COLORS: usize = 24;
 const MIN_BROWSER_NON_DOMINANT: usize = 25_000;
@@ -67,6 +72,20 @@ impl RdpDriver {
                     .any(|value| value.is_ascii_control() || value == b' '),
             "probe URL is not a bounded guest-loopback URL"
         );
+        // Clear any transient Chromium surface first. More importantly, this
+        // gives xrdp one independently flushed input batch after its focus-in
+        // sequence; sending focus, Ctrl-L, the URL, and Enter in one fast-path
+        // frame is racy on a newly reattached persistent session.
+        self.session
+            .send_input(&key_event(Key::Escape, true, Modifiers::default()));
+        self.session
+            .send_input(&key_event(Key::Escape, false, Modifiers::default()));
+        ensure!(
+            self.flush_input()? >= 2,
+            "RDP pre-navigation focus input did not reach the wire encoder"
+        );
+        self.pump_for(PRE_NAVIGATION_SETTLE)?;
+
         let ctrl = Modifiers {
             ctrl: true,
             ..Modifiers::default()
@@ -81,12 +100,24 @@ impl RdpDriver {
             pressed: false,
             modifiers: Modifiers::default(),
         });
+        ensure!(
+            self.flush_input()? >= 5,
+            "RDP omnibox focus shortcut did not reach the wire encoder"
+        );
+        // Chromium must process Ctrl-L before Unicode URL events arrive. Keep
+        // the wait bounded and continue pumping inbound frames so xrdp cannot
+        // deadlock behind a pending repaint while the omnibox gains focus.
+        self.pump_for(OMNIBOX_FOCUS_SETTLE)?;
+
         self.session.send_input(&Event::Text(url.to_owned()));
         self.session
             .send_input(&key_event(Key::Enter, true, Modifiers::default()));
         self.session
             .send_input(&key_event(Key::Enter, false, Modifiers::default()));
-        self.flush_input()?;
+        ensure!(
+            self.flush_input()? >= url.len() + 2,
+            "RDP probe URL commit did not reach the wire encoder"
+        );
         Ok(())
     }
 
@@ -97,20 +128,55 @@ impl RdpDriver {
             "RDP click lies outside negotiated desktop"
         );
         let position = Pos2::new(f32::from(x), f32::from(y));
-        self.session.send_input(&Event::PointerMoved(position));
-        for pressed in [true, false] {
-            self.session.send_input(&Event::PointerButton {
-                pos: position,
-                button: PointerButton::Primary,
-                pressed,
-                modifiers: Modifiers::default(),
-            });
-        }
-        let sent = self.flush_input()?;
+
+        // xorgxrdp retains its last absolute pointer position across reconnects.
+        // Establish a fresh motion/enter path before the target move so the
+        // nested compositor cannot deduplicate an apparently unchanged point.
+        let detour = Pos2::new(f32::from(x.saturating_sub(96)), f32::from(y));
+        self.session.send_input(&Event::PointerMoved(detour));
         ensure!(
-            sent >= 3,
-            "RDP pointer gesture did not reach the wire encoder"
+            self.flush_input()? >= 1,
+            "RDP pointer detour did not reach the wire encoder"
         );
+        self.pump_for(POINTER_FOCUS_SETTLE)?;
+
+        self.session.send_input(&Event::PointerMoved(position));
+        ensure!(
+            self.flush_input()? >= 1,
+            "RDP target pointer move did not reach the wire encoder"
+        );
+        self.pump_for(POINTER_FOCUS_SETTLE)?;
+
+        self.session.send_input(&Event::PointerButton {
+            pos: position,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        });
+        ensure!(
+            self.flush_input()? >= 1,
+            "RDP pointer-down did not reach the wire encoder"
+        );
+        // Keep the two physical transitions in separate FastPath frames. A
+        // zero-duration down+up batch can reach the desktop as an
+        // already-released button and therefore is not a real trusted click.
+        self.pump_for(POINTER_BUTTON_HOLD)?;
+
+        self.session.send_input(&Event::PointerButton {
+            pos: position,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::default(),
+        });
+        ensure!(
+            self.flush_input()? >= 1,
+            "RDP pointer-up did not reach the wire encoder"
+        );
+        // Give the trusted browser handler and its loopback fetch a bounded
+        // head start before the host begins authenticated status polling. This
+        // prevents a host GET from overtaking the event POST on the guest's
+        // deliberately small controller.
+        self.pump_for(POST_CLICK_BROWSER_SETTLE)?;
         Ok(())
     }
 
@@ -126,6 +192,14 @@ impl RdpDriver {
 
     pub fn pump_once(&mut self) -> Result<Option<ColorImage>> {
         Ok(self.pump_once_with_damage()?.map(|(frame, _damage)| frame))
+    }
+
+    fn pump_for(&mut self, minimum: Duration) -> Result<()> {
+        let started = Instant::now();
+        while started.elapsed() < minimum {
+            let _frame = self.pump_once()?;
+        }
+        Ok(())
     }
 
     fn pump_once_with_damage(&mut self) -> Result<Option<(ColorImage, FrameDamage)>> {

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CONSECUTIVE_STATUS_ERRORS: u8 = 3;
 
 struct RequiredEnvironment {
     domain: String,
@@ -344,10 +345,32 @@ fn wait_for_state(
     let started = Instant::now();
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut last_state = "unknown".to_owned();
+    let mut consecutive_status_errors = 0_u8;
     while started.elapsed() < CONTROL_TIMEOUT {
         let _frame = driver.pump_once()?;
         if last_poll.elapsed() >= Duration::from_millis(100) {
-            let status = control.status()?;
+            let status = match control.status() {
+                Ok(status) => {
+                    consecutive_status_errors = 0;
+                    status
+                }
+                Err(error) => {
+                    consecutive_status_errors += 1;
+                    if consecutive_status_errors > MAX_CONSECUTIVE_STATUS_ERRORS {
+                        return Err(error).context(
+                            "Browser controller status remained unavailable after bounded retries",
+                        );
+                    }
+                    // Chromium may leave a speculative loopback connection in
+                    // front of the controller's host-status request. The
+                    // controller closes that idle connection at its bounded
+                    // read timeout. Keep pumping RDP and retry the authenticated
+                    // status request; no failed or unauthenticated response is
+                    // accepted, and CONTROL_TIMEOUT still bounds the operation.
+                    last_poll = Instant::now();
+                    continue;
+                }
+            };
             last_state.clone_from(&status.state);
             if status.state == "failed" {
                 bail!("Browser page failed closed before {expected}");

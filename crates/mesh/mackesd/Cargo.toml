@@ -489,6 +489,9 @@ assets = [
     # The warning helper is the mandatory five-second pre-update operator notice.
     { source = "install-helpers/seat-update-warning.sh", dest = "/usr/libexec/mackesd/seat-update-warning", mode = "755" },
     { source = "install-helpers/provision-browser-vm-rdp-credential.sh", dest = "/usr/libexec/mackesd/provision-browser-vm-rdp-credential", mode = "755" },
+    { source = "install-helpers/extract-browser-vm-rdp-password.py", dest = "/usr/libexec/mackesd/extract-browser-vm-rdp-password", mode = "755" },
+    { source = "install-helpers/collect-browser-vm-live-audio.sh", dest = "/usr/libexec/mackesd/collect-browser-vm-live-audio", mode = "755" },
+    { source = "install-helpers/verify-browser-vm-live-audio.py", dest = "/usr/libexec/mackesd/verify-browser-vm-live-audio.py", mode = "755" },
     { source = "install-helpers/request-browser-vm-workload.sh", dest = "/usr/libexec/mackesd/request-browser-vm-workload", mode = "755" },
     { source = "packaging/systemd/browser-vm-rdp-credential.conf", dest = "/usr/libexec/mackesd/browser-vm-rdp-credential.conf", mode = "644" },
     # The Browser VM's QEMU Pulse backend connects only to this seat-user-owned

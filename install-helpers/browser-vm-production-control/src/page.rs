@@ -144,6 +144,18 @@ const PAGE_TEMPLATE: &str = r##"<!doctype html>
     gain.gain.setValueAtTime(0.25, context.currentTime);
     oscillator.connect(gain).connect(context.destination);
     const began = performance.now();
+    oscillator.onended = async () => {
+      try {
+        const elapsed = Math.round(performance.now() - began);
+        await postEvent({event: "playback_completed", oscillator_ended: true, elapsed_ms: elapsed});
+        state = "completed";
+        setStatus("Browser WebAudio tone completed.");
+        await context.close();
+      } catch (error) { await fail(error.message || "playback-completion"); }
+    };
+    // Install the completion observer before starting the real oscillator. A
+    // delayed controller response must never make an already-fired `ended`
+    // event disappear while the Browser awaits playback_started admission.
     oscillator.start();
     oscillator.stop(context.currentTime + durationSeconds);
     await postEvent({
@@ -157,15 +169,6 @@ const PAGE_TEMPLATE: &str = r##"<!doctype html>
     state = "running";
     button.disabled = true;
     setStatus("Real Browser WebAudio tone is active.");
-    oscillator.onended = async () => {
-      try {
-        const elapsed = Math.round(performance.now() - began);
-        await postEvent({event: "playback_completed", oscillator_ended: true, elapsed_ms: elapsed});
-        state = "completed";
-        setStatus("Browser WebAudio tone completed.");
-        await context.close();
-      } catch (error) { await fail(error.message || "playback-completion"); }
-    };
   }
 
   function encodeStereoPcm16(frameCount) {
@@ -402,6 +405,11 @@ mod tests {
         assert!(playback.contains("navigator.userActivation.isActive === true"));
         assert!(playback.contains("context.createOscillator()"));
         assert!(!playback.contains("autoplay-policy"));
+        assert!(
+            playback.find("oscillator.onended").unwrap_or(usize::MAX)
+                < playback.find("oscillator.start()").unwrap_or(0),
+            "playback completion must be observed before the oscillator starts"
+        );
 
         let capture =
             String::from_utf8(render(&spec(Operation::Capture), "nonce").html).unwrap_or_default();
