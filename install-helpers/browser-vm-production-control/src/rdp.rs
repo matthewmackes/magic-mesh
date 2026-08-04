@@ -14,6 +14,7 @@ const PRE_NAVIGATION_SETTLE: Duration = Duration::from_millis(150);
 const OMNIBOX_FOCUS_SETTLE: Duration = Duration::from_millis(350);
 const POST_NAVIGATION_BROWSER_SETTLE: Duration = Duration::from_secs(1);
 const BETWEEN_JOB_CONTROLLER_SETTLE: Duration = Duration::from_secs(6);
+const BETWEEN_JOB_NEUTRAL_URL: &str = "about:blank";
 const POINTER_FOCUS_SETTLE: Duration = Duration::from_millis(50);
 const POINTER_BUTTON_HOLD: Duration = Duration::from_millis(75);
 const POST_CLICK_BROWSER_SETTLE: Duration = Duration::from_millis(350);
@@ -74,6 +75,10 @@ impl RdpDriver {
                     .any(|value| value.is_ascii_control() || value == b' '),
             "probe URL is not a bounded guest-loopback URL"
         );
+        self.navigate_location(url)
+    }
+
+    fn navigate_location(&mut self, url: &str) -> Result<()> {
         // Clear any transient Chromium surface first. More importantly, this
         // gives xrdp one independently flushed input batch after its focus-in
         // sequence; sending focus, Ctrl-L, the URL, and Enter in one fast-path
@@ -88,12 +93,11 @@ impl RdpDriver {
         );
         self.pump_for(PRE_NAVIGATION_SETTLE)?;
 
-        // Replace the current tab for every one-shot controller job. Ctrl-L is
+        // Replace the current tab for every controlled navigation. Ctrl-L is
         // proven to focus the omnibox in this kiosk session; Ctrl-T can be
-        // consumed without creating or focusing a tab, which leaves a
-        // follow-up job registered but never fetched. The controller accepts
+        // consumed without creating or focusing a tab. The controller accepts
         // repeated transport GETs while a job remains registered, so replacing
-        // the completed page no longer risks consuming a duplicate claim.
+        // a completed page does not consume a duplicate claim.
         for event in omnibox_focus_events() {
             self.session.send_input(&event);
         }
@@ -113,13 +117,11 @@ impl RdpDriver {
             .send_input(&key_event(Key::Enter, false, Modifiers::default()));
         ensure!(
             self.flush_input()? >= url.len() + 2,
-            "RDP probe URL commit did not reach the wire encoder"
+            "RDP Browser URL commit did not reach the wire encoder"
         );
-        // The guest controller intentionally handles one bounded request at a
-        // time. Let Chromium receive the one-shot page and post page_loaded
-        // before the host begins authenticated status polling. Transport
-        // re-fetches remain safe only until that first browser event closes the
-        // page endpoint.
+        // Give Chromium a bounded interval to commit the location while still
+        // pumping inbound frames. For a probe URL, the caller separately
+        // requires the authenticated page_loaded state before it can proceed.
         self.pump_for(POST_NAVIGATION_BROWSER_SETTLE)?;
         Ok(())
     }
@@ -255,10 +257,16 @@ impl RdpDriver {
     }
 
     pub fn settle_between_browser_jobs(&mut self) -> Result<()> {
-        // The strict guest HTTP server closes an idle speculative Chromium
-        // socket after four seconds. Keep servicing RDP frames while that
-        // bounded timeout expires so the following one-shot page GET cannot
-        // queue behind the stale connection and retry as a duplicate claim.
+        // Tear down the completed probe document before opening the next job.
+        // Chromium can otherwise assign a speculative connection retained by
+        // that document to the follow-up top-level navigation; the strict
+        // one-request controller rejects the resulting transport and leaves
+        // the new job correctly untouched. A local about:blank transition
+        // removes the old origin first. Keep servicing RDP frames for longer
+        // than the controller's four-second socket timeout before the caller
+        // navigates to the next one-shot page.
+        self.navigate_location(BETWEEN_JOB_NEUTRAL_URL)
+            .context("leave completed Browser probe page")?;
         self.pump_for(BETWEEN_JOB_CONTROLLER_SETTLE)
     }
 
