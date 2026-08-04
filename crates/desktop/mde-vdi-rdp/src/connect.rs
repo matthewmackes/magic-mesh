@@ -50,15 +50,18 @@ use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{
     ClientConnector, ConnectorError, ConnectorErrorExt as _, Credentials, DesktopSize, ServerName,
 };
+use ironrdp_core::WriteBuf;
 use ironrdp_graphics::image_processing::PixelFormat as IronPixelFormat;
 use ironrdp_pdu::gcc::KeyboardType;
 use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
-use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
 use ironrdp_pdu::input::mouse::PointerFlags;
 use ironrdp_pdu::input::mouse_x::PointerXFlags;
 use ironrdp_pdu::input::{MousePdu, MouseXPdu};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_pdu::rdp::client_info::TimezoneInfo;
+use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
 use ironrdp_rdpsnd::client::Rdpsnd;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput, SessionError};
@@ -85,6 +88,51 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The client name advertised in the GCC core data (max 15 chars on the wire).
 const CLIENT_NAME: &str = "mde-vdi";
+
+/// mstsc and FreeRDP both repeat their focus-in input sequence after control is
+/// granted. FreeRDP documents the duplicate as an interoperability guard for a
+/// server-side activation race; xrdp likewise does not reliably dispatch input
+/// to the new Xorg session until this sequence arrives.
+const FOCUS_IN_REPEAT_COUNT: usize = 2;
+
+/// Tab's set-1 scancode. Focus-in sends only key-up events, so it cannot insert
+/// a Tab into the remote application; it merely releases any stale server-side
+/// key state around the lock-key synchronization event.
+const TAB_SCANCODE: u8 = 0x0f;
+
+fn refresh_region_for_area(
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    desktop_width: u16,
+    desktop_height: u16,
+) -> Option<InclusiveRectangle> {
+    let right = x.checked_add(width.checked_sub(1)?)?;
+    let bottom = y.checked_add(height.checked_sub(1)?)?;
+    if right >= desktop_width || bottom >= desktop_height {
+        return None;
+    }
+    Some(InclusiveRectangle {
+        left: x,
+        top: y,
+        right,
+        bottom,
+    })
+}
+
+/// Select one process-level Rustls provider before IronRDP builds its TLS
+/// client. The complete Construct shell links dependencies that enable both
+/// `aws-lc-rs` and `ring`; Rustls correctly refuses to choose between them and
+/// otherwise panics in the live RDP worker. A provider installed earlier by
+/// another subsystem remains authoritative.
+fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Losing the one-time installation race is harmless: the winner is now
+        // the process default and the RDP handshake can use it.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
 
 /// Why the live connect layer failed — every wire-facing failure is typed so
 /// the shell can distinguish "wrong password" from "link died" (governance:
@@ -136,6 +184,21 @@ pub enum ConnectError {
     /// server-side resize). This thin pump does not replay the activation
     /// state machine — reconnect, exactly as for a tier change.
     Reactivation,
+    /// A requested refresh area is empty or escapes the negotiated desktop.
+    InvalidRefreshArea {
+        /// Left edge in desktop pixels.
+        x: u16,
+        /// Top edge in desktop pixels.
+        y: u16,
+        /// Requested width in pixels.
+        width: u16,
+        /// Requested height in pixels.
+        height: u16,
+        /// Negotiated desktop width in pixels.
+        desktop_width: u16,
+        /// Negotiated desktop height in pixels.
+        desktop_height: u16,
+    },
 }
 
 impl core::fmt::Display for ConnectError {
@@ -157,7 +220,7 @@ impl core::fmt::Display for ConnectError {
                  (was {stored}, now {current}); strict pinning refused the connection"
             ),
             Self::Connector(e) => write!(f, "rdp connection sequence failed: {e}"),
-            Self::Session(e) => write!(f, "rdp active stage failed: {e}"),
+            Self::Session(e) => write!(f, "rdp active stage failed: {}", e.report()),
             Self::Blit(e) => write!(f, "decoded update does not fit the session desktop: {e}"),
             Self::Timeout { phase } => write!(
                 f,
@@ -167,6 +230,18 @@ impl core::fmt::Display for ConnectError {
             Self::Reactivation => write!(
                 f,
                 "server initiated deactivation-reactivation; reconnect to continue"
+            ),
+            Self::InvalidRefreshArea {
+                x,
+                y,
+                width,
+                height,
+                desktop_width,
+                desktop_height,
+            } => write!(
+                f,
+                "RDP refresh area {width}x{height}+{x}+{y} escapes the \
+                 {desktop_width}x{desktop_height} desktop"
             ),
         }
     }
@@ -182,7 +257,8 @@ impl std::error::Error for ConnectError {
             Self::NoServerPublicKey
             | Self::CertPinChanged { .. }
             | Self::Timeout { .. }
-            | Self::Reactivation => None,
+            | Self::Reactivation
+            | Self::InvalidRefreshArea { .. } => None,
         }
     }
 }
@@ -449,6 +525,18 @@ pub fn push_fastpath_events(
     }
 }
 
+/// The post-activation focus handshake used by mstsc and FreeRDP:
+/// Tab-up → synchronize lock states → Tab-up. Sending it twice matches
+/// their activation-race workaround and makes the xrdp/Xorg input owner live
+/// before the shell forwards the first real operator event.
+fn focus_in_events() -> [FastPathInputEvent; 3] {
+    [
+        FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, TAB_SCANCODE),
+        FastPathInputEvent::SyncEvent(SynchronizeFlags::empty()),
+        FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, TAB_SCANCODE),
+    ]
+}
+
 /// The framed transport once TLS is up.
 type TlsFramed = TokioFramed<ironrdp_tls::TlsStream<TcpStream>>;
 
@@ -466,6 +554,10 @@ pub struct RdpConnection {
     /// fingerprint differed from the pin — the shell surfaces it as a warning.
     cert_pin_change: Option<CertPinChange>,
     started: Instant,
+    /// Reassert focus immediately before the first operator input.  The
+    /// post-activation handshake can precede a nested compositor/application
+    /// becoming the real input owner on a persistent xrdp session.
+    first_input_focus_pending: bool,
 }
 
 impl RdpConnection {
@@ -480,6 +572,7 @@ impl RdpConnection {
     /// negotiation (bad credentials surface here as a connector error), or
     /// timeout after [`CONNECT_TIMEOUT`].
     pub fn connect(session: &mut RdpSession) -> Result<Self, ConnectError> {
+        ensure_rustls_crypto_provider();
         let tier = session.quality_tier();
         let settings = session.connect_settings();
         let config = connector_config_for(session.config(), &settings);
@@ -524,11 +617,7 @@ impl RdpConnection {
         );
         let active_stage = ActiveStage::new(connection_result);
 
-        // The connection was built from the target tier's settings: the
-        // session's reconnect-gated tier change is now applied (E12-10).
-        session.mark_tier_applied();
-
-        Ok(Self {
+        let mut connection = Self {
             runtime,
             framed,
             active_stage,
@@ -537,7 +626,21 @@ impl RdpConnection {
             audio,
             cert_pin_change,
             started: Instant::now(),
-        })
+            first_input_focus_pending: true,
+        };
+
+        // Finalization grants protocol control, but mstsc and FreeRDP also
+        // focus the new input owner before forwarding operator events. Without
+        // this post-grant sequence, xrdp paints the Xorg desktop yet can leave
+        // both FastPath and slow-path mouse input undispatched.
+        connection.send_focus_in(session)?;
+
+        // The connection was built from the target tier's settings and its
+        // post-activation focus handshake reached the wire: the session's
+        // reconnect-gated tier change is now applied (E12-10).
+        session.mark_tier_applied();
+
+        Ok(connection)
     }
 
     /// The connection sequence proper, on the runtime. Split out so every
@@ -740,6 +843,83 @@ impl RdpConnection {
             })
     }
 
+    /// Ask the server to repaint one bounded area of the negotiated desktop.
+    ///
+    /// RDP servers may coalesce transient classic-bitmap damage while a browser
+    /// popup is being composed. A Refresh Rect PDU is the protocol recovery
+    /// mechanism: it asks for current pixels without changing guest state or
+    /// reconnecting the session. Keeping the area bounded avoids turning one
+    /// click into an unnecessary full-desktop transfer.
+    ///
+    /// # Errors
+    /// [`ConnectError`] if the area is empty or outside the negotiated desktop,
+    /// the PDU cannot be encoded, or the transport write fails.
+    pub fn request_refresh_area(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), ConnectError> {
+        let (desktop_width, desktop_height) = self.negotiated.desktop_size;
+        let Some(region) =
+            refresh_region_for_area(x, y, width, height, desktop_width, desktop_height)
+        else {
+            return Err(ConnectError::InvalidRefreshArea {
+                x,
+                y,
+                width,
+                height,
+                desktop_width,
+                desktop_height,
+            });
+        };
+        let mut frame = WriteBuf::new();
+        self.active_stage
+            .encode_static(
+                &mut frame,
+                ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                    areas_to_refresh: vec![region],
+                }),
+            )
+            .map_err(ConnectError::Session)?;
+        self.write_frame(&frame.into_inner())
+    }
+
+    /// Ask the server to repaint the whole negotiated desktop.
+    ///
+    /// Prefer [`Self::request_refresh_area`] for interaction recovery; this is
+    /// retained for callers recovering an actually obscured whole surface.
+    ///
+    /// # Errors
+    /// [`ConnectError`] if the negotiated desktop is empty, the PDU cannot be
+    /// encoded, or the transport write fails.
+    pub fn request_full_refresh(&mut self) -> Result<(), ConnectError> {
+        let (width, height) = self.negotiated.desktop_size;
+        self.request_refresh_area(0, 0, width, height)
+    }
+
+    /// Focus the newly granted RDP input owner using the same sequence mstsc
+    /// and FreeRDP send. The duplicate is intentional: FreeRDP carries it as a
+    /// compatibility workaround for an activation timing race, and live xrdp
+    /// proof shows rendering can otherwise succeed while input is ignored.
+    fn send_focus_in(&mut self, session: &mut RdpSession) -> Result<(), ConnectError> {
+        let events = focus_in_events();
+        for _ in 0..FOCUS_IN_REPEAT_COUNT {
+            let outputs = self
+                .active_stage
+                .process_fastpath_input(&mut self.image, &events)
+                .map_err(ConnectError::Session)?;
+            self.apply_outputs(session, outputs)?;
+        }
+        tracing::debug!(
+            repeats = FOCUS_IN_REPEAT_COUNT,
+            events_per_repeat = events.len(),
+            "rdp post-activation focus sequence sent"
+        );
+        Ok(())
+    }
+
     /// Blit one updated region of the decoded surface into the session
     /// framebuffer through the same [`RdpSession::apply_rect`] the unit tests
     /// exercise. The decoded surface is RGBA (see [`RdpConnection::connect`]),
@@ -893,6 +1073,11 @@ impl RdpConnection {
         if intents.is_empty() {
             return Ok(0);
         }
+        if self.first_input_focus_pending {
+            self.send_focus_in(session)?;
+            self.first_input_focus_pending = false;
+            tracing::debug!("rdp first-input focus sequence sent");
+        }
         let pointer = session.pointer_position();
         let mut events = Vec::with_capacity(intents.len());
         for intent in intents {
@@ -928,7 +1113,9 @@ impl RdpConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        connector_config_for, push_fastpath_events, CertPinChange, ConnectError, PumpOutcome,
+        connector_config_for, ensure_rustls_crypto_provider, focus_in_events, push_fastpath_events,
+        refresh_region_for_area, CertPinChange, ConnectError, PumpOutcome, FOCUS_IN_REPEAT_COUNT,
+        TAB_SCANCODE,
     };
     use crate::audio::{RdpAudioCapability, RdpAudioUnsupportedReason};
     use crate::config::RdpConfig;
@@ -938,15 +1125,33 @@ mod tests {
     use crate::pixel::FramebufferError;
     use crate::tier::RdpTierSettings;
     use ironrdp_connector::Credentials;
-    use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+    use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
     use ironrdp_pdu::input::mouse::PointerFlags;
     use ironrdp_pdu::input::mouse_x::PointerXFlags;
-    use ironrdp_pdu::rdp::client_info::CompressionType;
 
     fn events_for(intent: RdpInputEvent) -> Vec<FastPathInputEvent> {
         let mut out = Vec::new();
         push_fastpath_events(intent, (40, 50), &mut out);
         out
+    }
+
+    #[test]
+    fn refresh_region_is_inclusive_bounded_and_rejects_invalid_geometry() {
+        let region =
+            refresh_region_for_area(1_280, 0, 640, 1_080, 1_920, 1_080).expect("bounded area");
+        assert_eq!((region.left, region.top), (1_280, 0));
+        assert_eq!((region.right, region.bottom), (1_919, 1_079));
+
+        let region =
+            refresh_region_for_area(0, 0, 1_920, 1_080, 1_920, 1_080).expect("full desktop");
+        assert_eq!((region.left, region.top), (0, 0));
+        assert_eq!((region.right, region.bottom), (1_919, 1_079));
+        assert_eq!(refresh_region_for_area(0, 0, 0, 1, 1_920, 1_080), None);
+        assert_eq!(refresh_region_for_area(0, 0, 1, 0, 1_920, 1_080), None);
+        assert_eq!(
+            refresh_region_for_area(1_500, 0, 640, 1, 1_920, 1_080),
+            None
+        );
     }
 
     #[test]
@@ -971,13 +1176,40 @@ mod tests {
         assert_eq!(full.domain.as_deref(), Some("MESH"));
         let full_bitmap = full.bitmap.expect("tier always sets a bitmap config");
         assert_eq!(full_bitmap.color_depth, 32);
+        assert!(
+            full_bitmap.codecs.0.is_empty(),
+            "the active stage must keep xrdp on classic bitmap updates"
+        );
         assert_eq!(full.compression_type, None);
 
         let minimal = connector_config_for(&cfg, &RdpTierSettings::for_tier(QualityTier::Minimal));
         let minimal_bitmap = minimal.bitmap.expect("tier always sets a bitmap config");
         assert_eq!(minimal_bitmap.color_depth, 15, "the connector's floor");
         assert!(minimal_bitmap.codecs.0.is_empty(), "no RemoteFX on Minimal");
-        assert_eq!(minimal.compression_type, Some(CompressionType::Rdp61));
+        assert_eq!(minimal.compression_type, None);
+    }
+
+    #[test]
+    fn live_connect_installs_an_explicit_rustls_provider() {
+        ensure_rustls_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "the mixed-provider shell must not reach Rustls provider inference"
+        );
+    }
+
+    #[test]
+    fn post_activation_focus_matches_mstsc_and_freerdp() {
+        assert_eq!(FOCUS_IN_REPEAT_COUNT, 2, "activation-race workaround");
+        assert_eq!(
+            focus_in_events(),
+            [
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, TAB_SCANCODE),
+                FastPathInputEvent::SyncEvent(SynchronizeFlags::empty()),
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, TAB_SCANCODE),
+            ],
+            "focus must release stale Tab state around lock-key synchronization"
+        );
     }
 
     #[test]

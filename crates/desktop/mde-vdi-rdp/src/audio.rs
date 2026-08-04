@@ -11,7 +11,7 @@ use std::fmt;
 /// The exact reason a connection cannot claim an audio path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdpAudioUnsupportedReason {
-    /// No usable `pw-cat`/`pw-playback` process could be connected to stdin.
+    /// No usable `pw-cat`/`pw-play` process could be connected to stdin.
     NoHostPlaybackSink,
     /// RDPSND selected a server format that is not the one advertised here.
     NoSharedFormat,
@@ -26,9 +26,7 @@ impl RdpAudioUnsupportedReason {
     #[must_use]
     pub const fn diagnostic(self) -> &'static str {
         match self {
-            Self::NoHostPlaybackSink => {
-                "no usable host PipeWire playback sink (pw-cat/pw-playback)"
-            }
+            Self::NoHostPlaybackSink => "no usable host PipeWire playback sink (pw-cat/pw-play)",
             Self::NoSharedFormat => "RDPSND did not select the advertised shared PCM format",
             Self::SinkWriteFailed => "host PipeWire playback sink rejected or lost PCM input",
             Self::LiveConnectDisabled => "mde-vdi-rdp was built without the live-connect feature",
@@ -182,6 +180,27 @@ mod live {
     const MAX_PENDING_WAVES: usize = 8;
     const MAX_WAVE_BYTES: usize = 1_048_576;
     const MAX_AUDIO_SINK_QUEUE: usize = 8;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PipeWirePlaybackProgram {
+        PwCat,
+        PwPlay,
+    }
+
+    impl PipeWirePlaybackProgram {
+        const ALL: [Self; 2] = [Self::PwCat, Self::PwPlay];
+
+        const fn executable(self) -> &'static str {
+            match self {
+                Self::PwCat => "pw-cat",
+                Self::PwPlay => "pw-play",
+            }
+        }
+
+        const fn needs_playback_flag(self) -> bool {
+            matches!(self, Self::PwCat)
+        }
+    }
 
     #[derive(Debug)]
     pub(crate) struct PendingWave {
@@ -366,32 +385,38 @@ mod live {
         fn close(&mut self) {}
     }
 
+    fn pipewire_playback_command(
+        executable: impl AsRef<std::ffi::OsStr>,
+        program: PipeWirePlaybackProgram,
+        format: RdpPcmFormat,
+    ) -> Command {
+        let mut command = Command::new(executable);
+        if program.needs_playback_flag() {
+            command.arg("--playback");
+        }
+        command
+            .args(["--raw", "--format", "s16", "--rate"])
+            .arg(format.sample_rate.to_string())
+            .arg("--channels")
+            .arg(format.channels.to_string())
+            // Both PipeWire entry points require a filename operand. `-`
+            // selects stdin; without it they print usage and exit before
+            // RDPSND can be advertised. `--raw` is intentional because RDP
+            // WAVE PDUs carry headerless interleaved PCM, not a WAV container.
+            .arg("-");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
     fn spawn_pipewire_sink(
         format: RdpPcmFormat,
         state: SharedAudioState,
     ) -> Result<(SyncSender<Vec<u8>>, thread::JoinHandle<()>), RdpAudioUnsupportedReason> {
-        let rate = format.sample_rate.to_string();
-        let channels = format.channels.to_string();
-        let candidates = ["pw-cat", "pw-playback"];
-        for program in candidates {
-            let mut command = Command::new(program);
-            if program == "pw-cat" {
-                command.arg("--playback");
-            }
-            let child = command
-                .args([
-                    "--raw",
-                    "--format",
-                    "s16",
-                    "--rate",
-                    rate.as_str(),
-                    "--channels",
-                    channels.as_str(),
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+        for program in PipeWirePlaybackProgram::ALL {
+            let child = pipewire_playback_command(program.executable(), program, format).spawn();
             let Ok(mut child) = child else {
                 continue;
             };
@@ -437,12 +462,37 @@ mod live {
     #[cfg(test)]
     mod tests {
         use super::{
-            supported_format, AudioState, PipeWireRdpsndHandler, RdpPcmFormat, MAX_PENDING_WAVES,
-            MAX_WAVE_BYTES,
+            pipewire_playback_command, supported_format, AudioState, PipeWirePlaybackProgram,
+            PipeWireRdpsndHandler, RdpPcmFormat, MAX_PENDING_WAVES, MAX_WAVE_BYTES,
         };
         use ironrdp_rdpsnd::client::RdpsndClientHandler;
         use std::borrow::Cow;
+        use std::fs;
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::{Arc, Mutex};
+
+        static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+        fn playback_args(program: PipeWirePlaybackProgram) -> Vec<&'static str> {
+            let mut args = Vec::new();
+            if program.needs_playback_flag() {
+                args.push("--playback");
+            }
+            args.extend([
+                "--raw",
+                "--format",
+                "s16",
+                "--rate",
+                "48000",
+                "--channels",
+                "2",
+                "-",
+            ]);
+            args
+        }
 
         #[test]
         fn handler_bounds_pending_wave_count_and_size() {
@@ -477,6 +527,66 @@ mod live {
             );
             assert_eq!(format.n_block_align, 4);
             assert_eq!(format.n_avg_bytes_per_sec, 192_000);
+        }
+
+        #[test]
+        fn pipewire_commands_bind_pcm_input_to_explicit_stdin_filename() {
+            for program in PipeWirePlaybackProgram::ALL {
+                let command = pipewire_playback_command(
+                    program.executable(),
+                    program,
+                    RdpPcmFormat::STEREO_S16_48K,
+                );
+                assert_eq!(command.get_program(), program.executable());
+                assert_eq!(
+                    command
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                    playback_args(program)
+                );
+                assert_eq!(command.get_args().last().unwrap(), "-");
+            }
+        }
+
+        #[test]
+        fn pipewire_commands_stream_pcm_bytes_through_child_stdin() {
+            let fixture = std::env::temp_dir().join(format!(
+                "mde-vdi-rdp-pipewire-{}-{}",
+                process::id(),
+                NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&fixture).unwrap();
+            let executable = fixture.join("pipewire-argv-stdin-fixture");
+            fs::write(
+                &executable,
+                b"#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" >\"$MDE_TEST_ARGS\"\ncat >\"$MDE_TEST_STDIN\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let pcm = [0x00, 0x00, 0xff, 0x7f, 0x01, 0x80, 0x00, 0x00];
+            for program in PipeWirePlaybackProgram::ALL {
+                let stem = program.executable();
+                let args_path = fixture.join(format!("{stem}.args"));
+                let stdin_path = fixture.join(format!("{stem}.stdin"));
+                let mut command =
+                    pipewire_playback_command(&executable, program, RdpPcmFormat::STEREO_S16_48K);
+                command
+                    .env("MDE_TEST_ARGS", &args_path)
+                    .env("MDE_TEST_STDIN", &stdin_path);
+                let mut child = command.spawn().unwrap();
+                child.stdin.take().unwrap().write_all(&pcm).unwrap();
+                assert!(child.wait().unwrap().success());
+
+                assert_eq!(fs::read(&stdin_path).unwrap(), pcm);
+                assert_eq!(
+                    fs::read_to_string(&args_path).unwrap(),
+                    format!("{}\n", playback_args(program).join("\n"))
+                );
+            }
+
+            fs::remove_dir_all(fixture).unwrap();
         }
     }
 }

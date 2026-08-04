@@ -32,7 +32,9 @@
 //! link-quality estimator + the hysteresis [`QualityTier`] ladder (a weak link
 //! degrades fast, a recovered one upgrades slowly), and [`tier`] maps each
 //! tier onto the connect-time knobs the pinned `ironrdp` actually exposes
-//! (colour depth, `RemoteFX`, performance flags, bulk compression). RDP has no
+//! (colour depth, bitmap compression, performance flags, bulk compression).
+//! The pinned active stage deliberately does not advertise RemoteFX because it
+//! cannot decode the stream xorgxrdp selects for that capability. RDP has no
 //! client-driven mid-session re-negotiation, so tier changes are honestly
 //! typed [`TierApplication::OnReconnect`] and surfaced through
 //! [`RdpSession::needs_reconnect`].

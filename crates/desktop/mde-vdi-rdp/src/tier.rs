@@ -25,7 +25,7 @@
 
 use crate::link::{QualityTier, TierApplication};
 use ironrdp_connector::BitmapConfig;
-use ironrdp_pdu::rdp::capability_sets::{client_codecs_capabilities, BitmapCodecs};
+use ironrdp_pdu::rdp::capability_sets::BitmapCodecs;
 use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags};
 
 /// The connect-time RDP settings one [`QualityTier`] maps to.
@@ -43,9 +43,6 @@ pub struct RdpTierSettings {
     pub color_depth: u32,
     /// Allow lossy bitmap compression (`BitmapConfig::lossy_compression`).
     pub lossy_bitmap_compression: bool,
-    /// Advertise the `RemoteFX` codec. Off on the lightest tier so the server
-    /// falls back to plain (bulk-compressed) bitmaps at the reduced depth.
-    pub remotefx: bool,
     /// Client Info performance flags — server-side eye-candy the tier sheds.
     pub performance_flags: PerformanceFlags,
     /// Bulk (MPPC/NCRUSH/XCRUSH) compression to negotiate; richer levels on
@@ -68,11 +65,17 @@ impl RdpTierSettings {
             | PerformanceFlags::DISABLE_THEMING
             | PerformanceFlags::DISABLE_CURSOR_SHADOW
             | PerformanceFlags::DISABLE_CURSORSETTINGS;
+        // xrdp 0.10.6 emits a slow-path pointer update immediately after
+        // activation. `IronRDP` 0.10 corrupts that update whenever bulk
+        // compression is negotiated (verified with NCRUSH/RDP6 and MPPC/K64),
+        // so keep transport-level compression off until the pinned decoder is
+        // upgraded. The lighter tiers still reduce colour depth, enable bitmap
+        // compression, and progressively disable eye candy.
+        let compatible_bulk_compression = None;
         match tier {
             QualityTier::Full => Self {
                 color_depth: 32,
                 lossy_bitmap_compression: false,
-                remotefx: true,
                 performance_flags: PerformanceFlags::ENABLE_FONT_SMOOTHING
                     | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION,
                 bulk_compression: None,
@@ -80,24 +83,21 @@ impl RdpTierSettings {
             QualityTier::Reduced => Self {
                 color_depth: 16,
                 lossy_bitmap_compression: true,
-                remotefx: true,
                 performance_flags: disable_eyecandy | PerformanceFlags::ENABLE_FONT_SMOOTHING,
-                bulk_compression: Some(CompressionType::K64),
+                bulk_compression: compatible_bulk_compression,
             },
             QualityTier::Compressed => Self {
                 color_depth: 16,
                 lossy_bitmap_compression: true,
-                remotefx: true,
                 performance_flags: disable_everything,
-                bulk_compression: Some(CompressionType::Rdp6),
+                bulk_compression: compatible_bulk_compression,
             },
             QualityTier::Minimal => Self {
                 // 15-bpp RGB555 is the floor the pinned connector accepts.
                 color_depth: 15,
                 lossy_bitmap_compression: true,
-                remotefx: false,
                 performance_flags: disable_everything,
-                bulk_compression: Some(CompressionType::Rdp61),
+                bulk_compression: compatible_bulk_compression,
             },
         }
     }
@@ -112,25 +112,21 @@ impl RdpTierSettings {
         }
     }
 
-    /// The bitmap-codec capability set: `RemoteFX` advertised on the richer
-    /// tiers, none (plain bitmaps) on [`QualityTier::Minimal`].
+    /// The bitmap-codec capability set.
+    ///
+    /// `IronRDP` 0.10's active stage fails when xorgxrdp selects `RemoteFX` capture
+    /// for the advertised codec.  Advertising no bitmap codec keeps xrdp on
+    /// the classic bitmap-update path that this client decodes and has rendered
+    /// successfully against the production Browser VM.
     #[must_use]
     pub fn codecs(&self) -> BitmapCodecs {
-        let wanted: &[&str] = if self.remotefx {
-            &["remotefx:on"]
-        } else {
-            &["remotefx:off"]
-        };
-        // The parser only errors on an unknown codec name; both inputs are
-        // fixed known strings, so the fallback (advertise nothing = plain
-        // bitmaps) is unreachable in practice but keeps this panic-free.
-        client_codecs_capabilities(wanted).unwrap_or_else(|_| BitmapCodecs(Vec::new()))
+        BitmapCodecs(Vec::new())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionType, PerformanceFlags, RdpTierSettings, TierApplication};
+    use super::{PerformanceFlags, RdpTierSettings, TierApplication};
     use crate::link::QualityTier;
 
     #[test]
@@ -158,9 +154,9 @@ mod tests {
         assert!(!full.lossy_bitmap_compression, "full tier stays lossless");
         assert!(reduced.lossy_bitmap_compression);
         assert_eq!(full.bulk_compression, None);
-        assert_eq!(reduced.bulk_compression, Some(CompressionType::K64));
-        assert_eq!(compressed.bulk_compression, Some(CompressionType::Rdp6));
-        assert_eq!(minimal.bulk_compression, Some(CompressionType::Rdp61));
+        assert_eq!(reduced.bulk_compression, None);
+        assert_eq!(compressed.bulk_compression, None);
+        assert_eq!(minimal.bulk_compression, None);
         assert!(
             full.performance_flags
                 .contains(PerformanceFlags::ENABLE_FONT_SMOOTHING),
@@ -175,21 +171,14 @@ mod tests {
     }
 
     #[test]
-    fn remotefx_is_advertised_on_rich_tiers_and_dropped_on_minimal() {
-        assert!(
-            !RdpTierSettings::for_tier(QualityTier::Full)
-                .codecs()
-                .0
-                .is_empty(),
-            "full advertises RemoteFX"
-        );
-        assert!(
-            RdpTierSettings::for_tier(QualityTier::Minimal)
-                .codecs()
-                .0
-                .is_empty(),
-            "minimal advertises no codec (plain bitmaps)"
-        );
+    fn remotefx_is_not_advertised_for_any_tier() {
+        for tier in QualityTier::ALL {
+            let codecs = RdpTierSettings::for_tier(tier).codecs();
+            assert!(
+                codecs.0.is_empty(),
+                "{tier:?} must use classic bitmap updates"
+            );
+        }
     }
 
     #[test]
@@ -197,6 +186,6 @@ mod tests {
         let cfg = RdpTierSettings::for_tier(QualityTier::Reduced).bitmap_config();
         assert_eq!(cfg.color_depth, 16);
         assert!(cfg.lossy_compression);
-        assert!(!cfg.codecs.0.is_empty());
+        assert!(cfg.codecs.0.is_empty());
     }
 }

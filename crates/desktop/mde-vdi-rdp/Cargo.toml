@@ -64,6 +64,7 @@ live-connect = [
     "dep:ironrdp-tokio",
     "dep:ironrdp-tls",
     "dep:ironrdp-rdpsnd",
+    "dep:rustls",
     "dep:tokio",
 ]
 
@@ -81,6 +82,15 @@ optional = true
 # rustls backend only — the workspace substrate lock (§3 / deny.toml) bans any
 # OpenSSL linkage; ironrdp-tls's `rustls` feature rides tokio-rustls.
 features = ["rustls"]
+
+# The full shell feature graph currently contains both Rustls crypto providers.
+# Rustls deliberately refuses to guess in that situation, so the RDP boundary
+# installs ring explicitly before IronRDP constructs its TLS client.
+[dependencies.rustls]
+version = "0.23"
+optional = true
+default-features = false
+features = ["ring", "std"]
 
 [dependencies.tokio]
 version = "1"

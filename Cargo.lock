@@ -4850,6 +4850,7 @@ dependencies = [
  "mackes-mesh-types",
  "mde-egui",
  "mde-vdi-core",
+ "rustls",
  "sha2 0.10.9",
  "tokio",
  "tracing",
