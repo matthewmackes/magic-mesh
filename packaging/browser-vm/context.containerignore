@@ -1,6 +1,9 @@
 # Browser VM Containerfile copies only packaging inputs from the repository.
 *
 !packaging
+!install-helpers
+!install-helpers/browser-vm-production-control
+!install-helpers/browser-vm-production-control/**
 !crates
 !crates/desktop
 !crates/desktop/mde-media-core

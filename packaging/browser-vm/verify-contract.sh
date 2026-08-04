@@ -12,6 +12,7 @@ ATTACH_VERIFY="$BROWSER_VM/verify-transport-attach.sh"
 RUNTIME_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-runtime-evidence.py"
 IMAGE_BUILD="$BROWSER_VM/build-image.sh"
 IMAGE_VERIFY="$BROWSER_VM/verify-image.sh"
+PRODUCTION_CONTROL_VERIFY="$BROWSER_VM/verify-production-control-image.py"
 RUNTIME="$BROWSER_VM/mcnf-browser-vm-runtime.sh"
 RUNTIME_UNIT="$BROWSER_VM/mcnf-browser-vm-runtime.service"
 XRDP_STARTWM="$BROWSER_VM/mcnf-browser-vm-xrdp-startwm.sh"
@@ -25,6 +26,9 @@ VDI_LIVE_PROOF_VERIFY="$ROOT/install-helpers/verify-vdi-live-proof.py"
 DEPLOYMENT_VERIFY="$ROOT/install-helpers/verify-browser-vm-deployment.py"
 EPHEMERAL_NOCLOUD="$BROWSER_VM/prepare-ephemeral-nocloud.sh"
 DEPLOY_IMAGE="$BROWSER_VM/deploy-image.sh"
+PRODUCTION_CONTROL_UNIT="$ROOT/install-helpers/browser-vm-production-control/deploy/browser-vm-guest-audio-probe-controller.service"
+PRODUCTION_CONTROL_CONFIG="$ROOT/install-helpers/browser-vm-production-control/deploy/controller-config.example.json"
+PRODUCTION_CONTROL_POLICY="$BROWSER_VM/mcnf-browser-vm-managed-policy.json"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
@@ -38,6 +42,7 @@ fail() {
 [ -x "$RUNTIME_EVIDENCE_VERIFY" ] || fail "runtime evidence verifier is not executable"
 [ -x "$IMAGE_BUILD" ] || fail "image builder is not executable"
 [ -x "$IMAGE_VERIFY" ] || fail "image verifier is not executable"
+[ -x "$PRODUCTION_CONTROL_VERIFY" ] || fail "production-control image verifier is not executable"
 [ -x "$RUNTIME" ] || fail "guest runtime is not executable"
 [ -x "$XRDP_STARTWM" ] || fail "xrdp session entrypoint is not executable"
 [ -x "$SESSION" ] || fail "media session supervisor is not executable"
@@ -51,9 +56,12 @@ fail() {
 [ -x "$EPHEMERAL_NOCLOUD" ] || fail "ephemeral NoCloud helper is not executable"
 [ -x "$DEPLOY_IMAGE" ] || fail "image deploy helper is not executable"
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
+[ -f "$PRODUCTION_CONTROL_UNIT" ] || fail "production-control guest service unit is missing"
+[ -f "$PRODUCTION_CONTROL_CONFIG" ] || fail "production-control guest config is missing"
+[ -f "$PRODUCTION_CONTROL_POLICY" ] || fail "production-control Chromium policy is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$SESSION_INPUT_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
-python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY"
+python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY" "$PRODUCTION_CONTROL_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
@@ -70,10 +78,45 @@ grep -Fq "use_fastpath=input" "$BROWSER_VM/Containerfile" \
     || fail "Browser image does not keep graphics on slow-path bitmap updates"
 grep -Fq 'xrdp-selinux' "$BROWSER_VM/Containerfile" \
     || fail "Browser image omits the Fedora xrdp SELinux policy package"
+for image_path in \
+    '/usr/libexec/mcnf/browser-vm-guest-audio-probe-controller' \
+    '/usr/lib/systemd/system/browser-vm-guest-audio-probe-controller.service' \
+    '/etc/mcnf/browser-vm-guest-audio-probe-controller.json' \
+    '/etc/chromium/policies/managed/mcnf-browser-vm.json'; do
+    grep -Fq "$image_path" "$BROWSER_VM/Containerfile" \
+        || fail "Browser image omits production-control path: $image_path"
+done
+grep -Fq 'mcnf-browser-probe' "$BROWSER_VM/Containerfile" \
+    || fail "Browser image omits the dedicated production-control account"
+grep -Eq 'systemctl[[:space:]]+enable[[:space:]]+browser-vm-guest-audio-probe-controller\.service' "$BROWSER_VM/Containerfile" \
+    || fail "Browser image does not enable the production-control guest service"
+for directive in \
+    'User=mcnf-browser-probe' \
+    'Group=mcnf-browser-probe' \
+    'ExecStart=/usr/libexec/mcnf/browser-vm-guest-audio-probe-controller' \
+    'IPAddressDeny=any' \
+    'IPAddressAllow=192.168.122.1/32'; do
+    grep -Fxq "$directive" "$PRODUCTION_CONTROL_UNIT" \
+        || fail "production-control guest service omits: $directive"
+done
+if ! grep -Fxq 'IPAddressAllow=localhost' "$PRODUCTION_CONTROL_UNIT"; then
+    if ! grep -Fxq 'IPAddressAllow=127.0.0.0/8' "$PRODUCTION_CONTROL_UNIT" \
+        || ! grep -Fxq 'IPAddressAllow=::1/128' "$PRODUCTION_CONTROL_UNIT"; then
+        fail "production-control guest service does not admit localhost only"
+    fi
+fi
+"$PRODUCTION_CONTROL_VERIFY" --source-assets \
+    --service-unit "$PRODUCTION_CONTROL_UNIT" \
+    --controller-config "$PRODUCTION_CONTROL_CONFIG" \
+    --chromium-policy "$PRODUCTION_CONTROL_POLICY" >/dev/null
+if grep -Eq '^[[:space:]]*(ADD|COPY)[[:space:]].*controller-secret' "$BROWSER_VM/Containerfile"; then
+    fail "Browser image attempts to embed the production-control shared secret"
+fi
 grep -Fq 'BROWSER_VM_DISK_GB' "$IMAGE_BUILD" || fail "image builder does not bind disk size to the profile"
 grep -Fq 'qemu-img resize' "$IMAGE_BUILD" || fail "image builder does not resize the disk output"
 grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce the 64-GiB image floor"
 "$IMAGE_VERIFY" --self-test >/dev/null
+"$PRODUCTION_CONTROL_VERIFY" --self-test >/dev/null
 "$RUNTIME_EVIDENCE_VERIFY" --self-test >/dev/null
 "$MEDIA_EVIDENCE_VERIFY" --self-test >/dev/null
 "$PERFORMANCE_EVIDENCE_VERIFY" --self-test >/dev/null

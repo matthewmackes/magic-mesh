@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "listen_address": "0.0.0.0",
+  "listen_port": 38443,
+  "allowed_host_address": "192.168.122.1",
+  "controller_secret_file": "/etc/mcnf/browser-vm-control/controller-secret",
+  "max_jobs": 4
+}

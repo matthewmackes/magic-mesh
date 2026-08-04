@@ -81,6 +81,22 @@ that record with `install-helpers/verify-browser-vm-media-evidence.py`. This is
 guest-local decode evidence only: it does not claim GPU hardware acceleration,
 audible playback, VDI presentation, or reconnect recovery.
 
+The immutable image also builds and installs the guest half of the production
+audio qualification control plane. The controller runs as the dedicated
+`mcnf-browser-probe` account, is enabled but condition-gated until a separately
+provisioned controller secret exists, and admits traffic only from loopback or
+the fixed hypervisor-side `192.168.122.1/32` address at both the systemd IP ACL
+and application-authentication layers. The image contains no controller
+secret. Provisioning must create the 64-hex-character secret as
+`mcnf-browser-probe:mcnf-browser-probe` mode `0400`, then start the service;
+the matching host copy remains root-owned mode `0600`.
+
+Chromium is managed with `AudioCaptureAllowed=false` plus one exception,
+`http://127.0.0.1:38443/*`. This leaves microphone capture denied for every
+other origin while removing the permission dialog for the authenticated local
+probe page. The page still requires its two real trusted RDP clicks, and this
+packaging state alone is not playback, capture, reconnect, or audibility proof.
+
 The guest launch boundary is equally fail-closed. Workloads writes only
 `profile-id`, `image-id`, `image-digest`, `session-id`, and `transport` under
 `/etc/mcnf-browser-vm`; the image runs `validate-runtime-inputs.sh` before

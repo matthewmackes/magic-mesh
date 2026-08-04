@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "rdp_host": "192.168.122.58",
+  "rdp_port": 3389,
+  "rdp_username": "mcnf-browser",
+  "rdp_password_file": "/etc/mcnf/browser-vm-control/rdp-password",
+  "controller_host": "192.168.122.58",
+  "controller_port": 38443,
+  "controller_secret_file": "/etc/mcnf/browser-vm-control/controller-secret",
+  "desktop_width": 1920,
+  "desktop_height": 1080,
+  "control_button_x": 960,
+  "control_button_y": 580
+}

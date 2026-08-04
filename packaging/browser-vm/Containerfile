@@ -2,6 +2,21 @@
 # The image owns Chromium, Wayland, GPU/audio/input plumbing, and the runtime.
 
 ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:4d3600c36e461f77af144750fb7c199f8c80f1c987bad492def4215dcf1bbf7f
+FROM ${BROWSER_VM_BASE} AS browser-vm-controller-builder
+
+COPY install-helpers/browser-vm-production-control/ /tmp/browser-vm-production-control/
+RUN set -eux; \
+    dnf -y --setopt=install_weak_deps=False install cargo gcc rust; \
+    install -d -m 0700 /tmp/mcnf-builder-home /tmp/mcnf-cargo-home; \
+    HOME=/tmp/mcnf-builder-home CARGO_HOME=/tmp/mcnf-cargo-home \
+    cargo build --release --locked \
+        --manifest-path /tmp/browser-vm-production-control/guest-controller/Cargo.toml \
+        --target-dir /tmp/browser-vm-controller-target \
+        --bin browser-vm-guest-audio-probe-controller; \
+    install -D -m 0755 \
+        /tmp/browser-vm-controller-target/release/browser-vm-guest-audio-probe-controller \
+        /out/browser-vm-guest-audio-probe-controller
+
 FROM ${BROWSER_VM_BASE}
 
 ARG MCNF_RPM_LANE=repo
@@ -15,7 +30,11 @@ COPY packaging/browser-vm/verify-session-input-contract.sh /tmp/mcnf-browser-vm-
 COPY packaging/browser-vm/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-fixture.html
 COPY packaging/browser-vm/mcnf-browser-vm-media-probe.sh /tmp/mcnf-browser-vm-media-probe
 COPY packaging/browser-vm/mcnf-x11-present-copy.c /tmp/mcnf-x11-present-copy.c
+COPY packaging/browser-vm/mcnf-browser-vm-managed-policy.json /tmp/mcnf-browser-vm-managed-policy.json
 COPY crates/desktop/mde-media-core/tests/fixtures/tiny_clip.mkv /tmp/mcnf-browser-vm-tiny_clip.mkv
+COPY install-helpers/browser-vm-production-control/deploy/browser-vm-guest-audio-probe-controller.service /tmp/browser-vm-guest-audio-probe-controller.service
+COPY install-helpers/browser-vm-production-control/deploy/controller-config.example.json /tmp/browser-vm-guest-audio-probe-controller.json
+COPY --from=browser-vm-controller-builder /out/browser-vm-guest-audio-probe-controller /tmp/browser-vm-guest-audio-probe-controller
 COPY packaging/browser-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 
@@ -28,6 +47,17 @@ RUN set -eux; \
     install -D -m 0755 /tmp/mcnf-browser-vm-media-probe /usr/local/libexec/mcnf-browser-vm-media-probe; \
     install -D -m 0644 /tmp/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html; \
     install -D -m 0644 /tmp/mcnf-browser-vm-tiny_clip.mkv /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; \
+    useradd --system --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin mcnf-browser-probe; \
+    install -D -m 0755 /tmp/browser-vm-guest-audio-probe-controller /usr/libexec/mcnf/browser-vm-guest-audio-probe-controller; \
+    install -D -o mcnf-browser-probe -g mcnf-browser-probe -m 0444 \
+        /tmp/browser-vm-guest-audio-probe-controller.json \
+        /etc/mcnf/browser-vm-guest-audio-probe-controller.json; \
+    install -d -o root -g mcnf-browser-probe -m 0750 /etc/mcnf/browser-vm-control; \
+    test ! -e /etc/mcnf/browser-vm-control/controller-secret; \
+    install -D -m 0644 /tmp/browser-vm-guest-audio-probe-controller.service \
+        /usr/lib/systemd/system/browser-vm-guest-audio-probe-controller.service; \
+    install -D -m 0644 /tmp/mcnf-browser-vm-managed-policy.json \
+        /etc/chromium/policies/managed/mcnf-browser-vm.json; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         guest_rpm="$(find /tmp/mcnf-rpms -maxdepth 1 -type f -name 'magic-mesh-lighthouse-*.rpm' -print -quit)"; \
         [ -n "$guest_rpm" ] || { echo 'FATAL: local Browser VM lane needs a magic-mesh-lighthouse RPM'; exit 1; }; \
@@ -91,15 +121,16 @@ RUN set -eux; \
     install -d -m 0755 /usr/share/mcnf/browser-vm; \
     printf '%s\n' "$BROWSER_VM_SOURCE_COMMIT" > /usr/share/mcnf/browser-vm/source-commit; \
     printf '%s\n' \
-        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","control_plane":"magic-mesh-lighthouse","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
+        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","control_plane":"magic-mesh-lighthouse","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","audio_probe_control":"rdp-webaudio-hmac-v1","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
         > /usr/share/mcnf/browser-vm/image-contract.json; \
     systemctl enable qemu-guest-agent.service; \
     # Fedora ships spice-vdagentd as a static unit. Install the target link
     # explicitly so the guest agent starts when the SPICE channel is present.
     ln -sf /usr/lib/systemd/system/spice-vdagentd.service /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service; \
     systemctl enable xrdp.service; \
+    systemctl enable browser-vm-guest-audio-probe-controller.service; \
     dnf -y remove gcc libxcb-devel; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-verify-session-input /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv /tmp/mcnf-x11-present-copy.c; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-verify-session-input /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv /tmp/mcnf-x11-present-copy.c /tmp/mcnf-browser-vm-managed-policy.json /tmp/browser-vm-guest-audio-probe-controller /tmp/browser-vm-guest-audio-probe-controller.json /tmp/browser-vm-guest-audio-probe-controller.service; \
     dnf clean all
 
 RUN systemctl enable mcnf-browser-vm-runtime.service

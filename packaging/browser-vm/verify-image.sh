@@ -4,10 +4,13 @@ set -euo pipefail
 TAG="${1:-localhost/magic-mesh-browser-vm-chromium:latest}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SESSION_INPUT_VERIFY="$ROOT/packaging/browser-vm/verify-session-input-contract.sh"
+PRODUCTION_CONTROL_VERIFY="$ROOT/packaging/browser-vm/verify-production-control-image.py"
 
 if [[ "${1:-}" == "--self-test" ]]; then
+    # shellcheck disable=SC2050 # Deliberate fixed positive provenance fixture.
     [[ "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
     "$SESSION_INPUT_VERIFY" --self-test >/dev/null
+    "$PRODUCTION_CONTROL_VERIFY" --self-test >/dev/null
     echo 'Browser VM image provenance self-tests passed'
     exit 0
 fi
@@ -23,6 +26,7 @@ image_source_commit="$(podman image inspect --format '{{index .Config.Labels "or
     exit 1
 }
 
+# shellcheck disable=SC2016 # Expanded by Bash inside the image, not by this shell.
 inner='set -u
 fail=0
 ok(){ echo "  OK   $1"; }
@@ -83,4 +87,10 @@ out="$(printf '%s\n' "$inner" | podman run --rm -i -e "MCNF_EXPECTED_SOURCE_COMM
 printf '%s\n' "$out"
 grep -q '^  OK ' <<<"$out" || rc=1
 grep -q '^  FAIL ' <<<"$out" && rc=1
+control_rc=0
+control_out="$(podman run --rm -i "$TAG" /usr/bin/python3 - --image-root / \
+    < "$PRODUCTION_CONTROL_VERIFY" 2>&1)" || control_rc=$?
+printf '%s\n' "$control_out"
+(( control_rc == 0 )) || rc=1
+grep -Fxq 'Browser VM production-control image contract passed' <<<"$control_out" || rc=1
 exit "$rc"

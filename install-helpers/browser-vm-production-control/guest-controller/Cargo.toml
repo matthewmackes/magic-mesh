@@ -1,0 +1,47 @@
+[workspace]
+
+[package]
+name = "browser-vm-production-control-guest"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "browser_vm_production_control"
+path = "../src/lib.rs"
+
+[[bin]]
+name = "browser-vm-guest-audio-probe-controller"
+path = "../src/bin/browser-vm-guest-audio-probe-controller.rs"
+
+[features]
+default = []
+# The shared source gates host-only RDP modules behind this feature. This
+# guest-only package deliberately cannot satisfy or enable that dependency set.
+host-control = []
+
+[dependencies]
+anyhow = "1"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "=0.3.36", features = ["formatting"] }
+zeroize = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
