@@ -34,12 +34,14 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import dataclass
+from fractions import Fraction
 import glob
 import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -69,6 +71,8 @@ WIDTH = 1920
 HEIGHT = 1080
 TARGET_FPS = 30
 TAB_RATE_PROBE_SECONDS = 4.0
+MEDIA_DURATION_SECONDS = 8
+MAX_MEDIA_BYTES = 64 * 1024 * 1024
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -172,6 +176,159 @@ def file_sha256(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class MediaAsset:
+    data: bytes
+    sha256: str
+    codec: str
+    width: int
+    height: int
+    fps: int
+    duration_ms: int
+    generator_sha256: str
+    generator_version: str
+
+
+def generate_media_asset(runtime_root: Path) -> MediaAsset:
+    """Generate and inspect the real encoded 1080p/36 source served to Chromium."""
+    ffmpeg = Path("/usr/bin/ffmpeg")
+    ffprobe = Path("/usr/bin/ffprobe")
+    for path, label in ((ffmpeg, "ffmpeg"), (ffprobe, "ffprobe")):
+        if not path.is_file() or not os.access(path, os.X_OK):
+            fail(f"{label} is unavailable for the live encoded media source")
+    output = runtime_root / "browser-vm-performance-source.webm"
+    command = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        (
+            f"testsrc2=size={WIDTH}x{HEIGHT}:rate=36:"
+            f"duration={MEDIA_DURATION_SECONDS}"
+        ),
+        "-an",
+        "-c:v",
+        "libvpx-vp9",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-row-mt",
+        "1",
+        "-threads",
+        "8",
+        "-b:v",
+        "1200k",
+        "-g",
+        "72",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "webm",
+        "-y",
+        str(output),
+    ]
+    try:
+        generated = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"live 1080p media generation failed: {exc}")
+    if generated.returncode != 0:
+        fail(f"live 1080p media generation was rejected: {generated.stderr[:512]}")
+    try:
+        metadata = output.lstat()
+    except OSError as exc:
+        fail(f"live 1080p media output is unavailable: {exc}")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or not 0 < metadata.st_size <= MAX_MEDIA_BYTES
+    ):
+        fail("live 1080p media output is not one bounded regular file")
+    try:
+        inspected = subprocess.run(
+            [
+                str(ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,avg_frame_rate",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(output),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"live 1080p media inspection failed: {exc}")
+    if inspected.returncode != 0:
+        fail(f"live 1080p media inspection was rejected: {inspected.stderr[:512]}")
+    try:
+        facts = json.loads(inspected.stdout)
+        stream = facts["streams"][0]
+        codec = stream["codec_name"]
+        width = int(stream["width"])
+        height = int(stream["height"])
+        frame_rate = Fraction(stream["avg_frame_rate"])
+        duration = float(facts["format"]["duration"])
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, json.JSONDecodeError):
+        fail("live 1080p media inspection returned malformed facts")
+    if (
+        codec != "vp9"
+        or width != WIDTH
+        or height != HEIGHT
+        or frame_rate != Fraction(36, 1)
+        or not math.isfinite(duration)
+        or duration < MEDIA_DURATION_SECONDS - 0.1
+    ):
+        fail("encoded media did not verify as VP9 1920x1080 at 36 fps")
+    try:
+        version = subprocess.run(
+            [str(ffmpeg), "-version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        ).stdout.splitlines()[0][:256]
+        data = output.read_bytes()
+    except (OSError, subprocess.SubprocessError, IndexError) as exc:
+        fail(f"encoded media provenance could not be recorded: {exc}")
+    finally:
+        try:
+            output.unlink()
+        except FileNotFoundError:
+            pass
+    return MediaAsset(
+        data=data,
+        sha256="sha256:" + hashlib.sha256(data).hexdigest(),
+        codec=codec,
+        width=width,
+        height=height,
+        fps=frame_rate.numerator,
+        duration_ms=round(duration * 1_000),
+        generator_sha256=file_sha256(ffmpeg),
+        generator_version=version,
+    )
 
 
 def materialize_rdp_password(
@@ -1044,6 +1201,39 @@ class CdpTab:
             time.sleep(0.1)
         fail(f"Chromium window {window_id} did not enter a verified minimized state")
 
+    def set_normal_window_bounds(
+        self, window_id: int, *, left: int, top: int, width: int, height: int
+    ) -> None:
+        self.socket.call(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "normal"}},
+        )
+        self.socket.call(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                },
+            },
+        )
+        expected = {"left": left, "top": top, "width": width, "height": height}
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            value = self.socket.call("Browser.getWindowBounds", {"windowId": window_id})
+            bounds = value.get("bounds") if isinstance(value, dict) else None
+            if (
+                isinstance(bounds, dict)
+                and bounds.get("windowState") == "normal"
+                and all(bounds.get(field) == number for field, number in expected.items())
+            ):
+                return
+            time.sleep(0.1)
+        fail(f"Chromium window {window_id} did not enter its verified tiled bounds")
+
     def close(self) -> None:
         self.socket.close()
 
@@ -1109,6 +1299,31 @@ def spread_tabs_across_windows(tabs: list[CdpTab]) -> bool:
     return True
 
 
+def tile_tab_windows(tabs: list[CdpTab]) -> list[int]:
+    """Keep every 1080p source visibly scheduled on the 1920x1080 desktop."""
+    layout = (
+        (0, 0, 640, 520),
+        (640, 0, 640, 520),
+        (1280, 0, 640, 520),
+        (320, 540, 640, 520),
+        (960, 540, 640, 520),
+    )
+    windows: list[int] = []
+    for tab, (left, top, width, height) in zip(tabs, layout):
+        window_id = tab.window_id()
+        if window_id in windows:
+            fail("Chromium media tabs did not retain independent windows")
+        tab.set_normal_window_bounds(
+            window_id,
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+        )
+        windows.append(window_id)
+    return windows
+
+
 MEDIA_PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MCNF Browser VM performance media</title>
 <style>
@@ -1118,7 +1333,7 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#07111f}
 background:#c62828;color:white;font:700 17px system-ui;z-index:4;box-shadow:0 3px 18px #0008}
 #nav{position:fixed;width:1px;height:1px;left:-10px;top:-10px;border:0}
 </style></head><body>
-<video id="video" muted autoplay playsinline></video>
+<video id="video" muted autoplay loop playsinline preload="auto"></video>
 <button id="beacon" type="button">INPUT 0</button><iframe id="nav"></iframe>
 <script>
 (() => {
@@ -1129,38 +1344,16 @@ background:#c62828;color:white;font:700 17px system-ui;z-index:4;box-shadow:0 3p
   const tab = Number(query.get('tab'));
   const run = query.get('run');
   const mediaOrigin = location.origin;
-  const canvas = document.createElement('canvas');
-  canvas.width = 1920; canvas.height = 1080;
-  const ctx = canvas.getContext('2d', {alpha:false, desynchronized:true});
   const video = document.getElementById('video');
   const beacon = document.getElementById('beacon');
   const nav = document.getElementById('nav');
   let sourceTick = 0, framesPresented = 0, beaconEpoch = 0;
   let begun = false, navigationSequence = 0, navigationLatencies = [], navigationTimer;
-  ctx.fillStyle = '#07111f'; ctx.fillRect(0, 0, 1920, 1080);
-  ctx.fillStyle = `hsl(${tab * 57} 72% 28%)`; ctx.fillRect(0, 0, 1920, 180);
-  ctx.fillStyle = '#ffffff'; ctx.font = '700 72px system-ui';
-  ctx.fillText(`MCNF 1080p TAB ${tab}`, 420, 535);
-  ctx.font = '500 36px system-ui'; ctx.fillText('LIVE 36 FPS VIDEO SOURCE', 640, 605);
-  let previousX = 0;
-  function draw() {
-    sourceTick++;
-    const x = (sourceTick * 23 + tab * 131) % 1792;
-    ctx.fillStyle = '#07111f'; ctx.fillRect(previousX, 900, 128, 96);
-    ctx.fillStyle = `hsl(${(sourceTick + tab * 47) % 360} 88% 58%)`;
-    ctx.fillRect(x, 900, 128, 96);
-    ctx.fillStyle = '#07111f'; ctx.fillRect(760, 650, 400, 70);
-    ctx.fillStyle = '#fff'; ctx.font = '500 34px system-ui';
-    ctx.fillText(`SOURCE FRAME ${sourceTick}`, 790, 698);
-    previousX = x;
-  }
-  draw();
-  setInterval(draw, 1000 / 36);
-  const stream = canvas.captureStream(36);
-  video.srcObject = stream;
+  video.src = `${mediaOrigin}/video.webm?run=${encodeURIComponent(run)}&tab=${tab}`;
   video.play().catch(() => {});
   function presented() {
     framesPresented++;
+    sourceTick++;
     video.requestVideoFrameCallback(presented);
   }
   video.requestVideoFrameCallback(presented);
@@ -1218,6 +1411,13 @@ class MediaHandler(BaseHTTPRequestHandler):
         if parsed.path == "/media.html":
             body = MEDIA_PAGE
             content_type = "text/html; charset=utf-8"
+        elif parsed.path == "/video.webm":
+            asset = getattr(self.server, "media_asset", None)
+            if not isinstance(asset, MediaAsset):
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            body = asset.data
+            content_type = "video/webm"
         elif parsed.path == "/nav":
             body = b"<!doctype html><meta charset=utf-8><title>navigation receipt</title>ok"
             content_type = "text/html; charset=utf-8"
@@ -1245,8 +1445,9 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class MediaServer:
-    def __init__(self, bind: str, port: int) -> None:
+    def __init__(self, bind: str, port: int, media_asset: MediaAsset) -> None:
         self.server = ReusableThreadingHTTPServer((bind, port), MediaHandler)
+        self.server.media_asset = media_asset  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def start(self) -> None:
@@ -1393,6 +1594,11 @@ def wait_for_tabs(
                     if windows_changed:
                         last_error = "rediscovering five independent Chromium windows"
                         continue
+                    try:
+                        tile_tab_windows(tabs)
+                    except (HarnessError, OSError) as exc:
+                        fatal_window_error = str(exc)
+                        raise
                     statuses = [tab.initialization_status() for tab in tabs]
                     if not all(status.get("harness") is True for status in statuses):
                         errors = sorted(
@@ -1774,6 +1980,7 @@ class HarnessContext:
     guest_helper_sha256: str
     guest_profile: str
     last_guest_metrics_sequence: int
+    media_asset: MediaAsset
     firewall: FirewallLease
     credential_runtime_root: Path
 
@@ -1848,6 +2055,16 @@ def run_live_stream(context: HarnessContext, nonce: str, output: BinaryIO) -> No
             "server_sha256": context.server_sha256,
             "rdp_probe_sha256": context.probe_sha256,
             "guest_helper_sha256": context.guest_helper_sha256,
+            "media_asset": {
+                "sha256": context.media_asset.sha256,
+                "codec": context.media_asset.codec,
+                "width": context.media_asset.width,
+                "height": context.media_asset.height,
+                "fps": context.media_asset.fps,
+                "duration_ms": context.media_asset.duration_ms,
+                "generator_sha256": context.media_asset.generator_sha256,
+                "generator_version": context.media_asset.generator_version,
+            },
             "media_firewall_rule": context.firewall.rule,
             "qemu_pid": context.qemu.pid,
         }
@@ -2090,7 +2307,8 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
     try:
         sidecar = SidecarWriter(args.sidecar_out)
         firewall = FirewallLease(guest_ip, args.media_port)
-        media = MediaServer(args.media_bind, args.media_port)
+        media_asset = generate_media_asset(credential_runtime_root)
+        media = MediaServer(args.media_bind, args.media_port, media_asset)
         media.start()
         probe = RdpProbe(
             args.rdp_probe,
@@ -2167,6 +2385,7 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
             guest_helper_sha256=guest_helper_sha256,
             guest_profile=guest_profile,
             last_guest_metrics_sequence=guest_metrics_sequence,
+            media_asset=media_asset,
             firewall=firewall,
             credential_runtime_root=credential_runtime_root,
         )
@@ -2310,7 +2529,7 @@ def self_test() -> None:
         "vcs0": 9,
     }
     validate_source("1" * 40, "sha256:" + "a" * 64)
-    assert b"captureStream(36)" in MEDIA_PAGE
+    assert b"/video.webm" in MEDIA_PAGE
     assert b"requestVideoFrameCallback" in MEDIA_PAGE
     identities = RuntimeIdentity(
         host_boot_id="11111111-1111-4111-8111-111111111111",
@@ -2340,12 +2559,27 @@ def self_test() -> None:
         sidecar.write({"type": "self-test", "fixture_status": "never-live"})
         sidecar.close()
         assert stat.S_IMODE(sidecar_path.stat().st_mode) == 0o600
-        media = MediaServer("127.0.0.1", 0)
+        media_asset = MediaAsset(
+            data=b"self-test-webm",
+            sha256="sha256:" + hashlib.sha256(b"self-test-webm").hexdigest(),
+            codec="vp9",
+            width=WIDTH,
+            height=HEIGHT,
+            fps=36,
+            duration_ms=MEDIA_DURATION_SECONDS * 1_000,
+            generator_sha256="sha256:" + "a" * 64,
+            generator_version="self-test only",
+        )
+        media = MediaServer("127.0.0.1", 0, media_asset)
         media.start()
         port = media.server.server_address[1]
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/media.html", timeout=5) as response:
             assert response.status == HTTPStatus.OK
             assert b"__mcnfPerformance" in response.read()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/video.webm", timeout=5) as response:
+            assert response.status == HTTPStatus.OK
+            assert response.headers.get_content_type() == "video/webm"
+            assert response.read() == media_asset.data
         media.stop()
     print("serve-browser-vm-performance.py: self-test passed")
 
