@@ -410,11 +410,11 @@ def materialize_rdp_password(
 
 
 def remove_runtime_password(runtime_root: Path) -> None:
-    password_path = runtime_root / "rdp-password"
-    try:
-        password_path.unlink()
-    except FileNotFoundError:
-        pass
+    for name in ("rdp-password", "browser-vm-performance-source.webm"):
+        try:
+            (runtime_root / name).unlink()
+        except FileNotFoundError:
+            pass
     try:
         runtime_root.rmdir()
     except FileNotFoundError:
@@ -1152,6 +1152,8 @@ class CdpTab:
             fail("Chromium media page returned a malformed snapshot")
         required = {
             "framesPresented",
+            "qualityTotalFrames",
+            "qualityDroppedFrames",
             "sourceTick",
             "width",
             "height",
@@ -1163,6 +1165,8 @@ class CdpTab:
             fail("Chromium media page snapshot omitted required values")
         for field in (
             "framesPresented",
+            "qualityTotalFrames",
+            "qualityDroppedFrames",
             "sourceTick",
             "width",
             "height",
@@ -1384,8 +1388,11 @@ background:#c62828;color:white;font:700 17px system-ui;z-index:4;box-shadow:0 3p
     },
     snapshot() {
       const latencies = navigationLatencies.splice(0, navigationLatencies.length);
+      const quality = video.getVideoPlaybackQuality();
       return {
         framesPresented,
+        qualityTotalFrames: quality.totalVideoFrames,
+        qualityDroppedFrames: quality.droppedVideoFrames,
         width: video.videoWidth,
         height: video.videoHeight,
         readyState: video.readyState,
@@ -1634,6 +1641,28 @@ def wait_for_tabs(
                                     frame_baselines, rate_snapshots
                                 )
                             ]
+                            quality_rates = [
+                                (
+                                    snapshot["qualityTotalFrames"]
+                                    - snapshot["qualityDroppedFrames"]
+                                    - baseline["qualityTotalFrames"]
+                                    + baseline["qualityDroppedFrames"]
+                                )
+                                / rate_elapsed
+                                for baseline, snapshot in zip(
+                                    snapshots, rate_snapshots
+                                )
+                            ]
+                            dropped_rates = [
+                                (
+                                    snapshot["qualityDroppedFrames"]
+                                    - baseline["qualityDroppedFrames"]
+                                )
+                                / rate_elapsed
+                                for baseline, snapshot in zip(
+                                    snapshots, rate_snapshots
+                                )
+                            ]
                             if all(
                                 snapshot["width"] == WIDTH
                                 and snapshot["height"] == HEIGHT
@@ -1646,7 +1675,16 @@ def wait_for_tabs(
                                 "five media tabs did not sustain 30 fps during "
                                 f"the {rate_elapsed:.3f}s live probe: "
                                 + json.dumps(
-                                    [round(rate, 3) for rate in rates],
+                                    {
+                                        "rvfc": [round(rate, 3) for rate in rates],
+                                        "quality_presented": [
+                                            round(rate, 3) for rate in quality_rates
+                                        ],
+                                        "quality_dropped": [
+                                            round(rate, 3) for rate in dropped_rates
+                                        ],
+                                    },
+                                    sort_keys=True,
                                     separators=(",", ":"),
                                 )
                             )
