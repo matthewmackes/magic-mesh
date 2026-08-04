@@ -623,6 +623,30 @@ resolve_short_node() {
     printf '%s\n' "$result"
 }
 
+wait_short_node() {
+    local kind=$1 expected=$2 attempt result
+    for ((attempt = 0; attempt < 50; attempt += 1)); do
+        if result=$(resolve_short_node "$kind" "$expected"); then
+            printf '%s\n' "$result"
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_monitor_for_sink() {
+    local sink_id=$1 attempt result
+    for ((attempt = 0; attempt < 50; attempt += 1)); do
+        if result=$(resolve_monitor_for_sink "$sink_id"); then
+            printf '%s\n' "$result"
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 move_qemu_stream_to() {
     local direction=$1 pid=$2 target=$3 source_id=$4 attempt result stream_id route_id
     for ((attempt = 0; attempt < 40; attempt += 1)); do
@@ -921,9 +945,9 @@ load_injection_sink() {
     module_output=${module_output//$'\n'/}
     [[ $module_output =~ ^[0-9]+$ ]] || die "$phase capture received an invalid PipeWire module id"
     injection_module=$module_output
-    sink_id=$(resolve_short_node sinks "$injection_sink") ||
+    sink_id=$(wait_short_node sinks "$injection_sink") ||
         die "$phase capture could not resolve its exact stimulus sink"
-    injection_monitor=$(resolve_monitor_for_sink "$sink_id") ||
+    injection_monitor=$(wait_monitor_for_sink "$sink_id") ||
         die "$phase capture could not resolve its exact stimulus monitor"
 }
 
@@ -975,8 +999,8 @@ collect_capture() {
     IFS=$'\t' read -r capture_stream_id source_id <<<"$stream"
     capture_original_source=$source_id
     load_injection_sink "$phase"
-    injection_sink_id=$(resolve_short_node sinks "$injection_sink") || die "stimulus sink disappeared"
-    injection_monitor_id=$(resolve_short_node sources "$injection_monitor") || die "stimulus monitor disappeared"
+    injection_sink_id=$(wait_short_node sinks "$injection_sink") || die "stimulus sink disappeared"
+    injection_monitor_id=$(wait_short_node sources "$injection_monitor") || die "stimulus monitor disappeared"
     capture_stream_id=$(move_qemu_stream_to capture "$qemu_pid" "$injection_monitor" "$injection_monitor_id") ||
         die "$phase capture source-output route did not take effect on the exact QEMU stream"
 
@@ -1414,6 +1438,7 @@ def warned():
 injection = (state / "injection-name").read_text().strip() if (state / "injection-name").exists() else ""
 current_source = (state / "current-source").read_text().strip() if (state / "current-source").exists() else "12"
 stream_id = (state / "stream-id").read_text().strip() if (state / "stream-id").exists() else "55"
+hide_next_sink_list = state / "hide-next-sink-list"
 if args == ["list", "clients"]:
     print('''Client #88
 \tProperties:
@@ -1457,7 +1482,9 @@ elif args == ["list", "source-outputs"]:
 \t\tmedia.name = "{stream_name}"''')
 elif args == ["list", "short", "sinks"]:
     print("10\talsa_output.test.analog-stereo\tPipeWire\ts16le 2ch 48000Hz\tRUNNING")
-    if injection:
+    if injection and hide_next_sink_list.exists():
+        hide_next_sink_list.unlink()
+    elif injection:
         print(f"20\t{injection}\tPipeWire\ts16le 2ch 48000Hz\tIDLE")
 elif args == ["list", "short", "sources"]:
     print("11\talsa_output.test.analog-stereo.monitor\tPipeWire\ts16le 2ch 48000Hz\tRUNNING")
@@ -1491,6 +1518,8 @@ elif args[:2] == ["load-module", "module-null-sink"]:
     if len(names) != 1:
         raise SystemExit(1)
     (state / "injection-name").write_text(names[0] + "\n", encoding="utf-8")
+    if (state / "transient-node-list").exists():
+        hide_next_sink_list.touch()
     event("mutate:pactl-load:" + names[0])
     print("77")
 elif len(args) == 3 and args[0] == "move-source-output" and args[1] == stream_id:
@@ -1743,6 +1772,7 @@ PY
     export MCNF_TEST_IMAGE_DIGEST="$image_digest"
     export MCNF_TEST_TRANSPORT="$transport"
     : >"$test_state/delayed-source-restore"
+    : >"$test_state/transient-node-list"
 
     collect
     trap - EXIT HUP INT TERM
