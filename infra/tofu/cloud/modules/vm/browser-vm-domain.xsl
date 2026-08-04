@@ -13,8 +13,8 @@
       <xsl:apply-templates select="@*|node()"/>
       <sound model="virtio"/>
       <audio id="1" type="pulseaudio" serverName="tcp:127.0.0.1:4713">
-        <input name="browser-vm-capture"/>
-        <output name="browser-vm" streamName="MCNF-Browser-VM"/>
+        <input streamName="MCNF-Browser-VM-Capture"/>
+        <output streamName="MCNF-Browser-VM"/>
       </audio>
       <!-- The guest spice-vdagentd uses this channel to negotiate monitor
            geometry before wlroots commits the virtio-gpu scanout. -->

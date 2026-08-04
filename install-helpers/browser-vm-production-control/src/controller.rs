@@ -96,6 +96,20 @@ impl Job {
         }
     }
 
+    fn claim_page_transport(&mut self) -> Result<()> {
+        // Chromium may speculatively fetch a typed loopback URL and then issue
+        // the committed navigation. Both requests are transport delivery of
+        // the same unguessable job, not separate Browser activations. Permit a
+        // re-fetch only until the first page_loaded event advances the strict
+        // state machine; every later GET remains fail-closed.
+        ensure!(
+            self.stage == Stage::Registered,
+            "probe page is no longer available"
+        );
+        self.page_claimed = true;
+        Ok(())
+    }
+
     fn common_gesture(
         &mut self,
         is_trusted: bool,
@@ -567,11 +581,7 @@ impl Controller {
                 "probe page requires GET"
             );
             let job = self.jobs.get_mut(job_id).context("unknown job")?;
-            ensure!(
-                job.stage == Stage::Registered && !job.page_claimed,
-                "probe page is one-shot"
-            );
-            job.page_claimed = true;
+            job.claim_page_transport()?;
             let nonce = hex_encode(&random_bytes::<18>()?);
             let rendered = page::render(&job.spec, &nonce);
             let mut response = HttpResponse::bytes(200, "text/html; charset=utf-8", rendered.html);
@@ -747,6 +757,16 @@ mod tests {
         assert!(job.apply_event(event).is_err());
         assert_eq!(job.stage, Stage::PageLoaded);
         assert!(!job.user_gesture_observed);
+    }
+
+    #[test]
+    fn speculative_refetch_closes_at_the_first_browser_event() {
+        let mut job = Job::new(spec(Operation::Capture));
+        assert!(job.claim_page_transport().is_ok());
+        assert!(job.claim_page_transport().is_ok());
+        assert!(job.apply_event(BrowserEvent::PageLoaded).is_ok());
+        assert!(job.claim_page_transport().is_err());
+        assert_eq!(job.stage, Stage::PageLoaded);
     }
 
     #[test]

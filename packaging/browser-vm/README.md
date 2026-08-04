@@ -142,7 +142,11 @@ The declarative audio boundary can be checked with
 `install-helpers/verify-browser-vm-audio.sh --domain <name>` (or an XML file).
 It requires exactly one virtio sound device and one Browser-owned PulseAudio
 backend on `tcp:127.0.0.1:4713`, with exactly one playback and one capture
-endpoint; it rejects duplicate or alternate routes. It intentionally does not
+endpoint. Capture must use `streamName="MCNF-Browser-VM-Capture"` and playback
+must use `streamName="MCNF-Browser-VM"`; neither node may carry a `name`
+device selector. This routes both QEMU streams through the seat's default
+Pulse source/sink while retaining exact stream identities, and rejects
+duplicate, physical-device, or alternate routes. It intentionally does not
 claim that live audio is audible, captured, or recovered.
 
 For the Browser-specific OpenTofu domain, both compatibility and accelerated

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 const PUMP_SLICE: Duration = Duration::from_millis(75);
 const PRE_NAVIGATION_SETTLE: Duration = Duration::from_millis(150);
 const OMNIBOX_FOCUS_SETTLE: Duration = Duration::from_millis(350);
+const POST_NAVIGATION_BROWSER_SETTLE: Duration = Duration::from_secs(1);
+const BETWEEN_JOB_CONTROLLER_SETTLE: Duration = Duration::from_secs(6);
 const POINTER_FOCUS_SETTLE: Duration = Duration::from_millis(50);
 const POINTER_BUTTON_HOLD: Duration = Duration::from_millis(75);
 const POST_CLICK_BROWSER_SETTLE: Duration = Duration::from_millis(350);
@@ -24,6 +26,7 @@ pub const MIN_RECONNECT_DAMAGE_PER_MILLE: u16 = 700;
 pub struct RdpDriver {
     session: RdpSession,
     connection: Option<RdpConnection>,
+    navigation_count: u8,
 }
 
 impl RdpDriver {
@@ -57,6 +60,7 @@ impl RdpDriver {
         let mut driver = Self {
             session,
             connection: Some(connection),
+            navigation_count: 0,
         };
         let _frame = driver.wait_for_browser_frame(INITIAL_FRAME_TIMEOUT)?;
         Ok(driver)
@@ -86,24 +90,48 @@ impl RdpDriver {
         );
         self.pump_for(PRE_NAVIGATION_SETTLE)?;
 
-        let ctrl = Modifiers {
-            ctrl: true,
-            ..Modifiers::default()
-        };
-        self.session.send_input(&key_event(Key::L, true, ctrl));
-        self.session.send_input(&key_event(Key::L, false, ctrl));
-        // A button-up with default modifiers releases the synthesized Ctrl key
-        // without adding a printable key that would alter the omnibox.
-        self.session.send_input(&Event::PointerButton {
-            pos: Pos2::new(0.0, 0.0),
-            button: PointerButton::Primary,
-            pressed: false,
-            modifiers: Modifiers::default(),
-        });
-        ensure!(
-            self.flush_input()? >= 5,
-            "RDP omnibox focus shortcut did not reach the wire encoder"
-        );
+        if self.navigation_count == 0 {
+            let ctrl = Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            };
+            self.session.send_input(&key_event(Key::L, true, ctrl));
+            self.session.send_input(&key_event(Key::L, false, ctrl));
+            // A button-up with default modifiers releases the synthesized Ctrl
+            // key without adding a printable key that would alter the omnibox.
+            self.session.send_input(&Event::PointerButton {
+                pos: Pos2::new(0.0, 0.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::default(),
+            });
+            ensure!(
+                self.flush_input()? >= 5,
+                "RDP omnibox focus shortcut did not reach the wire encoder"
+            );
+        } else {
+            // Keep the authenticated RDP transport, but give the second
+            // one-shot controller page a clean Chromium navigation lifecycle.
+            // Replacing the completed playback page in-place can make Chromium
+            // issue a duplicate GET before page_loaded; a fresh tab starts with
+            // one selected omnibox and avoids that duplicate claim.
+            let ctrl = Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            };
+            self.session.send_input(&key_event(Key::T, true, ctrl));
+            self.session.send_input(&key_event(Key::T, false, ctrl));
+            self.session.send_input(&Event::PointerButton {
+                pos: Pos2::new(0.0, 0.0),
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::default(),
+            });
+            ensure!(
+                self.flush_input()? >= 5,
+                "RDP follow-up tab shortcut did not reach the wire encoder"
+            );
+        }
         // Chromium must process Ctrl-L before Unicode URL events arrive. Keep
         // the wait bounded and continue pumping inbound frames so xrdp cannot
         // deadlock behind a pending repaint while the omnibox gains focus.
@@ -118,6 +146,13 @@ impl RdpDriver {
             self.flush_input()? >= url.len() + 2,
             "RDP probe URL commit did not reach the wire encoder"
         );
+        self.navigation_count = self.navigation_count.saturating_add(1);
+        // The guest controller intentionally handles one bounded request at a
+        // time. Let Chromium receive the one-shot page and post page_loaded
+        // before the host begins authenticated status polling; otherwise a
+        // second browser GET can observe page_claimed while the job is still
+        // registered and replace the page with a fail-closed 400 response.
+        self.pump_for(POST_NAVIGATION_BROWSER_SETTLE)?;
         Ok(())
     }
 
@@ -249,6 +284,14 @@ impl RdpDriver {
             .context("RDP control transport is disconnected")?
             .request_full_refresh()
             .context("request post-reconnect Browser repaint")
+    }
+
+    pub fn settle_between_browser_jobs(&mut self) -> Result<()> {
+        // The strict guest HTTP server closes an idle speculative Chromium
+        // socket after four seconds. Keep servicing RDP frames while that
+        // bounded timeout expires so the following one-shot page GET cannot
+        // queue behind the stale connection and retry as a duplicate claim.
+        self.pump_for(BETWEEN_JOB_CONTROLLER_SETTLE)
     }
 
     /// Complete a real graceful disconnect. The returned timestamp must be

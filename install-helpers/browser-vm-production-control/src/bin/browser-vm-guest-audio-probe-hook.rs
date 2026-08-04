@@ -5,6 +5,6 @@ fn main() {
         // Collector discards hook output. Keep this bounded diagnostic free of
         // credentials, controller bodies, audio, and receipt contents anyway.
         eprintln!("browser-vm-guest-audio-probe-hook: failed closed: {error:#}");
-        std::process::exit(1);
+        std::process::exit(hook::probe_failure_exit_code(&error));
     }
 }

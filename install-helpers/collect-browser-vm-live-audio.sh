@@ -14,15 +14,20 @@ readonly SCRIPT_DIR
 readonly VALIDATOR="$SCRIPT_DIR/verify-browser-vm-live-audio.py"
 readonly LIBVIRT_URI="qemu:///system"
 readonly PLAYBACK_STREAM_NAME="MCNF-Browser-VM"
+readonly CAPTURE_STREAM_NAME="MCNF-Browser-VM-Capture"
 readonly SAMPLE_RATE=48000
 readonly SAMPLE_CHANNELS=2
 readonly SAMPLE_FRAMES=96000
 readonly STIMULUS_SECONDS=8
 readonly OPERATION_TIMEOUT_SECONDS=90
 readonly RECONNECT_TIMEOUT_SECONDS=240
+readonly RDP_SESSION_SETTLE_SECONDS=3
 readonly QGA_TIMEOUT_SECONDS=8
 readonly MAX_QGA_FILE_BYTES=4096
 readonly CONTROL_FILE_WAIT_ATTEMPTS=$((OPERATION_TIMEOUT_SECONDS * 10))
+readonly GUEST_HOOK_READY_ATTEMPTS=4
+readonly GUEST_HOOK_RETRYABLE_EXIT_CODE=75
+readonly GUEST_HOOK_RETRY_SETTLE_SECONDS=5
 
 domain="browser-vm"
 seat_user="mm"
@@ -41,9 +46,12 @@ run_nonce=""
 stage_dir=""
 host_runtime=""
 guest_hook_pid=""
+guest_hook_unit=""
+guest_duplex_active=0
 host_async_pid=""
 host_async_unit=""
 host_async_log=""
+host_async_allow_exit_one=0
 injection_module=""
 injection_sink=""
 injection_monitor=""
@@ -62,6 +70,7 @@ PW_RECORD_BIN=""
 PW_PLAY_BIN=""
 SYSTEMD_RUN_BIN=""
 SYSTEMCTL_BIN=""
+JOURNALCTL_BIN=""
 TIMEOUT_BIN=""
 SHA256SUM_BIN=""
 
@@ -148,10 +157,11 @@ resolve_commands() {
     PW_PLAY_BIN=$(command -v pw-play || true)
     SYSTEMD_RUN_BIN=$(command -v systemd-run || true)
     SYSTEMCTL_BIN=$(command -v systemctl || true)
+    JOURNALCTL_BIN=$(command -v journalctl || true)
     TIMEOUT_BIN=$(command -v timeout || true)
     SHA256SUM_BIN=$(command -v sha256sum || true)
     local name value
-    for name in VIRSH PYTHON BASE64 PACTL PW_RECORD PW_PLAY SYSTEMD_RUN SYSTEMCTL TIMEOUT SHA256SUM; do
+    for name in VIRSH PYTHON BASE64 PACTL PW_RECORD PW_PLAY SYSTEMD_RUN SYSTEMCTL JOURNALCTL TIMEOUT SHA256SUM; do
         value=${name}_BIN
         [[ -n ${!value} ]] || die "required command is unavailable: ${name,,}"
     done
@@ -197,6 +207,13 @@ invoke_warning() {
             "$warning_helper" >"$host_runtime/warning-output" 2>"$error_file" ||
             die "mandatory five-second warning failed; live mutation was not started"
     fi
+}
+
+settle_rdp_session() {
+    # Standalone diagnostic hooks still need a bounded detach interval. A live
+    # duplex hook deliberately stays attached and pumps the same RDP transport
+    # across playback and capture, so it must not be treated as disconnected.
+    ((test_mode || guest_duplex_active)) || sleep "$RDP_SESSION_SETTLE_SECONDS"
 }
 
 prepare_output() {
@@ -247,13 +264,31 @@ host_run() {
     local seat_uid unit
     seat_uid=$(id -u "$seat_user")
     unit="mcnf-audio-query-${run_nonce}-${RANDOM}"
+    if ((test_mode)); then
+        "$TIMEOUT_BIN" --signal=KILL 12 \
+            "$SYSTEMD_RUN_BIN" --quiet --wait --collect --pipe \
+            --unit="$unit" --uid="$seat_uid" --property=UMask=0077 \
+            --property=RuntimeMaxSec=10s \
+            --setenv="XDG_RUNTIME_DIR=/run/user/$seat_uid" \
+            --setenv="PULSE_SERVER=unix:/run/user/$seat_uid/pulse/native" \
+            -- "$@"
+        return
+    fi
+
+    # `systemd-run --pipe` passes the caller's FIFO through D-Bus.  On an
+    # enforcing Fedora seat that FIFO retains sshd_session_t, so dbus-broker
+    # correctly rejects the cross-domain read.  Keep the transient-unit user,
+    # cgroup, timeout, and umask boundaries, but use systemd's journal transport
+    # and retrieve only stdout/stderr from this unique unit afterwards.
     "$TIMEOUT_BIN" --signal=KILL 12 \
-        "$SYSTEMD_RUN_BIN" --quiet --wait --collect --pipe \
+        "$SYSTEMD_RUN_BIN" --quiet --wait --collect \
         --unit="$unit" --uid="$seat_uid" --property=UMask=0077 \
         --property=RuntimeMaxSec=10s \
         --setenv="XDG_RUNTIME_DIR=/run/user/$seat_uid" \
         --setenv="PULSE_SERVER=unix:/run/user/$seat_uid/pulse/native" \
-        -- "$@"
+        -- "$@" >/dev/null || return 1
+    "$JOURNALCTL_BIN" --quiet --no-pager -o cat \
+        "_SYSTEMD_UNIT=$unit.service" _TRANSPORT=stdout
 }
 
 host_async_start() {
@@ -264,7 +299,11 @@ host_async_start() {
     seat_uid=$(id -u "$seat_user")
     host_async_unit="mcnf-audio-${run_nonce}-${RANDOM}"
     host_async_log="$host_runtime/${host_async_unit}.log"
-    "$SYSTEMD_RUN_BIN" --quiet --wait --collect --pipe \
+    host_async_allow_exit_one=0
+    [[ $1 == "$PW_RECORD_BIN" ]] && host_async_allow_exit_one=1
+    local -a pipe_option=()
+    ((test_mode)) && pipe_option=(--pipe)
+    "$SYSTEMD_RUN_BIN" --quiet --wait --collect "${pipe_option[@]}" \
         --unit="$host_async_unit" --uid="$seat_uid" --property=UMask=0077 \
         --property="RuntimeMaxSec=${max_seconds}s" \
         --setenv="XDG_RUNTIME_DIR=/run/user/$seat_uid" \
@@ -274,15 +313,24 @@ host_async_start() {
 }
 
 host_async_wait() {
-    local label=$1 pid=$host_async_pid
+    local label=$1 pid=$host_async_pid rc=0
     [[ -n $pid ]] || die "internal error: no host operation to wait for"
-    if ! wait "$pid"; then
-        host_async_pid=""
-        host_async_unit=""
-        die "$label failed"
+    wait "$pid" || rc=$?
+    if ((!test_mode)); then
+        "$JOURNALCTL_BIN" --quiet --no-pager -o cat \
+            "_SYSTEMD_UNIT=$host_async_unit.service" _TRANSPORT=stdout \
+            >"$host_async_log" 2>&1 || true
     fi
     host_async_pid=""
     host_async_unit=""
+    if ((rc != 0 && !(host_async_allow_exit_one && rc == 1))); then
+        host_async_allow_exit_one=0
+        die "$label failed"
+    fi
+    # PipeWire 1.6.8 pw-record returns 1 after satisfying --sample-count even
+    # though it closes a complete WAV.  Only that fixed-sample command may use
+    # this exception; private-file and sample/tone validation still gate it.
+    host_async_allow_exit_one=0
 }
 
 qga_call() {
@@ -397,7 +445,7 @@ verify_domain_contract() {
     "$VIRSH_BIN" --connect "$LIBVIRT_URI" dumpxml "$domain" >"$xml" 2>"$host_runtime/domain-error" ||
         die "cannot read active Browser VM domain XML"
     chmod 0600 "$xml"
-    "$PYTHON_BIN" - "$xml" "$PLAYBACK_STREAM_NAME" <<'PY' || exit 1
+    "$PYTHON_BIN" - "$xml" "$PLAYBACK_STREAM_NAME" "$CAPTURE_STREAM_NAME" <<'PY' || exit 1
 import sys
 import xml.etree.ElementTree as ET
 
@@ -413,10 +461,12 @@ inputs = audio.findall("input")
 outputs = audio.findall("output")
 if len(inputs) != 1 or len(outputs) != 1:
     raise SystemExit("Browser VM domain lacks one input and one output")
-if not inputs[0].get("name") or not outputs[0].get("name"):
-    raise SystemExit("Browser VM domain audio nodes are unnamed")
+if "name" in inputs[0].attrib or "name" in outputs[0].attrib:
+    raise SystemExit("Browser VM domain uses forbidden Pulse device selectors")
 if outputs[0].get("streamName") != sys.argv[2]:
     raise SystemExit("Browser VM playback stream identity is not release-owned")
+if inputs[0].get("streamName") != sys.argv[3]:
+    raise SystemExit("Browser VM capture stream identity is not release-owned")
 PY
 }
 
@@ -427,7 +477,11 @@ read_qemu_pid() {
     mode=$(stat -Lc '%a' "$qemu_pid_file")
     [[ $owner == 0 || $owner == "$EUID" ]] || die "Browser VM QEMU pid file has an unexpected owner"
     (( (8#$mode & 0022) == 0 )) || die "Browser VM QEMU pid file is writable by an untrusted account"
-    read -r pid <"$qemu_pid_file" || die "cannot read Browser VM QEMU pid"
+    # libvirt writes this runtime PID as an EOF-terminated scalar without a
+    # trailing newline.  Bash `read` still assigns the value but returns 1 at
+    # EOF, so accept that exact non-empty case and validate the shape below.
+    IFS= read -r pid <"$qemu_pid_file" || [[ -n $pid ]] ||
+        die "cannot read Browser VM QEMU pid"
     [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || die "Browser VM QEMU pid is malformed"
     if ((!test_mode)); then
         [[ -r /proc/$pid/cmdline ]] || die "Browser VM QEMU process is absent"
@@ -447,7 +501,8 @@ find_qemu_stream() {
         host_run "$PACTL_BIN" list source-outputs >"$streams_file" || return 1
     fi
     chmod 0600 "$clients_file" "$streams_file"
-    "$PYTHON_BIN" - "$clients_file" "$streams_file" "$direction" "$pid" "$PLAYBACK_STREAM_NAME" <<'PY'
+    "$PYTHON_BIN" - "$clients_file" "$streams_file" "$direction" "$pid" \
+        "$PLAYBACK_STREAM_NAME" "$CAPTURE_STREAM_NAME" <<'PY'
 import re
 import sys
 
@@ -491,7 +546,8 @@ candidates = []
 for stream in blocks(sys.argv[2], heading):
     if stream.get("client") not in client_ids:
         continue
-    if direction == "playback" and stream["props"].get("media.name") != sys.argv[5]:
+    expected_stream_name = sys.argv[5] if direction == "playback" else sys.argv[6]
+    if stream["props"].get("media.name") != expected_stream_name:
         continue
     route = stream.get(route_field, "")
     if route.isdigit():
@@ -636,8 +692,20 @@ guest_hook_start() {
     [[ -z $guest_hook_pid ]] || die "internal error: overlapping guest control operations"
     local -a environment
     hook_environment environment
-    "$TIMEOUT_BIN" --signal=KILL "$OPERATION_TIMEOUT_SECONDS" \
-        "${environment[@]}" "$guest_probe_hook" "$@" >/dev/null 2>&1 &
+    if ((test_mode)); then
+        "$TIMEOUT_BIN" --signal=KILL "$OPERATION_TIMEOUT_SECONDS" \
+            "${environment[@]}" "$guest_probe_hook" "$@" >/dev/null 2>&1 &
+    else
+        # Keep each RDP controller in a separately parented transient service.
+        # xrdp can retain per-parent attachment state after a completed Browser
+        # probe; a new PID-1-owned unit gives the following probe a clean
+        # process/session boundary while RuntimeMaxSec preserves the hard limit.
+        guest_hook_unit="mcnf-browser-probe-${run_nonce}-${RANDOM}"
+        "$SYSTEMD_RUN_BIN" --quiet --wait --collect \
+            --unit="$guest_hook_unit" --property=UMask=0077 \
+            --property="RuntimeMaxSec=${OPERATION_TIMEOUT_SECONDS}s" \
+            -- "${environment[@]}" "$guest_probe_hook" "$@" >/dev/null 2>&1 &
+    fi
     guest_hook_pid=$!
 }
 
@@ -646,9 +714,72 @@ guest_hook_wait() {
     [[ -n $pid ]] || die "internal error: guest control hook is not running"
     if ! wait "$pid"; then
         guest_hook_pid=""
+        guest_hook_unit=""
         die "$label guest control hook failed"
     fi
     guest_hook_pid=""
+    guest_hook_unit=""
+}
+
+guest_hook_reap() {
+    local pid=$guest_hook_pid rc=0
+    [[ -n $pid ]] || die "internal error: guest control hook is not running"
+    wait "$pid" || rc=$?
+    guest_hook_pid=""
+    guest_hook_unit=""
+    return "$rc"
+}
+
+guest_hook_start_until_ready() {
+    local ready=$1
+    shift
+    local attempt rc
+    for ((attempt = 1; attempt <= GUEST_HOOK_READY_ATTEMPTS; attempt += 1)); do
+        guest_hook_start "$@"
+        if wait_private_file "$ready"; then
+            return 0
+        fi
+        rc=0
+        guest_hook_reap || rc=$?
+        if ((rc != GUEST_HOOK_RETRYABLE_EXIT_CODE || attempt == GUEST_HOOK_READY_ATTEMPTS)); then
+            return 1
+        fi
+        # Exit 75 is emitted only after the trusted hook authenticates an
+        # untouched `registered` controller job and deletes it. No page event,
+        # user gesture, or receipt may be carried into the fresh process. The
+        # live xrdp session needs the full bounded interval to reap a failed
+        # attachment before a fresh process can navigate its one-time URL.
+        [[ ! -e $ready && ! -L $ready ]] || return 1
+        ((test_mode)) || sleep "$GUEST_HOOK_RETRY_SETTLE_SECONDS"
+    done
+    return 1
+}
+
+guest_duplex_start() {
+    local phase=$1 playback_tone=$2 playback_index=$3 capture_tone=$4 capture_index=$5
+    local playback_control="$stage_dir/control/${playback_index}-${phase}-playback"
+    local capture_control="$stage_dir/control/${capture_index}-${phase}-capture"
+    local playback_ready="${playback_control}-ready.json"
+    local capture_output="$stage_dir/samples/${capture_index}-${phase}-capture.wav"
+
+    ((guest_duplex_active == 0)) || die "internal error: overlapping duplex Browser control"
+    guest_hook_start_until_ready "$playback_ready" duplex \
+        --phase "$phase" \
+        --playback-tone-hz "$playback_tone" \
+        --playback-duration-seconds "$STIMULUS_SECONDS" \
+        --playback-ready-receipt "$playback_ready" \
+        --playback-start-signal "${playback_control}-start" \
+        --playback-started-receipt "${playback_control}-started.json" \
+        --playback-completed-receipt "${playback_control}-completed.json" \
+        --capture-tone-hz "$capture_tone" \
+        --capture-duration-seconds 2 \
+        --capture-ready-receipt "${capture_control}-ready.json" \
+        --capture-start-signal "${capture_control}-start" \
+        --capture-completed-receipt "${capture_control}-completed.json" \
+        --capture-release-signal "${capture_control}-release" \
+        --capture-output-wav "$capture_output" ||
+        die "$phase duplex Browser control did not become ready"
+    guest_duplex_active=1
 }
 
 wait_private_file() {
@@ -735,11 +866,13 @@ collect_playback() {
     local final_wav="$stage_dir/samples/${index}-${phase}-playback.wav"
     local qemu_pid stream sink_id monitor captured_at
 
-    guest_hook_start playback \
-        --phase "$phase" --tone-hz "$tone" --duration-seconds "$STIMULUS_SECONDS" \
-        --ready-receipt "$ready" --start-signal "$signal" \
-        --started-receipt "$started" --completed-receipt "$completed"
-    wait_private_file "$ready" || die "$phase playback control did not become ready"
+    if ((guest_duplex_active == 0)); then
+        guest_hook_start_until_ready "$ready" playback \
+            --phase "$phase" --tone-hz "$tone" --duration-seconds "$STIMULUS_SECONDS" \
+            --ready-receipt "$ready" --start-signal "$signal" \
+            --started-receipt "$started" --completed-receipt "$completed" ||
+            die "$phase playback control did not become ready"
+    fi
     guest_probe_receipt_valid "$ready" playback ready "$phase" "$tone" ||
         die "$phase playback ready receipt is invalid"
     write_signal "$signal"
@@ -758,7 +891,9 @@ collect_playback() {
         --target "$monitor" --rate "$SAMPLE_RATE" --channels "$SAMPLE_CHANNELS" \
         --channel-map FL,FR --format s16 --container wav -n "$SAMPLE_FRAMES" "$work_wav"
     host_async_wait "$phase host playback monitor capture"
-    guest_hook_wait "$phase playback"
+    if ((guest_duplex_active == 0)); then
+        guest_hook_wait "$phase playback"
+    fi
     wait_private_file "$completed" || die "$phase playback completion receipt is missing"
     guest_probe_receipt_valid "$completed" playback completed "$phase" "$tone" ||
         die "$phase playback completion receipt is invalid"
@@ -813,12 +948,17 @@ collect_capture() {
         chown "$(id -u "$seat_user"):$(id -g "$seat_user")" "$tone_wav"
     fi
 
-    guest_hook_start capture \
-        --phase "$phase" --tone-hz "$tone" --duration-seconds 2 \
-        --ready-receipt "$ready" --start-signal "$signal" \
-        --completed-receipt "$completed" --release-signal "$release" \
-        --output-wav "$final_wav"
-    wait_private_file "$ready" || die "$phase capture control did not open a Browser-owned microphone"
+    if ((guest_duplex_active)); then
+        wait_private_file "$ready" ||
+            die "$phase capture control did not open a Browser-owned microphone"
+    else
+        guest_hook_start_until_ready "$ready" capture \
+            --phase "$phase" --tone-hz "$tone" --duration-seconds 2 \
+            --ready-receipt "$ready" --start-signal "$signal" \
+            --completed-receipt "$completed" --release-signal "$release" \
+            --output-wav "$final_wav" ||
+            die "$phase capture control did not open a Browser-owned microphone"
+    fi
     guest_probe_receipt_valid "$ready" capture ready "$phase" "$tone" ||
         die "$phase capture ready receipt is invalid"
 
@@ -857,6 +997,7 @@ collect_capture() {
     injection_monitor=""
     write_signal "$release"
     guest_hook_wait "$phase capture"
+    guest_duplex_active=0
     captured_at=$(utc_now)
     COLLECTED_AT=$captured_at
 }
@@ -1012,6 +1153,9 @@ cleanup() {
     local rc=$?
     trap - EXIT HUP INT TERM
     set +e
+    if [[ -n $guest_hook_unit ]]; then
+        "$SYSTEMCTL_BIN" stop "$guest_hook_unit.service" >/dev/null 2>&1
+    fi
     if [[ -n $guest_hook_pid ]]; then
         kill "$guest_hook_pid" 2>/dev/null
         wait "$guest_hook_pid" 2>/dev/null
@@ -1061,12 +1205,16 @@ collect() {
     local before_latest after_floor
     local -a rows=()
 
+    if ((!test_mode)); then
+        guest_duplex_start before-recovery 523 0 719 1
+    fi
     collect_playback before-recovery 523 0
     before_playback_at=$COLLECTED_AT
     rows+=(before-recovery playback host-pipewire-browser-vm-playback \
         samples/0-before-recovery-playback.wav \
         "$("$SHA256SUM_BIN" "$stage_dir/samples/0-before-recovery-playback.wav" | awk '{print $1}')" \
         "$before_playback_at" 523)
+    settle_rdp_session
     collect_capture before-recovery 719 1
     before_capture_at=$COLLECTED_AT
     rows+=(before-recovery capture guest-browser-vm-capture-input \
@@ -1075,12 +1223,14 @@ collect() {
         "$before_capture_at" 719)
     before_latest=$before_capture_at
     [[ $before_playback_at > $before_latest ]] && before_latest=$before_playback_at
+    settle_rdp_session
 
     # Transport mutation gets its own warning window. The reconnect hook must
     # return observed timestamps in a private receipt; exit status alone is not
     # promoted into recovery evidence.
     invoke_warning
     run_reconnect "$before_latest"
+    settle_rdp_session
     disconnect_at=$DISCONNECT_AT
     reconnect_at=$RECONNECT_AT
     if ! valid_timestamp "$disconnect_at" || ! valid_timestamp "$reconnect_at"; then
@@ -1091,6 +1241,9 @@ collect() {
     # after_floor is intentionally obtained before starting the after phase;
     # each captured_at value is produced only after its WAV completes.
     : "$after_floor"
+    if ((!test_mode)); then
+        guest_duplex_start after-recovery 977 2 1301 3
+    fi
     collect_playback after-recovery 977 2
     after_playback_at=$COLLECTED_AT
     [[ $after_playback_at > $reconnect_at ]] || die "post-recovery playback timestamp is not after reconnect"
@@ -1098,6 +1251,7 @@ collect() {
         samples/2-after-recovery-playback.wav \
         "$("$SHA256SUM_BIN" "$stage_dir/samples/2-after-recovery-playback.wav" | awk '{print $1}')" \
         "$after_playback_at" 977)
+    settle_rdp_session
     collect_capture after-recovery 1301 3
     after_capture_at=$COLLECTED_AT
     [[ $after_capture_at > $reconnect_at ]] || die "post-recovery capture timestamp is not after reconnect"
@@ -1169,7 +1323,9 @@ if command == "domstate":
     print("running")
     raise SystemExit(0)
 if command == "dumpxml":
-    print("""<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input name='browser-vm-capture'/><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio></devices></domain>""")
+    capture_stream = "wrong-capture-stream" if (state / "wrong-domain-capture-stream").exists() else "MCNF-Browser-VM-Capture"
+    selector = " name='default'" if (state / "domain-device-selectors").exists() else ""
+    print(f"""<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input{selector} streamName='{capture_stream}'/><output{selector} streamName='MCNF-Browser-VM'/></audio></devices></domain>""")
     raise SystemExit(0)
 if command != "qemu-agent-command" or len(args) != 3:
     raise SystemExit(2)
@@ -1289,11 +1445,12 @@ Sink Input #66
 \t\tmedia.name = "mcnf-live-audio-stimulus"''')
 elif args == ["list", "source-outputs"]:
     if (state / "capture-active").exists():
+        stream_name = "wrong-capture-stream" if (state / "wrong-capture-stream").exists() else "MCNF-Browser-VM-Capture"
         print(f'''Source Output #55
 \tClient: 88
 \tSource: {current_source}
 \tProperties:
-\t\tmedia.name = "browser-vm-capture"''')
+\t\tmedia.name = "{stream_name}"''')
 elif args == ["list", "short", "sinks"]:
     print("10\talsa_output.test.analog-stereo\tPipeWire\ts16le 2ch 48000Hz\tRUNNING")
     if injection:
@@ -1381,6 +1538,9 @@ with wave.open(str(path), "wb") as out:
 path.chmod(0o600)
 with (state / "events").open("a", encoding="utf-8") as out:
     out.write(f"mutate:host-monitor-record:{tone}\n")
+# Match PipeWire 1.6.8: the fixed sample-count boundary closes a complete WAV
+# but pw-record itself exits 1.  The collector must validate the artifact.
+raise SystemExit(1)
 PY
 
     cat >"$mock_bin/pw-play" <<'PY'
@@ -1424,6 +1584,13 @@ while args:
     options[key[2:]] = args.pop(0)
 phase = options["phase"]
 tone = int(options["tone-hz"])
+
+retry_marker = state / "retryable-before-recovery-capture"
+retry_count = int(retry_marker.read_text(encoding="utf-8")) if retry_marker.exists() else 0
+if operation == "capture" and phase == "before-recovery" and retry_count < 3:
+    retry_marker.write_text(f"{retry_count + 1}\n", encoding="utf-8")
+    retry_marker.chmod(0o600)
+    raise SystemExit(75)
 
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1539,7 +1706,9 @@ receipt.chmod(0o600)
 PY
 
     chmod 0755 "$mock_bin"/*
-    printf '%s\n' 4242 >"$test_state/qemu.pid"
+    # Match libvirt's live /run/libvirt/qemu/<domain>.pid byte shape: one
+    # numeric scalar terminated by EOF rather than a newline.
+    printf '%s' 4242 >"$test_state/qemu.pid"
     chmod 0600 "$test_state/qemu.pid"
 
     test_mode=1
@@ -1565,6 +1734,10 @@ PY
         die "self-test did not publish its private evidence directory"
     manifest="$output_dir/audio-evidence.json"
     private_regular_file "$manifest" 262144 || die "self-test manifest is not private"
+    private_regular_file "$test_state/retryable-before-recovery-capture" 64 ||
+        die "self-test did not exercise a fresh-process untouched-job retry"
+    [[ $(<"$test_state/retryable-before-recovery-capture") == 3 ]] ||
+        die "self-test did not exercise all three bounded fresh-process retries"
     validation=$("$PYTHON_BIN" "$VALIDATOR" validate "$manifest") ||
         die "self-test manifest was not accepted by the validator"
     printf '%s' "$validation" | "$PYTHON_BIN" -c '
@@ -1601,6 +1774,19 @@ if not any("guest-capture-ready:after-recovery:1301" in value for value in event
     raise SystemExit("after-recovery getUserMedia control was not exercised")
 PY
 
+    # Domain verification must reject physical Pulse device selectors and any
+    # capture stream identity other than the exact release-owned value.
+    : >"$test_state/domain-device-selectors"
+    if (verify_domain_contract >/dev/null 2>&1); then
+        die "self-test accepted Pulse device selector names in the domain"
+    fi
+    rm -f "$test_state/domain-device-selectors"
+    : >"$test_state/wrong-domain-capture-stream"
+    if (verify_domain_contract >/dev/null 2>&1); then
+        die "self-test accepted the wrong domain capture stream identity"
+    fi
+    rm -f "$test_state/wrong-domain-capture-stream"
+
     # The capture source-output must not be accepted before the Browser hook
     # opens getUserMedia. Once active, it must bind to the exact QEMU PID.
     rm -f "$test_state/capture-active"
@@ -1610,7 +1796,11 @@ PY
     : >"$test_state/capture-active"
     [[ $(find_qemu_stream capture 4242) == $'55\t12' ]] ||
         die "self-test did not resolve the exact QEMU capture source-output"
-    rm -f "$test_state/capture-active"
+    : >"$test_state/wrong-capture-stream"
+    if find_qemu_stream capture 4242 >/dev/null 2>&1; then
+        die "self-test accepted a QEMU capture source-output with the wrong stream identity"
+    fi
+    rm -f "$test_state/capture-active" "$test_state/wrong-capture-stream"
 
     # Ambiguous Browser playback streams are rejected rather than guessed.
     : >"$test_state/playback-active"
@@ -1637,7 +1827,7 @@ PY
 
     rm -rf -- "$fixture"
     trap - EXIT HUP INT TERM
-    echo "collect-browser-vm-live-audio: self-test passed (full four-tone flow + 5 fail-closed controls)"
+    echo "collect-browser-vm-live-audio: self-test passed (full four-tone flow + 8 fail-closed controls)"
 }
 
 main() {

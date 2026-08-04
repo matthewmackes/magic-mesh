@@ -87,12 +87,16 @@ if server_name != "tcp:127.0.0.1:4713":
     reasons.append("Browser audio backend is not the tracked localhost endpoint")
 if len(outputs) != 1:
     reasons.append("domain must contain exactly one guest playback endpoint")
-elif output.get("name") != "browser-vm" or output.get("streamName") != "MCNF-Browser-VM":
-    reasons.append("guest playback endpoint identity is not Browser-owned")
+elif "name" in output.attrib:
+    reasons.append("guest playback endpoint must route to the seat default sink")
+elif output.get("streamName") != "MCNF-Browser-VM":
+    reasons.append("guest playback stream identity is not Browser-owned")
 if len(inputs) != 1:
     reasons.append("domain must contain exactly one guest capture endpoint")
-elif input_.get("name") != "browser-vm-capture":
-    reasons.append("guest capture endpoint identity is not Browser-owned")
+elif "name" in input_.attrib:
+    reasons.append("guest capture endpoint must route to the seat default source")
+elif input_.get("streamName") != "MCNF-Browser-VM-Capture":
+    reasons.append("guest capture stream identity is not Browser-owned")
 if reasons:
     result["status"] = "failed"
     result["reason"] = "; ".join(reasons)
@@ -102,10 +106,12 @@ raise SystemExit(1 if reasons else 0)
 }
 
 self_test() {
-    local valid="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input name='browser-vm-capture'/><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio></devices></domain>"
-    local missing_capture="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio></devices></domain>"
-    local broad_listener="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:0.0.0.0:4713'><input name='browser-vm-capture'/><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio></devices></domain>"
-    local duplicate_backend="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input name='browser-vm-capture'/><output name='browser-vm' streamName='MCNF-Browser-VM'/></audio><audio id='2' type='pipewire'><input/><output/></audio></devices></domain>"
+    local valid="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input streamName='MCNF-Browser-VM-Capture'/><output streamName='MCNF-Browser-VM'/></audio></devices></domain>"
+    local missing_capture="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><output streamName='MCNF-Browser-VM'/></audio></devices></domain>"
+    local broad_listener="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:0.0.0.0:4713'><input streamName='MCNF-Browser-VM-Capture'/><output streamName='MCNF-Browser-VM'/></audio></devices></domain>"
+    local duplicate_backend="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input streamName='MCNF-Browser-VM-Capture'/><output streamName='MCNF-Browser-VM'/></audio><audio id='2' type='pipewire'><input/><output/></audio></devices></domain>"
+    local selector_names="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input name='default' streamName='MCNF-Browser-VM-Capture'/><output name='default' streamName='MCNF-Browser-VM'/></audio></devices></domain>"
+    local wrong_capture_stream="<domain><devices><sound model='virtio'/><audio id='1' type='pulseaudio' serverName='tcp:127.0.0.1:4713'><input streamName='browser-vm-capture'/><output streamName='MCNF-Browser-VM'/></audio></devices></domain>"
     local wiring_result
     wiring_result=$(printf '%s' "$valid" | check_xml self-test-valid)
     printf '%s' "$wiring_result" | python3 -c '
@@ -126,6 +132,14 @@ if result.get("status") != "wired" or result.get("sample_backed") is not False o
     fi
     if printf '%s' "$duplicate_backend" | check_xml self-test-duplicate-backend >/dev/null 2>&1; then
         echo 'verify-browser-vm-audio: self-test accepted duplicate audio backends' >&2
+        exit 1
+    fi
+    if printf '%s' "$selector_names" | check_xml self-test-device-selectors >/dev/null 2>&1; then
+        echo 'verify-browser-vm-audio: self-test accepted Pulse device selector names' >&2
+        exit 1
+    fi
+    if printf '%s' "$wrong_capture_stream" | check_xml self-test-capture-stream >/dev/null 2>&1; then
+        echo 'verify-browser-vm-audio: self-test accepted the wrong capture stream identity' >&2
         exit 1
     fi
     runtime_evidence_order_self_test

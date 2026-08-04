@@ -18,6 +18,30 @@ use std::time::{Duration, Instant};
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONSECUTIVE_STATUS_ERRORS: u8 = 3;
+pub const RETRYABLE_UNTOUCHED_JOB_EXIT_CODE: i32 = 75;
+
+#[derive(Debug)]
+struct UntouchedRegisteredJob;
+
+impl std::fmt::Display for UntouchedRegisteredJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Browser controller job remained registered and unactivated")
+    }
+}
+
+impl std::error::Error for UntouchedRegisteredJob {}
+
+pub fn is_retryable_untouched_job(error: &anyhow::Error) -> bool {
+    error.is::<UntouchedRegisteredJob>()
+}
+
+pub fn probe_failure_exit_code(error: &anyhow::Error) -> i32 {
+    if is_retryable_untouched_job(error) {
+        RETRYABLE_UNTOUCHED_JOB_EXIT_CODE
+    } else {
+        1
+    }
+}
 
 struct RequiredEnvironment {
     domain: String,
@@ -65,19 +89,30 @@ struct ProbeArguments {
     output_wav: Option<PathBuf>,
 }
 
-impl ProbeArguments {
+enum ProbePlan {
+    Single(ProbeArguments),
+    Duplex {
+        playback: ProbeArguments,
+        capture: ProbeArguments,
+    },
+}
+
+impl ProbePlan {
     fn parse() -> Result<Self> {
-        let mut args = env::args_os().skip(1);
-        let operation = match args
+        Self::parse_from(env::args_os().skip(1))
+    }
+
+    fn parse_from<I>(arguments: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = std::ffi::OsString>,
+    {
+        let mut args = arguments.into_iter();
+        let command = args
             .next()
             .context("probe operation is missing")?
             .to_str()
             .context("probe operation is not UTF-8")?
-        {
-            "playback" => Operation::Playback,
-            "capture" => Operation::Capture,
-            _ => bail!("probe operation must be playback or capture"),
-        };
+            .to_owned();
         let mut options = BTreeMap::new();
         while let Some(raw_key) = args.next() {
             let key = raw_key.to_str().context("probe option is not UTF-8")?;
@@ -95,28 +130,70 @@ impl ProbeArguments {
             );
         }
         let phase = take(&mut options, "phase")?;
-        let tone_hz = take(&mut options, "tone-hz")?
+        let plan = match command.as_str() {
+            "playback" => Self::Single(ProbeArguments::from_options(
+                Operation::Playback,
+                phase,
+                "",
+                &mut options,
+            )?),
+            "capture" => Self::Single(ProbeArguments::from_options(
+                Operation::Capture,
+                phase,
+                "",
+                &mut options,
+            )?),
+            "duplex" => Self::Duplex {
+                playback: ProbeArguments::from_options(
+                    Operation::Playback,
+                    phase.clone(),
+                    "playback",
+                    &mut options,
+                )?,
+                capture: ProbeArguments::from_options(
+                    Operation::Capture,
+                    phase,
+                    "capture",
+                    &mut options,
+                )?,
+            },
+            _ => bail!("probe operation must be playback, capture, or duplex"),
+        };
+        ensure!(options.is_empty(), "unknown probe option");
+        Ok(plan)
+    }
+}
+
+impl ProbeArguments {
+    fn from_options(
+        operation: Operation,
+        phase: String,
+        prefix: &str,
+        options: &mut BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let tone_hz = take(options, &option_name(prefix, "tone-hz"))?
             .parse::<u32>()
             .context("tone-hz is invalid")?;
-        let duration_seconds = take(&mut options, "duration-seconds")?
+        let duration_seconds = take(options, &option_name(prefix, "duration-seconds"))?
             .parse::<u32>()
             .context("duration-seconds is invalid")?;
-        let ready_receipt = absolute_option(&take(&mut options, "ready-receipt")?)?;
-        let start_signal = absolute_option(&take(&mut options, "start-signal")?)?;
-        let completed_receipt = absolute_option(&take(&mut options, "completed-receipt")?)?;
+        let ready_receipt =
+            absolute_option(&take(options, &option_name(prefix, "ready-receipt"))?)?;
+        let start_signal = absolute_option(&take(options, &option_name(prefix, "start-signal"))?)?;
+        let completed_receipt =
+            absolute_option(&take(options, &option_name(prefix, "completed-receipt"))?)?;
         let started_receipt = options
-            .remove("started-receipt")
+            .remove(&option_name(prefix, "started-receipt"))
             .map(|value| absolute_option(&value))
             .transpose()?;
         let release_signal = options
-            .remove("release-signal")
+            .remove(&option_name(prefix, "release-signal"))
             .map(|value| absolute_option(&value))
             .transpose()?;
         let output_wav = options
-            .remove("output-wav")
+            .remove(&option_name(prefix, "output-wav"))
             .map(|value| absolute_option(&value))
             .transpose()?;
-        ensure!(options.is_empty(), "unknown probe option");
         match operation {
             Operation::Playback => ensure!(
                 started_receipt.is_some() && release_signal.is_none() && output_wav.is_none(),
@@ -139,6 +216,14 @@ impl ProbeArguments {
             release_signal,
             output_wav,
         })
+    }
+}
+
+fn option_name(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}-{name}")
     }
 }
 
@@ -239,7 +324,31 @@ fn ensure_status(response: &ClientResponse, expected: u16) -> Result<()> {
 
 pub fn run_probe() -> Result<()> {
     let environment = RequiredEnvironment::load()?;
-    let arguments = ProbeArguments::parse()?;
+    let plan = ProbePlan::parse()?;
+    let config = HostConfig::load()?;
+    let mut driver = RdpDriver::connect(&config).context("connect Browser RDP probe session")?;
+    let result = match plan {
+        ProbePlan::Single(arguments) => {
+            run_probe_job(&environment, &config, &arguments, &mut driver)
+        }
+        ProbePlan::Duplex { playback, capture } => {
+            run_probe_job(&environment, &config, &playback, &mut driver)
+                .and_then(|()| driver.settle_between_browser_jobs())
+                .and_then(|()| run_probe_job(&environment, &config, &capture, &mut driver))
+        }
+    };
+    let shutdown = driver.shutdown();
+    result?;
+    shutdown?;
+    Ok(())
+}
+
+fn run_probe_job(
+    environment: &RequiredEnvironment,
+    config: &HostConfig,
+    arguments: &ProbeArguments,
+    driver: &mut RdpDriver,
+) -> Result<()> {
     let spec = JobSpec {
         schema_version: 1,
         job_id: hex_encode(&random_bytes::<32>()?),
@@ -247,27 +356,42 @@ pub fn run_probe() -> Result<()> {
         phase: arguments.phase.clone(),
         tone_hz: arguments.tone_hz,
         duration_seconds: arguments.duration_seconds,
-        source_commit: environment.source_commit,
-        image_digest: environment.image_digest,
-        transport: environment.transport,
+        source_commit: environment.source_commit.clone(),
+        image_digest: environment.image_digest.clone(),
+        transport: environment.transport.clone(),
     };
     spec.validate()?;
-    let config = HostConfig::load()?;
     let control = ProbeControl::register(&config, &spec)?;
-    let mut driver = match RdpDriver::connect(&config) {
-        Ok(driver) => driver,
-        Err(error) => {
-            let _ignored = control.delete();
-            return Err(error);
-        }
-    };
-    let result = run_registered_probe(&config, &spec, &arguments, &control, &mut driver);
-    let shutdown = driver.shutdown();
+    let result = run_registered_probe(config, &spec, arguments, &control, driver);
+    let retry_registered = result.is_err()
+        && control
+            .status()
+            .is_ok_and(|status| is_unactivated_registered_job(&status));
     let deletion = control.delete();
-    result?;
-    shutdown?;
-    deletion?;
-    Ok(())
+    match result {
+        Ok(()) => {
+            deletion?;
+            Ok(())
+        }
+        Err(_) if retry_registered => {
+            // Only this typed outcome permits the collector to launch a fresh
+            // hook process and one-time job. Deletion must succeed first.
+            deletion.context("delete untouched Browser probe job before retry")?;
+            Err(UntouchedRegisteredJob.into())
+        }
+        Err(error) => {
+            let _ignored = deletion;
+            Err(error)
+        }
+    }
+}
+
+fn is_unactivated_registered_job(status: &JobStatus) -> bool {
+    status.schema_version == 1
+        && status.state == "registered"
+        && !status.user_gesture_observed
+        && status.browser_api == "unavailable"
+        && status.channels == 0
 }
 
 fn run_registered_probe(
@@ -462,8 +586,11 @@ pub fn run_reconnect() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::ProbeArguments;
-    use crate::protocol::Operation;
+    use super::{
+        is_retryable_untouched_job, is_unactivated_registered_job, probe_failure_exit_code,
+        ProbeArguments, ProbePlan, UntouchedRegisteredJob, RETRYABLE_UNTOUCHED_JOB_EXIT_CODE,
+    };
+    use crate::protocol::{JobStatus, Operation};
     use std::ffi::OsString;
 
     #[test]
@@ -472,5 +599,94 @@ mod tests {
         assert_eq!(Operation::Capture.as_str(), "capture");
         let _type_guard: Option<ProbeArguments> = None;
         let _argv_guard: Vec<OsString> = Vec::new();
+    }
+
+    #[test]
+    fn duplex_arguments_map_both_jobs_without_reconnecting() {
+        let arguments = [
+            "duplex",
+            "--phase",
+            "before-recovery",
+            "--playback-tone-hz",
+            "523",
+            "--playback-duration-seconds",
+            "8",
+            "--playback-ready-receipt",
+            "/run/playback-ready",
+            "--playback-start-signal",
+            "/run/playback-start",
+            "--playback-started-receipt",
+            "/run/playback-started",
+            "--playback-completed-receipt",
+            "/run/playback-completed",
+            "--capture-tone-hz",
+            "719",
+            "--capture-duration-seconds",
+            "2",
+            "--capture-ready-receipt",
+            "/run/capture-ready",
+            "--capture-start-signal",
+            "/run/capture-start",
+            "--capture-completed-receipt",
+            "/run/capture-completed",
+            "--capture-release-signal",
+            "/run/capture-release",
+            "--capture-output-wav",
+            "/run/capture.wav",
+        ]
+        .into_iter()
+        .map(OsString::from);
+
+        let ProbePlan::Duplex { playback, capture } =
+            ProbePlan::parse_from(arguments).expect("valid duplex contract")
+        else {
+            panic!("duplex command did not produce a duplex plan");
+        };
+        assert_eq!(playback.operation, Operation::Playback);
+        assert_eq!(playback.phase, "before-recovery");
+        assert_eq!(playback.tone_hz, 523);
+        assert_eq!(playback.duration_seconds, 8);
+        assert_eq!(
+            playback.started_receipt.as_deref(),
+            Some(std::path::Path::new("/run/playback-started"))
+        );
+        assert_eq!(capture.operation, Operation::Capture);
+        assert_eq!(capture.phase, "before-recovery");
+        assert_eq!(capture.tone_hz, 719);
+        assert_eq!(capture.duration_seconds, 2);
+        assert_eq!(
+            capture.release_signal.as_deref(),
+            Some(std::path::Path::new("/run/capture-release"))
+        );
+        assert_eq!(
+            capture.output_wav.as_deref(),
+            Some(std::path::Path::new("/run/capture.wav"))
+        );
+    }
+
+    #[test]
+    fn reattach_is_limited_to_an_unactivated_registered_job() {
+        let mut status = JobStatus {
+            schema_version: 1,
+            job_id: "a".repeat(64),
+            state: "registered".to_owned(),
+            user_gesture_observed: false,
+            browser_api: "unavailable".to_owned(),
+            channels: 0,
+        };
+        assert!(is_unactivated_registered_job(&status));
+
+        status.user_gesture_observed = true;
+        assert!(!is_unactivated_registered_job(&status));
+        status.user_gesture_observed = false;
+        status.state = "page_loaded".to_owned();
+        assert!(!is_unactivated_registered_job(&status));
+
+        let retryable = anyhow::Error::new(UntouchedRegisteredJob);
+        assert!(is_retryable_untouched_job(&retryable));
+        assert!(!is_retryable_untouched_job(&anyhow::anyhow!("other")));
+        assert_eq!(RETRYABLE_UNTOUCHED_JOB_EXIT_CODE, 75);
+        assert_eq!(probe_failure_exit_code(&retryable), 75);
+        assert_eq!(probe_failure_exit_code(&anyhow::anyhow!("other")), 1);
     }
 }
