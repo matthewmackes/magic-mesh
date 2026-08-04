@@ -360,18 +360,18 @@ remains here under a completed status.
   dedicated `browser-vm`, attaches through VDI, renders the guest framebuffer,
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
-- Current state: The standalone repository preserves the old CEF/Servo stack;
-  `Surface::Browser` has a typed Workloads start/resume controller; RDP is
-  preferred and Sunshine/Moonlight explicit. Dell runs immutable Fedora 44
-  source `1f8bd845…`, digest `sha256:17e38205…b0556`, through the accepted r5
-  overlay and session-bound r6 identity, encrypted login, connected health, and
+- Current state: The standalone repository preserves the old CEF/Servo stack.
+  Browser uses a typed Workloads start/resume controller; RDP is preferred and
+  Sunshine/Moonlight explicit. Dell runs immutable Fedora 44 source `1f8bd845…`,
+  digest `sha256:17e38205…b0556`, accepted r5/r6 identity, encrypted login, and
   five-second alerts. Pushed RDP client `9660cbd9…` passed three strict runs:
-  1920x1080 Chromium, reversible pointer/Escape input, 79.6% inbound reconnect
-  repaint, and 99.9% identity. Farm validators passed one guest playback/capture
-  endpoint pair and fixed-fixture video/audio decode with zero drops; VA-API is
-  unavailable. Public clean-clone publication, old host removal, released-shell
-  auto-selection, sample-backed audio recovery, five-tab performance, and fleet
-  rollout remain; see `docs/platform/evidence/WL-ARCH-008-2026-08-04-dell-r6.md`.
+  1920x1080 Chromium, reversible pointer/Escape input, 79.6% reconnect repaint,
+  and 99.9% identity. Farm validators passed playback/capture endpoint wiring
+  and fixed-fixture A/V decode; VA decode failed a rolled-back GL probe. Exact
+  release `6f28404b…` auto-selected Workloads, brokered RDP, published active,
+  and rendered Chromium in a native Dell readback. Public repository/host
+  removal, sample-backed audio, five-tab performance, and fleet rollout remain;
+  see the dated WL-ARCH-008 evidence.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
