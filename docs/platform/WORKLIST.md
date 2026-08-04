@@ -361,17 +361,17 @@ remains here under a completed status.
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
 - Current state: The standalone repository preserves the old CEF/Servo stack;
-  `Surface::Browser` selects typed `browser-vm`, with RDP preferred and
-  Sunshine/Moonlight explicit. Dell now runs clean immutable Fedora 44 r5 from
-  source `1f8bd845…`, digest `sha256:17e38205…b0556`, through a fresh one-edge
-  overlay/NoCloud seed, encrypted host-bound login, and five-second alerts. Its
-  schema-v2 receipt validates the running domain and base. The release RDP client
-  at pushed commit `9660cbd9…` rendered Chromium at 1920x1080, opened and closed
-  its real app menu via pointer plus Escape, repainted 88.7% on reconnect, and
-  retained 99.9% visual identity. Workloads auto-launch, connected runtime/media,
-  live stereo playback/capture, 15-minute five-tab performance, shell
-  auto-selection, and fleet rollout remain; see
-  `docs/platform/evidence/WL-ARCH-008-2026-08-04-dell-r5.md`.
+  `Surface::Browser` has a typed Workloads start/resume controller; RDP is
+  preferred and Sunshine/Moonlight explicit. Dell runs immutable Fedora 44
+  source `1f8bd845…`, digest `sha256:17e38205…b0556`, through the accepted r5
+  overlay and session-bound r6 identity, encrypted login, connected health, and
+  five-second alerts. Pushed RDP client `9660cbd9…` passed three strict runs:
+  1920x1080 Chromium, reversible pointer/Escape input, 79.6% inbound reconnect
+  repaint, and 99.9% identity. Farm validators passed one guest playback/capture
+  endpoint pair and fixed-fixture video/audio decode with zero drops; VA-API is
+  unavailable. Public clean-clone publication, old host removal, released-shell
+  auto-selection, sample-backed audio recovery, five-tab performance, and fleet
+  rollout remain; see `docs/platform/evidence/WL-ARCH-008-2026-08-04-dell-r6.md`.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,

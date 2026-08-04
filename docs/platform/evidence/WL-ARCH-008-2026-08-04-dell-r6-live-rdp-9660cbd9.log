@@ -1,0 +1,38 @@
+
+running 1 test
+live: desktop qualification requires at least 32 distinct colors
+live: Chromium pointer challenge REQUIRED
+live: CONNECTED tier=Full desktop=1920x1080 compression=None io_channel=1003 user_channel=1005
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-qualification-best.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-qualification-best.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-qualification-best.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-qualification-best.ppm
+live: FRAME OK 1920x1080 rects=40 fnv1a64=0xe77b527e58b33dc5 distinct_colors=43 non_dominant_pixels=129847
+live: settled baseline fnv1a64=0x31a8abb13d16e24b
+live: Chromium input uses the reversible app-menu + Escape challenge
+live: POINTER ARMED point=1898,62 sent=1 quiet_ms=1500 fnv1a64=0x79be741c6207dd11
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: settled framebuffer capture written to /var/tmp/browser-vm-r6-live-rdp-9660cbd9-postboot2-best-menu-reaction.ppm
+live: POINTER CLICK VERIFIED kind=chromium-app-menu point=1898,62 sent=2 opening_rects=64 closing_rects=13 changed_near=71307 changed_total=71307 bounds=PixelBounds { left: 1452, top: 46, right: 1920, bottom: 883 } restored=64601/71307 residual=6706 before=0x79be741c6207dd11 opened=0xc4958cf48b882a8f closed=0xdd84e86520a3646a
+live: RECONNECTED tier=Compressed desktop=1920x1080 compression=None
+live: RECONNECT IDENTITY OK point=1898,62 inbound_damage_per_mille=796 visual_identity_per_mille=999
+live: TIER FRAME OK 1920x1080 rects=5 fnv1a64=0x2481ad6e54af450f distinct_colors=1161
+test live_rdp_renders_accepts_input_and_applies_tier_on_reconnect ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 35.19s
