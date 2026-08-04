@@ -72,6 +72,7 @@ HEIGHT = 1080
 TARGET_FPS = 30
 TAB_RATE_PROBE_SECONDS = 4.0
 MEDIA_DURATION_SECONDS = 8
+MEDIA_FPS = 60
 MAX_MEDIA_BYTES = 64 * 1024 * 1024
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -192,7 +193,7 @@ class MediaAsset:
 
 
 def generate_media_asset(runtime_root: Path) -> MediaAsset:
-    """Generate and inspect the real encoded 1080p/36 source served to Chromium."""
+    """Generate and inspect the real encoded 1080p/60 source served to Chromium."""
     ffmpeg = Path("/usr/bin/ffmpeg")
     ffprobe = Path("/usr/bin/ffprobe")
     for path, label in ((ffmpeg, "ffmpeg"), (ffprobe, "ffprobe")):
@@ -208,12 +209,20 @@ def generate_media_asset(runtime_root: Path) -> MediaAsset:
         "lavfi",
         "-i",
         (
-            f"testsrc2=size={WIDTH}x{HEIGHT}:rate=36:"
+            f"color=c=0x07111f:size={WIDTH}x{HEIGHT}:rate={MEDIA_FPS}:"
             f"duration={MEDIA_DURATION_SECONDS}"
+        ),
+        "-vf",
+        (
+            "drawbox=x=0:y=0:w=iw:h=180:color=0x1b5e20:t=fill,"
+            "drawtext=font=Sans:text='MCNF 1080p 60 FPS':"
+            "fontcolor=white:fontsize=72:x=420:y=470,"
+            "drawtext=font=Sans:text='FRAME %{n}':"
+            "fontcolor=0x80cbc4:fontsize=64:x='mod(n*23,1500)':y=900"
         ),
         "-an",
         "-c:v",
-        "libvpx-vp9",
+        "libvpx",
         "-deadline",
         "realtime",
         "-cpu-used",
@@ -293,14 +302,14 @@ def generate_media_asset(runtime_root: Path) -> MediaAsset:
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, json.JSONDecodeError):
         fail("live 1080p media inspection returned malformed facts")
     if (
-        codec != "vp9"
+        codec != "vp8"
         or width != WIDTH
         or height != HEIGHT
-        or frame_rate != Fraction(36, 1)
+        or frame_rate != Fraction(MEDIA_FPS, 1)
         or not math.isfinite(duration)
         or duration < MEDIA_DURATION_SECONDS - 0.1
     ):
-        fail("encoded media did not verify as VP9 1920x1080 at 36 fps")
+        fail("encoded media did not verify as VP8 1920x1080 at 60 fps")
     try:
         version = subprocess.run(
             [str(ffmpeg), "-version"],
@@ -1205,127 +1214,8 @@ class CdpTab:
             time.sleep(0.1)
         fail(f"Chromium window {window_id} did not enter a verified minimized state")
 
-    def set_normal_window_bounds(
-        self, window_id: int, *, left: int, top: int, width: int, height: int
-    ) -> None:
-        self.socket.call(
-            "Browser.setWindowBounds",
-            {"windowId": window_id, "bounds": {"windowState": "normal"}},
-        )
-        self.socket.call(
-            "Browser.setWindowBounds",
-            {
-                "windowId": window_id,
-                "bounds": {
-                    "left": left,
-                    "top": top,
-                    "width": width,
-                    "height": height,
-                },
-            },
-        )
-        expected = {"left": left, "top": top, "width": width, "height": height}
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            value = self.socket.call("Browser.getWindowBounds", {"windowId": window_id})
-            bounds = value.get("bounds") if isinstance(value, dict) else None
-            if (
-                isinstance(bounds, dict)
-                and bounds.get("windowState") == "normal"
-                and all(bounds.get(field) == number for field, number in expected.items())
-            ):
-                return
-            time.sleep(0.1)
-        fail(f"Chromium window {window_id} did not enter its verified tiled bounds")
-
     def close(self) -> None:
         self.socket.close()
-
-
-def spread_tabs_across_windows(tabs: list[CdpTab]) -> bool:
-    """Give every measured page an active tab in its own Chromium window.
-
-    Chromium does not submit video frames for inactive tabs, even when its
-    renderer/timer background throttles are disabled.  Keeping one measured
-    tab per real browser window preserves five concurrent, headful video
-    players; ``--disable-backgrounding-occluded-windows`` then keeps the
-    covered windows rendering while RDP observes the foreground window.
-
-    Return ``True`` after replacing duplicate-window tabs.  The caller must
-    rediscover targets because both the old and new CDP identities change the
-    target list while this operation is in flight.
-    """
-    if len(tabs) != MIN_TABS:
-        fail("Chromium window spreading requires the exact measured tab set")
-    owners: dict[int, CdpTab] = {}
-    duplicates: list[CdpTab] = []
-    for tab in tabs:
-        window_id = tab.window_id()
-        if window_id in owners:
-            duplicates.append(tab)
-        else:
-            owners[window_id] = tab
-    if not duplicates:
-        return False
-
-    controller = tabs[0]
-    created: list[str] = []
-    try:
-        for tab in duplicates:
-            result = controller.socket.call(
-                "Target.createTarget",
-                {
-                    "url": tab.url,
-                    "newWindow": True,
-                    "background": False,
-                },
-            )
-            target_id = result.get("targetId") if isinstance(result, dict) else None
-            if (
-                not isinstance(target_id, str)
-                or SESSION_RE.fullmatch(target_id) is None
-                or target_id in created
-            ):
-                fail("Chromium returned a malformed replacement-window target")
-            created.append(target_id)
-    except Exception:
-        for target_id in created:
-            try:
-                controller.socket.call("Target.closeTarget", {"targetId": target_id})
-            except (HarnessError, OSError):
-                pass
-        raise
-
-    for tab in duplicates:
-        result = controller.socket.call("Target.closeTarget", {"targetId": tab.id})
-        if not isinstance(result, dict) or result.get("success") is not True:
-            fail("Chromium did not close a replaced background media tab")
-    return True
-
-
-def tile_tab_windows(tabs: list[CdpTab]) -> list[int]:
-    """Keep every 1080p source visibly scheduled on the 1920x1080 desktop."""
-    layout = (
-        (0, 0, 640, 520),
-        (640, 0, 640, 520),
-        (1280, 0, 640, 520),
-        (320, 540, 640, 520),
-        (960, 540, 640, 520),
-    )
-    windows: list[int] = []
-    for tab, (left, top, width, height) in zip(tabs, layout):
-        window_id = tab.window_id()
-        if window_id in windows:
-            fail("Chromium media tabs did not retain independent windows")
-        tab.set_normal_window_bounds(
-            window_id,
-            left=left,
-            top=top,
-            width=width,
-            height=height,
-        )
-        windows.append(window_id)
-    return windows
 
 
 MEDIA_PAGE = r"""<!doctype html>
@@ -1548,7 +1438,6 @@ def wait_for_tabs(
     endpoint = f"http://{guest_ip}:{proxy_port}/json/list"
     deadline = time.monotonic() + timeout
     last_error = "not reachable"
-    fatal_window_error: str | None = None
     while time.monotonic() < deadline:
         try:
             targets = fetch_json(
@@ -1593,19 +1482,6 @@ def wait_for_tabs(
                 accepted = False
                 try:
                     tabs = [CdpTab(target) for target in rewritten]
-                    try:
-                        windows_changed = spread_tabs_across_windows(tabs)
-                    except (HarnessError, OSError) as exc:
-                        fatal_window_error = str(exc)
-                        raise
-                    if windows_changed:
-                        last_error = "rediscovering five independent Chromium windows"
-                        continue
-                    try:
-                        tile_tab_windows(tabs)
-                    except (HarnessError, OSError) as exc:
-                        fatal_window_error = str(exc)
-                        raise
                     statuses = [tab.initialization_status() for tab in tabs]
                     if not all(status.get("harness") is True for status in statuses):
                         errors = sorted(
@@ -1712,8 +1588,6 @@ def wait_for_tabs(
                 last_error = f"observed {len(matches)} controlled media tabs"
         except (HarnessError, OSError, urllib.error.URLError) as exc:
             last_error = str(exc)
-        if fatal_window_error is not None:
-            break
         time.sleep(0.5)
     fail(f"Chromium did not expose five ready CDP media tabs: {last_error}")
 
@@ -2600,10 +2474,10 @@ def self_test() -> None:
         media_asset = MediaAsset(
             data=b"self-test-webm",
             sha256="sha256:" + hashlib.sha256(b"self-test-webm").hexdigest(),
-            codec="vp9",
+            codec="vp8",
             width=WIDTH,
             height=HEIGHT,
-            fps=36,
+            fps=MEDIA_FPS,
             duration_ms=MEDIA_DURATION_SECONDS * 1_000,
             generator_sha256="sha256:" + "a" * 64,
             generator_version="self-test only",

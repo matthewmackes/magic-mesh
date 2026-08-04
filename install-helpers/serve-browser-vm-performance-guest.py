@@ -292,8 +292,7 @@ class ActiveRun:
         self.chromium = subprocess.Popen(
             [
                 chromium_binary(),
-                "--ozone-platform=wayland",
-                "--enable-features=UseOzonePlatform",
+                "--ozone-platform=x11",
                 "--start-maximized",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -304,6 +303,8 @@ class ActiveRun:
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
                 "--disable-background-media-suspend",
+                "--disable-frame-rate-limit",
+                "--disable-gpu-vsync",
                 "--remote-allow-origins=*",
                 "--remote-debugging-address=127.0.0.1",
                 f"--remote-debugging-port={self.internal_port}",
