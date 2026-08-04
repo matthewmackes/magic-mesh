@@ -144,8 +144,13 @@ const PAGE_TEMPLATE: &str = r##"<!doctype html>
     gain.gain.setValueAtTime(0.25, context.currentTime);
     oscillator.connect(gain).connect(context.destination);
     const began = performance.now();
+    let stopTimer = null;
     oscillator.onended = async () => {
       try {
+        if (stopTimer !== null) {
+          window.clearTimeout(stopTimer);
+          stopTimer = null;
+        }
         const elapsed = Math.round(performance.now() - began);
         await postEvent({event: "playback_completed", oscillator_ended: true, elapsed_ms: elapsed});
         state = "completed";
@@ -157,7 +162,18 @@ const PAGE_TEMPLATE: &str = r##"<!doctype html>
     // delayed controller response must never make an already-fired `ended`
     // event disappear while the Browser awaits playback_started admission.
     oscillator.start();
-    oscillator.stop(context.currentTime + durationSeconds);
+    // A disconnected or failed virtual audio backend can stall AudioContext's
+    // media clock indefinitely. Schedule the real oscillator stop from the
+    // Browser's monotonic wall clock so `ended` is still delivered; the live
+    // collector independently rejects missing or malformed PCM at QEMU's
+    // PipeWire capture point.
+    stopTimer = window.setTimeout(() => {
+      try {
+        oscillator.stop();
+      } catch (error) {
+        void fail(error.message || "playback-stop");
+      }
+    }, durationSeconds * 1000);
     await postEvent({
       event: "playback_started",
       is_trusted: event.isTrusted === true,
@@ -410,6 +426,9 @@ mod tests {
                 < playback.find("oscillator.start()").unwrap_or(0),
             "playback completion must be observed before the oscillator starts"
         );
+        assert!(playback.contains("window.setTimeout"));
+        assert!(playback.contains("oscillator.stop()"));
+        assert!(!playback.contains("oscillator.stop(context.currentTime"));
 
         let capture =
             String::from_utf8(render(&spec(Operation::Capture), "nonce").html).unwrap_or_default();
