@@ -14,6 +14,7 @@ COPY packaging/browser-vm/mcnf-browser-vm-session.sh /tmp/mcnf-browser-vm-sessio
 COPY packaging/browser-vm/verify-session-input-contract.sh /tmp/mcnf-browser-vm-verify-session-input
 COPY packaging/browser-vm/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-fixture.html
 COPY packaging/browser-vm/mcnf-browser-vm-media-probe.sh /tmp/mcnf-browser-vm-media-probe
+COPY packaging/browser-vm/mcnf-x11-present-copy.c /tmp/mcnf-x11-present-copy.c
 COPY crates/desktop/mde-media-core/tests/fixtures/tiny_clip.mkv /tmp/mcnf-browser-vm-tiny_clip.mkv
 COPY packaging/browser-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
@@ -42,7 +43,19 @@ RUN set -eux; \
         pulseaudio-utils \
         mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
         libva-utils libinput libxkbcommon xorg-x11-server-Xwayland \
-        xrdp xrdp-selinux xorgxrdp-glamor qemu-guest-agent; \
+        xrdp xrdp-selinux xorgxrdp-glamor qemu-guest-agent \
+        gcc libxcb-devel; \
+    # wlroots' nested X11 backend presents a child-window pixmap. Keep an
+    # unprivileged Sway executable (Fedora's /usr/bin/sway has file capabilities,
+    # which intentionally disable LD_PRELOAD) and mirror each presented frame
+    # into Xorg's root backing drawable for xorgxrdp's classic capture path.
+    cc -shared -fPIC -O2 -Wall -Wextra -Werror \
+        -Wl,-z,relro,-z,now,-z,noexecstack \
+        -o /usr/local/lib64/libmcnf-x11-present-copy.so \
+        /tmp/mcnf-x11-present-copy.c \
+        $(pkg-config --cflags --libs xcb xcb-present) -ldl; \
+    install -D -m 0755 /usr/bin/sway /usr/local/libexec/mcnf-sway; \
+    test -z "$(getcap /usr/local/libexec/mcnf-sway)"; \
     # Fedora's glamor build keeps xrdp's software capture memory synchronized
     # with the composed Xorg screen pixmap.  The Browser VM presents a virtio
     # render node, so admit that DRM driver in addition to Fedora's physical-GPU
@@ -85,7 +98,8 @@ RUN set -eux; \
     # explicitly so the guest agent starts when the SPICE channel is present.
     ln -sf /usr/lib/systemd/system/spice-vdagentd.service /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service; \
     systemctl enable xrdp.service; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-verify-session-input /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv; \
+    dnf -y remove gcc libxcb-devel; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-verify-session-input /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv /tmp/mcnf-x11-present-copy.c; \
     dnf clean all
 
 RUN systemctl enable mcnf-browser-vm-runtime.service

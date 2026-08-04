@@ -135,6 +135,11 @@ verify_desktop_chain() {
         || fail "xrdp startwm does not select Sway's nested X11 backend"
     has_active_line "$startwm" 'export WLR_RENDERER=pixman' \
         || fail "xrdp startwm does not select the nested X11 renderer"
+    has_active_line "$startwm" 'export MCNF_X11_PRESENT_COPY=1' \
+        || fail "xrdp startwm does not enable nested-X11 present mirroring"
+    has_active_line "$startwm" \
+        'export LD_PRELOAD=/usr/local/lib64/libmcnf-x11-present-copy.so' \
+        || fail "xrdp startwm does not preload the present-mirroring boundary"
     [ "$(trimmed_last_active_line "$startwm")" = \
         'exec /usr/local/libexec/mcnf-browser-vm-runtime' ] \
         || fail "xrdp startwm does not remain attached to the Browser runtime"
@@ -148,7 +153,7 @@ verify_desktop_chain() {
         'sed -i "s#@CHROMIUM_BIN@#$chromium_bin#" "$HOME/.config/sway/config"' \
         || fail "runtime does not bind the resolved Chromium binary into Sway"
     [ "$(trimmed_last_active_line "$runtime")" = \
-        'exec /usr/bin/sway --unsupported-gpu --config "$HOME/.config/sway/config"' ] \
+        'exec /usr/local/libexec/mcnf-sway --unsupported-gpu --config "$HOME/.config/sway/config"' ] \
         || fail "runtime does not remain attached to Sway"
     [ "$(trimmed_last_active_line "$session")" = '"$@"' ] \
         || fail "session supervisor does not keep the Browser runtime in the foreground"
@@ -346,6 +351,7 @@ verify_xorg_glamor_capture() {
 
 verify_image_root() {
     local root=$1 prefix sesman default_wm xorg_binary config_parameter xorg_config
+    local present_library sway_copy
     [ -d "$root" ] || fail "image root is not a directory: $root"
     prefix=${root%/}
     sesman=$prefix/etc/xrdp/sesman.ini
@@ -377,6 +383,16 @@ verify_image_root() {
     verify_xorg_glamor_capture "$xorg_config"
     verify_driver_module "$prefix" xrdpmouse
     verify_driver_module "$prefix" xrdpkeyb
+    present_library=$prefix/usr/local/lib64/libmcnf-x11-present-copy.so
+    sway_copy=$prefix/usr/local/libexec/mcnf-sway
+    [ -f "$present_library" ] && [ -r "$present_library" ] \
+        || fail "nested-X11 present-mirroring library is missing"
+    [ -f "$sway_copy" ] && [ -x "$sway_copy" ] \
+        || fail "unprivileged Sway executable is missing"
+    if command -v getcap >/dev/null 2>&1; then
+        [ -z "$(getcap "$sway_copy")" ] \
+            || fail "present-mirroring Sway executable must not carry file capabilities"
+    fi
     verify_desktop_chain \
         "$prefix/usr/libexec/xrdp/startwm.sh" \
         "$prefix/usr/local/libexec/mcnf-browser-vm-runtime" \
@@ -384,13 +400,15 @@ verify_image_root() {
 }
 
 verify_source() {
-    local source=$1 container startwm runtime session
+    local source=$1 container startwm runtime session present_source
     [ -d "$source" ] || fail "source directory is missing: $source"
     container=$source/Containerfile
     startwm=$source/mcnf-browser-vm-xrdp-startwm.sh
     runtime=$source/mcnf-browser-vm-runtime.sh
     session=$source/mcnf-browser-vm-session.sh
+    present_source=$source/mcnf-x11-present-copy.c
     [ -f "$container" ] || fail "Browser VM Containerfile is missing"
+    [ -f "$present_source" ] || fail "nested-X11 present-mirroring source is missing"
 
     verify_desktop_chain "$startwm" "$runtime" "$session"
     active_code_contains "$container" 'xrdp xrdp-selinux xorgxrdp-glamor' \
@@ -410,6 +428,15 @@ verify_source() {
     active_code_contains "$container" \
         'install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /usr/libexec/xrdp/startwm.sh' \
         || fail "Browser image does not replace Fedora's selected xrdp startwm entrypoint"
+    active_code_contains "$container" \
+        'COPY packaging/browser-vm/mcnf-x11-present-copy.c /tmp/mcnf-x11-present-copy.c' \
+        || fail "Browser image does not copy the present-mirroring source"
+    active_code_contains "$container" \
+        '-o /usr/local/lib64/libmcnf-x11-present-copy.so' \
+        || fail "Browser image does not build the present-mirroring library"
+    active_code_contains "$container" \
+        'install -D -m 0755 /usr/bin/sway /usr/local/libexec/mcnf-sway' \
+        || fail "Browser image does not install an unprivileged Sway executable"
     active_code_contains "$container" \
         "sed -i 's/^DefaultWindowManager=.*/DefaultWindowManager=startwm.sh/' /etc/xrdp/sesman.ini" \
         || fail "Browser image does not select its authenticated desktop entrypoint"
@@ -438,6 +465,8 @@ self_test() {
         "$source_fixture/mcnf-browser-vm-runtime.sh"
     cp "$script_dir/mcnf-browser-vm-session.sh" \
         "$source_fixture/mcnf-browser-vm-session.sh"
+    cp "$script_dir/mcnf-x11-present-copy.c" \
+        "$source_fixture/mcnf-x11-present-copy.c"
     verify_source "$source_fixture"
 
     cp "$script_dir/Containerfile" "$source_fixture/Containerfile"
@@ -496,7 +525,7 @@ self_test() {
         "$source_fixture/mcnf-browser-vm-xrdp-startwm.sh"
     cp "$script_dir/mcnf-browser-vm-runtime.sh" \
         "$source_fixture/mcnf-browser-vm-runtime.sh"
-    sed -i 's#^exec /usr/bin/sway #/usr/bin/sway #' \
+    sed -i 's#^exec /usr/local/libexec/mcnf-sway #/usr/local/libexec/mcnf-sway #' \
         "$source_fixture/mcnf-browser-vm-runtime.sh"
     expect_rejected 'source with a detached runtime/Sway chain' \
         verify_source "$source_fixture"
@@ -518,6 +547,7 @@ self_test() {
         "$image_fixture/etc/X11/xrdp" \
         "$image_fixture/usr/libexec/xrdp" \
         "$image_fixture/usr/local/libexec" \
+        "$image_fixture/usr/local/lib64" \
         "$image_fixture/usr/lib64/xorg/modules/input"
     cp "$script_dir/mcnf-browser-vm-xrdp-startwm.sh" \
         "$image_fixture/usr/libexec/xrdp/startwm.sh"
@@ -525,6 +555,9 @@ self_test() {
         "$image_fixture/usr/local/libexec/mcnf-browser-vm-runtime"
     cp "$script_dir/mcnf-browser-vm-session.sh" \
         "$image_fixture/usr/local/libexec/mcnf-browser-vm-session"
+    install -m 0755 /dev/null "$image_fixture/usr/local/libexec/mcnf-sway"
+    install -m 0755 /dev/null \
+        "$image_fixture/usr/local/lib64/libmcnf-x11-present-copy.so"
     install -m 0755 /dev/null "$image_fixture/usr/libexec/Xorg"
     install -m 0644 /dev/null \
         "$image_fixture/usr/lib64/xorg/modules/input/xrdpmouse_drv.so"
@@ -589,6 +622,16 @@ EOF
     expect_rejected 'image without the xrdpkeyb module' verify_image_root "$image_fixture"
     install -m 0644 /dev/null \
         "$image_fixture/usr/lib64/xorg/modules/input/xrdpkeyb_drv.so"
+
+    rm "$image_fixture/usr/local/lib64/libmcnf-x11-present-copy.so"
+    expect_rejected 'image without nested-X11 present mirroring' \
+        verify_image_root "$image_fixture"
+    install -m 0755 /dev/null \
+        "$image_fixture/usr/local/lib64/libmcnf-x11-present-copy.so"
+
+    rm "$image_fixture/usr/local/libexec/mcnf-sway"
+    expect_rejected 'image without unprivileged Sway' verify_image_root "$image_fixture"
+    install -m 0755 /dev/null "$image_fixture/usr/local/libexec/mcnf-sway"
 
     sed -i 's/Driver "xrdpmouse"/Driver "libinput"/' \
         "$image_fixture/etc/X11/xrdp/xorg.conf"

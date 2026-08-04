@@ -285,4 +285,4 @@ EOF
 # browser state is accepted from the host declaration.
 sed -i "s#@CHROMIUM_BIN@#$chromium_bin#" "$HOME/.config/sway/config"
 log 'starting Sway and guest-owned Chromium after audio readiness'
-exec /usr/bin/sway --unsupported-gpu --config "$HOME/.config/sway/config"
+exec /usr/local/libexec/mcnf-sway --unsupported-gpu --config "$HOME/.config/sway/config"
