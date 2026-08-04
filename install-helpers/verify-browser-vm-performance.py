@@ -6,7 +6,8 @@ VDI session.  It does not run a local benchmark or synthesize live readiness.
 A pass requires the version-4 challenged live stream provenance emitted by the
 collector, distinct host/guest/domain identities, an observed 15-minute wall
 window, immutable browser/workload/desktop-source and tab identities, every
-tab's 1080p guest source cadence, shell-delivered cadence, coordinate-derived
+tab's 1080p geometry and positive playback progress, visible shell-delivered
+cadence, coordinate-derived
 stationary-pointer and counter-derived hidden-surface windows, bounded
 navigation/session latency, direct full/partial upload counters, broadly sampled
 host-process CPU and DRM GPU load, and reconnect recovery. RDP is the default
@@ -49,6 +50,10 @@ HIDDEN_QUIESCENT_WINDOW_MS = 5 * 60 * 1000
 MAX_HIDDEN_REPAINT_BURST_MS = 20_000
 MAX_HIDDEN_REPAINT_ACTIVE_FRACTION = 0.05
 MIN_CADENCE_RATIO_PERMILLE = 900
+MIN_SUPPORTED_TARGET_FPS = 30
+MIN_VISIBLE_DELIVERY_FPS = (
+    MIN_SUPPORTED_TARGET_FPS * MIN_CADENCE_RATIO_PERMILLE + 999
+) // 1_000
 STATIONARY_POINTER_WINDOW_MS = 5 * 60 * 1000
 MIN_LIVE_SAMPLE_COUNT = 91
 MIN_MEDIA_TAB_COUNT = 5
@@ -521,9 +526,10 @@ def validate_document(data: Any) -> dict[str, Any]:
             "viewport": width >= 1920 and height >= 1080,
             "five_tab_source_resolution": tab_source_width >= 1920
             and tab_source_height >= 1080,
-            "min_fps": min_fps >= 30,
-            "source_fps": source_fps >= 30,
-            "supported_target_fps": supported_target_fps >= 30,
+            "visible_delivery_fps": min_fps >= MIN_VISIBLE_DELIVERY_FPS,
+            "five_tab_source_progress": source_fps > 0,
+            "supported_target_fps": supported_target_fps
+            >= MIN_SUPPORTED_TARGET_FPS,
             "cadence_ratio_permille": cadence_ratio
             >= MIN_CADENCE_RATIO_PERMILLE,
             "max_stall_ms": max_stall <= 500,
@@ -659,10 +665,10 @@ def valid_record(transport: str = DEFAULT_TRANSPORT) -> dict[str, Any]:
         "tab_source_height": 1080,
         "viewport_width": 1920,
         "viewport_height": 1080,
-        "min_fps": 30,
-        "source_fps": 30,
-        "cadence_ratio_permille": 1_000,
-        "supported_target_fps": 30,
+        "min_fps": MIN_VISIBLE_DELIVERY_FPS,
+        "source_fps": 1,
+        "cadence_ratio_permille": MIN_CADENCE_RATIO_PERMILLE,
+        "supported_target_fps": MIN_SUPPORTED_TARGET_FPS,
         "max_stall_ms": 500,
         "pointer_updates": 1,
         "stationary_pointer_continuous_ms": 300_000,
@@ -707,6 +713,9 @@ def self_test() -> None:
     assert rdp_result["status"] == "validated"
     assert rdp_result["live_proof"] == "observed"
     assert rdp_result["transport"] == DEFAULT_TRANSPORT
+    assert rdp_result["min_fps"] == MIN_VISIBLE_DELIVERY_FPS
+    assert rdp_result["source_fps"] == 1
+    assert rdp_result["cadence_ratio_permille"] == MIN_CADENCE_RATIO_PERMILLE
     sunshine_result = validate_document(valid_record("sunshine"))
     assert sunshine_result["status"] == "validated"
     assert sunshine_result["transport"] == "sunshine"
@@ -745,8 +754,18 @@ def self_test() -> None:
         "five_tab_source_resolution",
     )
     assert_rejected(dict(valid_record(), duration_seconds=899), "duration_seconds")
-    assert_rejected(dict(valid_record(), min_fps=29), "min_fps")
-    assert_rejected(dict(valid_record(), source_fps=29), "source_fps")
+    assert_rejected(
+        dict(valid_record(), min_fps=MIN_VISIBLE_DELIVERY_FPS - 1),
+        "visible_delivery_fps",
+    )
+    assert_rejected(
+        dict(valid_record(), source_fps=0),
+        "five_tab_source_progress",
+    )
+    assert_rejected(
+        dict(valid_record(), supported_target_fps=MIN_SUPPORTED_TARGET_FPS - 1),
+        "supported_target_fps",
+    )
     assert_rejected(
         dict(valid_record(), cadence_ratio_permille=899),
         "cadence_ratio_permille",

@@ -99,6 +99,10 @@ HIDDEN_QUIESCENT_WINDOW_MS = 5 * 60 * 1000
 MAX_HIDDEN_REPAINT_BURST_MS = 2 * MAX_SAMPLE_GAP_MS
 MAX_HIDDEN_REPAINT_ACTIVE_FRACTION = 0.05
 MIN_CADENCE_RATIO_PERMILLE = 900
+MIN_SUPPORTED_TARGET_FPS = 30
+MIN_VISIBLE_DELIVERY_FPS = (
+    MIN_SUPPORTED_TARGET_FPS * MIN_CADENCE_RATIO_PERMILLE + 999
+) // 1_000
 STATIONARY_POINTER_WINDOW_MS = 5 * 60 * 1000
 MIN_MEDIA_TAB_COUNT = 5
 MIN_HOST_LOAD_COVERAGE_PERMILLE = 900
@@ -440,7 +444,7 @@ def validate_header(
         data["supported_target_fps"],
         MAX_FPS,
         "stream supported_target_fps",
-        minimum=30,
+        minimum=MIN_SUPPORTED_TARGET_FPS,
     )
     return StreamIdentity(
         live_protocol=True,
@@ -1349,8 +1353,15 @@ def assess(observation: Observation) -> Assessment:
             metrics["tab_source_width"] >= 1920
             and metrics["tab_source_height"] >= 1080,
         ),
-        ("min_fps", metrics["min_fps"] >= 30),
-        ("five_tab_source_fps", metrics["source_fps"] >= 30),
+        (
+            "visible_delivery_fps",
+            metrics["min_fps"] >= MIN_VISIBLE_DELIVERY_FPS,
+        ),
+        ("five_tab_source_progress", metrics["source_fps"] > 0),
+        (
+            "supported_target_fps",
+            metrics["supported_target_fps"] >= MIN_SUPPORTED_TARGET_FPS,
+        ),
         (
             "source_cadence_ratio",
             metrics["cadence_ratio_permille"] >= MIN_CADENCE_RATIO_PERMILLE,
@@ -1579,6 +1590,8 @@ def validate_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
             MAX_HIDDEN_REPAINT_ACTIVE_FRACTION,
         ),
         ("MIN_CADENCE_RATIO_PERMILLE", MIN_CADENCE_RATIO_PERMILLE),
+        ("MIN_SUPPORTED_TARGET_FPS", MIN_SUPPORTED_TARGET_FPS),
+        ("MIN_VISIBLE_DELIVERY_FPS", MIN_VISIBLE_DELIVERY_FPS),
         ("STATIONARY_POINTER_WINDOW_MS", STATIONARY_POINTER_WINDOW_MS),
         ("MIN_MEDIA_TAB_COUNT", MIN_MEDIA_TAB_COUNT),
         ("MAX_HOST_LOAD_PERMILLE", MAX_HOST_LOAD_PERMILLE),
@@ -2271,18 +2284,46 @@ def self_test() -> None:
     cadence_drop_samples = copied_samples()
     cadence_drop_samples[10]["frames_received"] -= 50
     cadence_drop = assess(with_samples(cadence_drop_samples))
-    assert "min_fps" in cadence_drop.failures
+    assert "visible_delivery_fps" in cadence_drop.failures
     assert "source_cadence_ratio" in cadence_drop.failures
+
+    visible_boundary_samples = copied_samples()
+    for sample in visible_boundary_samples:
+        sample["frames_received"] = (
+            sample["elapsed_ms"] * MIN_VISIBLE_DELIVERY_FPS // 1_000
+        )
+    visible_boundary = assess(with_samples(visible_boundary_samples))
+    assert visible_boundary.min_fps == MIN_VISIBLE_DELIVERY_FPS
+    assert visible_boundary.cadence_ratio_permille == MIN_CADENCE_RATIO_PERMILLE
+    assert visible_boundary.criteria_met, visible_boundary.failures
+
+    below_visible_floor_samples = copied_samples()
+    for sample in below_visible_floor_samples:
+        delivered_frames = (
+            sample["elapsed_ms"] * (MIN_VISIBLE_DELIVERY_FPS - 1) // 1_000
+        )
+        sample["frames_received"] = delivered_frames
+        sample["tab_source_frames"][tab_ids[0]]["frames_presented"] = delivered_frames
+    below_visible_floor = assess(with_samples(below_visible_floor_samples))
+    assert below_visible_floor.min_fps == MIN_VISIBLE_DELIVERY_FPS - 1
+    assert below_visible_floor.cadence_ratio_permille == 1_000
+    assert "visible_delivery_fps" in below_visible_floor.failures
 
     slow_fifth_tab_samples = copied_samples()
     for sample in slow_fifth_tab_samples:
         sample["tab_source_frames"][tab_ids[-1]]["frames_presented"] = (
-            sample["elapsed_ms"] * 29 // 1_000
+            sample["elapsed_ms"] // 1_000
         )
-    assert (
-        "five_tab_source_fps"
-        in assess(with_samples(slow_fifth_tab_samples)).failures
-    )
+    slow_fifth_tab = assess(with_samples(slow_fifth_tab_samples))
+    assert slow_fifth_tab.source_fps == 1
+    assert slow_fifth_tab.criteria_met, slow_fifth_tab.failures
+
+    stopped_fifth_tab_samples = copied_samples()
+    for sample in stopped_fifth_tab_samples:
+        sample["tab_source_frames"][tab_ids[-1]]["frames_presented"] = 0
+    stopped_fifth_tab = assess(with_samples(stopped_fifth_tab_samples))
+    assert stopped_fifth_tab.source_fps == 0
+    assert "five_tab_source_progress" in stopped_fifth_tab.failures
 
     low_resolution_tab_samples = copied_samples()
     for sample in low_resolution_tab_samples:

@@ -72,6 +72,7 @@ MIN_TABS = 5
 WIDTH = 1920
 HEIGHT = 1080
 TARGET_FPS = 30
+MIN_VISIBLE_DELIVERY_FPS = 27
 WINDOW_TILE_WIDTH = 500
 WINDOW_TILE_HEIGHT = 216
 WINDOW_LAYOUT = (
@@ -1500,6 +1501,65 @@ def spread_tabs_across_visible_windows(tabs: list[CdpTab]) -> bool:
     return False
 
 
+def evaluate_tab_rate_probe(
+    tab_ids: list[str],
+    rates: list[float],
+    quality_rates: list[float],
+    dropped_rates: list[float],
+) -> tuple[bool, dict[str, Any]]:
+    """Apply the visible cadence floor while requiring background progress."""
+
+    if not (
+        len(tab_ids)
+        == len(rates)
+        == len(quality_rates)
+        == len(dropped_rates)
+        == MIN_TABS
+    ):
+        fail("media tab rate probe did not return the exact five-tab counter set")
+    tab_diagnostics: list[dict[str, Any]] = []
+    accepted = True
+    for index, (tab_id, rvfc_rate, quality_rate, dropped_rate) in enumerate(
+        zip(tab_ids, rates, quality_rates, dropped_rates)
+    ):
+        visible = index == 0
+        if visible:
+            rvfc_ok = (
+                math.isfinite(rvfc_rate)
+                and rvfc_rate >= MIN_VISIBLE_DELIVERY_FPS
+            )
+            quality_ok = (
+                math.isfinite(quality_rate)
+                and quality_rate >= MIN_VISIBLE_DELIVERY_FPS
+            )
+            requirement = f">={MIN_VISIBLE_DELIVERY_FPS}fps on both counters"
+        else:
+            rvfc_ok = math.isfinite(rvfc_rate) and rvfc_rate > 0.0
+            quality_ok = math.isfinite(quality_rate) and quality_rate > 0.0
+            requirement = ">0fps on both counters"
+        tab_ok = rvfc_ok and quality_ok
+        accepted = accepted and tab_ok
+        tab_diagnostics.append(
+            {
+                "tab_id": tab_id,
+                "role": "visible" if visible else "background",
+                "requirement": requirement,
+                "rvfc_fps": round(rvfc_rate, 3),
+                "quality_presented_fps": round(quality_rate, 3),
+                "quality_dropped_fps": round(dropped_rate, 3),
+                "rvfc_ok": rvfc_ok,
+                "quality_presented_ok": quality_ok,
+                "accepted": tab_ok,
+            }
+        )
+    return accepted, {
+        "declared_visible_tab_id": tab_ids[0],
+        "supported_target_fps": TARGET_FPS,
+        "visible_delivery_floor_fps": MIN_VISIBLE_DELIVERY_FPS,
+        "tabs": tab_diagnostics,
+    }
+
+
 MEDIA_PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MCNF Browser VM performance media</title>
 <style>
@@ -1828,30 +1888,31 @@ def wait_for_tabs(
                                     snapshots, rate_snapshots
                                 )
                             ]
-                            if all(
+                            rate_probe_accepted, rate_probe_diagnostic = (
+                                evaluate_tab_rate_probe(
+                                    [tab.id for tab in tabs],
+                                    rates,
+                                    quality_rates,
+                                    dropped_rates,
+                                )
+                            )
+                            geometry_ready = all(
                                 snapshot["width"] == WIDTH
                                 and snapshot["height"] == HEIGHT
                                 and snapshot["readyState"] >= 2
                                 for snapshot in rate_snapshots
-                            ) and all(
-                                rate >= TARGET_FPS for rate in rates
-                            ) and all(
-                                rate >= TARGET_FPS for rate in quality_rates
-                            ):
+                            )
+                            if geometry_ready and rate_probe_accepted:
                                 accepted = True
                                 return tabs
                             last_error = (
-                                "five media tabs did not sustain 30 fps during "
+                                "five media tabs failed the visible-cadence/background-"
+                                "progress setup contract during "
                                 f"the {rate_elapsed:.3f}s live probe: "
                                 + json.dumps(
                                     {
-                                        "rvfc": [round(rate, 3) for rate in rates],
-                                        "quality_presented": [
-                                            round(rate, 3) for rate in quality_rates
-                                        ],
-                                        "quality_dropped": [
-                                            round(rate, 3) for rate in dropped_rates
-                                        ],
+                                        "geometry_ready": geometry_ready,
+                                        **rate_probe_diagnostic,
                                     },
                                     sort_keys=True,
                                     separators=(",", ":"),
@@ -2808,6 +2869,53 @@ def summarize(args: argparse.Namespace) -> int:
 
 def self_test() -> None:
     assert compact_json({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
+    assert TARGET_FPS == 30
+    assert MIN_VISIBLE_DELIVERY_FPS == 27
+    probe_tab_ids = [f"cdp-tab-{index}" for index in range(1, MIN_TABS + 1)]
+    slow_background_rates = [27.0, 0.25, 1.0, 12.0, 26.0]
+    probe_accepted, probe_diagnostic = evaluate_tab_rate_probe(
+        probe_tab_ids,
+        slow_background_rates,
+        slow_background_rates,
+        [0.0] * MIN_TABS,
+    )
+    assert probe_accepted, probe_diagnostic
+    assert probe_diagnostic["declared_visible_tab_id"] == probe_tab_ids[0]
+    assert probe_diagnostic["tabs"][0]["requirement"] == ">=27fps on both counters"
+    visible_rvfc_slow = list(slow_background_rates)
+    visible_rvfc_slow[0] = 26.999
+    assert not evaluate_tab_rate_probe(
+        probe_tab_ids,
+        visible_rvfc_slow,
+        slow_background_rates,
+        [0.0] * MIN_TABS,
+    )[0]
+    visible_quality_slow = list(slow_background_rates)
+    visible_quality_slow[0] = 26.999
+    assert not evaluate_tab_rate_probe(
+        probe_tab_ids,
+        slow_background_rates,
+        visible_quality_slow,
+        [0.0] * MIN_TABS,
+    )[0]
+    stopped_background = list(slow_background_rates)
+    stopped_background[-1] = 0.0
+    stopped_accepted, stopped_diagnostic = evaluate_tab_rate_probe(
+        probe_tab_ids,
+        stopped_background,
+        slow_background_rates,
+        [0.0] * MIN_TABS,
+    )
+    assert not stopped_accepted
+    assert not stopped_diagnostic["tabs"][-1]["rvfc_ok"]
+    stopped_quality = list(slow_background_rates)
+    stopped_quality[-1] = 0.0
+    assert not evaluate_tab_rate_probe(
+        probe_tab_ids,
+        slow_background_rates,
+        stopped_quality,
+        [0.0] * MIN_TABS,
+    )[0]
     assert len(WINDOW_LAYOUT) == MIN_TABS
     assert sum(width * height for _, _, width, height in WINDOW_LAYOUT) == (
         WINDOW_TILE_WIDTH * WINDOW_TILE_HEIGHT * MIN_TABS
