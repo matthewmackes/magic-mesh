@@ -26,7 +26,6 @@ pub const MIN_RECONNECT_DAMAGE_PER_MILLE: u16 = 700;
 pub struct RdpDriver {
     session: RdpSession,
     connection: Option<RdpConnection>,
-    navigation_count: u8,
 }
 
 impl RdpDriver {
@@ -60,7 +59,6 @@ impl RdpDriver {
         let mut driver = Self {
             session,
             connection: Some(connection),
-            navigation_count: 0,
         };
         let _frame = driver.wait_for_browser_frame(INITIAL_FRAME_TIMEOUT)?;
         Ok(driver)
@@ -90,48 +88,19 @@ impl RdpDriver {
         );
         self.pump_for(PRE_NAVIGATION_SETTLE)?;
 
-        if self.navigation_count == 0 {
-            let ctrl = Modifiers {
-                ctrl: true,
-                ..Modifiers::default()
-            };
-            self.session.send_input(&key_event(Key::L, true, ctrl));
-            self.session.send_input(&key_event(Key::L, false, ctrl));
-            // A button-up with default modifiers releases the synthesized Ctrl
-            // key without adding a printable key that would alter the omnibox.
-            self.session.send_input(&Event::PointerButton {
-                pos: Pos2::new(0.0, 0.0),
-                button: PointerButton::Primary,
-                pressed: false,
-                modifiers: Modifiers::default(),
-            });
-            ensure!(
-                self.flush_input()? >= 5,
-                "RDP omnibox focus shortcut did not reach the wire encoder"
-            );
-        } else {
-            // Keep the authenticated RDP transport, but give the second
-            // one-shot controller page a clean Chromium navigation lifecycle.
-            // Replacing the completed playback page in-place can make Chromium
-            // issue a duplicate GET before page_loaded; a fresh tab starts with
-            // one selected omnibox and avoids that duplicate claim.
-            let ctrl = Modifiers {
-                ctrl: true,
-                ..Modifiers::default()
-            };
-            self.session.send_input(&key_event(Key::T, true, ctrl));
-            self.session.send_input(&key_event(Key::T, false, ctrl));
-            self.session.send_input(&Event::PointerButton {
-                pos: Pos2::new(0.0, 0.0),
-                button: PointerButton::Primary,
-                pressed: false,
-                modifiers: Modifiers::default(),
-            });
-            ensure!(
-                self.flush_input()? >= 5,
-                "RDP follow-up tab shortcut did not reach the wire encoder"
-            );
+        // Replace the current tab for every one-shot controller job. Ctrl-L is
+        // proven to focus the omnibox in this kiosk session; Ctrl-T can be
+        // consumed without creating or focusing a tab, which leaves a
+        // follow-up job registered but never fetched. The controller accepts
+        // repeated transport GETs while a job remains registered, so replacing
+        // the completed page no longer risks consuming a duplicate claim.
+        for event in omnibox_focus_events() {
+            self.session.send_input(&event);
         }
+        ensure!(
+            self.flush_input()? >= 5,
+            "RDP omnibox focus shortcut did not reach the wire encoder"
+        );
         // Chromium must process Ctrl-L before Unicode URL events arrive. Keep
         // the wait bounded and continue pumping inbound frames so xrdp cannot
         // deadlock behind a pending repaint while the omnibox gains focus.
@@ -146,12 +115,11 @@ impl RdpDriver {
             self.flush_input()? >= url.len() + 2,
             "RDP probe URL commit did not reach the wire encoder"
         );
-        self.navigation_count = self.navigation_count.saturating_add(1);
         // The guest controller intentionally handles one bounded request at a
         // time. Let Chromium receive the one-shot page and post page_loaded
-        // before the host begins authenticated status polling; otherwise a
-        // second browser GET can observe page_claimed while the job is still
-        // registered and replace the page with a fail-closed 400 response.
+        // before the host begins authenticated status polling. Transport
+        // re-fetches remain safe only until that first browser event closes the
+        // page endpoint.
         self.pump_for(POST_NAVIGATION_BROWSER_SETTLE)?;
         Ok(())
     }
@@ -435,6 +403,25 @@ fn key_event(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
     }
 }
 
+fn omnibox_focus_events() -> [Event; 3] {
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::default()
+    };
+    [
+        key_event(Key::L, true, ctrl),
+        key_event(Key::L, false, ctrl),
+        // A button-up with default modifiers releases the synthesized Ctrl key
+        // without adding a printable key that would alter the omnibox.
+        Event::PointerButton {
+            pos: Pos2::new(0.0, 0.0),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::default(),
+        },
+    ]
+}
+
 fn frame_is_browser(frame: &ColorImage) -> bool {
     distinct_colors(frame) >= MIN_BROWSER_COLORS
         && non_dominant_pixels(frame) >= MIN_BROWSER_NON_DOMINANT
@@ -476,11 +463,43 @@ fn visual_identity_per_mille(before: &ColorImage, after: &ColorImage) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        frame_is_browser, visual_identity_per_mille, DamageCoverage,
+        frame_is_browser, omnibox_focus_events, visual_identity_per_mille, DamageCoverage,
         MIN_RECONNECT_IDENTITY_PER_MILLE,
     };
     use mde_vdi_core::{DamageRect, FrameDamage};
-    use mde_vdi_rdp::egui::{Color32, ColorImage};
+    use mde_vdi_rdp::egui::{Color32, ColorImage, Event, Key, PointerButton};
+
+    #[test]
+    fn every_navigation_focuses_the_current_omnibox() {
+        let events = omnibox_focus_events();
+        assert!(matches!(
+            &events[0],
+            Event::Key {
+                key: Key::L,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::Key {
+                key: Key::L,
+                pressed: false,
+                modifiers,
+                ..
+            } if modifiers.ctrl
+        ));
+        assert!(matches!(
+            &events[2],
+            Event::PointerButton {
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers,
+                ..
+            } if !modifiers.ctrl
+        ));
+    }
 
     #[test]
     fn reconnect_identity_tolerates_small_codec_quantization() {

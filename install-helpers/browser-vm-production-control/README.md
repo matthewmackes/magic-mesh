@@ -8,8 +8,9 @@ This standalone crate supplies the two trusted executables required by
   real RDP clicks per measured operation: one to arm WebAudio/getUserMedia and
   one, after the collector's start signal, to start the measured operation. A
   live collection keeps one authenticated RDP transport for the phase's
-  playback and capture jobs, opens capture in a fresh Chromium tab, and pumps
-  the bounded controller handoff rather than racing a second xrdp attachment.
+  playback and capture jobs, replaces the current tab through Chromium's
+  proven omnibox shortcut for each job, and pumps the bounded controller
+  handoff rather than racing a second xrdp attachment.
 - `browser-vm-reconnect-hook` gracefully closes a real RDP transport, creates a
   new TLS/CredSSP transport to the same endpoint, and requires both at least
   700 per mille unique inbound repaint coverage and 850 per mille visual
