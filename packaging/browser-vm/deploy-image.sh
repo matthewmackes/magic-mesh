@@ -113,6 +113,7 @@ remote_preflight() {
         test -r /dev/kvm
         command -v qemu-img >/dev/null
         command -v getent >/dev/null
+        command -v stat >/dev/null
         qemu_gid=\$(getent group qemu | awk -F: 'NR == 1 && \$1 == \"qemu\" && \$3 ~ /^[0-9]+\$/ { print \$3 }')
         test -n \"\$qemu_gid\"
         sudo -n true
@@ -120,6 +121,7 @@ remote_preflight() {
         test ! -L '$(dirname -- "$REMOTE_IMAGE")'
         test -d '$(dirname -- "$REMOTE_STAGING")'
         test ! -L '$(dirname -- "$REMOTE_STAGING")'
+        test \"\$(stat -c '%d' '$(dirname -- "$REMOTE_IMAGE")')\" = \"\$(stat -c '%d' '$(dirname -- "$REMOTE_STAGING")')\"
         if sudo -n test -e '$REMOTE_IMAGE'; then
             sudo -n test -f '$REMOTE_IMAGE'
             sudo -n test ! -L '$REMOTE_IMAGE'
@@ -340,7 +342,14 @@ run_action() {
         sudo -n chmod 0400 '$remote_tmp'
         test \"\$(sudo -n sha256sum -- '$remote_tmp' | awk '{print \"sha256:\" \$1}')\" = '$digest'
         sudo -n qemu-img check --force-share '$remote_tmp'
-        sudo -n install -o root -g qemu -m 0440 '$remote_tmp' '${REMOTE_IMAGE}.new'
+        # The staging and image directories are required to share this seat's
+        # root filesystem. Move the already-verified staging inode into the
+        # atomic install path instead of copying another full qcow2; constrained
+        # seats then need space for one incoming image, not two.
+        sudo -n test ! -e '${REMOTE_IMAGE}.new'
+        sudo -n mv -T -- '$remote_tmp' '${REMOTE_IMAGE}.new'
+        sudo -n chown root:"$qemu_gid" '${REMOTE_IMAGE}.new'
+        sudo -n chmod 0440 '${REMOTE_IMAGE}.new'
         test \"\$(sudo -n sha256sum -- '${REMOTE_IMAGE}.new' | awk '{print \"sha256:\" \$1}')\" = '$digest'
         sudo -n qemu-img check --force-share '${REMOTE_IMAGE}.new'
         if sudo -n test -e '$REMOTE_IMAGE'; then
