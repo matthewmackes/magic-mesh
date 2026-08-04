@@ -36,7 +36,10 @@ fn sized_input(events: Vec<egui::Event>) -> egui::RawInput {
     sized_input_with_size(events, egui::vec2(1000.0, 700.0))
 }
 
-fn sized_input_with_modifiers(events: Vec<egui::Event>, modifiers: egui::Modifiers) -> egui::RawInput {
+fn sized_input_with_modifiers(
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+) -> egui::RawInput {
     sized_input_with_size_and_modifiers(events, egui::vec2(1000.0, 700.0), modifiers)
 }
 
@@ -50,10 +53,7 @@ fn sized_input_with_size_and_modifiers(
     modifiers: egui::Modifiers,
 ) -> egui::RawInput {
     egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            size,
-        )),
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
         events,
         modifiers,
         time: Some(0.0),
@@ -368,7 +368,10 @@ fn shared_app_frame_survives_desktop_narrow_and_large_text() {
         let mut surface = CommunicationsSurface::new();
         let shapes = render_shapes_with_size_and_zoom(&mut surface, &data, size, zoom);
         let texts = painted_text(&shapes);
-        assert!(!shapes.is_empty(), "Mesh Teams {label} frame painted nothing");
+        assert!(
+            !shapes.is_empty(),
+            "Mesh Teams {label} frame painted nothing"
+        );
         assert!(
             texts.iter().any(|(text, _)| text == "Mesh Teams"),
             "Mesh Teams {label} frame must retain the shared workspace title: {texts:?}"
@@ -396,9 +399,9 @@ fn mesh_teams_light_render_resolves_activity_text_palette() {
         "Activity body text must resolve through the Light palette: {texts:?}"
     );
     assert!(
-        texts.iter().any(|(text, color)| {
-            text == "Mesh" && *color == Style::QUAZAR_LIGHT_TEXT_DIM
-        }),
+        texts
+            .iter()
+            .any(|(text, color)| { text == "Mesh" && *color == Style::QUAZAR_LIGHT_TEXT_DIM }),
         "Mesh Teams rail text must resolve through the Light palette: {texts:?}"
     );
 }
@@ -1097,7 +1100,7 @@ fn rail_click_routes_through_the_shared_sidebar() {
     let _ = ctx.run(
         sized_input_with_size(vec![], egui::vec2(1200.0, 700.0)),
         |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
+            egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
         },
     );
     let first = data.space_directory().spaces[0].id;
@@ -1114,21 +1117,24 @@ fn rail_click_routes_through_the_shared_sidebar() {
 
     // Frame 2 clicks the second row.
     let _ = ctx.run(
-        sized_input_with_size(vec![
-            egui::Event::PointerMoved(at),
-            egui::Event::PointerButton {
-                pos: at,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            },
-            egui::Event::PointerButton {
-                pos: at,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            },
-        ], egui::vec2(1200.0, 700.0)),
+        sized_input_with_size(
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            egui::vec2(1200.0, 700.0),
+        ),
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
         },

@@ -138,7 +138,10 @@ impl<T: NetworkCommandRunner + ?Sized> AudioCommandRunner for T {
 }
 
 fn bounded_record_count(stdout: &str) -> Option<u16> {
-    let count = stdout.lines().filter(|line| !line.trim().is_empty()).count();
+    let count = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     u16::try_from(count.min(usize::from(u16::MAX))).ok()
 }
 
@@ -211,9 +214,7 @@ pub fn collect_audio_observation<R: AudioCommandRunner>(runner: &R) -> AudioObse
     .filter(|component| component.availability == AudioAvailability::Available)
     .count();
     let available_count = component_count
-        + usize::from(
-            pulse_audio_compatibility.availability == AudioAvailability::Available,
-        );
+        + usize::from(pulse_audio_compatibility.availability == AudioAvailability::Available);
 
     // Recovery is deliberately a conservative provider-availability signal:
     // it is available only when at least one provider produced evidence.  It
@@ -558,9 +559,7 @@ mod tests {
         fn run_audio(&self, program: &str, args: &[&str]) -> Option<String> {
             assert!(
                 args.iter().all(|arg| {
-                    !arg.contains("profile")
-                        && !arg.contains("password")
-                        && !arg.contains("secret")
+                    !arg.contains("profile") && !arg.contains("password") && !arg.contains("secret")
                 }),
                 "audio probe requested credential-shaped arguments"
             );
@@ -577,7 +576,10 @@ mod tests {
         let runner = AudioRunner {
             values: [
                 ("pactl", Some("Server Name: PulseAudio (on PipeWire)\n")),
-                ("pw-cli", Some("id 42, type PipeWire:Interface:Node\nid 43\n")),
+                (
+                    "pw-cli",
+                    Some("id 42, type PipeWire:Interface:Node\nid 43\n"),
+                ),
                 ("wpctl", Some("Audio\n ├─ Devices:\n")),
                 ("alsaucm", Some("hw:0\nhw:1\n")),
                 ("aplay", Some("card 0: HDMI\ncard 1: Analog\n")),
@@ -605,7 +607,10 @@ mod tests {
         network.insert("overlay_if".into(), Value::String("nebula1".into()));
         merge_audio_observation(&mut network, &observation);
         assert_eq!(network["overlay_if"], "nebula1");
-        assert_eq!(network["audio"]["pipewire_graph"]["availability"], "available");
+        assert_eq!(
+            network["audio"]["pipewire_graph"]["availability"],
+            "available"
+        );
         assert_eq!(network["audio"]["recovery"]["observed_items"], 6);
     }
 
@@ -624,7 +629,10 @@ mod tests {
             .collect(),
         });
         assert_eq!(observation.availability, AudioAvailability::Unavailable);
-        assert_eq!(observation.recovery.availability, AudioAvailability::Unavailable);
+        assert_eq!(
+            observation.recovery.availability,
+            AudioAvailability::Unavailable
+        );
         let wire = serde_json::to_value(&observation).unwrap();
         assert_eq!(wire["playback"]["availability"], "unavailable");
         assert_eq!(wire["capture"]["availability"], "unavailable");
@@ -648,7 +656,10 @@ mod tests {
             .collect(),
         };
         let observation = collect_audio_observation(&runner);
-        assert_eq!(observation.playback.availability, AudioAvailability::Available);
+        assert_eq!(
+            observation.playback.availability,
+            AudioAvailability::Available
+        );
         assert!(observation.playback.observed_items.is_some());
         let wire = serde_json::to_vec(&observation).unwrap();
         assert!(wire.len() < MAX_STATUS_COMMAND_BYTES);

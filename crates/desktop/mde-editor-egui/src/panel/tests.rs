@@ -329,7 +329,10 @@ fn direct_entry_collapses_all_optional_sidebars() {
 
     surface.collapse_sidebars();
 
-    assert!(!surface.show_tree, "direct Editor entry hides the project tree");
+    assert!(
+        !surface.show_tree,
+        "direct Editor entry hides the project tree"
+    );
     assert!(
         !surface.show_outline,
         "direct Editor entry hides the symbol outline"

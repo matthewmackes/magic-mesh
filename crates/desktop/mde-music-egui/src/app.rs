@@ -170,7 +170,11 @@ impl MusicApp {
                 ui.colored_label(Style::DANGER, format!("Couldn't load the library: {e}"));
             }
             Fetch::Cached(albums) if albums.is_empty() => {
-                centered_state(ui, false, "The music server is offline and the cached library is empty.");
+                centered_state(
+                    ui,
+                    false,
+                    "The music server is offline and the cached library is empty.",
+                );
             }
             Fetch::Cached(albums) => {
                 ui.colored_label(Style::TEXT_DIM, "Offline — showing cached library");
@@ -293,12 +297,19 @@ impl MusicApp {
 /// `seat|http(s)-url|priority` entries separated by `;`; the stored server is
 /// always retained as the local/default candidate.
 fn seat_connections(c: &mde_musicd::creds::Creds) -> Vec<(SeatServer, Client)> {
-    let mut specs = vec![(SeatServer::new("local", c.server_url.clone()), c.server_url.clone())];
+    let mut specs = vec![(
+        SeatServer::new("local", c.server_url.clone()),
+        c.server_url.clone(),
+    )];
     if let Ok(raw) = std::env::var("MDE_MUSIC_SEATS") {
         for item in raw.split(';').filter(|item| !item.trim().is_empty()) {
             let mut fields = item.split('|');
-            let (Some(seat), Some(url)) = (fields.next(), fields.next()) else { continue };
-            if !(url.starts_with("http://") || url.starts_with("https://")) { continue }
+            let (Some(seat), Some(url)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                continue;
+            }
             let mut server = SeatServer::new(seat.trim(), url.trim());
             server.operator_priority = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             specs.push((server, url.trim().to_string()));
@@ -307,7 +318,9 @@ fn seat_connections(c: &mde_musicd::creds::Creds) -> Vec<(SeatServer, Client)> {
     specs
         .into_iter()
         .map(|(mut server, url)| {
-            if server.seat == "local" { server.operator_priority = 0; }
+            if server.seat == "local" {
+                server.operator_priority = 0;
+            }
             (server, Client::new(url, c.username.clone(), &c.password))
         })
         .collect()
@@ -666,12 +679,14 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::TopBottomPanel::top("music-header-test")
-                .show(ctx, |ui| music_header(ui, app));
+            egui::TopBottomPanel::top("music-header-test").show(ctx, |ui| music_header(ui, app));
             egui::CentralPanel::default().show(ctx, |ui| music_panel(ui, app));
         });
         let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
-        assert!(!prims.is_empty(), "full music frame produced no draw primitives");
+        assert!(
+            !prims.is_empty(),
+            "full music frame produced no draw primitives"
+        );
         out.shapes
     }
 
@@ -762,9 +777,7 @@ mod tests {
         ready.albums = Fetch::Ready(vec![album("1")]);
         let texts = painted_text(&render_full_shapes(&mut app_with(ready, None)));
         assert!(
-            texts
-                .iter()
-                .any(|(t, _)| t == "MUSIC"),
+            texts.iter().any(|(t, _)| t == "MUSIC"),
             "the workspace title must render on the shared bar: {texts:?}"
         );
 

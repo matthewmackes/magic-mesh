@@ -48,8 +48,8 @@ mod display;
 mod error;
 mod hardware;
 pub mod hotkeys;
-mod lid;
 mod keyboard_backlight;
+mod lid;
 mod logind;
 mod mixer;
 mod network;
@@ -57,8 +57,8 @@ mod network_agent;
 pub mod pairing;
 mod powerprofiles;
 mod props;
-mod snapshot;
 mod service;
+mod snapshot;
 mod upower;
 
 pub use arrange::{ArrangeError, DisplayLayout, MonitorId, OutputArrangement};
@@ -75,12 +75,12 @@ pub use ddc::{
 pub use display::{Connector, ConnectorStatus, DisplayMode, DisplayProber, DrmProber};
 pub use error::{Backend, SeatError};
 pub use hardware::{
-    FirmwareStatus, HardwareClient, HardwareStatus, StorageDevice, SysfsHardware,
-    ThermalZone, ThunderboltDevice,
+    FirmwareStatus, HardwareClient, HardwareStatus, StorageDevice, SysfsHardware, ThermalZone,
+    ThunderboltDevice,
 };
 pub use hotkeys::{Hotkey, HotkeyAction, HOTKEYS};
-pub use lid::{parse_lid_state, LidClient, LidState, ProcLid};
 pub use keyboard_backlight::{KeyboardBacklight, KeyboardBacklightClient, SysfsKeyboardBacklight};
+pub use lid::{parse_lid_state, LidClient, LidState, ProcLid};
 pub use logind::{Avail, LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 pub use mixer::{
     fold_graph, MixerClient, MixerStatus, MixerStrip, PwCli, PwGraph, PwRunner, StripOrigin,
@@ -98,6 +98,6 @@ pub use pairing::{
     PairingResponder, Refusal,
 };
 pub use powerprofiles::{fold_profiles, ProfileState, ProfilesClient, ZbusProfiles};
-pub use snapshot::{Probe, Seat, SeatSnapshot};
 pub use service::{safe_service_unit, ServiceClient, ZbusService};
+pub use snapshot::{Probe, Seat, SeatSnapshot};
 pub use upower::{Battery, BatteryKind, BatteryState, UPowerClient, ZbusUPower};

@@ -1,0 +1,4 @@
+[build]
+# Keep the standalone harness's heavy IronRDP graph in the repository-level
+# target tree so the build-farm sync excludes and reuses it between gates.
+target-dir = "../../../target/serve-browser-vm-performance-rdp"

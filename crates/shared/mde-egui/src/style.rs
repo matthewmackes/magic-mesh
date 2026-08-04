@@ -425,8 +425,8 @@ impl Style {
     /// Secondary / dimmed text.
     pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9A, 0x9A, 0xA6);
     /// **Emphasis** text — one rung brighter than [`TEXT`](Self::TEXT) (Carbon
-/// white). The shared font installer embeds the selected interface face for
-/// proportional UI and the selected monospace face for fixed-width surfaces; the honest token cue for
+    /// white). The shared font installer embeds the selected interface face for
+    /// proportional UI and the selected monospace face for fixed-width surfaces; the honest token cue for
     /// emphasis on the dark ground is this brighter tone, the mirror of
     /// [`TEXT_DIM`](Self::TEXT_DIM)'s dimmer one. Markdown preview (EDTB-7)
     /// paints bold spans + heading titles with it.

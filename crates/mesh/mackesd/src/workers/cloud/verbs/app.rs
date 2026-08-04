@@ -41,13 +41,7 @@ fn build_reply(
     verb_name: &str,
     body: &CloudActionBody,
 ) -> CloudReply {
-    build_reply_with_profile(
-        state_root,
-        None,
-        verb_name,
-        body,
-        AppVmProfile::default(),
-    )
+    build_reply_with_profile(state_root, None, verb_name, body, AppVmProfile::default())
 }
 
 fn build_reply_with_runtime_bus(
@@ -366,20 +360,15 @@ mod tests {
         admit_app_image(tmp.path());
         let mut request = body("eagle", "writer");
         request.resume = false;
-        let first = build_reply_with_runtime_bus(
-            tmp.path(),
-            Some(bus.path()),
-            "app-provision",
-            &request,
+        let first =
+            build_reply_with_runtime_bus(tmp.path(), Some(bus.path()), "app-provision", &request);
+        assert!(
+            first.ok,
+            "initial declaration should await first boot evidence"
         );
-        assert!(first.ok, "initial declaration should await first boot evidence");
 
-        let replay = build_reply_with_runtime_bus(
-            tmp.path(),
-            Some(bus.path()),
-            "app-provision",
-            &request,
-        );
+        let replay =
+            build_reply_with_runtime_bus(tmp.path(), Some(bus.path()), "app-provision", &request);
         assert!(!replay.ok);
         assert!(replay
             .error
@@ -528,13 +517,7 @@ mod tests {
             vcpu: 0,
             ..AppVmProfile::default()
         };
-        let reply = build_reply_with_profile(
-            tmp.path(),
-            None,
-            "app-provision",
-            &request,
-            profile,
-        );
+        let reply = build_reply_with_profile(tmp.path(), None, "app-provision", &request, profile);
         assert!(!reply.ok);
         assert!(reply
             .error

@@ -421,6 +421,19 @@ impl DomainState {
                     if c.space == space_id {
                         c.participants.insert(actor.clone(), *state);
                         c.muted.entry(actor.clone()).or_insert(false);
+                        // `CallEnded` is a convenience event, not a safe
+                        // convergence requirement: two connected peers may
+                        // hang up concurrently while each still sees the
+                        // other as connected. Derive the terminal state from
+                        // the participant facts so that merged offline logs
+                        // cannot leave an all-left call active forever.
+                        if !c
+                            .participants
+                            .values()
+                            .any(|state| matches!(state, CallParticipantState::Connected))
+                        {
+                            c.ended = true;
+                        }
                     }
                 }
             }

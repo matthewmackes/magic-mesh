@@ -86,10 +86,6 @@
 # launchable surfaces and so are not required to be catalog-mounted. Keep this list SHORT and
 # justify every entry; the whole point of the gate is that new surfaces cannot
 # silently join this set.
-#   mde-panel-egui : the E12-7 egui panel CLIENT (the retired cosmic-applet's
-#                    replacement), not a launchable surface. It renders standalone,
-#                    not inside the shell's catalog. If it is ever wired into the shell
-#                    or retired, drop it from this list.
 # (mde-shell-egui is the shell HOST itself, handled separately — never a surface.)
 #
 # Env overrides (mostly for --self-test; default to the live repo layout):
@@ -114,7 +110,7 @@ DESKTOP_DIR="${DESKTOP_DIR:-$REPO_ROOT/crates/desktop}"
 
 # The shell HOST (never a surface) and the justified non-surface egui crates.
 readonly SHELL_HOST_CRATE="mde-shell-egui"
-EXEMPT_SURFACES=("mde-panel-egui")
+EXEMPT_SURFACES=()
 
 readonly BASE_KEY_BINS=("mde-shell-egui" "mackesd")
 readonly SERVER_KEY_BINS=("mackesd")

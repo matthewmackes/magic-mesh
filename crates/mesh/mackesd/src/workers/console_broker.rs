@@ -20,7 +20,8 @@
 //! 1. **Resolves** the live console via `virsh domdisplay <vm>` (SPICE first, VNC
 //!    fallback) — the concrete autoport libvirt actually assigned.
 //! 2. **Relays** that loopback port onto the Nebula overlay (`nebula1`) with a
-//!    scoped `socat` proxy — exactly how [`super::compute_expose`] forwards a VM
+//!    scoped `socat` proxy, sharing an exact same-target listener across
+//!    duplicate sessions — exactly how [`super::compute_expose`] forwards a VM
 //!    port onto the overlay, but for a host-loopback console rather than a
 //!    firewalld forward to a VM's own overlay IP (a local VM's graphics live on
 //!    the *host's* loopback, so a userspace relay is the right shape).
@@ -52,10 +53,12 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::cloud::CloudArmedToken;
@@ -107,6 +110,19 @@ pub const BROWSER_VM_RDP_PORT: u16 = 3389;
 /// A short guest-probe timeout. This is only a readiness probe; the retained
 /// `socat` relay owns the actual long-lived connection.
 const GUEST_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
+
+/// A successful `spawn()` is not relay ownership: `socat` reports bind errors
+/// only after exec. Keep the startup check short but long enough to observe an
+/// immediate EADDRINUSE exit before publishing `Brokered`.
+const RELAY_STARTUP_GRACE: Duration = Duration::from_millis(200);
+
+/// `/proc/<pid>/cmdline` only needs to hold `socat` plus its two bounded relay
+/// arguments. Cap reads so a hostile unrelated process cannot make discovery
+/// allocate up to the host's argument limit.
+const MAX_SOCAT_CMDLINE_BYTES: u64 = 4 * 1024;
+
+/// Bound the Linux socket-table read used for listener ownership proof.
+const MAX_PROC_NET_TCP_BYTES: u64 = 2 * 1024 * 1024;
 
 // ───────────────────────────── pure: data model ─────────────────────────────
 
@@ -179,7 +195,7 @@ pub enum ConsoleBrokerError {
     Gated(String),
     /// The console couldn't be resolved (VM off, no graphics, domain not found).
     Resolve(String),
-    /// The relay couldn't be started (socat spawn failed).
+    /// The relay couldn't prove listener ownership (spawn, bind, or startup failed).
     Relay(String),
 }
 
@@ -331,56 +347,391 @@ pub fn build_relay_args(
 
 // ───────────────────────────── relay seam ─────────────────────────────
 
-/// A live relay process handle — killed on drop/teardown so a closed session
-/// leaves no dangling overlay listener. A fake (tests) holds no child.
-#[derive(Debug, Default)]
+#[derive(Debug)]
+enum RelayProcess {
+    /// Child this worker owns; the final shared lease kills it on drop.
+    Owned(Child),
+    /// Exact same-target `socat` parent adopted from another live owner. This
+    /// worker observes but never kills it.
+    Borrowed {
+        pid: u32,
+        args: Vec<String>,
+        overlay_addr: String,
+        overlay_port: u16,
+    },
+    /// No process is needed because the resolved endpoint is directly reachable
+    /// (also used by the headless test fake).
+    Direct,
+    /// Explicitly stopped or observed dead.
+    Stopped,
+    /// Test-only process whose teardown count proves shared-lease ownership.
+    #[cfg(test)]
+    Counted(Arc<std::sync::atomic::AtomicUsize>),
+}
+
+impl RelayProcess {
+    fn stop(&mut self) {
+        let previous = std::mem::replace(self, Self::Stopped);
+        match previous {
+            Self::Owned(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            #[cfg(test)]
+            Self::Counted(counter) => {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Self::Borrowed { .. } | Self::Direct | Self::Stopped => {}
+        }
+    }
+
+    fn is_alive(&mut self) -> bool {
+        let alive = match self {
+            Self::Owned(child) => matches!(child.try_wait(), Ok(None)),
+            Self::Borrowed {
+                pid,
+                args,
+                overlay_addr,
+                overlay_port,
+            } => socat_process_owns_listener(
+                Path::new("/proc"),
+                *pid,
+                args,
+                overlay_addr,
+                *overlay_port,
+            ),
+            Self::Direct => true,
+            Self::Stopped => false,
+            #[cfg(test)]
+            Self::Counted(_) => true,
+        };
+        if !alive {
+            self.stop();
+        }
+        alive
+    }
+}
+
+/// Process ownership shared by every session using one exact relay command.
+/// Its drop is the single teardown point, so closing one duplicate session
+/// cannot stop a relay still leased by another session.
+#[derive(Debug)]
+struct RelayLease {
+    process: Mutex<RelayProcess>,
+}
+
+impl RelayLease {
+    fn new(process: RelayProcess) -> Self {
+        Self {
+            process: Mutex::new(process),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        let mut process = self
+            .process
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        process.is_alive()
+    }
+}
+
+impl Drop for RelayLease {
+    fn drop(&mut self) {
+        match self.process.get_mut() {
+            Ok(process) => process.stop(),
+            Err(poisoned) => poisoned.into_inner().stop(),
+        }
+    }
+}
+
+/// A shared live-relay lease. Clones retain the same process; the final handle
+/// tears down an owned child. Borrowed exact-match relays are observed but never
+/// killed.
+#[derive(Debug, Clone)]
 pub struct RelayHandle {
-    child: Option<Child>,
+    lease: Arc<RelayLease>,
+    reused_existing: bool,
+}
+
+impl Default for RelayHandle {
+    fn default() -> Self {
+        Self::detached()
+    }
 }
 
 impl RelayHandle {
-    /// Wrap a spawned relay child.
+    /// Wrap a spawned relay child owned by this worker.
     #[must_use]
     pub fn from_child(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            lease: Arc::new(RelayLease::new(RelayProcess::Owned(child))),
+            reused_existing: false,
+        }
     }
 
-    /// A handle with no process (the test fake / a no-op teardown).
+    /// A handle with no process (the test fake / a directly reachable endpoint).
     #[must_use]
-    pub const fn detached() -> Self {
-        Self { child: None }
-    }
-
-    /// Kill the relay process (idempotent; a no-op for a detached handle).
-    pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+    pub fn detached() -> Self {
+        Self {
+            lease: Arc::new(RelayLease::new(RelayProcess::Direct)),
+            reused_existing: false,
         }
     }
 
-    /// Return whether the retained relay process is still serving. A detached
-    /// handle represents a directly reachable endpoint and is therefore alive
-    /// by definition. Reaping an exited child here lets the broker recreate the
-    /// overlay listener before a client retry rather than publishing a stale
-    /// endpoint forever.
-    fn is_alive(&mut self) -> bool {
-        let Some(child) = self.child.as_mut() else {
-            return true;
-        };
-        match child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) | Err(_) => {
-                self.child = None;
-                false
-            }
+    fn borrowed(pid: u32, args: Vec<String>, overlay_addr: &str, overlay_port: u16) -> Self {
+        Self {
+            lease: Arc::new(RelayLease::new(RelayProcess::Borrowed {
+                pid,
+                args,
+                overlay_addr: overlay_addr.to_string(),
+                overlay_port,
+            })),
+            reused_existing: true,
         }
+    }
+
+    fn reuse(lease: Arc<RelayLease>) -> Self {
+        Self {
+            lease,
+            reused_existing: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn stopped_for_test() -> Self {
+        Self {
+            lease: Arc::new(RelayLease::new(RelayProcess::Stopped)),
+            reused_existing: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn counted_for_test(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            lease: Arc::new(RelayLease::new(RelayProcess::Counted(counter))),
+            reused_existing: false,
+        }
+    }
+
+    /// Whether startup reused an exact same-target `socat` listener rather than
+    /// claiming ownership of a newly spawned process.
+    #[must_use]
+    pub const fn reused_existing(&self) -> bool {
+        self.reused_existing
+    }
+
+    /// Return whether the retained/adopted relay process is still serving. A
+    /// directly reachable endpoint is alive by definition. Reaping an exited
+    /// owned child lets the broker recreate the listener before client retry.
+    fn is_alive(&self) -> bool {
+        self.lease.is_alive()
     }
 }
 
-impl Drop for RelayHandle {
-    fn drop(&mut self) {
-        self.stop();
+fn read_cmdline(path: &Path) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_SOCAT_CMDLINE_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// Match only the exact command this worker emits. A listener on the right port
+/// but forwarding to a different guest is a conflict, never reusable ownership.
+fn socat_cmdline_matches(raw: &[u8], args: &[String]) -> bool {
+    if args.len() != 2 {
+        return false;
+    }
+    let mut argv = raw.split(|byte| *byte == 0).filter(|arg| !arg.is_empty());
+    let Some(program) = argv.next() else {
+        return false;
+    };
+    let program = program
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(program);
+    program == b"socat"
+        && argv.next() == Some(args[0].as_bytes())
+        && argv.next() == Some(args[1].as_bytes())
+        && argv.next().is_none()
+}
+
+fn socat_process_matches(proc_root: &Path, pid: u32, args: &[String]) -> bool {
+    let cmdline = proc_root.join(pid.to_string()).join("cmdline");
+    read_cmdline(&cmdline).is_some_and(|raw| socat_cmdline_matches(&raw, args))
+}
+
+fn listening_socket_inode(
+    proc_root: &Path,
+    overlay_addr: &str,
+    overlay_port: u16,
+) -> Option<String> {
+    let ip = overlay_addr.parse::<Ipv4Addr>().ok()?;
+    let expected_local = format!("{:08X}:{overlay_port:04X}", u32::from_le_bytes(ip.octets()));
+    let mut raw = Vec::new();
+    File::open(proc_root.join("net/tcp"))
+        .ok()?
+        .take(MAX_PROC_NET_TCP_BYTES)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let table = std::str::from_utf8(&raw).ok()?;
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        (fields.len() > 9 && fields[1].eq_ignore_ascii_case(&expected_local) && fields[3] == "0A")
+            .then(|| fields[9].to_string())
+    })
+}
+
+fn process_has_socket_inode(proc_root: &Path, pid: u32, inode: &str) -> bool {
+    let socket = format!("socket:[{inode}]");
+    std::fs::read_dir(proc_root.join(pid.to_string()).join("fd"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .any(|target| target.to_string_lossy().as_ref() == socket)
+}
+
+/// Prove both halves of relay identity: the process has the exact command and
+/// one of its file descriptors owns the requested TCP LISTEN socket. Merely
+/// connecting to the port would be ambiguous when a different target owns it.
+fn socat_process_owns_listener(
+    proc_root: &Path,
+    pid: u32,
+    args: &[String],
+    overlay_addr: &str,
+    overlay_port: u16,
+) -> bool {
+    if !socat_process_matches(proc_root, pid, args) {
+        return false;
+    }
+    listening_socket_inode(proc_root, overlay_addr, overlay_port)
+        .is_some_and(|inode| process_has_socket_inode(proc_root, pid, &inode))
+}
+
+fn matching_socat_listener_pid(
+    proc_root: &Path,
+    args: &[String],
+    overlay_addr: &str,
+    overlay_port: u16,
+) -> Option<u32> {
+    std::fs::read_dir(proc_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            socat_process_owns_listener(proc_root, *pid, args, overlay_addr, overlay_port)
+        })
+        .min()
+}
+
+fn registered_relay(
+    relays: &mut HashMap<Vec<String>, Weak<RelayLease>>,
+    args: &[String],
+) -> Option<RelayHandle> {
+    let lease = relays.get(args).and_then(Weak::upgrade);
+    let Some(lease) = lease else {
+        relays.remove(args);
+        return None;
+    };
+    let handle = RelayHandle::reuse(lease);
+    if handle.is_alive() {
+        Some(handle)
+    } else {
+        relays.remove(args);
+        None
+    }
+}
+
+fn register_relay(
+    relays: &mut HashMap<Vec<String>, Weak<RelayLease>>,
+    args: &[String],
+    handle: &RelayHandle,
+) {
+    relays.insert(args.to_vec(), Arc::downgrade(&handle.lease));
+}
+
+fn existing_same_target_relay(
+    overlay_addr: &str,
+    overlay_port: u16,
+    args: &[String],
+) -> Option<RelayHandle> {
+    let pid = matching_socat_listener_pid(Path::new("/proc"), args, overlay_addr, overlay_port)?;
+    Some(RelayHandle::borrowed(
+        pid,
+        args.to_vec(),
+        overlay_addr,
+        overlay_port,
+    ))
+}
+
+fn wait_for_relay_startup(
+    child: &mut Child,
+    overlay_addr: &str,
+    overlay_port: u16,
+    args: &[String],
+) -> Result<(), ConsoleBrokerError> {
+    let started = Instant::now();
+    while started.elapsed() < RELAY_STARTUP_GRACE {
+        match child.try_wait() {
+            Ok(None)
+                if socat_process_owns_listener(
+                    Path::new("/proc"),
+                    child.id(),
+                    args,
+                    overlay_addr,
+                    overlay_port,
+                ) =>
+            {
+                return Ok(())
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(Some(status)) => {
+                return Err(ConsoleBrokerError::Relay(format!(
+                    "socat exited before owning {overlay_addr}:{overlay_port}: {status}"
+                )))
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ConsoleBrokerError::Relay(format!(
+                    "inspect socat startup for {overlay_addr}:{overlay_port}: {error}"
+                )));
+            }
+        }
+    }
+    match child.try_wait() {
+        Ok(None)
+            if socat_process_owns_listener(
+                Path::new("/proc"),
+                child.id(),
+                args,
+                overlay_addr,
+                overlay_port,
+            ) =>
+        {
+            Ok(())
+        }
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(ConsoleBrokerError::Relay(format!(
+                "socat stayed alive but did not own {overlay_addr}:{overlay_port}"
+            )))
+        }
+        Ok(Some(status)) => Err(ConsoleBrokerError::Relay(format!(
+            "socat exited before owning {overlay_addr}:{overlay_port}: {status}"
+        ))),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(ConsoleBrokerError::Relay(format!(
+                "inspect socat startup for {overlay_addr}:{overlay_port}: {error}"
+            )))
+        }
     }
 }
 
@@ -418,7 +769,8 @@ pub trait ConsoleRelay: Send + Sync {
     ///
     /// # Errors
     /// [`ConsoleBrokerError::Gated`] when `socat` is absent;
-    /// [`ConsoleBrokerError::Relay`] on a spawn failure.
+    /// [`ConsoleBrokerError::Relay`] when exact listener ownership cannot be
+    /// established after spawn.
     fn start_relay(
         &self,
         overlay_addr: &str,
@@ -432,6 +784,9 @@ pub trait ConsoleRelay: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LiveConsoleRelay {
     nebula_interface: String,
+    /// Weak exact-command registry. It serializes starts and lets independently
+    /// keyed sessions share one owned process without extending its lifetime.
+    relays: Arc<Mutex<HashMap<Vec<String>, Weak<RelayLease>>>>,
 }
 
 impl Default for LiveConsoleRelay {
@@ -446,6 +801,7 @@ impl LiveConsoleRelay {
     pub fn new() -> Self {
         Self {
             nebula_interface: DEFAULT_NEBULA_INTERFACE.to_string(),
+            relays: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -570,17 +926,44 @@ impl ConsoleRelay for LiveConsoleRelay {
         overlay_port: u16,
         target: &ConsoleAddr,
     ) -> Result<RelayHandle, ConsoleBrokerError> {
+        let args = build_relay_args(overlay_addr, overlay_port, &target.host, target.port);
+        // Keep this lock through discovery/startup. Concurrent sessions for the
+        // same exact target therefore cannot both race into bind(2).
+        let mut relays = self.relays.lock().map_err(|_| {
+            ConsoleBrokerError::Relay("relay ownership registry is unavailable".to_string())
+        })?;
+        if let Some(handle) = registered_relay(&mut relays, &args) {
+            return Ok(handle);
+        }
+        if let Some(handle) = existing_same_target_relay(overlay_addr, overlay_port, &args) {
+            register_relay(&mut relays, &args, &handle);
+            return Ok(handle);
+        }
         if !super::mesh_mount::binary_on_path("socat") {
             return Err(ConsoleBrokerError::Gated(
                 "socat not found — cannot relay the console onto the overlay".to_string(),
             ));
         }
-        let args = build_relay_args(overlay_addr, overlay_port, &target.host, target.port);
-        Command::new("socat")
+
+        let mut child = Command::new("socat")
             .args(&args)
             .spawn()
-            .map(RelayHandle::from_child)
-            .map_err(|e| ConsoleBrokerError::Relay(format!("spawn socat: {e}")))
+            .map_err(|e| ConsoleBrokerError::Relay(format!("spawn socat: {e}")))?;
+        if let Err(startup_error) =
+            wait_for_relay_startup(&mut child, overlay_addr, overlay_port, &args)
+        {
+            // Another exact same-target owner may have won after discovery but
+            // before our bind. Adopt it; never disturb it. A different-target
+            // EADDRINUSE remains an honest hard failure.
+            if let Some(handle) = existing_same_target_relay(overlay_addr, overlay_port, &args) {
+                register_relay(&mut relays, &args, &handle);
+                return Ok(handle);
+            }
+            return Err(startup_error);
+        }
+        let handle = RelayHandle::from_child(child);
+        register_relay(&mut relays, &args, &handle);
+        Ok(handle)
     }
 }
 
@@ -704,7 +1087,7 @@ pub fn broker_console_with_transport(
     }
     let overlay_port = overlay_port_for(console.port);
     match relay.start_relay(&overlay, overlay_port, &console) {
-        Ok(handle) => (
+        Ok(handle) if handle.is_alive() => (
             ConsoleStatus::Brokered {
                 protocol: console.protocol,
                 host: overlay,
@@ -712,6 +1095,12 @@ pub fn broker_console_with_transport(
                 clipboard: clipboard_status_for_protocol(console.protocol),
             },
             Some(handle),
+        ),
+        Ok(_) => (
+            ConsoleStatus::Unbrokerable {
+                reason: format!("relay: process exited before owning {overlay}:{overlay_port}"),
+            },
+            None,
         ),
         Err(e) => (ConsoleStatus::Unbrokerable { reason: e.reason() }, None),
     }
@@ -1014,7 +1403,14 @@ impl ConsoleBrokerWorker {
                 };
                 let (status, handle) =
                     broker_console_with_transport(self.relay.as_ref(), vm_id, browser_transport);
+                let reused_existing = handle.as_ref().is_some_and(RelayHandle::reused_existing);
                 match &status {
+                    ConsoleStatus::Brokered { host, port, .. } if reused_existing => {
+                        tracing::info!(
+                            session = %id, vm = %vm_id, overlay = %host, port,
+                            "console_broker: reused live same-target VM console relay"
+                        );
+                    }
                     ConsoleStatus::Brokered { host, port, .. } => tracing::info!(
                         session = %id, vm = %vm_id, overlay = %host, port,
                         "console_broker: brokered local VM console onto the overlay"
@@ -1146,6 +1542,7 @@ impl Worker for ConsoleBrokerWorker {
 mod tests {
     use super::*;
     use crate::ipc::action_auth::authorize_test_body;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     const AUTH_KEY: &[u8] = b"vdi-console-action-auth-test-key";
@@ -1250,6 +1647,103 @@ mod tests {
         assert!(args[0].contains("bind=10.42.0.7"));
     }
 
+    fn encoded_cmdline(program: &str, args: &[String]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(program.as_bytes());
+        raw.push(0);
+        for arg in args {
+            raw.extend_from_slice(arg.as_bytes());
+            raw.push(0);
+        }
+        raw
+    }
+
+    #[test]
+    fn socat_reuse_requires_the_exact_listener_and_target_command() {
+        let args = build_relay_args("10.42.0.4", 3389, "192.168.122.113", 3389);
+        assert!(socat_cmdline_matches(
+            &encoded_cmdline("/usr/bin/socat", &args),
+            &args
+        ));
+
+        let wrong_target = build_relay_args("10.42.0.4", 3389, "192.168.122.114", 3389);
+        assert!(!socat_cmdline_matches(
+            &encoded_cmdline("/usr/bin/socat", &wrong_target),
+            &args
+        ));
+        assert!(!socat_cmdline_matches(
+            &encoded_cmdline("/usr/bin/not-socat", &args),
+            &args
+        ));
+        let mut extra_arg = args.clone();
+        extra_arg.push("unexpected".to_string());
+        assert!(!socat_cmdline_matches(
+            &encoded_cmdline("/usr/bin/socat", &extra_arg),
+            &args
+        ));
+    }
+
+    #[test]
+    fn proc_discovery_ignores_different_target_relays() {
+        let proc_root = tempfile::tempdir().expect("fake proc root");
+        let args = build_relay_args("10.42.0.4", 3389, "192.168.122.113", 3389);
+        let wrong_target = build_relay_args("10.42.0.4", 3389, "192.168.122.114", 3389);
+        for (pid, process_args) in [(902_u32, &wrong_target), (901_u32, &args)] {
+            let process_dir = proc_root.path().join(pid.to_string());
+            std::fs::create_dir_all(&process_dir).expect("fake process directory");
+            std::fs::write(
+                process_dir.join("cmdline"),
+                encoded_cmdline("/usr/bin/socat", process_args),
+            )
+            .expect("fake process cmdline");
+        }
+        let net_dir = proc_root.path().join("net");
+        std::fs::create_dir_all(&net_dir).expect("fake proc net directory");
+        std::fs::write(
+            net_dir.join("tcp"),
+            concat!(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+                "   0: 04002A0A:0D3D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 4242 1\n",
+            ),
+        )
+        .expect("fake TCP socket table");
+        let fd_dir = proc_root.path().join("901/fd");
+        std::fs::create_dir_all(&fd_dir).expect("fake process fd directory");
+        std::os::unix::fs::symlink("socket:[4242]", fd_dir.join("3")).expect("fake listener fd");
+
+        assert_eq!(
+            matching_socat_listener_pid(proc_root.path(), &args, "10.42.0.4", 3389),
+            Some(901)
+        );
+        assert_eq!(
+            matching_socat_listener_pid(proc_root.path(), &wrong_target, "10.42.0.4", 3389),
+            None,
+            "matching argv without ownership of the listener is not reusable"
+        );
+    }
+
+    #[test]
+    fn exact_relay_registry_keeps_one_owner_until_the_final_lease_drops() {
+        let args = build_relay_args("10.42.0.4", 3389, "192.168.122.113", 3389);
+        let different_target = build_relay_args("10.42.0.4", 3389, "192.168.122.114", 3389);
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let first = RelayHandle::counted_for_test(Arc::clone(&stopped));
+        let mut relays = HashMap::new();
+        register_relay(&mut relays, &args, &first);
+
+        assert!(registered_relay(&mut relays, &different_target).is_none());
+        let second = registered_relay(&mut relays, &args).expect("reuse exact relay");
+        assert!(second.reused_existing());
+        assert!(Arc::ptr_eq(&first.lease, &second.lease));
+
+        drop(first);
+        assert_eq!(stopped.load(Ordering::SeqCst), 0, "second lease owns it");
+        assert!(second.is_alive());
+        drop(second);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1, "final lease tears down");
+        assert!(registered_relay(&mut relays, &args).is_none());
+    }
+
     #[test]
     fn overlay_port_is_one_to_one() {
         assert_eq!(overlay_port_for(5930), 5930);
@@ -1263,6 +1757,8 @@ mod tests {
         selected: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
         overlay: String,
         relay_ok: bool,
+        relay_dead: bool,
+        relays: Arc<Mutex<HashMap<Vec<String>, Weak<RelayLease>>>>,
         started: Arc<Mutex<Vec<(String, u16, u16)>>>, // (overlay_addr, overlay_port, target_port)
     }
 
@@ -1292,13 +1788,22 @@ mod tests {
             overlay_port: u16,
             target: &ConsoleAddr,
         ) -> Result<RelayHandle, ConsoleBrokerError> {
+            let args = build_relay_args(overlay_addr, overlay_port, &target.host, target.port);
+            let mut relays = self.relays.lock().unwrap();
+            if let Some(handle) = registered_relay(&mut relays, &args) {
+                return Ok(handle);
+            }
             self.started.lock().unwrap().push((
                 overlay_addr.to_string(),
                 overlay_port,
                 target.port,
             ));
-            if self.relay_ok {
-                Ok(RelayHandle::detached())
+            if self.relay_ok && self.relay_dead {
+                Ok(RelayHandle::stopped_for_test())
+            } else if self.relay_ok {
+                let handle = RelayHandle::detached();
+                register_relay(&mut relays, &args, &handle);
+                Ok(handle)
             } else {
                 Err(ConsoleBrokerError::Relay("fake relay refused".into()))
             }
@@ -1522,6 +2027,25 @@ mod tests {
         assert!(matches!(status, ConsoleStatus::Unbrokerable { .. }));
     }
 
+    #[test]
+    fn broker_rejects_a_child_that_exited_after_successful_spawn() {
+        let relay = FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            relay_dead: true,
+            ..FakeRelay::default()
+        };
+        let (status, handle) = broker_console(&relay, "win11");
+        assert!(handle.is_none());
+        assert!(matches!(
+            status,
+            ConsoleStatus::Unbrokerable { ref reason }
+                if reason.contains("exited before owning 10.42.0.7:5900")
+        ));
+        assert_eq!(relay.started.lock().unwrap().len(), 1);
+    }
+
     // ── the worker fold: apply() + serves-gate + close teardown ──
 
     fn open(id: &str, serving_peer: &str, vm: &str) -> SessionRequest {
@@ -1688,6 +2212,87 @@ mod tests {
             w.brokered["heartbeat"].record.status,
             ConsoleStatus::Brokered { port: 5900, .. }
         ));
+    }
+
+    #[test]
+    fn failed_start_is_not_retried_on_every_worker_poll() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut w = worker_with(FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            relay_dead: true,
+            started: Arc::clone(&started),
+            ..FakeRelay::default()
+        });
+        assert!(w.apply(&open("dead-start", "oak", "win11")));
+        assert!(matches!(
+            w.brokered["dead-start"].record.status,
+            ConsoleStatus::Unbrokerable { .. }
+        ));
+        assert!(w.brokered["dead-start"]._relay.is_none());
+        assert_eq!(started.lock().unwrap().len(), 1);
+
+        assert!(!w.refresh_relays(false), "ordinary poll must not retry");
+        assert_eq!(started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_sessions_share_one_exact_relay_and_close_is_non_disruptive() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut w = worker_with(FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            started: Arc::clone(&started),
+            ..FakeRelay::default()
+        });
+        assert!(w.apply(&open("first", "oak", "win11")));
+        assert!(w.apply(&open("second", "oak", "win11")));
+        assert_eq!(started.lock().unwrap().len(), 1, "one relay start");
+        {
+            let first = w.brokered["first"]._relay.as_ref().unwrap();
+            let second = w.brokered["second"]._relay.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&first.lease, &second.lease));
+            assert!(second.reused_existing());
+        }
+
+        assert!(w.apply(&SessionRequest::Close { id: "first".into() }));
+        assert!(!w.refresh_relays(false));
+        assert!(w.brokered["second"]
+            ._relay
+            .as_ref()
+            .is_some_and(RelayHandle::is_alive));
+        assert_eq!(started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dead_shared_relay_refreshes_once_then_is_reused_by_all_sessions() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut w = worker_with(FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            started: Arc::clone(&started),
+            ..FakeRelay::default()
+        });
+        assert!(w.apply(&open("first", "oak", "win11")));
+        assert!(w.apply(&open("second", "oak", "win11")));
+        {
+            let relay = w.brokered["first"]._relay.as_ref().unwrap();
+            relay.lease.process.lock().unwrap().stop();
+        }
+
+        assert!(w.refresh_relays(false));
+        assert_eq!(
+            started.lock().unwrap().len(),
+            2,
+            "one initial start and one replacement, never one per session"
+        );
+        let first = w.brokered["first"]._relay.as_ref().unwrap();
+        let second = w.brokered["second"]._relay.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first.lease, &second.lease));
+        assert!(first.is_alive());
     }
 
     #[test]

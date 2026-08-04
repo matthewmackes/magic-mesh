@@ -12,9 +12,9 @@
 //! [`DeviceInventory`] tree and publishes it to
 //! `<workgroup_root>/device-inventory/<hostname>.json` (the SEC-5 own-row idiom
 //! the `node_grade` worker uses), so every peer reads every host's hardware. The
-//! shell maps [`DeviceStatus`] to Windows-style MDM problem codes (#11) — the
-//! producer exposes the **honest normalized status + the real Linux reason**
-//! ([`DeviceRecord::problem`]), never a fabricated Windows code.
+//! Device Manager renders this as neutral inventory. Corroborated faults are
+//! consumed by the System and Mesh Health authority rather than mapped to a
+//! second problem-code presentation.
 
 use std::path::{Path, PathBuf};
 
@@ -100,12 +100,9 @@ pub fn category_label(key: &str) -> String {
 
 /// The normalized device state, derived from real Linux facts.
 ///
-/// Read from driver binding, `enable`, `operstate`, and dmesg. The shell maps
-/// each variant to a Windows MDM
-/// problem code (#11) — e.g. [`NoDriver`](DeviceStatus::NoDriver) → *Code 28*,
-/// [`Disabled`](DeviceStatus::Disabled) → *Code 22*, [`Degraded`](DeviceStatus::Degraded)
-/// → *Code 10* — but the mapping is the consumer's; here the state stays honest
-/// and the real reason rides [`DeviceRecord::problem`].
+/// Read from explicit platform policy records and corroborated kernel evidence.
+/// A missing driver binding alone is [`Unknown`](DeviceStatus::Unknown), not a
+/// fault, and PCI `enable == 0` alone never produces `Disabled`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeviceStatus {
@@ -113,32 +110,20 @@ pub enum DeviceStatus {
     /// CPU/memory/thermal).
     #[default]
     Ok,
-    /// A bus device with no kernel driver bound (→ MDM Code 28).
-    NoDriver,
-    /// Administratively disabled — PCI `enable == 0`, an interface set `down`,
-    /// a de-authorized USB device (→ MDM Code 22).
+    /// Administratively disabled by an explicit platform policy/action record.
     Disabled,
-    /// Bound + present but reporting errors (a dmesg error line, an I/O fault)
-    /// (→ MDM Code 10).
+    /// Bound + present but reporting corroborated errors.
     Degraded,
     /// State could not be determined (an honest `unknown`, never a fake `ok`).
     Unknown,
 }
 
 impl DeviceStatus {
-    /// Whether this state is a problem the shell should badge (anything but
-    /// [`Ok`](DeviceStatus::Ok)).
-    #[must_use]
-    pub const fn is_problem(self) -> bool {
-        !matches!(self, Self::Ok)
-    }
-
     /// A short stable label (the wire token) for logs + tests.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            Self::NoDriver => "no-driver",
             Self::Disabled => "disabled",
             Self::Degraded => "degraded",
             Self::Unknown => "unknown",
@@ -199,11 +184,11 @@ pub struct DeviceRecord {
     /// The bound module's version (sysfs `driver/module/version`), when exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver_version: Option<String>,
-    /// The normalized state (the shell maps to an MDM problem code).
+    /// The normalized provider state; the inventory UI does not badge it.
     pub status: DeviceStatus,
     /// The honest Linux reason behind a non-[`Ok`](DeviceStatus::Ok) status
     /// (`no kernel driver bound`, `link down`, a dmesg error) — kept beside the
-    /// synthetic problem code so the emulation stays honest (design "Risks").
+    /// central health authority can publish the supporting evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
     /// IRQ / I/O / memory resources (the Resources tab, #10).
@@ -256,15 +241,6 @@ impl DeviceCategory {
             label: category_label(key),
             devices,
         }
-    }
-
-    /// Devices in this category that carry a problem status (badge count).
-    #[must_use]
-    pub fn problem_count(&self) -> usize {
-        self.devices
-            .iter()
-            .filter(|d| d.status.is_problem())
-            .count()
     }
 }
 
@@ -335,15 +311,6 @@ impl DeviceInventory {
         self.categories.iter().map(|c| c.devices.len()).sum()
     }
 
-    /// Total problem-status device count across every category (#20 badge).
-    #[must_use]
-    pub fn problem_count(&self) -> usize {
-        self.categories
-            .iter()
-            .map(DeviceCategory::problem_count)
-            .sum()
-    }
-
     /// A deterministic fixture (tests + the shell's `--dry-run` preview): a
     /// laptop-shaped host with one healthy GPU + one driverless PCI device.
     #[must_use]
@@ -374,8 +341,8 @@ impl DeviceInventory {
             sysfs_path: Some("/sys/bus/pci/devices/0000:02:00.0".into()),
             driver: None,
             driver_version: None,
-            status: DeviceStatus::NoDriver,
-            problem: Some("no kernel driver bound".into()),
+            status: DeviceStatus::Unknown,
+            problem: None,
             resources: DeviceResources::default(),
             events: vec![],
         };
@@ -536,13 +503,11 @@ mod tests {
     #[test]
     fn status_serializes_kebab_case() {
         assert_eq!(
-            serde_json::to_string(&DeviceStatus::NoDriver).unwrap(),
-            "\"no-driver\""
+            serde_json::to_string(&DeviceStatus::Unknown).unwrap(),
+            "\"unknown\""
         );
         assert_eq!(serde_json::to_string(&DeviceStatus::Ok).unwrap(), "\"ok\"");
         assert_eq!(DeviceStatus::default(), DeviceStatus::Ok);
-        assert!(DeviceStatus::NoDriver.is_problem());
-        assert!(!DeviceStatus::Ok.is_problem());
     }
 
     #[test]
@@ -561,7 +526,6 @@ mod tests {
     fn fixture_round_trips_and_counts() {
         let inv = DeviceInventory::fixture();
         assert_eq!(inv.device_count(), 2);
-        assert_eq!(inv.problem_count(), 1, "the driverless PCI device");
         let json = serde_json::to_string_pretty(&inv).unwrap();
         let back: DeviceInventory = serde_json::from_str(&json).unwrap();
         assert_eq!(inv, back);

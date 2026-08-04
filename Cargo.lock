@@ -4620,16 +4620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mde-lighthouse-health"
-version = "0.1.0"
-dependencies = [
- "mackes-mesh-types",
- "mde-bus",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "mde-maps-location-egui"
 version = "12.1.6"
 dependencies = [
@@ -4710,15 +4700,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mde-panel-egui"
-version = "12.1.6"
-dependencies = [
- "mde-bus",
- "mde-egui",
- "mde-lighthouse-health",
-]
-
-[[package]]
 name = "mde-role"
 version = "12.1.6"
 dependencies = [
@@ -4774,7 +4755,6 @@ dependencies = [
  "mde-egui",
  "mde-files",
  "mde-files-egui",
- "mde-lighthouse-health",
  "mde-maps-location-egui",
  "mde-media-egui",
  "mde-mesh-view",

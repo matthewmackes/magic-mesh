@@ -6,8 +6,9 @@ hardware inspector** — a faithful categorized device tree, rendered in Constru
 with the ability to **switch which host you're inspecting** across the whole mesh
 (nodes, cloud instances, paired phones, LAN devices, VyOS/routers). Each node
 self-enumerates its hardware and publishes it to the substrate; the panel reads any
-host's tree, shows rich per-device properties, flags problems MDM-style, and (in
-Phase 2) drives real device actions over the overlay.
+host's tree, shows rich per-device properties, and (in Phase 2) drives real
+device actions over the overlay. Platform faults and remediation are presented
+only by the centered System and Mesh Health modal.
 
 ## Locked decisions (25)
 
@@ -17,13 +18,13 @@ Phase 2) drives real device actions over the overlay.
 | 2 | Placement | **Device Manager fills the About body** — the brand/version shrinks to a compact title strip; the device tree is the surface body. |
 | 3 | View modes | **By type + By connection + By node** — the two classic MDM modes plus a mesh-native "By node" mode that flattens every host's devices into one cross-fleet tree. |
 | 4 | Categories | **Full Linux taxonomy** — CPU, Memory, Disk drives + storage controllers, Network adapters, Display/GPU, USB controllers, PCI/system devices, Audio, Input, Sensors/thermal, Bluetooth, Battery/power. |
-| 5 | Host picker | **Left host rail + tree on the right** — a persistent left column lists all hosts (status dots); selecting one shows its device tree. Layout = rail │ tree │ (bottom drawer). |
+| 5 | Host picker | **Left host rail + tree on the right** — a persistent left column lists all hosts (freshness dots); selecting one shows its device tree. Layout = rail │ tree │ (bottom drawer). |
 | 6 | Host types | **Mesh peer nodes + Workloads VM instances + paired phones + LAN-discovered hosts + VyOS/router devices** (local always included). |
 | 7 | Data path | **Hybrid: published snapshot + live refresh** — instant load from each node's published inventory, plus an on-demand "refresh live" per host. |
 | 8 | Freshness | **Snapshot + Scan action + ~30s auto-refresh** — a "Scan for hardware changes" button (MDM's scan) + periodic republish; not a live stream. |
 | 9 | Properties | **Bottom detail drawer** — selecting a device slides a detail drawer up from the bottom; the tree stays full-width above it. |
 | 10 | Property tabs | **General + Driver + Details(sysfs/IDs) + Events + Resources** — the full MDM tab set, mapped to Linux. |
-| 11 | Status | **Full MDM problem-code parity** — Windows-style problem codes (Code 10/28/43…) mapped from Linux states (no driver bound, disabled, dmesg errors, degraded), shown in the drawer + as tree badges. |
+| 11 | Status | **Neutral inventory** — identity, driver, resources, events, and freshness only. No problem counters, ordering, badges, codes, or health verdicts. Corroborated device faults are centralized health conditions with an inventory deep link. |
 | 12 | Actions | **Rescan bus + Enable/Disable + Reload kernel module + Properties/Copy-info** — the Linux-real equivalents of MDM's Scan/Disable/Update/Properties. |
 | 13 | Remote actions | **Any host, destructive armed** — actions fire on whichever host is selected (local or remote over the overlay); destructive ones sit behind typed-arming. |
 | 14 | Arming | **Typed-arming** — reuse the platform's typed-arming confirm (type the device/host name) for disable/unbind/reload, matching EXPLORER-5 / Console power ops. |
@@ -32,8 +33,8 @@ Phase 2) drives real device actions over the overlay.
 | 17 | Search | **No search box** — browse via the category grouping + expand/collapse. |
 | 18 | Expand default | **All collapsed** on open (most MDM-faithful). |
 | 19 | Chrome | **Full menu bar (Action / View / Help) + toolbar** — the faithful MDM chrome. |
-| 20 | Summary | **Rich per-host header card** — hostname, OS/kernel, uptime, CPU/RAM/disk totals, device count + problem badge, above the tree. |
-| 21 | Notify | **Yes — fleet-wide fault notify** — a device faulting on ANY node posts to the mesh notify feed (→ Chat + phone), debounced (mirrors node_grade's D/F alert). |
+| 20 | Summary | **Rich per-host header card** — hostname, OS/kernel, uptime, CPU/RAM/disk totals, device count, and inventory freshness above the tree. |
+| 21 | Notify | **Central authority only** — the device provider supplies evidence to System and Mesh Health; it does not emit a parallel device-fault notification stream. Critical health continues through signed mesh chat. |
 | 22 | Non-PC hosts | **Same tree, applicable categories only** — a VyOS router shows Network/System/Firmware; a phone shows Power/Sensors/Radios; a Workloads VM shows virtio devices; a LAN host shows what's remotely detectable. No empty categories. |
 | 23 | Export | **JSON + Markdown report + clipboard** — export the current host's inventory as machine JSON and a human-readable report. |
 | 24 | About info | **Title strip + ⓘ button** — a compact `◈ Magic-Mesh Construct v<ver>` strip always visible; an ⓘ button opens license/credits/mesh-identity in a dialog. The tree fills the body. |
@@ -49,13 +50,14 @@ mint a new worker (#16):
   for human names, and `lshw -json` / `dmidecode` shelled out for deep DMI/firmware
   details on demand (#15). Build the **full Linux taxonomy** (#4), each device carrying
   `{name, vendor, model, ids(vendor:product), sysfs_path, driver/module + version,
-  status + problem_code, resources(irq/io/mem), recent events(dmesg/udev)}`.
+  neutral status + evidence, resources(irq/io/mem), recent events(dmesg/udev)}`.
 - **Publish** the tree to the substrate at `<workgroup_root>/device-inventory/<hostname>.json`
-  (the same SEC-5 mesh-shunt replication node_grade uses — every peer reads every host's
-  inventory). A **smoothed/periodic republish** + an on-demand live re-query seam (#7/#8).
-- **Fault notify** (#21, P2): on a device transition INTO a problem state (driver drops,
-  disk I/O errors, NIC down), emit an `event/notify/<source>` alert (the CHAT-FIX-2
-  producer) so it reaches Chat + the phone. Debounced against flapping (mirror node_grade).
+  (the same own-row replication pattern used by System and Mesh Health — every peer
+  reads every host's inventory). A **smoothed/periodic republish** + an on-demand live
+  re-query seam (#7/#8).
+- **Health evidence** (#21): corroborated driver faults and kernel errors are
+  consumed by the health authority. `/sys/.../enable == 0` alone is never an
+  administrative-disable verdict. The inventory producer owns no alert ledger.
 - Runs on **every node** (rank-0 — each node enumerates its own hardware best).
 
 ### The shared inventory schema (§6 boundary)
@@ -76,10 +78,9 @@ In `mde-shell-egui`, a new `device_manager.rs` module rendered as the body of
   live-refresh button, #7; Scan + ~30s auto-refresh, #8; honest dim/stale/offline states).
 - **The tree** (#1/#3/#4/#18): the faithful MDM device tree in Construct-dark tokens, three
   view modes (By type default, By connection = the PCI/USB topology, By node = cross-fleet),
-  all-collapsed default, category grouping, per-device **problem badges** (#11 — Linux
-  state → MDM problem code).
+  all-collapsed default, and neutral category grouping (#11).
 - **Rich header card** (#20): host · OS/kernel · uptime · CPU/RAM/disk totals · device
-  count + problem badge.
+  count · snapshot freshness.
 - **Bottom detail drawer** (#9/#10): selecting a device slides up a drawer with the
   General / Driver / Details / Events / Resources tabs.
 - **Export** (#23): the current host's inventory → JSON + a Markdown report + clipboard.
@@ -103,11 +104,11 @@ In `mde-shell-egui`, a new `device_manager.rs` module rendered as the body of
   `<root>/device-inventory/<host>.json`; the panel reads the local + any mesh node's tree
   (hybrid snapshot + live refresh; Scan + auto-refresh; honest stale/offline).
 - The **host rail** switches hosts; **By type / By connection / By node** all render;
-  selecting a device opens the **bottom drawer** with all five tabs; problems show as
-  **MDM problem codes** + tree badges.
+  selecting a device opens the **bottom drawer** with all five tabs; no problem
+  counters, problem-first ranking, problem badges, or synthetic problem codes remain.
 - **Export** produces JSON + a Markdown report. (P2) **Actions** fire on local + remote
-  hosts, destructive ones typed-armed; a device fault on any node **posts to the notify
-  feed**; **non-PC hosts** (Workloads VM/phone/LAN/VyOS) render with only applicable categories.
+  hosts, destructive ones typed-armed; corroborated device faults become centralized
+  health conditions; **non-PC hosts** (Workloads VM/phone/LAN/VyOS) render with only applicable categories.
 - Everything through `mde_egui` `Style`/`Motion` tokens (§4); the worker is rank-0; the
   shell↔worker contract is the published JSON (§6, no cross-boundary crate dep).
 
@@ -118,9 +119,9 @@ In `mde-shell-egui`, a new `device_manager.rs` module rendered as the body of
   *remote* node over the overlay can strand it. Typed-arming + read-only-by-default posture
   + an audit-log append are the guardrails; consider a "you may lose reach to this host"
   warning for network devices.
-- **Problem-code parity is synthetic** — Windows problem codes don't exist on Linux; the
-  mapping (no-driver→Code 28, disabled→Code 22, error→Code 10) is a faithful *emulation*.
-  Keep it honest (show the real Linux reason beside the code).
+- **Fault classification belongs to health** — retain raw driver/events evidence in
+  inventory, but never infer an incident from a missing optional driver or a PCI
+  enable bit. The health authority applies role and corroboration policy.
 - **lshw/dmidecode dependency + latency** — deep details shell out; the RPM should
   `Requires: lshw` (+ pci/usb ids) and the tree must stay responsive (sysfs-first, lshw
   lazy). Cf. the browser's excluded-heavy-engine packaging discipline.

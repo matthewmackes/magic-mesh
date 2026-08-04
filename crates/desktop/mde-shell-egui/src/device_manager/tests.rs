@@ -1,12 +1,11 @@
 use super::{
     apply_devmgr_popup_style, build_connection_tree, build_node_tree, build_rail, cpu_line,
-    derive_bus, device_a11y_label, device_a11y_value, device_armed, device_status_display,
-    device_target, devmgr_tooltip, export_dir, format_mem_kb, header_lines, host_a11y_value,
-    host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code, read_phones,
-    read_routers, render_device_details, render_json, render_report, sanitize, scanned_label,
-    status_tone, write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection,
-    DrawerTab, HostEntry, HostFreshness, MenuAction, RouterEditDraft, RowActionRequest, ViewMode,
-    MAX_REPLICATED_DEVICE_MIRROR_BYTES, STALE_AFTER,
+    derive_bus, device_a11y_label, device_a11y_value, device_armed, device_target, devmgr_tooltip,
+    export_dir, format_mem_kb, header_lines, host_a11y_value, host_dot_tone, host_hover,
+    humanize_ago, humanize_uptime, now_ms, read_phones, read_routers, render_device_details,
+    render_json, render_report, sanitize, scanned_label, write_export, DeviceAction, DeviceArming,
+    DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness, MenuAction,
+    RouterEditDraft, RowActionRequest, ViewMode, MAX_REPLICATED_DEVICE_MIRROR_BYTES, STALE_AFTER,
 };
 use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
 use mackes_mesh_types::device_inventory::{
@@ -250,36 +249,29 @@ fn device_manager_context_menu_uses_themed_text_and_surface() {
 // ── a11y-05: the device-row + host-row accessible name/state seam ──
 
 #[test]
-fn device_a11y_label_and_value_read_the_name_and_mdm_status() {
-    // A faulted device speaks the MDM problem code + the honest Linux reason.
-    let mut dev = DeviceRecord::new("Intel Wi-Fi 6 AX200", DeviceStatus::NoDriver);
+fn device_a11y_label_and_value_read_neutral_inventory_identity() {
+    let mut dev = DeviceRecord::new("Intel Wi-Fi 6 AX200", DeviceStatus::Unknown);
     dev.problem = Some("no kernel driver bound".to_string());
     assert_eq!(device_a11y_label(&dev), "Intel Wi-Fi 6 AX200");
     assert_eq!(
         device_a11y_value(&dev),
-        "Code 28 \u{2014} no kernel driver bound",
-        "the a11y value is the exact MDM status the drawer shows",
+        "Inventory device; no driver information published",
     );
-    // A healthy device reads the plain "working properly" line.
-    let ok = DeviceRecord::new("Samsung NVMe SSD", DeviceStatus::Ok);
-    assert_eq!(device_a11y_value(&ok), "This device is working properly.");
+    let mut bound = DeviceRecord::new("Samsung NVMe SSD", DeviceStatus::Ok);
+    bound.driver = Some("nvme".into());
+    assert_eq!(device_a11y_value(&bound), "Inventory device; driver nvme");
 }
 
 #[test]
-fn host_a11y_value_reads_freshness_and_device_and_problem_counts() {
-    // A live host with a faulted device.
+fn host_a11y_value_reads_freshness_and_device_count() {
     let live = HostEntry {
         host: "node-a".to_string(),
         label: "node-a".to_string(),
         kind: HostKind::Node,
         published_at_ms: Some(1_000),
         device_count: 12,
-        problem_count: 1,
     };
-    assert_eq!(
-        host_a11y_value(&live, 1_500),
-        "live \u{00B7} 12 devices \u{00B7} 1 problem",
-    );
+    assert_eq!(host_a11y_value(&live, 1_500), "live \u{00B7} 12 devices",);
     // An absent host reads the honest offline line (§7).
     let absent = HostEntry::absent("node-b");
     assert_eq!(
@@ -338,9 +330,8 @@ fn header_card_fields_derive_from_the_summary() {
     );
     assert!(get("Memory").ends_with("GiB"), "memory: {}", get("Memory"));
     assert_ne!(get("Uptime"), "\u{2014}", "uptime present in the fixture");
-    // The header badge counts (#20) come straight off the schema helpers.
+    // The neutral header count comes straight off the schema helper.
     assert_eq!(inv.device_count(), 2);
-    assert_eq!(inv.problem_count(), 1);
 }
 
 #[test]
@@ -407,24 +398,6 @@ fn uptime_and_memory_format_honestly() {
 }
 
 #[test]
-fn status_tones_separate_ok_from_problems() {
-    // Ok is the success green; the problem states are visibly distinct tones,
-    // and none of them read as Ok (so a problem never renders "healthy").
-    assert_eq!(status_tone(DeviceStatus::Ok), Style::OK);
-    for bad in [
-        DeviceStatus::NoDriver,
-        DeviceStatus::Degraded,
-        DeviceStatus::Disabled,
-        DeviceStatus::Unknown,
-    ] {
-        assert_ne!(status_tone(bad), Style::OK, "{bad:?} must not read as Ok");
-    }
-    // A hard error is the danger tone; a driverless device warns.
-    assert_eq!(status_tone(DeviceStatus::Degraded), Style::DANGER);
-    assert_eq!(status_tone(DeviceStatus::NoDriver), Style::WARN);
-}
-
-#[test]
 fn cpu_line_degrades_over_a_partial_summary() {
     let mut s = HostSummary {
         cpu_model: Some("Intel Xeon".to_string()),
@@ -443,8 +416,8 @@ fn cpu_line_degrades_over_a_partial_summary() {
 
 // ── DEVMGR-3 helpers ─────────────────────────────────────────────────────
 
-/// The fixture's driverless PCI device (`NoDriver` + the honest Linux reason,
-/// with no driver / events / resources — the empty-tab cases).
+/// The fixture's driverless PCI device (neutral unknown evidence, with no driver
+/// / events / resources — the empty-tab cases).
 fn orphan() -> DeviceRecord {
     DeviceInventory::fixture()
         .categories
@@ -463,47 +436,6 @@ fn item_ids(menu: &Menu<MenuAction>) -> Vec<MenuAction> {
             _ => None,
         })
         .collect()
-}
-
-// ── (b) MDM problem-code parity (#11) ────────────────────────────────────
-
-#[test]
-fn linux_state_maps_to_the_mdm_problem_code() {
-    // The faithful emulation the design locks: no-driver→28, disabled→22,
-    // degraded→10; Ok + Unknown carry no fabricated Windows code.
-    assert_eq!(problem_code(DeviceStatus::NoDriver), Some(28));
-    assert_eq!(problem_code(DeviceStatus::Disabled), Some(22));
-    assert_eq!(problem_code(DeviceStatus::Degraded), Some(10));
-    assert_eq!(problem_code(DeviceStatus::Ok), None);
-    assert_eq!(problem_code(DeviceStatus::Unknown), None);
-}
-
-#[test]
-fn device_status_display_keeps_the_real_linux_reason_beside_the_code() {
-    // A driverless device → Code 28 WITH the honest Linux reason, in the warn
-    // tone — the code never stands alone (design "keep the emulation honest").
-    let (text, tone) = device_status_display(&orphan());
-    assert!(text.contains("Code 28"), "the MDM code: {text}");
-    assert!(
-        text.contains("no kernel driver bound"),
-        "the honest Linux reason rides beside the code: {text}"
-    );
-    assert_eq!(tone, Style::WARN);
-    // A healthy device reads the MDM "working properly", in the Ok tone.
-    let gpu = DeviceRecord::new("Intel UHD Graphics", DeviceStatus::Ok);
-    let (text, tone) = device_status_display(&gpu);
-    assert_eq!(text, "This device is working properly.");
-    assert_eq!(tone, Style::OK);
-    // An unknown state stays honest — never dressed as a fabricated code.
-    let mut unk = DeviceRecord::new("Unclaimed bus device", DeviceStatus::Unknown);
-    let (text, _) = device_status_display(&unk);
-    assert!(!text.contains("Code"), "unknown fabricates no code: {text}");
-    unk.problem = Some("state could not be read".to_string());
-    let (text, _) = device_status_display(&unk);
-    assert!(
-        text.contains("state could not be read"),
-        "reason kept: {text}"
-    );
 }
 
 // ── (a) the bottom detail drawer (#9/#10) ────────────────────────────────
@@ -677,7 +609,7 @@ fn apply_dispatches_each_action_to_its_seam() {
 }
 
 #[test]
-fn the_status_cluster_reflects_host_devices_and_problems() {
+fn the_status_cluster_is_neutral_inventory_and_freshness() {
     let inv = DeviceInventory::fixture();
     let published = inv.published_at_ms;
     let s = state_with(Some(inv), true);
@@ -690,10 +622,8 @@ fn the_status_cluster_reflects_host_devices_and_problems() {
     );
     assert!(chips.iter().any(|c| c.text == "2 devices"), "device count");
     assert!(
-        chips
-            .iter()
-            .any(|c| c.text.contains("1 problem") && c.tone == ChipTone::Danger),
-        "the one faulted device reads a danger problem chip"
+        chips.iter().all(|chip| !chip.text.contains("problem")),
+        "platform health never appears in the inventory cluster"
     );
     assert!(
         chips.iter().any(|c| c.text == "Scanned 1m ago"),
@@ -703,13 +633,13 @@ fn the_status_cluster_reflects_host_devices_and_problems() {
 }
 
 #[test]
-fn the_status_cluster_is_honest_before_a_read_and_when_clean() {
+fn the_status_cluster_is_honest_before_and_after_a_read() {
     // Pre-read: only the host chip, neutral, no fabricated counts.
     let pre = state_with(None, false);
     let chips = pre.status_chips(0);
     assert_eq!(chips.len(), 1, "no counts before the first read");
     assert_eq!(chips[0].tone, ChipTone::Neutral);
-    // A clean host reads an Ok "No problems".
+    // A loaded host still reports only identity, device count, and freshness.
     let mut inv = DeviceInventory::fixture();
     for cat in &mut inv.categories {
         for dev in &mut cat.devices {
@@ -719,12 +649,8 @@ fn the_status_cluster_is_honest_before_a_read_and_when_clean() {
     }
     let clean = state_with(Some(inv), true);
     let chips = clean.status_chips(0);
-    assert!(
-        chips
-            .iter()
-            .any(|c| c.text == "No problems" && c.tone == ChipTone::Ok),
-        "a clean host reads an Ok 'No problems'"
-    );
+    assert_eq!(chips.len(), 3);
+    assert!(chips.iter().all(|chip| !chip.text.contains("problem")));
 }
 
 #[test]
@@ -757,10 +683,9 @@ fn the_rail_lists_every_published_host_with_local_pinned_first() {
     // row (§7) — a selectable "you are here" that has published nothing yet.
     assert_eq!(rail[0].published_at_ms, None);
     assert_eq!(rail[0].freshness(0), HostFreshness::Absent);
-    // A published peer carries its real counts (the fixture: 2 devices, 1 fault).
+    // A published peer carries its real device count.
     let alpha = rail.iter().find(|e| e.host == "alpha").unwrap();
     assert_eq!(alpha.device_count, 2);
-    assert_eq!(alpha.problem_count, 1);
 }
 
 #[test]
@@ -841,22 +766,16 @@ fn freshness_maps_to_honest_dim_stale_and_offline_dots() {
     let absent = HostEntry::absent("ghost");
     assert_eq!(absent.freshness(now), HostFreshness::Absent);
     assert_eq!(host_dot_tone(&absent, now), Style::TEXT_DIM);
-    // Fresh + clean → OK green; fresh + a fault → danger red.
+    // Fresh inventory is green regardless of platform-health state.
     let fresh_ok = HostEntry {
         host: "a".into(),
         label: "a".into(),
         kind: HostKind::Node,
         published_at_ms: Some(now - 1_000),
         device_count: 3,
-        problem_count: 0,
     };
     assert_eq!(fresh_ok.freshness(now), HostFreshness::Fresh);
     assert_eq!(host_dot_tone(&fresh_ok, now), Style::OK);
-    let fresh_bad = HostEntry {
-        problem_count: 2,
-        ..fresh_ok
-    };
-    assert_eq!(host_dot_tone(&fresh_bad, now), Style::DANGER);
     // Stale — published, but older than STALE_AFTER: amber, not green (its
     // health can't be trusted), even with no problems in the stale snapshot.
     let stale = HostEntry {
@@ -865,7 +784,6 @@ fn freshness_maps_to_honest_dim_stale_and_offline_dots() {
         kind: HostKind::Node,
         published_at_ms: Some(now - stale_ms - 1),
         device_count: 5,
-        problem_count: 0,
     };
     assert_eq!(stale.freshness(now), HostFreshness::Stale);
     assert_eq!(host_dot_tone(&stale, now), Style::WARN);
@@ -876,7 +794,6 @@ fn freshness_maps_to_honest_dim_stale_and_offline_dots() {
         kind: HostKind::Node,
         published_at_ms: Some(0),
         device_count: 1,
-        problem_count: 0,
     };
     assert_eq!(unknown.freshness(now), HostFreshness::Stale);
 }
@@ -907,14 +824,10 @@ fn the_rail_renders_headless_and_its_hover_stays_honest() {
         kind: HostKind::Node,
         published_at_ms: Some(now - 600_000),
         device_count: 5,
-        problem_count: 1,
     };
     let h = host_hover(&stale, now);
     assert!(h.contains("Stale"), "a stale hover flags staleness: {h}");
-    assert!(
-        h.contains("5 devices") && h.contains("1 problem"),
-        "the real counts: {h}"
-    );
+    assert!(h.contains("5 devices"), "the real device count: {h}");
     // The rail itself renders headless from a populated hosts list (a live
     // render — a fresh local peer + an offline one — proving it isn't dead).
     let mut s = state_with(Some(DeviceInventory::fixture()), true);
@@ -1087,7 +1000,7 @@ fn export_json_round_trips_the_fixture_inventory() {
 }
 
 #[test]
-fn the_markdown_report_lists_the_host_every_device_and_the_problem_code() {
+fn the_markdown_report_lists_the_host_and_every_device_without_health_codes() {
     let inv = DeviceInventory::fixture();
     let report = render_report(Some(&inv), &inv.host, ViewMode::ByType);
     assert!(
@@ -1104,15 +1017,14 @@ fn the_markdown_report_lists_the_host_every_device_and_the_problem_code() {
     // Every published device is named (the on-screen tree membership).
     assert!(report.contains("Intel UHD Graphics 620"), "the GPU row");
     assert!(report.contains("SD Host Controller"), "the PCI device row");
-    // The driverless device carries its MDM problem code + the honest Linux
-    // reason, identical to the drawer's General tab (DEVMGR-3 reuse).
-    assert!(report.contains("Code 28"), "the MDM problem code: {report}");
     assert!(
-        report.contains("no kernel driver bound"),
-        "the honest reason"
+        !report.contains("Code 28"),
+        "problem codes belong to health: {report}"
     );
-    // A healthy device reads the working-properly line, never a fake code.
-    assert!(report.contains("This device is working properly."));
+    assert!(
+        !report.contains("working properly"),
+        "health summaries belong to health: {report}"
+    );
 }
 
 #[test]
@@ -1270,10 +1182,9 @@ fn the_device_action_set_is_the_honest_read_only_subset() {
 }
 
 #[test]
-fn device_details_dump_carries_every_field_and_the_problem_code() {
+fn device_details_dump_carries_inventory_fields_without_health_status() {
     // Copy-info (#12) dumps every drawer-tab field. The rich fixture GPU carries
-    // ids / driver / sysfs / resources; the dump names each, plus the honest MDM
-    // status line — identical to what the drawer's General tab shows.
+    // ids / driver / sysfs / resources; the dump names each neutral field.
     let gpu = DeviceInventory::fixture()
         .categories
         .into_iter()
@@ -1282,7 +1193,10 @@ fn device_details_dump_carries_every_field_and_the_problem_code() {
         .expect("the fixture publishes a display device");
     let dump = render_device_details(&gpu);
     assert!(dump.contains(&gpu.name), "the device name: {dump}");
-    assert!(dump.contains("Status:"), "the MDM status line: {dump}");
+    assert!(
+        !dump.contains("Status:"),
+        "health status must not be duplicated: {dump}"
+    );
     assert!(dump.contains("Manufacturer:") && dump.contains("Model:"));
     assert!(
         dump.contains("Driver:") && dump.contains("sysfs path:"),
@@ -1292,16 +1206,15 @@ fn device_details_dump_carries_every_field_and_the_problem_code() {
         dump.contains("Resources:") && dump.contains("Events:"),
         "the resources + events sections: {dump}"
     );
-    // The driverless PCI device dumps its Code 28 + the honest Linux reason,
-    // byte-for-byte the drawer's General tab (device_status_display reuse).
-    let (status, _) = device_status_display(&orphan());
     let dump = render_device_details(&orphan());
-    assert!(dump.contains("Code 28"), "the problem code: {dump}");
     assert!(
-        dump.contains(&status),
-        "the same status line the drawer shows"
+        !dump.contains("Code 28"),
+        "problem codes must not be exported: {dump}"
     );
-    assert!(dump.contains("no kernel driver bound"), "the honest reason");
+    assert!(
+        !dump.contains("no kernel driver bound"),
+        "health reasons must not be exported: {dump}"
+    );
 }
 
 #[test]
@@ -1550,8 +1463,7 @@ fn the_arming_banner_renders_headless_with_a_pending_confirm() {
 
 // ── DEVMGR-10: the By-node cross-fleet view ──────────────────────────────
 
-/// A fixture inventory re-hosted under `host` with every device forced healthy
-/// — a clean node (0 problems) for the By-node ranking tests.
+/// A fixture inventory re-hosted under `host` with normalized provider states.
 fn clean_host(host: &str) -> DeviceInventory {
     let mut inv = host_inventory(host);
     for cat in &mut inv.categories {
@@ -1563,11 +1475,11 @@ fn clean_host(host: &str) -> DeviceInventory {
     inv
 }
 
-/// A clean host with `problems` extra faulted devices bolted on — a node whose
-/// `problem_count` is exactly `problems`, for the By-node ranking + badge tests.
-fn faulted_host(host: &str, problems: usize) -> DeviceInventory {
+/// A host carrying provider-reported fault states, used to prove that inventory
+/// ordering remains neutral and does not rank platform health.
+fn status_varied_host(host: &str, records: usize) -> DeviceInventory {
     let mut inv = clean_host(host);
-    let devs: Vec<DeviceRecord> = (0..problems)
+    let devs: Vec<DeviceRecord> = (0..records)
         .map(|i| {
             let mut d = DeviceRecord::new(format!("Faulted device {i}"), DeviceStatus::Degraded);
             d.problem = Some("simulated I/O fault".into());
@@ -1611,34 +1523,20 @@ fn by_node_aggregates_every_host_into_one_cross_fleet_tree() {
 }
 
 #[test]
-fn by_node_ranks_problem_hosts_above_clean_ones_with_exact_counts() {
-    // #3 — problem hosts sort near the top (most problems highest) so a fleet
-    // scan surfaces faults first; clean hosts follow alphabetically. And the
-    // per-host problem count is exact (the ⚠ N badge is truthful).
+fn by_node_order_is_alphabetical_and_health_neutral() {
     let all = vec![
-        clean_host("aaa-clean"),    // 0 problems, alphabetically first
-        faulted_host("mmm-two", 2), // 2 problems
-        clean_host("zzz-clean"),    // 0 problems
-        faulted_host("bbb-one", 1), // 1 problem
+        clean_host("aaa-clean"),
+        status_varied_host("mmm-two", 2),
+        clean_host("zzz-clean"),
+        status_varied_host("bbb-one", 1),
     ];
     let tree = build_node_tree(&all, "aaa-clean");
     let order: Vec<&str> = tree.hosts.iter().map(|h| h.host.as_str()).collect();
     assert_eq!(
         order,
-        vec!["mmm-two", "bbb-one", "aaa-clean", "zzz-clean"],
-        "problem hosts (most first) rank above clean hosts"
+        vec!["aaa-clean", "bbb-one", "mmm-two", "zzz-clean"],
+        "device status must not influence inventory ordering"
     );
-    let count = |h: &str| {
-        tree.hosts
-            .iter()
-            .find(|n| n.host == h)
-            .unwrap()
-            .problem_count
-    };
-    assert_eq!(count("mmm-two"), 2, "the per-host problem count is exact");
-    assert_eq!(count("bbb-one"), 1);
-    assert_eq!(count("aaa-clean"), 0);
-    assert_eq!(count("zzz-clean"), 0);
 }
 
 #[test]

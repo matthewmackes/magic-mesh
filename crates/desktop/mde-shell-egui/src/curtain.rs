@@ -32,7 +32,8 @@
 //! the same `wpctl` backend the tray drives) work WHILE locked — design lock 3,
 //! playback needs no unlock — and are the ONLY input the engaged curtain exempts
 //! from its whole-screen grab (lock 10). Beside them the status row glances
-//! battery / mesh health / date (lock 4); no message content ever reaches the
+//! battery / date (lock 4); health remains queued behind the lock curtain and
+//! no message content ever reaches the
 //! curtain (lock 4 — chat stays private until unlock). Music is honestly scoped
 //! out: `mde-music-egui` exposes no in-process transport seam to drive.
 
@@ -47,7 +48,6 @@ use std::time::{Duration, Instant};
 use mde_egui::egui::{self, Align2, Color32, FontId, RichText};
 use mde_egui::{Motion, Style};
 
-use mde_lighthouse_health::LighthouseHealth;
 use mde_media_egui::{MediaSurface, TransportAction};
 use mde_seat::{Battery, BatteryState, MixerClient, PwGraph, SeatError, SeatSnapshot};
 use mde_theme::brand::icons::IconId;
@@ -738,7 +738,8 @@ impl Curtain {
     /// CURTAIN-4 hands in the live transport + status state the locked face
     /// exposes: `media` is the active player the now-playing strip drives
     /// (design lock 3/7), `seat` carries the master-mixer level + the battery
-    /// glanceable (lock 4), and `mesh` the network-health glanceable (lock 4).
+    /// glanceable (lock 4). `mesh` remains in the stable caller seam but health
+    /// presentation is intentionally deferred until unlock.
     /// The shell passes its own `self.media` / `system.snapshot()` /
     /// `chrome.summary()` — the same reads the dock status folds, no new poll.
     pub(crate) fn show(
@@ -904,7 +905,7 @@ impl Curtain {
 
     /// The **CURTAIN-4 seam** — the face's glanceable extras region: the
     /// unified now-playing transport strip (design lock 3/7), the master-volume
-    /// row (lock 3), and the status glanceables (battery / mesh / date, lock 4).
+    /// row (lock 3), and the status glanceables (battery / date, lock 4).
     /// All three fade with the idle dim. No message content is ever shown — the
     /// curtain is handed no chat state to leak (lock 4).
     fn face_extras(
@@ -913,7 +914,7 @@ impl Curtain {
         dim: f32,
         media: &mut dyn LockMedia,
         seat: Option<&SeatSnapshot>,
-        mesh: &MeshSummary,
+        _mesh: &MeshSummary,
     ) {
         // The extras fade with the face's idle dim — faint, never gone (lock 10).
         ui.set_opacity(dim.mul_add(-FAINT_DROP, 1.0));
@@ -923,7 +924,7 @@ impl Curtain {
         ui.add_space(Style::SP_S);
         self.volume_row(ui, seat, now);
         ui.add_space(Style::SP_S);
-        status_row(ui, seat, mesh);
+        status_row(ui, seat);
     }
 
     /// The master-volume row (design lock 3): the mute-toggle speaker glyph + a
@@ -1156,11 +1157,10 @@ fn now_playing_strip(ui: &mut egui::Ui, media: &mut dyn LockMedia) {
     });
 }
 
-/// The glanceable status row (design lock 4): battery · mesh health · date — the
+/// The glanceable status row (design lock 4): battery · date — the
 /// ONLY status the curtain shows. NO message content: chat previews stay private
-/// until unlock, and the curtain is handed no chat state to leak. The status fold
-/// logic is restated locally for the lock screen.
-fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, mesh: &MeshSummary) {
+/// until unlock, and health auto-open remains queued until the curtain clears.
+fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>) {
     ui.horizontal(|ui| {
         if let Some((pct, tone)) = battery_glance(seat) {
             glance_dot(ui, tone);
@@ -1179,14 +1179,6 @@ fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, mesh: &MeshSummary
             );
             ui.add_space(Style::SP_M);
         }
-        let (tone, word) = mesh_glance(mesh);
-        glance_dot(ui, tone);
-        ui.label(
-            RichText::new(word)
-                .size(Style::TYPE_CAPTION)
-                .color(Style::TEXT_DIM),
-        );
-        ui.add_space(Style::SP_M);
         let (_, date) = face_lines(unix_now());
         ui.label(
             RichText::new(date)
@@ -1265,19 +1257,6 @@ fn battery_glance_tone(b: &Battery) -> Color32 {
             }
         }
         BatteryState::PendingCharge | BatteryState::Unknown => Style::TEXT_DIM,
-    }
-}
-
-/// The mesh-health glanceable `(tone, word)` — the worst-of lighthouse verdict,
-/// dim/"—" before the first snapshot (lock 4).
-const fn mesh_glance(mesh: &MeshSummary) -> (Color32, &'static str) {
-    if !mesh.seen {
-        return (Style::TEXT_DIM, "Mesh \u{2014}");
-    }
-    match mesh.health {
-        LighthouseHealth::AllHealthy => (Style::OK, "Mesh OK"),
-        LighthouseHealth::Degraded => (Style::DANGER, "Mesh degraded"),
-        LighthouseHealth::None => (Style::TEXT_DIM, "Mesh \u{2014}"),
     }
 }
 
@@ -1548,16 +1527,6 @@ mod tests {
             time_to_empty: None,
             time_to_full: None,
             energy_rate: None,
-        }
-    }
-
-    /// A seen mesh summary at a chosen health.
-    fn seen_mesh(health: LighthouseHealth) -> MeshSummary {
-        MeshSummary {
-            peers_total: 2,
-            peers_online: 2,
-            health,
-            seen: true,
         }
     }
 
@@ -2297,10 +2266,9 @@ mod tests {
     }
 
     #[test]
-    fn the_status_folds_battery_mesh_and_show_no_chat() {
-        // Design lock 4: the glanceables read real battery + mesh; the curtain
-        // is handed NO chat state (the `show` signature takes only media / seat /
-        // mesh), so message content can never reach the face.
+    fn the_status_folds_battery_and_shows_no_health_or_chat() {
+        // Design lock 4: the glanceable reads real battery. Health and chat are
+        // not rendered while locked; a critical health modal is queued for unlock.
         let mut s = seat();
         s.batteries = Probe::Present(vec![pack(12.0, BatteryState::Discharging)]);
         let (pct, tone) = battery_glance(Some(&s)).expect("a system pack");
@@ -2309,20 +2277,6 @@ mod tests {
         assert!(
             battery_glance(None).is_none(),
             "no seat → no battery glanceable"
-        );
-
-        assert_eq!(
-            mesh_glance(&seen_mesh(LighthouseHealth::AllHealthy)),
-            (Style::OK, "Mesh OK")
-        );
-        assert_eq!(
-            mesh_glance(&seen_mesh(LighthouseHealth::Degraded)).0,
-            Style::DANGER
-        );
-        assert_eq!(
-            mesh_glance(&MeshSummary::default()).0,
-            Style::TEXT_DIM,
-            "a pre-first-snapshot mesh reads dim, not a fabricated verdict"
         );
     }
 

@@ -228,7 +228,6 @@ struct BrowserPolicyStat {
     last_flush_ms: u64,
 }
 
-
 /// One node's browser + ad-block fleet reality, folded from the latest
 /// `state/adfilter/*` + `state/browser-policy/*` messages seen for that host.
 #[derive(Debug, Clone)]
@@ -245,10 +244,7 @@ struct BrowserFleetRow {
 /// sorted-by-host per-node view.
 /// Latest message wins per host (each stream tracked by its own publish time).
 /// Pure — no Bus, no GPU.
-fn project_browser(
-    adfilter_bodies: &[String],
-    policy_bodies: &[String],
-) -> Vec<BrowserFleetRow> {
+fn project_browser(adfilter_bodies: &[String], policy_bodies: &[String]) -> Vec<BrowserFleetRow> {
     let mut rows: BTreeMap<String, BrowserFleetRow> = BTreeMap::new();
 
     for body in adfilter_bodies {
@@ -1041,7 +1037,6 @@ fn show_browser_row(ui: &mut egui::Ui, row: &BrowserFleetRow) {
     ui.indent((row.host.as_str(), "adblock"), |ui| {
         show_adblock_stats(ui, row.adblock.as_ref());
     });
-
 }
 
 /// The enforced browser-policy detail rows: the folded role + forced-ad-blocker

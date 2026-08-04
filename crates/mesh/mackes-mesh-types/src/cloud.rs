@@ -1999,8 +1999,13 @@ impl core::fmt::Display for AppVmAdmissionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::VcpuOutOfRange {
-                requested, min, max,
-            } => write!(f, "vcpu {requested} is outside the admitted range {min}..={max}"),
+                requested,
+                min,
+                max,
+            } => write!(
+                f,
+                "vcpu {requested} is outside the admitted range {min}..={max}"
+            ),
             Self::MemoryOutOfRange {
                 requested,
                 min,
@@ -2010,8 +2015,13 @@ impl core::fmt::Display for AppVmAdmissionError {
                 "memory_mb {requested} is outside the admitted range {min}..={max}"
             ),
             Self::DiskOutOfRange {
-                requested, min, max
-            } => write!(f, "disk_gb {requested} is outside the admitted range {min}..={max}"),
+                requested,
+                min,
+                max,
+            } => write!(
+                f,
+                "disk_gb {requested} is outside the admitted range {min}..={max}"
+            ),
             Self::NetworkIsolationRequired => {
                 f.write_str("network isolation is required for App VMs")
             }
@@ -2020,7 +2030,10 @@ impl core::fmt::Display for AppVmAdmissionError {
                 "requested capability count {requested} exceeds the admitted maximum {max}"
             ),
             Self::UnsupportedCapability { capability } => {
-                write!(f, "capability `{capability}` is not admitted by the App VM profile")
+                write!(
+                    f,
+                    "capability `{capability}` is not admitted by the App VM profile"
+                )
             }
             Self::InvalidRequest(error) => write!(f, "invalid App VM request: {error}"),
         }
@@ -2072,7 +2085,8 @@ impl AppVmProfile {
         if !self.network_isolation {
             return Err(AppVmAdmissionError::NetworkIsolationRequired);
         }
-        app.validate().map_err(AppVmAdmissionError::InvalidRequest)?;
+        app.validate()
+            .map_err(AppVmAdmissionError::InvalidRequest)?;
         if app.requested_capabilities.len() > APP_VM_MAX_CAPABILITIES {
             return Err(AppVmAdmissionError::TooManyCapabilities {
                 requested: app.requested_capabilities.len(),

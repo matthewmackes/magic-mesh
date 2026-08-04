@@ -114,15 +114,35 @@ impl FileActorLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut log = Self {
+        let mut log = Self::empty(path);
+        log.load()?;
+        Ok(log)
+    }
+
+    /// Open an append-only handle without materializing the existing history.
+    ///
+    /// This is for an author that already guarantees fresh event IDs (the live
+    /// collaboration worker uses UUIDv4 IDs and never replays command lanes).
+    /// Durable replay remains the source of truth and uses [`Self::open`] when
+    /// callers need the complete idempotency index or [`ActorLog::read_all`].
+    /// Avoiding a full historical load keeps a hot actor log writable while a
+    /// separate incremental projector catches up after restart.
+    pub fn open_append_only(root: &Path, space: SpaceId, actor: &ActorId) -> Result<Self> {
+        let path = Self::path_for(root, space, actor);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(Self::empty(path))
+    }
+
+    fn empty(path: PathBuf) -> Self {
+        Self {
             path,
             seen: std::collections::HashSet::new(),
             order: Vec::new(),
             envelopes: BTreeMap::new(),
             rejected_lines: 0,
-        };
-        log.load()?;
-        Ok(log)
+        }
     }
 
     fn load(&mut self) -> Result<()> {
@@ -285,5 +305,31 @@ mod tests {
         let reopened = FileActorLog::open(root.path(), space, &actor).expect("reopen");
         assert_eq!(reopened.rejected_line_count(), 1);
         assert_eq!(reopened.len(), 1);
+    }
+
+    #[test]
+    fn append_only_open_does_not_materialize_history_but_keeps_it_durable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(10));
+        let actor = ActorId::new("seat-15");
+        let mut initial = FileActorLog::open(root.path(), space, &actor).expect("open initial");
+        assert!(initial.append(&event(10, space)).expect("append initial"));
+
+        let mut live =
+            FileActorLog::open_append_only(root.path(), space, &actor).expect("open append-only");
+        assert_eq!(live.len(), 0, "historical rows stay out of the live writer");
+        assert!(live.append(&event(11, space)).expect("append live"));
+
+        let reopened = FileActorLog::open(root.path(), space, &actor).expect("reopen full log");
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(
+            reopened
+                .read_all()
+                .expect("read all")
+                .into_iter()
+                .map(|envelope| envelope.event_id)
+                .collect::<Vec<_>>(),
+            vec![event(10, space).event_id, event(11, space).event_id]
+        );
     }
 }

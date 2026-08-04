@@ -1161,7 +1161,9 @@ const MAX_MEDIA_SERVER_RECORDS_BYTES: usize = 64 * 1024;
 fn valid_media_credential_ref(value: &str) -> bool {
     value.is_empty()
         || (value.starts_with("media/") || value.starts_with("secret:"))
-            && !value.chars().any(|c| c.is_whitespace() || c == '=' || c == '@')
+            && !value
+                .chars()
+                .any(|c| c.is_whitespace() || c == '=' || c == '@')
 }
 
 /// Parse operator-configured media records. Accepts either one object or an

@@ -418,10 +418,9 @@ impl FrontDoorPeerAppFavorites {
     }
 
     pub(crate) fn contains_target(&self, target: &FrontDoorPeerAppTarget) -> bool {
-        self.entries.iter().any(|entry| {
-            entry.node == target.node
-                && entry.app_id.as_str() == target.app_id
-        })
+        self.entries
+            .iter()
+            .any(|entry| entry.node == target.node && entry.app_id.as_str() == target.app_id)
     }
 
     pub(crate) fn toggle_target(&mut self, target: &FrontDoorPeerAppTarget) -> bool {
@@ -793,17 +792,34 @@ const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 3] = [
     },
 ];
 
-const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
+const SERVICE_CARDS: [FrontDoorWorkflowCard; 3] = [
+    FrontDoorWorkflowCard {
+        kind: FrontDoorWorkflowKind::Service,
+        surface: Surface::ThisNode,
+        workbench_plane: None,
+        execution: FrontDoorWorkflowExecution::ShellOwned,
+        title: "System and Mesh Health",
+        target: "One condition-backed health matrix for this seat and the mesh",
+        terms: &[
+            "health",
+            "diagnostics",
+            "issues",
+            "warnings",
+            "critical",
+            "grade",
+            "system health",
+            "mesh health",
+        ],
+        icon: IconId::Workbench,
+    },
     FrontDoorWorkflowCard {
         kind: FrontDoorWorkflowKind::Service,
         surface: Surface::Workbench,
         workbench_plane: Some(Plane::Provisioning),
         execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "Mesh services",
-        target: "Fleet service health and controls",
-        terms: &[
-            "services", "mesh", "fleet", "health", "mackesd", "nebula", "systemd",
-        ],
+        target: "Fleet service lifecycle and controls",
+        terms: &["services", "mesh", "fleet", "mackesd", "nebula", "systemd"],
         icon: IconId::Workbench,
     },
     FrontDoorWorkflowCard {
@@ -812,7 +828,7 @@ const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
         workbench_plane: None,
         execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "Cloud API services",
-        target: "Service catalog, endpoints, health",
+        target: "Service catalog, endpoints, and lifecycle",
         terms: &[
             "services",
             "cloud",
@@ -825,6 +841,12 @@ const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
         icon: IconId::Server,
     },
 ];
+
+impl FrontDoorWorkflowCard {
+    pub(crate) fn opens_health(self) -> bool {
+        self.title == "System and Mesh Health"
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct FrontDoorState {
@@ -1003,8 +1025,14 @@ fn peer_app_launch_block_reason(app: &FrontDoorPeerApp) -> Option<String> {
         };
         return Some(format!("not launchable: {state}"));
     }
-    if app.catalog_revision.as_deref().is_none_or(|value| value.trim().is_empty())
-        || app.guest_profile.as_deref().is_none_or(|value| value.trim().is_empty())
+    if app
+        .catalog_revision
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        || app
+            .guest_profile
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
     {
         return Some("not launchable: admission pending".to_owned());
     }
@@ -1071,19 +1099,31 @@ impl FrontDoorPeerAppLaunchState {
     const fn guidance(self) -> &'static str {
         match self {
             Self::Ready => "Construct will place or resume one guest App VM session.",
-            Self::Installing => "Guest content is being installed; launch will remain disabled until it is ready.",
-            Self::WaitingForPlacement => "The admitted guest is waiting for a permitted mesh placement.",
-            Self::StartingGuest => "The guest is booting; Construct will keep the same session identity.",
+            Self::Installing => {
+                "Guest content is being installed; launch will remain disabled until it is ready."
+            }
+            Self::WaitingForPlacement => {
+                "The admitted guest is waiting for a permitted mesh placement."
+            }
+            Self::StartingGuest => {
+                "The guest is booting; Construct will keep the same session identity."
+            }
             Self::StartingApp => "The guest compositor is ready and the application is starting.",
             Self::Connected => "The application session is connected; use Desktop to focus it.",
-            Self::Paused => "The guest session is paused; resume it from the existing Desktop session.",
-            Self::Reconnecting => "The same guest session is reconnecting; no new VM will be created.",
+            Self::Paused => {
+                "The guest session is paused; resume it from the existing Desktop session."
+            }
+            Self::Reconnecting => {
+                "The same guest session is reconnecting; no new VM will be created."
+            }
             Self::NotInstalled => "Guest content is not installed; no host fallback is available.",
             Self::Denied => "The catalog or guest policy denied this launch.",
             Self::StaleCatalog => "Refresh the signed catalog before launching this revision.",
             Self::UnsignedCatalog => "A signed catalog is required before this app can launch.",
             Self::Unavailable => "The guest provider is unavailable; retry when it recovers.",
-            Self::Failed => "The guest session failed; retry keeps the app identity and placement intent.",
+            Self::Failed => {
+                "The guest session failed; retry keeps the app identity and placement intent."
+            }
         }
     }
 }
@@ -1111,9 +1151,7 @@ fn peer_app_launch_state(target: &FrontDoorPeerAppTarget) -> FrontDoorPeerAppLau
             FrontDoorPeerAppLaunchState::NotInstalled
         }
         "denied" => FrontDoorPeerAppLaunchState::Denied,
-        "stale" | "stale_catalog" | "stale catalog" => {
-            FrontDoorPeerAppLaunchState::StaleCatalog
-        }
+        "stale" | "stale_catalog" | "stale catalog" => FrontDoorPeerAppLaunchState::StaleCatalog,
         "unsigned" | "unsigned catalog" => FrontDoorPeerAppLaunchState::UnsignedCatalog,
         "failed" => FrontDoorPeerAppLaunchState::Failed,
         "unavailable" | "availability unknown" => FrontDoorPeerAppLaunchState::Unavailable,
@@ -1123,7 +1161,11 @@ fn peer_app_launch_state(target: &FrontDoorPeerAppTarget) -> FrontDoorPeerAppLau
 
 fn bounded_front_door_permission(value: &str) -> String {
     const MAX_PERMISSION_CHARS: usize = 40;
-    let mut value = value.trim().chars().take(MAX_PERMISSION_CHARS).collect::<String>();
+    let mut value = value
+        .trim()
+        .chars()
+        .take(MAX_PERMISSION_CHARS)
+        .collect::<String>();
     if value.chars().count() == MAX_PERMISSION_CHARS {
         value.push_str("...");
     }
@@ -2747,9 +2789,9 @@ fn peer_app_provision_wire_with(
 /// executable string. Flatpak rows have already passed [`FlatpakAppId`].
 fn safe_peer_app_id(value: &str) -> bool {
     value.len() <= FlatpakAppId::MAX_BYTES
-        && !value.chars().any(|ch| {
-            ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '|')
-        })
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '|'))
 }
 
 fn primary_action_accesskit_id(hit: &SearchHit<FrontDoorTarget>) -> egui::Id {
@@ -3098,7 +3140,14 @@ fn action_button(
     ui.painter().rect_stroke(
         rect,
         5.0,
-        egui::Stroke::new(1.0, if enabled { Style::ACCENT } else { Style::BORDER }),
+        egui::Stroke::new(
+            1.0,
+            if enabled {
+                Style::ACCENT
+            } else {
+                Style::BORDER
+            },
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -3113,7 +3162,11 @@ fn action_button(
         ui.ctx(),
         icon,
         icon_size,
-        if enabled { Style::TEXT } else { Style::TEXT_DIM },
+        if enabled {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        },
     ) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         ui.painter()
@@ -3132,7 +3185,11 @@ fn action_button(
                 egui::Align2::CENTER_CENTER,
                 label,
                 Style::typography_font(TypographyRole::Label),
-                if enabled { Style::TEXT } else { Style::TEXT_DIM },
+                if enabled {
+                    Style::TEXT
+                } else {
+                    Style::TEXT_DIM
+                },
             );
         response
     } else {
@@ -4668,7 +4725,18 @@ mod tests {
     #[test]
     fn workflow_search_items_expose_real_owner_cards_without_duplicating_apps() {
         let items = workflow_search_items(40);
-        assert_eq!(items.len(), 5);
+        assert_eq!(items.len(), 6);
+        assert!(items.iter().any(|item| {
+            item.title == "System and Mesh Health"
+                && item.target == "One condition-backed health matrix for this seat and the mesh"
+                && matches!(
+                    item.payload,
+                    FrontDoorTarget::Workflow(FrontDoorWorkflowCard {
+                        kind: FrontDoorWorkflowKind::Service,
+                        ..
+                    })
+                )
+        }));
         assert!(items.iter().any(|item| {
             item.title == "Cloud workloads"
                 && item.target == "Instances, volumes, networks"
@@ -4683,7 +4751,7 @@ mod tests {
         }));
         assert!(items.iter().any(|item| {
             item.title == "Mesh services"
-                && item.target == "Fleet service health and controls"
+                && item.target == "Fleet service lifecycle and controls"
                 && matches!(
                     item.payload,
                     FrontDoorTarget::Workflow(FrontDoorWorkflowCard {
@@ -4766,10 +4834,7 @@ mod tests {
             hits[0].item.target,
             launcher_group_label(Surface::InfraCode)
         );
-        assert_eq!(
-            hits[1].item.payload,
-            FrontDoorTarget::App(Surface::Desktop)
-        );
+        assert_eq!(hits[1].item.payload, FrontDoorTarget::App(Surface::Desktop));
         assert_eq!(hits[1].item.target, "Desktop & Session");
     }
 
@@ -4838,7 +4903,11 @@ mod tests {
             .collect();
         assert_eq!(
             service_titles,
-            vec!["Mesh services", "Cloud API services"],
+            vec![
+                "System and Mesh Health",
+                "Mesh services",
+                "Cloud API services"
+            ],
             "Services filter should expose current local service cards"
         );
         assert!(service_hits.iter().all(|hit| {
@@ -6508,7 +6577,7 @@ mod tests {
         let service_out = render_front_door_accesskit_frame_with_filter(
             &ctx,
             "",
-            0,
+            1,
             egui::vec2(900.0, 640.0),
             workflow_search_items(0),
             FrontDoorFilter::Services,
@@ -6522,7 +6591,7 @@ mod tests {
         assert_eq!(fleet.role(), egui::accesskit::Role::Button);
         assert_eq!(
             fleet.value(),
-            Some("Workflow action: Workbench Fleet plane; Fleet service health and controls")
+            Some("Workflow action: Workbench Fleet plane; Fleet service lifecycle and controls")
         );
         assert!(fleet.supports_action(egui::accesskit::Action::Click));
     }
@@ -6817,7 +6886,10 @@ mod tests {
             0,
         );
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].target, "Guest Flatpak · on oak · not launchable: stale");
+        assert_eq!(
+            items[0].target,
+            "Guest Flatpak · on oak · not launchable: stale"
+        );
         let FrontDoorTarget::PeerApp(target) = &items[0].payload else {
             panic!("guest state should remain a peer-app result");
         };
@@ -6836,15 +6908,14 @@ mod tests {
             source: "flatpak".to_owned(),
             catalog_revision: Some("catalog-test".to_owned()),
             guest_profile: Some("wayland-standard".to_owned()),
-            requested_capabilities: vec![
-                "audio".to_owned(),
-                "network".to_owned(),
-                "x".repeat(200),
-            ],
+            requested_capabilities: vec!["audio".to_owned(), "network".to_owned(), "x".repeat(200)],
             launch_blocked_reason: None,
         };
 
-        assert_eq!(peer_app_launch_state(&target), FrontDoorPeerAppLaunchState::Ready);
+        assert_eq!(
+            peer_app_launch_state(&target),
+            FrontDoorPeerAppLaunchState::Ready
+        );
         let explanation = peer_app_permission_explanation(&target);
         assert!(explanation.contains("requested guest permissions: audio, network"));
         assert!(explanation.contains("isolated App VM"));

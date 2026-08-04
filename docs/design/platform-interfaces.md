@@ -139,9 +139,12 @@ Light is a production first-class appearance, both share azure accent
 
 ### 2.3 Persistent chrome (Q11–Q12)
 
-- **Q12 — Slim top status bar (~24px).** Clock + date left; mesh grade, network,
-  power, alert count right — fed by the existing `status.rs` StatusSegments
-  rollups. Surfaces may declare full-screen auto-hide (VDI always does).
+- **Q12 — Slim top status bar (~24px).** Clock + date left; network and power
+  state plus the one `HealthStatus` icon right. The icon's badge is the exact
+  active, required, unacknowledged, unsnoozed System and Mesh Health condition
+  count; the A–F grade is visible only inside the centered health modal. Bottom
+  and Left taskbar placements render this same logical control. Surfaces may
+  declare full-screen auto-hide (VDI always does).
   *(Status Bars)* **This reverses NAVBAR-W10's top-bar kill, deliberately.**
 - **Q12b — Reserved taskbar/rail space.** Construct body layout reserves exactly
   48px for the Bottom taskbar or the Left rail width so navigation never overlays
@@ -164,11 +167,15 @@ Light is a production first-class appearance, both share azure accent
 
 ### 2.4 System overlays (Q13–Q16)
 
-- **Q13 — Control Center** (full): volume, display, network/mesh, bluetooth,
-  Construct↔Car toggle, VDI session controls, file-operation progress. Replaces
-  every tray flyout. Scrim material, sheet-style dismiss.
+- **Q13 — Control Center** (full): volume, display, network/mesh controls,
+  bluetooth, Construct↔Car toggle, VDI session controls, file-operation progress.
+  It does not duplicate platform-health summaries. Scrim material, sheet-style
+  dismiss.
 - **Q14 — Notifications:** HIG banners (top, transient, reusing toast plumbing)
-  + a pull-down **Notification Center** with grouped history and clear-all.
+  + a pull-down **Notification Center** with grouped application history and
+  clear-all. Critical health transitions use the existing signed mesh-chat
+  transport, while condition state and remediation remain solely in the health
+  authority/modal.
   *(Notifications)*
 - **Q15 — Spotlight:** the Front Door engine (producers, ranking, keyboard
   flow **byte-identical**) reskinned as a centered floating search field.
@@ -177,6 +184,13 @@ Light is a production first-class appearance, both share azure accent
   previews (never live-render; plate fallback when no snapshot), flick-up to
   close (= leaves recents), Super+Tab / swipe-up-hold.
   *(Multitasking — as principles)*
+
+- **Q16b — System and Mesh Health modal:** a centered responsive modal, not a
+  flyout or workspace. Its five-seat matrix and mesh-wide row are the only
+  platform/system/mesh issue presentation. Health and diagnostics search terms
+  open it with the local node selected. This Node retains configuration and
+  neutral inventory; Fleet, Network, Provisioning, Workloads, Control Center,
+  and Notification Center retain domain lifecycle state but no health rollup.
 
 ### 2.5 Apps (Q17–Q20)
 

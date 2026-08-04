@@ -414,7 +414,6 @@ fn mpris_request_now_playing_and_volume_maps_playerctl_state_to_report() {
     assert_eq!(report.can_pause, Some(true));
 }
 
-
 #[test]
 fn mpris_request_command_reuses_the_transport_allowlist() {
     let control = RecordingMediaControl::default();

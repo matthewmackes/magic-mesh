@@ -1123,11 +1123,21 @@ fn file_present(
     }
 }
 
-/// The call must exist; returns its space.
+/// The call must exist and still have a connected participant; returns its
+/// space. This derived guard prevents a late answer/decline from resurrecting
+/// a call whose independently-authored participant facts have all converged to
+/// `left`/`declined`, even when no peer could safely mint `CallEnded`.
 fn require_call(state: &DomainState, call: mde_collab_types::ids::CallId) -> Result<SpaceId> {
     state
         .calls
         .get(&call)
+        .filter(|call| {
+            !call.ended
+                && call
+                    .participants
+                    .values()
+                    .any(|state| matches!(state, CallParticipantState::Connected))
+        })
         .map(|c| c.space)
         .ok_or(CollabError::CallNotFound(call))
 }

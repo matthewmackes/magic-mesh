@@ -48,11 +48,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use mde_bus::persist::Persist;
 use mackes_mesh_types::vdi_clipboard::{
     ClipboardMaterialization, VdiClipboardText, CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS,
     CLIPBOARD_MATERIALIZATION_TOPIC,
 };
+use mde_bus::persist::Persist;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
@@ -574,12 +574,11 @@ impl ClipboardAccess for OsClipboardAccess {
         let Some(body) = message.body.as_deref() else {
             return Ok(None);
         };
-        let handoff: ClipboardMaterialization = serde_json::from_str(body).map_err(|error| {
-            ClipboardAccessError::Failed {
+        let handoff: ClipboardMaterialization =
+            serde_json::from_str(body).map_err(|error| ClipboardAccessError::Failed {
                 op: "read_local",
                 reason: format!("decode local clipboard handoff: {error}"),
-            }
-        })?;
+            })?;
         if handoff.target_seat != target_seat {
             return Ok(None);
         }
@@ -644,10 +643,11 @@ impl ClipboardAccess for OsClipboardAccess {
             op: "write_local",
             reason: format!("open local clipboard Bus: {error}"),
         })?;
-        let body = serde_json::to_string(&handoff).map_err(|error| ClipboardAccessError::Failed {
-            op: "write_local",
-            reason: format!("encode local clipboard handoff: {error}"),
-        })?;
+        let body =
+            serde_json::to_string(&handoff).map_err(|error| ClipboardAccessError::Failed {
+                op: "write_local",
+                reason: format!("encode local clipboard handoff: {error}"),
+            })?;
         persist
             .write(
                 CLIPBOARD_MATERIALIZATION_TOPIC,
@@ -1151,14 +1151,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
         let access = OsClipboardAccess::for_bus(dir.path().to_path_buf());
         access
-            .write_local("seat:dell", ClipDirection::GuestToClient, &ClipPayload::text("x"))
+            .write_local(
+                "seat:dell",
+                ClipDirection::GuestToClient,
+                &ClipPayload::text("x"),
+            )
             .expect("guest text handoff");
         assert_eq!(
             access.read_local("seat:dell").expect("read handoff"),
             Some(ClipPayload::text("x"))
         );
         assert!(
-            access.read_local("seat:other").expect("read other seat").is_none(),
+            access
+                .read_local("seat:other")
+                .expect("read other seat")
+                .is_none(),
             "a target-seat handoff must not cross seats"
         );
     }
@@ -1167,12 +1174,19 @@ mod tests {
     fn os_clipboard_access_keeps_client_to_guest_explicitly_gated() {
         let access = OsClipboardAccess::for_bus(tempfile::tempdir().unwrap().path().to_path_buf());
         let error = access
-            .write_local("seat:dell", ClipDirection::ClientToGuest, &ClipPayload::text("x"))
+            .write_local(
+                "seat:dell",
+                ClipDirection::ClientToGuest,
+                &ClipPayload::text("x"),
+            )
             .expect_err("daemon does not own the live guest protocol session");
         match error {
             ClipboardAccessError::IntegrationGated { op, reason } => {
                 assert_eq!(op, "write_local");
-                assert!(reason.contains("VNC/RFB"), "explicit protocol blocker: {reason}");
+                assert!(
+                    reason.contains("VNC/RFB"),
+                    "explicit protocol blocker: {reason}"
+                );
             }
             ClipboardAccessError::Failed { op, reason } => {
                 panic!("expected integration-gated, got Failed {{{op}: {reason}}}")
@@ -1466,7 +1480,11 @@ mod tests {
         let bus = seed_bus(&[event("s1", ClipDirection::ClientToGuest, "current")]);
         let access = FakeClipboard::default();
         access
-            .write_local("s1", ClipDirection::ClientToGuest, &ClipPayload::text("current"))
+            .write_local(
+                "s1",
+                ClipDirection::ClientToGuest,
+                &ClipPayload::text("current"),
+            )
             .unwrap();
         let writes = access.writes.clone();
         let baseline = writes.lock().expect("writes mutex").len(); // 1 (the seed write)

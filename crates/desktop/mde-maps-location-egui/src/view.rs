@@ -14,8 +14,8 @@ use crate::model::{
     Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
     OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
     SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleHealthRail,
-    VehicleHealthRailSlot, VehicleHealthRailState, VehicleMirrorState, VehicleMirrorStatus,
-    VehicleHealthRailLayout, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
+    VehicleHealthRailLayout, VehicleHealthRailSlot, VehicleHealthRailState, VehicleMirrorState,
+    VehicleMirrorStatus, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
     VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
@@ -45,8 +45,8 @@ const MANEUVER_BLUE_DEEP: Color32 = Color32::from_rgb(0x11, 0x4C, 0xB6); // styl
 const ROUTE_CASING: Color32 = Color32::from_rgb(0x14, 0x4C, 0x92); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
 const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
-// Keep these content colors intentionally distinct from Style::TEXT_STRONG and
-// Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
+                                                                  // Keep these content colors intentionally distinct from Style::TEXT_STRONG and
+                                                                  // Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
 const MAP_TEXT_STRONG: Color32 = Color32::from_rgb(0xF5, 0xF6, 0xFA); // style-leak-ok: map-content-color
 const MAP_TEXT_DIM: Color32 = Color32::from_rgb(0xB8, 0xC0, 0xCC); // style-leak-ok: map-content-color
 
@@ -704,11 +704,7 @@ fn drive_hud(
     // five FAB hit targets never float over banner text at narrow or enlarged
     // zooms.
     let fab_lane_width = drive_fab_lane_width(fab_r, fab_gap);
-    let banner_width = (width
-        - 2.0 * margin
-        - fab_lane_width
-        - DRIVE_FAB_LANE_SEPARATION)
-        .max(1.0);
+    let banner_width = (width - 2.0 * margin - fab_lane_width - DRIVE_FAB_LANE_SEPARATION).max(1.0);
     let banner = safe_rect(
         rect.left() + margin,
         rect.top() + margin,
@@ -776,15 +772,9 @@ fn drive_hud(
     // the HUD margin so the last large-text pill cannot touch or cross that
     // boundary. The stack is shifted upward as a unit, preserving the
     // health-rail separation while keeping every alert visible.
-    let mut pill_y = alert_stack_start(
-        below_banner,
-        rect.bottom(),
-        margin,
-        alert_count,
-    );
-    let inline_system_alerts = text_zoom > 1.0
-        && !has_fix
-        && offline.readiness == OfflineNavigationReadiness::Blocked;
+    let mut pill_y = alert_stack_start(below_banner, rect.bottom(), margin, alert_count);
+    let inline_system_alerts =
+        text_zoom > 1.0 && !has_fix && offline.readiness == OfflineNavigationReadiness::Blocked;
     let initial_pill_y = pill_y;
     if !has_fix {
         pill_y = paint_alert_pill(
@@ -798,9 +788,7 @@ fn drive_hud(
     }
     if offline.readiness == OfflineNavigationReadiness::Blocked {
         let blocked_x = if inline_system_alerts {
-            pill_x
-                + alert_pill_width(&painter, "Acquiring GPS")
-                + Style::SP_S
+            pill_x + alert_pill_width(&painter, "Acquiring GPS") + Style::SP_S
         } else {
             pill_x
         };
@@ -874,12 +862,7 @@ fn drive_hud(
     }
 }
 
-fn paint_health_rail(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    rail: &VehicleHealthRail,
-    text_zoom: f32,
-) {
+fn paint_health_rail(ui: &mut egui::Ui, rect: Rect, rail: &VehicleHealthRail, text_zoom: f32) {
     let rail_layout = rail.layout_for_text_zoom(text_zoom);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -910,15 +893,19 @@ fn paint_health_rail(
             let columns = rail_layout.columns;
             let rows = rail_layout.rows;
             let gap = Style::SP_XS;
-            let slot_width = ((ui.available_width() - gap * (columns - 1) as f32)
-                / columns as f32)
-                .max(1.0);
-            let slot_height = ((ui.available_height() - gap * (rows - 1) as f32)
-                / rows as f32)
-                .max(30.0);
+            let slot_width =
+                ((ui.available_width() - gap * (columns - 1) as f32) / columns as f32).max(1.0);
+            let slot_height =
+                ((ui.available_height() - gap * (rows - 1) as f32) / rows as f32).max(30.0);
             for row in 0..rows {
                 ui.horizontal_top(|ui| {
-                    for (column, slot) in rail.slots.iter().skip(row * columns).take(columns).enumerate() {
+                    for (column, slot) in rail
+                        .slots
+                        .iter()
+                        .skip(row * columns)
+                        .take(columns)
+                        .enumerate()
+                    {
                         let response = ui
                             .allocate_ui_with_layout(
                                 Vec2::new(slot_width, slot_height),
@@ -954,11 +941,8 @@ fn paint_health_rail(
                                         .map_or("not reported", VehicleRadioOperation::label);
                                     if compact_large_text {
                                         let font = FontId::proportional(Style::SMALL);
-                                        let summary = format!(
-                                            "{} · {}",
-                                            slot.label,
-                                            slot.state.label()
-                                        );
+                                        let summary =
+                                            format!("{} · {}", slot.label, slot.state.label());
                                         let summary = elide(
                                             slot_ui.painter(),
                                             &summary,
@@ -3888,11 +3872,7 @@ fn paint_fab(
             } else {
                 "audio-volume-high"
             };
-            let tone = if muted {
-                Style::WARN
-            } else {
-                MAP_TEXT_STRONG
-            };
+            let tone = if muted { Style::WARN } else { MAP_TEXT_STRONG };
             let _ = paint_carbon(painter, icon_box, name, tone);
         }
         "overview" => {
@@ -4274,7 +4254,11 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 fn mg90_connection_card(ui: &mut egui::Ui, state: &MapsLocationSurface) {
     let current = state.vehicle_mirror_status.state.is_current();
     let (tone, title, detail) = if current {
-        (Style::OK, "Bench MG90 connected", "Live vehicle mirror accepted")
+        (
+            Style::OK,
+            "Bench MG90 connected",
+            "Live vehicle mirror accepted",
+        )
     } else {
         (
             Style::WARN,
@@ -6630,7 +6614,11 @@ fn map_pill(ui: &mut egui::Ui, label: &str, tone: Color32) {
         .stroke(Stroke::new(1.0, tone.gamma_multiply(0.8)))
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(label).size(Style::SMALL).color(MAP_TEXT_STRONG));
+            ui.label(
+                RichText::new(label)
+                    .size(Style::SMALL)
+                    .color(MAP_TEXT_STRONG),
+            );
         });
 }
 
@@ -8167,10 +8155,7 @@ mod tests {
         surface.active = WorkspaceTab::Drive;
         let out = ctx.run(
             egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(
-                    Pos2::ZERO,
-                    egui::vec2(1280.0, 820.0),
-                )),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 820.0))),
                 ..Default::default()
             },
             |ctx| {
@@ -8180,7 +8165,10 @@ mod tests {
             },
         );
         assert!(!out.shapes.is_empty());
-        assert_eq!(surface.vehicle_health_rail().state, VehicleHealthRailState::Unavailable);
+        assert_eq!(
+            surface.vehicle_health_rail().state,
+            VehicleHealthRailState::Unavailable
+        );
     }
 
     #[test]

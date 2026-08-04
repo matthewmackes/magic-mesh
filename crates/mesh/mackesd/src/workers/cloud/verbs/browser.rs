@@ -167,7 +167,10 @@ mod tests {
     #[test]
     fn browser_provision_requires_explicit_node_and_name() {
         let tmp = tempdir().unwrap();
-        for request in [body("", Some(BROWSER_VM_WORKLOAD_NAME)), body("eagle", None)] {
+        for request in [
+            body("", Some(BROWSER_VM_WORKLOAD_NAME)),
+            body("eagle", None),
+        ] {
             let reply = build_reply(tmp.path(), "browser-provision", &request);
             assert!(!reply.ok);
             assert!(reply.desired.is_none());

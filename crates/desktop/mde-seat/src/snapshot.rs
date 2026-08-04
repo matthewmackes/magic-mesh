@@ -16,10 +16,10 @@ use crate::ddc::{DdcClient, DdcCtl, DdcDisplay};
 use crate::display::{Connector, DisplayProber, DrmProber};
 use crate::error::{Backend, SeatError};
 use crate::hardware::{HardwareClient, HardwareStatus, SysfsHardware};
-use crate::lid::{LidClient, LidState, ProcLid};
 use crate::keyboard_backlight::{
     KeyboardBacklight, KeyboardBacklightClient, SysfsKeyboardBacklight,
 };
+use crate::lid::{LidClient, LidState, ProcLid};
 use crate::logind::{LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 use crate::mixer::{MixerClient, MixerStatus, PwGraph};
 use crate::network::{NetworkClient, NetworkStatus, ZbusNetwork};

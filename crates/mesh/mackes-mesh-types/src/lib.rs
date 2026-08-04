@@ -53,6 +53,8 @@ pub mod earthquake;
 pub mod exposure;
 /// WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS hotspot snapshots.
 pub mod firms;
+/// Canonical system-and-mesh health contracts shared by the daemon and shell.
+pub mod health;
 /// WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated radar tiles.
 pub mod iem_radar;
 pub mod traffic;
@@ -153,11 +155,11 @@ pub use nebula::{NebulaFacts, NebulaRole};
 pub use peer_probe::{BusTopology, Descriptors, KernelDriver, NatClass, PeerProbe, PowerThermal};
 pub use resources::{
     ActionAvailability, ActionAvailabilityStatus, AuthState, ClientCapability, HealthState,
-    ResourceAction, ResourceActionTarget, ResourceActionVerb, ResourceCard, ResourceCatalog,
-    ResourceClass, ResourceIdentity, ResourceOperatingRole, ServiceCategory,
-    LocalServiceStack, ServiceConfigurationField, ServiceConfigurationFieldKind,
-    ServiceInterface, ServiceLifecycleStatus, ServiceStackPlane, ServiceStackTier,
-    SourceProvenance, TransportCandidate, RESOURCE_CATALOG_TOPIC,
+    LocalServiceStack, ResourceAction, ResourceActionTarget, ResourceActionVerb, ResourceCard,
+    ResourceCatalog, ResourceClass, ResourceIdentity, ResourceOperatingRole, ServiceCategory,
+    ServiceConfigurationField, ServiceConfigurationFieldKind, ServiceInterface,
+    ServiceLifecycleStatus, ServiceStackPlane, ServiceStackTier, SourceProvenance,
+    TransportCandidate, RESOURCE_CATALOG_TOPIC,
 };
 pub use tags::{Tag, TagFlavor, TagMember, TagStore, TagStoreError};
 

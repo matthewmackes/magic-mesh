@@ -495,6 +495,12 @@ pub(crate) struct ConnectRequest {
     pub preferred_size: Option<(u16, u16)>,
 }
 
+/// The Browser VM is a fixed high-quality application surface, not an adaptive
+/// administrative console. Keep its guest desktop at Full HD and scale that
+/// complete framebuffer into the Construct panel. This prevents the panel's
+/// chrome height from silently renegotiating the guest below 1080p.
+const BROWSER_VM_DESKTOP_PX: (u16, u16) = (1920, 1080);
+
 impl ConnectRequest {
     /// Assemble a request from the picked target + the three display choices + the
     /// resolved auth (CHOOSER-6).
@@ -1799,7 +1805,7 @@ impl VdiState {
         transport: BrowserVmTransport,
         client_peer: &str,
         bus_root: Option<PathBuf>,
-        preferred_size: Option<(u16, u16)>,
+        _preferred_size: Option<(u16, u16)>,
         auth: DesktopAuth,
     ) -> Result<(), String> {
         let mut last_error = None;
@@ -1827,7 +1833,7 @@ impl VdiState {
         )
         .with_browser_transport(transport)
         .with_broker_session(BrokerSessionLifecycle::new(publication.id, bus_root))
-        .with_preferred_size(preferred_size);
+        .with_preferred_size(Some(BROWSER_VM_DESKTOP_PX));
         self.request_connect(request);
         Ok(())
     }
@@ -2106,6 +2112,17 @@ impl VdiState {
     /// stay on the LINEAR upscale (imperceptible, no disruptive re-dial).
     #[cfg(feature = "live-vdi")]
     fn note_resize_target(&mut self, panel_px: (u16, u16), guest_px: (u16, u16)) {
+        // Browser is deliberately a fixed 1080p source. Construct scales the
+        // complete framebuffer to its panel; panel chrome must never trigger a
+        // lower-resolution guest re-dial.
+        if self
+            .requested
+            .as_ref()
+            .is_some_and(|request| request.browser_transport.is_some())
+        {
+            self.pending_resize = None;
+            return;
+        }
         // Only an RDP/SPICE session re-negotiates by re-dialing; VNC excludes itself.
         let renegotiable = self.live_rdp.is_some() || self.live_spice.is_some();
         if !renegotiable || self.session_phase != SessionPhase::Live {

@@ -842,6 +842,67 @@ mod tests {
     }
 
     #[test]
+    fn mackesd_unit_pins_the_packaged_repo_root() {
+        let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
+
+        assert!(
+            unit.contains("Environment=MCNF_REPO=/opt/mcnf"),
+            "mackesd must resolve packaged mesh helpers instead of a developer checkout"
+        );
+        assert!(
+            unit.contains("mcnf-mesh-secret-recipient.service"),
+            "node recipient registration must run before mesh-key installation"
+        );
+    }
+
+    #[test]
+    fn every_daemon_rpm_bootstraps_mesh_secret_recipients() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+
+        for requires in [
+            &rpm["requires"],
+            &rpm["variants"]["lighthouse"]["requires"],
+            &rpm["variants"]["server"]["requires"],
+        ] {
+            assert_eq!(
+                requires["age"].as_str(),
+                Some("*"),
+                "every daemon-bearing RPM needs the age runtime"
+            );
+        }
+        for assets in [
+            rpm["assets"].as_array().expect("base assets array"),
+            rpm["variants"]["lighthouse"]["assets"]
+                .as_array()
+                .expect("lighthouse assets array"),
+            rpm["variants"]["server"]["assets"]
+                .as_array()
+                .expect("server assets array"),
+        ] {
+            for destination in [
+                "/usr/libexec/mackesd/mesh-secret-recipient-reconcile",
+                "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service",
+                "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer",
+            ] {
+                assert!(
+                    assets
+                        .iter()
+                        .any(|asset| asset["dest"].as_str() == Some(destination)),
+                    "each RPM shape must ship {destination}"
+                );
+            }
+        }
+        assert!(
+            rpm["post_install_script"]
+                .as_str()
+                .is_some_and(|script| script.contains("mcnf-mesh-secret-recipient.timer")),
+            "the base RPM must enable ongoing recipient reconciliation"
+        );
+    }
+
+    #[test]
     fn mackesd_unit_does_not_abort_on_slow_stop() {
         let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
         let dropin =

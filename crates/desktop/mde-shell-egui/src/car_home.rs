@@ -550,9 +550,16 @@ pub fn car_home_panel_with_scheme(
     let media_clicked = paint_media_card(ui, &painter, layout.media_card, glance, palette, accent);
     // The glance card's dominant content is the vehicle telematics summary, so
     // its (full-card, Density::Touch) tap lands on the Vehicle telematics tab.
-    let vehicle_clicked = paint_glance_card(ui, &painter, layout.glance_card, glance, palette, accent);
+    let vehicle_clicked =
+        paint_glance_card(ui, &painter, layout.glance_card, glance, palette, accent);
     let strip_clicked = core::array::from_fn(|index| {
-        paint_app_tile(ui, &painter, layout.strip[index], CarTile::ALL[index], palette)
+        paint_app_tile(
+            ui,
+            &painter,
+            layout.strip[index],
+            CarTile::ALL[index],
+            palette,
+        )
     });
     activated_car_tile(nav_clicked, media_clicked, vehicle_clicked, strip_clicked)
 }
@@ -657,11 +664,27 @@ fn card_header(
 
 /// The Nav card — the largest card: the live route/ETA glance while guidance
 /// runs, else the honest "Where to?" prompt. Tap opens Navigation.
-fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance, palette: mde_egui::StylePalette, accent: Color32) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "nav", "Navigation", palette, accent) else {
+fn paint_nav_card(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    g: &CarHomeGlance,
+    palette: mde_egui::StylePalette,
+    accent: Color32,
+) -> bool {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "nav", "Navigation", palette, accent)
+    else {
         return false;
     };
-    card_header(ui, &p, rect, IconId::MapsLocation, "Navigation", palette, accent);
+    card_header(
+        ui,
+        &p,
+        rect,
+        IconId::MapsLocation,
+        "Navigation",
+        palette,
+        accent,
+    );
     // The glance line — live values read strong, the absent-data prompt reads
     // dim (the honesty cue: a fallback never masquerades as a reading).
     let live = g.nav_value().is_some();
@@ -681,8 +704,16 @@ fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeG
 
 /// The Media card — the now-playing glance (honest "Music & podcasts" when
 /// nothing is loaded). Tap opens Media.
-fn paint_media_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance, palette: mde_egui::StylePalette, accent: Color32) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "media", "Media", palette, accent) else {
+fn paint_media_card(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    g: &CarHomeGlance,
+    palette: mde_egui::StylePalette,
+    accent: Color32,
+) -> bool {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "media", "Media", palette, accent)
+    else {
         return false;
     };
     card_header(ui, &p, rect, IconId::Media, "Media", palette, accent);
@@ -745,8 +776,23 @@ fn glance_row(
 /// The glance card — the vehicle telematics summary (the live MG90 glance when
 /// the gateway drives location) over the comms alert count. Tap opens the
 /// Vehicle telematics tab.
-fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance, palette: mde_egui::StylePalette, accent: Color32) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "glance", "Vehicle telematics", palette, accent) else {
+fn paint_glance_card(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    g: &CarHomeGlance,
+    palette: mde_egui::StylePalette,
+    accent: Color32,
+) -> bool {
+    let Some((p, clicked)) = card_plate(
+        ui,
+        painter,
+        rect,
+        "glance",
+        "Vehicle telematics",
+        palette,
+        accent,
+    ) else {
         return false;
     };
     let inset = Rect::from_min_max(
@@ -786,7 +832,13 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
 
 /// Paint one compact app-strip tile (glyph over label) and return whether it
 /// was tapped this frame.
-fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTile, palette: mde_egui::StylePalette) -> bool {
+fn paint_app_tile(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    tile: CarTile,
+    palette: mde_egui::StylePalette,
+) -> bool {
     if !rect.is_finite() || rect.width() < 2.0 || rect.height() < 2.0 {
         return false;
     }
@@ -1264,11 +1316,8 @@ mod tests {
             vehicle: Some("MG90 stale · no fix".to_string()),
             vehicle_live: false,
         };
-        let canvas = captured_car_home_canvas(
-            &glance,
-            screen_size,
-            mde_egui::StyleColorScheme::Dark,
-        );
+        let canvas =
+            captured_car_home_canvas(&glance, screen_size, mde_egui::StyleColorScheme::Dark);
         let body = car_home_body_rect(screen_size);
         let layout = dashboard_layout(body).expect("pixel proof body lays out");
         let palette = Style::palette_for(mde_egui::StyleColorScheme::Dark);
@@ -1285,8 +1334,7 @@ mod tests {
             layout.nav_card.min + Vec2::splat(Style::SP_L),
             layout.nav_card.max - Vec2::splat(Style::SP_L),
         );
-        let nav_surface_pixels =
-            canvas.count_near_color_in_rect(nav_interior, palette.surface, 1);
+        let nav_surface_pixels = canvas.count_near_color_in_rect(nav_interior, palette.surface, 1);
         let nav_interior_pixels = rect_pixels(nav_interior, &canvas);
         assert!(
             (nav_surface_pixels as f32) >= (nav_interior_pixels as f32 * 0.55),
@@ -1318,8 +1366,7 @@ mod tests {
             vec2(inset.width(), half),
         );
         let vehicle_dim = canvas.count_near_color_in_rect(vehicle_row, palette.text_dim, 24);
-        let vehicle_strong =
-            canvas.count_near_color_in_rect(vehicle_row, palette.text_strong, 24);
+        let vehicle_strong = canvas.count_near_color_in_rect(vehicle_row, palette.text_strong, 24);
         assert!(
             vehicle_dim > 24 && vehicle_dim > vehicle_strong * 2,
             "stale MG90 vehicle text must rasterize dim, not live-strong ({vehicle_dim} dim vs {vehicle_strong} strong pixels)"
@@ -1336,16 +1383,9 @@ mod tests {
     fn car_home_surface_scheme_changes_ground_and_cards_but_keeps_auto_accent() {
         let screen_size = vec2(1024.0, 640.0);
         let glance = CarHomeGlance::default();
-        let dark = captured_car_home_canvas(
-            &glance,
-            screen_size,
-            mde_egui::StyleColorScheme::Dark,
-        );
-        let light = captured_car_home_canvas(
-            &glance,
-            screen_size,
-            mde_egui::StyleColorScheme::Light,
-        );
+        let dark = captured_car_home_canvas(&glance, screen_size, mde_egui::StyleColorScheme::Dark);
+        let light =
+            captured_car_home_canvas(&glance, screen_size, mde_egui::StyleColorScheme::Light);
         let dark_palette = Style::palette_for(mde_egui::StyleColorScheme::Dark);
         let light_palette = Style::palette_for(mde_egui::StyleColorScheme::Light);
         assert!(

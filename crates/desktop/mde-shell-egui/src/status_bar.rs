@@ -1,7 +1,7 @@
 //! `status_bar` — WL-UX-006/U11: Construct's responsive clock/status chrome.
 //!
 //! Authority: `docs/design/platform-interfaces.md` §2.3 (Q12): a ~24px
-//! HIG-style side-rail strip — a centered clock, the mesh/system rollups, and
+//! HIG-style side-rail strip — a centered clock, one health control, and
 //! compact system-control glyphs on the right — plus a Windows-style bottom
 //! clock/tray when the taskbar is in Bottom mode. Both are fed by the existing
 //! [`crate::status`] `StatusSegments` read-model.
@@ -37,22 +37,19 @@
 //!
 //! ## Honest data (§7)
 //!
-//! Right-cluster cells surface exactly what the rollups carry: each daemon
-//! segment's folded severity word, plus the local node's A–F mesh grade. The
-//! Q12 sketch's "battery % / unacked alert count" are NOT in the
-//! `StatusSegments` read-model (rollups carry severity + summary, no numeric
-//! battery or count fields), so no number is fabricated: an absent rollup
-//! renders as a dim "—", never a made-up value (the NOTIF-3 rule, restated).
+//! The health control consumes the typed health snapshot. Its accessible label
+//! and badge carry the exact unacknowledged actionable count; A–F is shown only
+//! inside the centered modal.
 
 use std::time::Duration;
 
 use mde_egui::egui;
-use mde_egui::{GradeBand, Motion, Style, TypographyRole};
+use mde_egui::{Motion, Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
 
-use crate::chrome::NodeGrades;
+use crate::chrome::HealthStatus;
 use crate::construct::ConstructChrome;
-use crate::status::{segment_label, severity_color, severity_label, StatusSegment, StatusSegments};
+use crate::status::StatusSegments;
 use crate::surfaces::{icon_texture, Surface, TOOL_TRAY_SURFACES};
 
 /// The locked strip height (Q12: "~24px").
@@ -63,17 +60,6 @@ pub(crate) const STATUS_BAR_H: f32 = 24.0;
 pub(crate) const BOTTOM_TRAY_W: f32 = 376.0;
 /// Clear space between the taskbar placement control and the tray.
 pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.8;
-
-/// The daemon rollup segments the right cluster surfaces, left→right —
-/// Q12's "mesh grade, network, power, alert count" mapped onto what the
-/// `StatusSegments` read-model actually carries (module doc: Device platform
-/// health · Mesh = the mesh/fleet *network* rollup · Power · Alerts).
-pub(crate) const RIGHT_SEGMENTS: [StatusSegment; 4] = [
-    StatusSegment::Device,
-    StatusSegment::Mesh,
-    StatusSegment::Power,
-    StatusSegment::Alerts,
-];
 
 /// Construct-owned workspaces promoted into the persistent notification/tool
 /// tray. The navigation rail remains intact in both placement modes.
@@ -141,7 +127,6 @@ const STATUS_CLOCK_MIN_W: f32 = Style::SP_XL;
 /// A single status cell is deliberately one line. This cap is generous for
 /// the current fixed labels, but prevents a future daemon-provided label from
 /// turning the rail into an unbounded layout job.
-const STATUS_CELL_TEXT_MAX_W: f32 = 128.0;
 const MAX_STATUS_TEXT_CHARS: usize = 256;
 
 fn is_status_format_control(ch: char) -> bool {
@@ -396,61 +381,6 @@ pub(crate) const fn status_bar_visible(env: StatusBarEnv) -> bool {
     !env.curtain_engaged && !env.car && !env.immersive_app
 }
 
-/// One right-cluster segment cell, folded pure from the rollups (§7).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RightCell {
-    /// The daemon segment this cell reads.
-    pub segment: StatusSegment,
-    /// `"{label} {severity-word}"` when the rollup exists, `"{label} —"` when
-    /// it honestly does not.
-    pub text: String,
-    /// The severity dot tint ([`severity_color`]; dim when absent).
-    pub dot: egui::Color32,
-    /// Whether a rollup backs the cell (drives the text tint).
-    pub present: bool,
-}
-
-/// Fold the four daemon rollups into their compact cells. Absent rollup →
-/// a dim "—" cell, never a fabricated state (module doc).
-#[must_use]
-pub(crate) fn right_cells(segments: &StatusSegments) -> Vec<RightCell> {
-    RIGHT_SEGMENTS
-        .into_iter()
-        .map(|segment| {
-            let rollup = segments.get(segment);
-            let value = rollup.map_or("—", |r| severity_label(Some(r)));
-            let text = format!("{} {value}", segment_label(segment));
-            RightCell {
-                segment,
-                text: safe_status_text(&text),
-                dot: severity_color(rollup),
-                present: rollup.is_some(),
-            }
-        })
-        .collect()
-}
-
-/// The local node's A–F mesh grade glyph `(letter, band colour)` — the same
-/// fold as `status::local_grade_label`/`local_grade_color` (private there;
-/// replicated over the shared [`GradeBand`] so "which score is which grade"
-/// still lives ONCE in `mde_egui`). Missing or stale local row → a dim "—",
-/// never a fake letter (the NODE-GRADE-2 #17 rule).
-#[must_use]
-pub(crate) fn mesh_grade_cell(grades: &NodeGrades) -> (String, egui::Color32) {
-    grades
-        .rows
-        .iter()
-        .find(|row| row.is_local)
-        .filter(|row| !row.stale)
-        .map_or_else(
-            || ("—".to_string(), Style::TEXT_DIM),
-            |row| {
-                let band = GradeBand::from_score(f32::from(row.score));
-                (band.letter().to_string(), band.color())
-            },
-        )
-}
-
 /// Stable id of the strip's Area.
 fn status_bar_area_id() -> egui::Id {
     egui::Id::new("construct-status-bar")
@@ -461,9 +391,9 @@ pub(crate) fn status_bar_clock_id() -> egui::Id {
     egui::Id::new(("construct-status-bar", "clock"))
 }
 
-/// Stable id of the right rollup cluster (the Control Center trigger).
-pub(crate) fn status_bar_right_cluster_id() -> egui::Id {
-    egui::Id::new(("construct-status-bar", "right-cluster"))
+/// Stable id of the one health control in a taskbar placement.
+fn health_status_id(placement: &'static str) -> egui::Id {
+    egui::Id::new(("system-mesh-health", placement))
 }
 
 /// Mount the strip — called every frame from `main.rs`'s
@@ -472,10 +402,10 @@ pub fn mount(
     ctx: &egui::Context,
     construct: &mut ConstructChrome,
     segments: &StatusSegments,
-    grades: &NodeGrades,
+    health: &HealthStatus,
     env: StatusBarEnv,
 ) {
-    mount_top_with_active(ctx, construct, segments, grades, env, 1.0, None);
+    mount_top_with_active(ctx, construct, segments, health, env, 1.0, None);
 }
 
 /// Mount the current top-strip treatment with an explicit cross-fade weight.
@@ -485,18 +415,18 @@ pub(crate) fn mount_top(
     ctx: &egui::Context,
     construct: &mut ConstructChrome,
     segments: &StatusSegments,
-    grades: &NodeGrades,
+    health: &HealthStatus,
     env: StatusBarEnv,
     opacity: f32,
 ) {
-    mount_top_with_active(ctx, construct, segments, grades, env, opacity, None);
+    mount_top_with_active(ctx, construct, segments, health, env, opacity, None);
 }
 
 pub(crate) fn mount_top_with_active(
     ctx: &egui::Context,
     construct: &mut ConstructChrome,
     segments: &StatusSegments,
-    grades: &NodeGrades,
+    health: &HealthStatus,
     env: StatusBarEnv,
     opacity: f32,
     active_surface: Option<Surface>,
@@ -542,7 +472,7 @@ pub(crate) fn mount_top_with_active(
             // hit regions outside the reserved 24px band on narrow surfaces.
             ui.set_clip_rect(bar);
             ui.set_opacity(t);
-            strip(ui, bar, construct, segments, grades, active_surface);
+            strip(ui, bar, construct, segments, health, active_surface);
         });
 }
 
@@ -699,7 +629,7 @@ fn bottom_tray(
     ui: &egui::Ui,
     tray: egui::Rect,
     construct: &mut ConstructChrome,
-    segments: &StatusSegments,
+    _segments: &StatusSegments,
     opacity: f32,
     active_surface: Option<Surface>,
 ) {
@@ -795,38 +725,14 @@ fn bottom_tray(
         Style::NAV_BAR_ICON,
     );
 
-    let health = egui::pos2(
-        panel.left() + workspace_rect.width() + 8.0,
-        panel.center().y,
+    let health_rect = egui::Rect::from_min_size(
+        egui::pos2(panel.left() + workspace_rect.width(), panel.top()),
+        egui::vec2(34.0, panel.height()),
     );
-    let mesh_color = severity_color(segments.get(StatusSegment::Mesh));
-    painter.circle_filled(health, 4.4, mesh_color.gamma_multiply(opacity));
-    let health_response = ui.interact(
-        egui::Rect::from_center_size(health, egui::vec2(26.4, 35.2)),
-        egui::Id::new(("construct-bottom-system-tray", "mesh-health")),
-        egui::Sense::click(),
-    );
-    health_response.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::Button,
-            ui.is_enabled(),
-            format!(
-                "This Node health: {} — open hardware center",
-                severity_label(segments.get(StatusSegment::Mesh))
-            ),
-        )
-    });
-    if health_response.clicked() {
-        // WL-UX-011 — the global health authority drills into the unified
-        // This Node center. The typed one-frame workspace handoff keeps the
-        // status bar independent of shell navigation while preserving a single
-        // route owner in `Shell::mount_status_bar_slot`.
-        construct.request_workspace_tray(crate::surfaces::Surface::ThisNode);
-        construct.control_center_open = false;
-    }
+    paint_health_status(ui, health_rect, construct, opacity, "bottom");
 
     let icon_right = clock.left() - Style::SP_XS;
-    let icon_left = health.x + 11.0;
+    let icon_left = health_rect.right() + Style::SP_XS;
     let icon_space = icon_right - icon_left - Style::SP_XS * 2.2;
     if icon_space > 0.0 {
         let icon_width = (icon_space / 3.0).max(1.0);
@@ -882,6 +788,81 @@ fn bottom_tray(
     ));
 }
 
+/// Paint the same accessible System and Mesh Health icon in either taskbar
+/// placement. The ring reads calm at zero; warning/critical states use the
+/// shared semantic palette and carry the exact numeric badge.
+fn paint_health_status(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    construct: &mut ConstructChrome,
+    opacity: f32,
+    placement: &'static str,
+) {
+    let response = ui.interact(rect, health_status_id(placement), egui::Sense::click());
+    let count = construct.health_count;
+    let label = health_status_label(construct.health_fresh, count);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
+    });
+    let response = response.on_hover_text(label);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(
+            rect.shrink(2.0),
+            Style::RADIUS_S,
+            Style::SURFACE_HI.gamma_multiply(opacity),
+        );
+    }
+    let color = match construct.health_severity {
+        Some(mackes_mesh_types::health::HealthSeverity::Critical) => Style::SUPPORT_ERROR,
+        Some(mackes_mesh_types::health::HealthSeverity::Warning) => Style::SUPPORT_WARNING,
+        None if construct.health_fresh => Style::SUPPORT_SUCCESS,
+        None => Style::TEXT_DIM,
+    }
+    .gamma_multiply(opacity);
+    let center = rect.center();
+    painter.circle_stroke(center, 6.2, egui::Stroke::new(1.8, color));
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 3.0, center.y),
+            egui::pos2(center.x - 0.5, center.y + 2.5),
+        ],
+        egui::Stroke::new(1.6, color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 0.5, center.y + 2.5),
+            egui::pos2(center.x + 3.8, center.y - 3.0),
+        ],
+        egui::Stroke::new(1.6, color),
+    );
+    if count > 0 {
+        let badge = egui::pos2(rect.right() - 6.0, rect.top() + 7.0);
+        painter.circle_filled(badge, 6.0, color);
+        painter.text(
+            badge,
+            egui::Align2::CENTER_CENTER,
+            count.to_string(),
+            Style::typography_font(TypographyRole::Caption),
+            Style::BG,
+        );
+    }
+    if response.clicked() {
+        construct.open_health();
+    }
+}
+
+fn health_status_label(fresh: bool, count: usize) -> String {
+    if fresh {
+        format!(
+            "System and Mesh Health: {count} active unacknowledged {}",
+            if count == 1 { "issue" } else { "issues" }
+        )
+    } else {
+        "System and Mesh Health: evidence stale".to_string()
+    }
+}
+
 /// Paint + interact the strip body. Absolute screen-space rects throughout
 /// (the dock's WIN7-DESKTOP-1 lesson: an Area's `fixed_pos` only seeds the Ui,
 /// `ui.painter()`/`ui.interact` stay absolute).
@@ -889,8 +870,8 @@ fn strip(
     ui: &egui::Ui,
     bar: egui::Rect,
     construct: &mut ConstructChrome,
-    segments: &StatusSegments,
-    grades: &NodeGrades,
+    _segments: &StatusSegments,
+    _health: &HealthStatus,
     active_surface: Option<Surface>,
 ) {
     let painter = ui.painter().clone();
@@ -903,7 +884,6 @@ fn strip(
         egui::Stroke::new(1.0, Style::BORDER),
     );
     let cy = bar.center().y;
-    let time_role = TypographyRole::Label;
     // ── Center cluster: the one authoritative clock ────────────────────────
     let controls_rect = status_controls_rect(bar);
     let now = crate::timers::display_unix();
@@ -944,31 +924,9 @@ fn strip(
         construct.notification_center_open = !construct.notification_center_open;
     }
 
-    // ── Right cluster: rollups, then the three compact system controls ─────
-    let (grade_text, grade_color) = mesh_grade_cell(grades);
-    let cells = right_cells(segments);
-    let dot_r = Style::SP_XS;
-    let grade_w = Style::SP_S * 2.0;
-    let mut cluster_w = grade_w;
-    let cell_widths: Vec<f32> = cells
-        .iter()
-        .map(|cell| {
-            let text_w = finite_non_negative(
-                painter
-                    .layout_job(status_text_job(
-                        cell.text.clone(),
-                        time_role,
-                        Style::TEXT,
-                        STATUS_CELL_TEXT_MAX_W,
-                    ))
-                    .size()
-                    .x,
-            );
-            let w = dot_r * 2.0 + Style::SP_XS + text_w;
-            cluster_w += Style::SP_S + w;
-            w
-        })
-        .collect();
+    // One logical health affordance replaces the grade/status cluster. The
+    // grade stays available in the modal, while the badge is the exact active,
+    // unacknowledged actionable count.
     let workspace_rect = workspace_tray_rect(bar, clock_rect);
     let cluster_rect = bounded_cluster_rect(
         bar,
@@ -977,74 +935,9 @@ fn strip(
             egui::pos2(bar.left(), bar.top()),
             egui::pos2(workspace_rect.left(), bar.bottom()),
         ),
-        cluster_w,
+        36.0,
     );
-    let cluster = ui.interact(
-        cluster_rect,
-        status_bar_right_cluster_id(),
-        egui::Sense::click(),
-    );
-    cluster.widget_info(|| {
-        let summary: Vec<&str> = cells.iter().map(|c| c.text.as_str()).collect();
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::Button,
-            ui.is_enabled(),
-            format!(
-                "System status: grade {grade_text}, {} — Control Center",
-                summary.join(", ")
-            ),
-        )
-    });
-    if cluster.hovered() {
-        painter.rect_filled(cluster_rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
-    }
-    let cluster_painter = painter.with_clip_rect(cluster_rect);
-    let mut x = cluster_rect.left();
-    // The grade glyph — the letter over its band-coloured pip (the dock's
-    // local-grade idiom, shrunk to the strip).
-    let grade_center = egui::pos2(x + Style::SP_S, cy);
-    cluster_painter.circle_filled(grade_center, Style::SP_S, grade_color);
-    cluster_painter.text(
-        grade_center,
-        egui::Align2::CENTER_CENTER,
-        &grade_text,
-        Style::typography_font(TypographyRole::Caption),
-        Style::BG,
-    );
-    x += grade_w;
-    for (cell, w) in cells.iter().zip(cell_widths) {
-        x += Style::SP_S;
-        cluster_painter.circle_filled(egui::pos2(x + dot_r, cy), dot_r, cell.dot);
-        let cell_galley = cluster_painter.layout_job(status_text_job(
-            cell.text.clone(),
-            time_role,
-            if cell.present {
-                Style::TEXT
-            } else {
-                Style::TEXT_DIM
-            },
-            STATUS_CELL_TEXT_MAX_W,
-        ));
-        cluster_painter.galley(
-            egui::pos2(
-                x + dot_r * 2.0 + Style::SP_XS,
-                cy - cell_galley.size().y / 2.0,
-            ),
-            cell_galley,
-            if cell.present {
-                Style::TEXT
-            } else {
-                Style::TEXT_DIM
-            },
-        );
-        x += w;
-    }
-    if cluster.clicked() {
-        // WL-UX-011 — the grade/status cluster is the existing global health
-        // authority; selecting it opens the unified This Node hardware center.
-        construct.request_workspace_tray(crate::surfaces::Surface::ThisNode);
-        construct.control_center_open = false;
-    }
+    paint_health_status(ui, cluster_rect, construct, 1.0, "top");
 
     paint_workspace_tray(
         ui,
@@ -1103,8 +996,7 @@ fn strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chrome::{GradeRow, GradeTrend};
-    use crate::status::SegmentRollup;
+    use crate::chrome::HealthStatus;
 
     fn visible_env() -> StatusBarEnv {
         StatusBarEnv {
@@ -1114,38 +1006,13 @@ mod tests {
         }
     }
 
-    fn rollup(segment: &str, severity: &str) -> SegmentRollup {
-        SegmentRollup {
-            segment: segment.to_string(),
-            severity: severity.to_string(),
-            source: "unit".to_string(),
-            summary: "unit summary".to_string(),
-            host: "local".to_string(),
-            critical_policy: "none".to_string(),
-            ts_unix_ms: 0,
-        }
-    }
-
-    fn local_grade(score: u8, stale: bool) -> NodeGrades {
-        NodeGrades {
-            rows: vec![GradeRow {
-                host: "local".to_string(),
-                score,
-                trend: GradeTrend::Steady,
-                is_local: true,
-                stale,
-            }],
-            seen: true,
-        }
-    }
-
     /// Drive ONE headless frame of the strip through the house `Context::run`
     /// harness, minus the stand-in surface.
     fn drive(
         ctx: &egui::Context,
         construct: &mut ConstructChrome,
         segments: &StatusSegments,
-        grades: &NodeGrades,
+        grades: &HealthStatus,
         env: StatusBarEnv,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
@@ -1164,7 +1031,7 @@ mod tests {
         ctx: &egui::Context,
         construct: &mut ConstructChrome,
         segments: &StatusSegments,
-        grades: &NodeGrades,
+        grades: &HealthStatus,
         env: StatusBarEnv,
         screen: egui::Rect,
         events: Vec<egui::Event>,
@@ -1203,7 +1070,7 @@ mod tests {
         ctx: &egui::Context,
         construct: &mut ConstructChrome,
         segments: &StatusSegments,
-        grades: &NodeGrades,
+        grades: &HealthStatus,
         pos: egui::Pos2,
     ) {
         click_at(
@@ -1220,7 +1087,7 @@ mod tests {
         ctx: &egui::Context,
         construct: &mut ConstructChrome,
         segments: &StatusSegments,
-        grades: &NodeGrades,
+        grades: &HealthStatus,
         screen: egui::Rect,
         pos: egui::Pos2,
     ) {
@@ -1294,12 +1161,24 @@ mod tests {
             "the Windows-style clock must remain a reachable tray target"
         );
         assert!(
-            ctx.read_response(egui::Id::new((
-                "construct-bottom-system-tray",
-                "mesh-health"
-            )))
-            .is_some(),
+            ctx.read_response(health_status_id("bottom")).is_some(),
             "mesh health must remain a keyboard/click reachable target"
+        );
+    }
+
+    #[test]
+    fn health_accessibility_copy_is_exact_and_never_calls_stale_data_zero() {
+        assert_eq!(
+            health_status_label(true, 0),
+            "System and Mesh Health: 0 active unacknowledged issues"
+        );
+        assert_eq!(
+            health_status_label(true, 1),
+            "System and Mesh Health: 1 active unacknowledged issue"
+        );
+        assert_eq!(
+            health_status_label(false, 0),
+            "System and Mesh Health: evidence stale"
         );
     }
 
@@ -1415,71 +1294,12 @@ mod tests {
     }
 
     #[test]
-    fn right_cells_render_rollups_honestly() {
-        // Absent rollups → dim "—" cells, never a fabricated state (§7).
-        let empty = right_cells(&StatusSegments::default());
-        assert_eq!(empty.len(), RIGHT_SEGMENTS.len());
-        for cell in &empty {
-            assert!(cell.text.ends_with('—'), "{}", cell.text);
-            assert!(!cell.present);
-            assert_eq!(cell.dot, Style::TEXT_DIM);
-        }
-        // A live rollup folds to its severity word + tone.
-        let segments = StatusSegments {
-            mesh: Some(rollup("mesh", "warning")),
-            seen: true,
-            ..StatusSegments::default()
-        };
-        let mesh = right_cells(&segments)
-            .into_iter()
-            .find(|c| c.segment == StatusSegment::Mesh)
-            .expect("mesh cell folded");
-        assert_eq!(mesh.text, "Mesh warning");
-        assert!(mesh.present);
-        assert_eq!(mesh.dot, Style::SUPPORT_WARNING);
-
-        // The wire severity is untrusted, but the rail exposes only the
-        // canonical severity vocabulary — no control or bidi payload leaks
-        // into painted or accessible status text.
-        let hostile = StatusSegments {
-            alerts: Some(rollup("alerts", "critical\n\u{202e}")),
-            seen: true,
-            ..StatusSegments::default()
-        };
-        let alerts = right_cells(&hostile)
-            .into_iter()
-            .find(|c| c.segment == StatusSegment::Alerts)
-            .expect("alerts cell folded");
-        assert_eq!(alerts.text, "Alerts unknown");
-    }
-
-    #[test]
-    fn the_mesh_grade_cell_folds_the_local_row_honestly() {
-        let (letter, color) = mesh_grade_cell(&local_grade(95, false));
-        assert_eq!(letter, "A");
-        assert_eq!(color, GradeBand::A.color());
-        // Stale or missing local rows show a dim "—", never a fake letter.
-        assert_eq!(
-            mesh_grade_cell(&local_grade(95, true)),
-            ("—".to_string(), Style::TEXT_DIM)
-        );
-        assert_eq!(
-            mesh_grade_cell(&NodeGrades::default()),
-            ("—".to_string(), Style::TEXT_DIM)
-        );
-    }
-
-    #[test]
-    fn the_strip_renders_the_clock_and_a_rollup_cell() {
+    fn the_strip_renders_clock_without_old_rollup_or_grade_text() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
-        let segments = StatusSegments {
-            mesh: Some(rollup("mesh", "warning")),
-            seen: true,
-            ..StatusSegments::default()
-        };
-        let grades = local_grade(95, false);
+        let segments = StatusSegments::default();
+        let grades = HealthStatus::default();
         let _ = drive(
             &ctx,
             &mut construct,
@@ -1519,15 +1339,8 @@ mod tests {
             }),
             "no clock text painted: {texts:?}"
         );
-        // At least one rollup cell + the grade letter.
-        assert!(
-            texts.iter().any(|t| t == "Mesh warning"),
-            "no mesh rollup cell painted: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t == "A"),
-            "no mesh grade glyph painted: {texts:?}"
-        );
+        assert!(!texts.iter().any(|t| t == "Mesh warning"));
+        assert!(!texts.iter().any(|t| t == "A"));
         // Non-empty tessellation — the strip reaches real draw primitives.
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "the strip painted no draw primitives");
@@ -1539,7 +1352,7 @@ mod tests {
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
         let segments = StatusSegments::default();
-        let grades = NodeGrades::default();
+        let grades = HealthStatus::default();
         let _ = drive(
             &ctx,
             &mut construct,
@@ -1580,12 +1393,12 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_right_cluster_drills_into_this_node_health_center() {
+    fn clicking_the_health_control_opens_the_centered_modal() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
         let segments = StatusSegments::default();
-        let grades = NodeGrades::default();
+        let grades = HealthStatus::default();
         let _ = drive(
             &ctx,
             &mut construct,
@@ -1613,15 +1426,14 @@ mod tests {
             Vec::new(),
         );
         let pos = ctx
-            .read_response(status_bar_right_cluster_id())
-            .expect("right cluster registered")
+            .read_response(health_status_id("top"))
+            .expect("health control registered")
             .rect
             .center();
         click(&ctx, &mut construct, &segments, &grades, pos);
-        assert_eq!(
-            construct.take_workspace_tray_target(),
-            Some(crate::surfaces::Surface::ThisNode),
-            "cluster click drills into This Node"
+        assert!(
+            construct.health_modal_open,
+            "health control opens the modal"
         );
         assert!(
             !construct.control_center_open,
@@ -1754,7 +1566,7 @@ mod tests {
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
         let segments = StatusSegments::default();
-        let grades = NodeGrades::default();
+        let grades = HealthStatus::default();
 
         for _ in 0..3 {
             let _ = drive_at(
@@ -1770,7 +1582,7 @@ mod tests {
 
         for (label, id) in [
             ("clock", status_bar_clock_id()),
-            ("rollups", status_bar_right_cluster_id()),
+            ("health", health_status_id("top")),
         ] {
             let response = ctx
                 .read_response(id)
@@ -1831,7 +1643,7 @@ mod tests {
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
         let segments = StatusSegments::default();
-        let grades = NodeGrades::default();
+        let grades = HealthStatus::default();
         for _ in 0..3 {
             let _ = drive(
                 &ctx,
@@ -1882,7 +1694,7 @@ mod tests {
             Style::install(&ctx);
             let mut construct = ConstructChrome::default();
             let segments = StatusSegments::default();
-            let grades = NodeGrades::default();
+            let grades = HealthStatus::default();
             let out = drive(&ctx, &mut construct, &segments, &grades, env, Vec::new());
             let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
             assert!(
@@ -1903,7 +1715,7 @@ mod tests {
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
         let segments = StatusSegments::default();
-        let grades = NodeGrades::default();
+        let grades = HealthStatus::default();
 
         for _ in 0..3 {
             let _ = drive(

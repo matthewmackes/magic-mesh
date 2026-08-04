@@ -30,14 +30,25 @@ class SeatSpec:
     user: str
     ssh_auth: str
     privilege: str
+    proxy_jump: str | None = None
+
+
+def seat_address(label: str, default: str) -> str:
+    """Allow a DHCP-renumbered seat to be tested without changing the harness."""
+    return os.environ.get(f"MCNF_FIVE_SEAT_{label.upper()}_ADDRESS", default)
+
+
+def seat_proxy_jump(label: str) -> str | None:
+    """Route a seat through a reachable mesh peer when its LAN path is absent."""
+    return os.environ.get(f"MCNF_FIVE_SEAT_{label.upper()}_PROXY_JUMP")
 
 
 SEATS = (
-    SeatSpec("t480", "172.20.146.138", "mm", "password", "sudo-password"),
-    SeatSpec("eagle", "172.20.146.145", "mm", "password", "sudo-password"),
-    SeatSpec("basement", "172.20.0.15", "root", "key", "root"),
-    SeatSpec("dell", "172.20.146.225", "mm", "key", "sudo-n"),
-    SeatSpec("surface", "172.20.146.79", "root", "password", "root"),
+    SeatSpec("t480", seat_address("t480", "172.20.146.82"), "mm", "password", "sudo-password", seat_proxy_jump("t480")),
+    SeatSpec("eagle", seat_address("eagle", "172.20.146.83"), "mm", "password", "sudo-password", seat_proxy_jump("eagle")),
+    SeatSpec("basement", seat_address("basement", "172.20.0.15"), "root", "key", "root", seat_proxy_jump("basement")),
+    SeatSpec("dell", seat_address("dell", "172.20.146.225"), "mm", "key", "sudo-n", seat_proxy_jump("dell")),
+    SeatSpec("surface", seat_address("surface", "172.20.146.79"), "root", "password", "root", seat_proxy_jump("surface")),
 )
 
 SSH_COMMON = (
@@ -47,9 +58,9 @@ SSH_COMMON = (
     "-o", "ServerAliveCountMax=2",
 )
 ACCEPTANCE_BASE = (
-    "systemd-run --quiet --wait --pipe --collect "
+    "systemd-run --quiet --wait --collect "
     "-p LoadCredentialEncrypted=cloud-arm-key:/etc/credstore.encrypted/cloud-arm-key "
-    "-p Environment=MDE_BUS_ROOT=/run/mde-bus /usr/bin/mde-shell-egui"
+    "-p Environment=MDE_BUS_ROOT=/run/mde-bus"
 )
 
 
@@ -65,10 +76,11 @@ class Seat:
         self.hostname = ""
 
     def _ssh(self) -> list[str]:
+        route = ["-J", self.spec.proxy_jump] if self.spec.proxy_jump else []
         if self.spec.ssh_auth == "password":
-            return ["sshpass", "-f", str(args.password_file), "ssh", *SSH_COMMON,
+            return ["sshpass", "-f", str(args.password_file), "ssh", *SSH_COMMON, *route,
                     f"{self.spec.user}@{self.spec.address}"]
-        return ["ssh", "-i", str(self.key), *SSH_COMMON,
+        return ["ssh", "-i", str(self.key), *SSH_COMMON, *route,
                 f"{self.spec.user}@{self.spec.address}"]
 
     def run(
@@ -103,9 +115,29 @@ class Seat:
         return result
 
     def acceptance(self, verb: str, payload: str = "", argument: str | None = None) -> dict:
-        command = f"{ACCEPTANCE_BASE} {shlex.quote(verb)}"
+        transport_id = uuid.uuid4().hex
+        input_path = f"/run/mde-five-seat-accept-{transport_id}.in"
+        output_path = f"/run/mde-five-seat-accept-{transport_id}.out"
+        error_path = f"/run/mde-five-seat-accept-{transport_id}.err"
+        service = (
+            f"{ACCEPTANCE_BASE} "
+            f"-p StandardInput=file:{input_path} "
+            f"-p StandardOutput=file:{output_path} "
+            f"-p StandardError=file:{error_path} "
+            f"/usr/bin/mde-shell-egui {shlex.quote(verb)}"
+        )
         if argument is not None:
-            command += f" {shlex.quote(argument)}"
+            service += f" {shlex.quote(argument)}"
+        command = (
+            "umask 077; "
+            f"dd of={shlex.quote(input_path)} status=none; "
+            f"status=0; {service} || status=$?; "
+            f"test ! -s {shlex.quote(output_path)} || cat {shlex.quote(output_path)}; "
+            f"if test \"$status\" -ne 0 && test -s {shlex.quote(error_path)}; then "
+            f"cat {shlex.quote(error_path)} >&2; fi; "
+            f"rm -f -- {shlex.quote(input_path)} {shlex.quote(output_path)} {shlex.quote(error_path)}; "
+            "exit \"$status\""
+        )
         result = self.run(
             command,
             payload=payload.encode(),
@@ -148,7 +180,7 @@ def wait_for(description: str, predicate, timeout: int = 75, interval: float = 1
             value = predicate()
             if value:
                 return value
-        except (Failure, json.JSONDecodeError, OSError) as error:
+        except (Failure, json.JSONDecodeError, OSError, subprocess.TimeoutExpired) as error:
             last_error = error
         time.sleep(interval)
     suffix = f"; last error: {last_error}" if last_error else ""

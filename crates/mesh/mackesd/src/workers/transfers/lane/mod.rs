@@ -672,7 +672,6 @@ struct RsyncPlan {
     args: Vec<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SftpPlan {
     direction: SftpDirection,

@@ -21,8 +21,8 @@
 //!
 //! **Scope now covers DEVMGR-2 through DEVMGR-7** — the by-type tree + header card +
 //! local read (DEVMGR-2), plus the bottom **detail drawer** (General / Driver /
-//! Details / Events / Resources, #9/#10), the **MDM problem-code parity** (#11 —
-//! `DeviceStatus` → Windows Code 28/22/10 with the honest Linux reason beside it),
+//! Details / Events / Resources, #9/#10), with neutral device state and the
+//! honest Linux reason beside it,
 //! and the About chrome refactored onto the shared
 //! [`mde_egui::menubar::MenuBar`] — About is the **14th / last MENUBAR-ALL
 //! surface**, so its bespoke Action/View/Help bar is replaced by the shared
@@ -33,7 +33,7 @@
 //!
 //! **DEVMGR-4 adds the host rail + mesh-node switching** — a persistent left rail
 //! lists every peer that has published a `device-inventory/<host>.json` (via
-//! [`device_inventory::read_all`]) with a health/freshness status dot + the local
+//! [`device_inventory::read_all`]) with freshness metadata + the local
 //! "you are here" marker; selecting one loads THAT host's snapshot instantly and a
 //! live-refresh button re-reads it (#5/#7). The tree, header card, drawer + status
 //! cluster all reflect the **selected** host; local is the default on open. A host
@@ -57,8 +57,8 @@
 //! serde-serializes the live [`DeviceInventory`] (round-trips the §6 contract); the
 //! Markdown report mirrors the on-screen tree — the rich host header, then per
 //! category (By type) or per bus / controller (By connection) device rows carrying
-//! the same DEVMGR-3 problem-code + status text the drawer shows
-//! ([`device_status_display`]). No native file-save dialog seam exists on this DRM
+//! the same neutral state and evidence text the drawer shows. No native file-save
+//! dialog seam exists on this DRM
 //! seat, so a write lands at a deterministic `$XDG_DATA_HOME`/`~/.local/share/mde/
 //! device-inventory/<host>-<view>.<ext>` path ([`export_dir`]) and confirms on the
 //! shared KIRON toast lane; a failed write raises an error toast, never a silent
@@ -108,11 +108,10 @@
 //! devices, By-node re-roots the WHOLE fleet: every published host (via
 //! [`device_inventory::read_all`], the same read the rail uses) becomes a
 //! top-level branch with its devices nested beneath it (sub-grouped by category),
-//! so an operator scans every node's hardware in one tree. Hosts with a device in
-//! a problem state sort to the top ([`build_node_tree`]) and each carries a
-//! per-host `⚠ N` badge. A host that has published nothing renders an honest dim
+//! so an operator scans every node's hardware in one tree. Hosts remain in a
+//! neutral alphabetical order without a health rank or badge. A host that has published nothing renders an honest dim
 //! "no inventory" leaf, never a fabricated tree (§7). The device rows, status
-//! dots, problem codes, detail drawer + context menu are the DEVMGR-2..8 seams
+//! freshness dots, detail drawer + context menu are the DEVMGR-2..8 seams
 //! verbatim; only the outer nesting changes. In By-node the DEVMGR-4 rail
 //! selection is cross-fleet-wide: the tree shows all hosts with the rail-selected
 //! one accented, and clicking a device on another host is an honest cross-fleet
@@ -345,8 +344,8 @@ enum ViewMode {
     /// each record's sysfs path. Wired.
     ByConnection,
     /// The cross-fleet flatten of every host's devices (DEVMGR-10) — every
-    /// published host a top-level branch, its devices nested beneath, problem
-    /// hosts first ([`build_node_tree`]). Wired.
+    /// published host a top-level branch, its devices nested beneath in neutral
+    /// alphabetical order ([`build_node_tree`]). Wired.
     ByNode,
 }
 
@@ -420,7 +419,7 @@ impl ExportFormat {
 /// (§7), never a fabricated value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DrawerTab {
-    /// Identity + the MDM device-status box (name/vendor/model + problem code).
+    /// Neutral identity (name/vendor/model).
     #[default]
     General,
     /// The bound kernel driver / module + its version.
@@ -535,21 +534,6 @@ fn find_device<'a>(inv: &'a DeviceInventory, sel: &DeviceSelection) -> Option<&'
         .and_then(|c| c.devices.iter().find(|d| sel.matches(&c.key, d)))
 }
 
-/// The Windows-MDM problem code a Linux [`DeviceStatus`] maps to (#11) — the
-/// faithful *emulation* the design locks: no-driver → **Code 28**, disabled →
-/// **Code 22**, degraded/error → **Code 10**. [`Ok`](DeviceStatus::Ok) and
-/// [`Unknown`](DeviceStatus::Unknown) carry no code (an honest unknown is never
-/// dressed as a fabricated Windows code — design "Risks"). Pure, so the mapping is
-/// unit-tested without a render.
-const fn problem_code(status: DeviceStatus) -> Option<u32> {
-    match status {
-        DeviceStatus::NoDriver => Some(28),
-        DeviceStatus::Disabled => Some(22),
-        DeviceStatus::Degraded => Some(10),
-        DeviceStatus::Ok | DeviceStatus::Unknown => None,
-    }
-}
-
 /// How fresh a host's published inventory is (the rail's honest dim/stale/offline,
 /// design §7) — derived purely from the snapshot's publish time vs now, so the
 /// classification is unit-tested without a clock or a render.
@@ -658,8 +642,6 @@ struct HostEntry {
     published_at_ms: Option<u64>,
     /// Device count in the newest snapshot (0 for an absent host).
     device_count: usize,
-    /// Problem-status device count in the newest snapshot (0 for an absent host).
-    problem_count: usize,
 }
 
 impl HostEntry {
@@ -671,7 +653,6 @@ impl HostEntry {
             kind: HostKind::Node,
             published_at_ms: Some(inv.published_at_ms),
             device_count: inv.device_count(),
-            problem_count: inv.problem_count(),
         }
     }
 
@@ -684,7 +665,6 @@ impl HostEntry {
             kind: HostKind::Node,
             published_at_ms: None,
             device_count: 0,
-            problem_count: 0,
         }
     }
 
@@ -696,7 +676,6 @@ impl HostEntry {
             kind: host.kind,
             published_at_ms: Some(host.inventory.published_at_ms),
             device_count: host.inventory.device_count(),
-            problem_count: host.inventory.problem_count(),
         }
     }
 
@@ -1061,8 +1040,8 @@ fn read_vehicles(bus_root: Option<&Path>) -> Vec<VehicleState> {
 }
 
 /// Map a unit's health token onto an honest device status: a reported
-/// degraded/critical tier is a real problem (Code 10 with the real tier as the
-/// reason); `unreachable` is an honest [`Unknown`](DeviceStatus::Unknown); a
+/// degraded/critical tier remains raw provider metadata; `unreachable` is an
+/// honest [`Unknown`](DeviceStatus::Unknown); a
 /// healthy / absent / unrecognized tier stays plain-present (never a fabricated
 /// fault, §7).
 fn unit_status(health: Option<&str>) -> (DeviceStatus, Option<String>) {
@@ -1567,14 +1546,36 @@ impl Default for DeviceManagerState {
 }
 
 impl DeviceManagerState {
-    /// Re-read the substrate now — the host rail (every peer's freshness + health)
+    /// Open one inventory record from the central health modal's typed deep link.
+    pub(crate) fn open_health_device(&mut self, host: &str, stable_key: &str) {
+        self.select_host(host.to_string());
+        let selection = self.inventory.as_ref().and_then(|inventory| {
+            inventory.categories.iter().find_map(|category| {
+                category.devices.iter().find_map(|device| {
+                    let key = device
+                        .sysfs_path
+                        .as_deref()
+                        .unwrap_or(&device.name)
+                        .replace(['/', ':', ' '], "-");
+                    (key == stable_key).then(|| DeviceSelection::of(&category.key, device))
+                })
+            })
+        });
+        if let Some(selection) = selection {
+            self.expanded.insert(selection.category.clone());
+            self.selected = Some(selection);
+            self.active_tab = DrawerTab::General;
+        }
+    }
+
+    /// Re-read the substrate now — the host rail (every peer's inventory freshness)
     /// and the **selected** host's inventory in one [`device_inventory::read_all`]
     /// (#5/#7). An absent / half-replicated / unreadable file reads as an honest
     /// `None` (never a panic); `seen` flips true so the surface leaves the pre-poll
     /// state. The Scan action, the rail's live-refresh, host switching, and the
     /// cadence [`poll`](Self::poll) all land here.
     fn refresh(&mut self) {
-        // One dir read serves the rail (every peer's freshness/health), the
+        // One dir read serves the rail (every peer's inventory freshness), the
         // selected host's tree (found in the same set — no second file read), AND
         // the By-node cross-fleet flatten (which keeps the whole set, DEVMGR-10).
         let all = device_inventory::read_all(&self.workgroup_root);
@@ -2174,11 +2175,10 @@ impl DeviceManagerState {
         Some((sel.category.as_str(), dev))
     }
 
-    /// The live status cluster (MENUBAR-ALL lock 6): **host · N devices · M problems
-    /// · scanned-time**, all off real state (§7). The host chip tints Info when an
+    /// The live neutral inventory cluster: **host · N devices · scanned-time**,
+    /// all off real state (§7). The host chip tints Info when an
     /// inventory has loaded, Warn once a read found nothing, Neutral before the first
-    /// read; problems read Danger when any device is faulted, else an Ok "No
-    /// problems"; the scanned chip humanizes the snapshot's freshness. Takes `now_ms`
+    /// read; the scanned chip humanizes the snapshot's freshness. Takes `now_ms`
     /// so the freshness read-out is unit-tested deterministically.
     fn status_chips(&self, now_ms: u64) -> Vec<StatusChip> {
         let host = self
@@ -2200,16 +2200,6 @@ impl DeviceManagerState {
                 format!("{devices} {}", plural(devices, "device", "devices")),
                 ChipTone::Neutral,
             ));
-            let problems = inv.problem_count();
-            if problems > 0 {
-                chips.push(StatusChip::with_icon(
-                    "\u{26A0}", // ⚠
-                    format!("{problems} {}", plural(problems, "problem", "problems")),
-                    ChipTone::Danger,
-                ));
-            } else {
-                chips.push(StatusChip::new("No problems", ChipTone::Ok));
-            }
             chips.push(StatusChip::new(
                 scanned_label(now_ms, inv.published_at_ms),
                 ChipTone::Neutral,
@@ -2221,7 +2211,7 @@ impl DeviceManagerState {
     /// The by-type device tree (#1/#18) in a vertical scroll: each category is a
     /// forced-state [`egui::CollapsingHeader`] whose open/closed is driven from
     /// [`Self::expanded`] (so Expand-/Collapse-all and per-header clicks all route
-    /// through the one set), amber-tinted when it holds a problem device. A device
+    /// through the one set). A device
     /// row click opens/toggles the bottom detail drawer (DEVMGR-3).
     fn tree(&mut self, ui: &mut egui::Ui) {
         // The category a header click toggled + the device a row click selected this
@@ -2846,8 +2836,8 @@ impl DeviceManagerState {
     /// The **By-node** cross-fleet tree (DEVMGR-10, #3): the whole fleet's
     /// published inventories ([`Self::all_inventories`], the same read the rail
     /// uses) flattened into one tree — each host a top-level collapsing branch, its
-    /// devices nested beneath (sub-grouped by category), problem hosts sorted first
-    /// with a per-host `⚠ N` badge ([`build_node_tree`]). A host that has published
+    /// devices nested beneath (sub-grouped by category), neutrally ordered by host
+    /// ([`build_node_tree`]). A host that has published
     /// nothing renders an honest dim "no inventory" leaf, never a fabricated tree
     /// (§7). The host branches share [`Self::expanded`] (keyed on the namespaced
     /// host key) and the device rows + selection reuse the By-type render, so only
@@ -3008,8 +2998,8 @@ impl DeviceManagerState {
     }
 }
 
-/// The rich per-host header card (#20): the hostname, the device count + problem
-/// badge, and the summary fields — over a [`Style`]-token group.
+/// The rich per-host header card (#20): hostname, device count, and neutral
+/// summary fields over a [`Style`]-token group.
 fn header_card(ui: &mut egui::Ui, inv: &DeviceInventory) {
     mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -3021,21 +3011,6 @@ fn header_card(ui: &mut egui::Ui, inv: &DeviceInventory) {
             );
             ui.add_space(Style::SP_S);
             muted_note(ui, format!("{} devices", inv.device_count()));
-            let problems = inv.problem_count();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if problems > 0 {
-                    ui.colored_label(
-                        Style::DANGER,
-                        RichText::new(format!("\u{26A0} {problems} with problems")) // ⚠
-                            .size(Style::SMALL),
-                    );
-                } else {
-                    ui.colored_label(
-                        Style::OK,
-                        RichText::new("All devices OK").size(Style::SMALL),
-                    );
-                }
-            });
         });
         ui.add_space(Style::SP_XS);
         for (label, value) in header_lines(inv) {
@@ -3211,8 +3186,7 @@ fn render_json(inv: Option<&DeviceInventory>, host: &str) -> String {
 /// on-screen tree: a host header + summary (the #20 header-card fields), then the
 /// device section grouped to reflect the **active view mode** — per category (By
 /// type) or per bus / controller (By connection). Every device row carries the
-/// same DEVMGR-3 problem-code + status text the drawer shows
-/// ([`device_status_display`]). A host with nothing published renders an honest
+/// same neutral state and evidence text the drawer shows. A host with nothing published renders an honest
 /// "no inventory yet" report (§7). Pure, so the report is unit-tested.
 fn render_report(inv: Option<&DeviceInventory>, host: &str, view: ViewMode) -> String {
     use std::fmt::Write as _;
@@ -3247,11 +3221,10 @@ fn render_report(inv: Option<&DeviceInventory>, host: &str, view: ViewMode) -> S
         let _ = writeln!(out, "- **{label}:** {value}");
     }
     let devices = inv.device_count();
-    let problems = inv.problem_count();
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "**{devices} {}**, {problems} with problems.",
+        "**{devices} {}**.",
         plural(devices, "device", "devices")
     );
     let _ = writeln!(out);
@@ -3265,8 +3238,7 @@ fn render_report(inv: Option<&DeviceInventory>, host: &str, view: ViewMode) -> S
 }
 
 /// The By-type device section of the report — one `##` heading per category (the
-/// on-screen tree order) with its device rows beneath, an amber `⚠ N` suffix on a
-/// category holding a problem device.
+/// on-screen tree order) with its device rows beneath.
 fn report_by_type(out: &mut String, inv: &DeviceInventory) {
     use std::fmt::Write as _;
     if inv.categories.is_empty() {
@@ -3274,12 +3246,7 @@ fn report_by_type(out: &mut String, inv: &DeviceInventory) {
         return;
     }
     for cat in &inv.categories {
-        let _ = writeln!(
-            out,
-            "## {}{}",
-            cat.label,
-            problem_suffix(cat.problem_count())
-        );
+        let _ = writeln!(out, "## {}", cat.label);
         let _ = writeln!(out);
         for dev in &cat.devices {
             let _ = writeln!(out, "{}", report_device_line(dev));
@@ -3309,12 +3276,7 @@ fn report_by_connection(out: &mut String, inv: &DeviceInventory) {
             // A parentless device leaf directly under the host root (never dropped).
             let _ = writeln!(out, "{}", report_device_line(dev));
         } else {
-            let _ = writeln!(
-                out,
-                "## {}{}",
-                node.label,
-                problem_suffix(node.problem_count())
-            );
+            let _ = writeln!(out, "## {}", node.label);
             let _ = writeln!(out);
             for child in &node.children {
                 if let Some(dev) = &child.device {
@@ -3326,22 +3288,10 @@ fn report_by_connection(out: &mut String, inv: &DeviceInventory) {
     }
 }
 
-/// One device row in the report — the device name + the same DEVMGR-3 status text
-/// the General drawer tab shows ([`device_status_display`]), so a `Code 28`
-/// device reads identically in the report and the UI.
+/// One neutral device row in the report. Fault evidence belongs to the
+/// centralized health modal, not this inventory export.
 fn report_device_line(dev: &DeviceRecord) -> String {
-    let (status, _) = device_status_display(dev);
-    format!("- {} \u{2014} {status}", dev.name)
-}
-
-/// The amber `(⚠ N)` heading suffix for a branch holding problem devices (empty
-/// for a clean branch) — the report twin of the tree's category badge.
-fn problem_suffix(problems: usize) -> String {
-    if problems > 0 {
-        format!(" (\u{26A0} {problems})")
-    } else {
-        String::new()
-    }
+    format!("- {}", dev.name)
 }
 
 /// What a rendered [`category_header`] reports back for one frame: whether the
@@ -3357,10 +3307,8 @@ struct CategoryOutcome {
     action: Option<RowActionRequest>,
 }
 
-/// One category branch — a forced-state collapsing header (its open/closed driven
-/// by the caller's expand set, #18). The header tints amber and carries a `⚠ N`
-/// count when the category holds a problem device — a faithful MDM "attention on
-/// this branch" cue.
+/// One neutral category branch — a forced-state collapsing header whose
+/// open/closed state is driven by the caller's expand set (#18).
 fn category_header(
     ui: &mut egui::Ui,
     cat: &DeviceCategory,
@@ -3368,34 +3316,27 @@ fn category_header(
     selected: Option<&DeviceSelection>,
     allow_control: bool,
 ) -> CategoryOutcome {
-    let problems = cat.problem_count();
-    let tone = if problems > 0 {
-        Style::WARN
-    } else {
-        Style::TEXT
-    };
-    let mut title = cat.label.clone();
-    if problems > 0 {
-        use std::fmt::Write as _;
-        let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
-    }
     let mut clicked: Option<DeviceSelection> = None;
     let mut action: Option<RowActionRequest> = None;
-    let resp = egui::CollapsingHeader::new(RichText::new(title).color(tone).size(Style::BODY))
-        .id_salt(("dm-cat", cat.key.as_str()))
-        .open(Some(open))
-        .show(ui, |ui| {
-            for dev in &cat.devices {
-                let is_sel = selected.is_some_and(|s| s.matches(&cat.key, dev));
-                let out = device_row(ui, dev, &cat.key, is_sel, allow_control);
-                if out.clicked {
-                    clicked = Some(DeviceSelection::of(&cat.key, dev));
-                }
-                if let Some(req) = out.action {
-                    action = Some(req);
-                }
+    let resp = egui::CollapsingHeader::new(
+        RichText::new(&cat.label)
+            .color(Style::TEXT)
+            .size(Style::BODY),
+    )
+    .id_salt(("dm-cat", cat.key.as_str()))
+    .open(Some(open))
+    .show(ui, |ui| {
+        for dev in &cat.devices {
+            let is_sel = selected.is_some_and(|s| s.matches(&cat.key, dev));
+            let out = device_row(ui, dev, &cat.key, is_sel, allow_control);
+            if out.clicked {
+                clicked = Some(DeviceSelection::of(&cat.key, dev));
             }
-        });
+            if let Some(req) = out.action {
+                action = Some(req);
+            }
+        }
+    });
     CategoryOutcome {
         header_clicked: resp.header_response.clicked(),
         selected: clicked,
@@ -3455,18 +3396,6 @@ impl ConnNode {
             category: category.to_string(),
             children: Vec::new(),
         }
-    }
-
-    /// Problem-status devices this node covers — a leaf's own state, or the count
-    /// among a bus branch's children (its `⚠ N` badge).
-    fn problem_count(&self) -> usize {
-        let own = usize::from(self.device.as_ref().is_some_and(|d| d.status.is_problem()));
-        let kids = self
-            .children
-            .iter()
-            .filter(|c| c.device.as_ref().is_some_and(|d| d.status.is_problem()))
-            .count();
-        own + kids
     }
 }
 
@@ -3619,8 +3548,7 @@ fn title_case(s: &str) -> String {
 
 /// One bus / controller branch of the by-connection tree — a forced-state
 /// collapsing header (its open/closed driven by the caller's expand set) whose
-/// device rows nest beneath it, mirroring [`category_header`]. The header tints
-/// amber with a `⚠ N` count when the bus holds a problem device. Reuses
+/// device rows nest beneath it, mirroring the neutral [`category_header`]. Reuses
 /// [`device_row`] + [`DeviceSelection`] so a row behaves identically in both views
 /// (only the nesting differs, #3).
 fn conn_bus_header(
@@ -3630,36 +3558,29 @@ fn conn_bus_header(
     selected: Option<&DeviceSelection>,
     allow_control: bool,
 ) -> CategoryOutcome {
-    let problems = node.problem_count();
-    let tone = if problems > 0 {
-        Style::WARN
-    } else {
-        Style::TEXT
-    };
-    let mut title = node.label.clone();
-    if problems > 0 {
-        use std::fmt::Write as _;
-        let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
-    }
     let mut clicked: Option<DeviceSelection> = None;
     let mut action: Option<RowActionRequest> = None;
-    let resp = egui::CollapsingHeader::new(RichText::new(title).color(tone).size(Style::BODY))
-        .id_salt(("dm-conn", node.key.as_str()))
-        .open(Some(open))
-        .show(ui, |ui| {
-            for child in &node.children {
-                if let Some(dev) = &child.device {
-                    let is_sel = selected.is_some_and(|s| s.matches(&child.category, dev));
-                    let out = device_row(ui, dev, &child.category, is_sel, allow_control);
-                    if out.clicked {
-                        clicked = Some(DeviceSelection::of(&child.category, dev));
-                    }
-                    if let Some(req) = out.action {
-                        action = Some(req);
-                    }
+    let resp = egui::CollapsingHeader::new(
+        RichText::new(&node.label)
+            .color(Style::TEXT)
+            .size(Style::BODY),
+    )
+    .id_salt(("dm-conn", node.key.as_str()))
+    .open(Some(open))
+    .show(ui, |ui| {
+        for child in &node.children {
+            if let Some(dev) = &child.device {
+                let is_sel = selected.is_some_and(|s| s.matches(&child.category, dev));
+                let out = device_row(ui, dev, &child.category, is_sel, allow_control);
+                if out.clicked {
+                    clicked = Some(DeviceSelection::of(&child.category, dev));
+                }
+                if let Some(req) = out.action {
+                    action = Some(req);
                 }
             }
-        });
+        }
+    });
     CategoryOutcome {
         header_clicked: resp.header_response.clicked(),
         selected: clicked,
@@ -3688,8 +3609,6 @@ struct NodeHost {
     published_at_ms: Option<u64>,
     /// Total device count in its snapshot (0 for an absent host).
     device_count: usize,
-    /// Problem-status device count (its `⚠ N` badge; drives the fleet ranking).
-    problem_count: usize,
     /// Its categorized device tree (empty for an absent host).
     categories: Vec<DeviceCategory>,
 }
@@ -3701,7 +3620,6 @@ impl NodeHost {
             host: inv.host.clone(),
             published_at_ms: Some(inv.published_at_ms),
             device_count: inv.device_count(),
-            problem_count: inv.problem_count(),
             categories: inv.categories.clone(),
         }
     }
@@ -3713,7 +3631,6 @@ impl NodeHost {
             host: host.to_string(),
             published_at_ms: None,
             device_count: 0,
-            problem_count: 0,
             categories: Vec::new(),
         }
     }
@@ -3726,10 +3643,9 @@ impl NodeHost {
 }
 
 /// The whole By-node cross-fleet tree: every host as a top-level branch, ranked
-/// problem-hosts-first (DEVMGR-10, #3).
+/// in stable host order.
 struct NodeTree {
-    /// The host branches — problem hosts first, then clean, then absent, each
-    /// tier stable-sorted (see [`node_order`]).
+    /// The host branches — published first, then absent, alphabetically.
     hosts: Vec<NodeHost>,
 }
 
@@ -3745,21 +3661,11 @@ impl NodeTree {
     }
 }
 
-/// The By-node ranking (DEVMGR-10, #3): **problem hosts near the top** so a fleet
-/// scan surfaces faults first. Present hosts rank above absent ones (an absent
-/// host has no hardware to scan); among present hosts a host with any problem
-/// device ranks above a clean one, and more problems rank higher; ties (and the
-/// absent tier) break alphabetically for a stable order. Pure, so the ranking is
-/// unit-tested without a render.
+/// Neutral By-node ordering: present hosts first, then absent, alphabetically.
 fn node_order(a: &NodeHost, b: &NodeHost) -> std::cmp::Ordering {
     // Present (false) sorts before absent (true) — nothing to scan on an absent host.
     (!a.is_published())
         .cmp(&!b.is_published())
-        // A host with problems (false for problem==0) sorts before a clean one.
-        .then_with(|| (a.problem_count == 0).cmp(&(b.problem_count == 0)))
-        // Among problem hosts, more problems rank higher.
-        .then_with(|| b.problem_count.cmp(&a.problem_count))
-        // Stable alphabetical within a tier.
         .then_with(|| a.host.cmp(&b.host))
 }
 
@@ -3767,7 +3673,7 @@ fn node_order(a: &NodeHost, b: &NodeHost) -> std::cmp::Ordering {
 /// each host becomes a top-level [`NodeHost`] carrying its own device tree, with
 /// the local "you are here" node always present (even if it has published nothing
 /// — an honest absent leaf, mirroring the rail), and the whole set ranked
-/// problem-hosts-first ([`node_order`]). `all` arrives already sorted by host
+/// neutral alphabetical order ([`node_order`]). `all` arrives already sorted by host
 /// ([`device_inventory::read_all`]), so the rank is a stable re-order. Pure over
 /// its inputs, so the aggregation + ranking is unit-tested without a substrate.
 fn build_node_tree(all: &[DeviceInventory], local: &str) -> NodeTree {
@@ -3780,15 +3686,13 @@ fn build_node_tree(all: &[DeviceInventory], local: &str) -> NodeTree {
 }
 
 /// A compact cross-fleet summary above the By-node tree (DEVMGR-10) — the fleet
-/// twin of the By-type/By-connection header card (#20): the host count, how many
-/// are faulted, and the aggregate device + problem totals, all off real state
+/// twin of the By-type/By-connection header card (#20): host and aggregate
+/// device counts, all off real state
 /// (§7 — never a fabricated figure).
 fn fleet_header(ui: &mut egui::Ui, tree: &NodeTree) {
     let hosts = tree.hosts.len();
     let published = tree.hosts.iter().filter(|h| h.is_published()).count();
-    let problem_hosts = tree.hosts.iter().filter(|h| h.problem_count > 0).count();
     let devices: usize = tree.hosts.iter().map(|h| h.device_count).sum();
-    let problems: usize = tree.hosts.iter().map(|h| h.problem_count).sum();
     mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(
@@ -3806,23 +3710,6 @@ fn fleet_header(ui: &mut egui::Ui, tree: &NodeTree) {
                     plural(devices, "device", "devices"),
                 ),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if problems > 0 {
-                    ui.colored_label(
-                        Style::DANGER,
-                        RichText::new(format!(
-                            "\u{26A0} {problems} on {problem_hosts} {}", // ⚠
-                            plural(problem_hosts, "host", "hosts"),
-                        ))
-                        .size(Style::SMALL),
-                    );
-                } else {
-                    ui.colored_label(
-                        Style::OK,
-                        RichText::new("All devices OK across the fleet").size(Style::SMALL),
-                    );
-                }
-            });
         });
     });
 }
@@ -3830,8 +3717,7 @@ fn fleet_header(ui: &mut egui::Ui, tree: &NodeTree) {
 /// One host branch of the By-node tree — a forced-state collapsing header (its
 /// open/closed driven by the caller's expand set) whose device rows nest beneath
 /// it, sub-grouped by category. The header names the host, folds in its device
-/// count + a `⚠ N` problem badge, tints amber when faulted / accent when it is the
-/// rail-selected host, and flags a stale snapshot. An absent host is an honest dim
+/// count, accents the rail-selected host, and flags a stale snapshot. An absent host is an honest dim
 /// leaf ([`node_absent_row`]) — no header, no device tree (§7). Reuses
 /// [`device_row`] + [`DeviceSelection`] verbatim so a device behaves identically
 /// across all three views.
@@ -3852,11 +3738,8 @@ fn node_host_header(
             action: None,
         };
     }
-    let problems = host.problem_count;
     let tone = if is_selected_host {
         Style::ACCENT
-    } else if problems > 0 {
-        Style::WARN
     } else {
         Style::TEXT
     };
@@ -3869,9 +3752,6 @@ fn node_host_header(
             host.device_count,
             plural(host.device_count, "device", "devices")
         );
-        if problems > 0 {
-            let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
-        }
         if host_freshness(host.published_at_ms, now_ms) == HostFreshness::Stale {
             let _ = write!(title, "   \u{00B7} stale"); // ·
         }
@@ -3914,21 +3794,14 @@ fn node_host_header(
 
 /// A non-collapsible category sub-heading within a By-node host branch — the
 /// lightweight grouping caption (host → category → device) that keeps the single
-/// collapsible tier at the HOST level (so Expand-all is host-keyed). Dim by
-/// default, amber with a `⚠ N` count when the category holds a problem device.
+/// collapsible tier at the HOST level (so Expand-all is host-keyed).
 fn node_category_caption(ui: &mut egui::Ui, cat: &DeviceCategory) {
-    let problems = cat.problem_count();
-    let mut label = cat.label.clone();
-    if problems > 0 {
-        use std::fmt::Write as _;
-        let _ = write!(label, "  \u{26A0} {problems}"); // ⚠ N
-    }
-    let tone = if problems > 0 {
-        Style::WARN
-    } else {
-        Style::TEXT_DIM
-    };
-    ui.label(RichText::new(label).color(tone).size(Style::SMALL).strong());
+    ui.label(
+        RichText::new(&cat.label)
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
 }
 
 /// An absent host leaf in the By-node tree — a dim status dot, the hostname, and
@@ -4231,9 +4104,8 @@ fn device_target(category: &str, dev: &DeviceRecord) -> DeviceTarget {
 }
 
 /// One device row — a clickable selection row (DEVMGR-3) carrying the DEVMGR-7
-/// right-click action menu: a status dot in the device's [`status_tone`], the name
-/// (accent-tinted when selected), the MDM **problem-code badge** for a faulted
-/// device (#11), and the honest Linux reason from the schema, dimmed. Returns a
+/// right-click action menu. It shows the name (accent-tinted when selected) and
+/// the honest Linux state/evidence from the schema without a problem badge. Returns a
 /// [`RowOutcome`] — a left-click selection (open/toggle the drawer) and any
 /// context-menu action the operator chose for this device.
 fn device_row(
@@ -4245,23 +4117,8 @@ fn device_row(
 ) -> RowOutcome {
     let inner = ui
         .horizontal(|ui| {
-            status_dot(ui, status_tone(dev.status));
-            ui.add_space(Style::SP_XS);
             let name_tone = if selected { Style::ACCENT } else { Style::TEXT };
             ui.label(RichText::new(&dev.name).color(name_tone).size(Style::SMALL));
-            if let Some(code) = problem_code(dev.status) {
-                ui.add_space(Style::SP_XS);
-                ui.label(
-                    RichText::new(format!("Code {code}"))
-                        .color(status_tone(dev.status))
-                        .size(Style::SMALL)
-                        .strong(),
-                );
-            }
-            if let Some(reason) = &dev.problem {
-                ui.add_space(Style::SP_XS);
-                muted_note(ui, format!("\u{2014} {reason}")); // — reason
-            }
         })
         .response;
     // The row's labels don't sense clicks, so re-interact the whole strip as one
@@ -4335,18 +4192,6 @@ fn now_ms() -> u64 {
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
-}
-
-/// The status-dot tone for a device state — the honest Linux state coloured, not
-/// yet the MDM problem code (DEVMGR-3). Ok is green; a driverless device warns;
-/// a degraded (error) device is danger; disabled / unknown are dim (not alarms).
-const fn status_tone(status: DeviceStatus) -> egui::Color32 {
-    match status {
-        DeviceStatus::Ok => Style::OK,
-        DeviceStatus::Degraded => Style::DANGER,
-        DeviceStatus::NoDriver => Style::WARN,
-        DeviceStatus::Disabled | DeviceStatus::Unknown => Style::TEXT_DIM,
-    }
 }
 
 /// The honest pre-poll state (§7): a dim "?" over "reading…", drawn before the
@@ -4441,30 +4286,21 @@ fn host_row(
     resp.clicked()
 }
 
-/// The status-dot tone for a rail host (design §7): an **absent** host is dim
-/// (offline / nothing published), a **stale** snapshot is amber (published but old
-/// — likely offline, so its health can't be trusted), and a **fresh** host is
-/// green when clean or danger when any device is faulted. Pure, so the honest
-/// dim/stale/offline mapping is tested without a render.
+/// The freshness-dot tone for a rail host (design §7): an **absent** host is dim,
+/// a **stale** snapshot is amber, and a **fresh** inventory is calm green. Device
+/// faults are conditions in System and Mesh Health, never ranking input here.
 fn host_dot_tone(entry: &HostEntry, now_ms: u64) -> egui::Color32 {
     match entry.freshness(now_ms) {
         HostFreshness::Absent => Style::TEXT_DIM,
         HostFreshness::Stale => Style::WARN,
-        HostFreshness::Fresh => {
-            if entry.problem_count > 0 {
-                Style::DANGER
-            } else {
-                Style::OK
-            }
-        }
+        HostFreshness::Fresh => Style::OK,
     }
 }
 
-/// The rail row's hover summary — device / problem counts + a freshness read-out,
+/// The rail row's hover summary — device count + a freshness read-out,
 /// or an honest "nothing published" for an absent host (§7). Pure over `now_ms` so
 /// it is tested deterministically.
 fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
-    use std::fmt::Write as _;
     let fresh = entry.freshness(now_ms);
     if fresh == HostFreshness::Absent {
         return "No device inventory published \u{2014} offline or not yet scanned.".to_string();
@@ -4474,14 +4310,6 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
         entry.device_count,
         plural(entry.device_count, "device", "devices")
     );
-    if entry.problem_count > 0 {
-        let _ = write!(
-            s,
-            " \u{00B7} {} {}", // ·
-            entry.problem_count,
-            plural(entry.problem_count, "problem", "problems")
-        );
-    }
     s.push('\n');
     if fresh == HostFreshness::Stale {
         s.push_str("Stale \u{2014} "); // —
@@ -4501,8 +4329,7 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
 // by the strip response's id, with the device/host name as the accessible label
 // and its MDM status / freshness reading as the value — the established
 // `install_row_accessibility` idiom (role + label + value + bounds + Click),
-// reusing [`device_status_display`] so the a11y value can never drift from the
-// painted status.
+// exposing the same neutral inventory identity painted in the row.
 
 /// Convert an egui rect to an accesskit one (the `console.rs`/`dock.rs` helper,
 /// restated module-locally — the established per-module-copy idiom).
@@ -4521,13 +4348,13 @@ fn device_a11y_label(dev: &DeviceRecord) -> String {
     dev.name.clone()
 }
 
-/// The accessible **state/value** of a device row — the exact MDM status text
-/// the drawer shows ([`device_status_display`]): the problem code + honest Linux
-/// reason for a faulted device, the "working properly" line for a healthy one,
-/// or the honest "could not be determined" otherwise. Reuses the shared display
-/// so the spoken status can never drift from the painted one.
+/// The accessible **state/value** of a device row. Health state is intentionally
+/// excluded; assistive technology receives the neutral inventory classification.
 fn device_a11y_value(dev: &DeviceRecord) -> String {
-    device_status_display(dev).0
+    match dev.driver.as_deref() {
+        Some(driver) => format!("Inventory device; driver {driver}"),
+        None => "Inventory device; no driver information published".to_string(),
+    }
 }
 
 /// The freshness word a rail row reads out — the spoken counterpart of the
@@ -4541,14 +4368,14 @@ const fn freshness_word(fresh: HostFreshness) -> &'static str {
 }
 
 /// The accessible **value** of a rail host row — its freshness plus the device /
-/// problem counts, mirroring the [`host_hover`] summary in one spoken line; an
+/// device count, mirroring the [`host_hover`] summary in one spoken line; an
 /// absent host reads the honest "nothing published" (§7).
 fn host_a11y_value(entry: &HostEntry, now_ms: u64) -> String {
     let fresh = entry.freshness(now_ms);
     if fresh == HostFreshness::Absent {
         return "offline \u{00B7} nothing published".to_string();
     }
-    let mut parts = vec![
+    let parts = vec![
         freshness_word(fresh).to_owned(),
         format!(
             "{} {}",
@@ -4556,13 +4383,6 @@ fn host_a11y_value(entry: &HostEntry, now_ms: u64) -> String {
             plural(entry.device_count, "device", "devices")
         ),
     ];
-    if entry.problem_count > 0 {
-        parts.push(format!(
-            "{} {}",
-            entry.problem_count,
-            plural(entry.problem_count, "problem", "problems")
-        ));
-    }
     parts.join(" \u{00B7} ")
 }
 

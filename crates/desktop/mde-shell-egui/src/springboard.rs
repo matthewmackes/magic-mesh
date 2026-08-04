@@ -480,7 +480,9 @@ mod tests {
             .expect("Home should be discoverable to assistive technology");
         assert_eq!(node.role(), egui::accesskit::Role::Button);
         assert_eq!(node.value(), Some("Open Front Door search"));
-        let bounds = node.bounds().expect("Home action should have screen bounds");
+        let bounds = node
+            .bounds()
+            .expect("Home action should have screen bounds");
         assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
     }
 

@@ -82,11 +82,12 @@ use mde_kdc_host::sftp::{SftpMount, SshfsMount};
 use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
-use mde_kdc_proto::plugins::{ClipboardMaterialization as KdcClipboardMaterialization,
-    ClipboardPlugin, Plugin, PluginContext};
 use mde_kdc_proto::plugins::mousepad::{MouseModifiers, MousepadBody, MousepadEvent};
 use mde_kdc_proto::plugins::mpris::{MprisBody, MprisKind, MprisRequestBody};
 use mde_kdc_proto::plugins::notification::{notification_packet, NotificationBody};
+use mde_kdc_proto::plugins::{
+    ClipboardMaterialization as KdcClipboardMaterialization, ClipboardPlugin, Plugin, PluginContext,
+};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
@@ -1030,13 +1031,22 @@ fn apply_fanout_action(action: &FanoutAction) -> (bool, String) {
     match action {
         FanoutAction::Clipboard { content, source } => {
             let Some(root) = mde_bus::default_data_dir() else {
-                return (false, "clipboard unavailable (local Bus unavailable)".to_string());
+                return (
+                    false,
+                    "clipboard unavailable (local Bus unavailable)".to_string(),
+                );
             };
             let Ok(persist) = Persist::open(root) else {
-                return (false, "clipboard unavailable (local Bus unavailable)".to_string());
+                return (
+                    false,
+                    "clipboard unavailable (local Bus unavailable)".to_string(),
+                );
             };
             let Ok(text) = VdiClipboardText::new(content.clone()) else {
-                return (false, "clipboard rejected (text exceeds canonical bound)".to_string());
+                return (
+                    false,
+                    "clipboard rejected (text exceeds canonical bound)".to_string(),
+                );
             };
             let handoff = VdiClipboardMaterialization::new(
                 kdc_clipboard_target_seat(),
@@ -1045,7 +1055,10 @@ fn apply_fanout_action(action: &FanoutAction) -> (bool, String) {
                 chrono::Utc::now().to_rfc3339(),
             );
             let Ok(body) = serde_json::to_string(&handoff) else {
-                return (false, "clipboard unavailable (handoff serialization failed)".to_string());
+                return (
+                    false,
+                    "clipboard unavailable (handoff serialization failed)".to_string(),
+                );
             };
             if persist
                 .write(
@@ -1056,7 +1069,10 @@ fn apply_fanout_action(action: &FanoutAction) -> (bool, String) {
                 )
                 .is_err()
             {
-                return (false, "clipboard unavailable (handoff write failed)".to_string());
+                return (
+                    false,
+                    "clipboard unavailable (handoff write failed)".to_string(),
+                );
             }
             (true, format!("clipboard set ({} bytes)", content.len()))
         }

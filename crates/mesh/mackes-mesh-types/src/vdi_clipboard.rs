@@ -138,8 +138,7 @@ impl ClipboardMaterialization {
         if target.is_empty()
             || target.len() > 128
             || target.bytes().any(|byte| {
-                !byte.is_ascii_alphanumeric()
-                    && !matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+                !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
             })
         {
             return Err("clipboard materialization target_seat is unsafe or empty".to_owned());

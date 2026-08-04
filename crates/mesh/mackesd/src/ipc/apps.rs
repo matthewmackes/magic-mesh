@@ -528,10 +528,7 @@ pub fn read_peer_installed(workgroup_root: &Path, node: &str) -> Vec<AppEntry> {
 /// projection. Catalogs are optional for backwards compatibility, but an
 /// invalid or unsigned catalog is rejected rather than forwarded to the shell.
 #[must_use]
-pub fn read_peer_flatpak_catalog(
-    workgroup_root: &Path,
-    node: &str,
-) -> Option<FlatpakAppCatalog> {
+pub fn read_peer_flatpak_catalog(workgroup_root: &Path, node: &str) -> Option<FlatpakAppCatalog> {
     let path = workgroup_root.join(node).join("flatpak-catalog.json");
     read_bounded_app_record(&path)
         .and_then(|body| serde_json::from_str::<FlatpakAppCatalog>(&body).ok())

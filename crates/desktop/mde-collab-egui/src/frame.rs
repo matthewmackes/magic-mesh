@@ -539,69 +539,72 @@ impl CommunicationsSurface {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-        ui.label(
-            egui::RichText::new("Details")
-                .size(Style::BODY)
-                .strong()
-                .color(theme_color(ui, Style::TEXT_STRONG)),
-        );
-        ui.add_space(Style::SP_XS);
+                ui.label(
+                    egui::RichText::new("Details")
+                        .size(Style::BODY)
+                        .strong()
+                        .color(theme_color(ui, Style::TEXT_STRONG)),
+                );
+                ui.add_space(Style::SP_XS);
 
-        let Some(details) = channel_details_model(self.selected_space(), data) else {
-            ui.label(egui::RichText::new("No channel selected").color(theme_color(ui, Style::TEXT_DIM)));
-            return;
-        };
+                let Some(details) = channel_details_model(self.selected_space(), data) else {
+                    ui.label(
+                        egui::RichText::new("No channel selected")
+                            .color(theme_color(ui, Style::TEXT_DIM)),
+                    );
+                    return;
+                };
 
-        ui.label(
-            egui::RichText::new(details.name.as_str())
-                .size(Style::TITLE)
-                .strong()
-                .color(theme_color(ui, Style::TEXT_STRONG)),
-        );
-        ui.label(
-            egui::RichText::new(format!("{} · {}", details.kind, details.role))
-                .small()
-                .color(theme_color(ui, Style::TEXT_DIM)),
-        );
-        ui.add_space(Style::SP_S);
-        ui.separator();
-        ui.add_space(Style::SP_S);
+                ui.label(
+                    egui::RichText::new(details.name.as_str())
+                        .size(Style::TITLE)
+                        .strong()
+                        .color(theme_color(ui, Style::TEXT_STRONG)),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{} · {}", details.kind, details.role))
+                        .small()
+                        .color(theme_color(ui, Style::TEXT_DIM)),
+                );
+                ui.add_space(Style::SP_S);
+                ui.separator();
+                ui.add_space(Style::SP_S);
 
-        ui.label(
-            egui::RichText::new("Channel facts")
-                .small()
-                .strong()
-                .color(theme_color(ui, Style::TEXT_DIM)),
-        );
-        detail_row(ui, "Members", details.members);
-        detail_row(ui, "Unread", details.unread);
-        detail_text_row(ui, "Activity clock", details.last_activity.as_str());
-        ui.add_space(Style::SP_S);
+                ui.label(
+                    egui::RichText::new("Channel facts")
+                        .small()
+                        .strong()
+                        .color(theme_color(ui, Style::TEXT_DIM)),
+                );
+                detail_row(ui, "Members", details.members);
+                detail_row(ui, "Unread", details.unread);
+                detail_text_row(ui, "Activity clock", details.last_activity.as_str());
+                ui.add_space(Style::SP_S);
 
-        ui.label(
-            egui::RichText::new("Live projections")
-                .small()
-                .strong()
-                .color(theme_color(ui, Style::TEXT_DIM)),
-        );
-        detail_row(ui, "Messages", details.messages);
-        detail_row(ui, "Tasks", details.tasks);
-        detail_row(ui, "Files", details.files);
-        detail_row(ui, "Transfers", details.transfers);
-        detail_row(ui, "Documents", details.documents);
-        detail_row(ui, "Active calls", details.active_calls);
-        detail_row(ui, "Clip items", details.clips);
-        ui.add_space(Style::SP_S);
+                ui.label(
+                    egui::RichText::new("Live projections")
+                        .small()
+                        .strong()
+                        .color(theme_color(ui, Style::TEXT_DIM)),
+                );
+                detail_row(ui, "Messages", details.messages);
+                detail_row(ui, "Tasks", details.tasks);
+                detail_row(ui, "Files", details.files);
+                detail_row(ui, "Transfers", details.transfers);
+                detail_row(ui, "Documents", details.documents);
+                detail_row(ui, "Active calls", details.active_calls);
+                detail_row(ui, "Clip items", details.clips);
+                ui.add_space(Style::SP_S);
 
-        ui.label(
-            egui::RichText::new("Discord bridge")
-                .small()
-                .strong()
-                .color(theme_color(ui, Style::TEXT_DIM)),
-        );
-        for bridge in &details.discord_bridges {
-            discord_bridge_detail_row(ui, bridge);
-        }
+                ui.label(
+                    egui::RichText::new("Discord bridge")
+                        .small()
+                        .strong()
+                        .color(theme_color(ui, Style::TEXT_DIM)),
+                );
+                for bridge in &details.discord_bridges {
+                    discord_bridge_detail_row(ui, bridge);
+                }
             });
     }
 
@@ -624,11 +627,16 @@ impl CommunicationsSurface {
         let selected_space =
             selected_space_in_directory(self.selected_space(), data.space_directory());
         ui.horizontal(|ui| {
-            icons::icon(ui, icons::CALL_UNMUTE, glyph, theme_color(ui, Style::TEXT_DIM));
+            icons::icon(
+                ui,
+                icons::CALL_UNMUTE,
+                glyph,
+                theme_color(ui, Style::TEXT_DIM),
+            );
             ui.add_space(Style::SP_XS);
             if calls.is_empty() {
-                let none = egui::RichText::new("No active call")
-                    .color(theme_color(ui, Style::TEXT_DIM));
+                let none =
+                    egui::RichText::new("No active call").color(theme_color(ui, Style::TEXT_DIM));
                 ui.label(if car { none.size(Style::TITLE) } else { none });
                 if let Some(space) = selected_space {
                     ui.add_space(Style::SP_S);
@@ -709,7 +717,8 @@ impl CommunicationsSurface {
             } else {
                 (icons::CALL_MUTE, "Mute")
             };
-            if icons::icon_button(ui, glyph, ctrl, theme_color(ui, Style::TEXT_DIM), hint).clicked() {
+            if icons::icon_button(ui, glyph, ctrl, theme_color(ui, Style::TEXT_DIM), hint).clicked()
+            {
                 sink.emit(CollabCommand::SetCallMuted {
                     call: call.call,
                     muted: !participant.muted,
@@ -765,7 +774,7 @@ fn channel_find_editor(ui: &mut egui::Ui, surface: &mut CommunicationsSurface, s
         egui::RichText::new("Find")
             .small()
             .strong()
-                .color(theme_color(ui, Style::TEXT_DIM)),
+            .color(theme_color(ui, Style::TEXT_DIM)),
     );
     let mut query = surface.channel_find(space).to_owned();
     let response = ui.add_sized(

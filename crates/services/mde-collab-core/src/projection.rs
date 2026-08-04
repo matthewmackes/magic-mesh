@@ -70,6 +70,14 @@ const MAX_SAVED_MESSAGES: usize = 4096;
 // published per-space read model recent and bounded so opening Mesh Teams on a
 // modest seat does not deserialize/render an unbounded event history.
 const MAX_ACTIVITY_ENTRIES: usize = 1024;
+// The alert inbox is a latest-wins Bus state payload, not durable history.
+// Bound both its row count and its encoded body: the byte ceiling leaves ample
+// headroom below the 256 KiB message boundary for the Bus storage envelope and
+// JSON string escaping. The SQL order plus prefix-only byte truncation makes
+// every peer choose the same newest rows from the same event set.
+const MAX_ALERT_INBOX_ENTRIES: usize = 128;
+const MAX_ALERT_INBOX_JSON_BYTES: usize = 96 * 1024;
+const EMPTY_ALERT_INBOX_JSON_BYTES: usize = br#"{"alerts":[]}"#.len();
 // Media adapters must never be handed an unbounded call roster or participant
 // list. These are readiness rows only; live provider attempts happen elsewhere.
 const MAX_MEDIA_READINESS_SESSIONS: usize = 256;
@@ -385,12 +393,14 @@ impl Projection {
 
     /// The global alert inbox, newest-first.
     pub fn alert_inbox(&self) -> Result<AlertInbox> {
+        let row_limit = i64::try_from(MAX_ALERT_INBOX_ENTRIES).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
             "SELECT space_id, event_id, severity, source, headline, fields_json, actions_json, \
              goto, acknowledged, snoozed_until \
-             FROM alerts ORDER BY clock_wall DESC, clock_counter DESC, event_id",
+             FROM alerts \
+             ORDER BY clock_wall DESC, clock_counter DESC, event_id LIMIT ?1",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![row_limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -404,7 +414,8 @@ impl Projection {
                 r.get::<_, Option<i64>>(9)?,
             ))
         })?;
-        let mut alerts = Vec::new();
+        let mut alerts = Vec::with_capacity(MAX_ALERT_INBOX_ENTRIES);
+        let mut encoded_bytes = EMPTY_ALERT_INBOX_JSON_BYTES;
         for row in rows {
             let (
                 space,
@@ -426,13 +437,31 @@ impl Projection {
                 actions: serde_json::from_str(&actions_json)?,
                 goto,
             };
-            alerts.push(AlertView {
+            let alert = AlertView {
                 event_id: parse_event(&event)?,
                 space: parse_space(&space)?,
                 alert: payload,
                 acknowledged: ack != 0,
                 snoozed_until_unix_ms: snz,
-            });
+            };
+            let alert_bytes = serde_json::to_vec(&alert)?.len();
+            let separator_bytes = usize::from(!alerts.is_empty());
+            let candidate_bytes = encoded_bytes
+                .checked_add(separator_bytes)
+                .and_then(|bytes| bytes.checked_add(alert_bytes))
+                .ok_or_else(|| {
+                    CollabError::Serde("alert inbox encoded size overflow".to_owned())
+                })?;
+            if candidate_bytes > MAX_ALERT_INBOX_JSON_BYTES {
+                if alerts.is_empty() {
+                    return Err(CollabError::Serde(format!(
+                        "newest alert exceeds the {MAX_ALERT_INBOX_JSON_BYTES}-byte inbox boundary"
+                    )));
+                }
+                break;
+            }
+            alerts.push(alert);
+            encoded_bytes = candidate_bytes;
         }
         Ok(AlertInbox { alerts })
     }
@@ -1644,6 +1673,18 @@ impl SpaceFold {
                     let muted = c.muted.get(&actor.0).copied().unwrap_or(false);
                     c.participants.insert(actor.0.clone(), (*state, muted));
                     c.muted.entry(actor.0.clone()).or_insert(muted);
+                    // A separate CallEnded event cannot be required for
+                    // convergence: concurrent hang-ups are independently
+                    // authored and neither peer may observe itself as the
+                    // last connected participant. The participant LWW facts
+                    // are sufficient to derive the terminal read model.
+                    if !c
+                        .participants
+                        .values()
+                        .any(|(state, _)| matches!(state, CallParticipantState::Connected))
+                    {
+                        c.ended = true;
+                    }
                 }
             }
             CollabEventKind::CallParticipantMuted { call, actor, muted } => {
@@ -2069,9 +2110,10 @@ fn summarize(kind_tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Projection, MAX_ACTIVITY_ENTRIES, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS,
-        MAX_ENVELOPE_JSON_BYTES, MAX_MEDIA_READINESS_SESSIONS, MAX_MESSAGE_BODY_BYTES,
-        MAX_TABLE_DUMP_BYTES, MAX_TIMELINE_MESSAGES,
+        Projection, MAX_ACTIVITY_ENTRIES, MAX_ALERT_INBOX_ENTRIES, MAX_ALERT_INBOX_JSON_BYTES,
+        MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
+        MAX_MEDIA_READINESS_SESSIONS, MAX_MESSAGE_BODY_BYTES, MAX_TABLE_DUMP_BYTES,
+        MAX_TIMELINE_MESSAGES,
     };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
@@ -2141,6 +2183,36 @@ mod tests {
                 },
             ),
         ]
+    }
+
+    fn insert_alert_row(
+        projection: &Projection,
+        space: SpaceId,
+        id: u128,
+        clock: (i64, i64),
+        headline: &str,
+        state: (bool, Option<i64>),
+    ) {
+        let (clock_wall, clock_counter) = clock;
+        let (acknowledged, snoozed_until) = state;
+        projection
+            .connection()
+            .execute(
+                "INSERT INTO alerts \
+                 (space_id, event_id, severity, source, headline, fields_json, actions_json, \
+                  goto, acknowledged, snoozed_until, clock_wall, clock_counter) \
+                 VALUES (?1, ?2, 'warning', 'seat-15', ?3, '{}', '[]', NULL, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    space.to_string(),
+                    event_id(id).to_string(),
+                    headline,
+                    i64::from(acknowledged),
+                    snoozed_until,
+                    clock_wall,
+                    clock_counter,
+                ],
+            )
+            .expect("insert alert row");
     }
 
     #[test]
@@ -2464,6 +2536,106 @@ mod tests {
             (MAX_ACTIVITY_ENTRIES + overflow - 1) as u64,
             "the feed remains newest-last within the retained recent window"
         );
+    }
+
+    #[test]
+    fn alert_inbox_keeps_only_the_deterministic_newest_prefix() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(2712);
+        let overflow = 23usize;
+        let corpus_len = MAX_ALERT_INBOX_ENTRIES + overflow;
+        let first_id = 60_000_u128;
+        let snooze = 2_000_000_000_000_i64;
+
+        for index in 0..corpus_len {
+            let newest = index + 1 == corpus_len;
+            insert_alert_row(
+                &projection,
+                space,
+                first_id + index as u128,
+                (index as i64, 0),
+                &format!("alert-{index}"),
+                (newest, newest.then_some(snooze)),
+            );
+        }
+
+        let inbox = projection.alert_inbox().expect("bounded alert inbox");
+
+        assert_eq!(inbox.alerts.len(), MAX_ALERT_INBOX_ENTRIES);
+        let expected = (overflow..corpus_len)
+            .rev()
+            .map(|index| event_id(first_id + index as u128))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inbox
+                .alerts
+                .iter()
+                .map(|alert| alert.event_id)
+                .collect::<Vec<_>>(),
+            expected,
+            "the oldest overflow rows are excluded without reordering the newest prefix"
+        );
+        assert!(inbox.alerts[0].acknowledged);
+        assert_eq!(inbox.alerts[0].snoozed_until_unix_ms, Some(snooze));
+        assert!(!inbox.alerts[1].acknowledged);
+        assert_eq!(inbox.alerts[1].snoozed_until_unix_ms, None);
+        assert!(
+            serde_json::to_vec(&inbox).expect("serialize inbox").len()
+                <= MAX_ALERT_INBOX_JSON_BYTES
+        );
+    }
+
+    #[test]
+    fn alert_inbox_uses_event_id_as_a_stable_clock_tie_breaker() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(2713);
+        for id in [70_003_u128, 70_001, 70_002] {
+            insert_alert_row(&projection, space, id, (500, 9), "tied", (false, None));
+        }
+
+        let inbox = projection.alert_inbox().expect("ordered alert inbox");
+
+        assert_eq!(
+            inbox
+                .alerts
+                .iter()
+                .map(|alert| alert.event_id)
+                .collect::<Vec<_>>(),
+            [event_id(70_001), event_id(70_002), event_id(70_003)]
+        );
+    }
+
+    #[test]
+    fn alert_inbox_stops_at_the_encoded_state_body_budget() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(2714);
+        let corpus_len = 6usize;
+        let first_id = 80_000_u128;
+        let bounded_headline = "x".repeat(MAX_ALERT_INBOX_JSON_BYTES / 3);
+        for index in 0..corpus_len {
+            insert_alert_row(
+                &projection,
+                space,
+                first_id + index as u128,
+                (index as i64, 0),
+                &bounded_headline,
+                (false, None),
+            );
+        }
+
+        let inbox = projection.alert_inbox().expect("byte-bounded alert inbox");
+        let encoded = serde_json::to_vec(&inbox).expect("serialize inbox");
+
+        assert!(!inbox.alerts.is_empty());
+        assert!(inbox.alerts.len() < corpus_len);
+        assert!(encoded.len() <= MAX_ALERT_INBOX_JSON_BYTES);
+        for (offset, alert) in inbox.alerts.iter().enumerate() {
+            assert_eq!(
+                alert.event_id,
+                event_id(first_id + (corpus_len - 1 - offset) as u128),
+                "the byte cap may remove only an oldest suffix"
+            );
+        }
     }
 
     #[test]

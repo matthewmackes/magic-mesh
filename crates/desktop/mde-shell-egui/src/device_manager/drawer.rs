@@ -4,11 +4,10 @@
 //! The device **property sheet**: the plain-text `render_device_details` clipboard
 //! dump (#12), the bottom drawer chrome (`drawer_header`/`drawer_tabs`/`drawer_body`)
 //! and its five leaf tabs (General/Driver/Details/Events/Resources, #9/#10) plus the
-//! `optional_field` row helper, and the MDM `device_status_display` status-line mapping
-//! (#11) the drawer, the report generator and the a11y value all reuse.
+//! `optional_field` row helper.
 //!
 //! `use super::*` pulls in the parent's `DeviceRecord`/`DrawerTab`/`Style` + the egui
-//! re-exports and the sibling `problem_code`/`status_tone`/`dash` helpers; as a child
+//! re-exports and the sibling `dash` helper; as a child
 //! module it reads the parent's private items directly, so only the items the parent
 //! (and the tests) call back into are `pub(super)`.
 
@@ -17,8 +16,7 @@ use super::*;
 /// The full device detail dump copied to the clipboard by DEVMGR-7's **Copy device
 /// details** action — every field the five drawer tabs render (#10), as a plain-text
 /// block: identity (name / manufacturer / model / hardware IDs), the MDM device
-/// status line ([`device_status_display`], carrying the problem code + honest Linux
-/// reason), the bound driver, the sysfs details, and the resources + recent events.
+/// bound driver, the sysfs details, and the resources + recent events.
 /// Absent scalar fields read as an honest em-dash and empty lists as a "none
 /// reported" line (§7 — never a fabricated value), mirroring the tabs. Pure, so the
 /// dump is unit-tested without a render.
@@ -30,8 +28,6 @@ pub(super) fn render_device_details(dev: &DeviceRecord) -> String {
     let _ = writeln!(out, "Manufacturer: {}", opt(dev.vendor.as_deref()));
     let _ = writeln!(out, "Model: {}", opt(dev.model.as_deref()));
     let _ = writeln!(out, "Hardware IDs: {}", opt(dev.ids.as_deref()));
-    let (status, _) = device_status_display(dev);
-    let _ = writeln!(out, "Status: {status}");
     let _ = writeln!(out, "Driver: {}", opt(dev.driver.as_deref()));
     let _ = writeln!(
         out,
@@ -72,10 +68,10 @@ pub(super) fn render_device_details(dev: &DeviceRecord) -> String {
 
 // ─────────────────────────── the detail drawer (#9/#10) ─────────────────────
 
-/// The filled status-dot glyph the status cluster reuses.
+/// The filled glyph used by neutral inventory chips.
 pub(super) const DOT: &str = "\u{25CF}";
 
-/// The drawer's title row (#9): the selected device's status dot + name, with a
+/// The drawer's title row (#9): the selected device name, with a
 /// DEVMGR-7 **Copy details** button + a `×` close button on the right — the
 /// non-right-click path to the honest Copy-info action (#12).
 pub(super) fn drawer_header(
@@ -85,8 +81,6 @@ pub(super) fn drawer_header(
     copy: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        status_dot(ui, status_tone(dev.status));
-        ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(&dev.name)
                 .color(Style::TEXT_STRONG)
@@ -136,25 +130,16 @@ pub(super) fn drawer_body(ui: &mut egui::Ui, dev: &DeviceRecord, tab: DrawerTab)
 }
 
 /// The **General** tab (#10): identity (name / manufacturer / model) plus the MDM
-/// **device-status box** (#11) — "This device is working properly." for a healthy
-/// device, or the mapped problem code with the honest Linux reason beside it.
+/// inventory identity. Platform faults are deliberately presented by the central
+/// System and Mesh Health modal, not duplicated in this hardware browser.
 fn general_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
     field(ui, "Device name", &dev.name, Style::TEXT);
     optional_field(ui, "Manufacturer", dev.vendor.as_deref());
     optional_field(ui, "Model", dev.model.as_deref());
-    ui.add_space(Style::SP_S);
-    ui.label(
-        RichText::new("Device status")
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL),
-    );
-    let (text, tone) = device_status_display(dev);
-    ui.colored_label(tone, RichText::new(text).size(Style::SMALL));
 }
 
 /// The **Driver** tab (#10): the bound kernel driver / module + its version. An
-/// honestly-empty tab when no driver is bound (which is exactly the no-driver
-/// problem state, §7).
+/// honestly-empty tab when no driver is bound.
 fn driver_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
     if dev.driver.is_none() && dev.driver_version.is_none() {
         muted_note(ui, "No kernel driver is bound to this device.");
@@ -221,31 +206,4 @@ fn optional_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
         Some(v) => field(ui, label, v, Style::TEXT),
         None => field(ui, label, &dash(), Style::TEXT_DIM),
     }
-}
-
-/// The MDM device-status line for the General tab (#11): the problem code + the
-/// honest Linux reason for a faulted device, "working properly" for a healthy one,
-/// or an honest "could not be determined" for an unknown state — never a fabricated
-/// Windows code. Returns the text + its [`Style`] tone. Pure, so the mapping is
-/// unit-tested without a render.
-pub(super) fn device_status_display(dev: &DeviceRecord) -> (String, egui::Color32) {
-    if let Some(code) = problem_code(dev.status) {
-        let reason = dev
-            .problem
-            .as_deref()
-            .unwrap_or("no additional detail reported");
-        return (
-            format!("Code {code} \u{2014} {reason}"),
-            status_tone(dev.status),
-        );
-    }
-    if dev.status == DeviceStatus::Ok {
-        return ("This device is working properly.".to_string(), Style::OK);
-    }
-    // Unknown — an honest "could not be determined", never a fabricated code.
-    let text = dev.problem.as_deref().map_or_else(
-        || "Device status could not be determined.".to_string(),
-        |r| format!("Device status could not be determined \u{2014} {r}"),
-    );
-    (text, Style::TEXT_DIM)
 }

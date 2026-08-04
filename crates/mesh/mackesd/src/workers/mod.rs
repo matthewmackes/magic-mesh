@@ -152,8 +152,8 @@ pub mod adfilter;
 // KDC-MESH-6 — Seat-side consumer for phone-originated remote input. Drains the
 // KDC worker's action/seat/remote-input handoff, validates the event, and invokes
 // the configured uinput/seat helper when available.
-pub mod seat_remote_input;
 pub mod heartbeat;
+pub mod seat_remote_input;
 // mackesd-06 — the legacy reconcile loop (`crate::worker`) brought UNDER
 // the supervisor: an async adapter that runs the same blocking tick on
 // its dedicated OS thread but gets restart-on-panic + breaker treatment
@@ -865,17 +865,11 @@ pub mod notify;
 // shell renders. Universal (rank 0): a lighthouse relays cross-mesh traffic so it
 // especially must enforce the boundary; a workstation enforces its own ingress too.
 pub mod federation_enforcer;
-// NODE-GRADE-1 — the per-node self-grade worker (design docs/design/node-grade.md).
-// Every node computes + publishes its OWN A–F capability grade from telemetry the
-// platform already gathers (§6, no new probes): CPU headroom, RAM + disk free,
-// role/worker health (the supervisor's live status + systemctl --failed), and mesh
-// reachability (the replicated peer directory). Five factor sub-scores → a
-// resource-heaviest weighted average → a smoothed 0–100 score + trend → an A–F
-// band, published to `<workgroup_root>/node-grade/<hostname>.json` (the SEC-5
-// mesh-shunt own-row idiom) so every peer reads every node's grade. A debounced
-// drop into D/F fires an `event/notify/node-grade` alert the chat worker folds into
-// the Chat feed (CHAT-FIX-2). Pure scoring/smoothing/debounce cores fold headless
-// behind an injectable sampler; runs on EVERY node (rank 0).
+// The condition-backed System and Mesh Health publisher (docs/design/node-grade.md).
+// It evaluates role-required services, bounded/sustained resource policy, neutral
+// device evidence, current mesh/lighthouse reachability, firmware, and boot-bound
+// workstation audio proof. Typed node rows are folded only against the canonical
+// live roster; critical transitions reuse the signed notification/Chat path.
 pub mod node_grade;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every

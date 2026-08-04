@@ -23,13 +23,13 @@ const EDGE_PULSE_W: f32 = 14.0;
 /// Daemon notification segments presented by Construct chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatusSegment {
-    /// Local device/platform health.
+    /// Local device notification traffic.
     Device,
-    /// Mesh/fleet/cloud health.
+    /// Mesh/fleet/cloud notification traffic.
     Mesh,
     /// Power and energy posture.
     Power,
-    /// Aggregate alert health.
+    /// Aggregate alert priority.
     Alerts,
 }
 
@@ -174,17 +174,6 @@ pub(crate) fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
         Some("info" | "notice" | "debug") => Style::SUPPORT_INFO,
         Some("success" | "ok") => Style::SUPPORT_SUCCESS,
         _ => Style::TEXT_DIM,
-    }
-}
-
-/// Accessible severity label for one rollup.
-pub(crate) fn severity_label(rollup: Option<&SegmentRollup>) -> &'static str {
-    match rollup.map(|rollup| rollup.severity.as_str()) {
-        Some("critical" | "error" | "fatal" | "urgent") => "critical",
-        Some("warning" | "warn" | "high") => "warning",
-        Some("info" | "notice" | "debug") => "info",
-        Some("success" | "ok") => "ok",
-        Some(_) | None => "unknown",
     }
 }
 

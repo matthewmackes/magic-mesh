@@ -2186,7 +2186,6 @@ pub(crate) fn spawn_bookmark_workers(
             workgroup_root.clone(),
         )
     });
-
 }
 
 // run_serve extract: desktop/media discovery + seat input workers (seat_remote_input, desktop_sources, media_sources).
@@ -2987,7 +2986,7 @@ pub(crate) fn spawn_probe_observability_workers(
                     );
                 }
             }
-            if std::path::Path::new(&https_cert).exists() {
+            if relay_eligible && std::path::Path::new(&https_cert).exists() {
                 sup.spawn(Spawn::new(w, RestartPolicy::OnFailure));
                 worker_names
                     .lock()
@@ -3127,9 +3126,7 @@ pub(crate) fn spawn_messaging_sync_workers(
     role_rank: u8,
     node_id: &String,
     workgroup_root: &PathBuf,
-    worker_status: &mackesd_core::workers::WorkerStatusMap,
 ) {
-    use std::sync::Arc;
     // v4.0.1 KDC2-3.3 wire-up (2026-05-23) — spawn the KDC host
     // worker. Owns the pairing store at $XDG_CONFIG_HOME/mde/
     // connect (default ~/.config/mde/connect), the shared
@@ -3278,19 +3275,10 @@ pub(crate) fn spawn_messaging_sync_workers(
     });
 
     // NODE-GRADE-1 — the `node_grade` worker: every node computes + publishes
-    // its OWN A–F capability grade (docs/design/node-grade.md). It scores five
-    // factors from telemetry the platform already gathers (§6, no new probes):
-    // CPU headroom (/proc/loadavg vs cores), RAM + disk free (/proc/meminfo,
-    // df /), role/worker health (the supervisor's live worker-status map +
-    // systemctl --failed), and mesh reachability (the replicated peer
-    // directory) — resource-heaviest weighted average → a smoothed 0–100 score
-    // + trend → an A–F band, published to
-    // `<workgroup_root>/node-grade/<hostname>.json` (the SEC-5 mesh-shunt
-    // own-row idiom) so every peer reads every node's grade. A debounced drop
-    // into D/F fires an `event/notify/node-grade` alert the chat worker folds
-    // into the Chat feed (CHAT-FIX-2). Universal (rank 0) like notify — every
-    // node grades itself; role_rank marks a lighthouse for the mesh factor and
-    // worker_status feeds the role factor.
+    // System and Mesh Health authority (docs/design/node-grade.md). Each node
+    // publishes condition-backed evidence and an A–F grade; the observer folds
+    // only canonical, fresh roster members. Required services come from the
+    // node role, so optional internal workers cannot manufacture incidents.
     spawn_tiered(sup, worker_names, role_rank, "node_grade", || {
         let self_host = node_id
             .strip_prefix("peer:")
@@ -3300,7 +3288,6 @@ pub(crate) fn spawn_messaging_sync_workers(
             self_host,
             workgroup_root.clone(),
             role_rank,
-            Some(Arc::clone(&worker_status)),
         )
     });
 

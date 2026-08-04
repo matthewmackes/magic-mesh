@@ -1,0 +1,191 @@
+--- a/module/rdpCapture.c
++++ b/module/rdpCapture.c
+@@ -1333,56 +1333,77 @@
+ static int
+ copy_vmem(rdpPtr dev, RegionPtr in_reg)
+ {
+-    PixmapPtr hwPixmap;
+-    PixmapPtr swPixmap;
++    const BoxRec *extents;
+     BoxPtr pbox;
+     ScreenPtr pScreen;
+-    GCPtr copyGC;
+-    ChangeGCVal tmpval[1];
++    uint8_t *composed;
++    uint8_t *dst;
++    const uint8_t *src;
++    size_t composed_bytes;
+     int count;
+     int index;
++    int row;
+     int left;
+     int top;
+     int width;
+     int height;
++    int src_stride;
++    int row_bytes;
+ 
+-    /* copy the dirty area from the screen hw pixmap to a sw pixmap
+-       this should do a dma */
++    /*
++     * A nested Wayland compositor presents a separate pixmap on its X11
++     * window. GetScreenPixmap() remains the root backing pixmap and can be
++     * stale even while Xorg visibly composes the compositor window. Read the
++     * root drawable through GetImage(), which is Xorg's composed-window path,
++     * then update xorgxrdp's software capture buffer for the dirty rectangles.
++     */
+     pScreen = dev->pScreen;
+-    hwPixmap = pScreen->GetScreenPixmap(pScreen);
+-    swPixmap = dev->screenSwPixmap;
+-    copyGC = GetScratchGC(dev->depth, pScreen);
+-    if (copyGC != NULL)
++    extents = rdpRegionExtents(in_reg);
++    left = extents->x1;
++    top = extents->y1;
++    width = extents->x2 - left;
++    height = extents->y2 - top;
++    if ((width <= 0) || (height <= 0))
+     {
+-        tmpval[0].val = GXcopy;
+-        ChangeGC(NullClient, copyGC, GCFunction, tmpval);
+-        ValidateGC(&(hwPixmap->drawable), copyGC);
+-        count = REGION_NUM_RECTS(in_reg);
+-        pbox = REGION_RECTS(in_reg);
+-        for (index = 0; index < count; index++)
++        return 0;
++    }
++
++    src_stride = PixmapBytePad(width, dev->depth);
++    composed_bytes = (size_t)src_stride * (size_t)height;
++    composed = g_new(uint8_t, composed_bytes);
++    if (composed == NULL)
++    {
++        return 1;
++    }
++    pScreen->SourceValidate(&(pScreen->root->drawable), left, top,
++                            width, height, IncludeInferiors);
++    pScreen->GetImage(&(pScreen->root->drawable), left, top, width, height,
++                      ZPixmap, ~0UL, (char *)composed);
++
++    count = REGION_NUM_RECTS(in_reg);
++    pbox = REGION_RECTS(in_reg);
++    for (index = 0; index < count; index++)
++    {
++        width = pbox[index].x2 - pbox[index].x1;
++        height = pbox[index].y2 - pbox[index].y1;
++        if ((width > 0) && (height > 0))
+         {
+-            left = pbox[index].x1;
+-            top = pbox[index].y1;
+-            width = pbox[index].x2 - pbox[index].x1;
+-            height = pbox[index].y2 - pbox[index].y1;
+-            if ((width > 0) && (height > 0))
++            src = composed +
++                  (pbox[index].y1 - top) * src_stride +
++                  (pbox[index].x1 - left) * dev->Bpp;
++            dst = dev->pfbMemory +
++                  pbox[index].y1 * dev->paddedWidthInBytes +
++                  pbox[index].x1 * dev->Bpp;
++            row_bytes = width * dev->Bpp;
++            for (row = 0; row < height; row++)
+             {
+-                LLOGLN(10, ("copy_vmem: hwPixmap tex 0x%8.8x "
+-                       "swPixmap tex 0x%8.8x",
+-                       glamor_get_pixmap_texture(hwPixmap),
+-                       glamor_get_pixmap_texture(swPixmap)));
+-                 copyGC->ops->CopyArea(&(hwPixmap->drawable),
+-                                       &(swPixmap->drawable),
+-                                       copyGC, left, top,
+-                                       width, height, left, top);
++                g_memcpy(dst, src, row_bytes);
++                src += src_stride;
++                dst += dev->paddedWidthInBytes;
+             }
+         }
+-        FreeScratchGC(copyGC);
+-    }
+-    else
+-    {
+-        return 1;
+     }
++    free(composed);
+     return 0;
+ }
+ #endif
+--- a/module/rdpRandR.c
++++ b/module/rdpRandR.c
+@@ -128,6 +128,7 @@
+     PixmapPtr screenPixmap;
+     BoxRec box;
+     rdpPtr dev;
++    Bool rebind_damage;
+ 
+     LLOGLN(0, ("rdpRRScreenSetSize: width %d height %d mmWidth %d mmHeight %d",
+            width, height, (int)mmWidth, (int)mmHeight));
+@@ -144,6 +145,7 @@
+         LLOGLN(10, ("  error width %d height %d", width, height));
+         return FALSE;
+     }
++    rebind_damage = FALSE;
+     dev->width = width;
+     dev->height = height;
+     dev->paddedWidthInBytes = PixmapBytePad(dev->width, dev->depth);
+@@ -174,6 +176,20 @@
+         {
+             return FALSE;
+         }
++        /*
++         * DamageRegister() attaches the root listener to the drawable's
++         * current backing pixmap. RandR replaces that pixmap below. Relying
++         * only on SetWindowPixmap() to migrate the listener leaves it on the
++         * retired pre-resize pixmap on glamor/Present sessions, so nested
++         * compositor frames stop reaching RDP after the first resize.
++         * Explicitly detach while the old pixmap is alive and reattach after
++         * the root tree points at the replacement.
++         */
++        if (dev->damage != NULL)
++        {
++            DamageUnregister(dev->damage);
++            rebind_damage = TRUE;
++        }
+         screen_tex = glamor_get_pixmap_texture(screenPixmap);
+         LLOGLN(0, ("rdpRRScreenSetSize: screen_tex 0x%8.8x", screen_tex));
+         pScreen->SetScreenPixmap(screenPixmap);
+@@ -197,6 +213,10 @@
+     root->drawable.width = width;
+     root->drawable.height = height;
+     ResizeChildrenWinSize(root, 0, 0, 0, 0);
++    if (rebind_damage)
++    {
++        DamageRegister(&(root->drawable), dev->damage);
++    }
+     RRGetInfo(pScreen, 1);
+     LLOGLN(0, ("  screen resized to %dx%d", pScreen->width, pScreen->height));
+     RRScreenSizeNotify(pScreen);
+--- a/xrdpdev/xrdpdev.c
++++ b/xrdpdev/xrdpdev.c
+@@ -414,12 +414,23 @@
+ static void
+ xorgxrdpDamageReport(DamagePtr pDamage, RegionPtr pRegion, void *closure)
+ {
++    static unsigned int report_count;
+     rdpPtr dev;
+     ScreenPtr pScreen;
+ 
+-    LLOGLN(10, ("xorgxrdpDamageReport:"));
+     pScreen = (ScreenPtr)closure;
+     dev = rdpGetDevFromScreen(pScreen);
++    if (report_count < 128)
++    {
++        LLOGLN(0, ("MCNF-DAMAGE[%u]: rects %d extents %d,%d-%d,%d "
++               "root_pixmap %p screen_pixmap %p",
++               report_count, RegionNumRects(pRegion),
++               pRegion->extents.x1, pRegion->extents.y1,
++               pRegion->extents.x2, pRegion->extents.y2,
++               pScreen->GetWindowPixmap(pScreen->root),
++               pScreen->GetScreenPixmap(pScreen)));
++    }
++    report_count++;
+     rdpClientConAddAllReg(dev, pRegion, &(pScreen->root->drawable));
+ }
+ 

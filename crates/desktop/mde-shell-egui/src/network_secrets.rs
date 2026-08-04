@@ -76,7 +76,9 @@ fn safe_secret_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 96
         && !key.chars().any(char::is_control)
-        && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// Render the one-shot SecretAgent prompt. It is deliberately a modal: profile

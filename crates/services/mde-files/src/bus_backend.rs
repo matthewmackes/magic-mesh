@@ -28,9 +28,9 @@ use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
     CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
 };
+use mackes_mesh_types::service_record::{ServiceHealth, ServicesState};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
-use mackes_mesh_types::service_record::{ServiceHealth, ServicesState};
 
 use crate::backend::{BackendError, ConflictPolicy, Destination, OpId, SendMode};
 use crate::model::{FileRow, Mime, Peer, PeerKind, PeerStatus, SelfNode};
@@ -380,7 +380,10 @@ impl BusBackend {
             .any(|state| {
                 state.records.iter().any(|record| {
                     matches!(record.health, ServiceHealth::Up)
-                        && matches!(record.kind.to_ascii_lowercase().as_str(), "airsonic" | "navidrome")
+                        && matches!(
+                            record.kind.to_ascii_lowercase().as_str(),
+                            "airsonic" | "navidrome"
+                        )
                 })
             })
     }

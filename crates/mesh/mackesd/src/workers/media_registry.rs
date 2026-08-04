@@ -127,8 +127,7 @@ pub fn publish_server_record(node_id: &str, reg: &MediaServerRecord) {
 /// Publish the complete operator-configured endpoint roster for a node.
 pub fn publish_server_records(node_id: &str, records: &[MediaServerRecord]) {
     let topic = mesh_media::media_registry_topic(node_id);
-    if let Some(mut persist) =
-        crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
+    if let Some(mut persist) = crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
     {
         crate::bus_publish::publish_json(&mut persist, &topic, &records.to_vec());
     }

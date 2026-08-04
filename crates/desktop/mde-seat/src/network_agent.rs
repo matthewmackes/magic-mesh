@@ -112,9 +112,9 @@ fn valid_secret_settings(request: &SecretRequest, settings: &SecretSettings) -> 
             setting.len() <= 64
                 && !setting.chars().any(char::is_control)
                 && values.len() <= 32
-                && values.keys().all(|key| {
-                    key.len() <= 96 && !key.chars().any(char::is_control)
-                })
+                && values
+                    .keys()
+                    .all(|key| key.len() <= 96 && !key.chars().any(char::is_control))
         })
 }
 
@@ -152,12 +152,7 @@ impl SecretAgent {
         .await
     }
 
-    async fn cancel_get_secrets(
-        &self,
-        _connection_path: ObjectPath<'_>,
-        _setting_name: String,
-    ) {
-    }
+    async fn cancel_get_secrets(&self, _connection_path: ObjectPath<'_>, _setting_name: String) {}
 
     async fn save_secrets(
         &self,
@@ -288,7 +283,11 @@ fn run_agent(
             )
             .await
         {
-            let _ = tx.send(Err(classify_call(Backend::Network, "AgentManager.Register", &error)));
+            let _ = tx.send(Err(classify_call(
+                Backend::Network,
+                "AgentManager.Register",
+                &error,
+            )));
             return;
         }
         let _ = tx.send(Ok(()));

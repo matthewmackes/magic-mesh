@@ -843,12 +843,9 @@ impl CommunicationsSurface {
                 ui.max_rect()
             );
         }
-        ui.allocate_ui_with_layout(
-            body_size,
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_size(body_size);
-                frame::body_frame().show(ui, |ui| {
+        ui.allocate_ui_with_layout(body_size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(body_size);
+            frame::body_frame().show(ui, |ui| {
                 if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
                     eprintln!(
                         "communications central proof: available={}x{}, rect={:?}",
@@ -858,9 +855,8 @@ impl CommunicationsSurface {
                     );
                 }
                 anim::switch_body(ui, mode_slot, |ui| self.mode_body(ui, data, sink));
-                });
-            },
-        );
+            });
+        });
     }
 
     /// The active mode's central body.

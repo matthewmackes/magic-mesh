@@ -604,11 +604,7 @@ fn paint_no_data(painter: &Painter, rect: Rect) {
     };
     let panel_center = egui::pos2(panel_x, panel_y);
     let panel = Rect::from_center_size(panel_center, egui::vec2(panel_width, 88.0));
-    painter.rect_filled(
-        panel,
-        12.0,
-        Style::map_empty_panel(),
-    );
+    painter.rect_filled(panel, 12.0, Style::map_empty_panel());
     painter.rect_stroke(
         panel,
         12.0,

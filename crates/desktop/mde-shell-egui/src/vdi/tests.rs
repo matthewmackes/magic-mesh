@@ -1053,6 +1053,7 @@ fn browser_connect_routes_exactly_the_selected_transport() {
     let request = rdp.requested.as_ref().expect("RDP pending request");
     assert_eq!(request.protocol, VdiProtocol::Rdp);
     assert_eq!(request.browser_transport, Some(BrowserVmTransport::Rdp));
+    assert_eq!(request.preferred_size, Some((1920, 1080)));
 }
 
 #[test]
@@ -1717,6 +1718,25 @@ fn a_material_panel_growth_arms_a_resize_redial() {
         .pending_resize
         .expect("a material resize should arm a re-dial");
     assert_eq!(pending.target, (1920, 1080));
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn browser_vm_keeps_its_full_hd_guest_when_the_panel_is_smaller() {
+    let mut state = live_rdp_state();
+    state
+        .requested
+        .as_mut()
+        .expect("retained request")
+        .browser_transport = Some(BrowserVmTransport::Rdp);
+    state.negotiated_size = Some((1920, 1080));
+
+    state.note_resize_target((1600, 900), (1920, 1080));
+
+    assert!(
+        state.pending_resize.is_none(),
+        "Browser must scale its complete 1080p framebuffer, not renegotiate below Full HD"
+    );
 }
 
 #[cfg(feature = "live-vdi")]

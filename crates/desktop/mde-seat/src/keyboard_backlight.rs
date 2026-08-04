@@ -121,12 +121,11 @@ impl KeyboardBacklightClient for SysfsKeyboardBacklight {
             });
         }
         let dir = self.root.join(name);
-        let max = Self::read_u32(&dir.join("max_brightness")).map_err(|_| {
-            SeatError::Unavailable {
+        let max =
+            Self::read_u32(&dir.join("max_brightness")).map_err(|_| SeatError::Unavailable {
                 backend: Backend::KeyboardBacklight,
                 reason: format!("no keyboard backlight device {name}"),
-            }
-        })?;
+            })?;
         if value > max {
             return Err(SeatError::OutOfRange {
                 backend: Backend::KeyboardBacklight,
@@ -175,7 +174,10 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].percent(), 66);
         client.set_brightness(&devices[0].name, 3).unwrap();
-        assert_eq!(std::fs::read_to_string(led.join("brightness")).unwrap(), "3");
+        assert_eq!(
+            std::fs::read_to_string(led.join("brightness")).unwrap(),
+            "3"
+        );
         assert!(matches!(
             client.set_brightness(&devices[0].name, 4),
             Err(SeatError::OutOfRange { .. })

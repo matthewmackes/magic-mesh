@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,7 +114,19 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// fail-closed 4,096-envelope admission cap. The core still owns the hard
 /// all-or-nothing batch bound; the worker just avoids manufacturing oversized
 /// aggregate batches from retained Bus lanes or actor logs.
-const MAX_WORKER_MERGE_BATCH_EVENTS: usize = 1024;
+const MAX_WORKER_MERGE_BATCH_EVENTS: usize = 4096;
+
+/// Historical actor-log work admitted from one lane in one poll. A lane gets a
+/// live-tail slice and a sequential-history slice, so this deliberately stays
+/// tiny: with sixteen selected lanes the worst-case poll admits 128 envelopes.
+/// Signature verification and projection updates are CPU-heavy enough that a
+/// 256-envelope slice held one Tokio worker for minutes on the four-core Dell.
+const LOG_BACKFILL_SLICE_EVENTS: usize = 4;
+/// Bound total retained-log work while allowing every normally hot fleet lane
+/// to advance in the same worker tick. One slice was insufficient: a handful
+/// of continuously appended system logs could occupy every recent turn and
+/// starve a newly replicated Teams log indefinitely.
+const LOG_BACKFILL_SLICES_PER_TICK: usize = 16;
 
 /// Actor-log JSONL lines mirror the projection's 256 KiB serialized-envelope
 /// boundary, plus the writer's trailing `\n`. Oversized retained lines are
@@ -594,16 +606,7 @@ impl CollabWorker {
     ) -> mde_collab_core::Result<()> {
         let space = env.space_id;
         if !state.own_logs.contains_key(&space) {
-            let log = FileActorLog::open(&self.log_root, space, &self.self_actor)?;
-            if log.rejected_line_count() > 0 {
-                tracing::warn!(
-                    target: "mackesd::collab",
-                    %space,
-                    actor = %self.self_actor,
-                    rejected_lines = log.rejected_line_count(),
-                    "isolated malformed actor-log records; valid collaboration history remains writable",
-                );
-            }
+            let log = FileActorLog::open_append_only(&self.log_root, space, &self.self_actor)?;
             state.own_logs.insert(space, log);
         }
         let log = state
@@ -680,30 +683,80 @@ impl CollabWorker {
         self.merge_batch(state, incoming, touched, changed, "bus");
     }
 
-    /// Backfill from the replicated actor logs on disk (the Syncthing durable
-    /// path): re-read each log whose file grew since we last saw it and merge its
-    /// envelopes (idempotent). This is how a reconnecting node converges once
-    /// Syncthing has delivered a neighbour's log, and how a restart rebuilds its
-    /// own projection from its own durable log.
-    ///
-    /// WL-FUNC-011 Phase 2 follow-up: re-reads the whole grown log (mirroring the
-    /// engine's own full-refold note); a worker at fleet scale would fold each log
-    /// incrementally from a per-file offset.
+    /// Backfill from replicated actor logs in a bounded batch per tick.
+    /// Byte offsets are carried across ticks. Candidate selection alternates
+    /// between newest-modified first (live convergence) and oldest-modified
+    /// first (fair historical recovery), so a fresh log cannot sit behind a
+    /// fleet's many smaller retained logs and a continuously hot log cannot
+    /// starve old history.
+    /// A truncation resets that file to byte zero; an unterminated tail is left
+    /// unread until Syncthing delivers its newline.
     fn backfill_logs(
         &self,
         state: &mut CollabState,
         touched: &mut BTreeSet<SpaceId>,
         changed: &mut bool,
     ) {
-        for path in collect_log_files(&self.log_root) {
-            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            if state.log_sizes.get(&path) == Some(&len) {
-                continue; // unchanged since last backfill
+        let mut paths = collect_log_files(&self.log_root);
+        sort_backfill_candidates(&mut paths, state.prefer_recent_log_backfill);
+        let mut progressed = 0usize;
+        let mut selected = 0usize;
+        for path in paths {
+            if selected == LOG_BACKFILL_SLICES_PER_TICK {
+                break;
             }
-            read_log_envelope_chunks(&path, |incoming| {
-                self.merge_batch(state, incoming, touched, changed, "log");
-            });
-            state.log_sizes.insert(path, len);
+            let len = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            let mut offset = state.log_offsets.get(&path).copied().unwrap_or(0);
+            if offset > len {
+                offset = 0;
+            }
+            let complete_end = complete_log_end(&path);
+            let live_offset = state.log_live_offsets.get(&path).copied();
+            if offset == len && live_offset == Some(complete_end) {
+                continue;
+            }
+            selected += 1;
+
+            // The sequential lane below preserves bounded full-history recovery,
+            // but a multi-megabyte actor log can remain behind that cursor for
+            // minutes. Fold newly appended complete records from the live edge
+            // first so Teams and clipboard actions are observable immediately.
+            // If more than one slice arrived at once, also fold the newest slice;
+            // the sequential lane will recover the skipped middle idempotently.
+            if live_offset != Some(complete_end) {
+                let (incoming, next_live_offset) = match live_offset {
+                    Some(previous) if previous <= complete_end => {
+                        let (incoming, next) =
+                            read_log_envelope_chunk(&path, previous, LOG_BACKFILL_SLICE_EVENTS);
+                        self.merge_batch(state, incoming, touched, changed, "log-live");
+                        if next < complete_end {
+                            read_log_tail_envelope_chunk(&path, LOG_BACKFILL_SLICE_EVENTS)
+                        } else {
+                            (Vec::new(), next)
+                        }
+                    }
+                    _ => read_log_tail_envelope_chunk(&path, LOG_BACKFILL_SLICE_EVENTS),
+                };
+                self.merge_batch(state, incoming, touched, changed, "log-live-tail");
+                state
+                    .log_live_offsets
+                    .insert(path.clone(), next_live_offset);
+                progressed += 1;
+            }
+
+            if offset == len {
+                continue;
+            }
+            let (incoming, next_offset) =
+                read_log_envelope_chunk(&path, offset, LOG_BACKFILL_SLICE_EVENTS);
+            self.merge_batch(state, incoming, touched, changed, "log");
+            if next_offset != offset {
+                state.log_offsets.insert(path, next_offset);
+                progressed += 1;
+            }
+        }
+        if progressed > 0 {
+            state.prefer_recent_log_backfill = !state.prefer_recent_log_backfill;
         }
     }
 
@@ -961,9 +1014,13 @@ struct CollabState {
     /// This node's own per-space actor logs, kept open across ticks so a hot lane
     /// does not reopen + reload the file each append.
     own_logs: BTreeMap<SpaceId, FileActorLog>,
-    /// The last-seen byte length of each replicated log file — a log is re-read +
-    /// merged only when its file has grown.
-    log_sizes: BTreeMap<PathBuf, u64>,
+    /// Next complete JSONL-record byte offset for each replicated actor log.
+    log_offsets: BTreeMap<PathBuf, u64>,
+    /// Complete-record edge already folded through the low-latency live lane.
+    /// Full history still advances independently through `log_offsets`.
+    log_live_offsets: BTreeMap<PathBuf, u64>,
+    /// Alternates recent delivery with fair retained-history recovery.
+    prefer_recent_log_backfill: bool,
     /// The last published body per `state/collab/*` topic — skip republishing an
     /// identical read model (latest-wins churn guard).
     last_published: BTreeMap<String, String>,
@@ -979,7 +1036,9 @@ impl CollabState {
             ids: RandomIds,
             cursors: BTreeMap::new(),
             own_logs: BTreeMap::new(),
-            log_sizes: BTreeMap::new(),
+            log_offsets: BTreeMap::new(),
+            log_live_offsets: BTreeMap::new(),
+            prefer_recent_log_backfill: true,
             last_published: BTreeMap::new(),
             ai_requests: AiRequestBoard::default(),
         })
@@ -1220,46 +1279,174 @@ fn collect_log_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Read signed envelopes from one JSON-lines actor-log file in worker-sized
-/// chunks. A torn/partial trailing line, malformed line, or oversized line is
-/// skipped, never fatal.
-fn read_log_envelope_chunks(path: &Path, mut on_chunk: impl FnMut(Vec<CollabEventEnvelope>)) {
-    let Ok(file) = File::open(path) else {
-        return;
+fn sort_backfill_candidates(paths: &mut [PathBuf], prefer_recent: bool) {
+    paths.sort_by(|left, right| {
+        let left_metadata = std::fs::metadata(left).ok();
+        let right_metadata = std::fs::metadata(right).ok();
+        let left_modified = left_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let right_modified = right_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let modified_order = if prefer_recent {
+            right_modified.cmp(&left_modified)
+        } else {
+            left_modified.cmp(&right_modified)
+        };
+        modified_order
+            .then_with(|| {
+                left_metadata
+                    .as_ref()
+                    .map_or(u64::MAX, std::fs::Metadata::len)
+                    .cmp(
+                        &right_metadata
+                            .as_ref()
+                            .map_or(u64::MAX, std::fs::Metadata::len),
+                    )
+            })
+            .then_with(|| left.cmp(right))
+    });
+}
+
+/// Byte offset immediately after the final newline-terminated record.
+fn complete_log_end(path: &Path) -> u64 {
+    const SCAN_BLOCK_BYTES: usize = 64 * 1024;
+
+    let Ok(mut file) = File::open(path) else {
+        return 0;
     };
+    let len = file.metadata().map_or(0, |metadata| metadata.len());
+    let mut cursor = len;
+    while cursor > 0 {
+        let start = cursor.saturating_sub(SCAN_BLOCK_BYTES as u64);
+        let Ok(block_len) = usize::try_from(cursor - start) else {
+            return 0;
+        };
+        let mut block = vec![0_u8; block_len];
+        if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut block).is_err() {
+            return 0;
+        }
+        if let Some(index) = block.iter().rposition(|byte| *byte == b'\n') {
+            return start + index as u64 + 1;
+        }
+        cursor = start;
+    }
+    0
+}
+
+/// Read the newest bounded set of complete records without scanning an entire
+/// multi-megabyte actor log. The scan window is sized for `max_records` records
+/// at the hard per-line limit, so memory and I/O remain bounded.
+fn read_log_tail_envelope_chunk(
+    path: &Path,
+    max_records: usize,
+) -> (Vec<CollabEventEnvelope>, u64) {
+    let complete_end = complete_log_end(path);
+    if complete_end == 0 || max_records == 0 {
+        return (Vec::new(), complete_end);
+    }
+    let max_scan = (MAX_ACTOR_LOG_LINE_BYTES + 1).saturating_mul(max_records.saturating_add(1));
+    let scan_start = complete_end.saturating_sub(max_scan as u64);
+    let Ok(scan_len) = usize::try_from(complete_end - scan_start) else {
+        return (Vec::new(), complete_end);
+    };
+    let Ok(mut file) = File::open(path) else {
+        return (Vec::new(), complete_end);
+    };
+    if file.seek(SeekFrom::Start(scan_start)).is_err() {
+        return (Vec::new(), complete_end);
+    }
+    let mut bytes = vec![0_u8; scan_len];
+    if file.read_exact(&mut bytes).is_err() {
+        return (Vec::new(), complete_end);
+    }
+    let newline_offsets = bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .collect::<Vec<_>>();
+    let start = if newline_offsets.len() > max_records {
+        scan_start + newline_offsets[newline_offsets.len() - max_records - 1] as u64 + 1
+    } else if scan_start == 0 {
+        0
+    } else {
+        // The bounded scan may begin in the middle of an oversized record.
+        // Skip that fragment; the sequential lane will diagnose it later.
+        newline_offsets
+            .first()
+            .map_or(complete_end, |index| scan_start + *index as u64 + 1)
+    };
+    let (incoming, next_offset) = read_log_envelope_chunk(path, start, max_records);
+    (incoming, next_offset.min(complete_end))
+}
+
+/// Read at most `max_records` complete JSONL records starting at `offset`.
+/// Returns valid envelopes plus the next complete-record boundary.
+fn read_log_envelope_chunk(
+    path: &Path,
+    offset: u64,
+    max_records: usize,
+) -> (Vec<CollabEventEnvelope>, u64) {
+    let Ok(mut file) = File::open(path) else {
+        return (Vec::new(), offset);
+    };
+    let len = file.metadata().map_or(0, |metadata| metadata.len());
+    let start = offset.min(len);
+    let terminated = if len == 0 {
+        true
+    } else if file.seek(SeekFrom::End(-1)).is_ok() {
+        let mut tail = [0_u8; 1];
+        file.read_exact(&mut tail).is_ok() && tail[0] == b'\n'
+    } else {
+        false
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (Vec::new(), start);
+    }
     let mut reader = BufReader::new(file);
-    let mut batch = Vec::with_capacity(MAX_WORKER_MERGE_BATCH_EVENTS);
-    let mut line_number: u64 = 0;
-    loop {
+    let mut batch = Vec::with_capacity(max_records.min(MAX_WORKER_MERGE_BATCH_EVENTS));
+    let mut next_offset = start;
+    let mut records = 0_usize;
+    while records < max_records {
+        let line_start = reader.stream_position().unwrap_or(next_offset);
         match read_bounded_log_line(&mut reader, MAX_ACTOR_LOG_LINE_BYTES) {
             Ok(Some(BoundedLogLine::Line(line))) => {
-                line_number = line_number.saturating_add(1);
+                let line_end = reader.stream_position().unwrap_or(line_start);
+                if line_end == len && !terminated {
+                    break;
+                }
+                records = records.saturating_add(1);
+                next_offset = line_end;
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
                 match serde_json::from_slice::<CollabEventEnvelope>(&line) {
                     Ok(env) => {
                         batch.push(env);
-                        if batch.len() == MAX_WORKER_MERGE_BATCH_EVENTS {
-                            on_chunk(std::mem::take(&mut batch));
-                            batch.reserve(MAX_WORKER_MERGE_BATCH_EVENTS);
-                        }
                     }
                     Err(e) => tracing::warn!(
                         target: "mackesd::collab",
                         path = %path.display(),
-                        line = line_number,
+                        offset = line_start,
                         error = %e,
                         "skipping malformed actor-log line",
                     ),
                 }
             }
             Ok(Some(BoundedLogLine::OverLimit)) => {
-                line_number = line_number.saturating_add(1);
+                let line_end = reader.stream_position().unwrap_or(line_start);
+                if line_end == len && !terminated {
+                    break;
+                }
+                records = records.saturating_add(1);
+                next_offset = line_end;
                 tracing::warn!(
                     target: "mackesd::collab",
                     path = %path.display(),
-                    line = line_number,
+                    offset = line_start,
                     max_bytes = MAX_ACTOR_LOG_LINE_BYTES,
                     "skipping oversized actor-log line",
                 );
@@ -1276,8 +1463,22 @@ fn read_log_envelope_chunks(path: &Path, mut on_chunk: impl FnMut(Vec<CollabEven
             }
         }
     }
-    if !batch.is_empty() {
-        on_chunk(batch);
+    (batch, next_offset)
+}
+
+#[cfg(test)]
+fn read_log_envelope_chunks(path: &Path, mut on_chunk: impl FnMut(Vec<CollabEventEnvelope>)) {
+    let mut offset = 0_u64;
+    loop {
+        let (batch, next_offset) =
+            read_log_envelope_chunk(path, offset, MAX_WORKER_MERGE_BATCH_EVENTS);
+        if !batch.is_empty() {
+            on_chunk(batch);
+        }
+        if next_offset == offset {
+            break;
+        }
+        offset = next_offset;
     }
 }
 
@@ -1604,6 +1805,11 @@ impl Worker for CollabWorker {
             );
         }
         let mut tick = tokio::time::interval(self.poll_interval);
+        // A slow retained-history pass must not manufacture a permanent busy
+        // loop by replaying every interval that elapsed while it was running.
+        // Delay gives the runtime and DRM shell a full poll interval between
+        // passes while the independent live-tail lane keeps fresh work visible.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tokio::select! {
@@ -1892,7 +2098,7 @@ mod tests {
         let line = serde_json::to_string(&env).expect("serialize event");
         {
             let mut file = File::create(&log_path).expect("create actor log");
-            for _ in 0..(MAX_WORKER_MERGE_BATCH_EVENTS * 4 + 1) {
+            for _ in 0..(LOG_BACKFILL_SLICE_EVENTS * 4 + 1) {
                 writeln!(file, "{line}").expect("write actor log line");
             }
         }
@@ -1907,6 +2113,281 @@ mod tests {
         );
         assert!(state.engine.state().space(space).is_some());
         assert!(touched.contains(&space));
+        let offset = state
+            .log_offsets
+            .get(&log_path)
+            .copied()
+            .expect("backfill offset");
+        assert!(
+            offset < std::fs::metadata(&log_path).expect("log metadata").len(),
+            "one tick leaves retained history for a later bounded slice"
+        );
+    }
+
+    #[test]
+    fn backfill_live_tail_projects_fresh_event_behind_large_retained_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        let foreign_signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("dell")).expect("engine");
+        let mut fids = RandomIds;
+        let created = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "large-hot-log".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                50,
+            )
+            .expect("create")
+            .remove(0);
+        let fresh = foreign
+            .apply(
+                &CollabCommand::SendMessage {
+                    space: created.space_id,
+                    thread: None,
+                    body: MessageBody::new("fresh-at-live-edge"),
+                },
+                &foreign_signer,
+                &mut fids,
+                51,
+            )
+            .expect("fresh message")
+            .remove(0);
+        let log_path = w
+            .log_root
+            .join(created.space_id.to_string())
+            .join("dell.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("log parent")).expect("mkdir");
+        let retained_line = serde_json::to_string(&created).expect("serialize retained");
+        let mut file = File::create(&log_path).expect("create actor log");
+        for _ in 0..(LOG_BACKFILL_SLICE_EVENTS * 4) {
+            writeln!(file, "{retained_line}").expect("write retained row");
+        }
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&fresh).expect("serialize fresh")
+        )
+        .expect("write fresh row");
+        drop(file);
+        let log_len = std::fs::metadata(&log_path).expect("log metadata").len();
+        let mut touched = BTreeSet::new();
+        let mut changed = false;
+
+        w.backfill_logs(&mut state, &mut touched, &mut changed);
+
+        let timeline = state
+            .engine
+            .projection()
+            .conversation_timeline(created.space_id, None)
+            .expect("timeline");
+        assert!(
+            timeline
+                .messages
+                .iter()
+                .any(|message| message.body == "fresh-at-live-edge"),
+            "the newest complete event projects before sequential history catches up"
+        );
+        assert_eq!(state.log_live_offsets.get(&log_path), Some(&log_len));
+        assert!(
+            state.log_offsets.get(&log_path).copied().unwrap_or(0) < log_len,
+            "full retained history remains bounded to one sequential slice"
+        );
+    }
+
+    #[test]
+    fn backfill_batch_projects_a_new_small_log_alongside_retained_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        let foreign_signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("nyc3")).expect("engine");
+        let mut fids = RandomIds;
+        let old = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "old-history".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                50,
+            )
+            .expect("old event")
+            .remove(0);
+        let fresh = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "fresh-membership".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                51,
+            )
+            .expect("fresh event")
+            .remove(0);
+        let old_path = w.log_root.join(old.space_id.to_string()).join("nyc3.jsonl");
+        let fresh_path = w
+            .log_root
+            .join(fresh.space_id.to_string())
+            .join("nyc3.jsonl");
+        std::fs::create_dir_all(old_path.parent().expect("old parent")).expect("old mkdir");
+        std::fs::create_dir_all(fresh_path.parent().expect("fresh parent")).expect("fresh mkdir");
+        let old_line = serde_json::to_string(&old).expect("serialize old");
+        let mut old_file = File::create(&old_path).expect("create old log");
+        for _ in 0..(LOG_BACKFILL_SLICE_EVENTS + 1) {
+            writeln!(old_file, "{old_line}").expect("write old log");
+        }
+        writeln!(
+            File::create(&fresh_path).expect("create fresh log"),
+            "{}",
+            serde_json::to_string(&fresh).expect("serialize fresh")
+        )
+        .expect("write fresh log");
+        let mut touched = BTreeSet::new();
+        let mut changed = false;
+
+        w.backfill_logs(&mut state, &mut touched, &mut changed);
+
+        assert!(changed);
+        assert!(
+            state.engine.state().space(fresh.space_id).is_some(),
+            "the small new actor log is projected in the first bounded batch"
+        );
+        assert!(
+            state.engine.state().space(old.space_id).is_some(),
+            "the same batch also advances retained history"
+        );
+        assert!(
+            state
+                .log_offsets
+                .get(&old_path)
+                .copied()
+                .expect("old offset")
+                < std::fs::metadata(&old_path).expect("old metadata").len(),
+            "each individual log remains limited to one slice per tick"
+        );
+        assert_eq!(
+            state.log_offsets.get(&fresh_path).copied(),
+            Some(
+                std::fs::metadata(&fresh_path)
+                    .expect("fresh metadata")
+                    .len()
+            )
+        );
+    }
+
+    #[test]
+    fn backfill_batch_advances_fresh_and_stale_logs_and_alternates_fairly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        let foreign_signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("nyc3")).expect("engine");
+        let mut fids = RandomIds;
+        let stale = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "small-stale-log".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                50,
+            )
+            .expect("stale event")
+            .remove(0);
+        let fresh = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "larger-fresh-log".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                51,
+            )
+            .expect("fresh event")
+            .remove(0);
+        let stale_path = w
+            .log_root
+            .join(stale.space_id.to_string())
+            .join("nyc3.jsonl");
+        let fresh_path = w
+            .log_root
+            .join(fresh.space_id.to_string())
+            .join("nyc3.jsonl");
+        std::fs::create_dir_all(stale_path.parent().expect("stale parent")).expect("stale mkdir");
+        std::fs::create_dir_all(fresh_path.parent().expect("fresh parent")).expect("fresh mkdir");
+        writeln!(
+            File::create(&stale_path).expect("create stale log"),
+            "{}",
+            serde_json::to_string(&stale).expect("serialize stale")
+        )
+        .expect("write stale log");
+        let fresh_line = serde_json::to_string(&fresh).expect("serialize fresh");
+        {
+            let mut file = File::create(&fresh_path).expect("create fresh log");
+            for _ in 0..(LOG_BACKFILL_SLICE_EVENTS + 1) {
+                writeln!(file, "{fresh_line}").expect("write fresh row");
+            }
+        }
+        File::options()
+            .write(true)
+            .open(&stale_path)
+            .expect("open stale log")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            )
+            .expect("set stale time");
+        File::options()
+            .write(true)
+            .open(&fresh_path)
+            .expect("open fresh log")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+            )
+            .expect("set fresh time");
+        assert!(
+            std::fs::metadata(&fresh_path)
+                .expect("fresh metadata")
+                .len()
+                > std::fs::metadata(&stale_path)
+                    .expect("stale metadata")
+                    .len(),
+            "fixture proves size-first ordering would choose the wrong log"
+        );
+        let mut touched = BTreeSet::new();
+        let mut changed = false;
+
+        w.backfill_logs(&mut state, &mut touched, &mut changed);
+
+        assert!(state.engine.state().space(fresh.space_id).is_some());
+        assert!(
+            state.engine.state().space(stale.space_id).is_some(),
+            "one bounded tick advances more than the single hottest log"
+        );
+        assert!(!state.prefer_recent_log_backfill);
+
+        w.backfill_logs(&mut state, &mut touched, &mut changed);
+
+        assert_eq!(
+            state.log_offsets.get(&fresh_path).copied(),
+            Some(
+                std::fs::metadata(&fresh_path)
+                    .expect("fresh metadata")
+                    .len()
+            ),
+            "the next historical turn finishes the remaining bounded slice"
+        );
+        assert!(state.prefer_recent_log_backfill);
     }
 
     #[test]

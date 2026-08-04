@@ -43,13 +43,7 @@ pub enum Method {
 
 impl Method {
     /// Every method, in a stable order (help text + exhaustiveness tests).
-    pub const ALL: [Self; 5] = [
-        Self::Sftp,
-        Self::Rsync,
-        Self::Http,
-        Self::Node,
-        Self::Music,
-    ];
+    pub const ALL: [Self; 5] = [Self::Sftp, Self::Rsync, Self::Http, Self::Node, Self::Music];
 
     /// The canonical lowercase token (matches the serde wire form).
     #[must_use]

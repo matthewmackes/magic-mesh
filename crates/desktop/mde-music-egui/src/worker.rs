@@ -17,7 +17,9 @@ use mde_egui::egui::Context;
 use mde_musicd::airsonic::{Client, Song};
 use mde_musicd::engine::Engine;
 
-use crate::model::{select_default_server, track_for_engine, Command, FailoverRequest, SeatServer, Update};
+use crate::model::{
+    select_default_server, track_for_engine, Command, FailoverRequest, SeatServer, Update,
+};
 
 /// Albums fetched per library listing. Subsonic's `getAlbumList2` caps `size` at
 /// 500; one page covers the first-slice listing.
@@ -79,19 +81,23 @@ fn run(
         .map(|(server, client)| Connection { server, client })
         .collect();
     if connections.is_empty() {
-        let _ = updates.send(Update::Error("no music seat servers configured".to_string()));
+        let _ = updates.send(Update::Error(
+            "no music seat servers configured".to_string(),
+        ));
         return;
     }
     for connection in &mut connections {
         let started = Instant::now();
         if rt.block_on(connection.client.ping()).is_ok() {
-            connection.server.latency_ms = Some(
-                u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-            );
+            connection.server.latency_ms =
+                Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
         }
     }
     let mut active = select_default_server(
-        &connections.iter().map(|c| c.server.clone()).collect::<Vec<_>>(),
+        &connections
+            .iter()
+            .map(|c| c.server.clone())
+            .collect::<Vec<_>>(),
     )
     .unwrap_or(0);
     let _ = updates.send(Update::ServerSelected(connections[active].server.clone()));
@@ -122,10 +128,20 @@ fn run(
             match cmd {
                 Command::LoadLibrary => {
                     let result = rt
-                        .block_on(connections[active].client.get_album_list2(LIBRARY_ORDER, LIBRARY_PAGE))
+                        .block_on(
+                            connections[active]
+                                .client
+                                .get_album_list2(LIBRARY_ORDER, LIBRARY_PAGE),
+                        )
                         .map_err(|e| e.to_string());
                     if result.is_err() {
-                        propose_failover(&connections, active, updates, &mut pending_failover, "library server unavailable");
+                        propose_failover(
+                            &connections,
+                            active,
+                            updates,
+                            &mut pending_failover,
+                            "library server unavailable",
+                        );
                     }
                     let _ = updates.send(Update::Library(result));
                 }
@@ -135,7 +151,13 @@ fn run(
                         .map(|detail| detail.songs)
                         .map_err(|e| e.to_string());
                     if result.is_err() {
-                        propose_failover(&connections, active, updates, &mut pending_failover, "album server unavailable");
+                        propose_failover(
+                            &connections,
+                            active,
+                            updates,
+                            &mut pending_failover,
+                            "album server unavailable",
+                        );
                     }
                     let _ = updates.send(Update::Tracks {
                         album_id: id,
@@ -168,13 +190,15 @@ fn run(
                     if let Some(index) = connections.iter().position(|c| c.server.seat == seat) {
                         active = index;
                         pending_failover = None;
-                        let _ = updates.send(Update::ServerSelected(connections[active].server.clone()));
+                        let _ = updates
+                            .send(Update::ServerSelected(connections[active].server.clone()));
                     }
                 }
                 Command::ApproveFailover => {
                     if let Some(index) = pending_failover.take() {
                         active = index;
-                        let _ = updates.send(Update::ServerSelected(connections[active].server.clone()));
+                        let _ = updates
+                            .send(Update::ServerSelected(connections[active].server.clone()));
                     }
                 }
                 Command::RejectFailover => pending_failover = None,
@@ -219,7 +243,9 @@ fn propose_failover(
         .filter(|(index, _)| *index != active)
         .map(|(_, connection)| connection.server.clone())
         .collect();
-    let Some(candidate) = select_default_server(&candidates) else { return };
+    let Some(candidate) = select_default_server(&candidates) else {
+        return;
+    };
     let target = connections
         .iter()
         .position(|connection| connection.server == candidates[candidate])

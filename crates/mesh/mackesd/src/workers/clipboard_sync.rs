@@ -49,6 +49,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
+use mackes_mesh_types::vdi_clipboard::{
+    ClipboardMaterialization, VdiClipboardText, CLIPBOARD_MATERIALIZATION_TOPIC,
+};
 use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -407,6 +410,9 @@ pub fn clip_share_writable(workgroup_root: &Path) -> bool {
 /// `event/clipboard/clip` Bus bodies through [`apply_clip_event`].
 pub struct ClipboardSyncWorker {
     workgroup_root: PathBuf,
+    /// Exact direct-seat identity that may consume a replicated history
+    /// materialization on this node.
+    target_seat: String,
     /// Bus root override (tests). `None` ⇒ [`crate::bus_publish::default_bus_root`].
     bus_root_override: Option<PathBuf>,
     /// Bus drain cadence.
@@ -423,6 +429,7 @@ impl ClipboardSyncWorker {
     pub fn new(workgroup_root: PathBuf) -> Self {
         Self {
             workgroup_root,
+            target_seat: local_target_seat(),
             bus_root_override: None,
             poll: CLIP_EVENT_POLL_INTERVAL,
             vnc_action_signer: production_action_signer().ok(),
@@ -434,6 +441,14 @@ impl ClipboardSyncWorker {
     #[must_use]
     fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Override the direct-seat identity in deterministic tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_target_seat(mut self, target_seat: impl Into<String>) -> Self {
+        self.target_seat = target_seat.into();
         self
     }
 
@@ -624,6 +639,69 @@ impl ClipboardSyncWorker {
         Ok(true)
     }
 
+    /// Publish a newly-observed replicated history head into this node's
+    /// target-seat materialization lane. The shared history is the durable
+    /// mesh transport; this local handoff is what lets the compositor-less DRM
+    /// provider consume the value without fabricating a local capture event.
+    fn materialize_replicated_head(
+        &self,
+        persist: &mut Persist,
+        observed: &mut Option<ClipEventBody>,
+    ) -> Result<bool, String> {
+        let latest = read_history(&history_path(&self.workgroup_root))
+            .entries
+            .first()
+            .map(|entry| ClipEventBody {
+                id: entry.id.clone(),
+                text: entry.text.clone(),
+                source: entry.source.clone(),
+                time: entry.time.clone(),
+            });
+        if latest == *observed {
+            return Ok(false);
+        }
+        let Some(clip) = latest else {
+            *observed = None;
+            return Ok(false);
+        };
+
+        // Treat a malformed replicated row as observed so it is reported once,
+        // never retried as a 400 ms log storm. A later valid head still differs
+        // and will be delivered normally.
+        if let Err(error) = parse_clip_event_body(
+            &serde_json::to_string(&clip)
+                .map_err(|encode| format!("encode replicated clipboard head: {encode}"))?,
+        ) {
+            *observed = Some(clip);
+            return Err(format!(
+                "refused malformed replicated clipboard head: {error}"
+            ));
+        }
+        let text = VdiClipboardText::new(clip.text.clone())
+            .map_err(|error| format!("replicated clipboard text rejected: {error}"))?;
+        let handoff = ClipboardMaterialization::new(
+            self.target_seat.clone(),
+            text,
+            clip.source.clone(),
+            clip.time.clone(),
+        );
+        handoff
+            .validate()
+            .map_err(|error| format!("replicated clipboard handoff rejected: {error}"))?;
+        let body = serde_json::to_string(&handoff)
+            .map_err(|error| format!("encode replicated clipboard handoff: {error}"))?;
+        persist
+            .write(
+                CLIPBOARD_MATERIALIZATION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(|error| format!("publish replicated clipboard handoff: {error}"))?;
+        *observed = Some(clip);
+        Ok(true)
+    }
+
     /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
     fn drain_clip_events(
         &self,
@@ -743,6 +821,17 @@ impl Worker for ClipboardSyncWorker {
                 }
             }
         }
+        // Do not resurrect a retained clipboard at daemon start. Only a head
+        // that changes while this worker is alive is a fresh mesh delivery.
+        let mut observed_history_head = read_history(&history_path(&self.workgroup_root))
+            .entries
+            .first()
+            .map(|entry| ClipEventBody {
+                id: entry.id.clone(),
+                text: entry.text.clone(),
+                source: entry.source.clone(),
+                time: entry.time.clone(),
+            });
         info!(target: "clipboard_sync", "watching canonical clipboard bus lane");
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await;
@@ -750,11 +839,25 @@ impl Worker for ClipboardSyncWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     self.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint));
+                    if let Err(error) = self.materialize_replicated_head(
+                        &mut persist,
+                        &mut observed_history_head,
+                    ) {
+                        warn!(target: "clipboard_sync", %error, "replicated clipboard materialization failed");
+                    }
                 }
                 () = shutdown.wait() => return Ok(()),
             }
         }
     }
+}
+
+fn local_target_seat() -> String {
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("seat:{}", hostname.trim())
 }
 
 /// Build the supervisor-ready worker (call site in `run_serve`).
@@ -1221,6 +1324,59 @@ mod tests {
                 .map(|entry| entry.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["second", "first"]
+        );
+    }
+
+    #[test]
+    fn replicated_history_head_materializes_once_for_the_exact_local_seat() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let old = ClipEventBody::from_text("old clipboard", "seat:source", "2026-08-03T12:00:00Z");
+        let mut history = History::default();
+        assert!(apply_clip_event(&mut history, &old));
+        write_history(&history_path(history_dir.path()), &history).expect("write old history");
+        let mut observed = Some(old);
+
+        let fresh = ClipEventBody::from_text("fresh clipboard", "seat:remote", &now_rfc3339());
+        assert!(apply_clip_event(&mut history, &fresh));
+        write_history(&history_path(history_dir.path()), &history).expect("write fresh history");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_target_seat("seat:eagle");
+
+        assert!(worker
+            .materialize_replicated_head(&mut persist, &mut observed)
+            .expect("materialize changed head"));
+        let message = persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read materialization")
+            .expect("materialization exists");
+        let handoff: ClipboardMaterialization =
+            serde_json::from_str(message.body.as_deref().expect("materialization body"))
+                .expect("decode materialization");
+        assert_eq!(handoff.target_seat, "seat:eagle");
+        assert_eq!(String::from(handoff.text), "fresh clipboard");
+        assert_eq!(handoff.source, "seat:remote");
+        assert_eq!(handoff.time, fresh.time);
+        assert!(
+            persist
+                .read_latest(CLIP_TOPIC)
+                .expect("read capture lane")
+                .is_none(),
+            "a replicated handoff must not fabricate a local capture event"
+        );
+
+        assert!(!worker
+            .materialize_replicated_head(&mut persist, &mut observed)
+            .expect("unchanged head is a no-op"));
+        assert_eq!(
+            persist
+                .list_since(CLIPBOARD_MATERIALIZATION_TOPIC, None)
+                .expect("list handoffs")
+                .len(),
+            1,
+            "one replicated head produces exactly one local handoff",
         );
     }
 

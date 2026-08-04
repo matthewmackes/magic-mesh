@@ -51,8 +51,8 @@ pub const MCNF_SECRET_SCRIPT: &str = "automation/secrets/mcnf-secret.sh";
 /// daemon's systemd unit runs with cwd `/`, so the script can NOT be found
 /// relative to the process cwd — the repo root is resolved explicitly from
 /// `MCNF_REPO` (the project-wide convention, e.g. `disk-watchdog.sh`,
-/// `mcnf-farm-reconcile.service`), defaulting here.
-const DEFAULT_REPO_ROOT: &str = "/root/magic-mesh";
+/// `mcnf-farm-reconcile.service`), defaulting to the release payload root.
+const DEFAULT_REPO_ROOT: &str = "/opt/mcnf";
 
 // arch-7 — the mesh age **identity** path (`MCNF_AGE_KEY` env, else
 // `/root/.mcnf-age-key`) moved into the shared `mde-seal` crate alongside the
@@ -871,5 +871,10 @@ mod tests {
             SecretStore::Mesh { repo_dir } => assert_eq!(repo_dir, repo.path()),
             other => panic!("expected Mesh, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_repo_root_matches_the_rpm_payload() {
+        assert_eq!(DEFAULT_REPO_ROOT, "/opt/mcnf");
     }
 }

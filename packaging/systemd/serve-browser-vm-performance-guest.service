@@ -1,0 +1,30 @@
+[Unit]
+Description=MCNF Browser VM live performance guest controller
+After=systemd-user-sessions.service xrdp.service
+Wants=xrdp.service
+
+[Service]
+Type=simple
+User=mcnf-browser
+Group=mcnf-browser
+UMask=0077
+Environment=HOME=/var/home/mcnf-browser
+ExecStartPre=+/usr/bin/install -d -o root -g root -m 0755 /tmp/mcnf-browser-performance-control
+ExecStart=/var/lib/mcnf-browser-performance/serve-browser-vm-performance-guest
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/mcnf-browser /tmp
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

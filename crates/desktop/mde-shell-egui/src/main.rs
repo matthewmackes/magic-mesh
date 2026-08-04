@@ -48,6 +48,7 @@ mod federation;
 mod formfactor;
 mod front_door;
 mod front_door_peer_apps;
+mod health_modal;
 mod host_mirror;
 mod hotkeys;
 mod iac;
@@ -1472,6 +1473,11 @@ impl Shell {
         // remain governed by persisted navigation and user input. Reuse the one
         // production shell/goto grammar so proof cannot invent an unlaunchable route.
         shell.enforce_drm_proof_route();
+        if std::env::var_os("MDE_DRM_PROOF_READBACK").is_some()
+            && std::env::var_os("MDE_DRM_PROOF_HEALTH_MODAL").is_some()
+        {
+            shell.construct.health_modal_open = true;
+        }
         shell
     }
 
@@ -1850,7 +1856,7 @@ impl Shell {
             ctx,
             &mut self.construct,
             self.notify_status.segments(),
-            self.chrome.grades(),
+            self.chrome.health(),
             status_bar::StatusBarEnv {
                 curtain_engaged: self.curtain.engaged(),
                 car: self.system.layout_profile() == LayoutProfile::Car,
@@ -2296,11 +2302,7 @@ impl Shell {
             (_, _) => {
                 self.thisnode.set_detail_page(*page);
                 ui.push_id("this-node-detail", |ui| {
-                    self.thisnode.show_with_system_and_alerts(
-                        ui,
-                        Some(&mut self.system),
-                        Some(&self.communications),
-                    );
+                    self.thisnode.show_with_system(ui, Some(&mut self.system));
                 });
             }
         }
@@ -2311,7 +2313,7 @@ impl Shell {
         selected: &mut this_node_catalog::Section,
         selected_page: &mut this_node_catalog::PageEntry,
         query: &str,
-        status: &thisnode::ThisNodeState,
+        _status: &thisnode::ThisNodeState,
     ) {
         for (group, sections) in matching_this_node_groups(query) {
             egui::CollapsingHeader::new(group.label())
@@ -2326,24 +2328,10 @@ impl Shell {
                             .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
                     );
                     for candidate in sections {
-                        let health = status.section_health(candidate);
-                        let label = format!(
-                            "{} {} {}",
-                            health.glyph(),
-                            candidate.label(),
-                            health.label()
-                        );
+                        let label = candidate.label();
                         if mde_egui::widgets::hover_text(
                             ui.selectable_label(*selected == candidate, label),
-                            format!(
-                                "{} — {}",
-                                candidate.description(),
-                                if health.is_alert() {
-                                    "needs attention or a provider refresh"
-                                } else {
-                                    "current provider state"
-                                }
-                            ),
+                            candidate.description(),
                         )
                         .clicked()
                         {
@@ -2364,8 +2352,7 @@ impl Shell {
                             if !query.trim().is_empty() && !page.matches(query) {
                                 continue;
                             }
-                            let child_health = status.section_health(page.section);
-                            let child_label = format!("  {} {}", child_health.glyph(), page.label);
+                            let child_label = format!("  {}", page.label);
                             if ui
                                 .selectable_label(*selected_page == page, child_label)
                                 .clicked()
@@ -2855,8 +2842,8 @@ impl Boot {
                 tracing::info!(target: "shell::boot", milestone = "surfaces", "boot milestone completed");
             } else if !self.splash.is_complete(splash::Milestone::MeshSnapshot) {
                 // The shell's FIRST mesh-status snapshot poll — the same
-                // world-readable fold the dock grade/status chrome renders on its
-                // cadence, so the first dock frame opens with live status dots
+                // world-readable fold Construct chrome renders on its cadence,
+                // so the first desktop frame opens with live peer presence
                 // instead of cold dim ones whenever a snapshot exists.
                 if let Some(shell) = self.shell.as_mut() {
                     shell.chrome.poll(ctx);
@@ -3138,15 +3125,27 @@ impl Shell {
         );
         self.system.show_network_secret_dialog(ctx);
 
-        // The former top strip is retired; its snapshot poll survives as the
-        // grade/status mesh fold. ONE self-gating poll per frame (it also keeps the
-        // repaint heartbeat alive for the quad status dots) — the quads read the
-        // product, no second poll.
+        // The former top strip is retired. Keep one self-gating poll for current
+        // peer presence and the centralized health snapshot; the taskbar and modal
+        // consume that product without a second poll.
         self.chrome.poll(ctx);
 
         // Refresh the live models consumed by the status bar and centers before
         // painting this frame's Construct chrome.
         self.pump_shell_models(ctx);
+        let health_now_ms = u64::try_from(crate::timers::display_unix())
+            .unwrap_or(0)
+            .saturating_mul(1_000);
+        let health_open_blocked = self.curtain.engaged()
+            || self.immersive_vdi()
+            || self.construct.switcher_open
+            || self.construct.control_center_open
+            || self.construct.notification_center_open;
+        self.construct.observe_health(
+            self.chrome.health().snapshot(),
+            health_now_ms,
+            health_open_blocked,
+        );
 
         // WL-UX-005 — the legacy Start Menu was removed; Springboard and the
         // unified Front Door are the only launch/search surfaces.
@@ -3267,6 +3266,17 @@ impl Shell {
         // focuses it in the same frame, above the active surface.
         self.mount_front_door(ctx);
         self.mount_layout_profile_control(ctx, now);
+        health_modal::mount(ctx, &mut self.construct, self.chrome.health().snapshot());
+        if let Some((host, key)) = self.construct.health_inventory_target.take() {
+            self.nav.expanded = true;
+            self.nav.surface = Surface::ThisNode;
+            self.this_node_tab = ThisNodeTab::About;
+            self.this_node_section = this_node_catalog::Section::Hardware;
+            self.this_node_page = this_node_catalog::page_for_route("this-node/hardware")
+                .unwrap_or(this_node_catalog::page_index()[0]);
+            self.device_manager.open_health_device(&host, &key);
+            self.construct.health_modal_open = false;
+        }
 
         // The KIRON alert/OSD bridge (KIRON-2) — driven late so its centered OSD
         // pill floats (Foreground order) above the chrome, the surface, and any
@@ -3811,6 +3821,11 @@ impl Shell {
                 self.nav.surface = Surface::Desktop;
             }
             front_door::FrontDoorTarget::Workflow(card) => {
+                if card.opens_health() {
+                    self.construct.open_health();
+                    self.construct.health_selected_node = Some(crate::explorer::local_hostname());
+                    return;
+                }
                 self.nav.surface = card.surface;
                 if let Some(plane) = card.workbench_plane {
                     self.nav.plane = plane;
@@ -4108,7 +4123,8 @@ impl Shell {
                     let overlay_above = self.front_door.is_open()
                         || self.construct.switcher_open
                         || self.construct.control_center_open
-                        || self.construct.notification_center_open;
+                        || self.construct.notification_center_open
+                        || self.construct.health_modal_open;
                     backdrop::show(ui, backdrop::Coverage::Empty, None);
                     springboard::show(ui, overlay_above);
                 } else {

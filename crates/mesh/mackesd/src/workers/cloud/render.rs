@@ -63,15 +63,15 @@ pub(crate) fn render_tfvars(
             .then(|| spec.app.as_ref())
             .flatten()
             .map(|app| {
-            serde_json::json!({
-                "app_id": app.app_id,
-                "catalog_revision": app.catalog_revision,
-                "guest_profile": app.guest_profile,
-                "requested_capabilities": app.requested_capabilities,
-                "session_id": app.session_id,
-                "resume": app.resume,
-            })
-        });
+                serde_json::json!({
+                    "app_id": app.app_id,
+                    "catalog_revision": app.catalog_revision,
+                    "guest_profile": app.guest_profile,
+                    "requested_capabilities": app.requested_capabilities,
+                    "session_id": app.session_id,
+                    "resume": app.resume,
+                })
+            });
         vms.insert(
             name.to_string(),
             serde_json::json!({
@@ -246,21 +246,23 @@ mod tests {
             "appvm-writer",
             app,
         );
-        let value: serde_json::Value =
-            serde_json::from_str(&render_tfvars(
-                "eagle",
-                &[spec],
-                "qemu:///system",
-                super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
-            ))
-                .expect("valid tfvars");
+        let value: serde_json::Value = serde_json::from_str(&render_tfvars(
+            "eagle",
+            &[spec],
+            "qemu:///system",
+            super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+        ))
+        .expect("valid tfvars");
         let app = &value[TFVARS_VMS]["appvm-writer"]["app"];
         assert_eq!(app["app_id"], "org.example.Writer");
         assert_eq!(app["guest_profile"], "wayland-standard");
         assert_eq!(app["requested_capabilities"][0], "audio");
         assert_eq!(app["session_id"], "app-session-7");
         assert_eq!(app["resume"], true);
-        assert_eq!(value[TFVARS_VMS]["appvm-writer"]["image"], "app-vm-wayland-standard");
+        assert_eq!(
+            value[TFVARS_VMS]["appvm-writer"]["image"],
+            "app-vm-wayland-standard"
+        );
     }
 
     #[test]
@@ -281,7 +283,10 @@ mod tests {
             value[TFVARS_BROWSER_BASE_IMAGE_SOURCE],
             "/srv/browser/disk.qcow2"
         );
-        assert_eq!(value[TFVARS_VMS]["browser-vm"]["image"], "browser-vm-chromium");
+        assert_eq!(
+            value[TFVARS_VMS]["browser-vm"]["image"],
+            "browser-vm-chromium"
+        );
         assert_eq!(value[TFVARS_VMS]["browser-vm"]["image_digest"], digest);
     }
 

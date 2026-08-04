@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 pub struct MainChannel {
     connection: ChannelConnection,
     session_id: Option<u32>,
+    agent_connected: bool,
 }
 
 impl MainChannel {
@@ -19,6 +20,7 @@ impl MainChannel {
         Ok(Self {
             connection,
             session_id: None,
+            agent_connected: false,
         })
     }
 
@@ -44,6 +46,7 @@ impl MainChannel {
         Ok(Self {
             connection,
             session_id: None,
+            agent_connected: false,
         })
     }
 
@@ -82,6 +85,41 @@ impl MainChannel {
             .send_message(crate::protocol::SPICE_MSGC_MAIN_ATTACH_CHANNELS, &[])
             .await?;
         info!("Sent ATTACH_CHANNELS message");
+        Ok(())
+    }
+
+    /// Start the SPICE guest-agent lane and grant it an effectively unlimited
+    /// token window, matching spice-gtk's main-channel handshake.
+    async fn start_agent(&mut self) -> Result<()> {
+        self.connection
+            .send_message(SPICE_MSGC_MAIN_AGENT_START, &u32::MAX.to_le_bytes())
+            .await?;
+        self.agent_connected = true;
+        info!("Started SPICE guest-agent channel");
+        Ok(())
+    }
+
+    /// Ask the guest to expose one 32-bit monitor at the requested size.
+    ///
+    /// The payload is the packed `VDAgentMessage` envelope followed by one
+    /// packed `VDAgentMonitorsConfig`/`VDAgentMonConfig`, as specified by
+    /// `spice-protocol/spice/vd_agent.h`.
+    pub async fn send_monitor_config(&mut self, width: u32, height: u32) -> Result<()> {
+        if !self.agent_connected {
+            return Err(SpiceError::Protocol(
+                "SPICE guest agent is not connected; cannot set monitor size".to_string(),
+            ));
+        }
+        if width == 0 || height == 0 {
+            return Err(SpiceError::Protocol(
+                "SPICE monitor dimensions must be non-zero".to_string(),
+            ));
+        }
+        let payload = monitor_config_message(width, height);
+        self.connection
+            .send_message(SPICE_MSGC_MAIN_AGENT_DATA, &payload)
+            .await?;
+        info!("Requested SPICE guest monitor size {}x{}", width, height);
         Ok(())
     }
 
@@ -394,6 +432,10 @@ impl Channel for MainChannel {
                 // Store the session_id for use by other channels
                 self.session_id = Some(init_msg.session_id);
 
+                if init_msg.agent_connected != 0 {
+                    self.start_agent().await?;
+                }
+
                 // NOTE: The debug server rejects SPICE_MSGC_MAIN_CLIENT_INFO (type 101)
                 // with "invalid message type". This might be because:
                 // 1. The message type value is wrong
@@ -436,7 +478,9 @@ impl Channel for MainChannel {
                     "Agent connected with error code: {}",
                     agent_connected.error_code
                 );
-                // TODO: Initialize agent communication
+                if agent_connected.error_code == 0 {
+                    self.start_agent().await?;
+                }
             }
             x if x == MainChannelMessage::AgentDisconnected as u16 => {
                 info!("Agent disconnected");
@@ -566,5 +610,42 @@ impl Channel for MainChannel {
 
     fn channel_type(&self) -> ChannelType {
         ChannelType::Main
+    }
+}
+
+/// Build one complete `VDAgentMessage(VD_AGENT_MONITORS_CONFIG)` frame.
+fn monitor_config_message(width: u32, height: u32) -> Vec<u8> {
+    // VDAgentMonitorsConfig (8) + one VDAgentMonConfig (20).
+    const BODY_SIZE: u32 = 28;
+    let mut data = Vec::with_capacity(20 + BODY_SIZE as usize);
+    data.extend_from_slice(&VD_AGENT_PROTOCOL.to_le_bytes());
+    data.extend_from_slice(&VD_AGENT_MONITORS_CONFIG.to_le_bytes());
+    data.extend_from_slice(&0_u64.to_le_bytes()); // opaque
+    data.extend_from_slice(&BODY_SIZE.to_le_bytes());
+    data.extend_from_slice(&1_u32.to_le_bytes()); // num_of_monitors
+    data.extend_from_slice(&VD_AGENT_CONFIG_MONITORS_FLAG_USE_POS.to_le_bytes());
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(&width.to_le_bytes());
+    data.extend_from_slice(&32_u32.to_le_bytes()); // depth
+    data.extend_from_slice(&0_i32.to_le_bytes()); // x
+    data.extend_from_slice(&0_i32.to_le_bytes()); // y
+    data
+}
+
+#[cfg(test)]
+mod monitor_config_tests {
+    use super::monitor_config_message;
+
+    #[test]
+    fn monitor_config_is_packed_spice_agent_frame() {
+        let data = monitor_config_message(1920, 1080);
+        assert_eq!(data.len(), 48);
+        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(data[16..20].try_into().unwrap()), 28);
+        assert_eq!(u32::from_le_bytes(data[20..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(data[28..32].try_into().unwrap()), 1080);
+        assert_eq!(u32::from_le_bytes(data[32..36].try_into().unwrap()), 1920);
+        assert_eq!(u32::from_le_bytes(data[36..40].try_into().unwrap()), 32);
     }
 }

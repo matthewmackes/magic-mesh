@@ -46,14 +46,14 @@ impl Section {
 
     pub(crate) const fn description(self) -> &'static str {
         match self {
-            Self::Overview => "Node identity, status, and available controls.",
+            Self::Overview => "Node identity, inventory, and available controls.",
             Self::Connectivity => "Wi-Fi, Ethernet, cellular, VPN, DNS, and proxy.",
             Self::DisplaySound => "Displays, brightness, audio routes, and privacy.",
             Self::Input => "Keyboard, pointer, touch, pen, and seat policy.",
             Self::PowerPerformance => "Battery, thermals, performance, and sleep policy.",
             Self::Hardware => "Devices, firmware, storage, docks, and capabilities.",
             Self::Personalization => "Appearance, layout, wallpaper, and local preferences.",
-            Self::MeshSystem => "Nebula, services, updates, and mesh diagnostics.",
+            Self::MeshSystem => "Nebula, services, updates, and system configuration.",
         }
     }
 
@@ -77,18 +77,7 @@ impl Section {
     /// Keep this list descriptive: these are navigation aliases, not claims
     /// that a provider-backed control is available on this node.
     const KEYWORDS: [&'static [&'static str]; 8] = [
-        &[
-            "node",
-            "this node",
-            "status",
-            "identity",
-            "overview",
-            "health",
-            "health dashboard",
-            "alerts",
-            "critical alerts",
-            "all systems operational",
-        ],
+        &["node", "this node", "status", "identity", "overview"],
         &[
             "wi-fi",
             "wifi",
@@ -199,8 +188,6 @@ impl Section {
             "backup",
             "restore",
             "backup and restore",
-            "diagnostics",
-            "logs",
             "virtualization",
             "remote access",
             "time",
@@ -368,14 +355,14 @@ const fn provider_for(section: Section) -> PageProvider {
     }
 }
 
-const PAGE_INDEX: [PageEntry; 20] = [
+const PAGE_INDEX: [PageEntry; 19] = [
     PageEntry {
         route: "this-node/overview",
         section: Section::Overview,
         provider: provider_for(Section::Overview),
         label: "Overview",
-        description: "Health dashboard, identity, alerts, and recent events.",
-        keywords: &["health", "status", "alerts", "health dashboard"],
+        description: "Node identity, inventory, and recent events.",
+        keywords: &["identity", "inventory", "overview"],
     },
     PageEntry {
         route: "this-node/network",
@@ -504,14 +491,6 @@ const PAGE_INDEX: [PageEntry; 20] = [
         keywords: &["backup", "restore", "backup and restore"],
     },
     PageEntry {
-        route: "this-node/diagnostics",
-        section: Section::MeshSystem,
-        provider: PageProvider::Available,
-        label: "Diagnostics & Logs",
-        description: "Diagnostics, logs, and operator-readable evidence.",
-        keywords: &["diagnostics", "logs", "audit"],
-    },
-    PageEntry {
         route: "this-node/virtualization",
         section: Section::MeshSystem,
         provider: PageProvider::Available,
@@ -569,10 +548,7 @@ pub(crate) fn search_pages(query: &str) -> Vec<PageEntry> {
         })
         .collect();
     matches.sort_by_key(|(rank, index, _)| (*rank, *index));
-    matches
-        .into_iter()
-        .map(|(_, _, page)| page)
-        .collect()
+    matches.into_iter().map(|(_, _, page)| page).collect()
 }
 
 pub(crate) fn page_for_route(route: &str) -> Option<PageEntry> {
@@ -583,9 +559,7 @@ pub(crate) fn page_for_route(route: &str) -> Option<PageEntry> {
 /// catalog order so selecting a parent from the hierarchy never leaves the
 /// detail pane pointing at an unrelated route.
 pub(crate) fn first_page_for_section(section: Section) -> Option<PageEntry> {
-    PAGE_INDEX
-        .into_iter()
-        .find(|page| page.section == section)
+    PAGE_INDEX.into_iter().find(|page| page.section == section)
 }
 
 fn search_key(value: &str) -> String {
@@ -651,8 +625,6 @@ mod tests {
             ("thermal", Section::PowerPerformance),
             ("gpu", Section::PowerPerformance),
             ("fan", Section::PowerPerformance),
-            ("health dashboard", Section::Overview),
-            ("critical alerts", Section::Overview),
             ("interfaces", Section::Connectivity),
             ("topology", Section::Connectivity),
             ("privacy", Section::DisplaySound),
@@ -671,7 +643,6 @@ mod tests {
             ("users", Section::MeshSystem),
             ("recovery", Section::MeshSystem),
             ("backup", Section::MeshSystem),
-            ("logs", Section::MeshSystem),
         ];
 
         for (query, section) in aliases {
@@ -682,8 +653,6 @@ mod tests {
     #[test]
     fn search_covers_the_surveyed_device_manager_vocabulary() {
         let aliases = [
-            ("health dashboard", Section::Overview),
-            ("critical alerts", Section::Overview),
             ("network topology", Section::Connectivity),
             ("camera privacy", Section::DisplaySound),
             ("accessibility", Section::Input),
@@ -768,7 +737,10 @@ mod tests {
             }
         }
         let users = page_for_route("this-node/users").expect("users page route");
-        assert!(users.is_available(), "aggregate users observation is available");
+        assert!(
+            users.is_available(),
+            "aggregate users observation is available"
+        );
         assert!(users.unavailable_reason().is_none());
 
         assert!(page_for_route("this-node/virtualization")
@@ -783,14 +755,16 @@ mod tests {
             .unavailable_reason()
             .is_some_and(|reason| reason.contains("privileged")));
         let privacy = page_for_route("this-node/security-privacy").expect("privacy page route");
-        assert!(privacy.is_available(), "bounded privacy observations are available");
+        assert!(
+            privacy.is_available(),
+            "bounded privacy observations are available"
+        );
         assert!(privacy.unavailable_reason().is_none());
-        for route in [
-            "this-node/accessibility",
-            "this-node/time-language-region",
-        ] {
+        for route in ["this-node/accessibility", "this-node/time-language-region"] {
             assert!(
-                page_for_route(route).expect("partial provider route").is_available(),
+                page_for_route(route)
+                    .expect("partial provider route")
+                    .is_available(),
                 "durable System continuity should keep {route} reachable"
             );
         }
@@ -802,11 +776,6 @@ mod tests {
             search_pages("time zone")[0].route,
             "this-node/time-language-region"
         );
-        assert!(
-            page_for_route("this-node/diagnostics")
-                .expect("diagnostics page route")
-                .is_available(),
-            "bounded snapshot diagnostics must remain reachable"
-        );
+        assert!(page_for_route("this-node/diagnostics").is_none());
     }
 }

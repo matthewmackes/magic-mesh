@@ -553,10 +553,8 @@ fn title_header(ui: &mut Ui, title: &str, accent: Color32) {
         f32::INFINITY,
     );
     if let Some(section) = job.sections.first_mut() {
-        section.format.font_id = Style::typography_font_with_size(
-            TypographyRole::Mono,
-            TITLE_FONT_SIZE,
-        );
+        section.format.font_id =
+            Style::typography_font_with_size(TypographyRole::Mono, TITLE_FONT_SIZE);
     }
     let galley = ui.fonts(|fonts| fonts.layout_job(job));
     // Leave a deliberate trailing reserve for egui's fractional-pixel text

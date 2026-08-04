@@ -400,13 +400,12 @@ const _: () = {
             }
             group += 1;
         }
-        let expected = if is_tool_tray_surface(Surface::ALL[i])
-            || matches!(Surface::ALL[i], Surface::Files)
-        {
-            0
-        } else {
-            1
-        };
+        let expected =
+            if is_tool_tray_surface(Surface::ALL[i]) || matches!(Surface::ALL[i], Surface::Files) {
+                0
+            } else {
+                1
+            };
         assert!(
             count == expected,
             "central launcher must contain non-tray surfaces once and tray-owned surfaces zero times",
@@ -823,13 +822,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_surface_catalog_excludes_host_and_standalone_panel() {
+    fn embedded_surface_catalog_excludes_the_shell_host() {
         assert_eq!(EMBEDDED_SURFACE_CRATES.len(), 8);
         assert!(EMBEDDED_SURFACE_CRATES
             .windows(2)
             .all(|pair| pair[0] < pair[1]));
         assert!(!EMBEDDED_SURFACE_CRATES.contains(&"mde-shell-egui"));
-        assert!(!EMBEDDED_SURFACE_CRATES.contains(&"mde-panel-egui"));
     }
 
     #[test]

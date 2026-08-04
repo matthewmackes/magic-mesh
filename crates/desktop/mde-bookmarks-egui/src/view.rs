@@ -1215,11 +1215,9 @@ mod tests {
         let mut m = manager();
         let texts = painted_text(&render_shapes(&mut m));
         assert!(
-            texts
-                .iter()
-                .any(|(t, s)| {
-                    t == "Bookmarks" && (*s - Style::TYPE_HEADLINE).abs() < f32::EPSILON
-                }),
+            texts.iter().any(|(t, s)| {
+                t == "Bookmarks" && (*s - Style::TYPE_HEADLINE).abs() < f32::EPSILON
+            }),
             "the workspace title must render on the shared AppFrame Headline rung: {texts:?}"
         );
         assert!(

@@ -1054,12 +1054,14 @@ fn channel_task_completion_from_departed_member_is_ignored_during_offline_replay
     corpus.push(stale_completion);
     let mut reference = engine("reference");
     reference.merge(corpus.clone()).expect("reference replay");
-    assert!(!reference
-        .projection()
-        .channel_tasks(space)
-        .expect("reference task read model")
-        .tasks[0]
-        .completed);
+    assert!(
+        !reference
+            .projection()
+            .channel_tasks(space)
+            .expect("reference task read model")
+            .tasks[0]
+            .completed
+    );
     assert!(!reference.state().tasks[&task].completed);
 
     for seed in 1..=8 {
@@ -1069,7 +1071,10 @@ fn channel_task_completion_from_departed_member_is_ignored_during_offline_replay
             .expect("offline replay");
         assert_eq!(
             offline.projection().dump_tables().expect("offline dump"),
-            reference.projection().dump_tables().expect("reference dump"),
+            reference
+                .projection()
+                .dump_tables()
+                .expect("reference dump"),
             "departed-member task replay diverged for shuffle seed {seed}"
         );
     }
@@ -2390,6 +2395,104 @@ fn start_call_flows_into_the_call_state_projection() {
         cs.active.is_empty(),
         "once the last participant hangs up, CallEnded drops the call from the active set"
     );
+}
+
+#[test]
+fn concurrent_hangups_derive_an_ended_call_without_a_call_ended_event() {
+    let sa = sig(1);
+    let sb = sig(2);
+    let mut ia = SeqIds::new(1);
+    let mut ib = SeqIds::new(1_000);
+    let mut alice = engine("alice");
+
+    let created = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Direct,
+                name: "alice · bob".into(),
+            },
+            &sa,
+            &mut ia,
+            1_000,
+        )
+        .expect("create direct space");
+    let space = created[0].space_id;
+    alice
+        .apply(
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &sa,
+            &mut ia,
+            1_010,
+        )
+        .expect("add bob");
+    let call = CallId::new();
+    alice
+        .apply(
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+            &sa,
+            &mut ia,
+            1_020,
+        )
+        .expect("start call");
+
+    let mut bob = engine("bob");
+    bob.merge(alice.all_events()).expect("bob syncs call");
+    let answered = bob
+        .apply(&CollabCommand::AnswerCall { call }, &sb, &mut ib, 1_030)
+        .expect("bob answers");
+    alice.merge(answered).expect("alice observes answer");
+
+    // Both peers now disconnect against the same two-connected-participant
+    // snapshot. Neither can safely claim it is the last participant, so each
+    // authors only its own self-scoped Left event.
+    let alice_left = alice
+        .apply(&CollabCommand::HangUpCall { call }, &sa, &mut ia, 1_040)
+        .expect("alice hangs up offline");
+    let bob_left = bob
+        .apply(&CollabCommand::HangUpCall { call }, &sb, &mut ib, 1_040)
+        .expect("bob hangs up offline");
+    assert_eq!(alice_left.len(), 1);
+    assert_eq!(bob_left.len(), 1);
+    assert!(matches!(
+        alice_left[0].kind,
+        CollabEventKind::CallParticipantChanged {
+            state: CallParticipantState::Left,
+            ..
+        }
+    ));
+    assert!(matches!(
+        bob_left[0].kind,
+        CollabEventKind::CallParticipantChanged {
+            state: CallParticipantState::Left,
+            ..
+        }
+    ));
+
+    alice.merge(bob_left).expect("alice merges bob hangup");
+    bob.merge(alice_left).expect("bob merges alice hangup");
+    assert!(alice
+        .projection()
+        .call_state(Some(space))
+        .expect("alice call state")
+        .active
+        .is_empty());
+    assert!(bob
+        .projection()
+        .call_state(Some(space))
+        .expect("bob call state")
+        .active
+        .is_empty());
+
+    let late_answer = alice.apply(&CollabCommand::AnswerCall { call }, &sa, &mut ia, 1_050);
+    assert!(matches!(late_answer, Err(CollabError::CallNotFound(id)) if id == call));
 }
 
 // Ensure unused-import guards don't trip: BTreeSet is used by the purge model.

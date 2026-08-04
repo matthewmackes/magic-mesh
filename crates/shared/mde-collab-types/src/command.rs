@@ -109,11 +109,7 @@ impl TaskAction {
                 title: normalize_task_title(title)?,
                 source,
             }),
-            Self::Update {
-                space,
-                task,
-                title,
-            } => Ok(CollabCommand::UpdateTask {
+            Self::Update { space, task, title } => Ok(CollabCommand::UpdateTask {
                 space,
                 task,
                 title: normalize_task_title(title)?,

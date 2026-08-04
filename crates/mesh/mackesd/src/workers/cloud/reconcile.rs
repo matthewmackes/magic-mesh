@@ -558,12 +558,8 @@ pub(crate) fn plan_counts_for_node(
     libvirt_uri: &str,
     browser_base_image_source: &str,
 ) -> Result<PlanCounts, String> {
-    let tfvars = rendered_tfvars_for_node(
-        state_root,
-        node,
-        libvirt_uri,
-        browser_base_image_source,
-    )?;
+    let tfvars =
+        rendered_tfvars_for_node(state_root, node, libvirt_uri, browser_base_image_source)?;
     let ndjson = runner.plan_json(&tfvars)?;
     render::parse_plan_counts(&ndjson)
 }
@@ -913,7 +909,7 @@ mod tests {
             "qemu:///system",
             DEFAULT_BROWSER_VM_IMAGE_SOURCE,
         )
-            .expect_err("a malformed desired document must gate reconciliation");
+        .expect_err("a malformed desired document must gate reconciliation");
         assert!(
             err.contains("malformed desired document"),
             "unexpected error: {err}"
@@ -938,7 +934,7 @@ mod tests {
             "qemu:///system",
             DEFAULT_BROWSER_VM_IMAGE_SOURCE,
         )
-            .expect_err("a malformed desired document must gate live rendering");
+        .expect_err("a malformed desired document must gate live rendering");
         assert!(
             err.contains("malformed desired document"),
             "unexpected error: {err}"

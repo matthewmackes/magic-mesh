@@ -1302,7 +1302,7 @@ enum MeshSshKeyCmd {
 #[derive(clap::Args)]
 struct MeshSshKeyArgs {
     /// Repo root holding `automation/secrets/mcnf-secret.sh` (defaults to
-    /// `MCNF_REPO` / `/root/magic-mesh`) — selects the etcd-backed Mesh store
+    /// `MCNF_REPO` / `/opt/mcnf`) — selects the etcd-backed Mesh store
     /// when present, else the local-AEAD fallback under the workgroup root.
     #[arg(long)]
     repo: Option<PathBuf>,
@@ -1310,7 +1310,7 @@ struct MeshSshKeyArgs {
     /// `MDE_WORKGROUP_ROOT` / the canonical mesh mount).
     #[arg(long)]
     workgroup_root: Option<PathBuf>,
-    /// Override the mesh SSH login user the key authorizes (default `root`).
+    /// Override the mesh SSH login user the key authorizes (default `MDE-MESH`).
     #[arg(long)]
     mesh_user: Option<String>,
     /// Skip the live `systemctl reload sshd` — write the config only (the
@@ -2319,9 +2319,7 @@ fn install_mesh_service_key(
     })
 }
 
-fn log_mesh_service_key_outcome(
-    outcome: &mackesd_core::ipc::mesh_ssh_key::ProvisionOutcome,
-) {
+fn log_mesh_service_key_outcome(outcome: &mackesd_core::ipc::mesh_ssh_key::ProvisionOutcome) {
     use mackesd_core::ipc::mesh_ssh_key::SshdReload;
 
     match &outcome.reload {
@@ -3155,7 +3153,13 @@ fn run_serve(
         start_nebula_signal_dispatcher(&nebula_signal_slot);
         start_files_bus_responder(&worker_names, &shutdown, &host, &db_path);
 
-        spawn_messaging_sync_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root, &worker_status);
+        spawn_messaging_sync_workers(
+            &mut sup,
+            &worker_names,
+            role_rank,
+            &node_id,
+            &workgroup_root,
+        );
 
         // mackesd-06 — the reconcile worker now runs UNDER the supervisor (it was
         // a raw std::thread::spawn with NO restart-on-panic and NO supervision, so

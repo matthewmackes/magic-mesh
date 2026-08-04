@@ -530,21 +530,23 @@ pub struct TransferTarget {
 #[must_use]
 pub fn build_targets(peers: &[(String, String)], music_available: bool) -> Vec<TransferTarget> {
     let mut out = vec![TransferTarget {
-            label: "Mesh Share".to_string(),
-            // Symbolic: the node lane stages into the Syncthing mesh-share so it
-            // replicates (Q6); the daemon owns the `/mnt/mesh-storage` path.
-            dest: "mesh-share:".to_string(),
-            method: Method::Node,
-            kind: TargetKind::MeshShare,
-        },
-    ];
+        label: "Mesh Share".to_string(),
+        // Symbolic: the node lane stages into the Syncthing mesh-share so it
+        // replicates (Q6); the daemon owns the `/mnt/mesh-storage` path.
+        dest: "mesh-share:".to_string(),
+        method: Method::Node,
+        kind: TargetKind::MeshShare,
+    }];
     if music_available {
-        out.insert(0, TransferTarget {
-            label: "Music Library".to_string(),
-            dest: "music:library".to_string(),
-            method: Method::Music,
-            kind: TargetKind::Music,
-        });
+        out.insert(
+            0,
+            TransferTarget {
+                label: "Music Library".to_string(),
+                dest: "music:library".to_string(),
+                method: Method::Music,
+                kind: TargetKind::Music,
+            },
+        );
     }
     for (id, host) in peers {
         out.push(TransferTarget {
@@ -993,10 +995,13 @@ mod tests {
 
     #[test]
     fn targets_are_the_two_standing_plus_one_per_reachable_peer() {
-        let targets = build_targets(&[
-            ("oak-id".into(), "oak".into()),
-            ("pine-id".into(), "pine".into()),
-        ], true);
+        let targets = build_targets(
+            &[
+                ("oak-id".into(), "oak".into()),
+                ("pine-id".into(), "pine".into()),
+            ],
+            true,
+        );
         // A live music service plus Mesh Share, then one Node target per peer.
         assert_eq!(targets.len(), 4);
         assert_eq!(targets[0].kind, TargetKind::Music);
@@ -1008,7 +1013,9 @@ mod tests {
         assert_eq!(targets[2].method, Method::Node);
         // Peerless still offers the two standing node-state destinations.
         assert_eq!(build_targets(&[], false).len(), 1);
-        assert!(build_targets(&[], false).iter().all(|t| t.kind != TargetKind::Music));
+        assert!(build_targets(&[], false)
+            .iter()
+            .all(|t| t.kind != TargetKind::Music));
     }
 
     // ── filters + newest-relevant ordering ────────────────────────────────────────

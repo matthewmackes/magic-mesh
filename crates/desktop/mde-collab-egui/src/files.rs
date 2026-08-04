@@ -654,9 +654,7 @@ impl CommunicationsSurface {
         let workgroup_root = std::env::var_os("MDE_WORKGROUP_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/mnt/mesh-storage"));
-        let content_root = workgroup_root
-            .join("collab")
-            .join("content");
+        let content_root = workgroup_root.join("collab").join("content");
         let (file, reference) = link_file_at_content_root(path, &content_root)?;
         sink.emit(CollabCommand::LinkFile {
             space,
@@ -800,10 +798,7 @@ fn file_ref_from_bytes(path: &Path, bytes: &[u8]) -> (FileRefId, FileRef) {
 /// Materialize the exact bytes used to build the content address into the
 /// Syncthing-replicated collab content store before publishing the reference.
 /// A same-hash payload is idempotent; a conflicting file fails closed.
-fn link_file_at_content_root(
-    path: &Path,
-    content_root: &Path,
-) -> io::Result<(FileRefId, FileRef)> {
+fn link_file_at_content_root(path: &Path, content_root: &Path) -> io::Result<(FileRefId, FileRef)> {
     let bytes = read_regular_file_bounded(path)?;
     let (file, reference) = file_ref_from_bytes(path, &bytes);
     let prefix = reference
@@ -1024,8 +1019,8 @@ pub(crate) fn fmt_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        autofill_destination_label, file_ref_of_path, link_file_at_content_root,
-        safe_display_text, MAX_FILE_REF_BYTES,
+        autofill_destination_label, file_ref_of_path, link_file_at_content_root, safe_display_text,
+        MAX_FILE_REF_BYTES,
     };
 
     #[test]
@@ -1085,9 +1080,7 @@ mod tests {
         let (_, second) =
             link_file_at_content_root(&source, &content).expect("idempotent second link");
         assert_eq!(first.sha256_hex, second.sha256_hex);
-        let canonical = content
-            .join(&first.sha256_hex[..2])
-            .join(&first.sha256_hex);
+        let canonical = content.join(&first.sha256_hex[..2]).join(&first.sha256_hex);
         assert_eq!(
             std::fs::read(canonical).expect("read canonical payload"),
             b"mesh transfer payload"

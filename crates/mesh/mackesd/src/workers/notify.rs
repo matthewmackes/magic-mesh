@@ -26,13 +26,15 @@
 //!     seeds the baseline silently (no "everyone joined" flood on boot).
 //!   * **updates available** — `dnf check-update` on a slow (~hourly) cadence;
 //!     edge-triggered (fires once when updates appear, silent until they clear).
-//!   * **service failed/degraded** — `systemctl --failed`; emits a unit the first
-//!     time it enters the failed set.
-//!   * **disk-low / SMART** — `df` capacity threshold + `smartctl -H`; edge-
-//!     triggered per mount/device so a full disk alerts once, not every poll.
-//!   * **journal WARN-or-above** — `journalctl -p warning` since the last poll,
-//!     **coalesced** to a single "N warnings / M errors" line per poll so a noisy
-//!     journal can't spam the feed.
+//!   * **external application lifecycle notifications** — folds the Cloud lane
+//!     into its shell status segment without duplicating the Chat event.
+//!
+//! Platform service, storage, SMART, journal, and grade state deliberately do
+//! **not** emit from this worker. [`super::node_grade`] owns those observations,
+//! conditions, grades, acknowledgements, remediation, and critical notification
+//! edges through the typed System and Mesh Health authority. Keeping raw probes
+//! here would recreate a second health ledger and was the source of false
+//! "journal warnings" toasts alongside a healthy modal.
 //!
 //! **Honest degrade (§7).** Every external source runs through an injectable
 //! [`Probe`]; a probe that returns `None` (the binary is absent — no `dnf`, no
@@ -47,9 +49,8 @@
 //! **Testability (§7).** The whole worker drives headless: the Bus is an injected
 //! [`Persist`] (tempdir), the peer directory a tempdir, and every command a
 //! [`MapProbe`] of fixture outputs — so each source → a notification is asserted
-//! with no live net / live journal. The pure parsers ([`diff_peers`],
-//! [`parse_failed_units`], [`parse_df_capacity`], [`smart_health_failed`],
-//! [`parse_dnf_check_update`], [`coalesce_journal`]) are unit-tested directly, and
+//! with no live net. The pure parsers ([`diff_peers`] and
+//! [`parse_dnf_check_update`]) are unit-tested directly, and
 //! an end-to-end test folds the emitted lane through a real [`super::chat`] worker
 //! to prove the notifications reach `alert:<self>`.
 
@@ -86,23 +87,13 @@ pub const CRITICAL_POLICY_OWN_SEAT: &str = "own-seat-light-show";
 /// Remote criticals stay pull-first: pip + Chat.
 pub const CRITICAL_POLICY_REMOTE: &str = "remote-pip-chat";
 
-/// Base poll cadence. Peer + journal checks run every tick; the heavier probes
-/// run on slow multiples ([`SERVICE_EVERY`] / [`DISK_EVERY`] / [`UPDATES_EVERY`])
-/// so the worker never hammers.
+/// Base poll cadence. Peer checks run every tick; package checks run on the slow
+/// [`UPDATES_EVERY`] multiple so the worker never hammers.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// `systemctl --failed` cadence — every 4th tick (~2 min at the default).
-const SERVICE_EVERY: u64 = 4;
-/// `df` + `smartctl` cadence — every 10th tick (~5 min at the default).
-const DISK_EVERY: u64 = 10;
 /// `dnf check-update` cadence — every 120th tick (~1 h at the default). Updates
 /// change slowly and the probe is the heaviest, so it runs rarely.
 const UPDATES_EVERY: u64 = 120;
-
-/// Disk capacity (%) at/above which a filesystem raises a Warning.
-const DISK_WARN_PCT: u8 = 90;
-/// Disk capacity (%) at/above which a filesystem raises a Critical.
-const DISK_CRIT_PCT: u8 = 95;
 
 /// Bound on the recently-emitted-notification ring ([`NotifyLog`]).
 const NOTIFY_HISTORY_CAP: usize = 200;
@@ -120,16 +111,8 @@ pub enum NotifySource {
     Peer,
     /// Package / platform updates are available.
     Updates,
-    /// A systemd unit is failed/degraded.
-    Service,
-    /// A filesystem is low on space, or a disk's SMART health failed.
-    Disk,
-    /// Journal entries at WARN-or-above (coalesced).
-    Journal,
     /// Cloud notifications emitted by the cloud worker.
     Cloud,
-    /// A node capability grade entered D/F.
-    NodeGrade,
 }
 
 impl NotifySource {
@@ -139,11 +122,7 @@ impl NotifySource {
         match self {
             Self::Peer => "peer",
             Self::Updates => "updates",
-            Self::Service => "service",
-            Self::Disk => "disk",
-            Self::Journal => "journal",
             Self::Cloud => "cloud",
-            Self::NodeGrade => "node-grade",
         }
     }
 
@@ -159,17 +138,14 @@ impl NotifySource {
         match self {
             Self::Peer => NotifySegment::Mesh,
             Self::Updates => NotifySegment::Power,
-            Self::Service | Self::Disk => NotifySegment::Device,
-            Self::Journal | Self::Cloud | Self::NodeGrade => NotifySegment::Alerts,
+            Self::Cloud => NotifySegment::Alerts,
         }
     }
 }
 
-/// The four status segments the shell renders as pips.
+/// Lifecycle status segments retained outside the typed health authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NotifySegment {
-    /// Device/seat health.
-    Device,
     /// Mesh peer/connectivity health.
     Mesh,
     /// Power/update posture.
@@ -183,7 +159,6 @@ impl NotifySegment {
     #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
-            Self::Device => "device",
             Self::Mesh => "mesh",
             Self::Power => "power",
             Self::Alerts => "alerts",
@@ -257,14 +232,6 @@ const fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
-fn node_grade_severity(grade: &str) -> Option<Severity> {
-    match grade {
-        "F" => Some(Severity::Critical),
-        "D" => Some(Severity::Warning),
-        _ => None,
-    }
-}
-
 fn severity_from_tag(tag: &str) -> Option<Severity> {
     match tag.trim().to_ascii_lowercase().as_str() {
         "critical" | "crit" | "error" | "fatal" | "urgent" => Some(Severity::Critical),
@@ -316,9 +283,8 @@ struct BreakerAlertBody<'a> {
 
 /// test-obs-10 — build the NAMED circuit-breaker-trip alert for `worker`.
 ///
-/// A trip used to surface only as a journal `error!` line, which the journal
-/// source ([`coalesce_journal`]) folded into an anonymous "N journal warnings"
-/// blob — an operator could not tell WHICH worker died or that it was a
+/// A trip used to surface only as a journal `error!` line folded into an
+/// anonymous warning blob — an operator could not tell WHICH worker died or that it was a
 /// breaker-open trip (vs a transient restart). This emits a distinct, named
 /// alert on `fleet/health/breaker/<worker>` ([`BREAKER_ALERT_TOPIC_PREFIX`])
 /// carrying the worker name, the trip `reason`, and the breaker-open fact.
@@ -343,13 +309,6 @@ pub fn breaker_trip_alert(worker: &str, reason: &str) -> AlertMsg {
     // empty body rather than panic in the (unreachable) error arm.
     let body = serde_json::to_string(&body).unwrap_or_default();
     AlertMsg { topic, body }
-}
-
-#[derive(Debug, Deserialize)]
-struct GradeRow {
-    host: String,
-    grade: String,
-    score: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,95 +394,6 @@ pub fn diff_peers(prev: &BTreeSet<String>, now: &BTreeSet<String>) -> Vec<Notifi
     out
 }
 
-/// Parse the unit names from `systemctl --failed --no-legend --plain` output. The
-/// unit is the first whitespace-delimited column of each non-blank line.
-#[must_use]
-pub fn parse_failed_units(stdout: &str) -> BTreeSet<String> {
-    stdout
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter(|u| u.contains('.')) // a unit name (foo.service), not a stray marker
-        .map(str::to_string)
-        .collect()
-}
-
-/// Parse `df -P` output into `(mount, capacity_pct)` rows, skipping pseudo
-/// filesystems (their fullness is meaningless). The capacity column is the 5th
-/// (`NN%`); the mount is the 6th (last).
-#[must_use]
-pub fn parse_df_capacity(stdout: &str) -> Vec<(String, u8)> {
-    let mut out = Vec::new();
-    for line in stdout.lines().skip(1) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 6 {
-            continue;
-        }
-        let fs = cols[0];
-        let mount = cols[cols.len() - 1];
-        if is_pseudo_fs(fs, mount) {
-            continue;
-        }
-        let Ok(pct) = cols[4].trim_end_matches('%').parse::<u8>() else {
-            continue;
-        };
-        out.push((mount.to_string(), pct));
-    }
-    out
-}
-
-/// Whether a `df` row is a pseudo/virtual filesystem whose capacity is noise.
-fn is_pseudo_fs(fs: &str, mount: &str) -> bool {
-    matches!(fs, "tmpfs" | "devtmpfs" | "efivarfs" | "overlay")
-        || mount.starts_with("/proc")
-        || mount.starts_with("/sys")
-        || mount.starts_with("/dev")
-        || mount.starts_with("/run")
-        || mount == "/boot/efi"
-}
-
-/// The disk notification a `(mount, pct)` row raises, if it crossed a threshold.
-fn disk_notification(mount: &str, pct: u8) -> Option<Notification> {
-    if pct >= DISK_CRIT_PCT {
-        Some(Notification::new(
-            Severity::Critical,
-            NotifySource::Disk,
-            format!("filesystem {mount} is {pct}% full"),
-        ))
-    } else if pct >= DISK_WARN_PCT {
-        Some(Notification::new(
-            Severity::Warning,
-            NotifySource::Disk,
-            format!("filesystem {mount} is {pct}% full"),
-        ))
-    } else {
-        None
-    }
-}
-
-/// Parse `smartctl --scan` output into the device paths (the first token of each
-/// line, e.g. `/dev/sda -d scsi # …`). Bounded by the caller.
-#[must_use]
-pub fn parse_smart_scan(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter(|t| t.starts_with("/dev/"))
-        .map(str::to_string)
-        .collect()
-}
-
-/// Whether a `smartctl -H <dev>` report is a health FAILURE (the SMART overall
-/// self-assessment line reads anything other than PASSED/OK).
-#[must_use]
-pub fn smart_health_failed(stdout: &str) -> bool {
-    stdout.lines().any(|l| {
-        let l = l.to_ascii_lowercase();
-        (l.contains("overall-health") || l.contains("smart health status"))
-            && !l.contains("passed")
-            && !l.contains("ok")
-    })
-}
-
 /// Parse `dnf check-update` into a count of available package updates.
 ///
 /// dnf exits `100` when updates are available (`0` = none, other = error); the
@@ -542,38 +412,6 @@ pub fn parse_dnf_check_update(out: &ProbeOut) -> usize {
             cols.len() >= 3 && cols[0].contains('.') && !l.starts_with(' ')
         })
         .count()
-}
-
-/// Coalesce a `journalctl -p warning` batch into at most one notification.
-///
-/// One `-o cat` line per entry; the whole batch becomes a single "N journal
-/// warnings" (Warning) so a noisy journal can't spam the feed. Empty → none. The
-/// error split looks for an `error`/`fail`/`critical` token so the summary can
-/// mention them, but it stays one coalesced line.
-#[must_use]
-pub fn coalesce_journal(stdout: &str) -> Option<Notification> {
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() {
-        return None;
-    }
-    let total = lines.len();
-    let errors = lines
-        .iter()
-        .filter(|l| {
-            let low = l.to_ascii_lowercase();
-            low.contains("error") || low.contains("fail") || low.contains("critical")
-        })
-        .count();
-    let summary = if errors > 0 {
-        format!("{total} new journal warnings ({errors} error-level)")
-    } else {
-        format!("{total} new journal warnings")
-    };
-    Some(Notification::new(
-        Severity::Warning,
-        NotifySource::Journal,
-        summary,
-    ))
 }
 
 // ── the bounded, coalescing emit log (§7 "bounded") ─────────────────────────
@@ -616,19 +454,8 @@ impl NotifyLog {
 struct SourceState {
     /// The peer set as of the last poll (`None` before the first — seeds silently).
     known_peers: Option<BTreeSet<String>>,
-    /// Units already reported failed (edge-trigger on entry into the set).
-    known_failed: BTreeSet<String>,
-    /// Mounts already alerted over threshold (cleared when they drop back).
-    alerted_mounts: BTreeSet<String>,
-    /// Devices whose SMART failure was already alerted.
-    alerted_smart: BTreeSet<String>,
     /// Whether updates were pending as of the last check (edge-trigger 0→N).
     updates_pending: bool,
-    /// The journal `--since` cursor (unix seconds) — `None` before the first poll
-    /// (which seeds it to now, so old warnings aren't replayed).
-    journal_since: Option<i64>,
-    /// Last alarm grade seen per host; C-or-better clears a host.
-    known_node_grade_alarms: BTreeMap<String, String>,
     /// Cursors for external `event/notify/*` lanes owned by other workers.
     external_cursors: BTreeMap<String, Option<String>>,
     /// The bounded, coalescing emit log.
@@ -686,18 +513,9 @@ impl NotifyWorker {
     fn tick_once(&self, persist: &Persist, state: &mut SourceState, tick: u64, now_ms: i64) {
         let mut pending: Vec<Notification> = Vec::new();
 
-        // Peers + journal every tick (both cheap + edge-triggered).
+        // Platform health is exclusively emitted by the typed node-grade health
+        // authority. This legacy worker retains only non-health lifecycle lanes.
         pending.extend(self.check_peers(state));
-        pending.extend(self.check_journal(state, now_ms));
-        pending.extend(self.check_node_grades(state));
-
-        if tick % SERVICE_EVERY == 0 {
-            pending.extend(self.check_services(state));
-        }
-        if tick % DISK_EVERY == 0 {
-            pending.extend(self.check_disk(state));
-            pending.extend(self.check_smart(state));
-        }
         if tick % UPDATES_EVERY == 0 {
             pending.extend(self.check_updates(state));
         }
@@ -728,75 +546,6 @@ impl NotifyWorker {
             .map_or_else(Vec::new, |prev| diff_peers(&prev, &now))
     }
 
-    /// `systemctl --failed`: emit a unit the first time it enters the failed set.
-    fn check_services(&self, state: &mut SourceState) -> Vec<Notification> {
-        let Some(out) = self
-            .probe
-            .run("systemctl", &["--failed", "--no-legend", "--plain"])
-        else {
-            return Vec::new(); // no systemctl → skip honestly
-        };
-        let failed = parse_failed_units(&out.stdout);
-        let mut fresh = Vec::new();
-        for unit in failed.difference(&state.known_failed) {
-            fresh.push(Notification::new(
-                Severity::Warning,
-                NotifySource::Service,
-                format!("service {unit} failed"),
-            ));
-        }
-        state.known_failed = failed;
-        fresh
-    }
-
-    /// `df -P`: alert a filesystem the first time it crosses a threshold; clear it
-    /// when it drops back (so re-crossing re-alerts).
-    fn check_disk(&self, state: &mut SourceState) -> Vec<Notification> {
-        let Some(out) = self.probe.run("df", &["-P"]) else {
-            return Vec::new();
-        };
-        let mut fresh = Vec::new();
-        for (mount, pct) in parse_df_capacity(&out.stdout) {
-            match disk_notification(&mount, pct) {
-                Some(n) => {
-                    if state.alerted_mounts.insert(mount) {
-                        fresh.push(n);
-                    }
-                }
-                None => {
-                    state.alerted_mounts.remove(&mount);
-                }
-            }
-        }
-        fresh
-    }
-
-    /// `smartctl --scan` → per-device `smartctl -H`: alert a disk whose SMART
-    /// health first fails. Bounded to the first 8 devices.
-    fn check_smart(&self, state: &mut SourceState) -> Vec<Notification> {
-        let Some(scan) = self.probe.run("smartctl", &["--scan"]) else {
-            return Vec::new(); // no smartctl → skip honestly
-        };
-        let mut fresh = Vec::new();
-        for dev in parse_smart_scan(&scan.stdout).into_iter().take(8) {
-            let Some(health) = self.probe.run("smartctl", &["-H", &dev]) else {
-                continue;
-            };
-            if smart_health_failed(&health.stdout) {
-                if state.alerted_smart.insert(dev.clone()) {
-                    fresh.push(Notification::new(
-                        Severity::Critical,
-                        NotifySource::Disk,
-                        format!("disk {dev} SMART health check FAILED"),
-                    ));
-                }
-            } else {
-                state.alerted_smart.remove(&dev);
-            }
-        }
-        fresh
-    }
-
     /// `dnf check-update`: fire once when updates appear (0→N), stay silent until
     /// they clear.
     fn check_updates(&self, state: &mut SourceState) -> Vec<Notification> {
@@ -815,70 +564,6 @@ impl NotifyWorker {
         } else {
             Vec::new()
         }
-    }
-
-    /// `journalctl -p warning` since the last poll, coalesced to one line. First
-    /// poll seeds the cursor to now (no backlog replay of old warnings).
-    fn check_journal(&self, state: &mut SourceState, now_ms: i64) -> Vec<Notification> {
-        let now_secs = now_ms / 1000;
-        let Some(since) = state.journal_since else {
-            state.journal_since = Some(now_secs);
-            return Vec::new(); // seed the cursor, don't replay history
-        };
-        let since_arg = format!("@{since}");
-        let out = self.probe.run(
-            "journalctl",
-            &["-p", "warning", "-o", "cat", "--no-pager", "-S", &since_arg],
-        );
-        // Advance the cursor regardless (a probe failure just means "nothing new
-        // this window" — we don't re-scan the same span forever).
-        state.journal_since = Some(now_secs);
-        match out {
-            Some(o) => coalesce_journal(&o.stdout).into_iter().collect(),
-            None => Vec::new(), // no journalctl → skip honestly
-        }
-    }
-
-    /// Scan the existing node-grade mirror and alert on transitions into D/F.
-    fn check_node_grades(&self, state: &mut SourceState) -> Vec<Notification> {
-        let dir = self.workgroup_root.join("node-grade");
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut fresh = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(body) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(row) = serde_json::from_str::<GradeRow>(&body) else {
-                continue;
-            };
-            let grade = row.grade.trim().to_ascii_uppercase();
-            let Some(severity) = node_grade_severity(&grade) else {
-                state.known_node_grade_alarms.remove(&row.host);
-                continue;
-            };
-            let changed = state.known_node_grade_alarms.get(&row.host) != Some(&grade);
-            if changed {
-                state
-                    .known_node_grade_alarms
-                    .insert(row.host.clone(), grade.clone());
-                fresh.push(Notification::for_host(
-                    severity,
-                    NotifySource::NodeGrade,
-                    row.host.clone(),
-                    format!(
-                        "node {} dropped to grade {grade} (score {})",
-                        row.host, row.score
-                    ),
-                ));
-            }
-        }
-        fresh
     }
 
     fn fold_external_notify_lane(
@@ -981,14 +666,7 @@ impl NotifyWorker {
     /// therefore lose that first notification. Priming makes the prime absorb the
     /// first-sight skip, so every real notification thereafter is folded.
     fn prime_lanes(&self, persist: &Persist, now_ms: i64) {
-        for source in [
-            NotifySource::Peer,
-            NotifySource::Updates,
-            NotifySource::Service,
-            NotifySource::Disk,
-            NotifySource::Journal,
-            NotifySource::NodeGrade,
-        ] {
+        for source in [NotifySource::Peer, NotifySource::Updates] {
             let body = NotifyBody {
                 severity: Severity::Info.tag(),
                 source: source.key(),
@@ -1067,14 +745,10 @@ mod tests {
 
     // ── an injectable fixture probe ─────────────────────────────────────
 
-    /// A [`Probe`] returning canned output keyed by the program name (args are
-    /// ignored — each source calls exactly one program, except smartctl, handled
-    /// via a per-arg map).
+    /// A [`Probe`] returning canned output keyed by the program name.
     #[derive(Default)]
     struct MapProbe {
         by_program: BTreeMap<String, ProbeOut>,
-        /// `smartctl -H <dev>` outputs keyed by device.
-        smart_health: BTreeMap<String, ProbeOut>,
         /// Programs to report as absent (returns `None` — honest degrade).
         absent: BTreeSet<String>,
     }
@@ -1090,16 +764,6 @@ mod tests {
             );
             self
         }
-        fn smart(mut self, dev: &str, stdout: &str) -> Self {
-            self.smart_health.insert(
-                dev.to_string(),
-                ProbeOut {
-                    code: 0,
-                    stdout: stdout.to_string(),
-                },
-            );
-            self
-        }
         fn absent(mut self, prog: &str) -> Self {
             self.absent.insert(prog.to_string());
             self
@@ -1107,12 +771,9 @@ mod tests {
     }
 
     impl Probe for MapProbe {
-        fn run(&self, program: &str, args: &[&str]) -> Option<ProbeOut> {
+        fn run(&self, program: &str, _args: &[&str]) -> Option<ProbeOut> {
             if self.absent.contains(program) {
                 return None;
-            }
-            if program == "smartctl" && args.first() == Some(&"-H") {
-                return args.get(1).and_then(|d| self.smart_health.get(*d)).cloned();
             }
             self.by_program.get(program).cloned()
         }
@@ -1184,57 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_units_parse_from_systemctl_plain() {
-        let stdout = "sshd.service loaded failed failed OpenSSH server\n\
-                      nginx.service loaded failed failed nginx\n";
-        let failed = parse_failed_units(stdout);
-        assert!(failed.contains("sshd.service"));
-        assert!(failed.contains("nginx.service"));
-        assert_eq!(failed.len(), 2);
-        assert!(parse_failed_units("").is_empty());
-    }
-
-    #[test]
-    fn df_capacity_parses_and_skips_pseudo() {
-        let stdout = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
-                      /dev/sda1 100 95 5 95% /\n\
-                      tmpfs 100 1 99 1% /run\n\
-                      /dev/sdb1 100 50 50 50% /data\n";
-        let rows = parse_df_capacity(stdout);
-        // tmpfs on /run is skipped; real mounts kept.
-        assert!(rows.contains(&("/".to_string(), 95)));
-        assert!(rows.contains(&("/data".to_string(), 50)));
-        assert!(!rows.iter().any(|(m, _)| m == "/run"));
-    }
-
-    #[test]
-    fn disk_threshold_maps_severity() {
-        assert_eq!(disk_notification("/", 89), None);
-        assert_eq!(
-            disk_notification("/", 90).unwrap().severity,
-            Severity::Warning
-        );
-        assert_eq!(
-            disk_notification("/", 96).unwrap().severity,
-            Severity::Critical
-        );
-    }
-
-    #[test]
-    fn smart_health_parse() {
-        assert!(!smart_health_failed(
-            "SMART overall-health self-assessment test result: PASSED"
-        ));
-        assert!(smart_health_failed(
-            "SMART overall-health self-assessment test result: FAILED!"
-        ));
-        assert_eq!(
-            parse_smart_scan("/dev/sda -d scsi # comment\n/dev/nvme0 -d nvme\n").len(),
-            2
-        );
-    }
-
-    #[test]
     fn dnf_check_update_counts_only_on_exit_100() {
         let out = ProbeOut {
             code: 100,
@@ -1247,17 +857,6 @@ mod tests {
             stdout: String::new(),
         };
         assert_eq!(parse_dnf_check_update(&clean), 0);
-    }
-
-    #[test]
-    fn journal_coalesces_to_one_line() {
-        let stdout = "a warning happened\nanother warning\nsomething failed hard\n";
-        let n = coalesce_journal(stdout).expect("some warnings");
-        assert_eq!(n.severity, Severity::Warning);
-        assert!(n.summary.contains('3')); // 3 total
-        assert!(n.summary.contains("error-level")); // one "failed" line
-        assert!(coalesce_journal("").is_none());
-        assert!(coalesce_journal("   \n\n").is_none());
     }
 
     // ── test-obs-10: the NAMED breaker-trip alert seam ──────────────────
@@ -1288,7 +887,7 @@ mod tests {
     #[test]
     fn log_coalesces_within_window_and_caps() {
         let mut log = NotifyLog::default();
-        let n = Notification::new(Severity::Warning, NotifySource::Service, "service x failed");
+        let n = Notification::new(Severity::Warning, NotifySource::Peer, "peer x left");
         assert!(log.admit(&n, 1_000), "first emit admitted");
         assert!(!log.admit(&n, 2_000), "duplicate within window suppressed");
         // Past the coalesce window the same event is admitted again.
@@ -1296,7 +895,7 @@ mod tests {
         assert!(log.admit(&n, past), "re-emit after the window");
         // The ring stays bounded under a flood of distinct notifications.
         for i in 0..(NOTIFY_HISTORY_CAP * 2) {
-            let d = Notification::new(Severity::Info, NotifySource::Journal, format!("j{i}"));
+            let d = Notification::new(Severity::Info, NotifySource::Updates, format!("u{i}"));
             log.admit(&d, past + i64::try_from(i).unwrap());
         }
         assert!(
@@ -1310,6 +909,13 @@ mod tests {
     fn count_notify_msgs(persist: &Persist, source: NotifySource) -> usize {
         persist
             .list_since(&source.topic(), None)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    fn count_topic_msgs(persist: &Persist, topic: &str) -> usize {
+        persist
+            .list_since(topic, None)
             .map(|v| v.len())
             .unwrap_or(0)
     }
@@ -1339,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn each_source_emits_a_notification_from_fixtures() {
+    fn platform_health_probes_do_not_emit_duplicate_notification_lanes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let persist = persist_at(root);
@@ -1357,10 +963,6 @@ mod tests {
                 "Filesystem 1k Used Avail Capacity Mount\n/dev/sda1 100 97 3 97% /\n",
             )
             .program("smartctl", 0, "/dev/sda -d scsi\n")
-            .smart(
-                "/dev/sda",
-                "SMART overall-health self-assessment test result: FAILED\n",
-            )
             .program(
                 "dnf",
                 100,
@@ -1372,29 +974,18 @@ mod tests {
         let mut st = SourceState::default();
         // Prime the lanes exactly as run() does (one skipped-by-chat msg per lane).
         w.prime_lanes(&persist, 50_000);
-        // Seed peers + journal cursor on tick 0 (also runs all the due sources).
+        // Seed peers and run the lifecycle sources.
         w.tick_once(&persist, &mut st, 0, 100_000);
-        // A later tick where every slow source is due (tick chosen as a common
-        // multiple of the cadences) so journal has a real since-window too.
-        let common = SERVICE_EVERY * DISK_EVERY * UPDATES_EVERY; // divisible by all
-        w.tick_once(&persist, &mut st, common, 200_000);
+        w.tick_once(&persist, &mut st, UPDATES_EVERY, 200_000);
 
-        // Service (sshd failed): reported the first time it's seen (tick 0).
-        assert!(count_notify_msgs(&persist, NotifySource::Service) >= 2); // prime + real
-                                                                          // Disk 97% → Critical; SMART FAILED → Critical (both on the disk lane).
-        assert!(count_notify_msgs(&persist, NotifySource::Disk) >= 2);
-        // Updates available.
+        // Package updates remain an informational lifecycle notification.
         assert!(count_notify_msgs(&persist, NotifySource::Updates) >= 2);
-        // Journal warnings coalesced (emitted on the second tick, since-window).
-        assert!(count_notify_msgs(&persist, NotifySource::Journal) >= 2);
-
-        // Content spot-checks on the disk lane.
-        let disk = persist
-            .list_since(&NotifySource::Disk.topic(), None)
-            .unwrap();
-        let bodies: String = disk.iter().filter_map(|m| m.body.clone()).collect();
-        assert!(bodies.contains("97% full") || bodies.contains("SMART"));
-        assert!(bodies.contains("\"severity\":\"critical\""));
+        // Raw platform probes are owned by System and Mesh Health and must not
+        // create a second set of alert/toast lanes, even with alarming fixtures.
+        assert_eq!(count_topic_msgs(&persist, "event/notify/service"), 0);
+        assert_eq!(count_topic_msgs(&persist, "event/notify/disk"), 0);
+        assert_eq!(count_topic_msgs(&persist, "event/notify/journal"), 0);
+        assert_eq!(count_topic_msgs(&persist, "event/notify/node-grade"), 0);
     }
 
     #[test]
@@ -1402,47 +993,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let persist = persist_at(root);
-        let probe = MapProbe::default()
-            .program(
-                "systemctl",
-                0,
-                "sshd.service loaded failed failed OpenSSH\n",
-            )
-            .program(
-                "df",
-                0,
-                "Filesystem 1k Used Avail Capacity Mount\n/dev/sda1 100 99 1 99% /\n",
-            )
-            .absent("smartctl")
-            .absent("dnf")
-            .absent("journalctl");
-        let w = worker_with(root, probe);
+        let w = worker_with(root, MapProbe::default());
         let mut st = SourceState::default();
-        w.tick_once(&persist, &mut st, SERVICE_EVERY * DISK_EVERY, 100_000);
+        let critical = Notification::new(Severity::Critical, NotifySource::Cloud, "cloud down");
+        w.update_segment_rollup(&persist, &mut st, &critical, 100_000);
 
-        let device = persist
-            .list_since(&NotifySegment::Device.topic(), None)
+        let alerts = persist
+            .list_since(&NotifySegment::Alerts.topic(), None)
             .unwrap();
-        let latest = device.last().and_then(|m| m.body.as_deref()).unwrap();
-        assert!(latest.contains(r#""segment":"device""#));
-        assert!(latest.contains(r#""source":"disk""#));
+        let latest = alerts.last().and_then(|m| m.body.as_deref()).unwrap();
+        assert!(latest.contains(r#""segment":"alerts""#));
+        assert!(latest.contains(r#""source":"cloud""#));
         assert!(latest.contains(r#""severity":"critical""#));
         assert!(latest.contains(r#""critical_policy":"own-seat-light-show""#));
 
-        let lower = Notification::new(Severity::Warning, NotifySource::Service, "later warning");
+        let lower = Notification::new(Severity::Warning, NotifySource::Cloud, "later warning");
         w.update_segment_rollup(&persist, &mut st, &lower, 200_000);
-        let device_after = persist
-            .list_since(&NotifySegment::Device.topic(), None)
+        let alerts_after = persist
+            .list_since(&NotifySegment::Alerts.topic(), None)
             .unwrap();
         assert_eq!(
-            device_after.len(),
-            device.len(),
+            alerts_after.len(),
+            alerts.len(),
             "a lower-severity source cannot overwrite the active critical rollup"
         );
     }
 
     #[test]
-    fn node_grade_d_f_is_folded_into_alerts_segment() {
+    fn legacy_node_grades_do_not_emit_duplicate_alerts() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let persist = persist_at(root);
@@ -1451,45 +1029,13 @@ mod tests {
         let mut st = SourceState::default();
 
         w.tick_once(&persist, &mut st, 1, 100_000);
-        let lane = persist
-            .list_since(&NotifySource::NodeGrade.topic(), None)
-            .unwrap();
-        let body = lane.last().and_then(|m| m.body.as_deref()).unwrap();
-        assert!(body.contains(r#""severity":"warning""#));
-        assert!(body.contains("grade D"));
-        let rollups = persist
-            .list_since(&NotifySegment::Alerts.topic(), None)
-            .unwrap();
-        let rollup = rollups.last().and_then(|m| m.body.as_deref()).unwrap();
-        assert!(rollup.contains(r#""segment":"alerts""#));
-        assert!(rollup.contains(r#""source":"node-grade""#));
-
-        w.tick_once(&persist, &mut st, 2, 130_000);
-        assert_eq!(
+        assert_eq!(count_topic_msgs(&persist, "event/notify/node-grade"), 0);
+        assert!(
             persist
-                .list_since(&NotifySource::NodeGrade.topic(), None)
+                .list_since(&NotifySegment::Alerts.topic(), None)
                 .unwrap()
-                .len(),
-            lane.len(),
-            "same D grade is edge-triggered, not spammed"
+                .is_empty()
         );
-
-        write_grade(root, "nyc3", "C", 74);
-        w.tick_once(&persist, &mut st, 3, 160_000);
-        write_grade(root, "nyc3", "F", 40);
-        w.tick_once(&persist, &mut st, 4, 190_000);
-        let lane = persist
-            .list_since(&NotifySource::NodeGrade.topic(), None)
-            .unwrap();
-        let body = lane.last().and_then(|m| m.body.as_deref()).unwrap();
-        assert!(body.contains(r#""severity":"critical""#));
-        assert!(body.contains("grade F"));
-        let rollups = persist
-            .list_since(&NotifySegment::Alerts.topic(), None)
-            .unwrap();
-        let rollup = rollups.last().and_then(|m| m.body.as_deref()).unwrap();
-        assert!(rollup.contains(r#""host":"nyc3""#));
-        assert!(rollup.contains(r#""critical_policy":"remote-pip-chat""#));
     }
 
     #[test]
@@ -1550,14 +1096,13 @@ mod tests {
             .absent("journalctl");
         let w = worker_with(root, probe);
         let mut st = SourceState::default();
-        let common = SERVICE_EVERY * DISK_EVERY * UPDATES_EVERY;
         w.tick_once(&persist, &mut st, 0, 100_000);
-        w.tick_once(&persist, &mut st, common, 200_000);
+        w.tick_once(&persist, &mut st, UPDATES_EVERY, 200_000);
         // No REAL notifications beyond the single prime per lane (a prime is one msg).
-        assert_eq!(count_notify_msgs(&persist, NotifySource::Service), 0);
-        assert_eq!(count_notify_msgs(&persist, NotifySource::Disk), 0);
+        assert_eq!(count_topic_msgs(&persist, "event/notify/service"), 0);
+        assert_eq!(count_topic_msgs(&persist, "event/notify/disk"), 0);
         assert_eq!(count_notify_msgs(&persist, NotifySource::Updates), 0);
-        assert_eq!(count_notify_msgs(&persist, NotifySource::Journal), 0);
+        assert_eq!(count_topic_msgs(&persist, "event/notify/journal"), 0);
     }
 
     // ── end-to-end: the notifications reach the Chat feed ───────────────
@@ -1571,23 +1116,18 @@ mod tests {
         let root = tmp.path();
         let persist = persist_at(root);
 
-        // A disk-critical notification lands on the notify lane.
+        // An informational package lifecycle notification lands on its lane.
         let probe = MapProbe::default()
-            .program(
-                "df",
-                0,
-                "Filesystem 1k Used Avail Capacity Mount\n/dev/sda1 100 99 1 99% /\n",
-            )
+            .program("dnf", 100, "\nfoo.x86_64 1 updates\nbar.noarch 2 updates\n")
             .absent("systemctl")
             .absent("smartctl")
-            .absent("dnf")
             .absent("journalctl");
         let w = worker_with(root, probe);
         let mut st = SourceState::default();
-        w.tick_once(&persist, &mut st, DISK_EVERY, 3_000);
+        w.tick_once(&persist, &mut st, UPDATES_EVERY, 3_000);
 
-        // Read the raw notification off its `event/notify/disk` lane.
-        let topic = NotifySource::Disk.topic();
+        // Read the raw notification off its `event/notify/updates` lane.
+        let topic = NotifySource::Updates.topic();
         assert!(
             is_alert_lane(&topic),
             "the chat worker's alert-lane filter must accept the notify lane"
@@ -1596,8 +1136,8 @@ mod tests {
         let raw = msgs
             .iter()
             .rev()
-            .find(|m| m.body.as_deref().unwrap_or("").contains("99% full"))
-            .expect("the disk notification is on the lane");
+            .find(|m| m.body.as_deref().unwrap_or("").contains("2 package update"))
+            .expect("the update notification is on the lane");
 
         // Fold it EXACTLY as `chat::drain_alerts` does — this is the real path a
         // notification takes into the `alert:<self>` conversation the Chat surface
@@ -1619,11 +1159,11 @@ mod tests {
         else {
             unreachable!("a folded notification is an Alert message");
         };
-        assert_eq!(*severity, Severity::Critical);
+        assert_eq!(*severity, Severity::Info);
         assert_eq!(
             fields.get("summary").map(String::as_str),
-            Some("filesystem / is 99% full")
+            Some("2 package update(s) available")
         );
-        assert_eq!(fields.get("source").map(String::as_str), Some("disk"));
+        assert_eq!(fields.get("source").map(String::as_str), Some("updates"));
     }
 }

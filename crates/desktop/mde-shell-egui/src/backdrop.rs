@@ -171,12 +171,10 @@ fn show_with_status_anchor(
     // the complete screen. Paint through the middle layer so the first real
     // desktop frame is above the retained boot splash layer but below the
     // foreground Construct chrome.
-    let painter = ui
-        .ctx()
-        .layer_painter(egui::LayerId::new(
-            egui::Order::Middle,
-            egui::Id::new("construct-desktop-backdrop"),
-        ));
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("construct-desktop-backdrop"),
+    ));
     painter.rect_filled(free, 0.0, Style::BG);
     if let Some(texture) = wallpaper_texture(ui.ctx()) {
         painter.image(
@@ -478,12 +476,11 @@ fn wallpaper_texture(ctx: &egui::Context) -> Option<TextureHandle> {
 /// fails soft to the Carbon field until Bing has supplied an image.
 fn decode_wallpaper(ctx: &egui::Context) -> Option<TextureHandle> {
     let path = crate::system::bing_wallpaper_path()?;
-    let image = fs::read(path).ok().as_deref().and_then(decode_wallpaper_rgba)?;
-    Some(ctx.load_texture(
-        "bing-wallpaper-of-the-day",
-        image,
-        TextureOptions::LINEAR,
-    ))
+    let image = fs::read(path)
+        .ok()
+        .as_deref()
+        .and_then(decode_wallpaper_rgba)?;
+    Some(ctx.load_texture("bing-wallpaper-of-the-day", image, TextureOptions::LINEAR))
 }
 
 /// Decode the downloaded Bing payload regardless of its transport image
@@ -850,7 +847,10 @@ mod tests {
             drew,
             "the covered shell-colour backdrop produced no draw primitives"
         );
-        assert!(cached, "the covered backdrop must retain its Bing cache state");
+        assert!(
+            cached,
+            "the covered backdrop must retain its Bing cache state"
+        );
     }
 
     #[test]
@@ -954,7 +954,10 @@ mod tests {
 
         // The same seat re-saves; the newer write wins (its file is overwritten).
         store.save(false, 2_000).expect("save disabled");
-        assert_eq!(store.load_record().map(|record| record.enabled), Some(false));
+        assert_eq!(
+            store.load_record().map(|record| record.enabled),
+            Some(false)
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1002,7 +1005,10 @@ mod tests {
         let store = WallpaperStore::new(PathBuf::from("/no/such/mesh/root"));
         assert!(!store.is_ready());
         store.save(true, 1).expect("inert save is Ok");
-        assert!(store.load_record().is_none(), "nothing folded from a missing root");
+        assert!(
+            store.load_record().is_none(),
+            "nothing folded from a missing root"
+        );
     }
 
     #[test]

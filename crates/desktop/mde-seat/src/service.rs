@@ -60,13 +60,9 @@ impl ServiceClient for ZbusService {
                 reason: "service unit target is malformed or not a .service unit".to_owned(),
             });
         }
-        let unit_path: OwnedObjectPath = self.bus.call(
-            SYSTEMD,
-            MANAGER,
-            MANAGER_IFACE,
-            "GetUnit",
-            &(unit,),
-        )?;
+        let unit_path: OwnedObjectPath =
+            self.bus
+                .call(SYSTEMD, MANAGER, MANAGER_IFACE, "GetUnit", &(unit,))?;
         self.bus.call_unit(
             SYSTEMD,
             unit_path.as_str(),

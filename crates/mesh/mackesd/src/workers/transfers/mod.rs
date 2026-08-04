@@ -590,7 +590,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn cap_bounds_concurrent_running_jobs() {
         let tmp = tempfile::tempdir().unwrap();

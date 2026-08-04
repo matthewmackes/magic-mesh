@@ -97,15 +97,6 @@ base64 = "0.22"
 # egui rectangles, so no image stack or QR scanner dependency is pulled in.
 qrcode = { version = "0.14", default-features = false }
 
-# The chrome bar's live Peers + Status fold the world-readable mesh-status
-# snapshot, reusing the render-agnostic LIGHTHOUSE-7 model
-# (`lighthouse_health_from_snapshot` / `LighthouseHealth`) so the bar's health
-# verdict can't diverge from the fleet's. `default-features = false` drops the
-# applet's Cosmic-era panel shell (E12 retires that toolkit) — only the pure logic
-# layer compiles in. platform tier; the edge points inward (§6), the same reuse
-# the egui panel client (mde-panel-egui) makes.
-mde-lighthouse-health = { path = "../../platform/mde-lighthouse-health", default-features = false }
-
 # E12-3b EMBED — the three polished mesh-control surfaces are mounted as in-shell
 # panels (Construct §5: panels in the one shell, not separate clients). Each is a
 # desktop-shell-tier lib the shell owns the App of and drives per-frame (pump +

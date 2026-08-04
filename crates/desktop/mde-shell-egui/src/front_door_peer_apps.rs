@@ -326,7 +326,9 @@ fn fold_peer_apps_reply(
     let Some(reply_node) = clean_node(&reply.node).map(str::to_owned) else {
         return (
             Vec::new(),
-            Some(format!("{requested_node} app discovery reply omitted its node")),
+            Some(format!(
+                "{requested_node} app discovery reply omitted its node"
+            )),
         );
     };
     if reply_node != requested_node {
@@ -347,9 +349,10 @@ fn fold_peer_apps_reply(
                         .into_iter()
                         .map(|entry| {
                             let launchable = entry.is_launchable()
-                                && entry.supported_actions.iter().any(|action| {
-                                    action.trim().eq_ignore_ascii_case("launch")
-                                });
+                                && entry
+                                    .supported_actions
+                                    .iter()
+                                    .any(|action| action.trim().eq_ignore_ascii_case("launch"));
                             let state =
                                 if !launchable && entry.state == FlatpakInstallState::Installed {
                                     if entry.provenance.signature.is_some() {
@@ -553,36 +556,40 @@ mod tests {
     #[test]
     fn catalog_preserves_not_installed_and_unavailable_rows_without_promoting_them() {
         let mut catalog = catalog();
-        catalog.entries.push(mackes_mesh_types::app_catalog::FlatpakCatalogEntry {
-            app_id: "org.example.NotInstalled".into(),
-            display_name: "Not installed".into(),
-            summary: "Guest app not installed".into(),
-            icon_reference: "icon:not-installed".into(),
-            source_revision: "flathub-42".into(),
-            declared_capabilities: Vec::new(),
-            guest_profile: "wayland-standard".into(),
-            supported_actions: vec!["launch".into()],
-            provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
-                source: "curated".into(),
-                signature: Some("sig-42".into()),
-            },
-            state: FlatpakInstallState::Available,
-        });
-        catalog.entries.push(mackes_mesh_types::app_catalog::FlatpakCatalogEntry {
-            app_id: "org.example.Unavailable".into(),
-            display_name: "Unavailable".into(),
-            summary: "Guest app unavailable".into(),
-            icon_reference: "icon:unavailable".into(),
-            source_revision: "flathub-42".into(),
-            declared_capabilities: Vec::new(),
-            guest_profile: "wayland-standard".into(),
-            supported_actions: vec!["launch".into()],
-            provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
-                source: "curated".into(),
-                signature: Some("sig-42".into()),
-            },
-            state: FlatpakInstallState::Unavailable,
-        });
+        catalog
+            .entries
+            .push(mackes_mesh_types::app_catalog::FlatpakCatalogEntry {
+                app_id: "org.example.NotInstalled".into(),
+                display_name: "Not installed".into(),
+                summary: "Guest app not installed".into(),
+                icon_reference: "icon:not-installed".into(),
+                source_revision: "flathub-42".into(),
+                declared_capabilities: Vec::new(),
+                guest_profile: "wayland-standard".into(),
+                supported_actions: vec!["launch".into()],
+                provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
+                    source: "curated".into(),
+                    signature: Some("sig-42".into()),
+                },
+                state: FlatpakInstallState::Available,
+            });
+        catalog
+            .entries
+            .push(mackes_mesh_types::app_catalog::FlatpakCatalogEntry {
+                app_id: "org.example.Unavailable".into(),
+                display_name: "Unavailable".into(),
+                summary: "Guest app unavailable".into(),
+                icon_reference: "icon:unavailable".into(),
+                source_revision: "flathub-42".into(),
+                declared_capabilities: Vec::new(),
+                guest_profile: "wayland-standard".into(),
+                supported_actions: vec!["launch".into()],
+                provenance: mackes_mesh_types::app_catalog::FlatpakCatalogProvenance {
+                    source: "curated".into(),
+                    signature: Some("sig-42".into()),
+                },
+                state: FlatpakInstallState::Unavailable,
+            });
 
         let (apps, note) = fold_peer_apps_reply(
             "oak",
@@ -727,11 +734,7 @@ mod tests {
         );
 
         state.drive_for_focus(Some("oak"));
-        state
-            .pending
-            .as_mut()
-            .expect("initial request")
-            .sent = Instant::now() - REQUEST_TIMEOUT;
+        state.pending.as_mut().expect("initial request").sent = Instant::now() - REQUEST_TIMEOUT;
         state.drive_for_focus(Some("oak"));
 
         assert!(state.pending.is_none());
@@ -783,12 +786,14 @@ mod tests {
                 &reply_topic(&ulid),
                 Priority::Default,
                 None,
-                Some(&json!({
-                    "ok": false,
-                    "node": "oak",
-                    "error": "peer is temporarily unavailable"
-                })
-                .to_string()),
+                Some(
+                    &json!({
+                        "ok": false,
+                        "node": "oak",
+                        "error": "peer is temporarily unavailable"
+                    })
+                    .to_string(),
+                ),
             )
             .expect("write failed reply");
 
@@ -815,11 +820,7 @@ mod tests {
         let mut state = FrontDoorPeerAppsState::new(Some(root.clone()));
 
         state.drive_for_focus(Some("oak"));
-        state
-            .pending
-            .as_mut()
-            .expect("initial request")
-            .sent = Instant::now() - REQUEST_TIMEOUT;
+        state.pending.as_mut().expect("initial request").sent = Instant::now() - REQUEST_TIMEOUT;
         state.drive_for_focus(Some("oak"));
         state.retry_not_before = Some(Instant::now() - RETRY_BACKOFF);
         state.drive_for_focus(Some("oak"));

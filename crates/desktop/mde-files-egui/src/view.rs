@@ -1606,11 +1606,7 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
 /// The Files workspace's ten node-aware interactions. Keeping this inventory
 /// beside the Mesh roster makes the node the source of truth without creating a
 /// second transfer implementation or a second peer cache.
-fn node_actions_section(
-    ui: &mut egui::Ui,
-    b: &FileBrowser,
-    actions: &mut Vec<Action>,
-) {
+fn node_actions_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     let active = b.active_pane_index();
     section_header(ui, "NODE ACTIONS");
 
@@ -1720,7 +1716,6 @@ fn node_actions_section(
         "durable transfer history",
         Some(("Open", Action::SwitchSurface(SurfaceTab::Transfers))),
     );
-
 }
 
 fn node_action_row(
@@ -1753,12 +1748,10 @@ fn node_action_row(
             egui::Layout::top_down(egui::Align::Min),
             |content| {
                 let state = state.into();
-                content.add(
-                    egui::Label::new(RichText::new(label).color(Style::TEXT).strong()).wrap(),
-                );
-                content.add(
-                    egui::Label::new(RichText::new(state).color(Style::TEXT_DIM)).truncate(),
-                );
+                content
+                    .add(egui::Label::new(RichText::new(label).color(Style::TEXT).strong()).wrap());
+                content
+                    .add(egui::Label::new(RichText::new(state).color(Style::TEXT_DIM)).truncate());
             },
         );
         if let Some((button, action)) = action {

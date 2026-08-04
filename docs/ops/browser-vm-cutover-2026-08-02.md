@@ -5,6 +5,21 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Dell's 21:01 EDT physical-seat alert retest passed. The target publish is audit
+ULID `01KZ54K5V2763Z65AXS8PN9TDN`; the installed warning helper held the
+mutation gate for 5.320 seconds. A CPU-linear EGL readback of the exact live
+1366x768 DRM frame shows the red rounded `AI-GENERATED-ALERT` card at
+`460x224+453+272`: its horizontal center is 682.5 px, exactly matching the
+display center, and all copy and the Dismiss control remain contained. The PNG
+SHA-256 is `5eb1be7bebf1d9443af809b604a6916039f39bc588761eb5ffab1be006697a22`.
+A concurrent PipeWire monitor observed the shell-created `pw-play` node, both
+stereo output ports, and links into Dell's active ALSA sink. The earlier 20:59
+readback was rejected because it captured the boot splash before alert
+admission. After the accepted proof, the proof-only environment was cleared,
+the temporary guest SSH key and packet-key diagnostics were removed, the normal
+shell returned active as PID 363398 with zero restarts, and the Browser VM RDP
+endpoint remained reachable.
+
 Seat-15 lock-layer proof at 16:59 EDT showed that commit `29e3951b` successfully
 moved `AI-GENERATED-ALERT` above the lock curtain, but the same live capture
 rejected the presentation: the centered red card's headline was translated

@@ -407,7 +407,10 @@ mod tests {
             Err(SpiceClipboardError::Unsupported)
         );
         assert!(clipboard.read_text().is_none());
-        assert_eq!(clipboard.take_error(), Some(SpiceClipboardError::Unsupported));
+        assert_eq!(
+            clipboard.take_error(),
+            Some(SpiceClipboardError::Unsupported)
+        );
         assert_eq!(
             clipboard.write_text_checked("hello"),
             Err(SpiceClipboardError::Unsupported)

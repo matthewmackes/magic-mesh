@@ -4,8 +4,8 @@ Documentation=https://github.com/matthewmackes/magic-mesh
 # Start only after the overlay manager has been started.  This does not make
 # Nebula a hard dependency (a client can still come up degraded), but avoids
 # racing enrollment/peer publication against creation of nebula1 at boot.
-After=network-online.target nebula.service mcnf-cloud-arm-credential.service
-Wants=network-online.target nebula.service mcnf-cloud-arm-credential.service
+After=network-online.target nebula.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service
+Wants=network-online.target nebula.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service
 # Service-manager policy: keep retrying across a generous window (a fixed role
 # / mount brings it up without manual help) but don't tight-loop forever; the
 # mesh-health watchdog is the backstop if the start limit is ever hit.
@@ -38,6 +38,14 @@ WatchdogSec=180
 # user session gets the same value via /usr/lib/environment.d/90-mde-bus.conf;
 # the sticky 1777 dir is created by tmpfiles (magic-mesh.conf).
 Environment=MDE_BUS_ROOT=/run/mde-bus
+# mackesd intentionally owns many long-lived worker threads.  The glibc default
+# may create one allocator arena per busy thread and retain each worker's large
+# transient Bus/read-model allocations.  On a 16 GiB workstation that turned a
+# ~200 MiB live set into >4 GiB RSS and starved the DRM shell.  Keep transient
+# allocations mmap-backed/trim-friendly and bound arena fragmentation.
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
 # SETUP-fix — SHARED mesh-storage dir so this root daemon and the uid-1000
 # desktop GUIs resolve the SAME path. The code default is ~/QNM-Shared
 # (HOME-relative), which splits /root/QNM-Shared (root daemon) from
@@ -46,6 +54,10 @@ Environment=MDE_BUS_ROOT=/run/mde-bus
 # replicated directory, no FUSE) lets both uids read the one shared dir. The
 # user session gets the same value via environment.d/90-mde-workgroup.conf.
 Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
+# The release installs mesh coordination and secret-store helpers under
+# /opt/mcnf. Pin that packaged root explicitly so a production daemon never
+# falls back to a developer checkout path (or a node-local secret store).
+Environment=MCNF_REPO=/opt/mcnf
 # WL-ARCH-007 — the optional root-only live-mutation verifier is loaded by a
 # drop-in installed only after provision-cloud-arm-credential has materialized
 # the host-bound ciphertext. Before provisioning, mackesd starts but stages all
@@ -144,6 +156,10 @@ ExecStartPre=-/usr/bin/install -d -m 0700 /var/lib/mackesd
 LimitNOFILE=65536
 TasksMax=4096
 MemoryAccounting=true
+# A control-plane regression must restart the daemon, never hang the seat.
+# These limits sit above the documented <1 GiB settled / <2 GiB peak contract.
+MemoryHigh=1G
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target

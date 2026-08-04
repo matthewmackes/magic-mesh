@@ -7,9 +7,9 @@
 /// caller does not pick one.
 pub const DEFAULT_PORT: u16 = 5900;
 /// Default framebuffer width before the server's first surface is seen.
-pub const DEFAULT_WIDTH: u16 = 1024;
+pub const DEFAULT_WIDTH: u16 = 1920;
 /// Default framebuffer height before the server's first surface is seen.
-pub const DEFAULT_HEIGHT: u16 = 768;
+pub const DEFAULT_HEIGHT: u16 = 1080;
 
 /// Everything needed to open a SPICE session to a single KVM/QEMU console.
 ///

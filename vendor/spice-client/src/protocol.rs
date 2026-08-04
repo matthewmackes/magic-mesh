@@ -366,6 +366,8 @@ pub struct SpiceMsgDisplayMark {
 }
 
 // Main channel message type constants
+pub const SPICE_MSGC_MAIN_AGENT_START: u16 = 106;
+pub const SPICE_MSGC_MAIN_AGENT_DATA: u16 = 107;
 pub const SPICE_MSG_MAIN_MIGRATE_BEGIN: u16 = 101;
 pub const SPICE_MSG_MAIN_MIGRATE_CANCEL: u16 = 102;
 pub const SPICE_MSG_MAIN_INIT: u16 = 103;
@@ -384,6 +386,11 @@ pub const SPICE_MSG_MAIN_AGENT_CONNECTED_TOKENS: u16 = 115;
 pub const SPICE_MSG_MAIN_MIGRATE_BEGIN_SEAMLESS: u16 = 116;
 pub const SPICE_MSG_MAIN_MIGRATE_DST_SEAMLESS_ACK: u16 = 117;
 pub const SPICE_MSG_MAIN_MIGRATE_DST_SEAMLESS_NACK: u16 = 118;
+
+// SPICE guest-agent protocol constants (spice-protocol/spice/vd_agent.h).
+pub const VD_AGENT_PROTOCOL: u32 = 1;
+pub const VD_AGENT_MONITORS_CONFIG: u32 = 2;
+pub const VD_AGENT_CONFIG_MONITORS_FLAG_USE_POS: u32 = 1;
 
 pub const SPICE_MSG_DISPLAY_MODE: u16 = 101;
 pub const SPICE_MSG_DISPLAY_MARK: u16 = 102;

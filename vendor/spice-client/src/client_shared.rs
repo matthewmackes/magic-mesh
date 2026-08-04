@@ -598,7 +598,6 @@ impl SpiceClientShared {
                 info!("Started event loop for display channel {}", channel_id);
             }
 
-
             let cursor_channels: Vec<(u8, Arc<Mutex<CursorChannel>>)> = inner
                 .cursor_channels
                 .iter()
@@ -716,6 +715,25 @@ impl SpiceClientShared {
         }
 
         Ok(())
+    }
+
+    /// Request a single guest monitor with the exact client viewport size.
+    /// This must be called after [`Self::connect`] and before the main-channel
+    /// event loop takes ownership of the channel mutex.
+    pub async fn request_display_size(&self, width: u32, height: u32) -> Result<()> {
+        let main_channel = {
+            let inner = self.inner.lock().await;
+            inner
+                .main_channel
+                .clone()
+                .ok_or_else(|| SpiceError::Protocol("Not connected to main channel".to_string()))?
+        };
+        let result = main_channel
+            .lock()
+            .await
+            .send_monitor_config(width, height)
+            .await;
+        result
     }
 
     /// Gets the current cursor shape for a specific channel.

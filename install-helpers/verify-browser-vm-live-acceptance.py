@@ -5,9 +5,11 @@ The Browser VM has deliberately separate evidence producers for framebuffer
 presentation/input/reconnect, guest runtime state, Chromium media decode, and
 long-run performance.  This helper is the promotion boundary that binds those
 records to one source commit and image digest and additionally requires a
-real, sample-backed audio record.  It never probes a target and never turns a
-reachable port, a guest-local fixture, or a manually asserted counter into a
-pass.
+real, sample-backed audio record plus a separate operator confirmation that
+the bound after-reconnect playback was heard at the physical seat.  Digital
+PCM never substitutes for that human observation.  The verifier never probes
+a target and never turns a reachable port, a guest-local fixture, or a
+manually asserted counter into a pass.
 
 Usage:
   verify-browser-vm-live-acceptance.py validate acceptance.json
@@ -17,7 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
@@ -31,7 +33,6 @@ from typing import Any, NoReturn
 
 SCHEMA_VERSION = 1
 MAX_FILE_BYTES = 8 * 1024 * 1024
-MAX_COUNTER = 10_000_000_000
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_AGE_SECONDS = 24 * 60 * 60
@@ -39,6 +40,7 @@ UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+BOUNDED_LABEL_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 CREDENTIAL_FIELD_RE = re.compile(
     r"(?:pass(?:word|phrase)?|secret|token|ticket|credential|bearer|"
     r"api[_-]?key|access[_-]?key|private[_-]?key|cookie|authorization|"
@@ -63,11 +65,12 @@ EXPECTED_FIELDS = frozenset(
         "media_evidence",
         "performance_evidence",
         "audio_evidence",
+        "physical_audibility_evidence",
         "recorded_at",
     }
 )
 ARTIFACT_FIELDS = frozenset({"path", "sha256"})
-AUDIO_FIELDS = frozenset(
+PHYSICAL_AUDIBILITY_FIELDS = frozenset(
     {
         "schema_version",
         "kind",
@@ -78,14 +81,26 @@ AUDIO_FIELDS = frozenset(
         "status",
         "source",
         "transport",
-        "pcm_bytes",
-        "playback_samples",
-        "capture_samples",
-        "dropouts",
-        "recovery_observed",
+        "target_host",
+        "seat_id",
+        "sink_id",
+        "observation_method",
+        "audibility",
+        "operator_confirmation",
+        "audio_manifest_sha256",
+        "after_reconnect_playback_sha256",
+        "confirmed_at",
         "recorded_at",
     }
 )
+EXPECTED_AUDIO_CLAIMS = {
+    "playback": "sample-backed",
+    "capture": "sample-backed",
+    "recovery": "sample-backed-after-observed-reconnect",
+    "scope": "digital-pcm-path-only",
+    "physical_audibility": "operator-confirmation-required",
+    "production_audio_acceptance": "not-proven-by-this-validator",
+}
 
 
 class EvidenceError(ValueError):
@@ -151,14 +166,7 @@ def require_string(data: dict[str, Any], field: str, pattern: re.Pattern[str]) -
     return value
 
 
-def require_uint(data: dict[str, Any], field: str) -> int:
-    value = data.get(field)
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_COUNTER:
-        fail(f"{field} must be an integer between 0 and {MAX_COUNTER}")
-    return value
-
-
-def validate_timestamp(value: Any, field: str = "recorded_at") -> None:
+def validate_timestamp(value: Any, field: str = "recorded_at") -> datetime:
     if not isinstance(value, str) or UTC_TIMESTAMP_RE.fullmatch(value) is None:
         fail(f"{field} must use second-precision UTC form YYYY-MM-DDTHH:MM:SSZ")
     try:
@@ -169,9 +177,10 @@ def validate_timestamp(value: Any, field: str = "recorded_at") -> None:
         fail(f"{field} is not a real UTC timestamp: {exc}")
     if recorded.timestamp() > datetime.now(timezone.utc).timestamp() + 300:
         fail(f"{field} is too far in the future")
+    return recorded
 
 
-def validate_fresh_timestamp(value: Any, field: str) -> None:
+def validate_fresh_timestamp(value: Any, field: str) -> datetime:
     if not isinstance(value, str) or not value.endswith("Z"):
         fail(f"{field} must be a UTC timestamp")
     try:
@@ -181,6 +190,7 @@ def validate_fresh_timestamp(value: Any, field: str) -> None:
     age = (datetime.now(timezone.utc) - recorded).total_seconds()
     if age < -300 or age > MAX_AGE_SECONDS:
         fail(f"{field} is stale or from the future (age_seconds={age:.0f})")
+    return recorded
 
 
 def load_validator(name: str, filename: str) -> ModuleType:
@@ -234,47 +244,85 @@ def artifact_path(
     return resolved
 
 
-def validate_audio(data: Any, transport: str) -> dict[str, Any]:
-    if not isinstance(data, dict) or frozenset(data) != AUDIO_FIELDS:
-        fail("audio evidence has missing or unexpected fields")
-    reject_credential_fields(data, "audio")
-    if data["schema_version"] != SCHEMA_VERSION or isinstance(data["schema_version"], bool):
-        fail("audio evidence schema_version is invalid")
-    if data["kind"] != "browser_vm_live_audio":
-        fail("audio evidence kind is not browser_vm_live_audio")
+def validate_physical_audibility(
+    data: Any,
+    *,
+    transport: str,
+    source_commit: str,
+    image_digest: str,
+    target_host: str,
+    audio_descriptor: dict[str, Any],
+    audio_data: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(data, dict) or frozenset(data) != PHYSICAL_AUDIBILITY_FIELDS:
+        fail("physical audibility evidence has missing or unexpected fields")
+    reject_credential_fields(data, "physical_audibility")
+    if data["schema_version"] != SCHEMA_VERSION or isinstance(
+        data["schema_version"], bool
+    ):
+        fail("physical audibility evidence schema_version is invalid")
+    if data["kind"] != "browser_vm_physical_audibility_confirmation":
+        fail("physical audibility evidence kind is invalid")
     if data["profile"] != "browser-vm-chromium" or data["image"] != "browser-vm-chromium":
-        fail("audio evidence is not bound to browser-vm-chromium")
-    source_commit = require_string(data, "source_commit", COMMIT_RE)
-    image_digest = require_string(data, "image_digest", IMAGE_DIGEST_RE)
-    if source_commit == "0" * 40 or image_digest == "sha256:" + "0" * 64:
-        fail("audio evidence provenance must not use null values")
+        fail("physical audibility evidence is not bound to browser-vm-chromium")
+    if data["source_commit"] != source_commit or data["image_digest"] != image_digest:
+        fail("physical audibility evidence provenance does not match acceptance")
     if data["status"] != "observed":
-        fail("audio evidence is not observed")
-    if data["source"] != "live-browser-vm-audio":
-        fail("audio evidence source is not the approved live capture")
+        fail("physical audibility evidence is not observed")
+    if data["source"] != "operator-physical-listening":
+        fail("physical audibility evidence is not an operator listening observation")
     if data["transport"] != transport:
-        fail("audio evidence transport does not match the acceptance transport")
-    pcm = require_uint(data, "pcm_bytes")
-    playback = require_uint(data, "playback_samples")
-    capture = require_uint(data, "capture_samples")
-    dropouts = require_uint(data, "dropouts")
-    if not isinstance(data["recovery_observed"], bool):
-        fail("audio evidence recovery_observed must be boolean")
-    if pcm == 0 or playback == 0 or capture == 0:
-        fail("audio evidence requires PCM, playback, and capture samples")
-    if dropouts != 0:
-        fail("audio evidence contains dropouts")
-    if not data["recovery_observed"]:
-        fail("audio evidence lacks recovery observation")
-    validate_fresh_timestamp(data["recorded_at"], "audio.recorded_at")
+        fail("physical audibility evidence transport does not match acceptance")
+    if data["target_host"] != target_host:
+        fail("physical audibility evidence target_host does not match deployment")
+    seat_id = require_string(data, "seat_id", BOUNDED_LABEL_RE)
+    sink_id = require_string(data, "sink_id", BOUNDED_LABEL_RE)
+    if seat_id.strip() != seat_id or sink_id.strip() != sink_id:
+        fail("physical audibility seat_id and sink_id must not have edge whitespace")
+    if data["observation_method"] != "human-listening-at-physical-seat":
+        fail("physical audibility requires human listening at the physical seat")
+    if data["audibility"] != "audible" or data["operator_confirmation"] is not True:
+        fail("physical audibility lacks an explicit audible operator confirmation")
+
+    manifest_digest = require_string(data, "audio_manifest_sha256", SHA256_RE)
+    if manifest_digest != audio_descriptor.get("sha256"):
+        fail("physical audibility is not bound to the validated audio manifest")
+    after_playback = [
+        capture
+        for capture in audio_data.get("captures", [])
+        if capture.get("phase") == "after-recovery"
+        and capture.get("direction") == "playback"
+    ]
+    if len(after_playback) != 1:
+        fail("validated audio has no unique after-reconnect playback capture")
+    playback_digest = require_string(
+        data, "after_reconnect_playback_sha256", SHA256_RE
+    )
+    if playback_digest != after_playback[0].get("sha256"):
+        fail("physical audibility is not bound to after-reconnect playback samples")
+
+    confirmed = validate_timestamp(data["confirmed_at"], "physical_audibility.confirmed_at")
+    recorded = validate_timestamp(data["recorded_at"], "physical_audibility.recorded_at")
+    validate_fresh_timestamp(data["confirmed_at"], "physical_audibility.confirmed_at")
+    validate_fresh_timestamp(data["recorded_at"], "physical_audibility.recorded_at")
+    after_playback_at = validate_timestamp(
+        after_playback[0].get("captured_at"),
+        "audio.after_reconnect_playback.captured_at",
+    )
+    if confirmed < after_playback_at:
+        fail("physical audibility was not confirmed after reconnect playback")
+    if recorded < confirmed or recorded - confirmed > timedelta(minutes=5):
+        fail("physical audibility confirmation was not recorded within five minutes")
     return {
-        "status": "observed",
-        "pcm_bytes": pcm,
-        "playback_samples": playback,
-        "capture_samples": capture,
-        "dropouts": dropouts,
-        "source_commit": source_commit,
-        "image_digest": image_digest,
+        "status": "operator-confirmed",
+        "scope": "physical-speaker-output",
+        "observation_method": data["observation_method"],
+        "seat_id": seat_id,
+        "sink_id": sink_id,
+        "target_host": target_host,
+        "confirmed_at": data["confirmed_at"],
+        "audio_manifest_sha256": manifest_digest,
+        "after_reconnect_playback_sha256": playback_digest,
     }
 
 
@@ -282,7 +330,6 @@ def validate(
     bundle: Any,
     *,
     artifact_root: Path,
-    validators: dict[str, ModuleType] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(bundle, dict):
         fail("acceptance root must be one JSON object")
@@ -310,17 +357,21 @@ def validate(
     if image_digest == "sha256:" + "0" * 64:
         fail("image_digest must not be the null digest")
     transport = bundle["transport"]
-    if transport not in {"rdp", "spice"}:
-        fail("transport must be rdp or spice")
-    validate_timestamp(bundle["recorded_at"])
+    if transport != "rdp":
+        fail("transport must be rdp for R1 Chromium promotion")
+    acceptance_recorded_at = validate_timestamp(bundle["recorded_at"])
     validate_fresh_timestamp(bundle["recorded_at"], "recorded_at")
 
-    loaded = validators or {
+    # Promotion always loads the repository validators itself.  An injectable
+    # validator map would let a caller replace the PCM analyzer with a stub and
+    # recreate the legacy counter-only bypass.
+    loaded = {
         "vdi": load_validator("browser_vdi_proof", "verify-vdi-live-proof.py"),
         "deployment": load_validator("browser_deployment_receipt", "verify-browser-vm-deployment.py"),
         "runtime": load_validator("browser_runtime_evidence", "verify-browser-vm-runtime-evidence.py"),
         "media": load_validator("browser_media_evidence", "verify-browser-vm-media-evidence.py"),
         "performance": load_validator("browser_performance_evidence", "verify-browser-vm-performance.py"),
+        "audio": load_validator("browser_live_audio_samples", "verify-browser-vm-live-audio.py"),
     }
 
     deployment_path = artifact_path(
@@ -418,11 +469,51 @@ def validate(
 
     audio_path = artifact_path(bundle["audio_evidence"], "audio_evidence", artifact_root)
     audio_data = read_json(audio_path)
-    audio_result = validate_audio(audio_data, transport)
+    reject_credential_fields(audio_data, "audio")
+    try:
+        audio_result = loaded["audio"].validate_document(audio_data, audio_path.parent)
+    except Exception as exc:
+        fail(f"audio_evidence sample validation failed: {exc}")
+    if audio_result.get("status") != "validated":
+        fail("audio_evidence sample validator did not validate the evidence")
+    if audio_result.get("evidence_class") != "browser_vm_sample_backed_audio":
+        fail("audio_evidence is not sample-backed Browser VM audio")
+    if audio_result.get("claims") != EXPECTED_AUDIO_CLAIMS:
+        fail("audio_evidence claims do not preserve the digital-only boundary")
     if audio_data.get("source_commit") != source_commit:
         fail("audio_evidence source_commit does not match acceptance")
     if audio_data.get("image_digest") != image_digest:
         fail("audio_evidence image_digest does not match acceptance")
+    if audio_data.get("transport") != transport:
+        fail("audio_evidence transport does not match acceptance")
+    if audio_result.get("source_commit") != source_commit:
+        fail("audio_evidence validation result source_commit does not match acceptance")
+    if audio_result.get("image_digest") != image_digest:
+        fail("audio_evidence validation result image_digest does not match acceptance")
+    if audio_result.get("transport") != transport:
+        fail("audio_evidence validation result transport does not match acceptance")
+    validate_fresh_timestamp(audio_data.get("recorded_at"), "audio_evidence.recorded_at")
+
+    physical_path = artifact_path(
+        bundle["physical_audibility_evidence"],
+        "physical_audibility_evidence",
+        artifact_root,
+    )
+    physical_data = read_json(physical_path)
+    physical_result = validate_physical_audibility(
+        physical_data,
+        transport=transport,
+        source_commit=source_commit,
+        image_digest=image_digest,
+        target_host=deployment_data.get("target_host"),
+        audio_descriptor=bundle["audio_evidence"],
+        audio_data=audio_data,
+    )
+    physical_recorded_at = validate_timestamp(
+        physical_data.get("recorded_at"), "physical_audibility.recorded_at"
+    )
+    if acceptance_recorded_at < physical_recorded_at:
+        fail("acceptance was recorded before physical audibility confirmation")
 
     return {
         "status": "validated",
@@ -439,14 +530,17 @@ def validate(
             "transport_reconnect": "observed",
             "guest_gpu_video": "observed",
             "guest_chromium_decode": "observed",
-            "guest_audio": "observed",
+            "guest_audio_samples": "validated-before-and-after-reconnect",
+            "physical_audibility": "operator-confirmed-at-physical-seat",
+            "production_audio_acceptance": "sample-and-physical-evidence-validated",
             "performance": "observed",
         },
         "audio": audio_result,
+        "physical_audibility": physical_result,
     }
 
 
-def _valid_audio() -> dict[str, Any]:
+def _legacy_audio_summary() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "kind": "browser_vm_live_audio",
@@ -466,12 +560,61 @@ def _valid_audio() -> dict[str, Any]:
     }
 
 
+def _physical_audibility_fixture(
+    *,
+    source_commit: str,
+    image_digest: str,
+    target_host: str,
+    audio_manifest_sha256: str,
+    after_reconnect_playback_sha256: str,
+    confirmed_at: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "browser_vm_physical_audibility_confirmation",
+        "profile": "browser-vm-chromium",
+        "image": "browser-vm-chromium",
+        "source_commit": source_commit,
+        "image_digest": image_digest,
+        "status": "observed",
+        "source": "operator-physical-listening",
+        "transport": "rdp",
+        "target_host": target_host,
+        "seat_id": "Dell",
+        "sink_id": "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        "observation_method": "human-listening-at-physical-seat",
+        "audibility": "audible",
+        "operator_confirmation": True,
+        "audio_manifest_sha256": audio_manifest_sha256,
+        "after_reconnect_playback_sha256": after_reconnect_playback_sha256,
+        "confirmed_at": confirmed_at,
+        "recorded_at": recorded_at,
+    }
+
+
 def _write_artifact(root: Path, relative: str, value: Any) -> dict[str, str]:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(0o600)
     return {"path": relative, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _rewrite_json_artifact(
+    root: Path,
+    bundle: dict[str, Any],
+    field: str,
+    mutate: Any,
+) -> dict[str, Any]:
+    descriptor = bundle[field]
+    path = root / descriptor["path"]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mutate(data)
+    path.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    descriptor["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return data
 
 
 def _fixture(root: Path) -> dict[str, Any]:
@@ -482,6 +625,7 @@ def _fixture(root: Path) -> dict[str, Any]:
     media = load_validator("fixture_media_evidence", "verify-browser-vm-media-evidence.py")
     performance = load_validator("fixture_performance_evidence", "verify-browser-vm-performance.py")
     deployment = load_validator("fixture_browser_deployment", "verify-browser-vm-deployment.py")
+    audio = load_validator("fixture_live_audio_samples", "verify-browser-vm-live-audio.py")
     rdp_log = (
         "live: FRAME OK 1024x768 rects=1 fnv1a64=0x0123456789abcdef distinct_colors=42\n"
         "live: INPUT sent OK; framebuffer UNCHANGED after keystroke "
@@ -503,9 +647,8 @@ def _fixture(root: Path) -> dict[str, Any]:
     media_data.update({"source_commit": source_commit, "image_digest": image_digest})
     performance_data = performance.valid_record()
     performance_data.update({"source_commit": source_commit, "image_digest": image_digest})
-    recorded_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    recorded_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     deployment_data = {
         "schema_version": 2,
         "kind": "browser_vm_deployment_receipt",
@@ -530,11 +673,31 @@ def _fixture(root: Path) -> dict[str, Any]:
         "recorded_at": recorded_at,
     }
     deployment.validate_document(deployment_data)
-    audio_data = _valid_audio()
     runtime_data["recorded_at"] = recorded_at
     media_data["recorded_at"] = recorded_at
     performance_data["recorded_at"] = recorded_at
-    audio_data["recorded_at"] = recorded_at
+    audio_root = root / "evidence" / "audio"
+    audio_data = audio.fixture(audio_root, now - timedelta(seconds=10))
+    audio_data["source_commit"] = source_commit
+    audio_data["image_digest"] = image_digest
+    audio_descriptor = _write_artifact(
+        root, "evidence/audio/audio-samples.json", audio_data
+    )
+    after_reconnect_playback = [
+        capture
+        for capture in audio_data["captures"]
+        if capture["phase"] == "after-recovery" and capture["direction"] == "playback"
+    ]
+    assert len(after_reconnect_playback) == 1
+    physical_data = _physical_audibility_fixture(
+        source_commit=source_commit,
+        image_digest=image_digest,
+        target_host=deployment_data["target_host"],
+        audio_manifest_sha256=audio_descriptor["sha256"],
+        after_reconnect_playback_sha256=after_reconnect_playback[0]["sha256"],
+        confirmed_at=(now - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        recorded_at=(now - timedelta(seconds=4)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
     descriptors = {
         "deployment_evidence": _write_artifact(root, "evidence/deployment.json", deployment_data),
         "vdi_evidence": _write_artifact(root, "evidence/vdi.json", vdi_data),
@@ -543,7 +706,10 @@ def _fixture(root: Path) -> dict[str, Any]:
         "performance_evidence": _write_artifact(
             root, "evidence/performance.json", performance_data
         ),
-        "audio_evidence": _write_artifact(root, "evidence/audio.json", audio_data),
+        "audio_evidence": audio_descriptor,
+        "physical_audibility_evidence": _write_artifact(
+            root, "evidence/physical-audibility.json", physical_data
+        ),
     }
     return {
         "schema_version": 1,
@@ -556,9 +722,7 @@ def _fixture(root: Path) -> dict[str, Any]:
         "image_digest": image_digest,
         "transport": "rdp",
         **descriptors,
-        "recorded_at": datetime.now(timezone.utc).replace(microsecond=0).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        ),
+        "recorded_at": recorded_at,
     }
 
 
@@ -570,64 +734,297 @@ def self_test() -> None:
         bundle = _fixture(root)
         result = validate(bundle, artifact_root=root)
         assert result["status"] == "validated"
-        assert result["claims"]["guest_audio"] == "observed"
+        assert (
+            result["claims"]["guest_audio_samples"]
+            == "validated-before-and-after-reconnect"
+        )
+        assert (
+            result["claims"]["physical_audibility"]
+            == "operator-confirmed-at-physical-seat"
+        )
+        assert (
+            result["claims"]["production_audio_acceptance"]
+            == "sample-and-physical-evidence-validated"
+        )
+        assert result["audio"]["claims"] == EXPECTED_AUDIO_CLAIMS
+        assert result["physical_audibility"]["status"] == "operator-confirmed"
         positive += 1
 
-        for mutation, needle in (
-            (
-                lambda value: value["performance_evidence"].update(
-                    {"sha256": "0" * 64}
-                ),
-                "does not match",
-            ),
-            (
-                lambda value: json.loads(
-                    (root / value["runtime_evidence"]["path"]).read_text()
-                ).update({"gpu_status": "unavailable"}),
-                "gpu_status",
-            ),
-            (
-                lambda value: value.update({"source_commit": "f" * 40}),
-                "source_commit",
-            ),
-            (
-                lambda value: value.update({"image_digest": "sha256:" + "b" * 64}),
-                "audio_evidence image_digest",
-            ),
-        ):
-            # Each negative case gets fresh artifact bytes. Some mutations are
-            # intentionally written through the descriptor's referenced file;
-            # sharing those bytes across cases would test the fixture reset
-            # order instead of the acceptance boundary.
-            bundle = _fixture(root)
-            candidate = json.loads(json.dumps(bundle))
-            if needle == "gpu_status":
-                runtime_path = root / candidate["runtime_evidence"]["path"]
-                runtime_data = json.loads(runtime_path.read_text())
-                runtime_data["gpu_status"] = "unavailable"
-                runtime_path.write_text(json.dumps(runtime_data, sort_keys=True) + "\n")
-                runtime_path.chmod(0o600)
-                candidate["runtime_evidence"]["sha256"] = hashlib.sha256(
-                    runtime_path.read_bytes()
-                ).hexdigest()
-            elif needle == "audio_evidence image_digest":
-                audio_path = root / candidate["audio_evidence"]["path"]
-                audio_data = json.loads(audio_path.read_text())
-                audio_data["image_digest"] = "sha256:" + "b" * 64
-                audio_path.write_text(json.dumps(audio_data, sort_keys=True) + "\n")
-                audio_path.chmod(0o600)
-                candidate["audio_evidence"]["sha256"] = hashlib.sha256(
-                    audio_path.read_bytes()
-                ).hexdigest()
-            else:
-                mutation(candidate)
+        def fresh() -> dict[str, Any]:
+            return json.loads(json.dumps(_fixture(root)))
+
+        def expect_rejected(
+            candidate: dict[str, Any], needle: str, label: str
+        ) -> None:
+            nonlocal negative
             try:
                 validate(candidate, artifact_root=root)
             except EvidenceError as exc:
-                assert needle in str(exc), (needle, exc)
+                assert needle in str(exc), (label, needle, exc)
                 negative += 1
             else:
-                raise AssertionError(f"accepted invalid acceptance record: {needle}")
+                raise AssertionError(f"accepted invalid acceptance record: {label}")
+
+        candidate = fresh()
+        candidate["performance_evidence"]["sha256"] = "0" * 64
+        expect_rejected(candidate, "does not match", "performance artifact digest")
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "runtime_evidence",
+            lambda data: data.update({"gpu_status": "unavailable"}),
+        )
+        expect_rejected(candidate, "gpu_status", "runtime GPU bypass")
+
+        candidate = fresh()
+        candidate["source_commit"] = "f" * 40
+        expect_rejected(candidate, "source_commit", "acceptance provenance mismatch")
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "audio_evidence",
+            lambda data: data.update({"source_commit": "f" * 40}),
+        )
+        expect_rejected(
+            candidate, "audio_evidence source_commit", "audio provenance mismatch"
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "audio_evidence",
+            lambda data: data.update({"image_digest": "sha256:" + "b" * 64}),
+        )
+        expect_rejected(
+            candidate, "audio_evidence image_digest", "audio image mismatch"
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "audio_evidence",
+            lambda data: data.update({"transport": "sunshine"}),
+        )
+        expect_rejected(candidate, "audio_evidence transport", "audio transport mismatch")
+
+        def stale_audio(data: dict[str, Any]) -> None:
+            data["disconnect_observed_at"] = "2020-01-02T03:04:03Z"
+            data["reconnect_observed_at"] = "2020-01-02T03:04:04Z"
+            data["recorded_at"] = "2020-01-02T03:04:07Z"
+            for capture in data["captures"]:
+                if capture["phase"] == "before-recovery":
+                    second = 1 if capture["direction"] == "playback" else 2
+                else:
+                    second = 5 if capture["direction"] == "playback" else 6
+                capture["captured_at"] = f"2020-01-02T03:04:0{second}Z"
+
+        candidate = fresh()
+        _rewrite_json_artifact(root, candidate, "audio_evidence", stale_audio)
+        expect_rejected(candidate, "stale", "stale sample evidence")
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "audio_evidence",
+            lambda data: (data.clear(), data.update(_legacy_audio_summary())),
+        )
+        expect_rejected(
+            candidate,
+            "missing or unexpected fields",
+            "legacy counter-only audio summary",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "audio_evidence",
+            lambda data: data.update({"physical_audibility": "observed"}),
+        )
+        expect_rejected(
+            candidate,
+            "missing or unexpected fields",
+            "sample-manifest physical-audibility overclaim",
+        )
+
+        candidate = fresh()
+        audio_path = root / candidate["audio_evidence"]["path"]
+        raw_audio = audio_path.read_text(encoding="utf-8").rstrip()
+        audio_path.write_text(
+            raw_audio[:-1] + ', "kind": "browser_vm_live_audio_samples"}\n',
+            encoding="utf-8",
+        )
+        audio_path.chmod(0o600)
+        candidate["audio_evidence"]["sha256"] = hashlib.sha256(
+            audio_path.read_bytes()
+        ).hexdigest()
+        expect_rejected(candidate, "duplicate JSON field: kind", "duplicate audio field")
+
+        candidate = fresh()
+        audio_path = root / candidate["audio_evidence"]["path"]
+        audio_data = json.loads(audio_path.read_text(encoding="utf-8"))
+        after_playback = next(
+            capture
+            for capture in audio_data["captures"]
+            if capture["phase"] == "after-recovery"
+            and capture["direction"] == "playback"
+        )
+        sample_path = audio_path.parent / after_playback["path"]
+        audio_validator = load_validator(
+            "fixture_silent_audio_samples", "verify-browser-vm-live-audio.py"
+        )
+        after_playback["sha256"] = audio_validator.write_tone(
+            sample_path, after_playback["expected_tone_hz"], silent=True
+        )
+        audio_path.write_text(
+            json.dumps(audio_data, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        audio_path.chmod(0o600)
+        candidate["audio_evidence"]["sha256"] = hashlib.sha256(
+            audio_path.read_bytes()
+        ).hexdigest()
+        expect_rejected(candidate, "non-silent", "silent sample-validation bypass")
+
+        candidate = fresh()
+        candidate.pop("physical_audibility_evidence")
+        expect_rejected(
+            candidate,
+            "physical_audibility_evidence",
+            "missing physical audibility confirmation",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update({"observation_method": "digital-pcm-analysis"}),
+        )
+        expect_rejected(
+            candidate,
+            "human listening",
+            "digital-only physical-audibility overclaim",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update({"digital_only_claim": True}),
+        )
+        expect_rejected(
+            candidate,
+            "missing or unexpected fields",
+            "unknown physical audibility field",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update({"transport": "sunshine"}),
+        )
+        expect_rejected(
+            candidate,
+            "transport does not match",
+            "physical audibility transport mismatch",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update({"source_commit": "f" * 40}),
+        )
+        expect_rejected(
+            candidate,
+            "provenance does not match",
+            "physical audibility provenance mismatch",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update(
+                {
+                    "confirmed_at": "2020-01-02T03:04:05Z",
+                    "recorded_at": "2020-01-02T03:04:06Z",
+                }
+            ),
+        )
+        expect_rejected(candidate, "stale", "stale physical audibility evidence")
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update({"audio_manifest_sha256": "0" * 64}),
+        )
+        expect_rejected(
+            candidate,
+            "validated audio manifest",
+            "physical confirmation audio-manifest mismatch",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update(
+                {"after_reconnect_playback_sha256": "0" * 64}
+            ),
+        )
+        expect_rejected(
+            candidate,
+            "after-reconnect playback samples",
+            "physical confirmation playback-sample mismatch",
+        )
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "physical_audibility_evidence",
+            lambda data: data.update({"operator_confirmation": False}),
+        )
+        expect_rejected(
+            candidate,
+            "explicit audible operator confirmation",
+            "missing operator confirmation",
+        )
+
+        candidate = fresh()
+        candidate["legacy_audio_summary"] = _legacy_audio_summary()
+        expect_rejected(candidate, "unexpected fields", "unknown acceptance field")
+
+        candidate = fresh()
+        duplicate_path = root / "duplicate-acceptance.json"
+        raw_acceptance = json.dumps(candidate, sort_keys=True)
+        duplicate_path.write_text(
+            raw_acceptance[:-1] + ', "transport": "rdp"}\n', encoding="utf-8"
+        )
+        duplicate_path.chmod(0o600)
+        try:
+            read_json(duplicate_path)
+        except EvidenceError as exc:
+            assert "duplicate JSON field: transport" in str(exc), exc
+            negative += 1
+        else:
+            raise AssertionError("accepted a duplicate top-level acceptance field")
 
     print(
         "verify-browser-vm-live-acceptance: self-test passed "

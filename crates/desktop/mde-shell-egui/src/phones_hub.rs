@@ -683,8 +683,10 @@ impl PhonesHubState {
             ui.add_space(Style::SP_M);
             ui.colored_label(
                 Style::TEXT_DIM,
-                RichText::new(format!("this mesh appears to your phone as \u{201C}{name}\u{201D}"))
-                    .size(Style::SMALL),
+                RichText::new(format!(
+                    "this mesh appears to your phone as \u{201C}{name}\u{201D}"
+                ))
+                .size(Style::SMALL),
             );
         });
     }

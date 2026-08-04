@@ -18,9 +18,9 @@ resolver = "2"
 exclude = [
 ]
 members = [
+    "crates/guest/mde-wayland-workspace",
     "crates/platform/mde-bus",
     "crates/platform/mde-role",
-    "crates/platform/mde-lighthouse-health",
     "crates/platform/mde-role-chooser",
     "crates/mesh/mackes-config",
     "crates/mesh/mackes-mesh-types",
@@ -52,7 +52,6 @@ members = [
     "crates/desktop/mde-vdi-rdp",
     "crates/desktop/mde-vdi-vnc",
     "crates/desktop/mde-vdi-spice",
-    "crates/desktop/mde-panel-egui",
     "crates/desktop/mde-seat",
     "crates/desktop/mde-term-egui",
     "crates/desktop/mde-editor-egui",

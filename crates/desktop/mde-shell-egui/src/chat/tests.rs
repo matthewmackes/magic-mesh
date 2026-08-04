@@ -940,7 +940,10 @@ fn message_row_renders_a_timestamp() {
     assert_eq!(fmt_hh_mm(1_700_000_000_000), expected_hh_mm);
     assert_eq!(
         fmt_full_datetime(1_700_000_000_000),
-        format!("{expected_date} {expected_hh_mm} {}", crate::timers::display_zone_label())
+        format!(
+            "{expected_date} {expected_hh_mm} {}",
+            crate::timers::display_zone_label()
+        )
     );
     assert_eq!(fmt_date(1_700_000_000_000), expected_date);
     // A civil leap-year day still resolves (2024-02-29).

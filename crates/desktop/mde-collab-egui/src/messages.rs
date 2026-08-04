@@ -12,8 +12,8 @@ use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
-    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, TaskAction,
-    TaskView, ThreadId, MAX_TASK_TITLE_BYTES,
+    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, TaskAction, TaskView,
+    ThreadId, MAX_TASK_TITLE_BYTES,
 };
 
 use crate::icons::CommsHoverExt;

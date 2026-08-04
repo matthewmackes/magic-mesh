@@ -617,9 +617,10 @@ pub(crate) struct ToastBridge {
 
 impl Default for ToastBridge {
     fn default() -> Self {
+        let bus_root = mde_bus::client_data_dir();
         Self {
-            bus_root: mde_bus::client_data_dir(),
-            cursor: None,
+            cursor: initial_toast_cursor(bus_root.as_deref()),
+            bus_root,
             last_poll: None,
             last_tick: None,
             host: ToastHost::new(),
@@ -629,6 +630,21 @@ impl Default for ToastBridge {
             history: NotificationRing::default(),
         }
     }
+}
+
+/// Seed a restarting shell at the current alert-lane tail.
+///
+/// The toast topic is a notification transport, not a durable unresolved-alert
+/// ledger. Replaying its full retained history on every shell restart resurrects
+/// already-resolved health incidents and expired deployment countdowns. The Bus
+/// index exposes a cheap tail probe specifically for restartable consumers; new
+/// messages published after this cursor are still drained normally.
+fn initial_toast_cursor(bus_root: Option<&Path>) -> Option<String> {
+    let root = bus_root?;
+    Persist::open(root.to_path_buf())
+        .ok()?
+        .latest_ulid(TOAST_TOPIC)
+        .ok()?
 }
 
 impl ToastBridge {
@@ -801,13 +817,15 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use mde_bus::hooks::config::Priority;
+    use mde_bus::persist::Persist;
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
 
     use super::{
-        alert_severity, built_in_chime_wav, decode, plane_by_name, pulse_server_from_runtime_dir,
-        resolve_action, surface_by_name, try_chime_backends, Chime, ChimeBackend, Navigate,
-        Severity, Suppress, ToastBridge,
+        alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
+        pulse_server_from_runtime_dir, resolve_action, surface_by_name, try_chime_backends, Chime,
+        ChimeBackend, Navigate, Severity, Suppress, ToastBridge, TOAST_TOPIC,
     };
     use crate::surfaces::Surface;
     use crate::workbench::Plane;
@@ -836,6 +854,46 @@ mod tests {
         format!(
             r#"{{"severity":"{severity}","source_host":"{host}","flag":"SECURITY","headline":"{headline}"}}"#
         )
+    }
+
+    #[test]
+    fn restart_cursor_skips_retained_alerts_but_drains_new_ones() {
+        let dir = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+        let old = persist
+            .write(
+                TOAST_TOPIC,
+                Priority::Urgent,
+                None,
+                Some(&body("critical", "old-node", "resolved incident")),
+            )
+            .expect("write retained alert");
+        let cursor = initial_toast_cursor(Some(dir.path()));
+        assert_eq!(cursor.as_deref(), Some(old.ulid.as_str()));
+
+        let recorder = Recorder::default();
+        let mut bridge = ToastBridge {
+            bus_root: Some(dir.path().to_path_buf()),
+            cursor,
+            chime: Box::new(recorder.clone()),
+            ..ToastBridge::default()
+        };
+        persist
+            .write(
+                TOAST_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body("info", "new-node", "new incident")),
+            )
+            .expect("write new alert");
+
+        bridge.drain();
+        assert_eq!(
+            bridge.history().len(),
+            1,
+            "only the post-start alert is read"
+        );
+        assert_eq!(*recorder.0.borrow(), vec![Severity::Info]);
     }
 
     fn wav_u16(wav: &[u8], offset: usize) -> u16 {

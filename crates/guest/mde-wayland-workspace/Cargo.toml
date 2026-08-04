@@ -1,0 +1,20 @@
+[package]
+name = "mde-wayland-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Guest-only Rust supervisor for a private Wayland application workspace"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

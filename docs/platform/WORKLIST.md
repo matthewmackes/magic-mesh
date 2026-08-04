@@ -15,11 +15,11 @@ preserved in
 
 - **13 active epics:** 13 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **P0:** WL-ARCH-008 (standalone old Browser repo plus VM Browser cutover),
-  WL-ARCH-009 (process-isolated mackesd and Advanced administration),
-  WL-FUNC-011 (Mesh Teams completion and one-product cutover), WL-FUNC-016
-  (native text clipboard across seat/mesh/VDI), WL-FUNC-017 (complete Maps,
-  navigation, and MG90 radio health), WL-UX-011 (unified This Node hardware
-  center), WL-CRIT-006 (production evidence, six-node acceptance, and
+  WL-ARCH-009 (process-isolated mackesd and unified Workers interface),
+  WL-FUNC-011 (native Mesh Collaboration Suite and hard cut), WL-FUNC-016
+  (native rich clipboard across seat/mesh/VDI), WL-FUNC-017 (complete Maps,
+  navigation, and MG90 radio health), WL-UX-011 (node hardware providers and
+  safe controls), WL-CRIT-006 (production evidence, six-node acceptance, and
   corrected-forward recovery), WL-CRIT-007 (boot/sleep recovery and fleet
   peer return), and WL-FUNC-019 (universal resource/session discovery and
   client browser).
@@ -74,17 +74,17 @@ milestone, then rejoin at its live exit evidence.
 4. **R4 - Android Applications (WL-FUNC-020) - Queued.** Workloads lists the
    governed AOSP starter set and launches and reconnects each application
    through an Android VM.
-5. **R5 - Native Clipboard (WL-FUNC-016) - Queued.** Bounded UTF-8 clipboard
-   text crosses local seat, mesh, and released VDI paths with loop prevention
-   and explicit unsupported states.
-6. **R6 - Mesh Teams (WL-FUNC-011) - Queued.** Communications is the one
-   collaboration product with live messages, files, tasks, clips, calls, and
-   governed bridges.
+5. **R5 - Native Rich Clipboard (WL-FUNC-016) - Queued.** Session-opt-in rich
+   clipboard content crosses the direct seat and every enrolled node; released
+   VDI paths negotiate MIME support and hand binary payloads to Files.
+6. **R6 - Mesh Collaboration Suite (WL-FUNC-011) - Queued.** One native suite
+   exposes Alerts, Chat, Calls, Files, Editor, and Clipboard, with real media,
+   shared SIP gateways, a full IDE, and LibreOfficeKit-backed office editing.
 7. **R7 - Maps and Vehicle (WL-FUNC-017) - Queued.** Offline maps, routing,
    location, and MG90 radio health work with freshness and safe-action proof.
-8. **R8 - This Node and Administration (WL-UX-011, WL-ARCH-009) - Queued.**
-   The unified hardware center and process-isolated advanced administration
-   provide typed, audited actions and recovery.
+8. **R8 - Workers and Node Administration (WL-ARCH-009, WL-UX-011) - Queued.**
+   One Workers interface replaces State of the Mesh and This Node, backed by
+   process-isolated workers, complete node providers, and typed staged actions.
 9. **R9 - Construct Experience (WL-UX-009, WL-UX-012) - Queued.** Quazar
    Dark/Light, the full-width taskbar, search-first Home, and responsive
    seat/tablet interaction pass visual signoff.
@@ -129,27 +129,27 @@ implementation instructions, not a second worklist.
    independently buildable before deleting the host Browser. Browser VM sizing
    is hardware-adaptive with safe operator bounds; RDP and Sunshine/Moonlight
    are equal first-class display paths with explicit health and selection.
-2. Make Mesh Teams the single collaboration destination. Use named node channels
-   (`System · Dell`, `System · Eagle`, and `System · 15`), combined etcd/overlay
-   roster validation, deterministic last-writer-wins offline conflict handling,
-   per-user saved messages plus team pins, minimal channel tasks, disabled-until-
-   configured Discord, trusted-session remote control, and separate reference
-   removal versus permanent deletion.
-3. Make Mesh Teams the owner of persisted team clipboard history/actions. The
-   clipboard epic owns the transport and seat/VDI contract; use UTF-8 text,
-   same-team synchronization, mesh-membership trust, and session-only retention.
-   Files/Transfers remains the path for non-text or oversized content.
+2. Make the Mesh Collaboration Suite the single collaboration destination with
+   exactly six sections: Alerts, Chat, Calls, Files, Editor, and Clipboard.
+   Chat uses node direct messages and simple saved groups; remove Teams/channels,
+   tasks, Discord, AI, and separate Transfers/Activity/Settings destinations.
+3. Make the suite the owner of session-only Clipboard history/actions while
+   WL-FUNC-016 owns seat, mesh, KDC/mobile, and VDI transport. Rich MIME events
+   broadcast to every enrolled node after explicit session opt-in; inline text
+   is bounded to 1 MiB and Files transports larger or binary payloads.
 4. Make Maps offline-capable with a native local routing engine and open or
    zero-cost feeds. Show source age and disable unsafe actions for stale data.
    Use the retained MG90 mirror with direct polling as a stale-data fallback,
    enable GPS when Maps opens, retain no additional motion policy, and support
    Quazar Dark/Light in Car. Live MG90 proof is a production gate, not a preview
    blocker.
-5. Make This Node the only durable local settings route without retaining
-   legacy aliases. Keep Control Center transient. Allow typed, admin-authorized
-   remote hardware actions, use trusted-session authorization, expose unsupported
-   capabilities visibly, auto-recover unsafe profiles, warn before network
-   disruption, and require all named OEM adapters for production.
+5. Make Workers the only durable mesh and node-administration interface. Old
+   State of the Mesh, Fleet & Mesh, This Node, System, Storage, and About names
+   may normalize to Workers as routing aliases but may not retain renderers or
+   state. Keep Control Center transient. Use typed, staged, admin-authorized
+   actions, visibly expose unsupported capabilities, auto-recover unsafe
+   profiles, warn before network disruption, and require the named OEM adapters
+   for production.
 6. Make Quazar the only platform visual language with Dark and Light modes,
    balanced information density, licensed shared icons, expressive Apple-like
    shared motion as the default, the Terminal-pattern top bar with the
@@ -174,24 +174,78 @@ implementation instructions, not a second worklist.
 4. Resolve the Browser chrome visual ruling using platform best practice:
    conform it to the Quazar dark/light design tokens, with touch-sized tablet
    controls where applicable.
-5. Integrate LibreOffice as a dedicated App VM, not as a host-native or
-   in-process dependency. Expose Writer, Calc, and Impress through the
-   Workspace shortcut group; launch and reconnect through the existing VDI
-   session path. Files must offer the appropriate LibreOffice association for
-   supported office formats.
-6. Printing is a Construct-owned, world-class workflow over the App VM:
+5. Integrate Fedora's system-packaged LibreOfficeKit as a sandboxed headless
+   platform engine behind an entirely egui-visible Editor. Writer, Calc, and
+   Impress are Editor workspace kinds, not App VMs or host application windows;
+   Files owns their associations and open/save/version operations.
+6. Printing is a Construct-owned, world-class Editor workflow over the native
+   LibreOfficeKit integration:
    printer discovery and health, local/mesh printer selection, live
    page-faithful preview, paper/tray/orientation/margins, duplex/binding,
    color, copies, collation, ranges, scaling, N-up/booklet, PDF output,
    presets, progress, cancel, retry, and tablet-sized touch controls.
 7. Audio is a first-class production requirement across seats, App VMs,
-   Browser VMs, VDI, Mesh Teams, and node-to-node streaming. PulseAudio
-   compatibility must be present through PipeWire's Pulse server; ALSA,
+   Browser VMs, VDI, the Mesh Collaboration Suite, and node-to-node streaming.
+   PulseAudio compatibility must be present through PipeWire's Pulse server;
+   ALSA,
    PipeWire, WirePlumber, UCM, codecs, permissions, services, device
    discovery, microphones, speakers, HDMI/Bluetooth, VM audio, and remote
    audio transport must all be installed, routed, observable, recoverable,
    and proven live. Audio may not be marked optional or unavailable for
    production promotion.
+
+### Mesh Collaboration Suite survey - 2026-08-03
+
+The operator replaced the earlier Mesh Teams direction after a 20-question
+product survey and a three-question native-office follow-up. These decisions
+are the normative intent for WL-FUNC-011 and WL-FUNC-016 and supersede older
+Teams/channel, App-VM LibreOffice, text-only clipboard, durable Alerts-inbox,
+Discord, task, and assistive-AI requirements where they conflict.
+
+1. The product is named `Mesh Collaboration Suite` and has exactly six primary
+   sections: Alerts, Chat, Calls, Files, Editor, and Clipboard.
+2. Files is a universal file workspace: browse local, mesh, and SFTP sources and
+   create, monitor, pause, resume, retry, inspect, and verify every transfer.
+3. Remove Teams/channels, Tasks, Discord, and AI. Chat retains only node direct
+   messages and simple saved groups.
+4. Alerts aggregates events from every platform node and service through one
+   canonical envelope, with node, service, and severity filters.
+5. Relevant alerts also appear as transient system rows inside Chat while
+   Alerts remains the aggregate view.
+6. Alerts is an ephemeral bounded stream, not a durable triage queue. Durable
+   health issues and recovery remain owned by System and Mesh Health.
+7. Calls supports both direct and group voice/video sessions.
+8. Direct calls prefer peer-to-peer WebRTC; group calls and failed direct paths
+   use a self-hosted relay/SFU.
+9. Calls includes screen sharing and explicit-consent remote control.
+10. SIP uses a provider-neutral shared gateway pool, with Vitelity as the first
+    live adapter rather than the permanent provider model.
+11. Every node receives an internal SIP URI and may have optional inbound DID
+    mappings.
+12. The caller selects the outbound SIP gateway for each call; the suite may
+    remember the last choice and must show gateway health and failure state.
+13. Clipboard publishing starts disabled and requires opt-in every session.
+14. Clipboard supports rich content: text, formatted content, images, and file
+    payloads, with large/binary bytes transported by Files.
+15. An opted-in clipboard update broadcasts to every enrolled node, with source
+    attribution and echo prevention; only capable seats materialize it.
+16. SSH means SFTP browsing plus SFTP/rsync-over-SSH transfer jobs, not SSHFS or
+    an arbitrary remote shell.
+17. Scrape/download and multipart upload are first-class Files job adapters with
+    common progress, retry, credentials, result, and history behavior.
+18. Editor is a full IDE with projects, language intelligence, diagnostics,
+    terminals, tasks, tests, version control, and debugging.
+19. Editor opens local workspaces or managed development workspaces on a chosen
+    node; remote execution never becomes an unrestricted host-control shell.
+20. Cutover migrates useful state and settings, proves the new vertical slices,
+    then removes legacy routes, workers, writers, and packages in one hard cut.
+21. Writer, Calc, and Impress reuse LibreOfficeKit's document engine and tiled
+    editing while every visible control, dialog, and workflow remains egui.
+22. LibreOfficeKit is a Fedora system dependency. The repository carries the
+    safe adapter, native UI, packaging contract, and exact release provenance,
+    not a vendored LibreOffice source tree.
+23. Editor is one first-class section with Text/Code, Document, Spreadsheet,
+    and Presentation workspace kinds; there is no separate Office destination.
 
 ### Unified This Node survey completion - 2026-07-31
 
@@ -202,9 +256,10 @@ close it or imply production readiness.
 
 45. A critical health state opens an urgent alert with affected components,
     current impact, and guided recovery actions.
-46. Notifications are configurable and persistent, support severity,
-    acknowledgement, snooze, and escalation, and remain linked to the owning
-    health item.
+46. System and Mesh Health owns durable issue state and guided recovery. The
+    Mesh Collaboration Suite receives an ephemeral, severity-filterable alert
+    event linked to that issue and mirrors it transiently into relevant Chat;
+    acknowledgement, snooze, and escalation are not Alerts-stream state.
 47. Health views provide safe, guided recovery actions with explicit impact
     and confirmation before mutation.
 48. All operators may view health; only privileged roles may configure health
@@ -229,14 +284,82 @@ design direction, not a second workstream:
 5. Put mutations and recovery in a dedicated Actions tab with impact,
    confirmation, audit, and recovery details.
 6. Use a high-contrast technical visual language with strong state encoding.
-7. Retain one persistent global health score, supplemented by local severity
-   and freshness badges; do not create a second health authority.
+7. **Superseded 2026-08-03:** the centered System and Mesh Health modal owns the
+   sole condition-backed A–F authority. No persistent global score, local issue
+   badges, or second health presentation remains in This Node or Workers.
 8. Make the tree the primary discovery mechanism, supported by aliases,
    related-item links, and search rather than search-first navigation.
 9. Treat desktop and tablet interaction as equal primary targets, including
    touch-sized controls and responsive dense layouts.
 10. Permit a bold new workspace structure while preserving all functionality,
     typed contracts, safe actions, and clear continuity to existing routes.
+
+### Workers interface merge survey - 2026-08-03
+
+The operator completed a 25-question decision pass to merge State of the Mesh,
+all of its children and services, and every This Node capability into one
+reenvisioned interface named `Workers`. These latest decisions supersede the
+older This Node interface decisions where they conflict. WL-ARCH-009 owns the
+single product/runtime cutover; WL-UX-011 supplies node providers and safe
+hardware actions and must not create a second interface.
+
+1. The primary model is an entity graph paired with a synchronized hierarchy
+   tree; the initial view is the whole mesh, not the local node.
+2. The top level is worker-first and uses the actual runtime groups `control`,
+   `observation`, `actions`, `data`, `compute`, and `integrations`.
+3. Show canonical worker IDs exactly as registered. Start with all six group
+   hubs collapsed and expand children only by explicit operator action.
+4. Selecting a worker opens a fleet comparison with one row per applicable
+   node, not a local detail page or node-first branch.
+5. Relationships are typed and filterable. Ownership, dependency, publication,
+   subscription, state/event flow, and action targeting remain distinguishable.
+6. System and Mesh Health remains a separate centered modal and the only issue
+   authority. Workers contains no grades, issue counts, health badges, health
+   links, or duplicate diagnostics dashboard.
+7. The taskbar is the only manual health entry. Existing critical auto-open may
+   remain, and the modal may deep-link one way to a Workers entity.
+8. Workers is observational. Every mutation is staged in one global Action
+   Console; worker inspectors do not execute changes directly.
+9. Action Console changes are previewed as a change set before commit, bind the
+   target and expected generation, expose impact and recovery, and report honest
+   per-item partial success rather than claiming cross-node atomic rollback.
+10. Search filters the hierarchy in place; it is not a launcher or a second
+    navigation surface.
+11. One synchronized filter state controls tree and graph. Filters cover group,
+    node, runtime state, and relationship type.
+12. Runtime data updates live and always shows freshness; manual refresh remains
+    available. Unknown or stale data never appears current.
+13. Use one bounded, redacted timeline across worker/runtime activity. Raw logs,
+    credentials, secrets, and unbounded diagnostics are forbidden.
+14. Every former This Node capability receives canonical worker ownership.
+    There is no permanent local-shell, legacy-provider, or uncategorized branch.
+15. Use deterministic registry-order layout. Do not save or accept manual graph
+    coordinates.
+16. Wide layout is tree, graph, and inspector. Narrow layout shows one pane at a
+    time with an explicit Tree/Graph/Inspector selector and predictable back
+    navigation.
+17. The visual direction is cinematic mission control using stable group hues
+    plus semantic runtime colors with icon/text redundancy.
+18. Group hues are control blue, observation cyan, actions pink, data indigo,
+    compute purple, and integrations teal. Runtime running/degraded/failed/
+    unavailable states are green/amber/red/gray.
+19. Use Kdam Thmor Pro for interface text and IBM Plex Mono for worker IDs,
+    topics, generations, timestamps, and other technical identifiers.
+20. Motion is event-driven only: selection, topology changes, new state/events,
+    and action transitions. No ambient animation or continuous decorative pulse.
+21. The cutover is atomic. There is one canonical `Surface::Workers`; legacy
+    renderers, tabs, polls, catalog entries, and duplicated state are removed.
+22. State/Workbench aliases open the Workers overview; Mesh Map/Network aliases
+    apply network filters; Fleet/Explorer aliases focus observation/compute;
+    Provisioning focuses onboarding/reconcile workers.
+23. This Node/System/Storage/About aliases open Workers with This Node selected
+    and the owning workers focused. Licenses and credits move to Workers Help/
+    About. Aliases normalize routes only and are not visible product surfaces.
+24. Workloads and other application surfaces remain separate; this merge covers
+    mesh/node administration and its worker-owned providers only.
+25. Completion requires contract, hostile-input, registry/spawn drift,
+    process-isolation, change-set security, deterministic UI, responsive render,
+    full-fleet, forced-partial-failure, and legacy-removal proof.
 
 ### MG90 ownership, sharing, and cache contract
 
@@ -255,7 +378,7 @@ design direction, not a second workstream:
    `state/vehicle/<management-node>/<mg90-id>`. Deduplicate competing manager
    publications to the freshest valid complete snapshot, retain only the latest
    stale manager snapshot for diagnostics, and show MG90 identity, management
-   node, source, age, and sharing state in normal Maps, Car, This Node, and
+   node, source, age, and sharing state in normal Maps, Car, Workers, and
    other relevant views. Remote views render the same reported domains as
    read-only remote data; they never invent local hardware state.
 4. Use direct Ethernet first, then an authorized mesh path. Lighthouses are
@@ -301,10 +424,12 @@ epics for these rows. The complete rationale and interface requirements are in
 7. Every replicated domain declares its deterministic merge and provenance rule.
 8. The host Browser is removed in favor of the dedicated Browser VM.
 9. VDI sessions receive stable workload identity and resume/reconnect behavior.
-10. Clipboard uses one bounded UTF-8 text contract; Files/Transfers owns larger
-    or non-text content.
-11. Mesh Teams is the sole collaboration destination.
-12. This Node is the only durable local-settings authority.
+10. Clipboard uses one versioned rich-MIME contract. UTF-8 text up to 1 MiB may
+    travel inline; Files owns binary and larger payload transport.
+11. The six-section Mesh Collaboration Suite is the sole collaboration
+    destination.
+12. Workers is the durable mesh/node settings and administration authority;
+    Control Center remains transient.
 13. Hardware mutations use typed, allowlisted, audited adapters with safe
     fallback and watchdog recovery.
 14. Maps is offline-first and MG90 state is typed, fresh, sourced, and honest.
@@ -416,7 +541,7 @@ remains here under a completed status.
      for the R1 Chromium service release; an unavailable selected transport
      offers the alternate and a preference change rather than silently
      switching. Store the mesh-wide preference in replicated settings, expose
-     it in Browser settings and This Node, and apply changes on the next Browser
+     it in Browser settings and Workers, and apply changes on the next Browser
      launch.
   9. Preserve damage rectangles through VDI decode/apply/upload and add metrics
      for frame cadence, full/partial uploads, decode/apply/upload time,
@@ -512,391 +637,501 @@ remains here under a completed status.
 
 ## Functional Completeness
 
-### WL-ARCH-009 - Process-isolated mackesd and Advanced node administration
+### WL-ARCH-009 - Process-isolated mackesd and unified Workers interface
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: `mackesd` has grown into an 88-worker platform concentrated in one
-  process. Dell evidence shows roughly 3 GiB resident daemon memory and a
-  roughly 4.5 GiB cgroup peak after boot, while the current service has task
-  accounting but no effective memory ceiling. The worker registry mostly knows
-  only name, role rank, and restart policy, so optional providers, queues,
-  caches, retries, and process ownership are not uniformly observable. A
-  single failure domain makes memory growth, provider outages, and restart
-  storms harder to contain. This Node has no authoritative mackesd runtime or
-  fleet-administration page.
-- Required outcome: Replace the monolithic runtime with six clearly named,
-  independently supervised services: `mackesd-control.service`,
-  `mackesd-observation.service`, `mackesd-actions.service`,
-  `mackesd-data.service`, `mackesd-compute.service`, and
-  `mackesd-integrations.service`. Keep Control as the sole persistent-state
-  writer; use typed, versioned mde-bus contracts; make worker activation,
-  resource budgets, cleanup, retry behavior, and health observable. Add
-  `this-node/advanced` under This Node → Mesh & System as a desktop operator
-  dashboard with local-first and explicit fleet-wide scope, complete typed
-  worker/systemd controls, bounded evidence export, and per-node outcomes.
-  The test fleet uses a coordinated hard cut with no dual-running monolith.
-- Current state: The 79-worker registry now exposes a validated typed
-  `WorkerSpec` for group, criticality, capability activation, cadence, bounded
-  queue/cache policy, restart behavior, resource budget, namespace ownership,
-  and shutdown cleanup. Group distributions and all registry entries have
-  focused farm coverage. `spawn.rs` still constructs one daemon process, those
-  budgets are not yet enforced by split systemd services, and This Node has no
-  Advanced runtime/control surface.
+- Problem: `mackesd` remains a large single-process worker runtime with weak
+  failure and resource isolation. Its registry does not yet prove that every
+  spawned worker has complete ownership, applicability, relationship, state,
+  and action metadata. Operators also face duplicate State of the Mesh, Fleet &
+  Mesh, and This Node interfaces whose navigation and local-node abstractions do
+  not match the actual worker architecture. Runtime truth, node providers, and
+  mutations cannot be understood or administered from one canonical model.
+- Required outcome: Replace the monolith with independently supervised
+  `mackesd-control`, `mackesd-observation`, `mackesd-actions`, `mackesd-data`,
+  `mackesd-compute`, and `mackesd-integrations` services and introduce one
+  canonical `Surface::Workers`. Workers presents the whole mesh as synchronized
+  worker-first tree, deterministic graph, and fleet inspector; every former
+  This Node capability belongs to a real canonical worker. A global staged
+  Action Console owns all mutations. State of the Mesh, Fleet & Mesh, This
+  Node, System, Storage, About, and their child renderers are removed in one
+  hard cut after route aliases normalize into Workers. System and Mesh Health
+  remains a separate centered modal and never becomes Workers content.
+- Current state: The 79-worker registry exposes a typed `WorkerSpec` with group,
+  criticality, capability activation, cadence, bounded queues/caches, restart,
+  resource budget, namespace, and cleanup metadata. Focused farm tests cover
+  registry entries and group distribution. `spawn.rs` still constructs one
+  daemon process, runtime budgets are not enforced by split units, relationship
+  and complete ownership metadata are missing, and the shell still carries the
+  superseded mesh/node surfaces. In-progress centralized-health changes remain
+  valid and must be preserved as the separate modal authority.
 - Remaining work:
 
-  1. Baseline every current worker and service dependency on Dell and the
-     test nodes. Record RSS, anonymous/shared memory, cgroup current/peak,
-     CPU, tasks, queues, cache sizes, retry rates, startup time, and provider
-     availability. Capture the boot allocation anomaly before refactoring.
-  2. Wire the landed `WorkerSpec` into the single enforced runtime contract:
-     group, criticality, capability predicate, cadence, queue/cache bounds,
-     resource budget, restart policy, health key, state topic, action namespace,
-     and cleanup ownership. Add drift tests proving every spawned worker is registered and
-     every registered worker maps to exactly one named group.
-  3. Implement the six process entrypoints and `mackesd.target`. Assign all
-     existing workers exactly once to Control, Observation, Actions, Data,
-     Compute, or Integrations. Control owns SQLite migrations/writes and
-     shared configuration; other groups use typed bus contracts and bounded
-     read models. Remove the old monolithic service from the hard-cut package.
-  4. Add structured worker shutdown: cancel child tasks, close subscriptions
-     and sockets, release external leases/handles, drain or reject bounded
-     queues according to message class, and publish cleanup results.
-  5. Add universal resource discipline: do not start unconfigured optional
-     workers; use latest-wins telemetry, explicit command rejection, fixed
-     TTL/byte/item cache limits, per-group/provider semaphores, jittered
-     exponential backoff, circuit breakers, restart-storm suppression, and
-     anomaly-triggered sampled allocator profiles.
-  6. Install per-group systemd policies for MemoryHigh/MemoryMax, CPU
-     weight/quota, TasksMax, IOWeight, watchdog, restart/start limits,
-     filesystem protection, address-family restrictions, device allowlists,
-     writable paths, and dedicated identities. The first release warns and
-     captures evidence at normal budget thresholds; hard kill remains an
-     explicit emergency setting rather than automatic normal recovery.
-  7. Split the RPM into a lean core plus role/group subpackages. Audit bundled
-     system dependencies, install only required Integrations/Compute payloads,
-     use dedicated non-root identities for non-privileged groups, and retain
-     root only for unavoidable Actions operations.
-  8. Publish a strict-versioned `state/mackesd/<node>` snapshot and bounded,
-     credential-free `/run/mde/mackesd-status.json` projection. Include group
-     resources, worker state, queues, retries, capabilities, effective config,
-     staleness, and audit pointers; never include secrets, raw logs, or
-     unbounded diagnostics.
-  9. Add typed `action/mackesd/*` controls for every supported worker/resource
-     setting plus restart, pause, cleanup, refresh, profile apply, and evidence
-     export. Validate, preview, transact, verify, and audit every mutation.
-     Use existing exact-body, short-lived, single-use authorization; fleet
-     configuration uses signed revisions and per-node acknowledgements.
-  10. Add `this-node/advanced` to the durable catalog and a dedicated tab. The
-      page opens on This Node, exposes an explicit fleet switch, uses typed
-      filters plus explicit node checkboxes, shows large resource charts and a
-      searchable process-grouped worker roster, keeps stale nodes visible but
-      disables unsafe actions, and uses high-contrast white selectable choices
-      in both themes.
-  11. Add unit, integration, package, protocol, GUI, and live-fleet gates.
-      Exercise every group crash, provider outage, queue saturation, restart
-      storm, stale snapshot, partial fleet action, cleanup path, and schema
-      mismatch. Require Dell to settle below 1 GiB and peak below 2 GiB; run
-      the same failure matrix across the entire test fleet and record all
-      non-Dell evidence even though Dell is the final memory acceptance gate.
-  12. Deploy the hard cut to all test nodes simultaneously. If a node fails,
-      preserve diagnostics and correct forward through the governed farm/release
-      path; do not add a compatibility monolith or rely on rollback.
-- Scope: In scope are mackesd worker/process architecture, memory and CPU
-  governance, queue/cache/retry/cleanup policy, typed runtime snapshots and
-  actions, Fedora systemd/RPM hardening, the This Node Advanced page, fleet
-  targeting, audit/evidence, and test-fleet deployment. Out of scope are raw
-  shell/SQL/filesystem controls, arbitrary systemd properties not represented
-  by the typed schema, redesign of unrelated This Node providers, and a
-  production rollout before the existing platform production gates pass.
+  1. Inventory every actually spawned worker and service dependency from code
+     and live nodes. Record exact canonical ID, group, role applicability,
+     cadence, queue/cache limits, resource budget, restart and cleanup owner,
+     entity/output kinds, dependencies, publications, subscriptions, and typed
+     actions. Remove every unregistered-worker exception and add bidirectional
+     registry/spawn drift tests.
+  2. Establish a neutral shared, strict-versioned `worker_runtime` contract so
+     the shell does not depend on `mackesd`. Define `WorkerGroup`,
+     `WorkerContract`, `WorkerRuntimeSnapshot`, `WorkerRuntimeState`,
+     `WorkerRelation`, `WorkerTimelineEvent`, and change-set request/result
+     types with explicit size, count, nesting, string, and schema bounds.
+  3. Represent runtime states distinctly as `not_applicable`, `unconfigured`,
+     `starting`, `running`, `backoff`, `paused`, `stopped`, `failed`, `stale`,
+     and `unavailable`. Define freshness, unknown-version behavior, redaction,
+     stable IDs, generation ordering, and a 512-event maximum timeline.
+  4. Complete canonical ownership for former This Node data. `host_state` owns
+     bounded identity, OS, seat, connectivity, display, audio, input, power,
+     privacy, account, and locale observations. Add governance-required
+     `desktop_state` for appearance, wallpaper, layout, clock, workspace, and
+     accessibility preferences.
+  5. Assign hardware, storage, printers, services, applications, lifecycle,
+     recovery, backup, and virtualization to real workers such as
+     `hardware_probe`, `device_inventory`, `storage`, `cups_sync`,
+     `service_aggregator`, `fleet_reconcile`, `lifecycle_exec`,
+     `nebula_ca_backup`, and `vm_lifecycle`. Add missing workers rather than a
+     generic local shell branch. WL-UX-011 supplies provider/action behavior.
+  6. Implement the six process entrypoints and `mackesd.target`. Assign each
+     worker exactly once; keep Control as the sole SQLite migration/write owner
+     and expose only bounded typed read models to other groups. Remove the
+     monolithic unit and executable path from the hard-cut package.
+  7. Add structured shutdown and resource discipline: cancel tasks, release
+     sockets/leases, drain or reject bounded queues by message class, skip
+     unconfigured optional workers, cap caches and concurrency, jitter retries,
+     break circuits, suppress restart storms, and publish cleanup outcomes.
+  8. Install per-group systemd and RPM policy for memory, CPU, tasks, I/O,
+     watchdog, restart limits, filesystem, address families, devices, writable
+     paths, and dedicated identities. Retain privilege only for allowlisted
+     Actions operations and package optional groups/providers by role.
+  9. Publish bounded credential-free `state/mackesd/<node>` snapshots and
+     `/run/mde/mackesd-status.json`. Include group resources, worker runtime,
+     capabilities, relations, queues, retries, effective configuration,
+     generations, freshness, outputs, and audit pointers; exclude raw logs,
+     credentials, secrets, and unbounded diagnostics.
+  10. Build the Workers read model. Open on the whole mesh with six collapsed
+      group hubs and the full canonical roster, highlighting This Node without
+      changing the worker-first hierarchy. The tree is group → worker →
+      applicable node → entity/output and expands only by operator action.
+  11. Render a deterministic registry-order graph synchronized with the tree.
+      Use solid ownership, dashed dependencies, directed transient state/event
+      flow, and dotted action targeting. Filtered hidden dependencies become
+      dim boundary stubs; never persist manual coordinates.
+  12. Implement one shared filter state for group, node, runtime state, and
+      relation type. Tree search filters in place. Selection, expansion,
+      filtering, live snapshot updates, and manual refresh must preserve stable
+      focus and never produce divergent tree/graph truth.
+  13. Selecting a worker opens contract metadata and one fleet row per
+      applicable node with Runtime, Outputs, Relationships, and Timeline views.
+      Keep stale/unavailable nodes visible. A `Stage action` affordance may
+      populate the global console but cannot mutate from the inspector.
+  14. Implement the global Action Console around exact lanes
+      `action/mackesd/changeset/preview`, `/commit`, and `/cancel`. Preview
+      binds normalized typed items, target, expected generation, impact,
+      recovery, arming requirements, digest, and expiry. Commit rejects stale
+      previews before work starts and reports honest per-item partial outcomes.
+  15. Keep Action Console drafts session-local and discard uncommitted drafts
+      on close. Persist committed results through bounded audit records. Forbid
+      raw shell, arbitrary paths/properties, secret-bearing bodies, invented
+      rollback, or claims of cross-node transaction atomicity.
+  16. Implement the surveyed presentation: wide tree/graph/inspector layout;
+      narrow single-pane Tree/Graph/Inspector navigation with back stack; Kdam
+      Thmor Pro interface text; IBM Plex Mono technical IDs; stable group hues;
+      semantic state colors with icon/text redundancy; event-driven motion only.
+  17. Perform the atomic shell cutover. Add one Workers taskbar, Front Door,
+      title, and help identity. Normalize legacy aliases to the surveyed Workers
+      filters/selection, move credits/licenses to Workers Help/About, and delete
+      old tabs, catalogs, polls, renderer state, navigation, and dead tests.
+  18. Preserve the health boundary. Workers has no grade, issue count, badge,
+      health link, alert list, diagnostics dashboard, or automatic health entry.
+      The taskbar and critical auto-open own the modal; modal inventory links may
+      select a Workers entity without creating a return link.
+  19. Update governance, architecture, navigation, operator, and test documents
+      so Workers replaces the old five-plane/This Node information architecture.
+      Mark historical designs superseded and ensure no document presents
+      WL-UX-011 or a design note as a second interface workstream.
+  20. Cut one farm-built release across all five workstations and three
+      lighthouses. Exercise group crashes, provider loss, saturation, restart
+      storms, stale/unknown snapshots, a safe staged action, forced partial
+      failure, and corrected-forward recovery with no compatibility monolith.
+- Scope: In scope are worker registry/contracts, six-process runtime, resource
+  governance, typed snapshots/relations/timeline/actions, Workers shell/read
+  model/UI, Action Console, legacy route normalization and deletion, packaging,
+  docs, and full-fleet proof. WL-UX-011 provider implementations are inputs.
+  Workloads, application-specific surfaces, raw shell/SQL/filesystem controls,
+  arbitrary systemd properties, and System and Mesh Health modal internals are
+  out of scope.
 - Relevant files/components: `crates/mesh/mackesd/src/worker_role.rs`,
   `crates/mesh/mackesd/src/bin/mackesd/spawn.rs`,
-  `crates/mesh/mackesd/src/ipc/action_auth.rs`,
-  `crates/mesh/mackesd/Cargo.toml`, `packaging/systemd/mackesd.service`,
-  `crates/desktop/mde-shell-egui/src/this_node_catalog.rs`,
-  `crates/desktop/mde-shell-egui/src/main.rs`, and the existing mde-bus/fleet
-  state/action contracts.
-- Dependencies: WL-UX-011 owns the durable This Node hierarchy, health-score
-  integration, typed node actions, and provider truth; this epic owns the
-  mackesd runtime contract and Advanced implementation lane. Coordinate visual
-  primitives and contrast with WL-UX-009, integrated release evidence with
-  WL-CRIT-006, and role/package contracts with the build/release governance.
-  Use `docs/BUILD-ENVIRONMENT.md` and `AI_GOVERNANCE.md §10` for all heavy
-  build, test, package, and live-fleet gates.
+  `crates/mesh/mackesd/src/ipc/action_auth.rs`, mackesd package/systemd units,
+  `crates/desktop/mde-shell-egui/src/main.rs`, `this_node_catalog.rs`, State of
+  the Mesh/Fleet renderers, Front Door, taskbar, routing, and shell GUI tests.
+- Dependencies: WL-UX-011 supplies complete node provider truth and bounded
+  hardware actions but owns no presentation route. WL-UX-009 supplies shared
+  visual primitives and responsive profiles. Coordinate release/live evidence
+  with WL-CRIT-006 and recovery with WL-CRIT-007. Use the governed build farm
+  for all heavy build, package, GUI, and live-fleet work.
 - Acceptance criteria:
 
-  1. Every current spawned worker has exactly one registry entry, named group,
-     capability predicate, budget, queue/cache policy, state topic, health
-     key, restart policy, and tested cleanup owner.
-  2. The six named services start independently under `mackesd.target`; a
-     crashed group can restart without taking unrelated groups down, and no
-     old monolithic service runs concurrently.
-  3. Control is the only SQLite writer; cross-group state and actions use
-     strict-versioned typed mde-bus contracts with bounded bodies and replies.
-  4. Unconfigured optional workers do not start; retries, queues, caches,
-     task counts, and provider concurrency remain within declared bounds.
-  5. Dell settles below 1 GiB for the complete mackesd stack and remains below
-     2 GiB during boot; any anomaly has allocator/cgroup attribution and a
-     corrective test.
-  6. Advanced reports exact group/worker state, resources, queues, retries,
-     capabilities, staleness, effective settings, audit pointers, and action
-     outcomes without secrets or raw unbounded logs.
-  7. Advanced supports complete typed supported-setting administration,
-     contextual actions, local-first scope, explicit fleet selection, signed
-     revision rollout, partial-success reporting, and stale-node safety.
-  8. Every mutation is traceable; compact successful records and detailed
-     failure evidence are retained for one day with bounded purge behavior.
-  9. Dark/Light selectable choices remain readable on white high-contrast
-     surfaces with distinct hover, focus, selected, and disabled states.
-  10. All failure-injection, protocol, packaging, worklist, focused GUI, farm,
-      and Dell live gates pass, with unavailable hardware/provider evidence
-      recorded honestly.
-- Verification method: Run `install-helpers/lint-worklist.sh --self-test` and
-  the normal worklist lint. Run focused mackesd and shell tests plus farm
-  `cargo test -p mackesd`, touched shell tests, package/payload checks, and
-  workspace/clippy gates with the longest job on BigBoy. Inspect installed
-  systemd unit/cgroup state on every test node. Capture Dell boot/idle memory
-  timelines, allocator evidence, service health, and Advanced screenshots in
-  Dark/Light desktop layouts. Run the six-node chaos matrix and retain signed,
-  redacted evidence bundles; do not claim live hardware proof when unavailable.
+  1. Every spawned worker has exactly one complete canonical registration and
+     group; no exception list, duplicate owner, or unowned This Node capability
+     remains, and registry/spawn drift tests fail both directions.
+  2. Six independently supervised services run under `mackesd.target`; Control
+     is the only persistent-state writer, group crashes remain isolated, and no
+     monolithic runtime runs or ships.
+  3. Snapshots, relations, timeline events, and change sets are versioned,
+     bounded, redacted, credential-free, generation-aware, and safe under
+     hostile input, schema mismatch, stale data, and unavailable providers.
+  4. Dell settles below 1 GiB for the complete stack and stays below 2 GiB at
+     boot; queues, caches, tasks, retry rates, and concurrency remain within
+     declared limits across the fleet failure matrix.
+  5. Exactly one Workers product renders the worker-first tree, deterministic
+     graph, and fleet inspector with synchronized selection/filtering, manual
+     expansion, live freshness, manual refresh, and honest runtime states.
+  6. Wide, narrow, largest-text, Dark, Light, stale, unavailable, and large-
+     topology renders remain legible and operable with the surveyed typography,
+     group/state language, responsive panes, and event-only motion.
+  7. The Action Console previews and binds every mutation, rejects stale or
+     expired commits, audits results, and renders partial success honestly. No
+     worker page, legacy surface, raw command, or arbitrary path bypasses it.
+  8. Legacy names normalize to the specified Workers context, while their
+     renderers, tabs, polling, catalog/state branches, and visible destinations
+     are absent from source, package, runtime, navigation, and help.
+  9. Workers contains no health grades, scores, issue counts, badges, health
+     links, or duplicate diagnostics. The separate modal still opens from the
+     taskbar/critical condition and can deep-link to the exact Workers entity.
+  10. The exact release passes farm contract/process/security/GUI/package gates
+      and live proof on five workstations plus three lighthouses, including a
+      safe change set and forced partial failure with no legacy fallback.
+- Verification method: First run the worklist self-test and lint. On the farm,
+  run shared-contract hostile fixtures, registry/spawn drift, mackesd unit and
+  integration suites, six-group lifecycle/chaos tests, action-auth/change-set
+  security tests, shell route/model/render tests, fmt, clippy, package/payload,
+  architecture, secret, and supersession gates; put the longest job on BigBoy.
+  Capture deterministic baseline/after frames in Dark/Light desktop, narrow,
+  largest text, stale/unavailable, and large-topology states through DRM or
+  Sunshine. On all five workstations and three lighthouses, verify exact worker
+  IDs, unit/cgroup isolation, fresh projections, alias normalization, one safe
+  staged change, forced partial failure, no old surface, and the separate health
+  modal. Record unavailable hardware honestly without claiming that gate passed.
 - Origin or merged source IDs: 2026-08-01 operator evaluation of mackesd
   growth, Dell boot memory regression, process isolation, performance,
-  resilience, Fedora best practice, and fleet-wide Advanced administration.
-  Incorporates the 50-question decision pass: under-1-GiB idle target,
-  under-2-GiB boot peak, six clear process groups, mde-bus contracts, one-day
-  evidence retention, trusted-mesh mutation authority, typed forms, signed
-  fleet revisions, and Dell as the final memory gate.
+  resilience, Fedora best practice, and fleet-wide administration, including
+  the under-1-GiB idle and under-2-GiB boot targets. Expanded by the 2026-08-03
+  25-question Workers merge survey, which supersedes the Advanced/This Node
+  interface and makes this epic the sole owner of the State of the Mesh plus
+  This Node product/runtime hard cut.
 
-### WL-FUNC-011 - Complete Mesh Teams and cut over one collaboration product
+### WL-FUNC-011 - Build the native Mesh Collaboration Suite and hard-cut legacy collaboration
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: The collaboration contracts, projections, workers, and Mesh Teams
-  UI have substantial working foundations, but unfinished behavior remains
-  split between this functional epic and the retired UX-only WL-UX-010. Pins,
-  saved messages, tasks, provider-backed calls, two-way Discord, complete
-  coauthoring/file workflows, migration, and removal of superseded surfaces are
-  not all production-complete. Keeping backend and interface acceptance in
-  separate epics obscures the one-product cutover.
-- Required outcome: One `Mesh Teams` Communications product replaces Chat,
-  Voice, Editor, Files, Transfers, Notifications, and Clipboard destinations
-  without losing accepted behavior. Teams/channels organize signed,
-  offline-first messaging, threads, documents, files, transfers, calls, alerts,
-  text clipboard history, tasks, Discord provenance, and assistive
-  DigitalOcean AI. Every enrolled workstation has a named system channel:
-  `System · Dell`, `System · Eagle`, and `System · 15`. One epic owns contracts,
-  workers, projections, UI, migration, package removal, and final acceptance.
-- Current state: Shared collaboration types, core, UI, and shell/daemon
-  integration cover the major Teams/channel rails, Posts/Files/Calls, Activity,
-  composition, Details/search/threads, pin/save/task/membership, notification,
-  clipboard, persistence, and bounded provider-state foundations with focused
-  farm proof. The parity ledger remains the authority for open rows. Real
-  Discord/media/SIP/AI, complete document/file/transfer workflows, migration,
-  provider-backed live evidence, and removal of superseded surfaces remain
-  open. Exact landed-slice and live-render evidence is preserved in the dated
-  pre-lint-compaction snapshot.
+- Problem: The current Mesh Teams UI organizes collaboration around nested app,
+  team, channel, Activity, Details, Transfers, and Settings rails instead of the
+  six capabilities users need. Calls author signed state but production has no
+  media providers; legacy Chat still runs; SIP provisioning is gated; Files and
+  collaboration maintain competing transfer models; Clipboard is text-only;
+  and the capable native Editor is buried inside Documents. The worklist also
+  assigns LibreOffice to an App VM even though the approved product is a wholly
+  native collaboration and creation suite.
+- Required outcome: One egui-native `Mesh Collaboration Suite` replaces every
+  legacy Chat, Voice, Files/Transfers, Editor, Notifications, Clipboard, and
+  Mesh Teams destination. Its only primary sections are Alerts, Chat, Calls,
+  Files, Editor, and Clipboard. Files is the universal browser and transfer hub;
+  Editor owns Text/Code, Document, Spreadsheet, and Presentation workspaces;
+  Calls provides real direct/group media, shared provider-neutral SIP gateways,
+  screen sharing, and consented control. Fedora LibreOfficeKit supplies the
+  sandboxed Writer/Calc/Impress engine without a visible VCL UI, App VM, host
+  window, or compositor. One epic owns contracts, workers, UI, migration,
+  package removal, and final acceptance.
+- Current state: Signed offline-first collaboration envelopes, projections,
+  egui UI, shell/daemon mounting, and migration helpers are substantial. The
+  native Editor already has rope buffers, tree-sitter, LSP, panes, search, a
+  terminal, and Yrs collaboration. Files has POSIX operations and durable
+  transfer workers; the legacy voice stack has reusable SIP/RTP pieces. Calls
+  still use an empty production media registry, Vitelity live calls are gated,
+  the transfer worker exposes fewer lanes than the suite projection, and legacy
+  Chat remains spawned. LibreOfficeKit integration, rich Clipboard transport,
+  canonical Alerts, state migration, and the hard cut have not landed.
 - Remaining work:
 
-  1. Reconcile the parity ledger against current runtime/tests and leave only
-     open rows. Every accepted legacy command, route, hotkey, state writer,
-     migration source, package entry, and workflow must map to Mesh Teams or an
-     explicit surveyed retirement. Validate the combined etcd/overlay roster
-     before publishing membership and populate the named system channel for
-     every enrolled workstation.
-  2. Extend the landed shared pin/private-save baseline through the real Mesh
-     Teams runtime adapter and release acceptance; no pending control may
-     remain at release.
-  3. Add basic channel task/action-item contracts, projections, ownership,
-     completion state, offline convergence, and Posts/Details presentation.
-     Bound the Notification Stream with severity-aware coalescing, virtualization,
-     and a visible pause/resume control so notification volume cannot hold the
-     interface down.
-  4. Complete the real two-way Discord bridge: sealed configuration, channel
-     mapping, inbound/outbound provenance, loop prevention, replay/idempotence,
-     bounded attachments, health/degraded state, and worker supervision. Keep
-     Discord disabled and visibly unconfigured until its provider is configured.
-  5. Bind real microphone/camera/screen providers and finish direct WebRTC P2P,
-     elected LiveKit SFU fallback/failover, SIP ingress/egress, advancing media,
-     device switching, call controls, screen share, and remote-control
-     escalation. Remote control requires a trusted-session approval. Recording
-     and transcription remain absent. Audio must stream between enrolled
-     Mesh nodes over the direct path and the elected relay path with bounded
-     jitter, loss recovery, mute/volume state, device changes, authorization,
-     and reconnect behavior.
-  6. Complete full-IDE Markdown document entry, Yrs coauthoring, anchored review
-     threads, shared presence/follow mode, external-write three-way review,
-     version history, and safe Git behavior.
-  7. Complete channel Files and transfer-first workflows against stable file
-     references, resumable hash-verified transfers, new-member backfill,
-     reference-versus-delete semantics, and the shared operation-progress
-     authority. Extend the standalone Files workspace into the node-aware
-     control surface: expose enrolled nodes and their sync state, prepopulate
-     links/shares and destination metadata, and provide ten automatic
-     interactions covering node browse, share/link creation, sync inspection,
-     transfer routing, Airsonic upload targeting, retry/resume, conflict
-     review, offline queueing, node health, and per-node activity.
-     Typed ten-action inventory, per-node sync state, and provider-gated
-     Airsonic discovery are farm-tested. Completed Files, Terminal, and Editor
-     render slices are recorded in the DRM ledger. The explicit Files proof
-     route also produced wrong-surface frames on .138, so a feature-correct
-     direct-DRM provider-advertisement proof remains open. Exact payload,
-     capture, regression, rollback, and style-gate history is preserved in the
-     dated pre-lint-compaction snapshot.
-  8. Keep platform clipboard ownership in WL-FUNC-016. Mesh Teams consumes its
-     text history/actions; arbitrary MIME and large attachments flow through
-     Files/Transfers, not a second clipboard store.
-  9. Finish the typed DigitalOcean inference adapter, sealed key/model health,
-     bounded consented context, cancellation/rate-limit behavior, suggestion
-     attribution, and explicit user-apply flow. AI never mutates canonical
-     state autonomously.
-  10. Add an idempotent, failure-safe importer for legacy collaboration,
-      alert, clipboard-history, editor, file, transfer, SIP, launcher, and route
-      state. Run parity comparison before cutover.
-  11. When all parity rows pass, remove superseded routes, workers, state
-      writers, crates, package entries, and current docs in one release. Keep
-      only bounded migration readers for a documented support window.
-  12. Finish desktop, narrow/tablet, and completed Car-interface render,
-      performance, unavailable-state, and no-overlap acceptance using shared
-      WL-UX-009 primitives.
-- Scope: One collaboration domain and one user-facing Mesh Teams destination,
-  including signed contracts, storage/replication, workers, UI, media/provider
-  adapters, migration, and removal. Out of scope: recording/transcription,
-  @mentions, urgent/scheduled messages, emoji/GIF/sticker systems, slash/bot
-  platforms beyond Discord, global Mesh Teams search, autonomous AI actions,
-  and a permanent old/new compatibility switch.
-- Relevant files/components: `crates/shared/mde-collab-types/`,
-  `crates/services/mde-collab-core/`, `crates/desktop/mde-collab-egui/`, and
-  shell/daemon collaboration integration plus the parity ledger.
-- Dependencies: Use WL-FUNC-016 as the single text clipboard authority and
-  WL-UX-009 for shared visual/state primitives. The completed Car interface
-  supplies glance constraints. Missing live SIP, media, Discord, or model
-  credentials are evidence gates, not permission to ship stubs.
+  1. Reconcile the parity ledger and current runtime into the approved product.
+     Every legacy command, route, hotkey, state writer, migration source,
+     package, and workflow must map to one of the six sections or an explicit
+     retirement. Remove the conflicting keep-Files-separate, Teams/channel,
+     task, Discord, AI, text-only clipboard, and App-VM LibreOffice decisions.
+  2. Introduce strict-versioned shared contracts for `SuiteSection`,
+     `AlertEnvelopeV2`, `ConversationTarget`, `CallEndpoint`, `MediaRoute`,
+     `SipGateway`, `ControlGrant`, `FileEndpoint`, `FileOperation`,
+     `TransferJobV2`, `ClipboardEnvelopeV2`, `EditorWorkspace`, `EditorKind`,
+     and `OfficeSessionRecord`. Bound strings, arrays, MIME metadata, payloads,
+     retries, nesting, and unknown-version behavior; retain signed attribution.
+  3. Replace `Surface::Communications` and the current eight-app/nested-channel
+     frame with `Surface::Collaboration`. Render exactly six full-name sections
+     plus a stable context header showing selected node/group, connectivity,
+     call/share state, and cross-section actions. Settings belongs in contextual
+     preferences or Control Center; Transfers is Files content, not navigation.
+  4. Consolidate Chat on the collaboration event core. Support signed durable
+     node direct messages and simple saved groups, threads, attachments, offline
+     replay, local find, delivery state, and source identity. Import useful
+     legacy Chat history, then remove the old Chat worker, state tree, shell
+     renderer, package edges, and duplicate notification folding.
+  5. Replace the fixed alert-lane prefix fold with `AlertEnvelopeV2` emitted by
+     every platform service. Alerts keeps a session-only virtualized 500-row
+     ring with node/service/severity filters and deep links. Relevant events
+     also appear as transient Chat system rows. Durable health issue lifecycle
+     stays in System and Mesh Health; Alerts has no acknowledge, assign, snooze,
+     mute, escalation, or second persistent store.
+  6. Make Files the universal browser and file-operation authority. Expose local
+     paths, enrolled-node paths, SFTP profiles, shares, staging areas, and job
+     results in one source tree. Route list/stat/read/write, new file/folder,
+     rename, duplicate, move/copy, archive/extract, link, trash/delete, and
+     open-with operations through typed local or addressed node executors.
+  7. Replace the collaboration transfer projection and the old five-method GUI
+     mirrors with one `TransferJobV2` contract. Separate endpoint from operation
+     and support local/mesh copy, rsync sync, SFTP, HTTP download, browser scrape,
+     multipart upload, recurring mirror, and Clipboard payload jobs. Executors
+     keep durable node-local ledgers; signed summaries form the global Files
+     view. Preserve cancelled history, real bytes/rate/phase/attempt/error,
+     pause/resume/retry, bandwidth limits, checksum verification, and CLI parity.
+  8. Use direct resumable rsync-over-Nebula for node transfers and Syncthing
+     staging as the durable fallback. Browser supplies a typed scrape session
+     adapter while Files owns job state. Multipart/SFTP credentials are sealed
+     profile references, never job fields. Migrate existing ledger and sync-pair
+     JSON without resetting active jobs or losing history.
+  9. Keep shared Clipboard transport in WL-FUNC-016 and make the suite its one
+     session-history UI. Publishing starts disabled every session and broadcasts
+     rich MIME events to all enrolled nodes after opt-in. Inline text remains at
+     most 1 MiB; formatted, image, and file payloads use ephemeral priority Files
+     jobs, arrive first as attributed placeholders, and persist only through an
+     explicit `Save to Files` action.
+  10. Restore Editor as a first-class section and retain the current rope,
+      tree-sitter, LSP, panes, search, terminal, and Yrs foundations. Complete a
+      full IDE with Git status/diff/commit, DAP debugging, tasks, test discovery,
+      terminal management, conflict/diff views, and local or selected-node
+      projects. Remote tools run inside an admitted development workload on the
+      selected node, never as an unrestricted host-control shell.
+  11. Do not import Code-OSS or an extension marketplace. Reuse only audited open
+      protocols and independently licensed LSP/DAP adapters. Add Text/Code,
+      Document, Spreadsheet, and Presentation `EditorKind` workspaces to the
+      same tab/pane/session model and route all open/save/version operations
+      through Files with expected-content hashes and atomic conflict handling.
+  12. Add a process-isolated `mde-office-core` adapter over Fedora's system
+      `libreofficekit`, `libreoffice-core`, Writer, Calc, and Impress packages.
+      Run one sandboxed headless process per active document with the `svp` VCL
+      backend, no display/compositor access, separate temporary profile, default-
+      denied network, and macros/Java/extensions/external links disabled unless
+      a later typed policy explicitly admits them. Never load the engine into the
+      DRM shell or display LibreOffice VCL widgets.
+  13. Add an egui office renderer for LibreOfficeKit BGRA tiles, invalidation,
+      selections, cursors, touch/pointer/key input, parts/sheets/slides, command
+      state, and errors. Implement native menus, toolbars, dialogs, and status
+      for Writer formatting/styles/tables/images/comments/track-changes/layout;
+      Calc formulas/sheets/format/sort/filter/charts/freeze panes; and Impress
+      slide/layout/text/media/shape/notes/transition/presentation workflows.
+      Support ODF, Microsoft Office formats, PDF export, and fidelity warnings.
+  14. Implement native office collaboration with one leased, capable session
+      host per document, LibreOfficeKit multi-view state, signed Bus control,
+      direct Nebula tile/input transport, participant presence, cursors,
+      comments, and reconnect. Autosave atomic versioned snapshots through Files;
+      host loss elects another capable node and reopens the latest snapshot.
+      Text/code retains Yrs CRDT; conflicting offline office edits create an
+      explicit conflict version rather than an unsafe synthetic merge.
+  15. Move the LibreOffice printing requirement from WL-FUNC-018 into Editor.
+      LibreOfficeKit PDF/page output drives one page-faithful native preview and
+      CUPS workflow with printer discovery/health, local/mesh selection, paper,
+      tray, orientation, margins, duplex/binding, color, copies, collation,
+      ranges, scale, N-up/booklet, PDF output, presets, progress, cancel, retry,
+      offline/error states, and tablet-sized controls.
+  16. Populate the production media registry. Use direct WebRTC P2P for one-to-
+      one calls and self-hosted LiveKit for group calls or direct-path fallback.
+      Bind real PipeWire/WirePlumber microphones/speakers and camera/screen
+      capture; expose actual device selection, mute/volume, camera, screen,
+      quality, jitter/loss, reconnect, and failure state. Recording and
+      transcription remain absent.
+  17. Deploy LiveKit SFU and SIP as managed workloads on capable Workstations
+      with health-based room placement and no fixed central node. Define a
+      sealed provider-neutral shared SIP gateway pool, implement Vitelity as the
+      first live adapter, give each node an internal SIP URI, and support optional
+      DID mappings. The caller chooses a healthy outbound gateway for each call;
+      retain the last choice without silently overriding an explicit selection.
+  18. Support direct and group voice/video, inbound/outbound SIP participants,
+      DTMF, hold, transfer, device changes, route failover, and honest carrier
+      errors. Screen sharing and remote control require an explicit per-call
+      request/grant, persistent sharing indicator, immediate revoke, automatic
+      expiry on hangup, and no unattended-control mode.
+  19. Build an idempotent preflight/importer for collaboration, Chat, Alerts,
+      Clipboard history, editor state, file references, transfer jobs/sync pairs,
+      voice/SIP configuration, launcher pins, and routes. Quiesce legacy writers,
+      import once, compare counts/hashes/active state, activate the new surface,
+      and remove old routes, workers, writers, crates, packages, and current docs
+      in the same release. Retain no long dual-run or permanent compatibility
+      shim.
+  20. Amend durable governance and current interface authority before runtime
+      implementation: permit only sandboxed headless platform document engines,
+      retain the ban on host app windows/compositors, require every visible
+      office control to be egui, and replace the ICQ-only notification lock with
+      the six-section suite. Finish desktop, narrow/tablet, Car-safe, Dark/Light,
+      unavailable-state, performance, and no-overlap acceptance with WL-UX-009.
+- Scope: One collaboration domain and one native Mesh Collaboration Suite;
+  canonical Alerts and Chat; universal Files and transfers; rich Clipboard UI;
+  a full local/managed-remote IDE; LibreOfficeKit Writer/Calc/Impress editing and
+  printing; direct/group WebRTC, LiveKit, SIP, sharing/control; migration; and
+  legacy removal. Out of scope are Teams/channels, tasks, Discord, AI, Code-OSS,
+  an extension marketplace, recording/transcription, unattended control,
+  macros/Java/office extensions, a visible LibreOffice UI, an Office App VM,
+  arbitrary remote host shells, and a permanent old/new switch.
+- Relevant files/components: `mde-collab-types`, `mde-collab-core`,
+  `mde-collab-egui`, shell/daemon integration, and the parity ledger.
+- Dependencies: WL-FUNC-016 owns rich Clipboard seat/mesh/VDI transport;
+  WL-UX-009 owns shared visual/state primitives; WL-ARCH-009 supplies isolated
+  worker/service ownership; Files is the only binary-payload authority. Update
+  `AI_GOVERNANCE.md` and `docs/design/platform-interfaces.md` before landing the
+  native office runtime. Missing live SIP, media, or office hardware remains an
+  evidence gate and never permits a fake provider.
 - Acceptance criteria:
 
-  1. One Mesh Teams entry replaces every superseded collaboration destination
-     and state writer; no competing product surface or dead control remains.
+  1. One Mesh Collaboration Suite entry with exactly six full-name sections
+     replaces every superseded collaboration destination and state writer; no
+     competing surface, Teams/channel rail, separate Transfers app, or dead
+     control remains.
   2. Signed two/three-node partition, replay, membership, tombstone, blob,
      backfill, and migration fixtures converge without loss, duplication,
      invalid authority, or resurrection.
-  3. Teams/channels, including each enrolled workstation's named system
-     channel, Activity, Posts/Files/Calls, Details, rich composition, local
-     find, threads, pins, saved messages, tasks, alerts, and contextual
-     clipboard/transfer actions work with durable state and honest failures.
-     Notification floods remain bounded and cannot monopolize rendering.
-  4. Documents provide the accepted full IDE, live coauthoring, anchored
-     review, safe external-write merge, version history, and non-destructive Git
-     behavior.
-  5. Files preserve stable identity and distinguish reference removal from
-     permanent deletion; transfers resume, verify hashes, backfill members, and
-     report through the shared progress projection. The Files workspace exposes
-     ten tested node-aware interactions, prepopulates every available link/share
-     and Airsonic upload destination, and makes per-node sync state identifiable
-     without inventing unavailable services.
-  6. Direct and SFU-relayed calls carry advancing audio/video/screen frames;
-     SIP ingress/egress, device controls, failover, and remote-control
-     escalation work; no recording/transcription artifact exists. Node-to-node
-     audio streaming is independently proven on direct and relay paths,
-     including microphone capture, speaker playback, mute/volume propagation,
-     device switching, packet-loss/jitter handling, authorization, and
-     reconnect after node or route loss.
-  7. Discord is genuinely two-way with provenance and loop prevention only
-     after sealed provider configuration; otherwise it is visibly disabled.
-     DigitalOcean suggestions use consented bounded context, never auto-apply,
-     and fail without impairing local collaboration.
-  8. Migration is repeatable and failure-safe, the parity ledger has no open
-     row, and old runtime/package/doc surfaces are removed after cutover.
-  9. Desktop, narrow/tablet, and Car render and interaction tests show no
+  3. Chat direct messages/groups converge offline with durable signed history;
+     all platform Alerts enter the bounded ephemeral aggregate and relevant
+     transient Chat contexts without creating durable alert-inbox state or
+     monopolizing rendering.
+  4. Files browses and mutates local, mesh, and SFTP paths and owns one global
+     view over durable executor ledgers. Local/mesh/SFTP/rsync/HTTP/scrape/
+     multipart/recurring/Clipboard jobs report real progress, pause/resume,
+     retry, verify, survive restart, and never expose credentials.
+  5. Editor provides the accepted full IDE locally and in a managed development
+     workload, with language intelligence, Git, tasks/tests, terminal, debugger,
+     Yrs co-editing, safe external-write review, and version history.
+  6. Writer, Calc, and Impress open inside Editor with no VCL/VM window; native
+     chrome drives real LibreOfficeKit editing, office-format round trips,
+     collaborative presence, atomic versioned save/conflict handling, PDF, and
+     page-faithful printing. Engine crash and session-host loss recover honestly.
+  7. Direct and SFU-relayed calls carry advancing audio/video/screen frames;
+     direct/group sessions, SIP URI/DID ingress, caller-selected gateway egress,
+     DTMF/hold/transfer, devices, failover, and consented control work. No
+     recording, transcription, or unattended-control artifact exists.
+  8. Session-opt-in rich Clipboard events reach every enrolled node with source
+     attribution and echo prevention; capable seats materialize supported MIME,
+     Files transports binary payloads, and session-end cleanup preserves only
+     content explicitly saved to Files.
+  9. Migration is repeatable and failure-safe, the parity ledger has no open or
+     contradictory row, and old runtime/package/doc surfaces are removed after
+     cutover with no dual-run compatibility mode.
+  10. Desktop, narrow/tablet, and Car render and interaction tests show no
      overlap, unbounded feeds, hidden commands, placeholders, or fabricated
      provider state.
-- Verification method: Run focused unit/property tests for contracts,
-  signatures, projections, permissions, replay, CRDT, file/transfer, media,
-  Discord, AI consent, and migration. Run deterministic two/three-node fixtures
-  plus `@farm:{cargo test --workspace --all-targets}` and
-  `@farm:{cargo clippy --workspace --all-targets -- -D warnings}`, placing the
-  longest jobs on BigBoy and parallelizing independent crates. Complete live
-  media/SIP/Discord/model/file-backfill and rendered DRM evidence where
-  resources exist; record unavailable external resources without substituting
-  fake success.
+- Verification method: Run focused contract, signature, projection, permission,
+  replay, CRDT, file/transfer, Clipboard, LibreOfficeKit sandbox/round-trip,
+  media/SIP, and migration tests. Run deterministic multi-node fixtures plus
+  `@farm:{cargo test --workspace --all-targets}` and
+  `@farm:{cargo clippy --workspace --all-targets -- -D warnings}`, with BigBoy
+  carrying the long job. Prove live Files adapters, Clipboard, office editing,
+  collaboration/printing/recovery, direct/relayed media, SIP, migration, and DRM;
+  record unavailable external resources without claiming success.
 - Origin or merged source IDs: `NOTIFY-CHAT`, `EDITOR-*`, `FILEMGR-*`,
   `TRANSFERS-*`, `E12-11`, `VOIP-GW-*`, clipboard/alert-relay workstreams,
-  operator editor and Communications surveys, and retired/absorbed WL-UX-010.
-  Its completed interface evidence and every unfinished acceptance row are
-  owned here.
+  editor/Communications surveys, retired WL-UX-010, and the 2026-08-03 suite and
+  native-office surveys. Old interface evidence is historical baseline only.
 
-### WL-FUNC-016 - Native text clipboard across the DRM seat, mesh, and VDI
+### WL-FUNC-016 - Native rich clipboard across the DRM seat, mesh, and VDI
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: The direct DRM egui seat does not synthesize complete copy/cut/paste
-  events or consume platform copy output, while remaining host synchronization
-  depends on Wayland tools even though Construct has no compositor. Seat,
-  KDC/mobile, Mesh Teams history, and VDI guest clipboard paths do not yet share
-  one native text contract.
-- Required outcome: Copy, cut, and paste work among local egui apps, authorized
-  mesh/KDC producers, Mesh Teams history, and VDI guests through one canonical
-  text lane. The active seat can publish and materialize clipboard rows without
-  `wl-copy`/`wl-paste`; guests use real protocol channels or report explicit
-  unsupported status. Mesh Teams owns persisted team clipboard history/actions;
-  this epic owns transport and seat/VDI behavior. Browser participates only as
-  the `browser-vm` VDI guest.
-- Current state: Canonical clip events/actions, direct DRM copy/cut/paste,
+- Problem: The existing clipboard path is limited to UTF-8 text and does not
+  consistently connect direct-DRM applications, KDC/mobile clients, every
+  enrolled node, the collaboration UI, and VDI guests. Binary content has no
+  canonical Files handoff, rich MIME capability negotiation is absent, and
+  some host synchronization still assumes Wayland tools even though Construct
+  has no compositor.
+- Required outcome: One versioned rich-MIME clipboard contract carries text,
+  HTML/RTF, images, and file references among native egui applications,
+  authorized mesh/KDC producers, and capable VDI guests. Publishing is disabled
+  at each session start and, after explicit opt-in, broadcasts to every enrolled
+  node with attribution, ordering, deduplication, and echo prevention. Text up
+  to 1 MiB may remain inline; Files owns all large or binary bytes. The Mesh
+  Collaboration Suite owns session history/actions while this epic owns the
+  seat, mesh, KDC/mobile, and VDI transport.
+- Current state: Canonical text events/actions, direct DRM copy/cut/paste,
   bounded shell/daemon/KDC/mobile materialization, signed seat targeting,
-  retry/deduplication/attribution, Mesh Teams opt-in history/actions, and VNC
-  clipboard round-trip have focused farm coverage. Guest-to-client Bus handoff
-  is wired; client-to-guest remains gated by live protocol ownership. RDP
-  CLIPRDR and SPICE vdagent remain explicitly unsupported, and the production
-  signed-target adapter plus live VDI proof remain open. Exact test and
-  implementation evidence is preserved in the dated pre-lint-compaction
-  snapshot.
+  retry/deduplication/attribution, session UI, and VNC text round-trip have
+  focused farm coverage. Guest-to-client Bus handoff is wired; client-to-guest
+  remains gated by live protocol ownership. RDP CLIPRDR and SPICE vdagent are
+  explicitly unsupported. Rich MIME envelopes, Files payload jobs, all-node
+  broadcast, the production signed-target adapter, and live VDI proof remain
+  open. Exact prior evidence is preserved in the dated pre-lint snapshot.
 - Remaining work:
 
-  1. Wire the production OS/guest clipboard adapter for the signed target-seat
-     handoff, preserving bounded retry and explicit unavailable-state reporting;
-     do not reintroduce Wayland polling.
-  2. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
-     history/actions for the session only, support per-user opt-out, and keep
-     remote history visible when local publishing is disabled. Route Browser
-     copy and paste solely through its VDI protocol after WL-ARCH-008 removes
-     host Browser mediation.
-- Scope: UTF-8 text clipboard up to the existing 1 MiB guest transport cap,
-  direct DRM seat integration, Mesh Teams-owned session history/actions,
-  KDC/mobile inbound materialization, and VDI host/guest channels. Arbitrary
-  MIME, images, secret classification/filtering, and direct guest access to host
-  memory are out of scope; Files/Transfers owns larger content.
+  1. Introduce `ClipboardEnvelopeV2` with source node/seat/session, monotonic
+     sequence, timestamp, ordered MIME offers, bounded preview, content hash,
+     byte count, inline text, optional Files payload reference, and expiry.
+     Bound and sanitize every field; reject malformed, unauthorized, replayed,
+     oversized, unsupported, and unknown-version envelopes.
+  2. Complete the production direct-DRM adapter. Capture native copy/cut output,
+     materialize the richest supported representation, preserve explicit
+     unavailable state, and remove remaining `wl-copy`/`wl-paste` polling.
+  3. Add session-scoped publishing consent. Default it off on every login,
+     broadcast accepted updates to all enrolled nodes, retain source attribution,
+     prevent local/mesh/VDI echo loops, and let incapable targets expose an
+     unsupported representation without corrupting or downgrading the source.
+  4. Integrate the WL-FUNC-011 Files executor. Create short-lived priority jobs
+     for images, formatted payloads, and file bundles; publish placeholders
+     immediately, verify content before materialization, clean expired staging,
+     and preserve bytes only after an explicit `Save to Files` action.
+  5. Route the suite Clipboard section and KDC/mobile clients through the same
+     envelope, capability, consent, and authorization model. Migrate useful
+     text-session state, then delete duplicate clipboard histories and lanes.
+  6. Implement VNC, RDP CLIPRDR, and SPICE vdagent capability negotiation and
+     bidirectional transfer for their honestly supported MIME subsets. Browser
+     participates only through its `browser-vm` VDI protocol; no host Browser
+     or direct guest-memory exception is permitted.
+- Scope: Rich MIME negotiation and transport; direct DRM seat integration;
+  opted-in all-node broadcast; suite session history/actions; KDC/mobile
+  ingress/materialization; VDI host/guest channels; and Files-backed binary
+  payloads. Secret classification/DLP, arbitrary object deserialization, direct
+  guest access to host memory, and permanent clipboard publishing are out of
+  scope.
 - Relevant files/components: direct DRM handling in `mde-egui` and the shell;
-  daemon clipboard sync/IPC/bridge workers; Mesh Teams clipboard presentation;
+  daemon clipboard sync/IPC/bridge workers; collaboration Clipboard UI;
   `mde-vdi-rdp`, `mde-vdi-vnc`, and `mde-vdi-spice`.
-- Dependencies: Preserve the existing event/action wire bodies, VDI
-  authorization, echo guards, and 1 MiB cap. Coordinate Mesh Teams consumption
-  with WL-FUNC-011 and Browser VM transport with WL-ARCH-008.
+- Dependencies: WL-FUNC-011 owns the Files payload executor and suite UI;
+  WL-ARCH-008 owns Browser VM transport. Preserve signed authorization and echo
+  guards while versioning the text-only bodies through an explicit migration.
 - Acceptance criteria:
 
-  1. Copy/cut/paste works among local egui Editor, Terminal, and other text
-     surfaces on the direct DRM seat without Wayland tools.
-  2. Every accepted producer emits the canonical body, Mesh Teams history
-     consumes that lane for the session, and authorized rows materialize on the
-     target seat without loops. Local publish defaults off for new users and
-     opt-out never hides remote history.
+  1. Copy/cut/paste works among native egui surfaces on the direct DRM seat
+     without Wayland tools for text, formatted text, images, and file payloads.
+  2. Publishing defaults off every session. One opt-in update reaches every
+     enrolled node with stable ordering, attribution, deduplication, and no
+     echo loop; opt-out stops publishing immediately without deleting history.
   3. KDC/mobile ingress rejects malformed, oversized, unauthorized, duplicate,
-     and echo payloads while preserving honest source attribution.
-  4. VNC text is bidirectional over real RFB messages; RDP/SPICE use real
-     channels or expose unsupported state. `browser-vm` uses the same capability
-     and no host Browser exception.
-  5. Mesh Teams history/actions operate on the canonical lane and large/non-text
-     content is handed to Files/Transfers rather than silently truncated.
+     replayed, unknown-version, and echo payloads while preserving attribution.
+  4. Binary payloads use verified Files jobs and expire unless explicitly saved;
+     no binary bytes enter the bounded Bus envelope or clipboard history store.
+  5. VNC, RDP, and SPICE negotiate their real capabilities bidirectionally or
+     expose explicit unsupported state. `browser-vm` has no host-side exception.
+  6. The suite is the sole Clipboard UI and old text-only histories, workers,
+     and protocol lanes are removed after repeatable migration.
 - Verification method: Run focused farm tests for DRM shortcut/output handling,
-  shell publish/materialize, daemon history and authorization, KDC/mobile
-  ingress, Mesh Teams actions, VNC wire messages, and RDP/SPICE capability
-  reporting. Complete a live direct-seat round trip among Editor, Terminal,
-  Mesh Teams, a VDI desktop, and `browser-vm`; unavailable protocol channels
-  must be visibly unsupported.
+  MIME bounds/sanitization, consent, all-node fanout, ordering/echo prevention,
+  Files payload lifecycle, KDC/mobile authorization, and VNC/RDP/SPICE wire
+  behavior. Complete live direct-seat and multi-node round trips among Editor,
+  Terminal, the suite, a VDI desktop, and `browser-vm`; unsupported MIME or
+  protocol channels must remain explicit.
 - Origin or merged source IDs: 2026-07-26 operator report that platform cut and
-  paste is unusable, followed by the decision that all text paths connect
-  natively through one mesh lane. Reworked 2026-07-28 to remove the retired
-  host Browser clipboard model.
+  paste is unusable; 2026-07-28 host Browser retirement; and the 2026-08-03
+  Mesh Collaboration Suite survey requiring rich, opted-in all-node Clipboard.
 
 ### WL-FUNC-017 - Complete Maps, navigation, and MG90 radio health
 
@@ -1136,9 +1371,8 @@ remains here under a completed status.
   guest-owned launch/evidence policies have focused farm or static-image proof.
   Host-launch fallback remains rejected. Full provision/install/guest-process/
   portal/VDI app-mode convergence, remote signing, data/update/removal policy,
-  live GPU/audio/input/reconnect proof, and curated LibreOffice/printing remain
-  open. Exact implementation and image evidence is preserved in the dated
-  pre-lint-compaction snapshot.
+  live GPU/audio/input/reconnect proof remain open. Exact implementation and
+  image evidence is preserved in the dated pre-lint-compaction snapshot.
 - Remaining work:
 
   1. Complete the Front Door catalog experience around the validated projection:
@@ -1169,8 +1403,9 @@ remains here under a completed status.
      remote signing and bounded writable app-data policy remain to be
      implemented and inspected in a built image.
      The image-owned launcher binds app process lifetime to the
-     guest compositor and emits terminal failure evidence. Portal prompts and file access remain guest-scoped; the host
-     does not proxy arbitrary portal requests or grant unrestricted host paths.
+     guest compositor and emits terminal failure evidence. Portal prompts and
+     file access remain guest-scoped; the host does not proxy arbitrary portal
+     requests or grant unrestricted host paths.
   5. Complete VDI app-mode presentation so the shell renders the application
      surface with Construct chrome, forwards keyboard/pointer/touch/text input,
      preserves focus, and handles resize, close, suspend, reconnect, and
@@ -1216,23 +1451,14 @@ remains here under a completed status.
       favorites, roaming, remote placement, and broader catalog coverage.
       Existing Construct surfaces and the Browser VM route remain unchanged;
       an unavailable provider produces an honest disabled state.
-  11. Add a curated LibreOffice App VM profile using the same App VM/VDI
-      contract. Support Writer, Calc, and Impress, typed application identity,
-      document associations, and Workspace shortcut-group presentation. The
-      normal UX must not expose the guest desktop.
-  12. Add Construct-owned printing for the LibreOffice profile: printer
-      discovery/health, local and mesh printer selection, page-faithful preview,
-      paper/tray/orientation/margins, duplex/binding, color, copies/collation,
-      page ranges, scaling, N-up/booklet, PDF output, presets, progress,
-      cancel/retry, explicit offline/error states, and touch-sized tablet
-      controls. Print and preview must share pagination/rendering semantics.
 - Scope: Flatpak catalog/discovery, Front Door UX, App VM lifecycle and
   placement, guest Wayland/portal/runtime image, VDI app-mode display/input,
   permissions, app data, updates, roaming, resource admission, audit, recovery,
-  the curated LibreOffice App VM, and its printing workflow. Native host
-  Wayland mode, a host compositor, arbitrary user-built Flatpak manifests,
-  unrestricted host filesystem/D-Bus access, and a general host desktop/window
-  manager are out of scope.
+  and the governed Flatpak catalog. Native host Wayland mode, a host compositor,
+  arbitrary user-built Flatpak manifests, unrestricted host filesystem/D-Bus
+  access, a general host desktop/window manager, and LibreOffice/printing are
+  out of scope. WL-FUNC-011 owns native LibreOfficeKit Editor workspaces and
+  their printing workflow; no LibreOffice App VM is created.
 - Relevant files/components:
   `crates/desktop/mde-shell-egui/src/front_door.rs`,
   `crates/desktop/mde-shell-egui/src/front_door_peer_apps.rs`,
@@ -1241,10 +1467,11 @@ remains here under a completed status.
   `crates/mesh/mackesd/src/workers/{session_broker,vm_lifecycle,desktop_sources}.rs`,
   `crates/mesh/mackes-mesh-types/src/cloud.rs`, and App VM/bootc packaging.
 - Dependencies: Coordinate guest ownership and app-mode behavior with
-  WL-ARCH-008; use WL-FUNC-016 for bounded text clipboard across VDI; use
+  WL-ARCH-008; use WL-FUNC-016 for negotiated rich Clipboard over VDI and
+  Files-backed binary payloads where the guest protocol supports them; use
   WL-CRIT-006 for resource admission, provenance, retention, and production
-  evidence. Reuse the existing Workloads Bus contracts and session identity;
-  do not create a Flatpak-specific control plane or a second active worklist.
+  evidence. Reuse existing Workloads Bus contracts and session identity; do not
+  create a Flatpak-specific control plane or a second active worklist.
 - Acceptance criteria:
 
   1. A signed curated Flatpak catalog appears in Front Door with stable app
@@ -1651,9 +1878,9 @@ remains here under a completed status.
      worklist pointer and current gate list synchronized with dated evidence.
   8. Make audio a hard release gate: every production candidate proves local
      PulseAudio-compatible playback/capture, PipeWire/WirePlumber graph health,
-     VM/VDI audio, Mesh Teams calls, and node-to-node direct/relay streaming
-     on the six-node testbed. `.15` must pass the same gate; a missing or
-     broken PulseAudio compatibility layer fails promotion.
+     VM/VDI audio, Mesh Collaboration Suite calls, and node-to-node direct or
+     relayed streaming on the six-node testbed. `.15` must pass the same gate;
+     a missing or broken PulseAudio compatibility layer fails promotion.
 - Scope: Cross-cutting release authority, topology, enrollment/recovery,
   readiness, failover, state convergence, workload admission, retention,
   provenance, incident evidence, and multi-node acceptance. Feature behavior
@@ -1664,10 +1891,10 @@ remains here under a completed status.
   `install-helpers/ci-gate.sh`; `install-helpers/xcp-build.sh`;
   `docs/farm.md`; `docs/BUILD-ENVIRONMENT.md`; packaging/release helpers;
   enrollment, health, audit, workload, and recovery contracts.
-- Dependencies: Coordinate Browser, Teams, clipboard, Maps, This Node, theme,
-  and taskbar acceptance with their existing epics. Use the existing Bus,
-  healthz, audit, CA, Workloads, and farm contracts rather than creating a
-  second authority.
+- Dependencies: Coordinate Browser, Mesh Collaboration Suite, Clipboard, Maps,
+  Workers, theme, and taskbar acceptance with their existing epics. Use the
+  existing Bus, healthz, audit, CA, Workloads, and farm contracts rather than
+  creating a second authority.
 - Acceptance criteria:
 
   1. A GitHub required-check result and signed release-evidence artifact exist
@@ -1695,9 +1922,9 @@ remains here under a completed status.
   11. Audio passes on all six nodes: `pactl`/PulseAudio compatibility,
        `pw-cli`/PipeWire graph, WirePlumber policy, ALSA/UCM device discovery,
        speaker playback, microphone capture, HDMI/Bluetooth where present,
-       Browser/App VM/VDI audio, Mesh Teams calls, and direct plus relayed
-       node-to-node streams. The `.15` evidence bundle includes live playback,
-       capture, reconnect, and recovery proof.
+       Browser/App VM/VDI audio, Mesh Collaboration Suite calls, and direct plus
+       relayed node-to-node streams. The `.15` evidence bundle includes live
+       playback, capture, reconnect, and recovery proof.
 - Verification method: Run worklist, governance, documentation, secret,
   package, compatibility, and provenance lints; run GitHub required checks and
   farm gates with BigBoy carrying the long pole; run parallel six-node tests for
@@ -1829,8 +2056,8 @@ remains here under a completed status.
      reachable) for every Construct-owned route that still relies on
      representative or older-payload evidence (Editor, Terminal, Phones, Car,
      and any remaining Workbench/Infra, Music, Media, Browser boundary, Mesh
-     Teams, or This Node cells). Inspect Dark desktop, Light desktop, narrow,
-     and Light/Largest frames, retain only non-overlapping readable captures,
+     Collaboration Suite, or Workers cells). Inspect Dark desktop, Light
+     desktop, narrow, and Light/Largest frames, retain readable captures,
      and restore secure login-at-boot state after each proof batch. The
      proof-only settle window is implemented and farm-tested; retain it for
      asynchronous/expressive routes, with normal production timing unchanged.
@@ -1848,9 +2075,9 @@ remains here under a completed status.
      Editor entry now collapses both optional sidebars, covered by the focused
      farm test `direct_entry_collapses_all_optional_sidebars`; make
      the side tab bar 25% thinner, two-row, and zebra-striped without clipping.
-  4. Apply the shared language to Mesh Teams, This Node, and Construct-owned
-     `browser-vm` connection/unavailable/diagnostic states. Do not style the
-     guest Chromium viewport or reintroduce host Browser chrome.
+  4. Apply the shared language to the Mesh Collaboration Suite, Workers, and
+     Construct-owned `browser-vm` connection/unavailable/diagnostic states. Do
+     not style the guest Chromium viewport or reintroduce host Browser chrome.
   5. Complete Dark/Light, desktop/narrow/large-text, no-overlap, icon
      licensing/raster, expressive motion, and representative live DRM proof.
   Maps Drive HUD large-text geometry is now evidence-backed: the floating-action-
@@ -1865,9 +2092,10 @@ remains here under a completed status.
   `crates/shared/mde-theme/`, shell chrome, and all crates registered in the
   embedded surface inventory.
 - Dependencies: Coordinate adoption with WL-ARCH-008, WL-FUNC-011, and
-  WL-UX-011. WL-UX-011 owns This Node behavior, typed actions, health-score
-  integration, auditability, and vendor-pack contracts; WL-UX-009 owns only
-  shared visual adoption and render proof. WL-UX-012 owns taskbar chrome,
+  WL-UX-011. WL-ARCH-009 owns Workers behavior; WL-UX-011 owns node providers,
+  typed actions, integration, auditability, and vendor-pack contracts;
+  WL-UX-009 owns only shared visual adoption and render proof. WL-UX-012 owns
+  taskbar chrome,
   WL-FUNC-017 owns MG90 telemetry semantics, and WL-CRIT-006 owns integrated
   production evidence. Shared visual work may proceed independently and must
   not block functional contracts or create a second product epic.
@@ -1896,223 +2124,155 @@ remains here under a completed status.
   Reworked 2026-07-28 for the VM Browser architecture and 2026-07-29 to retire
   all Carbon theme/icon requirements.
 
-### WL-UX-011 - Unified This Node hardware center
+### WL-UX-011 - Node hardware providers and safe controls for Workers
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Local-node controls are fragmented across This Node, System,
-  Storage, Device Manager, About, status chrome, and Control Center. Wi-Fi is
-  absent, keyboard backlight has no complete backend/UI, detailed sound is
-  read-only, tap-to-click lacks real direct-seat application, and laptop,
-  thermal, dock, firmware, privacy, and safe OEM controls do not form one
-  coherent hardware-management experience.
-- Required outcome: `This Node` is the single searchable, progressively
-  disclosed hardware center. Its hierarchy owns Overview; Connectivity;
-  Display & Sound; Input; Power & Performance; Hardware; Personalization; and
-  Mesh & System. Controls operate through typed node-local contracts plus
-  admin-authorized trusted-session remote actions, preserve mesh reachability,
-  expose honest unavailable/degraded states, and bound privileged/OEM writes
-  with confirmation, audit, safety limits, and recovery. The operator-facing
-  experience follows a technical Device Manager model: a unified expandable
-  tree, an inventory-first landing view, and focused full-page detail views for
-  technical operators/admins. The existing top-rail health score remains the
-  single health authority; selecting it opens this tree with unhealthy items
-  highlighted. Monitoring and configuration have equal priority. Critical
-  alerts, affected components, stale data, and recovery actions remain visible
-  within the inventory landing view; a healthy node presents a calm
-  all-systems-operational summary. Health severity uses
-  color, icon, label, and text. The tree includes Hardware, Services, Storage,
-  Network, Users, and System, with persistent badges tied to the existing
-  score. Selecting an item opens a dedicated full-page detail view. Actions
-  live in a dedicated Actions tab; risky operations show expected impact and
-  require confirmation; restart-required changes warn before applying.
-  Recent events use compact expandable summaries. Storage uses capacity bars
-  with detailed tables in the detail view; Network uses an interface summary
-  with topology on demand; Performance uses live charts. Refresh is on demand
-  with stale indicators. Unavailable data shows a recovery error. Auditability
-  includes per-item operator, timestamp, and outcome history. Permission
-  management is role-first, with users grouped under roles. Long-term design
-  must remain extensible for future hardware, services, node types, and
-  installed vendor packs, which expose clearly separated, discoverable,
-  versioned vendor-specific settings in the owning detail view.
-  The center also covers the complete OS-management layer expected by mature
-  workstation settings surfaces: updates and lifecycle, recovery/reset,
-  security/privacy, accounts/sign-in, applications and services, backup/restore,
-  diagnostics/logs, printers and peripherals, accessibility, time/language/
-  region, and virtualization/remote access. These domains remain under the
-  same node authority and must not recreate legacy settings routes.
-- Current state: This Node now has a governed catalog/search/hierarchy,
-  health/stale provider projections, 16 routes, full-page details, Actions and
-  audit views, and typed credential-free providers for network, BlueZ, audio,
-  display, input, power, storage, firmware, privacy, and other local capability
-  evidence with focused farm proof. Many controls remain unavailable or
-  integration-gated. Legacy-route removal, complete privileged mutation
-  coverage, broad OS-management consolidation, and live device, DRM, audio,
-  recovery, Surface, and fleet evidence remain open. Exact implementation
-  history is preserved in the dated pre-lint-compaction snapshot.
+- Problem: Node hardware and OS providers remain incomplete: Wi-Fi, keyboard
+  backlight, detailed sound, direct-seat input policy, laptop power/thermal,
+  docks, firmware, privacy, lifecycle, recovery, and safe OEM actions lack
+  uniform production behavior. Existing This Node pages mix provider truth,
+  presentation, and mutation, which would recreate a second interface after the
+  Workers cutover.
+- Required outcome: Complete credential-free, capability-driven node provider
+  contracts and allowlisted actions for Workers. Each observation, entity,
+  output, setting, event, and action has one canonical worker owner, explicit
+  applicability/freshness, honest unsupported/degraded states, and bounded
+  recovery/audit behavior. Node-local and trusted-session remote mutations use
+  the WL-ARCH-009 staged Action Console and preserve mesh reachability. Standard
+  and versioned OEM/vendor adapters are safely separated. This epic owns no
+  durable route, hierarchy, renderer, action tab, or health presentation.
+- Current state: Existing This Node code has a governed catalog and typed
+  credential-free providers for network, BlueZ, audio, display, input, power,
+  storage, firmware, privacy, and other local evidence, with focused farm proof.
+  It is migration source only: many actions remain unavailable or integration-
+  gated, broad OS-management ownership is incomplete, and live device, DRM,
+  audio, recovery, Surface, and fleet proof remains open. WL-ARCH-009 owns all
+  Workers presentation, aliases, Action Console behavior, and legacy deletion.
 - Remaining work:
 
-  1. Finish the durable This Node sidebar and search index across every
-     provider-backed page; keep Control Center transient and status chrome
-     glanceable.
-  2. Implement NetworkManager/ModemManager connectivity: Wi-Fi, Ethernet,
+  1. Produce a provider-to-worker migration matrix for every current This Node,
+     System, Storage, Device Manager, About, Control Center, and direct-seat
+     datum/action. Map each to one canonical worker ID from WL-ARCH-009, its
+     entity/output kind, applicability predicate, freshness, and typed action;
+     fail tests on unmapped or duplicate ownership.
+  2. Implement NetworkManager/ModemManager connectivity for Wi-Fi, Ethernet,
      cellular/APN, hotspot, DNS/proxy, and imported WireGuard/OpenVPN. Preserve
      `nebula1`, mesh DNS/routes, and lighthouse reachability; use an in-process
-     SecretAgent and never serialize credentials into Bus/log/UI state.
-  3. Complete BlueZ and display/sound/privacy pages: pairing/trust/forget;
+     SecretAgent and never serialize credentials into Bus, logs, snapshots,
+     timeline events, previews, results, or UI state.
+  3. Complete BlueZ, display, audio, and privacy providers: pairing/trust/forget;
      display enable/mode/refresh/arrangement/scale/rotation; LCD/DDC brightness;
-     PipeWire/WirePlumber output/input/port/profile/app/VM strips and real
-     meters; camera/microphone device and privacy state.
-  4. Complete per-device keyboard/backlight, pointer, touch, pen, and gesture
-     policy through the real udev/libinput direct-seat path, including hotkeys,
-     OSD, and functional tap-to-click.
-  5. Implement battery/source/health/time/charge-limit/profile/idle/lid/sleep
-     behavior plus typed thermals, fan, CPU, GPU, and safe performance-profile
-     controls.
-  6. Integrate device/driver inventory, firmware, docks/Thunderbolt, storage,
-     and existing Surface support into capability-driven pages with honest
-     unsupported states.
-  7. Add a privileged node-local hardware worker with explicit actions for
-     platform profile, bounded fan mode/curve, CPU power limit, GPU profile,
-     device enablement, and Thunderbolt authorization. Permit only typed,
-     admin-authorized actions from trusted sessions when the target is remote.
-     Support standard kernel interfaces plus capability-detected Microsoft
-     Surface, Dell, Lenovo, HP, and ASUS adapters.
-  8. Bound manufacturer writes with arming, confirmation, audit, thermal limits,
-     watchdog recovery, and automatic safe-profile fallback. Never expose
-     arbitrary sysfs paths, raw MSR/SMI, `/dev/mem`, untyped remote mutation,
-     or shell command composition from the UI.
-  9. Reconcile Control Center and status chrome with the same typed state:
-     connectivity, Bluetooth, sound, LCD/keyboard brightness, power, underlay
-     versus mesh health, numeric battery, and microphone/camera indicators.
-  10. Finish desktop/narrow/large-text, unsupported-hardware, stale/provider
-      failure, destructive confirmation, and physical-device proof using
-      WL-UX-009 components.
-  11. Replace the current section catalog presentation with the surveyed
-      Device Manager-style hierarchy and health-dashboard landing view. Wire
-      the existing top-rail score to highlighted unhealthy tree nodes without
-      introducing a second score, and provide dedicated full-page details with
-      Actions, Events, Performance, Audit, and vendor-pack sections.
-  12. Implement the surveyed data states and operator workflows: on-demand
-      refresh/stale indicators; prominent unavailable recovery; compact
-      expandable events; capacity bars plus detailed storage tables; interface
-      summary plus on-demand topology; live resource charts; role-first users;
-      per-item audit records; restart warnings; and confirmation dialogs that
-      show expected impact.
-  13. Define and implement the vendor-pack extension contract. Discover
-      installed packs, version and capability status, expose vendor-specific
-      settings beside the owning hardware/service, keep standard and vendor
-      controls distinct, and fail visibly when a pack is missing, outdated, or
-      unavailable. Vendor writes must use the same typed authorization, safety,
-      audit, and recovery boundaries as platform controls.
-  14. Add the OS-management layer: update/lifecycle status, recovery/reset,
-      security/privacy and encryption posture, accounts/sign-in, applications
-      and services, backup/restore, diagnostics/logs, printers/peripherals,
-      accessibility, time/language/region, and virtualization/remote access.
-      Each provider must expose capability, freshness, safe actions, failure
-      recovery, and audit state through the unified authority.
-  15. Complete the final survey decisions: urgent critical-health alerts;
-      configurable persistent notifications with acknowledgement, snooze, and
-      escalation; guided recovery actions with expected-impact confirmation;
-      role-gated health policy and overrides; explicit live/on-demand refresh
-      and stale intervals; and redacted, audit-backed history export.
-  16. Onboard and close the Microsoft Surface physical validation seat
-      `172.20.146.79` (Surface Pro 6, Fedora 44 Server) against the current
-      workstation-seat baseline. The seat currently has DRM nodes but no
-      `magic-mesh` package, no pinned Workstation role, and inactive `mackesd`
-      and `mde-shell-egui` services; the live reference seat `.138` is on
-      `magic-mesh-12.1.6-1` with the Workstation role and both services active.
-      First cut a native Fedora 44 workstation RPM on the farm's halted
-      `mcnf-build-f44` builder after BigBoy capacity is available; do not
-      interrupt active BigBoy jobs or install the existing F42-linked artifact
-      whose FFmpeg sonames are incompatible with Fedora 44. Verify the new RPM
-      has the Fedora 44 FFmpeg sonames and ships the complete shell/daemon/
-      Browser/media payload, then deploy it, pin/provision the Workstation
-      role, join or enroll the seat through the typed onboarding path, and
-      verify zero-restart `mackesd` plus stable DRM shell scanout. Exercise
-      every Surface-relevant This Node capability and safe action that the
-      hardware exposes: display/modeset/brightness, keyboard backlight,
-      pointer/touch/pen/gestures, Wi-Fi/Ethernet/Bluetooth, PipeWire audio and
-      capture privacy, camera presence/privacy, battery/AC/charge limit,
-      lid/sleep/thermal/performance telemetry, storage, sensors, firmware,
-      docks/Thunderbolt, mesh reachability, and audit/recovery behavior.
-      Record each absent provider or unsupported Surface feature as an honest
-      disabled/unavailable result; never infer capability from DMI alone or
-      fabricate a successful write. Capture desktop, narrow, large-text,
-      stale/provider-loss, refusal, recovery, and physical-input proof, restore
-      secure login-at-boot state after destructive or proof-only batches, and
-      add the seat to the enrolled Workstation inventory only after evidence is
-      complete.
-- Scope: Local workstation hardware state, typed node-local mutation,
-  admin-authorized trusted-session remote mutation, diagnostics, settings
-  consolidation, capability discovery, quick controls, and safe OEM adapters.
-  Arbitrary path writes, lock/PAM replacement, raw privileged interfaces, and
-  host application ecosystems are out of scope.
-- Relevant files/components: shell This Node/System/Storage/Device Manager/
-  Control Center/status/direct-seat modules; `mde-seat` and shared `mde-egui`;
-  typed mesh contracts, daemon hardware/firmware workers, and package/provider
-  dependencies.
-- Dependencies: Use WL-UX-009 shared frames, state components, sheets, and
-  responsive proof profiles. Provider and safety work proceeds independently;
-  unsupported physical hardware never justifies fabricated data or controls.
+     PipeWire/WirePlumber device/port/profile/app/VM state and meters; and
+     camera/microphone inventory, use, and privacy state.
+  4. Complete keyboard/backlight, pointer, touch, pen, and gesture policy through
+     real udev/libinput direct-seat paths, including hotkeys, OSD, tap-to-click,
+     capability loss, device replacement, and reboot/resume persistence.
+  5. Implement battery/source/condition/time/charge-limit/profile/idle/lid/sleep
+     behavior plus typed thermals, fans, CPU, GPU, and safe performance-profile
+     controls. Hardware condition is provider evidence for the separate health
+     authority, not a score or issue presentation in Workers.
+  6. Complete device/driver inventory, storage, firmware, dock/Thunderbolt,
+     printers/peripherals, and Surface evidence as bounded entity/output models.
+     Expose explicit unsupported, unconfigured, stale, unavailable, and provider-
+     failure states rather than inferred or synthetic success.
+  7. Implement allowlisted hardware actions for platform profile, bounded fan
+     mode/curve, CPU power limit, GPU profile, device enablement, firmware,
+     storage, printer, and Thunderbolt authorization. Register every action on
+     its canonical action worker and expose it only through staged change sets.
+  8. Bound manufacturer writes with typed arming, impact/recovery metadata,
+     audit, thermal limits, watchdog recovery, and safe-profile fallback. Forbid
+     arbitrary sysfs, raw MSR/SMI, `/dev/mem`, arbitrary systemd properties,
+     untyped remote mutation, and shell-command composition.
+  9. Define the vendor-pack contract. Discover installed packs, validate version
+     and capability, keep standard and vendor controls distinct in provider
+     metadata, and fail honestly when missing, outdated, or unavailable. Support
+     capability-detected Microsoft Surface, Dell, Lenovo, HP, and ASUS adapters.
+  10. Complete OS-management providers for lifecycle/update, recovery/reset,
+      security/privacy/encryption, accounts/sign-in, applications/services,
+      backup/restore, component-local diagnostics, accessibility, locale/time,
+      and virtualization/remote access. Assign each to a canonical worker and
+      expose bounded observations, applicability, freshness, safe actions,
+      recovery, and audit pointers.
+  11. Reconcile Control Center and status chrome with the same typed authority
+      for connectivity, Bluetooth, sound, LCD/keyboard brightness, power,
+      numeric battery, and microphone/camera indicators. Keep Control Center
+      transient and do not create another durable hierarchy or health summary.
+  12. Adapt provider and action contracts to the WL-ARCH-009 shared runtime and
+      change-set schemas. Add hostile-input, bounds, redaction, capability-loss,
+      stale-generation, refusal, timeout, recovery, and audit tests for each
+      provider family and privileged adapter.
+  13. Complete physical proof across Seat 15, Dell, Eagle, T480, and Surface for
+      connectivity, audio, display/brightness, input, power/thermal, firmware,
+      docks, storage, privacy, and one safe reachable OEM action. Record absent
+      hardware/providers honestly; never infer capability from DMI alone.
+  14. Close Surface seat `172.20.146.79` with a native Fedora 44 release after
+      verifying FFmpeg sonames and complete seat/daemon/media payload. Repeat
+      reboot/resume, DRM, audio, input, connectivity, privacy, power/thermal,
+      storage, firmware, dock, provider-loss, refusal, safe-action, recovery,
+      audit, and zero-restart proof; restore secure login-at-boot afterward.
+- Scope: In scope are node observation providers, entity/output/action
+  contracts, direct-seat behavior, capability discovery, Control Center state,
+  OS-management sources, privileged hardware workers, vendor adapters, safety,
+  audit/recovery, packaging dependencies, and physical proof. Workers layout,
+  navigation, aliases, graph/tree/inspector, Action Console UI, health UI,
+  arbitrary path writes, lock/PAM replacement, and raw privileged interfaces
+  are out of scope.
+- Relevant files/components: current This Node/System/Storage/Device Manager
+  providers as migration sources; Control Center/status/direct-seat modules;
+  `mde-seat`; shared worker-runtime and change-set contracts; daemon network,
+  hardware, firmware, storage, host-state, desktop-state, lifecycle, backup,
+  printer, service, and virtualization workers; systemd/RPM dependencies.
+- Dependencies: WL-ARCH-009 owns the only Workers interface, route aliases,
+  Action Console, shared runtime integration, and old-renderer removal. Use
+  WL-UX-009 shared state primitives only where Control Center/OSD remains. The
+  separate health authority may consume provider evidence but is not owned here.
+  Coordinate release proof with WL-CRIT-006 and recovery with WL-CRIT-007.
 - Acceptance criteria:
 
-  1. One This Node route owns durable local settings/diagnostics; search,
-     hierarchy, narrow layout, unavailable states, and legacy-route
-     normalization are tested.
-  2. Connectivity, Bluetooth, display/brightness, sound/metering, privacy, and
-     input controls use real providers and typed contracts, preserve mesh
-     reachability, and keep credentials out of observable state.
+  1. Every migrated node datum/action has exactly one canonical worker owner;
+     matrix and drift tests reject missing, duplicate, legacy, or generic-shell
+     ownership, and WL-ARCH-009 can consume the contract without shell-to-daemon
+     implementation coupling.
+  2. Connectivity, Bluetooth, display/brightness, audio/metering, privacy, and
+     input use real providers, preserve mesh reachability, and keep credentials
+     out of all observable and action state.
   3. Keyboard backlight, tap-to-click, device policy, battery/power, thermals,
-     fans, CPU/GPU, firmware, docks, storage, and supported OEM controls perform
-     real bounded node-local actions. Typed remote actions require admin
-     authorization and a trusted session and never expose arbitrary paths.
-  4. Unsupported capabilities stay visible but disabled with a reason; provider
-     loss/stale data never appears successful.
-  5. Privileged actions are allowlisted, armed, audited, thermally constrained,
-     watchdog-protected, and recover automatically to a safe profile.
-  6. Control Center and status chrome consume the same authority without
-     creating a second durable settings hierarchy.
-  7. Desktop, narrow, large-text, degraded, and confirmation states have no
-     overlap/clipping; available physical controls pass direct-seat proof and
+     fans, CPU/GPU, firmware, docks, storage, printers, and supported OEM actions
+     perform real bounded work through canonical workers and staged change sets.
+  4. Unsupported, unconfigured, stale, unavailable, and failed providers remain
+     distinct; no capability or successful action is fabricated.
+  5. Privileged actions are allowlisted, generation-bound, armed, audited,
+     thermally constrained, watchdog-protected, and recover automatically to a
+     safe profile without arbitrary paths, commands, or secret exposure.
+  6. Vendor packs are discoverable, versioned, capability-aware, distinctly
+     identified in provider metadata, and governed by the same authorization,
+     safety, refusal, audit, and recovery boundaries as standard adapters.
+  7. Lifecycle, recovery, security/privacy, accounts, applications/services,
+     backup, component diagnostics, peripherals, accessibility, locale/time,
+     and virtualization providers expose bounded truth and safe actions through
+     their owning workers.
+  8. Control Center/status consume the same authority without a durable settings
+     tree, direct action bypass, or duplicate health summary. Provider evidence
+     reaches the separate health authority without appearing as Workers grades.
+  9. Farm tests and five-seat physical ledgers prove reachable hardware paths,
+     provider loss, refusal, recovery, audit, reboot/resume, and safe OEM action;
      unavailable hardware is recorded honestly.
-  8. The surveyed Device Manager hierarchy, health-dashboard landing view,
-     existing top-rail health-score drill-down, dedicated full-page details,
-     Actions/Events/Performance/Audit sections, and role-first Users view are
-     implemented without creating a second settings or health authority.
-  9. On-demand refresh, stale indicators, recovery errors, expandable event
-     summaries, capacity bars plus detail tables, interface summary plus
-     topology, live resource charts, restart warnings, and expected-impact
-     confirmations are tested at desktop, narrow, and large-text sizes.
-  10. Vendor packs are discoverable, versioned, capability-aware, and visibly
-      separated from standard controls; missing, outdated, or unavailable
-      packs fail honestly, and vendor actions use typed authorization, safety,
-      audit, and recovery boundaries.
-  11. Updates, recovery, security/privacy, accounts, applications/services,
-      backup/restore, diagnostics, peripherals, accessibility, time/language,
-      and virtualization/remote access are represented in the unified tree and
-      tested for capability discovery, unavailable states, safe actions, audit,
-      and responsive rendering.
-  12. Critical alerts, notification acknowledgement/snooze/escalation,
-      guided recovery, role-gated health policy, explicit refresh/stale
-      intervals, and redacted evidence export are tested and audited.
-- Verification method: Run fixture/contract tests for routing/search and every
-  provider/capability adapter; focused farm tests for shell, seat, typed
-  contracts, daemon workers, package dependencies, architecture/secret/style
-  gates, and workspace build/clippy/fmt with the longest shell job on BigBoy.
-  Complete physical proof for reachable connectivity, audio, brightness, input,
-  power, firmware/docks, and one safe action per reachable OEM; record explicit
-  unavailability for hardware that cannot be exercised. For the Surface seat,
-  additionally require a native Fedora 44 RPM dependency/payload audit,
-  role-provision and zero-restart service evidence, direct-DRM scanout, and a
-  capability-by-capability proof ledger covering the Surface hardware matrix
-  and all typed refusal/audit/recovery paths before declaring the seat
-  baseline complete.
-- Origin or merged source IDs: 2026-07-26 local-node GUI audit and operator
-  decisions: one This Node center, full connectivity, progressive disclosure,
-  complete laptop depth, safe OEM writes, and first-class Surface, Dell, Lenovo,
-  HP, and ASUS capability adapters.
+- Verification method: Run contract fixtures and provider/action tests for every
+  mapping, hostile bound, redaction, capability transition, stale generation,
+  refusal, timeout, watchdog, safe fallback, recovery, and audit path. On the
+  farm run touched daemon/seat/shared-contract tests, package dependency and
+  payload checks, fmt, clippy, architecture, secret, and supersession gates,
+  placing the longest job on BigBoy. On Seat 15, Dell, Eagle, T480, and Surface,
+  capture the provider matrix, direct-seat behavior, one safe reachable OEM
+  action, reboot/resume, zero-restart service state, and honest unsupported
+  results; include the Surface native-Fedora-44 dependency audit.
+- Origin or merged source IDs: 2026-07-26 node GUI and hardware survey covering
+  connectivity, laptop depth, safe OEM writes, and Surface/Dell/Lenovo/HP/ASUS
+  adapters. The 2026-08-01 This Node hierarchy decisions are superseded by the
+  2026-08-03 Workers merge survey; this epic retains only independently
+  completable provider, action, safety, and physical-validation obligations.
 
 ### WL-UX-012 - Full-width Construct taskbar and search-first Home
 
@@ -2133,12 +2293,15 @@ remains here under a completed status.
   first boot; migrated profiles preserve valid existing pins and never silently
   restore a default list. Exactly one underline identifies the focused
   workspace; no running/open indicator exists. Home is an icon-free wallpaper
-  and the App Grid is deleted.
+  and the App Grid is deleted. Bottom and Left layouts expose the same icon-only
+  System and Mesh Health control; its badge is the exact active unacknowledged
+  actionable count and A–F appears only in the centered health modal.
 - Current state: Navigation owns persisted placement, full-width 48px Bottom
   geometry, fixed targets, centered and bounded pins, migration/first-boot
   selection, singular focus marking, Start/Search routing, aliases, and motion
   with focused farm coverage. Springboard is gesture-only and the App Grid is
-  removed. Dark/Light material, complete workspace-identity/focus handling,
+  removed. Both placements share the centralized health icon/count. Dark/Light
+  material, complete workspace-identity/focus handling,
   large-overflow accessibility, and the final responsive live-render matrix
   remain open. Exact implementation and proof history is preserved in the dated
   pre-lint-compaction snapshot.
@@ -2156,8 +2319,8 @@ remains here under a completed status.
      4px gaps; never shrink targets to the current 24px fallback.
   3. Add three independent layout zones. Put icon-only Start, Back, and Home
      left with 8px outer padding. Center workspace icons against the physical
-     screen center, not leftover space. Put only the Bottom/Left placement
-     control right. Reserve symmetric center gutters from the larger side
+     screen center, not leftover space. Put the System and Mesh Health control
+     and Bottom/Left placement control right. Reserve symmetric center gutters from the larger side
      cluster so unequal clusters never shift the workspace strip.
   4. Add typed `OpenSearch` navigation. Start uses the existing Construct mark
      and calls Front Door `open()` so search opens and requests text-field
@@ -2165,12 +2328,12 @@ remains here under a completed status.
      a Start menu or second search path. Use the tooltip/accessibility name
      `Start - Search`.
   5. Replace `DOCK_LAUNCHER_GROUPS` with a searchable pin catalog containing
-     `FleetMesh`, `InfraCode`, `Desktop`, `Terminal`, `MapsLocation`,
-     `Communications`, `Files`, `Music`, `Media`, and `Browser`. Present
-     `InfraCode` as `Workloads` without renaming its internal enum or breaking
-     persisted/deep-link compatibility. Present `FleetMesh` as `Fleet & Mesh`.
-     Use a first-boot pin selector for new profiles rather than auto-pinning
-     the catalog.
+     `Workers`, `InfraCode`, `Desktop`, `Terminal`, `MapsLocation`,
+     `Collaboration`, `Music`, `Media`, and `Browser`. Present `InfraCode` as
+     `Workloads` without renaming its internal enum. Migrate persisted
+     `FleetMesh` and `Communications` pins to `Workers` and `Collaboration` as
+     part of their owning hard cuts. Use a first-boot pin selector for new
+     profiles rather than auto-pinning the catalog.
   6. Version `settings-nav-bar.json` with `schema_version`, existing serialized
      placement, and ordered `pinned_surfaces`. Preserve valid existing pins,
      discard unknown surfaces, bound the list to the searchable catalog, and
@@ -2193,9 +2356,10 @@ remains here under a completed status.
      paint running/open/recent markers or expose taskbar Close actions.
 - Scope: Construct taskbar geometry, appearance, focus state, Start/Search,
   default and user pins, overflow, preference migration, Bottom/Left
-  compatibility, icon-free Home, and App Grid removal. Car chrome, top-status
-  contents, search ranking/providers, workspace business logic, VDI protocols,
-  guest UI, and general accessibility rollout are out of scope. Taskbar
+  compatibility, health-icon parity, icon-free Home, and App Grid removal. Car
+  chrome, other top-status contents, search ranking/providers, workspace
+  business logic, VDI protocols, guest UI, and general accessibility rollout
+  are out of scope. Taskbar
   tooltips, context menus, search results, and accessibility names may use text;
   persistent taskbar and overflow controls remain icon-only.
 - Relevant files/components: Construct shell navigation and action dispatch;
@@ -2226,7 +2390,9 @@ remains here under a completed status.
   6. Narrow layouts retain 40px targets, keep focus visible, and place hidden
      pins in the icon-only single-column overflow without overlap or clipping.
   7. Bottom and Left modes contain icons only and share persisted pin order; no
-     `Infra`, `Ops`, `Life`, or other taskbar group labels remain.
+     `Infra`, `Ops`, `Life`, or other taskbar group labels remain. Both expose
+     one accessible health icon whose tooltip and badge report the same exact
+     unacknowledged actionable count.
   8. App Grid tiles, labels, selection, activation, and zoom ghosts are removed
      and unreachable. Home remains wallpaper-backed; all surfaces remain
      discoverable through Start/Search.
@@ -2326,16 +2492,14 @@ dated archive snapshot. Active epics are limited to 220 physical lines.
   `install-helpers/lint-worklist.sh`,
   `install-helpers/lint-doc-supersession.sh`, and `git diff --check` for every
   worklist structure change.
-### Current validation note — Mesh Teams responsive test contract
+### Historical validation note — retired Mesh Teams responsive test contract
 
-The Mesh Teams surface intentionally omits its nested app/channel rails, Details
-pane, and channel header below the 1024px workspace breakpoint. The existing
-headless tests rendered at 1000px while asserting desktop-only rail/Details
-content, so their failures are stale test fixtures rather than a Dell runtime
-regression. The Tasks body likewise now presents the specific `Channel tasks`
-heading and no longer paints a redundant standalone `Tasks` label. Reconcile
-those tests to their intended desktop/narrow contracts before the next farm
-gate; no production readiness claim follows from this correction.
+This note records pre-cutover evidence only. Its Teams/channel/Tasks rails and
+responsive contract are retired by WL-FUNC-011 and are not acceptance criteria
+for the Mesh Collaboration Suite. The earlier headless failures came from
+rendering at 1000px while asserting desktop-only rail/Details content rather
+than from a Dell runtime regression; preserve that fact for provenance, but do
+not update or carry the superseded fixtures into the new six-section surface.
 
 ### WL-UX-009 evidence disposition — Editor large-text menubar correction (2026-08-02)
 
@@ -2761,22 +2925,16 @@ hardware/boundary evidence are still required.
   the Dell Dark desktop route slice; Light/Largest and narrow cells, remaining
   Media coverage, Browser/VDI boundaries, strict linear scanout, and overall
   WL-UX-009 readiness remain open.
-- Inventory freshness rollup update (2026-08-02): the inventory-first landing
-  card now keeps the existing global health score as the sole health authority
-  and adds a compact local-provider rollup for `fresh`, `stale`, and `awaiting`
-  observations across diagnostics, services, locale, printers, backup,
-  applications, and local security. Detail cards retain their per-provider age
-  badges; the landing summary is only a bounded count, not a second score.
-  Focused This Node tests pass 48/48 on BigBoy, including distinct-state
-  freshness coverage.
-- Critical-alert recovery workflow update (2026-08-02): This Node's linked
-  shared AlertInbox now promotes structured affected-component, current-impact,
-  and recovery-guidance fields on the inventory landing. Typed inline recovery
-  actions are reachable from the same signed notification authority; safe
-  actions dispatch directly and destructive actions require an explicit
-  arm-and-confirm step. Acknowledgement and 15-minute snooze remain durable
-  shared commands, with no second local alert store. Focused This Node tests
-  pass 48/48 on BigBoy.
+- Superseded inventory-health update (2026-08-02, retired 2026-08-03): the
+  inventory landing's global score, local freshness rollup, and provider badges
+  were removed by the System and Mesh Health cutover. Provider evidence still
+  carries freshness, but issue presentation and A–F grading exist only in the
+  centered modal.
+- Superseded critical-alert update (2026-08-02, retired 2026-08-03): the linked
+  This Node AlertInbox and inline health recovery card were removed. Typed
+  conditions, acknowledgement, snooze, and guided recovery now live only in
+  System and Mesh Health; signed mesh Chat remains notification transport and
+  is not a second health ledger.
 - NetworkManager SecretAgent boundary update (2026-08-02): `mde-seat` now
   provides an in-process, non-persistent NetworkManager SecretAgent lifecycle
   and a typed profile-activation method using only validated provider-issued

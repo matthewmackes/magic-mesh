@@ -3375,10 +3375,7 @@ mod tests {
             .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
             .expect("clock remains reachable within the taskbar");
         let health = ctx
-            .read_response(egui::Id::new((
-                "construct-bottom-system-tray",
-                "mesh-health",
-            )))
+            .read_response(egui::Id::new(("system-mesh-health", "bottom")))
             .expect("mesh health remains reachable within the taskbar");
         assert_eq!(clock.layer_id, taskbar.layer_id);
         assert_eq!(health.layer_id, taskbar.layer_id);

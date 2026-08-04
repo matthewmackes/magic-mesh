@@ -21,9 +21,9 @@ use serde::Deserialize;
 
 use mackes_mesh_types::cloud::{
     CloudReply, LifecycleAction, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE,
-    VERB_ANDROID_PROVISION, VERB_BROWSER_PROVISION, VERB_CONSOLE_ATTACH, VERB_CONTAINER_DEPLOY,
-    VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
-    VERB_APP_PROVISION,
+    VERB_ANDROID_PROVISION, VERB_APP_PROVISION, VERB_BROWSER_PROVISION, VERB_CONSOLE_ATTACH,
+    VERB_CONTAINER_DEPLOY, VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN,
+    VERB_SET_DESIRED,
 };
 
 use super::runner::{default_browser_vm_image_source, CloudRunOutcome};
@@ -34,14 +34,14 @@ use super::CloudWorker;
 pub(crate) const MAX_CLOUD_ACTION_BODY_BYTES: usize = crate::ipc::MAX_RPC_BODY_BYTES;
 
 // Disjoint per-verb handler modules (one unit each, `cloud/verbs/<unit>.rs`).
+mod app_image;
 mod container;
 mod container_lifecycle;
 mod image;
-mod app_image;
 // Disjoint per-verb handler modules (one unit each owns its file).
 mod android; // U9 · android-provision
-mod browser; // WL-ARCH-008 · browser-provision
 mod app; // WL-FUNC-018 · app-provision
+mod browser; // WL-ARCH-008 · browser-provision
 mod console; // U8 · console-attach
 mod inventory; // U10 · inventory + output
 

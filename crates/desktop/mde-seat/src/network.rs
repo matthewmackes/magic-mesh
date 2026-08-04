@@ -198,7 +198,11 @@ pub fn fold_profiles(
             kind: NetworkProfileKind::from_nm(kind.as_deref().unwrap_or("")),
         })
         .collect::<Vec<_>>();
-    profiles.sort_by(|left, right| left.label.cmp(&right.label).then_with(|| left.path.cmp(&right.path)));
+    profiles.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     profiles
 }
 
@@ -232,9 +236,9 @@ pub fn fold_network(
             let interface = str_prop(props, "Interface")?;
             if interface.is_empty()
                 || interface.len() > 15
-                || !interface
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+                || !interface.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+                })
             {
                 return None;
             }
@@ -289,7 +293,7 @@ impl NetworkClient for ZbusNetwork {
             NETWORK_MANAGER_PATH,
             PROPERTIES,
             "GetAll",
-            &(NETWORK_MANAGER,)
+            &(NETWORK_MANAGER,),
         )?;
         let mut records = Vec::new();
         let paths: Vec<zbus::zvariant::OwnedObjectPath> = self.bus.call(
@@ -344,13 +348,8 @@ impl NetworkClient for ZbusNetwork {
                 reason: "NetworkManager device target is malformed".to_owned(),
             });
         }
-        self.bus.call_unit(
-            NETWORK_MANAGER,
-            path,
-            DEVICE_CONTROL,
-            "Disconnect",
-            &(),
-        )
+        self.bus
+            .call_unit(NETWORK_MANAGER, path, DEVICE_CONTROL, "Disconnect", &())
     }
 
     fn activate_profile(
@@ -400,7 +399,10 @@ mod tests {
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str};
 
     fn props(items: Vec<(&str, OwnedValue)>) -> PropMap {
-        items.into_iter().map(|(key, value)| (key.to_owned(), value)).collect()
+        items
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect()
     }
 
     #[test]
@@ -447,7 +449,9 @@ mod tests {
         assert!(safe_device_path(
             "/org/freedesktop/NetworkManager/Devices/7"
         ));
-        assert!(!safe_device_path("/org/freedesktop/NetworkManager/ActiveConnection/7"));
+        assert!(!safe_device_path(
+            "/org/freedesktop/NetworkManager/ActiveConnection/7"
+        ));
         assert!(!safe_device_path("/tmp/credential-shaped-target"));
         assert!(!safe_device_path(
             "/org/freedesktop/NetworkManager/Devices/7;rm"
@@ -507,6 +511,8 @@ mod tests {
         assert!(safe_device_path(
             "/org/freedesktop/NetworkManager/Devices/4"
         ));
-        assert!(!safe_device_path("/org/freedesktop/NetworkManager/Settings/4"));
+        assert!(!safe_device_path(
+            "/org/freedesktop/NetworkManager/Settings/4"
+        ));
     }
 }

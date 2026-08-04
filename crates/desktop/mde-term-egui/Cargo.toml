@@ -65,7 +65,7 @@ mde-bus = { path = "../../platform/mde-bus" }
 # TERM-10 saved layouts persist to the SAME Syncthing-replicated workgroup root
 # every mesh surface shares. `default_workgroup_root` is single-sourced here (the
 # split-brain fix — one mount resolver for the daemon + every GUI), and the crate
-# is serde-only, so this adds no heavy mesh graph. Mirrors `mde-panel-egui`'s
+# is serde-only, so this adds no heavy mesh graph. Mirrors the shell's
 # reuse of the same types crate from the desktop tier (§6 glue, not a re-impl).
 mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # REUSE (§6, TERM-15): send-selection-to-Chat rides the NOTIFY-CHAT

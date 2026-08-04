@@ -211,8 +211,7 @@ fn drm_proof_readback(
             0,
             0,
             i32::try_from(width).map_err(|_| DrmError::Present("proof width overflow".into()))?,
-            i32::try_from(height)
-                .map_err(|_| DrmError::Present("proof height overflow".into()))?,
+            i32::try_from(height).map_err(|_| DrmError::Present("proof height overflow".into()))?,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
             glow::PixelPackData::Slice(Some(&mut rgba)),

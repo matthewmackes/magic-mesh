@@ -58,8 +58,7 @@ mod tests;
 
 pub use clock::{ActorClock, ActorId};
 pub use command::{
-    CollabCommand, TaskAction, TaskActionValidationError, TransferControl,
-    MAX_TASK_TITLE_BYTES,
+    CollabCommand, TaskAction, TaskActionValidationError, TransferControl, MAX_TASK_TITLE_BYTES,
 };
 pub use envelope::{last_writer_wins, CollabEventEnvelope, EventSignature, SCHEMA_VERSION};
 pub use event::CollabEventKind;

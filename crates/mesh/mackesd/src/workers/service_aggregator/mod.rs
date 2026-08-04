@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mackes_mesh_types::service_record::ServicesState;
 use mackes_mesh_types::resources::RESOURCE_CATALOG_TOPIC;
+use mackes_mesh_types::service_record::ServicesState;
 
 use aggregate::{aggregate, ProbeInput, PublishedInput};
 
@@ -277,11 +277,9 @@ impl ServiceAggregatorWorker {
                 &state,
                 &self.workgroup_root,
             ) {
-                Ok(catalog) => publish_json(
-                    self.bus_root.as_deref(),
-                    RESOURCE_CATALOG_TOPIC,
-                    &catalog,
-                ),
+                Ok(catalog) => {
+                    publish_json(self.bus_root.as_deref(), RESOURCE_CATALOG_TOPIC, &catalog)
+                }
                 Err(error) => tracing::error!(
                     host = %self.host,
                     error = %error,
@@ -405,7 +403,10 @@ mod tests {
             .expect("catalog body");
         let catalog = ResourceCatalog::from_json(&body).expect("validated catalog");
         assert_eq!(catalog.publisher, "me");
-        assert!(catalog.cards.iter().any(|card| card.display_name == "Jellyfin"));
+        assert!(catalog
+            .cards
+            .iter()
+            .any(|card| card.display_name == "Jellyfin"));
     }
 
     #[tokio::test]

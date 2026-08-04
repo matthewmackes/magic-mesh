@@ -1182,11 +1182,7 @@ fn publish_command(
 /// creating a second mint authority or an unauthenticated Bus shortcut.
 pub(crate) fn publish_acceptance_command(command: &CollabCommand) -> Result<(), String> {
     let topic = mde_collab_types::topics::command_topic(command.verb());
-    publish_command(
-        mde_bus::client_data_dir().as_deref(),
-        &topic,
-        command,
-    )
+    publish_command(mde_bus::client_data_dir().as_deref(), &topic, command)
 }
 
 /// Publish one clipboard acceptance value through the native DRM provider's
@@ -2002,11 +1998,8 @@ mod tests {
             "a new session must not publish local clipboard text by default"
         );
 
-        let remote = ClipboardClipBody::from_text(
-            "remote history",
-            "seat:other",
-            "2026-07-30T12:00:00Z",
-        );
+        let remote =
+            ClipboardClipBody::from_text("remote history", "seat:other", "2026-07-30T12:00:00Z");
         persist
             .write(
                 CLIPBOARD_CAPTURE_TOPIC,
@@ -2078,7 +2071,11 @@ mod tests {
             "the authorized target-seat value remains the current clipboard across DRM frames"
         );
         let mut other = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:other");
-        assert_eq!(other.read_text(), None, "handoff must not cross target seats");
+        assert_eq!(
+            other.read_text(),
+            None,
+            "handoff must not cross target seats"
+        );
     }
 
     #[test]

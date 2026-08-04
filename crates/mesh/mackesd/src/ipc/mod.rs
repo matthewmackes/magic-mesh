@@ -57,9 +57,9 @@ pub mod secret_store;
 // FILEMGR-6 — the shared mesh SSH key provisioner + sshd overlay bind: generates
 // + seals the shared keypair under `mesh-ssh-key` (the ref FILEMGR-5's mesh_mount
 // worker reads), installs the public half overlay-only, and owns the re-key path.
-pub mod mesh_ssh_key;
 /// Joined-mesh-only `MDE-MESH` password-locked system account lifecycle.
 pub mod mesh_service_account;
+pub mod mesh_ssh_key;
 // FILEMGR-7 — the peer-side direct-transfer helper: serves `action/mesh-transfer/
 // direct` and drives a remote-to-remote rsync A→B over the overlay (reusing the
 // FILEMGR-5/6 shared key + `<host>.mesh` DNS + mount scope) so a cross-node copy

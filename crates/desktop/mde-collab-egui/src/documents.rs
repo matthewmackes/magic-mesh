@@ -363,15 +363,15 @@ impl CommunicationsSurface {
         frame::bar_frame().show(ui, |ui| self.documents_strip(ui, data, sink, space));
 
         egui::Frame::NONE.show(ui, |ui| match self.doc_submode() {
-                DocSubMode::Document => self.documents_pane(ui, data),
-                // WL-FUNC-011 Phase 3c: the Project editor is a distinct embedded
-                // `EditorSurface`; a follow-up may join a mesh co-edit session on
-                // the focused project buffer (the editor already carries
-                // `CollabSession`/`follow`). Today it is the full local IDE.
-                DocSubMode::Project => {
-                    editor_panel(ui, &mut self.documents.project_editor);
-                }
-            });
+            DocSubMode::Document => self.documents_pane(ui, data),
+            // WL-FUNC-011 Phase 3c: the Project editor is a distinct embedded
+            // `EditorSurface`; a follow-up may join a mesh co-edit session on
+            // the focused project buffer (the editor already carries
+            // `CollabSession`/`follow`). Today it is the full local IDE.
+            DocSubMode::Project => {
+                editor_panel(ui, &mut self.documents.project_editor);
+            }
+        });
     }
 
     /// The sub-mode tabs + (in Document sub-mode) the document toolbar: the session

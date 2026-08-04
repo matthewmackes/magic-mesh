@@ -1,0 +1,15 @@
+[package]
+name = "serve-browser-vm-performance-rdp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This is an operator harness, not a production workspace member.  Keeping the
+# manifest independent lets a reviewed source checkout build the exact probe
+# without changing the platform workspace or its release graph.
+[workspace]
+
+[dependencies]
+mde-vdi-core = { path = "../../crates/desktop/mde-vdi-core" }
+mde-vdi-rdp = { path = "../../crates/desktop/mde-vdi-rdp", features = ["live-connect"] }
+serde_json = "1"

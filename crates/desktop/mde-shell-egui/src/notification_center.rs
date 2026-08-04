@@ -1,6 +1,6 @@
 //! `notification_center` — WL-UX-006/U13: the Construct **Notification Center**
 //! (PLATFORM-INTERFACES Q14 — a pull-down panel of grouped alert history with
-//! clear-all, fed by the alerts rollup, over the existing KIRON toast plumbing).
+//! clear-all over the existing KIRON toast plumbing).
 //!
 //! Mounted from `main.rs`'s reserved `mount_notification_center_slot` (the U09
 //! contract): [`mount`] consumes the `NotificationCenter` [`ChromeIntent`],
@@ -11,23 +11,18 @@
 //!
 //! ## Data honesty (what "history" really is here)
 //!
-//! The shell has **no persistent notification store** to read: the notify
-//! daemon publishes only the *latest* rollup per segment
-//! (`state/notify/segment/*`, [`crate::status`]), and KIRON alert visuals fold
+//! The shell has **no persistent notification store** to read. KIRON alert visuals fold
 //! into the Communications hub (the popup tier is retired —
 //! [`crate::toast_bridge`]). So the Center groups exactly what IS retained,
 //! and nothing more:
 //!
-//! * **STATUS** — the daemon's latest per-segment rollups (the Q14 "alerts
-//!   rollup" feed): current posture, one row per live segment, deliberately
-//!   NOT clearable (they are daemon state, and inventing a Bus-side ack is out
-//!   of scope by design).
 //! * **Per-topic alert groups** — an in-memory ring ([`NotificationRing`],
 //!   honest cap [`RING_CAP`]) of the alerts this shell process decoded/raised
 //!   since launch, fed by the toast bridge's admit tap. Clear-all / per-group
 //!   clear empty only this shell-local ring.
 //!
-//! When neither source holds anything the panel says "No notifications" —
+//! Platform health posture is intentionally absent: the centered System and
+//! Mesh Health modal is its sole presentation. When the ring holds nothing the panel says "No notifications" —
 //! never a fabricated backlog.
 //!
 //! Row time stamps are absolute `HH:MM` through the one clock fold
@@ -43,7 +38,7 @@ use mde_egui::motion::Spring;
 use mde_egui::{paint_carbon, Elevation, Motion, Severity, Style, TypographyRole};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::status::{SegmentRollup, StatusSegments};
+use crate::status::StatusSegments;
 use crate::timers::{hhmm, now_unix};
 use crate::toast_bridge::ToastBridge;
 
@@ -188,35 +183,6 @@ pub(crate) fn grouped(ring: &NotificationRing) -> Vec<TopicGroup<'_>> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The alerts-rollup feed (Q14)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The daemon's `state/notify/segment/*` rollups present right now — the Q14
-/// "alerts rollup" feed. Latest-per-segment posture, NOT history (module doc),
-/// rendered as the Center's non-clearable STATUS group.
-fn status_rows(segments: &StatusSegments) -> Vec<(&'static str, &SegmentRollup)> {
-    [
-        ("Alerts", segments.alerts.as_ref()),
-        ("Device", segments.device.as_ref()),
-        ("Mesh", segments.mesh.as_ref()),
-        ("Power", segments.power.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(name, rollup)| rollup.map(|r| (name, r)))
-    .collect()
-}
-
-/// Map a rollup's wire severity string onto the shared ladder. An unknown
-/// string reads as Info — the Center never invents urgency.
-fn rollup_severity(severity: &str) -> Severity {
-    match severity {
-        "critical" => Severity::Critical,
-        "warning" => Severity::Warning,
-        _ => Severity::Info,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // The pull-down panel
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -256,7 +222,7 @@ pub(crate) fn mount(
     ctx: &egui::Context,
     construct: &mut ConstructChrome,
     toasts: &mut ToastBridge,
-    segments: &StatusSegments,
+    _segments: &StatusSegments,
 ) {
     if construct.take_intent(ChromeIntent::NotificationCenter) {
         construct.notification_center_open = !construct.notification_center_open;
@@ -311,7 +277,7 @@ pub(crate) fn mount(
         let inner_w = (rect.width() - 2.0 * Style::SP_M).max(0.0);
         ui.set_min_width(inner_w);
         ui.set_max_width(inner_w);
-        panel_contents(ui, toasts, segments, rect.height());
+        panel_contents(ui, toasts, rect.height());
     });
     // Q14 + P5: the scrim click and the (top-modal, consumed) Escape both
     // close — clearing the ONE open flag the input contract reads.
@@ -322,12 +288,7 @@ pub(crate) fn mount(
 
 /// The panel body: header (title + clear-all), then the STATUS group and the
 /// per-topic alert groups in a scroll region — or the honest empty state.
-fn panel_contents(
-    ui: &mut egui::Ui,
-    toasts: &mut ToastBridge,
-    segments: &StatusSegments,
-    panel_h: f32,
-) {
+fn panel_contents(ui: &mut egui::Ui, toasts: &mut ToastBridge, panel_h: f32) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("Notifications")
@@ -336,8 +297,6 @@ fn panel_contents(
                 .strong(),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // Clears only the shell-local ring — the daemon's STATUS rollups
-            // are current posture, not clearable history (module doc).
             if !toasts.history().is_empty()
                 && ui
                     .button(
@@ -352,8 +311,7 @@ fn panel_contents(
     });
     ui.add_space(Style::SP_S);
 
-    let status = status_rows(segments);
-    if status.is_empty() && toasts.history().is_empty() {
+    if toasts.history().is_empty() {
         // The honest empty state — nothing retained anywhere, say so.
         ui.add_space(Style::SP_XL);
         ui.vertical_centered(|ui| {
@@ -377,22 +335,6 @@ fn panel_contents(
         .max_height((panel_h - 2.0 * Style::SP_XL).max(0.0))
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            if !status.is_empty() {
-                let _ = group_header(ui, "Status", false);
-                for (name, rollup) in &status {
-                    row(
-                        ui,
-                        rollup_severity(&rollup.severity),
-                        &rollup.summary,
-                        &format!(
-                            "{name} · {} · {}",
-                            rollup.host,
-                            hhmm(rollup.ts_unix_ms / 1000)
-                        ),
-                    );
-                }
-                ui.add_space(Style::SP_S);
-            }
             // Per-group clear is deferred past the loop: the groups borrow the
             // ring immutably while rendering.
             let mut clear_topic: Option<String> = None;
@@ -641,14 +583,6 @@ mod tests {
         assert_eq!(groups[1].topic, "nyc3");
     }
 
-    #[test]
-    fn rollup_severity_maps_the_wire_strings() {
-        assert_eq!(rollup_severity("critical"), Severity::Critical);
-        assert_eq!(rollup_severity("warning"), Severity::Warning);
-        assert_eq!(rollup_severity("info"), Severity::Info);
-        assert_eq!(rollup_severity("nonsense"), Severity::Info, "never invents");
-    }
-
     // ── the mount contract (intent + paint-safety) ───────────────────────────
 
     #[test]
@@ -694,18 +628,7 @@ mod tests {
         toasts
             .history_mut()
             .record(Severity::Warning, "lh1", "BUILD", "farm went red");
-        let segments = StatusSegments {
-            alerts: Some(SegmentRollup {
-                segment: "alerts".to_owned(),
-                severity: "warning".to_owned(),
-                source: "journal".to_owned(),
-                summary: "3 warnings on eagle".to_owned(),
-                host: "eagle".to_owned(),
-                critical_policy: "remote-pip-chat".to_owned(),
-                ts_unix_ms: 12 * 3_600 * 1_000,
-            }),
-            ..StatusSegments::default()
-        };
+        let segments = StatusSegments::default();
 
         let out = warm(&ctx, &mut construct, &mut toasts, &segments);
         assert!(
@@ -717,8 +640,8 @@ mod tests {
             "grouped under its TYPE_FOOTNOTE topic header"
         );
         assert!(
-            shapes_contain_text(&out.shapes, "3 warnings on eagle"),
-            "the alerts rollup feeds the STATUS group"
+            !shapes_contain_text(&out.shapes, "Status"),
+            "platform posture must not be duplicated in Notification Center"
         );
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "an open Center painted no geometry");
@@ -800,7 +723,6 @@ mod tests {
         let mut toasts = ToastBridge::default();
         let segments = StatusSegments::default();
         assert!(toasts.history().is_empty());
-        assert!(status_rows(&segments).is_empty());
 
         let out = warm(&ctx, &mut construct, &mut toasts, &segments);
         assert!(

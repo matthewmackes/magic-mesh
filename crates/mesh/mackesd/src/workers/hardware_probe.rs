@@ -16,31 +16,22 @@
 //!
 //! DEVMGR-1 folds a SECOND artifact into this same rank-0 worker (lock #16 —
 //! "extend an existing inventory worker, not a new one"): on each tick it also
-//! calls [`super::device_inventory::publish_system_observing`], which walks the
+//! calls [`super::device_inventory::publish_system`], which walks the
 //! full Linux hardware taxonomy sysfs-first and publishes
 //! `<workgroup_root>/device-inventory/<hostname>.json` for the About →
-//! Device-Manager surface. The worker's census entry is unchanged.
-//!
-//! DEVMGR-9 (#21) rides the same tick: the publish also returns the
-//! fault-transition edges against the previous snapshot (a device entering
-//! `no-driver` / `disabled` / `degraded`), and this worker debounces each
-//! through the per-device [`device_inventory::DeviceFaultGate`] (the
-//! `node_grade` flapping-guard idiom) before publishing one alert on
-//! `event/notify/device-fault` — the CHAT-FIX-2 lane the `chat` worker folds
-//! into Chat + the phone. Still NOT a new worker: the same census entry
-//! produces a third, event-shaped artifact.
+//! Device-Manager surface. Device faults are evaluated and notified by the
+//! System and Mesh Health authority, so this inventory worker has no parallel
+//! problem ledger or alert path. The worker's census entry is unchanged.
 
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use super::{device_inventory, ShutdownToken, Worker};
 use mackes_mesh_types::peer_probe::{
     BusTopology, Descriptors, KernelDriver, NatClass, PeerProbe, PowerThermal,
 };
-use mde_bus::persist::Persist;
-
-use super::{device_inventory, ShutdownToken, Worker};
 
 /// Re-gather + publish cadence. Hardware changes slowly; a 5-minute
 /// refresh keeps the directory current without churn.
@@ -202,42 +193,23 @@ fn publish(workgroup_root: &Path, node_id: &str) {
 }
 
 /// The default Bus root (persisted message tree), matching every other worker.
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
-}
-
 /// The hardware-probe producer worker.
 pub struct HardwareProbeWorker {
     workgroup_root: PathBuf,
     node_id: String,
     tick: Duration,
-    /// The Bus spool the DEVMGR-9 fault notify publishes on. Tests point it at a
-    /// tempdir; `None` degrades to publish-only (no notify — an honest no-Bus seat).
-    bus_root: Option<PathBuf>,
-    /// The per-device fault debounce (DEVMGR-9, #21) — held across ticks so a
-    /// flapping device alerts once per [`device_inventory::FAULT_COOLDOWN`].
-    fault_gate: device_inventory::DeviceFaultGate,
 }
 
 impl HardwareProbeWorker {
     /// A production worker over `workgroup_root`, publishing as `node_id`, with
-    /// the default Bus root for the DEVMGR-9 fault notify.
+    /// the neutral device-inventory publisher.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
         Self {
             workgroup_root,
             node_id,
             tick: TICK,
-            bus_root: default_bus_root(),
-            fault_gate: device_inventory::DeviceFaultGate::default(),
         }
-    }
-
-    /// Override the notify Bus root (tests point at a tempdir).
-    #[must_use]
-    pub fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
-        self.bus_root = bus_root;
-        self
     }
 }
 
@@ -248,10 +220,6 @@ impl Worker for HardwareProbeWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let persist = self
-            .bus_root
-            .clone()
-            .and_then(|root| Persist::open(root).ok());
         loop {
             let root = self.workgroup_root.clone();
             let node = self.node_id.clone();
@@ -259,30 +227,17 @@ impl Worker for HardwareProbeWorker {
             // publishes under (node_id with the `peer:` prefix stripped), so a
             // host's grade + device tree line up in the shell.
             let host = node.strip_prefix("peer:").unwrap_or(&node).to_string();
-            let host_for_alert = host.clone();
             // Gather shells read-only tools + walks sysfs — keep it off the
             // scheduler. One blocking task publishes BOTH the PeerProbe
             // (SUBAUDIT-D2) and the full device-inventory tree (DEVMGR-1),
-            // returning the DEVMGR-9 fault edges against the previous snapshot.
+            // publishing both neutral inventory artifacts.
             let outcome = tokio::task::spawn_blocking(move || {
                 publish(&root, &node);
-                device_inventory::publish_system_observing(&root, &host)
+                device_inventory::publish_system(&root, &host)
             })
             .await;
             match outcome {
-                Ok(Ok((_, transitions))) => {
-                    // DEVMGR-9 — one debounced notify per device entering a fault
-                    // state (#21). The diff already edge-triggers; the gate guards
-                    // ok↔faulted flapping across ticks.
-                    let now = Instant::now();
-                    for t in &transitions {
-                        if self.fault_gate.admit(&t.key, now) {
-                            if let Some(p) = persist.as_ref() {
-                                device_inventory::emit_fault_alert(p, &host_for_alert, t);
-                            }
-                        }
-                    }
-                }
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
                         target: "mackesd::hardware_probe",
@@ -340,10 +295,5 @@ mod tests {
         let json = serde_json::to_string(&probe).expect("serialize");
         let back: PeerProbe = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.peer_id, "peer:test-node");
-    }
-
-    #[test]
-    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
-        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 }

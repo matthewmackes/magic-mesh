@@ -65,13 +65,7 @@ impl CommunicationsSurface {
         ui.separator();
 
         let publishing_enabled = self.clipboard_publishing_enabled;
-        self.clip_publish_composer(
-            ui,
-            sink,
-            space,
-            data.me().as_str(),
-            publishing_enabled,
-        );
+        self.clip_publish_composer(ui, sink, space, data.me().as_str(), publishing_enabled);
         ui.separator();
 
         match data.clipboard_lane(space) {
@@ -262,13 +256,7 @@ impl CommunicationsSurface {
         text: &str,
         source: &str,
     ) -> bool {
-        self.publish_clip_text_from_ingress(
-            sink,
-            space,
-            text,
-            source,
-            ClipboardIngress::LocalSeat,
-        )
+        self.publish_clip_text_from_ingress(sink, space, text, source, ClipboardIngress::LocalSeat)
     }
 
     /// Admit a guest-originated clipboard value only when the VDI session has
@@ -590,9 +578,12 @@ mod tests {
         let mut sink = CommandSink::new();
 
         assert!(!surface.clipboard_publishing_enabled());
-        assert!(
-            !surface.publish_clip_text(&mut sink, SpaceId::new(), "remote history stays", "eagle")
-        );
+        assert!(!surface.publish_clip_text(
+            &mut sink,
+            SpaceId::new(),
+            "remote history stays",
+            "eagle"
+        ));
         assert!(sink.is_empty());
 
         let mut enabled = CommunicationsSurface::new();

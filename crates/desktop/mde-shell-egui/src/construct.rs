@@ -47,7 +47,10 @@
 //! Still open: the **VDI dwell guard** stays the minimal two-swipe confirm
 //! ([`EdgeGuard`]); its visible arming affordance remains a follow-up.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
+
+use mackes_mesh_types::health::{HealthAction, HealthSeverity, SystemMeshHealthSnapshot};
 
 use mde_egui::egui;
 use mde_egui::{Edge, EdgeSwipeEvent};
@@ -298,6 +301,24 @@ pub struct ConstructChrome {
     pub control_center_open: bool,
     /// The Notification Center pull-down is showing (Q14, U15).
     pub notification_center_open: bool,
+    /// The centered System and Mesh Health modal.
+    pub health_modal_open: bool,
+    /// Node selected in the modal's evidence pane.
+    pub health_selected_node: Option<String>,
+    /// Current exact unacknowledged actionable count for either taskbar layout.
+    pub health_count: usize,
+    /// Worst active condition severity used only for semantic icon color.
+    pub health_severity: Option<HealthSeverity>,
+    /// Whether the observer-owned authority snapshot is inside its validity window.
+    pub health_fresh: bool,
+    /// Guided action awaiting explicit confirmation in the modal.
+    pub health_pending_action: Option<(String, HealthAction)>,
+    /// Device-inventory deep link requested from condition evidence.
+    pub health_inventory_target: Option<(String, String)>,
+    /// Critical condition identities already auto-opened during this occurrence.
+    observed_critical_health: BTreeSet<String>,
+    /// A new critical arrived while modal opening was unsafe.
+    queued_health_open: bool,
     /// A workspace selected from the persistent notification/tool tray. The
     /// status-bar painter owns the hit target; the shell drains this typed
     /// handoff after the chrome slot mounts it.
@@ -318,6 +339,15 @@ impl Default for ConstructChrome {
             switcher_open: false,
             control_center_open: false,
             notification_center_open: false,
+            health_modal_open: false,
+            health_selected_node: None,
+            health_count: 0,
+            health_severity: None,
+            health_fresh: false,
+            health_pending_action: None,
+            health_inventory_target: None,
+            observed_critical_health: BTreeSet::new(),
+            queued_health_open: false,
             workspace_tray_target: None,
             guard: EdgeGuard::default(),
             epoch: Instant::now(),
@@ -327,6 +357,64 @@ impl Default for ConstructChrome {
 }
 
 impl ConstructChrome {
+    /// Fold the centralized health snapshot into chrome and apply critical
+    /// auto-open-once semantics. `blocked` covers lock, immersive/full-screen,
+    /// and active confirmation/overlay states.
+    pub(crate) fn observe_health(
+        &mut self,
+        snapshot: Option<&SystemMeshHealthSnapshot>,
+        now_ms: u64,
+        blocked: bool,
+    ) {
+        let Some(snapshot) = snapshot.filter(|snapshot| snapshot.is_fresh(now_ms)) else {
+            self.health_count = 0;
+            self.health_severity = None;
+            self.health_fresh = false;
+            return;
+        };
+        self.health_fresh = true;
+        self.health_count = snapshot.active_issue_count(now_ms);
+        self.health_severity = snapshot
+            .active_conditions
+            .iter()
+            .filter(|condition| {
+                condition.is_active()
+                    && condition.requirement
+                        == mackes_mesh_types::health::RequirementClass::Required
+            })
+            .map(|condition| condition.severity)
+            .max();
+        let current: BTreeSet<_> = snapshot
+            .active_conditions
+            .iter()
+            .filter(|condition| {
+                condition.requirement == mackes_mesh_types::health::RequirementClass::Required
+                    && condition.severity == HealthSeverity::Critical
+            })
+            .map(|condition| condition.id.clone())
+            .collect();
+        let newly_observed = current
+            .iter()
+            .any(|condition| !self.observed_critical_health.contains(condition));
+        self.observed_critical_health = current;
+        if newly_observed {
+            if blocked {
+                self.queued_health_open = true;
+            } else {
+                self.health_modal_open = true;
+                self.queued_health_open = false;
+            }
+        } else if self.queued_health_open && !blocked {
+            self.health_modal_open = true;
+            self.queued_health_open = false;
+        }
+    }
+
+    pub(crate) fn open_health(&mut self) {
+        self.health_modal_open = true;
+        self.control_center_open = false;
+        self.notification_center_open = false;
+    }
     /// Queue a workspace route selected from the persistent tool tray.
     pub(crate) fn request_workspace_tray(&mut self, surface: crate::surfaces::Surface) {
         self.workspace_tray_target = Some(surface);

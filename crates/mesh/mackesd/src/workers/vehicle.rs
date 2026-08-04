@@ -64,9 +64,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
-    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, DeviceProbeStatus,
-    GpsFix, ImuSample, ManagerSetState, SnapshotProvenance, SnapshotSource, VehicleReply,
-    VehicleState, VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
+    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, DeviceProbeStatus, GpsFix,
+    ImuSample, ManagerSetState, SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState,
+    VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
     VEHICLE_STATE_V2_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
@@ -624,7 +624,7 @@ fn parse_status_port(raw: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-    /// Accept only the two MG90 OBD application paths documented by the repository's
+/// Accept only the two MG90 OBD application paths documented by the repository's
 /// access contract. A free-form URL here would turn a diagnostic opt-in into an
 /// arbitrary authenticated HTTP fetch.
 fn parse_obd_status_path(raw: &str) -> Result<&'static str, String> {
@@ -1038,7 +1038,10 @@ fn manager_route_rejection(
     snapshot: &VehicleStateV2,
     manager_id: &str,
 ) -> Option<VehicleManagerRouteRejection> {
-    if matches!(snapshot.approval, mackes_mesh_types::vehicle::ApprovalState::Revoked) {
+    if matches!(
+        snapshot.approval,
+        mackes_mesh_types::vehicle::ApprovalState::Revoked
+    ) {
         return Some(VehicleManagerRouteRejection::ApprovalRevoked);
     }
     // An unknown manager set is not proof that this manager is enrolled. Keep
@@ -1428,7 +1431,8 @@ impl VehicleRoster {
             let Some(candidate) = assignment.latest.as_ref() else {
                 continue;
             };
-            if let Some(reason) = manager_route_rejection(&candidate.snapshot, &candidate.manager_id)
+            if let Some(reason) =
+                manager_route_rejection(&candidate.snapshot, &candidate.manager_id)
             {
                 if rejected
                     .as_ref()
@@ -3142,10 +3146,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[test]
     fn obd_probe_verdicts_survive_v2_wire_without_fabricating_telemetry() {
         let cases = vec![
-            (
-                FakeProbe::real(),
-                DeviceProbeStatus::NotInstalled,
-            ),
+            (FakeProbe::real(), DeviceProbeStatus::NotInstalled),
             (
                 FakeProbe {
                     obd_status: Ok(Some(r#"{"currentStatus":{"rpm":1800}}"#.to_string())),

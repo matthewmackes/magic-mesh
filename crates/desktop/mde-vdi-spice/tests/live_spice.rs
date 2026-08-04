@@ -168,7 +168,11 @@ async fn live_spice_console_connects_renders_and_accepts_input() {
         "live: FRAME OK {}x{} fnv1a64={checksum:#018x} distinct_colors={colors}",
         img.size[0], img.size[1]
     );
-    assert!(img.size[0] > 0 && img.size[1] > 0, "empty desktop");
+    assert_eq!(
+        img.size,
+        [1920, 1080],
+        "live: Browser VM did not honor the requested 1080p SPICE monitor"
+    );
     assert!(
         colors > 16,
         "live: SPICE frame is a flat fill; decoded guest pixels are not ready"

@@ -27,9 +27,7 @@
 //! live) server since they need one to exercise.
 
 use spice_client::{
-    channels::display::DisplaySurface,
-    MouseButton as SpiceMouseButton,
-    SpiceClientShared,
+    channels::display::DisplaySurface, MouseButton as SpiceMouseButton, SpiceClientShared,
     SpiceError,
 };
 
@@ -112,6 +110,9 @@ impl SpiceTransport {
             client.set_password(password.clone()).await;
         }
         client.connect().await?;
+        client
+            .request_display_size(u32::from(config.width), u32::from(config.height))
+            .await?;
         let latest_surface = std::sync::Arc::new(std::sync::Mutex::new(None));
         let callback_surface = std::sync::Arc::clone(&latest_surface);
         client

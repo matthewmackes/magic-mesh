@@ -20,9 +20,9 @@
 //!   (a sysfs backlight or a DDC/CI monitor); steps ride the same hotkey seam.
 //!   No device → a Displays deep-link tile instead (the design's "do NOT
 //!   fabricate a slider" rule).
-//! * **Network/mesh** — the mesh peers-online summary + the notify worker's
-//!   Mesh segment rollup (the exact StatusSegments the tray pips read); the
-//!   tile deep-links to Settings → Network.
+//! * **Network/mesh** — the operational peers-online summary; platform health
+//!   remains exclusively in System and Mesh Health. The tile deep-links to
+//!   Settings → Network.
 //! * **Bluetooth** — the snapshot's BlueZ probe (radio power + connected
 //!   count); a click toggles the first adapter's radio through the hotkey
 //!   seam. No adapter → an honest deep-link to Settings → Bluetooth (where the
@@ -59,7 +59,7 @@ use mde_theme::brand::icons::IconId;
 use crate::chrome::MeshSummary;
 use crate::construct::{ChromeIntent, ConstructChrome};
 use crate::session_rail::SessionRailState;
-use crate::status::{severity_color, StatusSegments};
+use crate::status::StatusSegments;
 use crate::surfaces::{icon_texture, SessionRailEntry, Surface};
 use crate::system::{SettingsSection, SystemState};
 use crate::web::WebState;
@@ -312,7 +312,7 @@ fn fold_model(
     brightness_override: Option<f32>,
     profile: LayoutProfile,
     mesh: &MeshSummary,
-    segments: &StatusSegments,
+    _segments: &StatusSegments,
     entries: &[SessionRailEntry],
     files: Option<OperationProgressSummary>,
     browser: Option<OperationProgressSummary>,
@@ -331,7 +331,7 @@ fn fold_model(
     let file_ops = file_ops_model(files, browser);
 
     let mut tiles = vec![
-        network_tile(mesh, segments),
+        network_tile(mesh),
         bluetooth_tile(snap),
         layout_tile(profile),
     ];
@@ -378,9 +378,9 @@ fn fold_model(
     }
 }
 
-/// The Network/mesh tile: peers-online from the mesh summary, tinted by the
-/// notify worker's Mesh segment severity (the tray pips' exact sources).
-fn network_tile(mesh: &MeshSummary, segments: &StatusSegments) -> Tile {
+/// The Network/mesh tile: operational peer reachability without a second
+/// platform-health summary.
+fn network_tile(mesh: &MeshSummary) -> Tile {
     let caption = if mesh.seen {
         format!("{}/{} peers online", mesh.peers_online, mesh.peers_total)
     } else {
@@ -392,7 +392,7 @@ fn network_tile(mesh: &MeshSummary, segments: &StatusSegments) -> Tile {
         title: "Network",
         caption,
         active: false,
-        tone: Some(severity_color(segments.mesh.as_ref())),
+        tone: None,
         action: CcAction::OpenSettings(SettingsSection::Network),
     }
 }

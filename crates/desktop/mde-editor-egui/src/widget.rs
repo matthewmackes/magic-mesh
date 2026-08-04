@@ -40,7 +40,7 @@
 // is allowed for the layout arithmetic: `origin + col * glyph_w` reads far
 // clearer than the `mul_add` rewrite, and the precision/throughput gain is
 // irrelevant for a few pixel positions per row (same rationale + repo precedent
-// as `mde-mesh-view` / `mde-panel-egui`). The cast lints are allowed
+// as `mde-mesh-view`). The cast lints are allowed
 // module-wide: the multi-cursor geometry + fan-out edit arithmetic convert
 // between char indices (`usize`), signed shift accumulators (`isize`), and
 // row/column-to-pixel offsets (`f32`); every conversion is bounded by the

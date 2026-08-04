@@ -177,7 +177,10 @@ fn media_health_rank(health: MediaServerHealth) -> u8 {
     }
 }
 
-fn media_server_creds_json(record: &MediaServerRecord, secret_body: &str) -> Result<String, String> {
+fn media_server_creds_json(
+    record: &MediaServerRecord,
+    secret_body: &str,
+) -> Result<String, String> {
     let sealed: SealedAirsonicCreds = serde_json::from_str(secret_body)
         .map_err(|e| format!("parse sealed Media credential: {e}"))?;
     let username = sealed.username.trim();
@@ -211,8 +214,18 @@ fn materialized_media_server_creds(
         return Ok(None);
     };
     let secret_body = read_secret(&record.credential_ref)
-        .map_err(|e| format!("read sealed Media credential {}: {e}", record.credential_ref))?
-        .ok_or_else(|| format!("sealed Media credential {} is absent", record.credential_ref))?;
+        .map_err(|e| {
+            format!(
+                "read sealed Media credential {}: {e}",
+                record.credential_ref
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "sealed Media credential {} is absent",
+                record.credential_ref
+            )
+        })?;
     let body = media_server_creds_json(record, &secret_body)?;
     Ok(Some(MaterializedGatewayCreds {
         body,
@@ -502,7 +515,12 @@ mod tests {
         .to_string()
     }
 
-    fn media_record(endpoint: &str, priority: u16, health: MediaServerHealth, reference: &str) -> MediaServerRecord {
+    fn media_record(
+        endpoint: &str,
+        priority: u16,
+        health: MediaServerHealth,
+        reference: &str,
+    ) -> MediaServerRecord {
         MediaServerRecord::new(
             endpoint,
             mesh_media::MediaServerKind::Airsonic,

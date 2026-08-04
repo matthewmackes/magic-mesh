@@ -465,8 +465,10 @@ mod menubar {
                 if let Entry::Item(item) = entry {
                     assert_eq!(
                         item.checked,
-                        Some(item.id == MenuAction::FleetMeshTab(crate::FleetMeshTab::Workbench)
-                            || item.id == MenuAction::Plane(Plane::Network)),
+                        Some(
+                            item.id == MenuAction::FleetMeshTab(crate::FleetMeshTab::Workbench)
+                                || item.id == MenuAction::Plane(Plane::Network)
+                        ),
                         "{:?} check-state must track the active plane",
                         item.id
                     );

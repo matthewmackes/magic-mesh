@@ -13,9 +13,7 @@ fn this_node_action_audit_is_bounded_redacted_and_drained() {
     let records = state.take_action_audit();
     assert_eq!(records.len(), 32);
     assert!(records.iter().all(|record| {
-        record.action == "Wi-Fi power"
-            && record.outcome == "accepted"
-            && record.occurred_ms > 0
+        record.action == "Wi-Fi power" && record.outcome == "accepted" && record.occurred_ms > 0
     }));
     assert!(state.take_action_audit().is_empty());
 }
@@ -403,7 +401,9 @@ fn wallpaper_section_renders_bing_service_without_retired_provider_controls() {
         "Desktop page URL",
     ] {
         assert!(
-            !texts.iter().any(|(text, _)| text == retired || text.starts_with(retired)),
+            !texts
+                .iter()
+                .any(|(text, _)| text == retired || text.starts_with(retired)),
             "Retired wallpaper control {retired:?} was still painted: {texts:?}"
         );
     }
@@ -428,11 +428,20 @@ fn settings_combobox_popups_use_themed_readable_choice_colors() {
     assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
     assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
     assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
-    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT_STRONG);
+    assert_eq!(
+        style.visuals.widgets.hovered.fg_stroke.color,
+        Style::TEXT_STRONG
+    );
     assert_eq!(style.visuals.widgets.active.bg_fill, Style::SURFACE_HI);
-    assert_eq!(style.visuals.widgets.active.fg_stroke.color, Style::TEXT_STRONG);
+    assert_eq!(
+        style.visuals.widgets.active.fg_stroke.color,
+        Style::TEXT_STRONG
+    );
     assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
-    assert_eq!(style.visuals.widgets.open.fg_stroke.color, Style::TEXT_STRONG);
+    assert_eq!(
+        style.visuals.widgets.open.fg_stroke.color,
+        Style::TEXT_STRONG
+    );
     assert_eq!(style.visuals.widgets.open.bg_stroke.color, Style::BORDER);
     assert_eq!(
         style.visuals.widgets.noninteractive.fg_stroke.color,
@@ -904,11 +913,7 @@ fn every_section_is_reachable_exactly_once() {
         );
     }
     // The whole taxonomy is exactly those fifteen sections (no orphan leaf).
-    assert_eq!(
-        all.len(),
-        15,
-        "the taxonomy lists exactly fifteen sections"
-    );
+    assert_eq!(all.len(), 15, "the taxonomy lists exactly fifteen sections");
 }
 
 #[test]

@@ -52,10 +52,9 @@ use serde_json::Value;
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
     Avail, Backlight, BtAdapter, BtDevice, BtStatus, Connector, ConnectorStatus, DdcDisplay,
-    DisplayLayout, DisplayMode, LidState, MixerStatus, MixerStrip, MonitorId, OutputArrangement,
-    NetworkSecretAgent, PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot,
-    ZbusService,
-    HOTKEYS,
+    DisplayLayout, DisplayMode, LidState, MixerStatus, MixerStrip, MonitorId, NetworkSecretAgent,
+    OutputArrangement, PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot,
+    ZbusService, HOTKEYS,
 };
 
 use crate::backdrop;
@@ -699,19 +698,57 @@ impl SystemState {
     pub(crate) fn remote_proofing_summary(&self) -> Vec<String> {
         let plan = self.remote_proofing.service_plan(&self.mesh);
         let mut facts = vec![
-            format!("Service: {}", if plan.enabled { "enabled" } else { "disabled" }),
+            format!(
+                "Service: {}",
+                if plan.enabled { "enabled" } else { "disabled" }
+            ),
             format!("Bind scope: {:?}", plan.bind_scope),
-            format!("Bind target: {}", plan.bind_address.as_deref().unwrap_or("provider-selected")),
+            format!(
+                "Bind target: {}",
+                plan.bind_address.as_deref().unwrap_or("provider-selected")
+            ),
             format!("Firewall policy: {:?}", plan.firewall),
             format!("Capture: {}", plan.sunshine_capture),
             format!("Encoder: {}", plan.sunshine_encoder),
             format!("Minimum frame target: {} FPS", plan.min_fps_target),
-            format!("Local approval: {}", if plan.require_local_approval { "required" } else { "not required" }),
-            format!("Shadowing indicator: {}", if plan.show_shadowing_indicator { "visible" } else { "hidden" }),
-            format!("Remote input: {}", if plan.allow_remote_input { "allowed" } else { "blocked" }),
-            format!("VNC fallback: {}", if plan.vnc_fallback { "enabled" } else { "disabled" }),
+            format!(
+                "Local approval: {}",
+                if plan.require_local_approval {
+                    "required"
+                } else {
+                    "not required"
+                }
+            ),
+            format!(
+                "Shadowing indicator: {}",
+                if plan.show_shadowing_indicator {
+                    "visible"
+                } else {
+                    "hidden"
+                }
+            ),
+            format!(
+                "Remote input: {}",
+                if plan.allow_remote_input {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
+            ),
+            format!(
+                "VNC fallback: {}",
+                if plan.vnc_fallback {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
         ];
-        facts.extend(plan.warnings.into_iter().map(|warning| format!("Warning: {warning}")));
+        facts.extend(
+            plan.warnings
+                .into_iter()
+                .map(|warning| format!("Warning: {warning}")),
+        );
         facts
     }
 
@@ -747,9 +784,7 @@ impl SystemState {
 
     /// Return the latest typed keyboard-backlight inventory for This Node's
     /// Input detail and Actions continuity.
-    pub(crate) fn keyboard_backlight_targets(
-        &self,
-    ) -> Option<Vec<mde_seat::KeyboardBacklight>> {
+    pub(crate) fn keyboard_backlight_targets(&self) -> Option<Vec<mde_seat::KeyboardBacklight>> {
         match &self.snapshot.as_ref()?.keyboard_backlights {
             Probe::Present(backlights) => Some(backlights.clone()),
             Probe::Absent { .. } => None,
@@ -782,7 +817,8 @@ impl SystemState {
             return false;
         };
         if !choices.iter().any(|choice| choice == profile) {
-            self.error = Some("Hardware profile is no longer advertised; refresh required.".to_owned());
+            self.error =
+                Some("Hardware profile is no longer advertised; refresh required.".to_owned());
             self.record_action_audit("Platform profile", false);
             return false;
         }
@@ -792,7 +828,9 @@ impl SystemState {
                 true
             }
             Err(error) => {
-                self.error = Some(format!("Platform profile provider refused the change: {error}"));
+                self.error = Some(format!(
+                    "Platform profile provider refused the change: {error}"
+                ));
                 false
             }
         };
@@ -829,12 +867,14 @@ impl SystemState {
     /// immediately before dispatch, so a stale or fabricated name cannot reach
     /// the provider. The caller owns the user-facing confirmation step.
     pub(crate) fn dispatch_power_profile(&mut self, name: &str) -> bool {
-        let Some(action) = self.snapshot.as_ref().and_then(|snapshot| {
-            match &snapshot.power_profile {
-                Probe::Present(profile) => power_settings::profile_action(profile, name),
-                Probe::Absent { .. } => None,
-            }
-        }) else {
+        let Some(action) =
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| match &snapshot.power_profile {
+                    Probe::Present(profile) => power_settings::profile_action(profile, name),
+                    Probe::Absent { .. } => None,
+                })
+        else {
             return false;
         };
         self.apply(vec![action]);
@@ -845,10 +885,12 @@ impl SystemState {
 
     /// Return the provider-advertised charge-stop cap for This Node Actions.
     pub(crate) fn charge_limit_target(&self) -> Option<u8> {
-        self.snapshot.as_ref().and_then(|snapshot| match snapshot.charge_limit {
-            Probe::Present(Some(pct)) => Some(pct),
-            _ => None,
-        })
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| match snapshot.charge_limit {
+                Probe::Present(Some(pct)) => Some(pct),
+                _ => None,
+            })
     }
 
     /// Set a bounded charge-stop cap through the typed local seat provider.
@@ -901,9 +943,7 @@ impl SystemState {
     /// Return the first live adapter owner and the current typed Bluetooth
     /// device targets. Device paths stay inside this provider seam; the This
     /// Node surface renders only the operator-facing device facts.
-    pub(crate) fn bluetooth_device_targets(
-        &self,
-    ) -> Option<(String, Vec<mde_seat::BtDevice>)> {
+    pub(crate) fn bluetooth_device_targets(&self) -> Option<(String, Vec<mde_seat::BtDevice>)> {
         let snapshot = self.snapshot.as_ref()?;
         let Probe::Present(status) = &snapshot.bluetooth else {
             return None;
@@ -928,14 +968,21 @@ impl SystemState {
         let Probe::Present(status) = &snapshot.bluetooth else {
             return false;
         };
-        let Some(target) = status.devices.iter().find(|candidate| candidate.path == device)
+        let Some(target) = status
+            .devices
+            .iter()
+            .find(|candidate| candidate.path == device)
         else {
             return false;
         };
         let target_paired = target.paired;
         let target_connected = target.connected;
         let target_trusted = target.trusted;
-        if status.adapters.iter().all(|candidate| candidate.path != adapter) {
+        if status
+            .adapters
+            .iter()
+            .all(|candidate| candidate.path != adapter)
+        {
             return false;
         }
         let allowed = match action {
@@ -955,7 +1002,9 @@ impl SystemState {
             BluetoothDeviceAction::Pair => self.seat.bt_pair(device),
             BluetoothDeviceAction::Connect => self.seat.bt_connect(device),
             BluetoothDeviceAction::Disconnect => self.seat.bt_disconnect(device),
-            BluetoothDeviceAction::ToggleTrusted => self.seat.set_bt_trusted(device, !target_trusted),
+            BluetoothDeviceAction::ToggleTrusted => {
+                self.seat.set_bt_trusted(device, !target_trusted)
+            }
             BluetoothDeviceAction::Forget => self.seat.bt_remove_device(adapter, device),
         };
         let verb = match action {
@@ -992,7 +1041,9 @@ impl SystemState {
                 }
             }
             BluetoothDeviceAction::Forget => {
-                if let Some(Probe::Present(status)) = self.snapshot.as_mut().map(|s| &mut s.bluetooth) {
+                if let Some(Probe::Present(status)) =
+                    self.snapshot.as_mut().map(|s| &mut s.bluetooth)
+                {
                     status.devices.retain(|candidate| candidate.path != device);
                 }
             }
@@ -1017,14 +1068,16 @@ impl SystemState {
     /// used by the System surface.
     pub(crate) fn dispatch_display_output(&mut self, id: &MonitorId, enabled: bool) -> bool {
         let valid = self.layout.get(id).is_some_and(|output| {
-            output.connected
-                && (enabled || self.layout.guard_disable(id).is_ok())
+            output.connected && (enabled || self.layout.guard_disable(id).is_ok())
         });
         if !valid {
             return false;
         }
         self.apply(vec![SysAction::ToggleOutput(id.clone(), enabled)]);
-        let ok = self.layout.get(id).is_some_and(|output| output.enabled == enabled);
+        let ok = self
+            .layout
+            .get(id)
+            .is_some_and(|output| output.enabled == enabled);
         self.record_action_audit("Display output", ok);
         ok
     }
@@ -1038,7 +1091,9 @@ impl SystemState {
         let Probe::Present(connectors) = &self.snapshot.as_ref()?.displays else {
             return None;
         };
-        let connector = connectors.iter().find(|connector| connector.name == output.connector)?;
+        let connector = connectors
+            .iter()
+            .find(|connector| connector.name == output.connector)?;
         let current = output
             .effective_mode()
             .or_else(|| connector.preferred_mode().copied())
@@ -1057,14 +1112,15 @@ impl SystemState {
     /// Apply a mode to the live typed display intent only when the monitor id
     /// and mode are still advertised by the current connector probe.
     pub(crate) fn dispatch_display_mode(&mut self, id: &MonitorId, mode: DisplayMode) -> bool {
-        let valid = self.display_mode_target().is_some_and(|(target, _, _, modes)| {
-            target == *id && modes.contains(&mode)
-        });
+        let valid = self
+            .display_mode_target()
+            .is_some_and(|(target, _, _, modes)| target == *id && modes.contains(&mode));
         if !valid {
             return false;
         }
         self.apply(vec![SysAction::SetMode(id.clone(), mode)]);
-        let ok = self.layout
+        let ok = self
+            .layout
             .get(id)
             .and_then(OutputArrangement::effective_mode)
             == Some(mode);
@@ -1093,8 +1149,17 @@ impl SystemState {
     /// Nudge one connected output through the same saved DisplayLayout intent
     /// used by System. The DRM runner remains the live-apply authority.
     pub(crate) fn dispatch_display_nudge(&mut self, id: &MonitorId, left: bool) -> bool {
-        let valid = self.layout.outputs.iter().filter(|output| output.connected && output.enabled).count() > 1
-            && self.layout.get(id).is_some_and(|output| output.connected && output.enabled);
+        let valid = self
+            .layout
+            .outputs
+            .iter()
+            .filter(|output| output.connected && output.enabled)
+            .count()
+            > 1
+            && self
+                .layout
+                .get(id)
+                .is_some_and(|output| output.connected && output.enabled);
         if !valid {
             return false;
         }
@@ -1142,11 +1207,11 @@ impl SystemState {
         panel: bool,
         max: u32,
     ) -> bool {
-        let valid = self
-            .display_brightness_target()
-            .is_some_and(|(id, _, is_panel, target_max)| {
-                id == target && is_panel == panel && (!panel || target_max == max)
-            });
+        let valid =
+            self.display_brightness_target()
+                .is_some_and(|(id, _, is_panel, target_max)| {
+                    id == target && is_panel == panel && (!panel || target_max == max)
+                });
         if !valid || percent > 100 {
             return false;
         }
@@ -1224,7 +1289,8 @@ impl SystemState {
 
     /// Return the live master mixer target and mute state for This Node Actions.
     pub(crate) fn master_mute_target(&self) -> Option<(String, bool)> {
-        self.master_strip().map(|strip| (strip.id.clone(), strip.muted))
+        self.master_strip()
+            .map(|strip| (strip.id.clone(), strip.muted))
     }
 
     /// Toggle the typed master mixer mute state. The provider result is folded
@@ -1238,7 +1304,9 @@ impl SystemState {
             id: id.to_owned(),
             muted,
         }]);
-        let ok = self.master_strip().is_some_and(|strip| strip.muted == muted);
+        let ok = self
+            .master_strip()
+            .is_some_and(|strip| strip.muted == muted);
         self.record_action_audit("Audio mute", ok);
         ok
     }
@@ -1281,9 +1349,7 @@ impl SystemState {
     /// confirmation; this method validates the provider-issued id and preserves
     /// the previous state when the provider refuses the write.
     pub(crate) fn dispatch_microphone_mute(&mut self, id: &str, muted: bool) -> bool {
-        let valid = self
-            .capture_strip()
-            .is_some_and(|strip| strip.id == id);
+        let valid = self.capture_strip().is_some_and(|strip| strip.id == id);
         if !valid {
             return false;
         }
@@ -1305,7 +1371,10 @@ impl SystemState {
     pub(crate) fn wifi_power_target(&self) -> Option<bool> {
         match self.snapshot.as_ref()?.network {
             Probe::Present(ref status)
-                if status.links.iter().any(|link| link.kind == mde_seat::NetworkKind::Wifi) =>
+                if status
+                    .links
+                    .iter()
+                    .any(|link| link.kind == mde_seat::NetworkKind::Wifi) =>
             {
                 status.wifi_enabled
             }
@@ -1326,7 +1395,9 @@ impl SystemState {
             self.record_action_audit("Wi-Fi power", false);
             return false;
         }
-        if let Some(Probe::Present(status)) = self.snapshot.as_mut().map(|snapshot| &mut snapshot.network) {
+        if let Some(Probe::Present(status)) =
+            self.snapshot.as_mut().map(|snapshot| &mut snapshot.network)
+        {
             status.wifi_enabled = Some(enabled);
         }
         self.record_action_audit("Wi-Fi power", true);
@@ -1353,14 +1424,21 @@ impl SystemState {
     /// Dispatch one provider-issued profile activation. The caller supplies no
     /// secret and must perform visible confirmation before reaching this seam.
     pub(crate) fn activate_network_profile(&mut self, profile_path: &str) -> bool {
-        let Some(status) = self.snapshot.as_ref().and_then(|snapshot| match &snapshot.network {
-            Probe::Present(status) => Some(status),
-            Probe::Absent { .. } => None,
-        }) else {
+        let Some(status) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| match &snapshot.network {
+                Probe::Present(status) => Some(status),
+                Probe::Absent { .. } => None,
+            })
+        else {
             return false;
         };
         if !self.network_secret_agent_ready()
-            || !status.profiles.iter().any(|profile| profile.path == profile_path)
+            || !status
+                .profiles
+                .iter()
+                .any(|profile| profile.path == profile_path)
         {
             return false;
         }
@@ -1423,9 +1501,9 @@ impl SystemState {
     /// still names the same connected target. A successful provider response
     /// updates the cache to `Disconnected`; refusal leaves it untouched.
     pub(crate) fn dispatch_network_disconnect(&mut self, path: &str, interface: &str) -> bool {
-        let valid = self.network_disconnect_target().is_some_and(|(target, name)| {
-            target == path && name == interface
-        });
+        let valid = self
+            .network_disconnect_target()
+            .is_some_and(|(target, name)| target == path && name == interface);
         if !valid {
             self.error = Some("network disconnect: target is stale or protected".to_owned());
             return false;
@@ -1436,7 +1514,9 @@ impl SystemState {
             self.record_action_audit("Network disconnect", false);
             return false;
         }
-        if let Some(Probe::Present(status)) = self.snapshot.as_mut().map(|snapshot| &mut snapshot.network) {
+        if let Some(Probe::Present(status)) =
+            self.snapshot.as_mut().map(|snapshot| &mut snapshot.network)
+        {
             if let Some(link) = status.links.iter_mut().find(|link| link.path == path) {
                 link.state = mde_seat::NetworkState::Disconnected;
             }
@@ -1681,7 +1761,7 @@ impl SystemState {
             // collapse to one, so there is nothing to go back FROM. It rests on the
             // same Carbon layer-01 page (SETTINGS-2); the section body raises to a
             // layer-02 card inside (see [`settings_detail`]).
-                egui::CentralPanel::default()
+            egui::CentralPanel::default()
                 .frame(page_frame(Style::SP_L))
                 .show_inside(ui, |ui| {
                     let _ = AppFrame::new(selected.label()).show(ui);
@@ -2119,11 +2199,7 @@ impl SystemState {
     /// Render the ephemeral NetworkManager credential prompt at shell level so
     /// it remains reachable from This Node's Actions workflow as well as System.
     pub(crate) fn show_network_secret_dialog(&mut self, ctx: &egui::Context) {
-        network_secret_dialog(
-            ctx,
-            &self.network_secrets,
-            &mut self.network_secret_input,
-        );
+        network_secret_dialog(ctx, &self.network_secrets, &mut self.network_secret_input);
     }
 
     /// Drain the Bluetooth control-error toasts for the shell to raise into the one
@@ -2143,13 +2219,10 @@ impl SystemState {
     /// Apply a bounded pointer-speed change through the same persisted policy and
     /// native input seam used by Devices → Mouse & Touch. The policy is clamped
     /// before it reaches the DRM/libinput translator and egui options.
-    pub(crate) fn dispatch_pointer_speed(
-        &mut self,
-        ctx: &egui::Context,
-        target: i16,
-    ) -> bool {
+    pub(crate) fn dispatch_pointer_speed(&mut self, ctx: &egui::Context, target: i16) -> bool {
         if !(-100..=100).contains(&target) {
-            self.error = Some("pointer speed: target is outside the typed -100..100 range".to_owned());
+            self.error =
+                Some("pointer speed: target is outside the typed -100..100 range".to_owned());
             return false;
         }
         self.mouse_touch.pointer_speed_percent = target;
@@ -2163,11 +2236,7 @@ impl SystemState {
 
     /// Apply the persisted touchpad tap-to-click policy through the native
     /// DRM/libinput input-policy handoff, keeping This Node and System identical.
-    pub(crate) fn dispatch_touchpad_tap(
-        &mut self,
-        ctx: &egui::Context,
-        enabled: bool,
-    ) -> bool {
+    pub(crate) fn dispatch_touchpad_tap(&mut self, ctx: &egui::Context, enabled: bool) -> bool {
         self.mouse_touch.touchpad_tap_to_click = enabled;
         self.mouse_touch.save();
         self.apply_mouse_touch(ctx);
@@ -2180,7 +2249,11 @@ impl SystemState {
     /// order: two-finger scroll, touchscreen input, edge gestures.
     pub(crate) fn touch_gesture_policy_target(&self) -> (bool, bool, bool) {
         let cfg = self.mouse_touch;
-        (cfg.two_finger_scroll, cfg.touchscreen_enabled, cfg.edge_gestures)
+        (
+            cfg.two_finger_scroll,
+            cfg.touchscreen_enabled,
+            cfg.edge_gestures,
+        )
     }
 
     /// Apply one bounded touch/gesture policy field through the same persisted
@@ -2555,11 +2628,7 @@ impl SettingsSection {
             Self::Displays | Self::Mouse | Self::Audio | Self::Bluetooth | Self::Power => {
                 SettingsGroup::Devices
             }
-            Self::Wallpaper
-            | Self::Hotkeys
-            | Self::KeyMapping
-            | Self::Theme
-            | Self::Clock => {
+            Self::Wallpaper | Self::Hotkeys | Self::KeyMapping | Self::Theme | Self::Clock => {
                 SettingsGroup::Personalization
             }
             Self::Identity | Self::Role | Self::Pairing | Self::Network | Self::RemoteProofing => {
@@ -3949,8 +4018,7 @@ impl ClockConfig {
     fn load() -> Self {
         Self::default_path()
             .and_then(|path| {
-                read_bounded_local_config(&path)
-                    .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+                read_bounded_local_config(&path).and_then(|s| serde_json::from_str::<Self>(&s).ok())
             })
             .unwrap_or_default()
     }
@@ -4796,11 +4864,7 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
 /// existing typed [`Seat`] action seam. The master output is the emphasized
 /// channel spanning the pane; playback strips spread **across** the wide detail
 /// pane as channel tiles (SETTINGS-3), not a stacked column.
-fn mixer_section(
-    ui: &mut egui::Ui,
-    snap: Option<&SeatSnapshot>,
-    actions: &mut Vec<SysAction>,
-) {
+fn mixer_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>, actions: &mut Vec<SysAction>) {
     probe_section(
         ui,
         snap,

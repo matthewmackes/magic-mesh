@@ -820,12 +820,9 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         RestartPolicy::OnFailure,
         WorkerGroup::Control,
     ),
-    // NODE-GRADE-1 (node-grade.md #11) — the per-node self-grade worker. UNIVERSAL
-    // (rank 0): every node computes + publishes its OWN A–F capability grade
-    // (`<workgroup_root>/node-grade/<hostname>.json`) from the telemetry the
-    // platform already gathers, so a lighthouse grades itself too. A deliberate
-    // rank-0 census entry (the BUG-STORAGE-1 lesson), never the silent
-    // unknown-worker default.
+    // The universal System and Mesh Health publisher. Every node contributes
+    // typed evidence; workstation rows are roster-folded into the five-seat
+    // snapshot, while lighthouse reachability contributes mesh-wide evidence.
     WorkerSpec::tier(
         "node_grade",
         0,

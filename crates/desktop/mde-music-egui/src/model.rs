@@ -32,7 +32,12 @@ impl SeatServer {
     /// Construct an unprobed candidate at the default priority.
     #[must_use]
     pub fn new(seat: impl Into<String>, url: impl Into<String>) -> Self {
-        Self { seat: seat.into(), url: url.into(), operator_priority: 0, latency_ms: None }
+        Self {
+            seat: seat.into(),
+            url: url.into(),
+            operator_priority: 0,
+            latency_ms: None,
+        }
     }
 }
 
@@ -513,7 +518,10 @@ mod tests {
         let mut preferred = SeatServer::new("preferred", "https://preferred.example");
         preferred.operator_priority = 3;
         preferred.latency_ms = Some(200);
-        assert_eq!(select_default_server(&[slow.clone(), fast.clone(), preferred]), Some(2));
+        assert_eq!(
+            select_default_server(&[slow.clone(), fast.clone(), preferred]),
+            Some(2)
+        );
         assert_eq!(select_default_server(&[fast, slow]), Some(0));
     }
 

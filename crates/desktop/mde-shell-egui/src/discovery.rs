@@ -76,7 +76,7 @@ fn now_ms() -> u64 {
 
 /// The local peer name stamped as the session's `client_peer`: `$HOSTNAME` →
 /// `/etc/hostname` → `"localhost"` (the desktop-tier idiom, shared with
-/// `mde-panel-egui`). The mesh identifies nodes by hostname.
+/// the other mesh-aware clients). The mesh identifies nodes by hostname.
 pub(crate) fn local_peer() -> String {
     if let Ok(h) = std::env::var("HOSTNAME") {
         let h = h.trim();

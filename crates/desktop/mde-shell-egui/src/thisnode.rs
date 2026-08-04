@@ -36,7 +36,6 @@ use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::{DenseList, Style};
-use mde_collab_types::{AlertActionKind, AlertInbox, CollabCommand, Severity};
 
 use crate::this_node_catalog::{page_index, PageEntry, Section, SectionGroup};
 
@@ -65,14 +64,7 @@ const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 /// This Node state into an unbounded telemetry store.
 const MAX_TELEMETRY_SAMPLES: usize = 60;
 
-/// Journal reads are fixed, read-only, and off the render thread. The provider
-/// deliberately exposes only recent warning/error lines, never an arbitrary
-/// query or a user-provided command.
-const DIAGNOSTICS_REFRESH: Duration = Duration::from_secs(15);
 const SERVICES_REFRESH: Duration = Duration::from_secs(15);
-const MAX_DIAGNOSTIC_LINES: usize = 32;
-const MAX_DIAGNOSTIC_LINE_CHARS: usize = 240;
-const MAX_DIAGNOSTIC_BYTES: usize = 12 * 1024;
 const MAX_FAILED_SERVICES: usize = 32;
 const MAX_SERVICE_NAME_CHARS: usize = 128;
 const MAX_LOCAL_PRINTERS: usize = 16;
@@ -85,8 +77,6 @@ const MAX_APP_ROWS: usize = 256;
 const MAX_VENDOR_PACKS: usize = 8;
 const MAX_VENDOR_CAPABILITIES: usize = 8;
 const MAX_VENDOR_TEXT_CHARS: usize = 96;
-const MAX_LINKED_ALERTS: usize = 8;
-const MAX_ALERT_ACTIONS: usize = 4;
 
 #[derive(Default)]
 struct LocalFreshness {
@@ -106,61 +96,6 @@ impl LocalFreshnessSummary {
             Some(last) if last.elapsed() <= LOCAL_PROVIDER_MAX_AGE => self.fresh += 1,
             Some(_) => self.stale += 1,
             None => self.awaiting += 1,
-        }
-    }
-}
-
-struct DiagnosticsProvider {
-    lines: Vec<String>,
-    error: Option<&'static str>,
-    freshness: LocalFreshness,
-    last_poll: Option<Instant>,
-    receiver: Option<Receiver<Result<Vec<String>, &'static str>>>,
-}
-
-impl Default for DiagnosticsProvider {
-    fn default() -> Self {
-        Self {
-            lines: Vec::new(),
-            error: None,
-            freshness: LocalFreshness::default(),
-            last_poll: None,
-            receiver: None,
-        }
-    }
-}
-
-impl DiagnosticsProvider {
-    fn poll(&mut self) {
-        if let Some(receiver) = self.receiver.take() {
-            match receiver.try_recv() {
-                Ok(Ok(lines)) => {
-                    self.lines = lines;
-                    self.error = None;
-                    self.freshness.last_success = Some(Instant::now());
-                }
-                Ok(Err(error)) => {
-                    self.lines.clear();
-                    self.error = Some(error);
-                }
-                Err(TryRecvError::Empty) => self.receiver = Some(receiver),
-                Err(TryRecvError::Disconnected) => {
-                    self.lines.clear();
-                    self.error = Some("The journal provider stopped before returning evidence.");
-                }
-            }
-        }
-        if self.receiver.is_none()
-            && self
-                .last_poll
-                .is_none_or(|last| last.elapsed() >= DIAGNOSTICS_REFRESH)
-        {
-            self.last_poll = Some(Instant::now());
-            let (sender, receiver) = channel();
-            self.receiver = Some(receiver);
-            thread::spawn(move || {
-                let _ = sender.send(read_bounded_journal());
-            });
         }
     }
 }
@@ -218,7 +153,8 @@ impl LocalLocaleProvider {
                 Err(TryRecvError::Empty) => self.receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
                     self.facts = LocalLocaleFacts::default();
-                    self.state = Err("The local locale provider stopped before returning evidence.");
+                    self.state =
+                        Err("The local locale provider stopped before returning evidence.");
                 }
             }
         }
@@ -242,9 +178,9 @@ fn bounded_locale_value(value: &str) -> Option<String> {
     if value.is_empty()
         || value.len() > 96
         || value.chars().any(char::is_control)
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b'/' | b':'))
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b'/' | b':')
+        })
     {
         return None;
     }
@@ -255,7 +191,12 @@ fn read_local_locale() -> Result<LocalLocaleFacts, &'static str> {
     let mut language = None;
     let mut locale = None;
     let mut keyboard_region = None;
-    for path in ["/etc/locale.conf", "/etc/default/locale", "/etc/default/keyboard", "/etc/vconsole.conf"] {
+    for path in [
+        "/etc/locale.conf",
+        "/etc/default/locale",
+        "/etc/default/keyboard",
+        "/etc/vconsole.conf",
+    ] {
         let Ok(contents) = std::fs::read_to_string(path) else {
             continue;
         };
@@ -267,9 +208,7 @@ fn read_local_locale() -> Result<LocalLocaleFacts, &'static str> {
             match key.trim() {
                 "LANGUAGE" if language.is_none() => language = value,
                 "LANG" | "LC_ALL" if locale.is_none() => locale = value,
-                "XKBLAYOUT" | "KEYMAP" if keyboard_region.is_none() => {
-                    keyboard_region = value
-                }
+                "XKBLAYOUT" | "KEYMAP" if keyboard_region.is_none() => keyboard_region = value,
                 _ => {}
             }
         }
@@ -289,11 +228,13 @@ fn read_local_locale() -> Result<LocalLocaleFacts, &'static str> {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .and_then(|output| match String::from_utf8_lossy(&output.stdout).trim() {
-            "yes" => Some(true),
-            "no" => Some(false),
-            _ => None,
-        });
+        .and_then(
+            |output| match String::from_utf8_lossy(&output.stdout).trim() {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            },
+        );
     if language.is_none()
         && locale.is_none()
         && timezone.is_none()
@@ -313,7 +254,13 @@ fn read_local_locale() -> Result<LocalLocaleFacts, &'static str> {
 
 impl Default for LocalServiceProvider {
     fn default() -> Self {
-        Self { failed: Vec::new(), state: Err("The local service provider has not returned yet."), freshness: LocalFreshness::default(), last_poll: None, receiver: None }
+        Self {
+            failed: Vec::new(),
+            state: Err("The local service provider has not returned yet."),
+            freshness: LocalFreshness::default(),
+            last_poll: None,
+            receiver: None,
+        }
     }
 }
 
@@ -326,26 +273,42 @@ impl LocalServiceProvider {
                     self.state = Ok(());
                     self.freshness.last_success = Some(Instant::now());
                 }
-                Ok(Err(error)) => { self.failed.clear(); self.state = Err(error); }
+                Ok(Err(error)) => {
+                    self.failed.clear();
+                    self.state = Err(error);
+                }
                 Err(TryRecvError::Empty) => self.receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
                     self.failed.clear();
-                    self.state = Err("The local service provider stopped before returning evidence.");
+                    self.state =
+                        Err("The local service provider stopped before returning evidence.");
                 }
             }
         }
-        if self.receiver.is_none() && self.last_poll.is_none_or(|last| last.elapsed() >= SERVICES_REFRESH) {
+        if self.receiver.is_none()
+            && self
+                .last_poll
+                .is_none_or(|last| last.elapsed() >= SERVICES_REFRESH)
+        {
             self.last_poll = Some(Instant::now());
             let (sender, receiver) = channel();
             self.receiver = Some(receiver);
-            thread::spawn(move || { let _ = sender.send(read_failed_services()); });
+            thread::spawn(move || {
+                let _ = sender.send(read_failed_services());
+            });
         }
     }
 }
 
 fn read_failed_services() -> Result<Vec<String>, &'static str> {
     let output = Command::new("systemctl")
-        .args(["--failed", "--plain", "--no-legend", "--no-pager", "--type=service"])
+        .args([
+            "--failed",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--type=service",
+        ])
         .output()
         .map_err(|_| "The local systemd service provider is unavailable.")?;
     if !output.status.success() && output.status.code() != Some(1) {
@@ -354,10 +317,14 @@ fn read_failed_services() -> Result<Vec<String>, &'static str> {
     let mut failed = Vec::new();
     for raw in String::from_utf8_lossy(&output.stdout).lines() {
         let name = raw.split_whitespace().next().unwrap_or("");
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
         let name: String = name.chars().take(MAX_SERVICE_NAME_CHARS).collect();
         failed.push(name);
-        if failed.len() == MAX_FAILED_SERVICES { break; }
+        if failed.len() == MAX_FAILED_SERVICES {
+            break;
+        }
     }
     Ok(failed)
 }
@@ -409,12 +376,15 @@ impl LocalPrinterProvider {
                 Err(TryRecvError::Disconnected) => {
                     self.printers.clear();
                     self.default = None;
-                    self.state = Err("The local printer provider stopped before returning evidence.");
+                    self.state =
+                        Err("The local printer provider stopped before returning evidence.");
                 }
             }
         }
         if self.receiver.is_none()
-            && self.last_poll.is_none_or(|last| last.elapsed() >= SERVICES_REFRESH)
+            && self
+                .last_poll
+                .is_none_or(|last| last.elapsed() >= SERVICES_REFRESH)
         {
             self.last_poll = Some(Instant::now());
             let (sender, receiver) = channel();
@@ -434,7 +404,9 @@ fn read_local_printers() -> Result<(Vec<LocalPrinter>, Option<String>), &'static
     if !output.status.success() {
         return Err("The local CUPS printer provider refused the fixed read-only query.");
     }
-    Ok(parse_local_printers(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_local_printers(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_local_printers(output: &str) -> (Vec<LocalPrinter>, Option<String>) {
@@ -458,7 +430,9 @@ fn parse_local_printers(output: &str) -> (Vec<LocalPrinter>, Option<String>) {
             && fields.get(1) == Some(&"default")
             && fields.get(2) == Some(&"destination:")
         {
-            default = fields.get(3).map(|name| name.chars().take(MAX_SERVICE_NAME_CHARS).collect());
+            default = fields
+                .get(3)
+                .map(|name| name.chars().take(MAX_SERVICE_NAME_CHARS).collect());
         }
     }
     (printers, default)
@@ -514,7 +488,8 @@ impl LocalSecurityProvider {
                 }
                 Err(TryRecvError::Empty) => self.receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
-                    self.firewall = Err("The local firewalld provider stopped before returning evidence.");
+                    self.firewall =
+                        Err("The local firewalld provider stopped before returning evidence.");
                 }
             }
         }
@@ -528,12 +503,15 @@ impl LocalSecurityProvider {
                 }
                 Err(TryRecvError::Empty) => self.encryption_receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
-                    self.encryption = Err("The local encryption provider stopped before returning evidence.");
+                    self.encryption =
+                        Err("The local encryption provider stopped before returning evidence.");
                 }
             }
         }
         if self.receiver.is_none()
-            && self.last_poll.is_none_or(|last| last.elapsed() >= SECURITY_REFRESH)
+            && self
+                .last_poll
+                .is_none_or(|last| last.elapsed() >= SECURITY_REFRESH)
         {
             self.last_poll = Some(Instant::now());
             let (sender, receiver) = channel();
@@ -578,7 +556,10 @@ fn parse_firewall_state(state: &str) -> Result<FirewallState, &'static str> {
 fn show_local_freshness(ui: &mut egui::Ui, last_success: Option<Instant>) {
     match last_success {
         Some(last) if last.elapsed() <= LOCAL_PROVIDER_MAX_AGE => {
-            ui.colored_label(Style::OK, format!("Fresh • {}s ago", last.elapsed().as_secs()));
+            ui.colored_label(
+                Style::OK,
+                format!("Fresh • {}s ago", last.elapsed().as_secs()),
+            );
         }
         Some(_) => {
             ui.colored_label(Style::WARN, "Stale • refresh local provider");
@@ -603,12 +584,13 @@ fn show_local_timestamp_freshness(ui: &mut egui::Ui, observed_at_ms: u64) {
 }
 
 fn read_encryption_state(root: &Path) -> Result<EncryptionState, &'static str> {
-    let entries = std::fs::read_dir(root)
-        .map_err(|_| "The local encryption provider is unavailable.")?;
+    let entries =
+        std::fs::read_dir(root).map_err(|_| "The local encryption provider is unavailable.")?;
     let mut mappings = 0;
     let mut encrypted = 0;
     for entry in entries {
-        let entry = entry.map_err(|_| "The local encryption provider could not inspect mappings.")?;
+        let entry =
+            entry.map_err(|_| "The local encryption provider could not inspect mappings.")?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("dm-") {
@@ -628,7 +610,10 @@ fn read_encryption_state(root: &Path) -> Result<EncryptionState, &'static str> {
     if mappings == 0 {
         Ok(EncryptionState::NoMappings)
     } else {
-        Ok(EncryptionState::Observed { mappings, encrypted })
+        Ok(EncryptionState::Observed {
+            mappings,
+            encrypted,
+        })
     }
 }
 
@@ -668,12 +653,15 @@ impl LocalBackupProvider {
                 }
                 Err(TryRecvError::Empty) => self.receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
-                    self.state = Err("The local backup provider stopped before returning evidence.");
+                    self.state =
+                        Err("The local backup provider stopped before returning evidence.");
                 }
             }
         }
         if self.receiver.is_none()
-            && self.last_poll.is_none_or(|last| last.elapsed() >= SECURITY_REFRESH)
+            && self
+                .last_poll
+                .is_none_or(|last| last.elapsed() >= SECURITY_REFRESH)
         {
             self.last_poll = Some(Instant::now());
             let path = self.path.clone();
@@ -689,7 +677,9 @@ impl LocalBackupProvider {
 fn read_backup_metadata(path: &Path) -> Result<BackupState, &'static str> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BackupState::Missing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BackupState::Missing)
+        }
         Err(_) => return Err("The local backup artifact could not be inspected."),
     };
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -704,7 +694,10 @@ fn read_backup_metadata(path: &Path) -> Result<BackupState, &'static str> {
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .ok_or("The local backup artifact has no usable modification time.")?;
-    Ok(BackupState::Present { bytes: metadata.len(), modified_ms })
+    Ok(BackupState::Present {
+        bytes: metadata.len(),
+        modified_ms,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -745,12 +738,15 @@ impl LocalApplicationProvider {
                 }
                 Err(TryRecvError::Empty) => self.receiver = Some(receiver),
                 Err(TryRecvError::Disconnected) => {
-                    self.facts = Err("The local application mirror stopped before returning evidence.");
+                    self.facts =
+                        Err("The local application mirror stopped before returning evidence.");
                 }
             }
         }
         if self.receiver.is_none()
-            && self.last_poll.is_none_or(|last| last.elapsed() >= SERVICES_REFRESH)
+            && self
+                .last_poll
+                .is_none_or(|last| last.elapsed() >= SERVICES_REFRESH)
         {
             self.last_poll = Some(Instant::now());
             let installed = self.installed_path.clone();
@@ -786,11 +782,13 @@ fn read_app_array_count(path: &Path, key: &str) -> Result<Option<usize>, &'stati
     if metadata.len() > MAX_APP_MIRROR_BYTES as u64 {
         return Err("The local application mirror exceeds its bounded size.");
     }
-    let body = std::fs::read(path).map_err(|_| "The local application mirror could not be read.")?;
+    let body =
+        std::fs::read(path).map_err(|_| "The local application mirror could not be read.")?;
     if body.len() > MAX_APP_MIRROR_BYTES {
         return Err("The local application mirror grew beyond its bounded size.");
     }
-    let value: Value = serde_json::from_slice(&body).map_err(|_| "The local application mirror is malformed.")?;
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| "The local application mirror is malformed.")?;
     let count = value
         .get(key)
         .and_then(Value::as_array)
@@ -799,85 +797,6 @@ fn read_app_array_count(path: &Path, key: &str) -> Result<Option<usize>, &'stati
     (count <= MAX_APP_ROWS)
         .then_some(Some(count))
         .ok_or("The local application mirror exceeded its row bound.")
-}
-
-fn read_bounded_journal() -> Result<Vec<String>, &'static str> {
-    let output = Command::new("journalctl")
-        .args([
-            "--no-pager",
-            "--quiet",
-            "--output=short-monotonic",
-            "--lines=32",
-            "--priority=warning..emerg",
-        ])
-        .output()
-        .map_err(|_| "The local journal provider is unavailable.")?;
-    if !output.status.success() {
-        return Err("The local journal provider refused or could not read diagnostics.");
-    }
-    let mut lines = Vec::new();
-    let mut bytes: usize = 0;
-    for raw in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = redact_journal_line(raw);
-        if line.is_empty() {
-            continue;
-        }
-        let line: String = line.chars().take(MAX_DIAGNOSTIC_LINE_CHARS).collect();
-        if bytes.saturating_add(line.len()) > MAX_DIAGNOSTIC_BYTES {
-            break;
-        }
-        bytes = bytes.saturating_add(line.len());
-        lines.push(line);
-        if lines.len() == MAX_DIAGNOSTIC_LINES {
-            break;
-        }
-    }
-    Ok(lines)
-}
-
-fn redact_journal_line(raw: &str) -> String {
-    let mut redact_next = false;
-    raw.split_whitespace()
-        .map(|token| {
-            if redact_next {
-                redact_next = false;
-                return "<redacted>".to_owned();
-            }
-            let lower = token.to_ascii_lowercase();
-            let sensitive = [
-                "password",
-                "passwd",
-                "passphrase",
-                "token",
-                "secret",
-                "ssid",
-                "psk",
-                "api_key",
-                "apikey",
-                "authorization",
-                "cookie",
-            ]
-            .iter()
-            .any(|key| {
-                lower.starts_with(key)
-                    && (lower[key.len()..].starts_with('=')
-                        || lower[key.len()..].starts_with(':'))
-            });
-            if sensitive {
-                let delimiter = token
-                    .find(['=', ':'])
-                    .map(|index| &token[index..=index])
-                    .unwrap_or("=");
-                format!("<redacted>{delimiter}<redacted>")
-            } else if lower == "bearer" {
-                redact_next = true;
-                "Bearer".to_owned()
-            } else {
-                token.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Read one mesh-status snapshot through the descriptor that is consumed.
@@ -1340,17 +1259,14 @@ fn audio_facts(value: Option<&Value>) -> AudioFacts {
         return AudioFacts::default();
     };
     let component_available = |flat_key: &str, typed_key: &str| {
-        object
-            .get(flat_key)
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                object
-                    .get(typed_key)
-                    .and_then(Value::as_object)
-                    .and_then(|component| component.get("availability"))
-                    .and_then(Value::as_str)
-                    .map(|state| state == "available")
-            })
+        object.get(flat_key).and_then(Value::as_bool).or_else(|| {
+            object
+                .get(typed_key)
+                .and_then(Value::as_object)
+                .and_then(|component| component.get("availability"))
+                .and_then(Value::as_str)
+                .map(|state| state == "available")
+        })
     };
     let typed_pulse = object
         .get("pulse_audio_compatibility")
@@ -2109,164 +2025,6 @@ impl NodeStatus {
         })
     }
 
-    /// Fold the existing read model into the fixed eight-section dashboard.
-    /// There is intentionally no local score calculation here: the top rail's
-    /// mesh-status authority remains the source of health facts, while this
-    /// method only assigns a presentational state to each governed destination.
-    fn health_dashboard(&self) -> HealthDashboard {
-        let states = Section::ALL.map(|section| (section, self.section_health(section)));
-        let overall = if self.stale {
-            SectionHealth::Stale
-        } else if states
-            .iter()
-            .any(|(_, health)| *health == SectionHealth::Unhealthy)
-        {
-            SectionHealth::Unhealthy
-        } else if states
-            .iter()
-            .any(|(_, health)| *health == SectionHealth::Attention)
-        {
-            SectionHealth::Attention
-        } else if states
-            .iter()
-            .all(|(_, health)| *health == SectionHealth::Unavailable)
-        {
-            SectionHealth::Unavailable
-        } else if states
-            .iter()
-            .any(|(_, health)| *health == SectionHealth::Unavailable)
-        {
-            SectionHealth::Attention
-        } else {
-            SectionHealth::Healthy
-        };
-        HealthDashboard { states, overall }
-    }
-
-    fn section_health(&self, section: Section) -> SectionHealth {
-        if self.stale {
-            return SectionHealth::Stale;
-        }
-        if !self.seen {
-            return SectionHealth::Unavailable;
-        }
-
-        match section {
-            Section::Overview => {
-                if self.presence.as_deref() == Some("offline")
-                    || self.services.iter().any(|(_, up)| !up)
-                {
-                    SectionHealth::Unhealthy
-                } else if self.presence.as_deref() == Some("idle")
-                    || self.update_available
-                    || !self.in_directory
-                {
-                    SectionHealth::Attention
-                } else if self.services.is_empty() {
-                    SectionHealth::Unavailable
-                } else {
-                    SectionHealth::Healthy
-                }
-            }
-            Section::Connectivity => match self.connectivity_availability() {
-                ConnectivityAvailability::Available(_) => SectionHealth::Healthy,
-                ConnectivityAvailability::Degraded(_) => SectionHealth::Attention,
-                ConnectivityAvailability::Unavailable(_) => SectionHealth::Unavailable,
-            },
-            Section::DisplaySound => {
-                let has_display = self.display != DisplayFacts::default();
-                let has_audio = self.audio != AudioFacts::default();
-                if !has_display && !has_audio {
-                    SectionHealth::Unavailable
-                } else if [
-                    self.audio.pulse_available,
-                    self.audio.pipewire_graph,
-                    self.audio.wireplumber_policy,
-                    self.audio.playback,
-                    self.audio.capture,
-                ]
-                .into_iter()
-                .any(|state| state == Some(false))
-                {
-                    SectionHealth::Attention
-                } else {
-                    SectionHealth::Healthy
-                }
-            }
-            Section::Input => {
-                if self.input.event_devices.is_some() {
-                    SectionHealth::Attention
-                } else {
-                    SectionHealth::Unavailable
-                }
-            }
-            Section::Personalization => {
-                if section.unavailable_reason().is_some() {
-                    SectionHealth::Unavailable
-                } else {
-                    SectionHealth::Healthy
-                }
-            }
-            Section::PowerPerformance => {
-                let has_telemetry = self.telemetry.cpu_cores.is_some()
-                    || self.telemetry.load_1m_milli.is_some()
-                    || self.telemetry.memory_total_bytes.is_some()
-                    || self.hardware.thermal_zones.is_some()
-                    || self.hardware.thermal_max_milli_c.is_some();
-                let has_power_source = self.power_source.battery_count.is_some()
-                    || self.power_source.battery_percent.is_some()
-                    || self.power_source.ac_online.is_some();
-                if self.power_profile.active.is_some()
-                    && !self.power_profile.available.is_empty()
-                    && has_telemetry
-                    && has_power_source
-                {
-                    SectionHealth::Healthy
-                } else if !self.power_profile.available.is_empty()
-                    || has_telemetry
-                    || has_power_source
-                {
-                    SectionHealth::Attention
-                } else {
-                    SectionHealth::Unavailable
-                }
-            }
-            Section::Hardware => {
-                if self.telemetry.root_total_bytes.is_some()
-                    || self.hardware.storage_devices.is_some()
-                    || self.hardware.thermal_zones.is_some()
-                {
-                    SectionHealth::Attention
-                } else {
-                    // Do not turn the absence into a fake healthy device tree
-                    // or an invented device count.
-                    SectionHealth::Unavailable
-                }
-            }
-            Section::MeshSystem => {
-                let mesh = self
-                    .capability_projection()
-                    .into_iter()
-                    .find(|projection| projection.capability == NodeCapability::MeshContext)
-                    .map(|projection| projection.availability);
-                if self.services.iter().any(|(_, up)| !up) {
-                    SectionHealth::Unhealthy
-                } else if matches!(mesh, Some(CapabilityAvailability::Degraded(_)))
-                    || matches!(mesh, Some(CapabilityAvailability::Available(_)))
-                        && self.services.is_empty()
-                {
-                    SectionHealth::Attention
-                } else if matches!(mesh, Some(CapabilityAvailability::Available(_)))
-                    && !self.services.is_empty()
-                {
-                    SectionHealth::Healthy
-                } else {
-                    SectionHealth::Unavailable
-                }
-            }
-        }
-    }
-
     /// Project the bounded, read-only capabilities this snapshot can support.
     ///
     /// The snapshot is an observation boundary, not a provider registry. A
@@ -2600,9 +2358,7 @@ fn bounded_vendor_text(value: &str) -> Option<String> {
 /// after the source snapshot goes stale. Preserve an actually-unavailable state
 /// (there is still no observation to degrade), but make every observed state
 /// visibly stale in the row itself rather than relying on the banner above it.
-fn stale_provider_availability(
-    availability: ConnectivityAvailability,
-) -> ConnectivityAvailability {
+fn stale_provider_availability(availability: ConnectivityAvailability) -> ConnectivityAvailability {
     match availability {
         ConnectivityAvailability::Available(_) | ConnectivityAvailability::Degraded(_) => {
             ConnectivityAvailability::Degraded(
@@ -3000,90 +2756,6 @@ fn presence_tone(presence: &str) -> Color32 {
     }
 }
 
-/// Presentation severity for a governed This Node section.
-///
-/// This is deliberately not a second numeric health score. The dashboard folds
-/// the same snapshot/provider observations that the top rail already exposes:
-/// explicit down/offline facts become unhealthy, partial facts become attention,
-/// missing facts remain unavailable, and a retained projection remains stale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SectionHealth {
-    Healthy,
-    Attention,
-    Unhealthy,
-    Unavailable,
-    Stale,
-}
-
-impl SectionHealth {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Healthy => "Healthy",
-            Self::Attention => "Attention",
-            Self::Unhealthy => "Unhealthy",
-            Self::Unavailable => "Unavailable",
-            Self::Stale => "Stale",
-        }
-    }
-
-    pub(crate) const fn glyph(self) -> &'static str {
-        match self {
-            Self::Healthy => "●",
-            Self::Attention => "▲",
-            Self::Unhealthy => "■",
-            Self::Unavailable => "—",
-            Self::Stale => "◌",
-        }
-    }
-
-    pub(crate) const fn tone(self) -> Color32 {
-        match self {
-            Self::Healthy => Style::OK,
-            Self::Attention => Style::WARN,
-            Self::Unhealthy => Style::DANGER,
-            Self::Unavailable | Self::Stale => Style::TEXT_DIM,
-        }
-    }
-
-    pub(crate) const fn is_alert(self) -> bool {
-        matches!(self, Self::Attention | Self::Unhealthy | Self::Stale)
-    }
-}
-
-/// The fixed health projection used by the landing view and its tree.
-///
-/// Keeping the section/state pairs together makes it impossible for the
-/// dashboard and hierarchy to silently disagree about which governed section
-/// is affected. `states` is populated from `Section::ALL`, not provider data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HealthDashboard {
-    states: [(Section, SectionHealth); 8],
-    overall: SectionHealth,
-}
-
-impl HealthDashboard {
-    fn health(self, section: Section) -> SectionHealth {
-        self.states
-            .iter()
-            .find_map(|(candidate, health)| (*candidate == section).then_some(*health))
-            .unwrap_or(SectionHealth::Unavailable)
-    }
-
-    fn count(self, health: SectionHealth) -> usize {
-        self.states
-            .iter()
-            .filter(|(_, candidate)| *candidate == health)
-            .count()
-    }
-
-    fn alert_count(self) -> usize {
-        self.states
-            .iter()
-            .filter(|(_, health)| health.is_alert())
-            .count()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ThisNodeView {
     #[default]
@@ -3113,8 +2785,6 @@ pub(crate) struct ThisNodeState {
     /// Redacted provider outcomes consumed by the shared Events/Audit detail
     /// panes. This is a presentation cache; execution remains owned by System.
     action_audit: Vec<crate::system::ActionAuditRecord>,
-    /// Off-thread fixed journal provider for the Diagnostics & Logs route.
-    diagnostics: DiagnosticsProvider,
     /// Off-thread fixed local systemd failure provider for Services continuity.
     services: LocalServiceProvider,
     /// Off-thread fixed locale/time-zone provider for OS-management continuity.
@@ -3138,10 +2808,7 @@ pub(crate) struct ThisNodeState {
     /// The next Bluetooth radio state awaiting confirmation in Actions.
     pending_bluetooth_power: Option<bool>,
     /// The selected Bluetooth device verb awaiting confirmation.
-    pending_bluetooth_device: Option<(
-        String,
-        crate::system::BluetoothDeviceAction,
-    )>,
+    pending_bluetooth_device: Option<(String, crate::system::BluetoothDeviceAction)>,
     /// The host power/session verb awaiting confirmation.
     pending_power_session: Option<mde_seat::PowerVerb>,
     /// The next Wi-Fi radio state awaiting confirmation.
@@ -3188,7 +2855,6 @@ impl Default for ThisNodeState {
             last_poll: None,
             telemetry_history: Vec::new(),
             action_audit: Vec::new(),
-            diagnostics: DiagnosticsProvider::default(),
             services: LocalServiceProvider::default(),
             locale: LocalLocaleProvider::default(),
             printers: LocalPrinterProvider::default(),
@@ -3245,14 +2911,6 @@ impl ThisNodeState {
             }
             self.telemetry_history.push(sample);
         }
-    }
-
-    /// Return the presentational health for a governed section. The unified
-    /// shell uses this read-only projection for tree badges; it remains folded
-    /// from the same snapshot authority as the inventory dashboard and does
-    /// not introduce another score.
-    pub(crate) fn section_health(&self, section: Section) -> SectionHealth {
-        self.status.health_dashboard().health(section)
     }
 
     /// Whether the dedicated Actions workflow is selected. The unified shell
@@ -3327,7 +2985,6 @@ impl ThisNodeState {
     /// missing / unreadable snapshot retains a previously valid projection as
     /// stale; before the first valid snapshot it yields the unseen status.
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
-        self.diagnostics.poll();
         self.services.poll();
         self.locale.poll();
         self.printers.poll();
@@ -3381,19 +3038,6 @@ impl ThisNodeState {
         ui: &mut egui::Ui,
         mut system: Option<&mut crate::system::SystemState>,
     ) {
-        self.show_with_system_and_alerts(ui, system, None);
-    }
-
-    /// Render the plane with the existing Communications alert projection
-    /// linked into the inventory landing view. Alert mutations remain on the
-    /// signed collab command path; This Node does not own a second alert store.
-    pub(crate) fn show_with_system_and_alerts(
-        &mut self,
-        ui: &mut egui::Ui,
-        mut system: Option<&mut crate::system::SystemState>,
-        communications: Option<&crate::communications::CommunicationsState>,
-    ) {
-        let alert_inbox = communications.and_then(|state| state.alert_inbox());
         let mut view = self.view;
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -3417,10 +3061,7 @@ impl ThisNodeState {
             ui.menu_button("Open detail", |ui| {
                 for page in page_index().iter().copied() {
                     if ui
-                        .selectable_label(
-                            view == ThisNodeView::Detail(page),
-                            page.label,
-                        )
+                        .selectable_label(view == ThisNodeView::Detail(page), page.label)
                         .clicked()
                     {
                         view = ThisNodeView::Detail(page);
@@ -3437,33 +3078,24 @@ impl ThisNodeState {
         self.view = view;
         match view {
             ThisNodeView::Inventory => {
-                if let Some(page) = show_status(
-                    ui,
-                    &self.status,
-                    alert_inbox,
-                    communications,
-                    self.local_freshness_summary(),
-                ) {
+                if let Some(page) = show_status(ui, &self.status, self.local_freshness_summary()) {
                     self.view = ThisNodeView::Detail(page);
                 }
             }
-            ThisNodeView::Detail(page) => {
-                show_section_detail(
-                    ui,
-                    &self.status,
-                    page,
-                    system.as_deref_mut(),
-                    &self.telemetry_history,
-                    &self.action_audit,
-                    &self.diagnostics,
-                    &self.services,
-                    &self.locale,
-                    &self.printers,
-                    &self.security,
-                    &self.backup,
-                    &self.applications,
-                )
-            }
+            ThisNodeView::Detail(page) => show_section_detail(
+                ui,
+                &self.status,
+                page,
+                system.as_deref_mut(),
+                &self.telemetry_history,
+                &self.action_audit,
+                &self.services,
+                &self.locale,
+                &self.printers,
+                &self.security,
+                &self.backup,
+                &self.applications,
+            ),
             ThisNodeView::Actions => match system {
                 Some(system) => self.show_actions_with_system(ui, system),
                 None => show_actions_workflow(ui, &self.status),
@@ -3473,7 +3105,6 @@ impl ThisNodeState {
 
     fn local_freshness_summary(&self) -> LocalFreshnessSummary {
         let mut summary = LocalFreshnessSummary::default();
-        summary.add(&self.diagnostics.freshness);
         summary.add(&self.services.freshness);
         summary.add(&self.locale.freshness);
         summary.add(&self.printers.freshness);
@@ -3517,8 +3148,6 @@ fn local_hostname() -> String {
 fn show_status(
     ui: &mut egui::Ui,
     status: &NodeStatus,
-    alert_inbox: Option<&AlertInbox>,
-    communications: Option<&crate::communications::CommunicationsState>,
     local_freshness: LocalFreshnessSummary,
 ) -> Option<PageEntry> {
     let mut selected = None;
@@ -3537,17 +3166,9 @@ fn show_status(
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
                 );
-                let dashboard = status.health_dashboard();
-                selected = show_inventory_summary(ui, status, dashboard, local_freshness);
+                selected = show_inventory_summary(ui, status, local_freshness);
                 ui.add_space(Style::SP_S);
-                show_health_dashboard(ui, status, dashboard);
-                if let (Some(alert_inbox), Some(communications)) =
-                    (alert_inbox, communications)
-                {
-                    show_linked_health_alerts(ui, status, alert_inbox, communications);
-                }
-                ui.add_space(Style::SP_S);
-                selected = selected.or_else(|| show_section_hierarchy(ui, status, dashboard));
+                selected = selected.or_else(|| show_section_hierarchy(ui, status));
                 show_capability_surface(ui, status);
             });
         return selected;
@@ -3572,19 +3193,13 @@ fn show_status(
                 });
                 ui.add_space(Style::SP_S);
             }
-            let dashboard = status.health_dashboard();
-            selected = show_inventory_summary(ui, status, dashboard, local_freshness);
+            selected = show_inventory_summary(ui, status, local_freshness);
             ui.add_space(Style::SP_S);
-            show_health_dashboard(ui, status, dashboard);
-            if let (Some(alert_inbox), Some(communications)) = (alert_inbox, communications) {
-                show_linked_health_alerts(ui, status, alert_inbox, communications);
-            }
-            ui.add_space(Style::SP_S);
-            selected = selected.or_else(|| show_section_hierarchy(ui, status, dashboard));
+            selected = selected.or_else(|| show_section_hierarchy(ui, status));
             ui.add_space(Style::SP_S);
             mde_egui::muted_note(
                 ui,
-                "Select a row or use Open detail for the full provider view. The landing page stays compact so health and navigation remain usable at every size.",
+                "Select a row or use Open detail for the full provider view. The landing page stays compact and inventory-first at every size.",
             );
             show_capability_surface(ui, status);
     });
@@ -3592,8 +3207,8 @@ fn show_status(
 }
 
 /// Full-page detail view for one governed section. The detail route is a view
-/// over the same snapshot authority as the inventory and health dashboard; it
-/// does not create a second provider or health model.
+/// over the same inventory snapshot authority; it does not create a second
+/// provider model.
 fn show_section_detail(
     ui: &mut egui::Ui,
     status: &NodeStatus,
@@ -3601,7 +3216,6 @@ fn show_section_detail(
     system: Option<&mut crate::system::SystemState>,
     telemetry_history: &[TelemetrySample],
     action_audit: &[crate::system::ActionAuditRecord],
-    diagnostics: &DiagnosticsProvider,
     services: &LocalServiceProvider,
     locale: &LocalLocaleProvider,
     printers: &LocalPrinterProvider,
@@ -3613,15 +3227,9 @@ fn show_section_detail(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let health = status.health_dashboard().health(section);
             mde_egui::card().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(page.label).strong());
-                    ui.colored_label(
-                        health.tone(),
-                        RichText::new(format!("{} {}", health.glyph(), health.label()))
-                            .size(Style::SMALL),
-                    );
                     if status.stale {
                         ui.colored_label(Style::WARN, "refresh required");
                     }
@@ -3635,14 +3243,6 @@ fn show_section_detail(
                     ui.label(
                         RichText::new(reason)
                             .color(Style::TEXT_DIM)
-                            .size(Style::SMALL),
-                    );
-                } else if health != SectionHealth::Healthy {
-                    ui.label(
-                        RichText::new(
-                            section_health_detail(section, health, status),
-                        )
-                            .color(health.tone())
                             .size(Style::SMALL),
                     );
                 }
@@ -3662,9 +3262,6 @@ fn show_section_detail(
                 return;
             }
             match page.route {
-                "this-node/diagnostics" => {
-                    show_diagnostics(ui, status, diagnostics);
-                }
                 "this-node/services" => {
                     mde_egui::card().show(ui, |ui| show_services(ui, status));
                     ui.add_space(Style::SP_S);
@@ -3911,7 +3508,10 @@ fn show_detail_anatomy(
                 .size(Style::SMALL),
             );
             if status.stale {
-                ui.colored_label(Style::WARN, "Actions remain unavailable while this detail is stale.");
+                ui.colored_label(
+                    Style::WARN,
+                    "Actions remain unavailable while this detail is stale.",
+                );
             }
         });
 
@@ -3988,7 +3588,10 @@ fn show_vendor_packs(ui: &mut egui::Ui, status: &NodeStatus) {
 
 fn show_action_events(ui: &mut egui::Ui, records: &[crate::system::ActionAuditRecord]) {
     if records.is_empty() {
-        ui.colored_label(Style::TEXT_DIM, "No provider outcomes recorded in this visit");
+        ui.colored_label(
+            Style::TEXT_DIM,
+            "No provider outcomes recorded in this visit",
+        );
         ui.label(
             RichText::new(
                 "Events will remain empty until a typed action or bounded event provider publishes an outcome.",
@@ -4004,7 +3607,12 @@ fn show_action_events(ui: &mut egui::Ui, records: &[crate::system::ActionAuditRe
             .id_salt(("this-node-event", record.occurred_ms))
             .default_open(false)
             .show(ui, |ui| {
-                mde_egui::field(ui, "Timestamp", &format_audit_timestamp(record.occurred_ms), Style::TEXT);
+                mde_egui::field(
+                    ui,
+                    "Timestamp",
+                    &format_audit_timestamp(record.occurred_ms),
+                    Style::TEXT,
+                );
                 mde_egui::field(ui, "Outcome", record.outcome, Style::TEXT);
             });
     }
@@ -4029,10 +3637,7 @@ fn show_action_audit(ui: &mut egui::Ui, records: &[crate::system::ActionAuditRec
                 Style::OK,
                 format!("Exported audit evidence to {}", path.display()),
             ),
-            Err(error) => ui.colored_label(
-                Style::WARN,
-                format!("Audit export failed: {error}"),
-            ),
+            Err(error) => ui.colored_label(Style::WARN, format!("Audit export failed: {error}")),
         };
     }
     for record in records.iter().rev().take(12) {
@@ -4056,9 +3661,7 @@ fn show_action_audit(ui: &mut egui::Ui, records: &[crate::system::ActionAuditRec
 /// The payload contains only the action label, accepted/refused outcome, and
 /// timestamp; provider paths, device identities, credentials, and raw errors
 /// are never serialized.
-fn export_redacted_audit(
-    records: &[crate::system::ActionAuditRecord],
-) -> std::io::Result<PathBuf> {
+fn export_redacted_audit(records: &[crate::system::ActionAuditRecord]) -> std::io::Result<PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -4073,16 +3676,13 @@ fn export_redacted_audit(
     let path = directory.join(format!("audit-{stamp}.json"));
     let temporary = directory.join(format!(".audit-{stamp}.json.tmp"));
     let payload = redacted_audit_payload(records);
-    let encoded = serde_json::to_vec_pretty(&payload)
-        .map_err(std::io::Error::other)?;
+    let encoded = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
     std::fs::write(&temporary, encoded)?;
     std::fs::rename(&temporary, &path)?;
     Ok(path)
 }
 
-fn redacted_audit_payload(
-    records: &[crate::system::ActionAuditRecord],
-) -> serde_json::Value {
+fn redacted_audit_payload(records: &[crate::system::ActionAuditRecord]) -> serde_json::Value {
     serde_json::json!({
         "schema": "mde.this-node.audit.v1",
         "operator": "local trusted session",
@@ -4138,67 +3738,32 @@ fn show_recovery_reset_boundary(ui: &mut egui::Ui) {
     });
 }
 
-/// Diagnostics combines the bounded mesh snapshot with a fixed local journal
-/// provider. Journal access is read-only, redacted, capped, and never runs on
-/// the render thread; provider absence remains an explicit recovery state.
-fn show_diagnostics(
-    ui: &mut egui::Ui,
-    status: &NodeStatus,
-    diagnostics: &DiagnosticsProvider,
-) {
-    ui.label(RichText::new("Current health evidence").strong());
-    mde_egui::card().show(ui, |ui| show_services(ui, status));
-    ui.add_space(Style::SP_S);
-    mde_egui::card().show(ui, |ui| show_mesh(ui, status));
-    ui.add_space(Style::SP_S);
-    mde_egui::card().show(ui, |ui| show_telemetry(ui, status));
-    ui.add_space(Style::SP_S);
-    mde_egui::card().show(ui, |ui| {
-        ui.label(RichText::new("Operator logs").strong());
-        show_local_freshness(ui, diagnostics.freshness.last_success);
-        if let Some(error) = diagnostics.error {
-            ui.colored_label(Style::WARN, error);
-            ui.label(
-                RichText::new("Refresh the node provider; no raw command or user-supplied query is accepted here.")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-        } else if diagnostics.lines.is_empty() {
-            ui.colored_label(Style::TEXT_DIM, "No warning or error entries returned");
-            ui.label(
-                RichText::new("The fixed local journal query is active; entries are redacted and limited to the latest bounded result set.")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-        } else {
-            ui.colored_label(Style::TEXT_DIM, "Recent warning/error entries · redacted");
-            egui::ScrollArea::vertical()
-                .max_height(240.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for line in diagnostics.lines.iter().rev() {
-                        ui.add(egui::Label::new(RichText::new(line).size(Style::SMALL)).wrap());
-                    }
-                });
-        }
-    });
-}
-
 fn show_local_services(ui: &mut egui::Ui, services: &LocalServiceProvider) {
     ui.label(RichText::new("Local service provider").strong());
     show_local_freshness(ui, services.freshness.last_success);
     match services.state {
         Err(error) => {
             ui.colored_label(Style::WARN, error);
-            ui.label(RichText::new("No service state is inferred when the fixed provider is absent or stale.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(
+                    "No service state is inferred when the fixed provider is absent or stale.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
         }
         Ok(()) if services.failed.is_empty() => {
             ui.colored_label(Style::OK, "No failed system services reported");
             ui.label(RichText::new("Read-only systemd evidence is bounded to 32 service names and refreshed independently from mesh health.").color(Style::TEXT_DIM).size(Style::SMALL));
         }
         Ok(()) => {
-            ui.colored_label(Style::WARN, format!("{} failed system service(s)", services.failed.len()));
-            for name in &services.failed { ui.label(RichText::new(name).size(Style::SMALL)); }
+            ui.colored_label(
+                Style::WARN,
+                format!("{} failed system service(s)", services.failed.len()),
+            );
+            for name in &services.failed {
+                ui.label(RichText::new(name).size(Style::SMALL));
+            }
             ui.label(RichText::new("Restart remains behind the typed Actions provider with confirmation, audit, and recovery contracts.").color(Style::TEXT_DIM).size(Style::SMALL));
         }
     }
@@ -4212,13 +3777,32 @@ fn show_local_applications(ui: &mut egui::Ui, applications: &LocalApplicationPro
             ui.colored_label(Style::WARN, error);
             ui.label(RichText::new("Installed and running application counts remain unknown until the bounded mackesd mirror responds.").color(Style::TEXT_DIM).size(Style::SMALL));
         }
-        Ok(ApplicationFacts { installed: None, running: None }) => {
+        Ok(ApplicationFacts {
+            installed: None,
+            running: None,
+        }) => {
             ui.colored_label(Style::TEXT_DIM, "Application mirror not published");
-            ui.label(RichText::new("No installed or running application facts are inferred from an absent mirror.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(
+                    "No installed or running application facts are inferred from an absent mirror.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
         }
         Ok(ApplicationFacts { installed, running }) => {
-            mde_egui::field(ui, "Installed launchable apps", &installed.map_or_else(|| "unknown".to_owned(), |count| count.to_string()), Style::TEXT);
-            mde_egui::field(ui, "Running app ids", &running.map_or_else(|| "unknown".to_owned(), |count| count.to_string()), Style::TEXT);
+            mde_egui::field(
+                ui,
+                "Installed launchable apps",
+                &installed.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                Style::TEXT,
+            );
+            mde_egui::field(
+                ui,
+                "Running app ids",
+                &running.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                Style::TEXT,
+            );
             ui.label(RichText::new("Counts come from the local mackesd mirror; names, launch targets, and app actions remain in the existing Front Door authority.").color(Style::TEXT_DIM).size(Style::SMALL));
         }
     }
@@ -4230,11 +3814,21 @@ fn show_local_printers(ui: &mut egui::Ui, printers: &LocalPrinterProvider) {
     match printers.state {
         Err(error) => {
             ui.colored_label(Style::WARN, error);
-            ui.label(RichText::new("No printer is inferred when the fixed CUPS provider is absent or stale.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(
+                    "No printer is inferred when the fixed CUPS provider is absent or stale.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
         }
         Ok(()) if printers.printers.is_empty() => {
             ui.colored_label(Style::TEXT_DIM, "No local printers reported");
-            ui.label(RichText::new("CUPS answered successfully; printer inventory is empty.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new("CUPS answered successfully; printer inventory is empty.")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
         }
         Ok(()) => {
             for printer in &printers.printers {
@@ -4261,29 +3855,61 @@ fn show_local_security_posture(ui: &mut egui::Ui, security: &LocalSecurityProvid
         }
         Ok(FirewallState::NotRunning) => {
             ui.colored_label(Style::WARN, "firewalld not running");
-            ui.label(RichText::new("No broader firewall posture is inferred from this single provider.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new("No broader firewall posture is inferred from this single provider.")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
         }
         Err(error) => {
             ui.colored_label(Style::WARN, error);
-            ui.label(RichText::new("Firewall state remains unknown until the fixed local provider responds.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(
+                    "Firewall state remains unknown until the fixed local provider responds.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
         }
     }
     ui.separator();
     ui.label(RichText::new("Observed encryption mappings").strong());
     show_local_freshness(ui, security.encryption_last_success);
     match security.encryption {
-        Ok(EncryptionState::Observed { mappings, encrypted }) => {
-            let tone = if encrypted == mappings { Style::OK } else { Style::WARN };
-            ui.colored_label(tone, format!("{encrypted} of {mappings} device-mapper mapping(s) identify as LUKS"));
+        Ok(EncryptionState::Observed {
+            mappings,
+            encrypted,
+        }) => {
+            let tone = if encrypted == mappings {
+                Style::OK
+            } else {
+                Style::WARN
+            };
+            ui.colored_label(
+                tone,
+                format!("{encrypted} of {mappings} device-mapper mapping(s) identify as LUKS"),
+            );
             ui.label(RichText::new("This bounded observation does not prove full-disk coverage, unlocked state, or passphrase validity; no mapping names or keys leave the local seat.").color(Style::TEXT_DIM).size(Style::SMALL));
         }
         Ok(EncryptionState::NoMappings) => {
             ui.colored_label(Style::TEXT_DIM, "No device-mapper mappings observed");
-            ui.label(RichText::new("No encryption posture is inferred when no local mapping is published.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(
+                    "No encryption posture is inferred when no local mapping is published.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
         }
         Err(error) => {
             ui.colored_label(Style::WARN, error);
-            ui.label(RichText::new("Encryption posture remains unknown until the fixed local provider responds.").color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(
+                    "Encryption posture remains unknown until the fixed local provider responds.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
         }
     }
 }
@@ -4291,7 +3917,11 @@ fn show_local_security_posture(ui: &mut egui::Ui, security: &LocalSecurityProvid
 fn show_remote_access_posture(ui: &mut egui::Ui, system: &crate::system::SystemState) {
     ui.label(RichText::new("Remote Proofing policy").strong());
     for fact in system.remote_proofing_summary() {
-        let tone = if fact.starts_with("Warning:") { Style::WARN } else { Style::TEXT };
+        let tone = if fact.starts_with("Warning:") {
+            Style::WARN
+        } else {
+            Style::TEXT
+        };
         ui.colored_label(tone, RichText::new(fact).size(Style::SMALL));
     }
     ui.label(
@@ -4311,7 +3941,12 @@ fn show_local_backup_posture(ui: &mut egui::Ui, backup: &LocalBackupProvider) {
             ui.colored_label(Style::OK, "Encrypted backup artifact present");
             ui.horizontal_wrapped(|ui| {
                 mde_egui::field(ui, "Bundle size", &format!("{bytes} bytes"), Style::TEXT);
-                mde_egui::field(ui, "Modified", &format_audit_timestamp(modified_ms), Style::TEXT);
+                mde_egui::field(
+                    ui,
+                    "Modified",
+                    &format_audit_timestamp(modified_ms),
+                    Style::TEXT,
+                );
             });
             ui.label(RichText::new("Contents remain opaque to the desktop; presence does not prove passphrase validity or restore readiness.").color(Style::TEXT_DIM).size(Style::SMALL));
         }
@@ -4327,28 +3962,18 @@ fn show_local_backup_posture(ui: &mut egui::Ui, backup: &LocalBackupProvider) {
 }
 
 /// Inventory-first landing surface for WL-UX-011. This is intentionally a
-/// compact read-only index: each row names a governed node area, carries the
-/// same health state used by the dashboard, and summarizes only facts already
-/// present in the bounded projection. Detail views remain below this summary.
+/// compact read-only index: each row names a governed node area and summarizes
+/// only inventory/configuration facts already present in the bounded projection.
+/// Detail views remain below this summary.
 fn show_inventory_summary(
     ui: &mut egui::Ui,
     status: &NodeStatus,
-    dashboard: HealthDashboard,
     local_freshness: LocalFreshnessSummary,
 ) -> Option<PageEntry> {
     let mut selected = None;
     mde_egui::card().show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Node inventory").strong());
-            ui.colored_label(
-                dashboard.overall.tone(),
-                RichText::new(format!(
-                    "{} {}",
-                    dashboard.overall.glyph(),
-                    dashboard.overall.label()
-                ))
-                .size(Style::SMALL),
-            );
             if status.stale {
                 ui.colored_label(Style::WARN, "refresh required");
             }
@@ -4382,14 +4007,8 @@ fn show_inventory_summary(
 
         let mut rows = DenseList::new();
         for section in Section::ALL {
-            let health = dashboard.health(section);
             rows.row(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        health.tone(),
-                        RichText::new(format!("{} {}", health.glyph(), health.label()))
-                            .size(Style::SMALL),
-                    );
                     if ui
                         .selectable_label(false, RichText::new(section.label()).strong().size(Style::SMALL))
                         .clicked()
@@ -4494,330 +4113,12 @@ fn inventory_summary(section: Section, status: &NodeStatus) -> String {
     }
 }
 
-fn show_health_dashboard(ui: &mut egui::Ui, status: &NodeStatus, dashboard: HealthDashboard) {
-    mde_egui::card().show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Health dashboard").strong());
-            ui.colored_label(
-                dashboard.overall.tone(),
-                RichText::new(format!(
-                    "{} {}",
-                    dashboard.overall.glyph(),
-                    dashboard.overall.label()
-                ))
-                .strong(),
-            );
-        });
-
-        if dashboard.overall == SectionHealth::Healthy {
-            ui.label(
-                RichText::new("All systems operational")
-                    .color(Style::OK)
-                    .size(Style::BODY),
-            );
-            ui.label(
-                RichText::new(
-                    "The current mesh-status projection reports healthy facts for every governed section.",
-                )
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-            );
-        } else if dashboard.alert_count() > 0 {
-            let heading = if dashboard.count(SectionHealth::Unhealthy) > 0 {
-                "Critical alerts"
-            } else if dashboard.overall == SectionHealth::Stale {
-                "Status requires refresh"
-            } else {
-                "Attention needed"
-            };
-            ui.label(RichText::new(heading).color(dashboard.overall.tone()).strong());
-            let mut rows = DenseList::new();
-            for (section, health) in dashboard.states {
-                if !health.is_alert() {
-                    continue;
-                }
-                rows.row(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            health.tone(),
-                            RichText::new(format!("{} {}", health.glyph(), health.label()))
-                                .size(Style::SMALL),
-                        );
-                        ui.label(RichText::new(section.label()).strong().size(Style::SMALL));
-                        ui.label(
-                            RichText::new(section_health_detail(section, health, status))
-                                .color(Style::TEXT_DIM)
-                                .size(Style::SMALL),
-                        );
-                    });
-                });
-            }
-        } else {
-            ui.colored_label(
-                Style::TEXT_DIM,
-                format!(
-                    "Health data is unavailable for {} governed sections.",
-                    dashboard.count(SectionHealth::Unavailable)
-                ),
-            );
-            ui.label(
-                RichText::new(
-                    "This Node will show provider-backed health when the shared snapshot publishes it.",
-                )
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-            );
-        }
-
-        if dashboard.count(SectionHealth::Unavailable) > 0
-            && dashboard.overall != SectionHealth::Unavailable
-        {
-            ui.label(
-                RichText::new(format!(
-                    "{} sections have no published provider observation.",
-                    dashboard.count(SectionHealth::Unavailable)
-                ))
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-            );
-        }
-    });
-}
-
-/// Link the existing mesh alert projection into This Node without creating a
-/// second notification authority. Only alerts sourced by this node are shown;
-/// acknowledgement and snooze commands return through the signed collab path.
-fn show_linked_health_alerts(
-    ui: &mut egui::Ui,
-    status: &NodeStatus,
-    inbox: &AlertInbox,
-    communications: &crate::communications::CommunicationsState,
-) {
-    let matching_alerts = inbox
-        .alerts
-        .iter()
-        .filter(|row| row.alert.source == status.hostname || row.alert.source == "this-node")
-        .collect::<Vec<_>>();
-    let total_alerts = matching_alerts.len();
-    let alerts = matching_alerts
-        .into_iter()
-        .take(MAX_LINKED_ALERTS)
-        .collect::<Vec<_>>();
-    if alerts.is_empty() {
-        return;
-    }
-
-    mde_egui::card().show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("This Node alerts").strong());
-            ui.colored_label(
-                Style::TEXT_DIM,
-                format!(
-                    "{} linked · {} critical · {} warning",
-                    total_alerts,
-                    alerts
-                        .iter()
-                        .filter(|row| row.alert.severity == Severity::Critical)
-                        .count(),
-                    alerts
-                        .iter()
-                        .filter(|row| row.alert.severity == Severity::Warning)
-                        .count(),
-                ),
-            );
-        });
-        ui.label(
-            RichText::new(
-                "Expand an alert for details and guided recovery. Acknowledgement and snooze remain durable commands owned by the shared Notification authority.",
-            )
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL),
-        );
-        if total_alerts > MAX_LINKED_ALERTS {
-            ui.colored_label(
-                Style::TEXT_DIM,
-                format!(
-                    "{} additional alerts are available in Notifications.",
-                    total_alerts - MAX_LINKED_ALERTS
-                ),
-            );
-        }
-        for row in alerts {
-            let tone = match row.alert.severity {
-                Severity::Critical => Style::DANGER,
-                Severity::Warning => Style::WARN,
-                Severity::Info => Style::TEXT_DIM,
-            };
-            egui::CollapsingHeader::new(format!(
-                "{} {}",
-                match row.alert.severity {
-                    Severity::Critical => "●",
-                    Severity::Warning => "▲",
-                    Severity::Info => "○",
-                },
-                row.alert.headline
-            ))
-            .id_salt(("this-node-alert-v2", row.event_id))
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.colored_label(tone, format!("Source: {}", row.alert.source));
-                for (label, aliases) in [
-                    ("Affected component", &["affected_component", "component", "affected"] as &[&str]),
-                    ("Current impact", &["current_impact", "impact"]),
-                    ("Recovery guidance", &["recovery_guidance", "recovery"]),
-                ] {
-                    if let Some(value) = first_alert_field(&row.alert.fields, aliases) {
-                        mde_egui::field(ui, label, value, Style::TEXT);
-                    }
-                }
-                let known = [
-                    "affected_component",
-                    "component",
-                    "affected",
-                    "current_impact",
-                    "impact",
-                    "recovery_guidance",
-                    "recovery",
-                ];
-                for (key, value) in row
-                    .alert
-                    .fields
-                    .iter()
-                    .filter(|(key, _)| !known.contains(&key.as_str()))
-                    .take(4)
-                {
-                    mde_egui::field(ui, key, value, Style::TEXT);
-                }
-                if !row.alert.actions.is_empty() {
-                    ui.add_space(Style::SP_XS);
-                    ui.label(RichText::new("Guided recovery actions").strong());
-                    for action in row
-                        .alert
-                        .actions
-                        .iter()
-                        .filter(|action| {
-                            !matches!(action.kind, AlertActionKind::Ack | AlertActionKind::Snooze)
-                        })
-                        .take(MAX_ALERT_ACTIONS)
-                    {
-                        let action_id = egui::Id::new((
-                            "this-node-alert-action-armed",
-                            row.event_id,
-                            action.id.as_str(),
-                        ));
-                        let armed = ui.memory(|memory| memory.data.get_temp::<bool>(action_id).unwrap_or(false));
-                        let button_label = match (action.kind, armed) {
-                            (AlertActionKind::Destructive, true) => format!("Confirm {}", action.label),
-                            (AlertActionKind::Destructive, false) => format!("Arm {}", action.label),
-                            _ => action.label.clone(),
-                        };
-                        if ui.button(button_label).clicked() {
-                            if action.kind == AlertActionKind::Destructive && !armed {
-                                ui.memory_mut(|memory| memory.data.insert_temp(action_id, true));
-                            } else {
-                                let result = communications.publish_alert_command(
-                                    CollabCommand::RunAlertAction {
-                                        space: row.space,
-                                        alert: row.event_id,
-                                        action_id: action.id.clone(),
-                                        armed: action.kind == AlertActionKind::Destructive,
-                                    },
-                                );
-                                ui.memory_mut(|memory| memory.data.remove::<bool>(action_id));
-                                if let Err(message) = result {
-                                    ui.colored_label(Style::WARN, format!("Recovery action failed: {message}"));
-                                }
-                            }
-                        }
-                    }
-                    let hidden_actions = row
-                        .alert
-                        .actions
-                        .iter()
-                        .filter(|action| {
-                            !matches!(action.kind, AlertActionKind::Ack | AlertActionKind::Snooze)
-                        })
-                        .count()
-                        .saturating_sub(MAX_ALERT_ACTIONS);
-                    if hidden_actions > 0 {
-                        ui.colored_label(
-                            Style::TEXT_DIM,
-                            format!("{hidden_actions} additional recovery actions omitted here."),
-                        );
-                    }
-                    ui.label(
-                        RichText::new("Destructive actions require a visible arm-and-confirm step; execution remains in the signed notification authority.")
-                            .color(Style::TEXT_DIM)
-                            .size(Style::SMALL),
-                    );
-                }
-                if let Some(goto) = &row.alert.goto {
-                    ui.label(RichText::new(format!("Related route: {goto}"))
-                        .color(Style::TEXT_DIM)
-                        .size(Style::SMALL));
-                }
-                if row.acknowledged {
-                    ui.colored_label(Style::TEXT_DIM, "Acknowledged");
-                } else {
-                    let mut error = None;
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Acknowledge").clicked() {
-                            if let Err(message) = communications.publish_alert_command(
-                                CollabCommand::AckAlert {
-                                    space: row.space,
-                                    alert: row.event_id,
-                                },
-                            ) {
-                                error = Some(message);
-                            }
-                        }
-                        let snoozed = row
-                            .snoozed_until_unix_ms
-                            .is_some_and(|until| until > unix_epoch_ms() as i64);
-                        if snoozed {
-                            ui.colored_label(Style::TEXT_DIM, "Snoozed");
-                        } else if ui.button("Snooze 15 min").clicked() {
-                            let until = unix_epoch_ms().saturating_add(15 * 60 * 1_000) as i64;
-                            if let Err(message) = communications.publish_alert_command(
-                                CollabCommand::SnoozeAlert {
-                                    space: row.space,
-                                    alert: row.event_id,
-                                    until_unix_ms: until,
-                                },
-                            ) {
-                                error = Some(message);
-                            }
-                        }
-                    });
-                    if let Some(error) = error {
-                        ui.colored_label(Style::WARN, format!("Alert command failed: {error}"));
-                    }
-                }
-            });
-        }
-    });
-}
-
-fn first_alert_field<'a>(
-    fields: &'a std::collections::BTreeMap<String, String>,
-    aliases: &[&str],
-) -> Option<&'a str> {
-    aliases
-        .iter()
-        .find_map(|alias| fields.get(*alias).map(String::as_str))
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn show_section_hierarchy(
-    ui: &mut egui::Ui,
-    status: &NodeStatus,
-    dashboard: HealthDashboard,
-) -> Option<PageEntry> {
+fn show_section_hierarchy(ui: &mut egui::Ui, _status: &NodeStatus) -> Option<PageEntry> {
     let mut selected = None;
     ui.label(RichText::new("This Node hierarchy").strong());
     ui.label(
         RichText::new(
-            "Expand a governed section to inspect its current detail availability. Badges use the same live health authority as the dashboard.",
+            "Expand a governed section to inspect its current inventory and configuration providers.",
         )
         .color(Style::TEXT_DIM)
         .size(Style::SMALL),
@@ -4825,125 +4126,39 @@ fn show_section_hierarchy(
     ui.add_space(Style::SP_XS);
 
     for group in SectionGroup::ALL {
-        let group_health = group_health(dashboard, group);
-        egui::CollapsingHeader::new(
-            RichText::new(format!(
-                "{}   {} {}",
-                group.label(),
-                group_health.glyph(),
-                group_health.label()
-            ))
-            .color(group_health.tone()),
-        )
-        .id_salt(("this-node-hierarchy-v2", group.label()))
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(group.description())
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            let mut rows = DenseList::new();
-            for section in group.sections() {
-                let health = dashboard.health(*section);
-                rows.row(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            health.tone(),
-                            RichText::new(format!("{} {}", health.glyph(), health.label()))
-                                .size(Style::SMALL),
-                        );
-                        if ui
-                            .selectable_label(
-                                false,
-                                RichText::new(section.label()).strong().size(Style::SMALL),
-                            )
-                            .clicked()
-                        {
-                            selected = page_for_section(*section);
-                        }
-                        ui.label(
-                            RichText::new(section.description())
-                                .color(Style::TEXT_DIM)
-                                .size(Style::SMALL),
-                        );
+        egui::CollapsingHeader::new(group.label())
+            .id_salt(("this-node-hierarchy-v2", group.label()))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(group.description())
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL),
+                );
+                let mut rows = DenseList::new();
+                for section in group.sections() {
+                    rows.row(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    RichText::new(section.label()).strong().size(Style::SMALL),
+                                )
+                                .clicked()
+                            {
+                                selected = page_for_section(*section);
+                            }
+                            ui.label(
+                                RichText::new(section.description())
+                                    .color(Style::TEXT_DIM)
+                                    .size(Style::SMALL),
+                            );
+                        });
                     });
-                    if health != SectionHealth::Healthy {
-                        ui.label(
-                            RichText::new(section_health_detail(*section, health, status))
-                                .color(health.tone())
-                                .size(Style::SMALL),
-                        );
-                    }
-                });
-            }
-        });
+                }
+            });
     }
     selected
-}
-
-fn group_health(dashboard: HealthDashboard, group: SectionGroup) -> SectionHealth {
-    let mut has_attention = false;
-    let mut has_unavailable = false;
-    for section in group.sections() {
-        match dashboard.health(*section) {
-            SectionHealth::Unhealthy => return SectionHealth::Unhealthy,
-            SectionHealth::Stale => return SectionHealth::Stale,
-            SectionHealth::Attention => has_attention = true,
-            SectionHealth::Unavailable => has_unavailable = true,
-            SectionHealth::Healthy => {}
-        }
-    }
-    if has_attention {
-        SectionHealth::Attention
-    } else if has_unavailable {
-        SectionHealth::Unavailable
-    } else {
-        SectionHealth::Healthy
-    }
-}
-
-fn section_health_detail(section: Section, health: SectionHealth, status: &NodeStatus) -> String {
-    match health {
-        SectionHealth::Healthy => "Current provider facts are available.".to_string(),
-        SectionHealth::Stale => status
-            .stale_reason
-            .clone()
-            .unwrap_or_else(|| "The retained provider projection is stale; refresh first.".into()),
-        SectionHealth::Unavailable => section
-            .unavailable_reason()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "No provider observation for this section is published yet.".into()),
-        SectionHealth::Attention => match section {
-            Section::Connectivity => status.connectivity_availability().detail().to_string(),
-            Section::Overview => {
-                if !status.in_directory {
-                    "This node is named by the snapshot but has no directory row yet.".into()
-                } else if status.update_available {
-                    "A newer mesh version is visible; update execution remains provider-gated."
-                        .into()
-                } else {
-                    "The node is present but its health facts are only partially reported.".into()
-                }
-            }
-            Section::PowerPerformance => {
-                "Aggregate resource telemetry or power-profile facts are partial; missing values remain unavailable.".into()
-            }
-            Section::MeshSystem => {
-                "Mesh context or service health is only partially reported.".into()
-            }
-            _ => {
-                "This section has partial provider facts; missing values remain unavailable.".into()
-            }
-        },
-        SectionHealth::Unhealthy => {
-            if status.presence.as_deref() == Some("offline") {
-                "The node's published presence is offline.".into()
-            } else {
-                "One or more published service rows report down.".into()
-            }
-        }
-    }
 }
 
 fn show_power_profile(ui: &mut egui::Ui, status: &NodeStatus) {
@@ -5042,7 +4257,11 @@ fn show_local_power_telemetry(ui: &mut egui::Ui, system: &crate::system::SystemS
         rows.row(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&battery.model).strong().size(Style::SMALL));
-                ui.label(format!("{:.0}% · {}", battery.percentage, battery.state.label()));
+                ui.label(format!(
+                    "{:.0}% · {}",
+                    battery.percentage,
+                    battery.state.label()
+                ));
                 ui.colored_label(Style::TEXT_DIM, battery.kind.label());
             });
             let mut estimates = Vec::new();
@@ -5069,7 +4288,10 @@ fn show_local_power_telemetry(ui: &mut egui::Ui, system: &crate::system::SystemS
 /// backend must not hide the other truthful local facts.
 fn show_local_power_provider_state(ui: &mut egui::Ui, system: &crate::system::SystemState) {
     let Some(snapshot) = system.snapshot() else {
-        ui.colored_label(Style::TEXT_DIM, "Local power providers have not produced a snapshot.");
+        ui.colored_label(
+            Style::TEXT_DIM,
+            "Local power providers have not produced a snapshot.",
+        );
         return;
     };
     ui.horizontal_wrapped(|ui| {
@@ -5139,9 +4361,10 @@ fn show_telemetry(ui: &mut egui::Ui, status: &NodeStatus) {
         ui.label("CPU");
         ui.colored_label(
             Style::TEXT,
-            facts
-                .cpu_cores
-                .map_or_else(|| "unknown cores".to_owned(), |cores| format!("{cores} cores")),
+            facts.cpu_cores.map_or_else(
+                || "unknown cores".to_owned(),
+                |cores| format!("{cores} cores"),
+            ),
         );
         ui.add_space(Style::SP_S);
         ui.label("1m load");
@@ -5154,8 +4377,7 @@ fn show_telemetry(ui: &mut egui::Ui, status: &NodeStatus) {
         );
     });
 
-    if let (Some(total), Some(available)) =
-        (facts.memory_total_bytes, facts.memory_available_bytes)
+    if let (Some(total), Some(available)) = (facts.memory_total_bytes, facts.memory_available_bytes)
     {
         let used = total.saturating_sub(available);
         let ratio = if total == 0 {
@@ -5375,7 +4597,10 @@ fn show_storage_detail(
             .unwrap_or_else(|| total.saturating_sub(used));
         let ratio = telemetry
             .root_used_percent
-            .map_or_else(|| used as f32 / total.max(1) as f32, |value| value as f32 / 100.0)
+            .map_or_else(
+                || used as f32 / total.max(1) as f32,
+                |value| value as f32 / 100.0,
+            )
             .clamp(0.0, 1.0);
         ui.label(format!(
             "Root filesystem · {} used of {}",
@@ -5407,29 +4632,50 @@ fn show_storage_detail(
     let mut rows = DenseList::new();
     rows.row(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Aggregate block devices").strong().size(Style::SMALL));
+            ui.label(
+                RichText::new("Aggregate block devices")
+                    .strong()
+                    .size(Style::SMALL),
+            );
             ui.colored_label(
                 Style::TEXT,
-                hardware.storage_devices.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                hardware
+                    .storage_devices
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             );
         });
-        ui.colored_label(Style::TEXT_DIM, "Identity and device health are not published in the shared snapshot.");
+        ui.colored_label(
+            Style::TEXT_DIM,
+            "Device identities are available in the neutral Device Manager inventory.",
+        );
     });
     rows.row(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Aggregate capacity").strong().size(Style::SMALL));
+            ui.label(
+                RichText::new("Aggregate capacity")
+                    .strong()
+                    .size(Style::SMALL),
+            );
             ui.colored_label(
                 Style::TEXT,
-                hardware.storage_total_bytes.map_or_else(|| "unknown".to_owned(), format_bytes),
+                hardware
+                    .storage_total_bytes
+                    .map_or_else(|| "unknown".to_owned(), format_bytes),
             );
         });
     });
     rows.row(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Removable devices").strong().size(Style::SMALL));
+            ui.label(
+                RichText::new("Removable devices")
+                    .strong()
+                    .size(Style::SMALL),
+            );
             ui.colored_label(
                 Style::TEXT,
-                hardware.storage_removable.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                hardware
+                    .storage_removable
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             );
         });
     });
@@ -5443,7 +4689,10 @@ fn show_storage_detail(
         );
     }
     if status.stale {
-        ui.colored_label(Style::WARN, "Storage values are retained from a stale snapshot; refresh before acting.");
+        ui.colored_label(
+            Style::WARN,
+            "Storage values are retained from a stale snapshot; refresh before acting.",
+        );
     }
 }
 
@@ -5493,7 +4742,11 @@ fn show_local_display_inventory(ui: &mut egui::Ui, system: &crate::system::Syste
                     mde_seat::ConnectorStatus::Unknown => "state unknown",
                 };
                 ui.colored_label(
-                    if state == "connected" { Style::OK } else { Style::TEXT_DIM },
+                    if state == "connected" {
+                        Style::OK
+                    } else {
+                        Style::TEXT_DIM
+                    },
                     state,
                 );
                 if let Some((width, height)) = connector.size_mm {
@@ -5571,19 +4824,35 @@ fn show_local_input_policy(ui: &mut egui::Ui, system: &crate::system::SystemStat
         ("Pointer speed", format!("{pointer_speed:+}%")),
         (
             "Tap to click",
-            if tap_to_click { "enabled".to_owned() } else { "disabled".to_owned() },
+            if tap_to_click {
+                "enabled".to_owned()
+            } else {
+                "disabled".to_owned()
+            },
         ),
         (
             "Two-finger scroll",
-            if two_finger_scroll { "enabled".to_owned() } else { "disabled".to_owned() },
+            if two_finger_scroll {
+                "enabled".to_owned()
+            } else {
+                "disabled".to_owned()
+            },
         ),
         (
             "Touchscreen input",
-            if touchscreen { "enabled".to_owned() } else { "disabled".to_owned() },
+            if touchscreen {
+                "enabled".to_owned()
+            } else {
+                "disabled".to_owned()
+            },
         ),
         (
             "Edge gestures",
-            if edge_gestures { "enabled".to_owned() } else { "disabled".to_owned() },
+            if edge_gestures {
+                "enabled".to_owned()
+            } else {
+                "disabled".to_owned()
+            },
         ),
     ];
     let mut dense = DenseList::new();
@@ -5705,7 +4974,11 @@ fn show_local_storage_inventory(ui: &mut egui::Ui, system: &crate::system::Syste
                 );
                 ui.colored_label(
                     Style::TEXT_DIM,
-                    if device.removable { "removable" } else { "fixed" },
+                    if device.removable {
+                        "removable"
+                    } else {
+                        "fixed"
+                    },
                 );
                 ui.colored_label(
                     Style::TEXT_DIM,
@@ -5807,7 +5080,11 @@ fn show_local_mixer_inventory(ui: &mut egui::Ui, system: &crate::system::SystemS
             ui.label(RichText::new(&strip.name).strong().size(Style::SMALL));
             ui.colored_label(Style::TEXT_DIM, origin_label(&strip.origin));
             ui.colored_label(
-                if strip.muted { Style::WARN } else { Style::TEXT },
+                if strip.muted {
+                    Style::WARN
+                } else {
+                    Style::TEXT
+                },
                 if strip.muted {
                     "muted".to_owned()
                 } else {
@@ -6227,10 +5504,7 @@ fn show_actions_workflow_with_system(
     pending_power_profile: &mut Option<String>,
     pending_platform_profile: &mut Option<String>,
     pending_bluetooth_power: &mut Option<bool>,
-    pending_bluetooth_device: &mut Option<(
-        String,
-        crate::system::BluetoothDeviceAction,
-    )>,
+    pending_bluetooth_device: &mut Option<(String, crate::system::BluetoothDeviceAction)>,
     pending_power_session: &mut Option<mde_seat::PowerVerb>,
     pending_wifi_power: &mut Option<bool>,
     pending_display_output: &mut Option<bool>,
@@ -6417,7 +5691,11 @@ fn show_restart_service_action(
         }
         if let Err(reason) = services.state {
             ui.colored_label(Style::TEXT_DIM, "unavailable");
-            ui.label(RichText::new(reason).color(Style::TEXT_DIM).size(Style::SMALL));
+            ui.label(
+                RichText::new(reason)
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
             return;
         }
         let mut offered = 0usize;
@@ -7041,7 +6319,10 @@ fn show_microphone_mute_action(
         let next = !muted;
         let armed = *pending == Some(next);
         let label = if armed {
-            format!("Confirm microphone {}", if next { "mute" } else { "unmute" })
+            format!(
+                "Confirm microphone {}",
+                if next { "mute" } else { "unmute" }
+            )
         } else {
             format!("{} microphone", if next { "Mute" } else { "Unmute" })
         };
@@ -7066,9 +6347,13 @@ fn show_microphone_mute_action(
             ui.colored_label(Style::WARN, "confirmation required");
         }
         ui.label(
-            RichText::new(format!("Target {} · currently {}", id, if muted { "muted" } else { "live" }))
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
+            RichText::new(format!(
+                "Target {} · currently {}",
+                id,
+                if muted { "muted" } else { "live" }
+            ))
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
         );
     });
     ui.label(
@@ -7353,7 +6638,10 @@ fn show_tap_to_click_action(
         let next = !current;
         let armed = *pending == Some(next);
         let label = if armed {
-            format!("Confirm {} tap-to-click", if next { "enable" } else { "disable" })
+            format!(
+                "Confirm {} tap-to-click",
+                if next { "enable" } else { "disable" }
+            )
         } else {
             format!("{} tap-to-click", if next { "Enable" } else { "Disable" })
         };
@@ -7378,9 +6666,12 @@ fn show_tap_to_click_action(
             ui.colored_label(Style::WARN, "confirmation required");
         }
         ui.label(
-            RichText::new(format!("Currently {}", if current { "enabled" } else { "disabled" }))
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
+            RichText::new(format!(
+                "Currently {}",
+                if current { "enabled" } else { "disabled" }
+            ))
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
         );
     });
     ui.label(
@@ -7443,7 +6734,11 @@ fn show_touch_gesture_action(
             let next = !current;
             let armed = *pending == Some((policy, next));
             let button_label = if armed {
-                format!("Confirm {} {}", if next { "enable" } else { "disable" }, label)
+                format!(
+                    "Confirm {} {}",
+                    if next { "enable" } else { "disable" },
+                    label
+                )
             } else {
                 format!("{} {}", if next { "Enable" } else { "Disable" }, label)
             };
@@ -7516,7 +6811,10 @@ fn show_audio_mute_action(
         let next = !muted;
         let armed = *pending == Some(next);
         let label = if armed {
-            format!("Confirm master audio {}", if next { "mute" } else { "unmute" })
+            format!(
+                "Confirm master audio {}",
+                if next { "mute" } else { "unmute" }
+            )
         } else {
             format!("{} master audio", if next { "Mute" } else { "Unmute" })
         };
@@ -7626,10 +6924,7 @@ fn show_bluetooth_device_action(
     ui: &mut egui::Ui,
     status: &NodeStatus,
     system: &mut crate::system::SystemState,
-    pending: &mut Option<(
-        String,
-        crate::system::BluetoothDeviceAction,
-    )>,
+    pending: &mut Option<(String, crate::system::BluetoothDeviceAction)>,
 ) {
     let contract = ThisNodeAction::ManageBluetoothDevices.contract();
     let targets = if status.stale || status.bluetooth.devices.is_none() {
@@ -7749,7 +7044,9 @@ fn show_power_session_action(
     pending: &mut Option<mde_seat::PowerVerb>,
 ) {
     let contract = ThisNodeAction::PowerSession.contract();
-    let caps = (!status.stale).then(|| system.power_action_caps()).flatten();
+    let caps = (!status.stale)
+        .then(|| system.power_action_caps())
+        .flatten();
     ui.vertical(|ui| {
         ui.label(RichText::new(ThisNodeAction::PowerSession.label()).strong());
         let Some(caps) = caps else {
@@ -8052,7 +7349,10 @@ fn show_platform_profile_action(
 fn show_local_bluetooth_inventory(ui: &mut egui::Ui, system: &crate::system::SystemState) {
     ui.label(RichText::new("Trusted local Bluetooth").strong());
     let Some(snapshot) = system.snapshot() else {
-        ui.colored_label(Style::TEXT_DIM, "BlueZ provider has not produced a snapshot.");
+        ui.colored_label(
+            Style::TEXT_DIM,
+            "BlueZ provider has not produced a snapshot.",
+        );
         return;
     };
     match &snapshot.bluetooth {
@@ -8066,14 +7366,21 @@ fn show_local_bluetooth_inventory(ui: &mut egui::Ui, system: &crate::system::Sys
         }
         mde_seat::Probe::Present(bluetooth) => {
             if bluetooth.adapters.is_empty() {
-                ui.colored_label(Style::TEXT_DIM, "No local Bluetooth adapters are published.");
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    "No local Bluetooth adapters are published.",
+                );
             } else {
                 let mut rows = DenseList::new();
                 for adapter in &bluetooth.adapters {
                     rows.row(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(
-                                if adapter.powered { Style::OK } else { Style::TEXT_DIM },
+                                if adapter.powered {
+                                    Style::OK
+                                } else {
+                                    Style::TEXT_DIM
+                                },
                                 adapter.name.as_str(),
                             );
                             ui.label(if adapter.powered { "powered" } else { "off" });
@@ -8097,7 +7404,11 @@ fn show_local_bluetooth_inventory(ui: &mut egui::Ui, system: &crate::system::Sys
                     rows.row(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(
-                                if device.connected { Style::OK } else { Style::TEXT_DIM },
+                                if device.connected {
+                                    Style::OK
+                                } else {
+                                    Style::TEXT_DIM
+                                },
                                 device.alias.as_str(),
                             );
                             ui.label(if device.connected {
@@ -8135,7 +7446,10 @@ fn show_local_bluetooth_inventory(ui: &mut egui::Ui, system: &crate::system::Sys
 fn show_local_network_inventory(ui: &mut egui::Ui, system: &crate::system::SystemState) {
     ui.label(RichText::new("Trusted local underlay").strong());
     let Some(snapshot) = system.snapshot() else {
-        ui.colored_label(Style::TEXT_DIM, "NetworkManager provider has not produced a snapshot.");
+        ui.colored_label(
+            Style::TEXT_DIM,
+            "NetworkManager provider has not produced a snapshot.",
+        );
         return;
     };
     match &snapshot.network {
@@ -8182,13 +7496,16 @@ fn show_local_network_inventory(ui: &mut egui::Ui, system: &crate::system::Syste
                             mde_seat::NetworkKind::Wifi => "Wi-Fi",
                             mde_seat::NetworkKind::Cellular => "Cellular",
                         });
-                        ui.colored_label(Style::TEXT_DIM, match link.state {
-                            mde_seat::NetworkState::Connected => "connected",
-                            mde_seat::NetworkState::Connecting => "connecting",
-                            mde_seat::NetworkState::Disconnected => "disconnected",
-                            mde_seat::NetworkState::Unavailable => "unavailable",
-                            mde_seat::NetworkState::Unknown => "unknown",
-                        });
+                        ui.colored_label(
+                            Style::TEXT_DIM,
+                            match link.state {
+                                mde_seat::NetworkState::Connected => "connected",
+                                mde_seat::NetworkState::Connecting => "connecting",
+                                mde_seat::NetworkState::Disconnected => "disconnected",
+                                mde_seat::NetworkState::Unavailable => "unavailable",
+                                mde_seat::NetworkState::Unknown => "unknown",
+                            },
+                        );
                     });
                 });
             }
@@ -8333,11 +7650,9 @@ fn show_bluetooth(ui: &mut egui::Ui, status: &NodeStatus) {
     });
     ui.add(
         egui::Label::new(
-            RichText::new(
-                "Pairing and trust require typed BlueZ authorization.",
-            )
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL),
+            RichText::new("Pairing and trust require typed BlueZ authorization.")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
         )
         .wrap(),
     );
@@ -8541,22 +7856,36 @@ fn show_users(ui: &mut egui::Ui, status: &NodeStatus) {
     let mut roles = DenseList::new();
     roles.row(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Administrative roles").strong().size(Style::SMALL));
+            ui.label(
+                RichText::new("Administrative roles")
+                    .strong()
+                    .size(Style::SMALL),
+            );
             ui.colored_label(
                 Style::TEXT,
-                users
-                    .admin_groups
-                    .map_or_else(|| "unknown".to_owned(), |count| format!("{count} policy group(s)")),
+                users.admin_groups.map_or_else(
+                    || "unknown".to_owned(),
+                    |count| format!("{count} policy group(s)"),
+                ),
             );
         });
-        ui.colored_label(Style::TEXT_DIM, "Membership and privilege names remain local to the trusted identity provider.");
+        ui.colored_label(
+            Style::TEXT_DIM,
+            "Membership and privilege names remain local to the trusted identity provider.",
+        );
     });
     roles.row(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Interactive users").strong().size(Style::SMALL));
+            ui.label(
+                RichText::new("Interactive users")
+                    .strong()
+                    .size(Style::SMALL),
+            );
             ui.colored_label(
                 Style::TEXT,
-                users.login_count.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                users
+                    .login_count
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             );
         });
     });
@@ -8565,7 +7894,9 @@ fn show_users(ui: &mut egui::Ui, status: &NodeStatus) {
             ui.label(RichText::new("All accounts").strong().size(Style::SMALL));
             ui.colored_label(
                 Style::TEXT,
-                users.account_count.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                users
+                    .account_count
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             );
         });
     });
@@ -8675,11 +8006,17 @@ fn show_update_posture(ui: &mut egui::Ui, status: &NodeStatus) {
             mde_egui::field(ui, "Installed version", current, Style::TEXT);
             mde_egui::field(ui, "Newest mesh version", latest, Style::TEXT);
             if status.stale {
-                ui.colored_label(Style::WARN, "Update posture is stale; refresh before acting.");
+                ui.colored_label(
+                    Style::WARN,
+                    "Update posture is stale; refresh before acting.",
+                );
             } else if status.update_available {
                 ui.colored_label(Style::WARN, "An update is available from the mesh posture.");
             } else {
-                ui.colored_label(Style::OK, "This node matches the newest reported mesh version.");
+                ui.colored_label(
+                    Style::OK,
+                    "This node matches the newest reported mesh version.",
+                );
             }
         }
         (Some(current), None) => {
@@ -8688,7 +8025,10 @@ fn show_update_posture(ui: &mut egui::Ui, status: &NodeStatus) {
         }
         (None, _) => {
             mde_egui::field(ui, "Installed version", "unknown", Style::TEXT_DIM);
-            ui.colored_label(Style::TEXT_DIM, "Update posture is unavailable until the node publishes a version.");
+            ui.colored_label(
+                Style::TEXT_DIM,
+                "Update posture is unavailable until the node publishes a version.",
+            );
         }
     }
     ui.label(
@@ -8855,7 +8195,7 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_status(ui, status, None, None, LocalFreshnessSummary::default())
+                show_status(ui, status, LocalFreshnessSummary::default())
             });
         });
         let mut texts = Vec::new();
@@ -8875,7 +8215,7 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show_status(ui, status, None, None, LocalFreshnessSummary::default())
+                show_status(ui, status, LocalFreshnessSummary::default())
             });
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
@@ -8916,7 +8256,6 @@ mod tests {
                     Some(&mut system),
                     &[],
                     &[],
-                    &DiagnosticsProvider::default(),
                     &LocalServiceProvider::default(),
                     &LocalLocaleProvider::default(),
                     &LocalPrinterProvider::default(),
@@ -9023,30 +8362,23 @@ mod tests {
     }
 
     #[test]
-    fn journal_projection_redacts_credentials_and_keeps_fixed_operator_context() {
-        let line = redact_journal_line(
-            "warning wlan password=secret123 ssid=private-net token:abc123 Bearer abc456 service restarted",
-        );
-        assert!(!line.contains("secret123"));
-        assert!(!line.contains("private-net"));
-        assert!(!line.contains("abc123"));
-        assert!(!line.contains("abc456"));
-        assert!(line.contains("<redacted>"));
-        assert!(line.contains("service restarted"));
-        assert!(MAX_DIAGNOSTIC_LINES <= 32);
-        assert!(MAX_DIAGNOSTIC_LINE_CHARS <= 256);
-        assert!(MAX_DIAGNOSTIC_BYTES <= 16 * 1024);
-    }
-
-    #[test]
     fn printer_projection_is_bounded_and_keeps_job_data_out() {
         let (printers, default) = parse_local_printers(
             "printer office is idle. enabled since today\nprinter lab is disabled.\nsystem default destination: office\njob-42 secret-document.pdf",
         );
-        assert_eq!(printers, vec![
-            LocalPrinter { name: "office".into(), state: "idle.".into() },
-            LocalPrinter { name: "lab".into(), state: "disabled.".into() },
-        ]);
+        assert_eq!(
+            printers,
+            vec![
+                LocalPrinter {
+                    name: "office".into(),
+                    state: "idle.".into()
+                },
+                LocalPrinter {
+                    name: "lab".into(),
+                    state: "disabled.".into()
+                },
+            ]
+        );
         assert_eq!(default.as_deref(), Some("office"));
         assert!(format!("{printers:?}").contains("office"));
         assert!(!format!("{printers:?}").contains("secret-document"));
@@ -9072,13 +8404,23 @@ mod tests {
         summary.add(&LocalFreshness {
             last_success: Some(Instant::now() - LOCAL_PROVIDER_MAX_AGE - Duration::from_secs(1)),
         });
-        assert_eq!(summary, LocalFreshnessSummary { fresh: 1, stale: 1, awaiting: 1 });
+        assert_eq!(
+            summary,
+            LocalFreshnessSummary {
+                fresh: 1,
+                stale: 1,
+                awaiting: 1
+            }
+        );
     }
 
     #[test]
     fn firewall_state_is_only_accepted_from_the_fixed_provider_values() {
         assert_eq!(parse_firewall_state("running"), Ok(FirewallState::Running));
-        assert_eq!(parse_firewall_state("not running"), Ok(FirewallState::NotRunning));
+        assert_eq!(
+            parse_firewall_state("not running"),
+            Ok(FirewallState::NotRunning)
+        );
         assert!(parse_firewall_state("zone public rules=secret").is_err());
     }
 
@@ -9092,14 +8434,20 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sda")).expect("non-dm entry");
         assert_eq!(
             read_encryption_state(dir.path()),
-            Ok(EncryptionState::Observed { mappings: 2, encrypted: 1 })
+            Ok(EncryptionState::Observed {
+                mappings: 2,
+                encrypted: 1
+            })
         );
     }
 
     #[test]
     fn encryption_provider_keeps_empty_mapping_state_truthful() {
         let dir = tempfile::tempdir().expect("empty encryption tempdir");
-        assert_eq!(read_encryption_state(dir.path()), Ok(EncryptionState::NoMappings));
+        assert_eq!(
+            read_encryption_state(dir.path()),
+            Ok(EncryptionState::NoMappings)
+        );
     }
 
     #[test]
@@ -9118,7 +8466,10 @@ mod tests {
                 Path::new("/nonexistent/apps-installed.json"),
                 Path::new("/nonexistent/running-apps.json"),
             ),
-            Ok(ApplicationFacts { installed: None, running: None })
+            Ok(ApplicationFacts {
+                installed: None,
+                running: None
+            })
         );
     }
 
@@ -9144,8 +8495,12 @@ mod tests {
         assert_eq!(packs[0].status, "installed");
         assert_eq!(packs[1].status, "outdated");
         assert_eq!(vendor_pack_facts(None), Vec::new());
-        assert!(packs.iter().all(|pack| pack.capabilities.len() <= MAX_VENDOR_CAPABILITIES));
-        assert!(packs.iter().all(|pack| pack.name.len() <= MAX_VENDOR_TEXT_CHARS));
+        assert!(packs
+            .iter()
+            .all(|pack| pack.capabilities.len() <= MAX_VENDOR_CAPABILITIES));
+        assert!(packs
+            .iter()
+            .all(|pack| pack.name.len() <= MAX_VENDOR_TEXT_CHARS));
     }
 
     #[test]
@@ -9220,7 +8575,10 @@ mod tests {
         assert_eq!(s.telemetry.cpu_cores, Some(8));
         assert_eq!(s.telemetry.root_used_percent, Some(50));
         assert_eq!(s.power_source.battery_percent, Some(72));
-        assert_eq!(s.power_source.battery_status.as_deref(), Some("Discharging"));
+        assert_eq!(
+            s.power_source.battery_status.as_deref(),
+            Some("Discharging")
+        );
         assert_eq!(s.display.connected, Some(1));
         assert_eq!(s.display.backlight_percent, Some(64));
         assert_eq!(s.input.event_devices, Some(6));
@@ -9255,7 +8613,10 @@ mod tests {
         assert_eq!(facts.alsa_devices, None);
         assert_eq!(facts.playback, Some(false));
         assert_eq!(facts.capture, Some(true));
-        assert_eq!(facts.recovery.as_deref(), Some("restart PipeWire and refresh the snapshot"));
+        assert_eq!(
+            facts.recovery.as_deref(),
+            Some("restart PipeWire and refresh the snapshot")
+        );
         assert_eq!(audio_facts(None), AudioFacts::default());
 
         let typed = serde_json::json!({
@@ -9329,12 +8690,15 @@ mod tests {
         assert_eq!(facts.cpu_cores, Some(8));
         assert_eq!(facts.load_1m_milli, Some(1275));
         assert_eq!(facts.root_used_percent, Some(50));
-        assert_eq!(telemetry_facts(Some(&serde_json::json!({
-            "cpu_cores": 257,
-            "load_1m_milli": 256001,
-            "memory_total_bytes": (1_u64 << 44) + 1,
-            "root_used_percent": 101,
-        }))), TelemetryFacts::default());
+        assert_eq!(
+            telemetry_facts(Some(&serde_json::json!({
+                "cpu_cores": 257,
+                "load_1m_milli": 256001,
+                "memory_total_bytes": (1_u64 << 44) + 1,
+                "root_used_percent": 101,
+            }))),
+            TelemetryFacts::default()
+        );
         let debug = format!("{facts:?}");
         assert!(!debug.contains("secret-command"));
         assert!(!debug.contains("private/path"));
@@ -9377,18 +8741,24 @@ mod tests {
         })));
         assert_eq!(display.connected, Some(1));
         assert_eq!(display.backlight_percent, Some(64));
-        assert_eq!(display_facts(Some(&serde_json::json!({
-            "connectors": 65,
-            "modes": 513,
-            "backlight_percent": 101,
-        }))), DisplayFacts::default());
+        assert_eq!(
+            display_facts(Some(&serde_json::json!({
+                "connectors": 65,
+                "modes": 513,
+                "backlight_percent": 101,
+            }))),
+            DisplayFacts::default()
+        );
 
         let input = input_facts(Some(&serde_json::json!({
             "event_devices": 6,
             "device_name": "secret-keyboard",
         })));
         assert_eq!(input.event_devices, Some(6));
-        assert_eq!(input_facts(Some(&serde_json::json!({"event_devices": 65}))), InputFacts::default());
+        assert_eq!(
+            input_facts(Some(&serde_json::json!({"event_devices": 65}))),
+            InputFacts::default()
+        );
         let debug = format!("{display:?} {input:?}");
         assert!(!debug.contains("DP-1"));
         assert!(!debug.contains("secret-keyboard"));
@@ -9409,11 +8779,14 @@ mod tests {
         assert_eq!(facts.storage_devices, Some(2));
         assert_eq!(facts.storage_total_bytes, Some(1_u64 << 40));
         assert_eq!(facts.thermal_max_milli_c, Some(61250));
-        assert_eq!(hardware_facts(Some(&serde_json::json!({
-            "storage_devices": 129,
-            "storage_total_bytes": 1_u64 << 44 | 1,
-            "thermal_max_milli_c": 200001,
-        }))), HardwareFacts::default());
+        assert_eq!(
+            hardware_facts(Some(&serde_json::json!({
+                "storage_devices": 129,
+                "storage_total_bytes": 1_u64 << 44 | 1,
+                "thermal_max_milli_c": 200001,
+            }))),
+            HardwareFacts::default()
+        );
         let debug = format!("{facts:?}");
         assert!(!debug.contains("nvme0n1"));
         assert!(!debug.contains("hwmon0"));
@@ -9448,33 +8821,8 @@ mod tests {
     }
 
     #[test]
-    fn health_dashboard_tracks_the_fixed_tree_and_explicit_attention() {
+    fn inventory_hierarchy_tracks_the_fixed_tree() {
         let s = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
-        let dashboard = s.health_dashboard();
-
-        assert_eq!(dashboard.states.len(), Section::ALL.len());
-        assert_eq!(dashboard.overall, SectionHealth::Unhealthy);
-        assert_eq!(
-            dashboard.health(Section::Overview),
-            SectionHealth::Unhealthy
-        );
-        assert_eq!(
-            dashboard.health(Section::Connectivity),
-            SectionHealth::Healthy
-        );
-        assert_eq!(
-            dashboard.health(Section::DisplaySound),
-            SectionHealth::Healthy
-        );
-        assert_eq!(
-            dashboard.health(Section::PowerPerformance),
-            SectionHealth::Healthy
-        );
-        assert_eq!(
-            dashboard.health(Section::Hardware),
-            SectionHealth::Attention
-        );
-        assert!(dashboard.alert_count() > 0);
 
         let flattened: Vec<_> = SectionGroup::ALL
             .into_iter()
@@ -9482,10 +8830,7 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(flattened, Section::ALL);
-        assert!(
-            renders(&s),
-            "the dashboard and hierarchy must paint together"
-        );
+        assert!(renders(&s), "the inventory hierarchy must paint");
     }
 
     #[test]
@@ -9505,7 +8850,10 @@ mod tests {
             inventory_summary(Section::Connectivity, &live),
             "interface nebula1"
         );
-        assert!(renders(&live), "inventory-first landing must remain renderable");
+        assert!(
+            renders(&live),
+            "inventory-first landing must remain renderable"
+        );
     }
 
     #[test]
@@ -9514,11 +8862,7 @@ mod tests {
         let texts = landing_texts(&live);
 
         assert!(texts.iter().any(|text| text == "Node inventory"));
-        for duplicated_heading in [
-            "Node services",
-            "Display & sound",
-            "Resource telemetry",
-        ] {
+        for duplicated_heading in ["Node services", "Display & sound", "Resource telemetry"] {
             assert!(
                 !texts.iter().any(|text| text == duplicated_heading),
                 "landing view must not repeat the full {duplicated_heading} detail card"
@@ -9531,21 +8875,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_health_dashboard_marks_every_tree_row_stale() {
+    fn stale_provider_projection_remains_truthful() {
         let mut s = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
         s.mark_stale("provider stopped publishing");
 
-        let dashboard = s.health_dashboard();
-        assert_eq!(dashboard.overall, SectionHealth::Stale);
-        assert!(dashboard
-            .states
-            .iter()
-            .all(|(_, health)| *health == SectionHealth::Stale));
-        assert!(
-            section_health_detail(Section::Hardware, SectionHealth::Stale, &s)
-                .contains("provider stopped publishing")
-        );
-        assert!(renders(&s), "stale dashboard rows must remain renderable");
+        assert!(renders(&s), "stale inventory rows must remain renderable");
         assert!(s
             .provider_projection()
             .iter()
@@ -9862,7 +9196,11 @@ mod tests {
                 contract.audit,
                 contract.recovery,
             ] {
-                assert!(!field.trim().is_empty(), "{} has a blank safety field", action.label());
+                assert!(
+                    !field.trim().is_empty(),
+                    "{} has a blank safety field",
+                    action.label()
+                );
             }
         }
     }
@@ -10047,7 +9385,8 @@ mod tests {
     #[test]
     fn inventory_and_hierarchy_sections_resolve_to_durable_detail_routes() {
         for section in Section::ALL {
-            let page = page_for_section(section).expect("every governed section has a detail route");
+            let page =
+                page_for_section(section).expect("every governed section has a detail route");
             assert_eq!(page.section, section);
             assert!(page.route.starts_with("this-node/"));
         }
