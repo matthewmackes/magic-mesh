@@ -1069,6 +1069,33 @@ class RdpProbe:
             except queue.Full:
                 pass
 
+    def _failure_diagnostic(self) -> str:
+        """Return bounded observer exit details without exposing credentials."""
+
+        return_code = self.process.poll()
+        if return_code is not None:
+            try:
+                self.process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+            # Give the dedicated stderr reader a bounded chance to consume the
+            # final panic/runtime line after process exit.
+            time.sleep(0.05)
+        stderr_tail: list[str] = []
+        while True:
+            try:
+                stderr_tail.append(self.stderr_lines.get_nowait())
+            except queue.Empty:
+                break
+        with self.lock:
+            observer_error = self.error
+        details = [f"returncode={return_code!r}"]
+        if observer_error:
+            details.append(f"observer_error={observer_error}")
+        if stderr_tail:
+            details.append("stderr=" + " | ".join(stderr_tail[-8:])[:4096])
+        return "; ".join(details)
+
     def wait_ready(self, timeout: float = 90.0) -> dict[str, Any]:
         if not self.ready.wait(timeout):
             fail("RDP observer did not reach a connected 1920x1080 session")
@@ -1086,11 +1113,19 @@ class RdpProbe:
     def _send_control(self, control: str) -> None:
         if self.process.stdin is None:
             fail("RDP observer control pipe is unavailable")
+        if self.process.poll() is not None:
+            fail(
+                f"RDP observer exited before the {control!r} control: "
+                + self._failure_diagnostic()
+            )
         try:
             self.process.stdin.write(control + "\n")
             self.process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
-            fail(f"RDP observer rejected the {control!r} control: {exc}")
+            fail(
+                f"RDP observer rejected the {control!r} control: {exc}; "
+                + self._failure_diagnostic()
+            )
 
     def begin(self) -> None:
         self._send_control("begin")
