@@ -362,16 +362,16 @@ remains here under a completed status.
   media decode, and page failures remain inside the guest.
 - Current state: The standalone repository preserves the old CEF/Servo stack;
   `Surface::Browser` selects typed `browser-vm`, with RDP preferred and
-  Sunshine/Moonlight explicit. Dell runs immutable Fedora 44 r3 from source
-  `9ccb8e90…`, image `sha256:99110644…0ec6`, a fresh overlay/seed, encrypted
-  login, and five-second alerts; its schema-v2 receipt validates one backing
-  edge. Strict RDP proof rejected the login bitmap, decoded 73-color Chromium,
-  observed keyboard-driven frame change, reconnected via RDP6, decoded 6,739
-  colors, and removed its credential. Guest evidence records `vainfo` success,
-  1/1 audio endpoints, fixed-MKV A/V ready-state 4, 4/4 frames with zero drops,
-  and no relevant SELinux denial. Dell survived a reboot and remains online.
-  Workloads auto-launch, pointer, audible/capture/recovery, 15-minute performance,
-  and fleet gates remain; bounded evidence is in `docs/ops/browser-vm-r3-dell-acceptance-2026-08-03.md`.
+  Sunshine/Moonlight explicit. Dell now runs clean immutable Fedora 44 r5 from
+  source `1f8bd845…`, digest `sha256:17e38205…b0556`, through a fresh one-edge
+  overlay/NoCloud seed, encrypted host-bound login, and five-second alerts. Its
+  schema-v2 receipt validates the running domain and base. The release RDP client
+  at pushed commit `9660cbd9…` rendered Chromium at 1920x1080, opened and closed
+  its real app menu via pointer plus Escape, repainted 88.7% on reconnect, and
+  retained 99.9% visual identity. Workloads auto-launch, connected runtime/media,
+  live stereo playback/capture, 15-minute five-tab performance, shell
+  auto-selection, and fleet rollout remain; see
+  `docs/platform/evidence/WL-ARCH-008-2026-08-04-dell-r5.md`.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
