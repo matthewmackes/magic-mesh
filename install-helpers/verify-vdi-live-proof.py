@@ -8,6 +8,11 @@ the test prints its exact non-empty ``FRAME OK`` marker.  A reachable TCP
 port, a requested session, a fixture, or a failed decoder never becomes
 framebuffer evidence.
 
+RDP evidence additionally requires exactly one effective input marker and the
+single tier-reconnect marker.  Effective input is either a changed framebuffer
+reported by the generic probe or Chromium's strict reversible pointer-click
+challenge; an unchanged framebuffer is never effective input evidence.
+
 The output contains no endpoint ticket and no raw probe log; it records the
 protocol, bounded frame dimensions/hash, input observation, command result,
 and a digest of the captured log for later correlation.
@@ -41,8 +46,22 @@ FRAME_RE = re.compile(r"live-shell-(?:vnc|spice): FRAME OK ([1-9][0-9]{0,4})x([1
 ECHO_RE = re.compile(r"live-shell-(?:vnc|spice): INPUT ECHOED before=(0x[0-9a-fA-F]{16}) after=(0x[0-9a-fA-F]{16})")
 UNCHANGED_RE = re.compile(r"live-shell-(?:vnc|spice): INPUT sent; framebuffer unchanged fnv1a64=(0x[0-9a-fA-F]{16})")
 RDP_FRAME_RE = re.compile(r"^live: FRAME OK ([1-9][0-9]{0,4})x([1-9][0-9]{0,4})\b.*?fnv1a64=(0x[0-9a-fA-F]{16})\b.*$", re.MULTILINE)
-RDP_ECHO_RE = re.compile(r"^live: INPUT ECHOED .*?before=(0x[0-9a-fA-F]{16}) after=(0x[0-9a-fA-F]{16})$", re.MULTILINE)
+RDP_ECHO_RE = re.compile(
+    r"^live: INPUT ECHOED — framebuffer changed after keystroke "
+    r"\(before=(0x[0-9a-fA-F]{16}) after=(0x[0-9a-fA-F]{16})\)$",
+    re.MULTILINE,
+)
 RDP_UNCHANGED_RE = re.compile(r"^live: INPUT sent OK; framebuffer UNCHANGED .*?fnv1a64=(0x[0-9a-fA-F]{16}).*$", re.MULTILINE)
+RDP_POINTER_CLICK_RE = re.compile(
+    r"^live: POINTER CLICK VERIFIED kind=chromium-app-menu "
+    r"point=[0-9]{1,5},[0-9]{1,5} sent=2 "
+    r"opening_rects=[1-9][0-9]* closing_rects=[1-9][0-9]* "
+    r"changed_near=[1-9][0-9]* changed_total=[1-9][0-9]* "
+    r"bounds=PixelBounds \{ left: [0-9]+, top: [0-9]+, right: [0-9]+, bottom: [0-9]+ \} "
+    r"restored=[1-9][0-9]*/[1-9][0-9]* residual=[0-9]+ "
+    r"before=0x[0-9a-fA-F]{16} opened=0x[0-9a-fA-F]{16} closed=0x[0-9a-fA-F]{16}$",
+    re.MULTILINE,
+)
 RDP_RECONNECT_RE = re.compile(r"^live: RECONNECTED\b.*$", re.MULTILINE)
 TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9_.:-]+):(?P<port>[0-9]{1,5})(?P<credentials>(?:,[^,]*){0,2})?$")
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -88,22 +107,38 @@ def parse_probe(log: str, protocol: str, returncode: int) -> dict[str, Any]:
         frame_matches = list(RDP_FRAME_RE.finditer(log))
         echo_matches = list(RDP_ECHO_RE.finditer(log))
         unchanged_matches = list(RDP_UNCHANGED_RE.finditer(log))
+        pointer_click_matches = list(RDP_POINTER_CLICK_RE.finditer(log))
     else:
         frame_matches = [match for match in FRAME_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
         echo_matches = [match for match in ECHO_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
         unchanged_matches = [match for match in UNCHANGED_RE.finditer(log) if match.group(0).startswith(f"live-shell-{protocol}:")]
+        pointer_click_matches = []
     if returncode != 0:
         return {"status": "failed", "reason": f"probe exited {returncode}"}
     if len(frame_matches) != 1:
         return {"status": "unavailable", "reason": "exactly one non-empty guest FRAME OK marker was not observed"}
     if protocol == "rdp" and len(RDP_RECONNECT_RE.findall(log)) != 1:
         return {"status": "unavailable", "reason": "RDP tier reconnect marker was not observed exactly once"}
+    if protocol == "rdp":
+        effective_input_count = len(echo_matches) + len(pointer_click_matches)
+        hashes_changed = all(
+            match.group(1).lower() != match.group(2).lower()
+            for match in echo_matches
+        )
+        if effective_input_count != 1 or not hashes_changed or unchanged_matches:
+            return {
+                "status": "unavailable",
+                "reason": (
+                    "exactly one effective RDP input marker was not observed; "
+                    "unchanged or conflicting input is not proof"
+                ),
+            }
 
     frame = frame_matches[0]
     input_observation = "not-reported"
     echo = echo_matches[0] if echo_matches else None
     unchanged = unchanged_matches[0] if unchanged_matches else None
-    if echo:
+    if echo or pointer_click_matches:
         input_observation = "echoed"
     elif unchanged:
         input_observation = "unchanged"
@@ -193,6 +228,8 @@ def validate_evidence(data: Any) -> None:
             die("observed evidence has no bounded framebuffer digest")
         if data.get("input_observation") not in {"echoed", "unchanged", "not-reported"}:
             die("invalid input observation")
+        if data["protocol"] == "rdp" and data["input_observation"] != "echoed":
+            die("RDP evidence has no effective input observation")
         if data["protocol"] == "rdp" and data.get("reconnect_observation") != "tier-reconnected":
             die("RDP evidence has no tier-reconnect observation")
         if data["protocol"] != "rdp" and "reconnect_observation" in data:
@@ -280,21 +317,81 @@ def self_test() -> None:
     validate_evidence(evidence)
     assert evidence["status"] == "observed"
     assert evidence["frame"]["width"] == 1024
-    rdp_log = (
+    rdp_frame = (
         "live: CONNECTED tier=Full desktop=1024x768\n"
         "live: FRAME OK 1024x768 rects=1 fnv1a64=0x0123456789abcdef distinct_colors=42\n"
-        "live: INPUT sent OK; framebuffer UNCHANGED after keystroke (fnv1a64=0x0123456789abcdef)\n"
+    )
+    pointer_marker = (
+        "live: POINTER CLICK VERIFIED kind=chromium-app-menu point=998,62 sent=2 "
+        "opening_rects=64 closing_rects=13 changed_near=71307 changed_total=71307 "
+        "bounds=PixelBounds { left: 552, top: 46, right: 1024, bottom: 683 } "
+        "restored=64601/71307 residual=6706 before=0x79be741c6207dd11 "
+        "opened=0xc4958cf48b882a8f closed=0xdd84e86520a3646a\n"
+    )
+    rdp_reconnect = (
         "live: RECONNECTED tier=Compressed desktop=1024x768\n"
         "live: TIER FRAME OK 1024x768 rects=1 fnv1a64=0xfedcba9876543210 distinct_colors=43\n"
     )
+    rdp_log = rdp_frame + pointer_marker + rdp_reconnect
     rdp_evidence = make_evidence("rdp", "127.0.0.1:13389,mde,mde-live-proof", 0, rdp_log, source_commit, image_digest)
     validate_evidence(rdp_evidence)
     assert rdp_evidence["status"] == "observed"
     assert rdp_evidence["protocol"] == "rdp"
     assert rdp_evidence["target"] == {"host": "127.0.0.1", "port": 13389}
     assert "mde-live-proof" not in json.dumps(rdp_evidence)
-    assert rdp_evidence["input_observation"] == "unchanged"
+    assert rdp_evidence["input_observation"] == "echoed"
     assert rdp_evidence["reconnect_observation"] == "tier-reconnected"
+
+    generic_echo = (
+        "live: INPUT ECHOED — framebuffer changed after keystroke "
+        "(before=0x0123456789abcdef after=0xfedcba9876543210)\n"
+    )
+    generic_rdp = make_evidence(
+        "rdp",
+        "127.0.0.1:13389",
+        0,
+        rdp_frame + generic_echo + rdp_reconnect,
+        source_commit,
+        image_digest,
+    )
+    validate_evidence(generic_rdp)
+    assert generic_rdp["status"] == "observed"
+    assert generic_rdp["input_observation"] == "echoed"
+
+    unchanged = (
+        "live: INPUT sent OK; framebuffer UNCHANGED after keystroke "
+        "(fnv1a64=0x0123456789abcdef)\n"
+    )
+    ineffective_rdp_inputs = (
+        unchanged,
+        "live: POINTER CLICK VERIFIED\n",
+        pointer_marker.replace("kind=chromium-app-menu", "kind=other-app"),
+        pointer_marker.replace("sent=2", "sent=1"),
+        pointer_marker + pointer_marker,
+        pointer_marker + unchanged,
+        generic_echo.replace("after=0xfedcba9876543210", "after=0x0123456789abcdef"),
+    )
+    for input_log in ineffective_rdp_inputs:
+        rejected = make_evidence(
+            "rdp",
+            "127.0.0.1:13389",
+            0,
+            rdp_frame + input_log + rdp_reconnect,
+            source_commit,
+            image_digest,
+        )
+        assert rejected["status"] == "unavailable"
+
+    for ineffective_observation in ("unchanged", "not-reported"):
+        broken_rdp = dict(rdp_evidence)
+        broken_rdp["input_observation"] = ineffective_observation
+        try:
+            validate_evidence(broken_rdp)
+        except ProofError:
+            pass
+        else:
+            die("self-test accepted ineffective RDP input evidence")
+
     for log, code in (("", 0), ("live-shell-vnc: FRAME OK 0x0 fnv1a64=0x0123456789abcdef", 0), (valid_log, 1)):
         rejected = make_evidence("vnc", "127.0.0.1:15903", code, log, source_commit, image_digest)
         assert rejected["status"] != "observed"

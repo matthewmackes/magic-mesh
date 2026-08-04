@@ -628,8 +628,8 @@ def _fixture(root: Path) -> dict[str, Any]:
     audio = load_validator("fixture_live_audio_samples", "verify-browser-vm-live-audio.py")
     rdp_log = (
         "live: FRAME OK 1024x768 rects=1 fnv1a64=0x0123456789abcdef distinct_colors=42\n"
-        "live: INPUT sent OK; framebuffer UNCHANGED after keystroke "
-        "(fnv1a64=0x0123456789abcdef)\n"
+        "live: INPUT ECHOED — framebuffer changed after keystroke "
+        "(before=0x0123456789abcdef after=0xfedcba9876543210)\n"
         "live: RECONNECTED tier=Compressed desktop=1024x768\n"
         "live: TIER FRAME OK 1024x768 rects=1 fnv1a64=0xfedcba9876543210 distinct_colors=43\n"
     )

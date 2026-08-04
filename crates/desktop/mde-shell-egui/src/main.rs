@@ -2611,6 +2611,7 @@ impl Shell {
                         })
                         .inner;
                     if leave {
+                        self.web.note_vdi_session_detached();
                         self.vdi.clear_target();
                         self.nav.surface = Surface::Workbench;
                     }
@@ -6773,6 +6774,69 @@ mod tests {
             shell.web.operation_progress_summary().is_none(),
             "Browser download progress remains guest-owned at the VDI boundary"
         );
+    }
+
+    #[test]
+    fn browser_escape_return_rearms_the_same_vm_attachment() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Browser;
+
+        let target = super::web::BrowserVmTarget {
+            serving_peer: "dell".to_owned(),
+            workload: "browser-vm".to_owned(),
+            status: "active".to_owned(),
+            reachable: true,
+        };
+        shell.web.sync_browser_vm_target(Some(target.clone()));
+        let first = shell
+            .web
+            .take_browser_vm_connect()
+            .expect("active Browser VM should issue its first attachment");
+
+        let bus = tempfile::tempdir().expect("isolated VDI lifecycle bus");
+        shell.vdi.request_connect(
+            super::vdi::ConnectRequest::new(
+                super::vdi::RequestedTarget::new(
+                    first.target.serving_peer.clone(),
+                    first.target.workload.clone(),
+                ),
+                super::vdi::VdiProtocol::Rdp,
+                super::vdi::DisplayMode::Fullscreen,
+                super::vdi::MonitorSpan::Single,
+                super::auth::DesktopAuth::mesh_identity("dell"),
+            )
+            .with_browser_transport(first.transport)
+            .with_broker_session(super::vdi::BrokerSessionLifecycle::new(
+                "browser-session",
+                Some(bus.path().to_path_buf()),
+            )),
+        );
+        shell.vdi.request_return_to_chrome();
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| shell.body(ui));
+        });
+
+        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert!(
+            shell.vdi.requested_target().is_none(),
+            "Escape should clear the focused Browser VDI target"
+        );
+
+        shell.web.sync_browser_vm_target(Some(target));
+        let reattach = shell
+            .web
+            .take_browser_vm_connect()
+            .expect("returning to Browser should reattach the stable VM");
+        assert_eq!(reattach.target.workload, "browser-vm");
+        assert_eq!(reattach.target.serving_peer, "dell");
     }
 
     #[test]

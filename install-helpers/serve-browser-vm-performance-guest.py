@@ -56,9 +56,17 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def own_sha256() -> str:
+def compute_own_sha256() -> str:
     digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     return "sha256:" + digest
+
+
+HELPER_SHA256 = compute_own_sha256()
+
+
+def own_sha256() -> str:
+    """Return the startup-bound digest after the staged source is removed."""
+    return HELPER_SHA256
 
 
 _response_lock = threading.Lock()
@@ -152,7 +160,7 @@ def validate_common(request: dict[str, Any]) -> tuple[str, str]:
         fail("guest request has an unexpected shape")
     if request.get("schema_version") != 1:
         fail("guest request schema is unsupported")
-    if action not in {"start", "stop"}:
+    if action not in {"start", "stop", "shutdown"}:
         fail("guest request action is unsupported")
     run_id = request.get("run_id")
     if not isinstance(run_id, str) or RUN_ID_RE.fullmatch(run_id) is None:
@@ -303,8 +311,6 @@ class ActiveRun:
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
                 "--disable-background-media-suspend",
-                "--disable-frame-rate-limit",
-                "--disable-gpu-vsync",
                 "--remote-allow-origins=*",
                 "--remote-debugging-address=127.0.0.1",
                 f"--remote-debugging-port={self.internal_port}",
@@ -423,6 +429,8 @@ class ActiveRun:
 
 
 def self_test() -> None:
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", own_sha256())
+    assert own_sha256() == HELPER_SHA256
     action, run_id = validate_common(
         {
             "schema_version": 1,
@@ -435,6 +443,9 @@ def self_test() -> None:
         }
     )
     assert action == "start" and run_id == "a" * 16
+    assert validate_common(
+        {"schema_version": 1, "action": "shutdown", "run_id": "c" * 16}
+    ) == ("shutdown", "c" * 16)
     assert validate_start(
         {
             "guest_ip": "192.168.122.58",
@@ -519,7 +530,7 @@ def run() -> int:
                 active = ActiveRun(request, run_id)
                 publish_response(active.response())
                 next_metrics_refresh = time.monotonic() + 1.0
-            else:
+            elif action == "stop":
                 if active is None or active.run_id != run_id:
                     fail("stop request does not identify the active run")
                 active.stop()
@@ -533,6 +544,21 @@ def run() -> int:
                         "recorded_at": utc_now(),
                     }
                 )
+            else:
+                if active is not None:
+                    fail("controller shutdown is forbidden during an active run")
+                publish_response(
+                    {
+                        "schema_version": 1,
+                        "status": "stopped",
+                        "run_id": run_id,
+                        "helper_sha256": own_sha256(),
+                        "recorded_at": utc_now(),
+                    }
+                )
+                status_server.shutdown()
+                status_server.server_close()
+                return 0
         except Exception as exc:
             if active is not None and active.run_id == run_id:
                 active.stop()

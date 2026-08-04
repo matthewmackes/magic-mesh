@@ -17,8 +17,10 @@ Typical Dell invocation (run as root after the seat warning):
   serve-browser-vm-performance.py serve \
     --domain browser-vm --guest-ip 192.168.122.58 \
     --source-commit <40-hex> --image-digest sha256:<64-hex> \
-    --rdp-user mcnf-browser --credential-file /run/mcnf/browser-vm-rdp.secret \
+    --rdp-user mcnf-browser \
+    --credential-file /etc/credstore.encrypted/browser-vm-rdp \
     --rdp-probe /usr/local/libexec/serve-browser-vm-performance-rdp \
+    --guest-helper /usr/local/libexec/serve-browser-vm-performance-guest \
     --sidecar-out /var/lib/mcnf-browser-vm/performance-sidecar.ndjson
 
 Then, from the same host:
@@ -70,9 +72,16 @@ MIN_TABS = 5
 WIDTH = 1920
 HEIGHT = 1080
 TARGET_FPS = 30
+WINDOW_LAYOUT = (
+    (0, 0, 640, 540),
+    (640, 0, 640, 540),
+    (1280, 0, 640, 540),
+    (0, 540, 960, 540),
+    (960, 540, 960, 540),
+)
 TAB_RATE_PROBE_SECONDS = 4.0
 MEDIA_DURATION_SECONDS = 8
-MEDIA_FPS = 60
+MEDIA_FPS = 30
 MAX_MEDIA_BYTES = 64 * 1024 * 1024
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -86,9 +95,18 @@ ENDPOINT_PATH = "/v1/browser-vm/performance"
 SHELL_METRICS_SOURCE = "mde-shell-egui-vdi"
 GUEST_METRICS_SOURCE = "chromium-devtools"
 MAX_QGA_OUTPUT = 256 * 1024
+MAX_GUEST_HELPER_BYTES = 256 * 1024
+GUEST_CONTROL_DIRECTORY = "/tmp/mcnf-browser-performance-control"
 GUEST_CONTROL_REQUEST = "/tmp/mcnf-browser-performance-control/request.json"
 GUEST_CONTROL_STATUS_PORT = 41_880
 GUEST_HELPER_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+GUEST_RUNTIME_HELPER_RE = re.compile(
+    r"^/tmp/mcnf-browser-performance-control/"
+    r"serve-browser-vm-performance-guest-[0-9a-f]{64}$"
+)
+GUEST_SWAY_SOCKET_RE = re.compile(
+    r"^/run/user/1000/sway-ipc\.1000\.[0-9]+\.sock$"
+)
 GUEST_CHROMIUM_METRICS_SOURCE = "guest-user-procfs-controlled-session"
 GUEST_CHROMIUM_METRIC_FIELDS = {
     "process_count",
@@ -171,6 +189,23 @@ def validate_regular_private(path: Path, label: str, *, executable: bool = False
         fail(f"{label} is not executable")
 
 
+def validate_regular_executable(
+    path: Path, label: str, *, maximum_bytes: int | None = None
+) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"{label} is unavailable: {exc}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} must be a regular non-symlink file")
+    if metadata.st_size <= 0:
+        fail(f"{label} is empty")
+    if maximum_bytes is not None and metadata.st_size > maximum_bytes:
+        fail(f"{label} exceeds {maximum_bytes} bytes")
+    if not os.access(path, os.R_OK | os.X_OK):
+        fail(f"{label} is not readable and executable")
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -193,7 +228,7 @@ class MediaAsset:
 
 
 def generate_media_asset(runtime_root: Path) -> MediaAsset:
-    """Generate and inspect the real encoded 1080p/60 source served to Chromium."""
+    """Generate and inspect the real encoded 1080p/30 source served to Chromium."""
     ffmpeg = Path("/usr/bin/ffmpeg")
     ffprobe = Path("/usr/bin/ffprobe")
     for path, label in ((ffmpeg, "ffmpeg"), (ffprobe, "ffprobe")):
@@ -214,11 +249,11 @@ def generate_media_asset(runtime_root: Path) -> MediaAsset:
         ),
         "-vf",
         (
-            "drawbox=x=0:y=0:w=iw:h=180:color=0x1b5e20:t=fill,"
-            "drawtext=font=Sans:text='MCNF 1080p 60 FPS':"
-            "fontcolor=white:fontsize=72:x=420:y=470,"
+            "drawbox=x=0:y=0:w=iw:h=120:color=0x1b5e20:t=fill,"
+            "drawtext=font=Sans:text='MCNF 1080p 30 FPS':"
+            "fontcolor=white:fontsize=32:x=32:y=36,"
             "drawtext=font=Sans:text='FRAME %{n}':"
-            "fontcolor=0x80cbc4:fontsize=64:x='mod(n*23,1500)':y=900"
+            "fontcolor=0x80cbc4:fontsize=20:x='mod(n*11,500)':y=200"
         ),
         "-an",
         "-c:v",
@@ -309,7 +344,7 @@ def generate_media_asset(runtime_root: Path) -> MediaAsset:
         or not math.isfinite(duration)
         or duration < MEDIA_DURATION_SECONDS - 0.1
     ):
-        fail("encoded media did not verify as VP8 1920x1080 at 60 fps")
+        fail("encoded media did not verify as VP8 1920x1080 at 30 fps")
     try:
         version = subprocess.run(
             [str(ffmpeg), "-version"],
@@ -571,6 +606,137 @@ class GuestAgent:
             fail(f"{label} failed in the guest: {diagnostic}")
         return result.stdout
 
+    def ensure_control_directory(self) -> None:
+        result = self.command(
+            "/usr/bin/install",
+            [
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0755",
+                GUEST_CONTROL_DIRECTORY,
+            ],
+        )
+        if result.exitcode != 0:
+            fail(f"guest control directory creation failed: {result.stderr[:256]}")
+        observed = self.command(
+            "/usr/bin/stat",
+            ["-Lc", "%u:%g:%a", GUEST_CONTROL_DIRECTORY],
+        )
+        if observed.exitcode != 0 or observed.stdout.strip() != "0:0:755":
+            fail("guest control directory ownership or mode is not root:root 0755")
+
+    def stage_runtime_helper(self, source: Path) -> tuple[str, str]:
+        validate_regular_executable(
+            source,
+            "guest performance helper",
+            maximum_bytes=MAX_GUEST_HELPER_BYTES,
+        )
+        try:
+            payload = source.read_bytes()
+        except OSError as exc:
+            fail(f"guest performance helper is unreadable: {exc}")
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        guest_path = (
+            f"{GUEST_CONTROL_DIRECTORY}/serve-browser-vm-performance-guest-"
+            + digest.removeprefix("sha256:")
+        )
+        if GUEST_RUNTIME_HELPER_RE.fullmatch(guest_path) is None:
+            fail("guest performance helper runtime path is malformed")
+        self.ensure_control_directory()
+        removed = self.command("/usr/bin/rm", ["-f", "--", guest_path])
+        if removed.exitcode != 0:
+            fail("stale guest performance helper could not be removed")
+        response = self._qga(
+            {
+                "execute": "guest-file-open",
+                "arguments": {"path": guest_path, "mode": "w"},
+            }
+        )["return"]
+        if not isinstance(response, int) or response < 0:
+            fail("qemu guest-agent did not open the staged guest helper")
+        handle = response
+        try:
+            for offset in range(0, len(payload), 12 * 1024):
+                chunk = payload[offset : offset + 12 * 1024]
+                written = self._qga(
+                    {
+                        "execute": "guest-file-write",
+                        "arguments": {
+                            "handle": handle,
+                            "buf-b64": base64.b64encode(chunk).decode("ascii"),
+                        },
+                    }
+                )["return"]
+                if not isinstance(written, dict) or written.get("count") != len(chunk):
+                    fail("qemu guest-agent did not stage the complete guest helper")
+            self._qga(
+                {"execute": "guest-file-flush", "arguments": {"handle": handle}}
+            )
+        finally:
+            self._qga(
+                {"execute": "guest-file-close", "arguments": {"handle": handle}}
+            )
+        mode = self.command("/usr/bin/chmod", ["0755", guest_path])
+        if mode.exitcode != 0:
+            fail("staged guest performance helper could not be made executable")
+        observed = self.command(
+            "/usr/bin/stat",
+            ["-Lc", "%u:%g:%a:%s", guest_path],
+        )
+        expected_stat = f"0:0:755:{len(payload)}"
+        if observed.exitcode != 0 or observed.stdout.strip() != expected_stat:
+            fail("staged guest performance helper ownership, mode, or size changed")
+        hashed = self.command("/usr/bin/sha256sum", [guest_path])
+        hash_fields = hashed.stdout.split(maxsplit=1)
+        if (
+            hashed.exitcode != 0
+            or not hash_fields
+            or hash_fields[0] != digest.removeprefix("sha256:")
+        ):
+            fail("staged guest performance helper digest changed")
+        return guest_path, digest
+
+    def launch_runtime_helper(self, sway_socket: str, guest_path: str) -> None:
+        if GUEST_SWAY_SOCKET_RE.fullmatch(sway_socket) is None:
+            fail("authenticated guest Sway IPC identity is malformed")
+        if GUEST_RUNTIME_HELPER_RE.fullmatch(guest_path) is None:
+            fail("staged guest performance helper path is malformed")
+        launched = self.command(
+            "/usr/bin/swaymsg",
+            ["-s", sway_socket, "exec", guest_path],
+        )
+        try:
+            response = json.loads(launched.stdout)
+        except json.JSONDecodeError:
+            response = None
+        if (
+            launched.exitcode != 0
+            or not isinstance(response, list)
+            or len(response) != 1
+            or not isinstance(response[0], dict)
+            or response[0].get("success") is not True
+        ):
+            diagnostic = (launched.stderr or launched.stdout).strip()[:512]
+            fail(f"authenticated Sway refused the guest helper: {diagnostic}")
+
+    def remove_runtime_helper(self, guest_path: str, *, required: bool = True) -> None:
+        if GUEST_RUNTIME_HELPER_RE.fullmatch(guest_path) is None:
+            if required:
+                fail("guest performance helper cleanup path is malformed")
+            return
+        try:
+            result = self.command("/usr/bin/rm", ["-f", "--", guest_path])
+        except HarnessError:
+            if required:
+                raise
+            return
+        if result.exitcode != 0 and required:
+            fail("staged guest performance helper cleanup failed")
+
     def remove_control_file(self, path: str) -> None:
         if path != GUEST_CONTROL_REQUEST:
             fail("guest control cleanup path is not admitted")
@@ -633,6 +799,11 @@ for candidate in "$runtime"/wayland-*; do
     if [ -S "$candidate" ]; then wayland=${candidate##*/}; break; fi
 done
 printf 'wayland_display=%s\n' "$wayland"
+sway_socket=
+for candidate in "$runtime"/sway-ipc.$(id -u @GUEST_USER@).*.sock; do
+    if [ -S "$candidate" ]; then sway_socket=$candidate; break; fi
+done
+printf 'sway_socket=%s\n' "$sway_socket"
 display=
 for candidate in /tmp/.X11-unix/X*; do
     if [ -S "$candidate" ]; then display=:${candidate##*X}; fi
@@ -660,6 +831,7 @@ printf 'chromium_bin=%s\n' "$(command -v chromium || command -v chromium-browser
             "guest_gid",
             "guest_home",
             "wayland_display",
+            "sway_socket",
             "display",
             "chromium_bin",
         }
@@ -675,9 +847,13 @@ def wait_for_guest_session_facts(
     while time.monotonic() < deadline:
         try:
             facts = guest.facts()
-            if facts["wayland_display"] and facts["display"]:
+            if (
+                facts["wayland_display"]
+                and facts["sway_socket"]
+                and facts["display"]
+            ):
                 return facts
-            last = "authenticated xrdp session has no Wayland/X11 socket yet"
+            last = "authenticated xrdp session has no Sway/Wayland/X11 socket yet"
         except HarnessError as exc:
             last = str(exc)
         time.sleep(0.5)
@@ -1214,15 +1390,118 @@ class CdpTab:
             time.sleep(0.1)
         fail(f"Chromium window {window_id} did not enter a verified minimized state")
 
+    def place_desktop_window(
+        self, window_id: int, left: int, top: int, width: int, height: int
+    ) -> None:
+        self.socket.call(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "normal"}},
+        )
+        self.socket.call(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                },
+            },
+        )
+        observed: dict[str, Any] | None = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            value = self.socket.call("Browser.getWindowBounds", {"windowId": window_id})
+            bounds = value.get("bounds") if isinstance(value, dict) else None
+            observed = bounds if isinstance(bounds, dict) else None
+            # Chromium's outer-window report can exclude the compositor's
+            # one-pixel terminal edge even though the requested surface and
+            # decoded media remain 1920x1080.  Admit only that bounded frame
+            # accounting difference; source geometry is validated separately.
+            if (
+                isinstance(bounds, dict)
+                and bounds.get("windowState") == "normal"
+                and bounds.get("left") == left
+                and bounds.get("top") == top
+                and bounds.get("width") in {width - 1, width}
+                and bounds.get("height") in {height - 1, height}
+            ):
+                return
+            time.sleep(0.1)
+        fail(
+            f"Chromium window {window_id} did not enter its verified desktop tile "
+            f"bounds (observed {observed})"
+        )
+
     def close(self) -> None:
         self.socket.close()
+
+
+def spread_tabs_across_visible_windows(tabs: list[CdpTab]) -> bool:
+    """Keep every measured page active in its own visible headful window.
+
+    Inactive tabs do not submit compositor frames. Five non-overlapping tiles
+    keep every real 1080p source visibly scheduled while limiting composition
+    to the one 1920x1080 desktop, rather than asking a software guest to render
+    five full-desktop surfaces. Return ``True`` when targets changed so the
+    caller can rediscover them.
+    """
+    if len(tabs) != MIN_TABS:
+        fail("Chromium window spreading requires the exact measured tab set")
+    owners: dict[int, CdpTab] = {}
+    duplicates: list[CdpTab] = []
+    for tab in tabs:
+        window_id = tab.window_id()
+        if window_id in owners:
+            duplicates.append(tab)
+        else:
+            owners[window_id] = tab
+    if duplicates:
+        controller = tabs[0]
+        created: list[str] = []
+        try:
+            for tab in duplicates:
+                result = controller.socket.call(
+                    "Target.createTarget",
+                    {"url": tab.url, "newWindow": True, "background": False},
+                )
+                target_id = result.get("targetId") if isinstance(result, dict) else None
+                if (
+                    not isinstance(target_id, str)
+                    or SESSION_RE.fullmatch(target_id) is None
+                    or target_id in created
+                ):
+                    fail("Chromium returned a malformed replacement-window target")
+                created.append(target_id)
+        except Exception:
+            for target_id in created:
+                try:
+                    controller.socket.call("Target.closeTarget", {"targetId": target_id})
+                except (HarnessError, OSError):
+                    pass
+            raise
+        for tab in duplicates:
+            result = controller.socket.call("Target.closeTarget", {"targetId": tab.id})
+            if not isinstance(result, dict) or result.get("success") is not True:
+                fail("Chromium did not close a replaced background media tab")
+        return True
+
+    windows: set[int] = set()
+    for tab, (left, top, width, height) in zip(tabs, WINDOW_LAYOUT, strict=True):
+        window_id = tab.window_id()
+        if window_id in windows:
+            fail("Chromium media tabs did not retain independent windows")
+        tab.place_desktop_window(window_id, left, top, width, height)
+        windows.add(window_id)
+    return False
 
 
 MEDIA_PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MCNF Browser VM performance media</title>
 <style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#07111f}
-#video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#07111f}
+#video{position:fixed;left:0;top:0;width:1920px;height:1080px;object-fit:none;background:#07111f}
 #beacon{position:fixed;left:24px;top:48px;width:160px;height:96px;border:0;border-radius:12px;
 background:#c62828;color:white;font:700 17px system-ui;z-index:4;box-shadow:0 3px 18px #0008}
 #nav{position:fixed;width:1px;height:1px;left:-10px;top:-10px;border:0}
@@ -1482,6 +1761,13 @@ def wait_for_tabs(
                 accepted = False
                 try:
                     tabs = [CdpTab(target) for target in rewritten]
+                    if spread_tabs_across_visible_windows(tabs):
+                        last_error = "rediscovering five independent Chromium windows"
+                        continue
+                    for tab in tabs:
+                        activate_tab(guest_ip, proxy_port, tab.id)
+                        time.sleep(0.4)
+                    activate_tab(guest_ip, proxy_port, tabs[0].id)
                     statuses = [tab.initialization_status() for tab in tabs]
                     if not all(status.get("harness") is True for status in statuses):
                         errors = sorted(
@@ -1544,7 +1830,11 @@ def wait_for_tabs(
                                 and snapshot["height"] == HEIGHT
                                 and snapshot["readyState"] >= 2
                                 for snapshot in rate_snapshots
-                            ) and all(rate >= TARGET_FPS for rate in rates):
+                            ) and all(
+                                rate >= TARGET_FPS for rate in rates
+                            ) and all(
+                                rate >= TARGET_FPS for rate in quality_rates
+                            ):
                                 accepted = True
                                 return tabs
                             last_error = (
@@ -1623,6 +1913,17 @@ def fetch_guest_control_status(
     return value
 
 
+def guest_controller_reachable(guest_ip: str) -> bool:
+    try:
+        connection = socket.create_connection(
+            (guest_ip, GUEST_CONTROL_STATUS_PORT), timeout=0.5
+        )
+    except OSError:
+        return False
+    connection.close()
+    return True
+
+
 def validate_guest_chromium_stats(
     response: dict[str, Any], chromium_pid: int
 ) -> dict[str, Any]:
@@ -1691,6 +1992,7 @@ def prepare_controlled_chromium(
     cdp_internal_port: int,
     cdp_proxy_port: int,
     run_id: str,
+    expected_helper_sha256: str,
 ) -> tuple[list[CdpTab], str, str, str, int]:
     if not facts["wayland_display"] or not facts["display"]:
         fail("authenticated RDP session has no guest Wayland/X11 display")
@@ -1741,6 +2043,8 @@ def prepare_controlled_chromium(
         helper_sha256
     ) is None:
         fail("guest performance controller returned a malformed helper digest")
+    if helper_sha256 != expected_helper_sha256:
+        fail("guest performance controller does not match the trusted helper digest")
     chromium_stats = validate_guest_chromium_stats(
         response, int(response["chromium_pid"])
     )
@@ -1799,6 +2103,36 @@ def stop_guest_controlled_chromium(
             time.sleep(0.2)
         if required:
             fail("guest performance controller did not confirm Chromium cleanup")
+    except HarnessError:
+        if required:
+            raise
+    finally:
+        try:
+            guest.remove_control_file(GUEST_CONTROL_REQUEST)
+        except HarnessError:
+            if required:
+                raise
+
+
+def shutdown_runtime_guest_controller(
+    guest: GuestAgent, guest_ip: str, *, required: bool = True
+) -> None:
+    """Stop a runtime-staged controller before removing its source file."""
+    if not guest_controller_reachable(guest_ip):
+        return
+    run_id = secrets.token_hex(8)
+    try:
+        guest.remove_control_file(GUEST_CONTROL_REQUEST)
+        guest.write_control_request(
+            {"schema_version": 1, "action": "shutdown", "run_id": run_id}
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if not guest_controller_reachable(guest_ip):
+                return
+            time.sleep(0.2)
+        if required:
+            fail("runtime-staged guest performance controller did not stop")
     except HarnessError:
         if required:
             raise
@@ -1895,6 +2229,7 @@ class HarnessContext:
     media_asset: MediaAsset
     firewall: FirewallLease
     credential_runtime_root: Path
+    staged_guest_helper_path: str | None
 
 
 def write_stream_record(
@@ -2204,8 +2539,15 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
     if args.media_bind != "192.168.122.1" or args.media_port != 9081:
         fail("the controlled media origin must remain the Dell libvirt bridge endpoint")
     validate_regular_private(args.credential_file, "RDP credential file")
-    if not args.rdp_probe.is_absolute() or not args.rdp_probe.is_file():
-        fail("RDP probe must be one absolute regular file")
+    if not args.rdp_probe.is_absolute() or not args.guest_helper.is_absolute():
+        fail("RDP probe and guest helper paths must be absolute")
+    validate_regular_executable(args.rdp_probe, "RDP probe")
+    validate_regular_executable(
+        args.guest_helper,
+        "guest performance helper",
+        maximum_bytes=MAX_GUEST_HELPER_BYTES,
+    )
+    expected_guest_helper_sha256 = file_sha256(args.guest_helper)
 
     credential_runtime_root, password_path = materialize_rdp_password(
         args.credential_file, args.rdp_user
@@ -2216,6 +2558,7 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
     probe: RdpProbe | None = None
     guest = GuestAgent(domain, args.rdp_user)
     guest_run_id: str | None = None
+    staged_guest_helper_path: str | None = None
     try:
         sidecar = SidecarWriter(args.sidecar_out)
         firewall = FirewallLease(guest_ip, args.media_port)
@@ -2239,6 +2582,16 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
             fail("guest transport is not the collector's requested RDP path")
         if facts["guest_user"] != args.rdp_user:
             fail("guest runtime account does not match the RDP credential account")
+        guest.ensure_control_directory()
+        if not guest_controller_reachable(guest_ip):
+            staged_guest_helper_path, staged_digest = guest.stage_runtime_helper(
+                args.guest_helper
+            )
+            if staged_digest != expected_guest_helper_sha256:
+                fail("staged guest helper changed from its trusted host digest")
+            guest.launch_runtime_helper(
+                facts["sway_socket"], staged_guest_helper_path
+            )
         run_id = secrets.token_hex(8)
         guest_run_id = run_id
         cdp_internal_port = secrets.randbelow(1_000) + 39_000
@@ -2257,6 +2610,7 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
                 cdp_internal_port,
                 cdp_proxy_port,
                 run_id,
+                expected_guest_helper_sha256,
             )
         )
         host_boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
@@ -2300,6 +2654,7 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
             media_asset=media_asset,
             firewall=firewall,
             credential_runtime_root=credential_runtime_root,
+            staged_guest_helper_path=staged_guest_helper_path,
         )
         return context, media
     except Exception:
@@ -2307,8 +2662,12 @@ def build_context(args: argparse.Namespace) -> tuple[HarnessContext, MediaServer
             stop_guest_controlled_chromium(
                 guest, guest_ip, guest_run_id, required=False
             )
+        if staged_guest_helper_path is not None:
+            shutdown_runtime_guest_controller(guest, guest_ip, required=False)
         if probe is not None:
             probe.stop()
+        if staged_guest_helper_path is not None:
+            guest.remove_runtime_helper(staged_guest_helper_path, required=False)
         if media is not None:
             media.stop()
         if firewall is not None:
@@ -2348,17 +2707,27 @@ def serve(args: argparse.Namespace) -> int:
         server.server_close()
         for tab in context.tabs:
             tab.close()
-        context.probe.stop()
-        stop_guest_controlled_chromium(
-            context.guest,
-            context.guest_ip,
-            context.guest_run_id,
-            required=True,
-        )
-        media.stop()
-        context.firewall.close()
-        context.sidecar.close()
-        remove_runtime_password(context.credential_runtime_root)
+        try:
+            stop_guest_controlled_chromium(
+                context.guest,
+                context.guest_ip,
+                context.guest_run_id,
+                required=True,
+            )
+            if context.staged_guest_helper_path is not None:
+                shutdown_runtime_guest_controller(
+                    context.guest, context.guest_ip, required=True
+                )
+        finally:
+            context.probe.stop()
+            if context.staged_guest_helper_path is not None:
+                context.guest.remove_runtime_helper(
+                    context.staged_guest_helper_path, required=False
+                )
+            media.stop()
+            context.firewall.close()
+            context.sidecar.close()
+            remove_runtime_password(context.credential_runtime_root)
 
 
 def percentile(values: list[int], fraction: float) -> int | None:
@@ -2436,6 +2805,28 @@ def summarize(args: argparse.Namespace) -> int:
 
 def self_test() -> None:
     assert compact_json({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
+    assert len(WINDOW_LAYOUT) == MIN_TABS
+    assert sum(width * height for _, _, width, height in WINDOW_LAYOUT) == WIDTH * HEIGHT
+    for index, (left, top, width, height) in enumerate(WINDOW_LAYOUT):
+        assert 0 <= left < WIDTH and 0 <= top < HEIGHT
+        assert width > 0 and height > 0
+        assert left + width <= WIDTH and top + height <= HEIGHT
+        for other in WINDOW_LAYOUT[index + 1 :]:
+            other_left, other_top, other_width, other_height = other
+            assert (
+                left + width <= other_left
+                or other_left + other_width <= left
+                or top + height <= other_top
+                or other_top + other_height <= top
+            )
+    assert GUEST_RUNTIME_HELPER_RE.fullmatch(
+        GUEST_CONTROL_DIRECTORY
+        + "/serve-browser-vm-performance-guest-"
+        + "a" * 64
+    )
+    assert GUEST_SWAY_SOCKET_RE.fullmatch(
+        "/run/user/1000/sway-ipc.1000.1234.sock"
+    )
     assert parse_i915_engine_runtimes("rcs0\n\tRuntime: 12ms\nvcs0\n  Runtime: 9ms\n") == {
         "rcs0": 12,
         "vcs0": 9,
@@ -2443,6 +2834,7 @@ def self_test() -> None:
     validate_source("1" * 40, "sha256:" + "a" * 64)
     assert b"/video.webm" in MEDIA_PAGE
     assert b"requestVideoFrameCallback" in MEDIA_PAGE
+    assert b"width:1920px;height:1080px" in MEDIA_PAGE
     identities = RuntimeIdentity(
         host_boot_id="11111111-1111-4111-8111-111111111111",
         guest_boot_id="22222222-2222-4222-8222-222222222222",
@@ -2514,6 +2906,7 @@ def main(argv: list[str]) -> int:
     serve_parser.add_argument("--rdp-port", type=int, default=3389)
     serve_parser.add_argument("--credential-file", required=True, type=Path)
     serve_parser.add_argument("--rdp-probe", required=True, type=Path)
+    serve_parser.add_argument("--guest-helper", required=True, type=Path)
     serve_parser.add_argument("--sidecar-out", required=True, type=Path)
     serve_parser.add_argument("--accept-timeout-seconds", type=int, default=300)
 
