@@ -315,5 +315,4 @@ mod tests {
         let v = split_lines(" a \n\n b:c \n");
         assert_eq!(v, vec!["a".to_string(), "b:c".to_string()]);
     }
-
 }

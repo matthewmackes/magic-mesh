@@ -843,10 +843,9 @@ mod tests {
         let dropin = include_str!("../../../../../../packaging/systemd/cloud-arm-credential.conf");
         let credential_service =
             include_str!("../../../../../../packaging/systemd/mcnf-cloud-arm-credential.service");
-        let recipient_service = include_str!(
-            "../../../../../../packaging/systemd/mcnf-mesh-secret-recipient.service"
-        );
-        let daemon = include_str!("../../../../../../packaging/systemd/mackesd.service");
+        let recipient_service =
+            include_str!("../../../../../../packaging/systemd/mcnf-mesh-secret-recipient.service");
+        let daemon = include_str!("../../../../../../packaging/systemd/mackesd-compute.service");
         let shell = include_str!("../../../../../../packaging/bootc/units/mde-shell-egui.service");
         let helper =
             include_str!("../../../../../../install-helpers/provision-cloud-arm-credential.sh");
@@ -866,7 +865,7 @@ mod tests {
                 .all(|line| !line.trim_start().starts_with("User=")),
             "the shipped DRM shell remains root-owned"
         );
-        assert!(helper.contains("mackesd.service mde-shell-egui.service"));
+        assert!(helper.contains("mackesd-compute.service mde-shell-egui.service"));
         assert!(helper.contains("/etc/systemd/system/$unit.d/50-cloud-arm-credential.conf"));
         assert!(!helper.contains("MDE_CLOUD_ARM_KEY"));
         assert!(helper.contains("--restart)"));
@@ -877,14 +876,13 @@ mod tests {
             .expect("credential service must declare ordering");
         assert!(credential_after
             .split_whitespace()
-            .any(|dependency| dependency == "mackesd.service"));
+            .any(|dependency| dependency == "mackesd-compute.service"));
+        assert!(credential_service.lines().all(|line| !line
+            .trim_start()
+            .starts_with("Before=mackesd-compute.service")));
         assert!(credential_service
-            .lines()
-            .all(|line| !line.trim_start().starts_with("Before=mackesd.service")));
-        assert!(credential_service.contains(
-            "/usr/libexec/mackesd/provision-cloud-arm-credential --refresh"
-        ));
-        assert!(credential_service.contains("After=network-online.target mackesd.service"));
+            .contains("/usr/libexec/mackesd/provision-cloud-arm-credential --refresh"));
+        assert!(credential_service.contains("After=network-online.target mackesd-compute.service"));
 
         let daemon_after = daemon
             .lines()
@@ -896,18 +894,11 @@ mod tests {
         assert!(!daemon_after
             .split_whitespace()
             .any(|dependency| dependency == "mcnf-mesh-secret-recipient.service"));
-        let daemon_wants = daemon
-            .lines()
-            .find(|line| line.trim_start().starts_with("Wants="))
-            .expect("mackesd must retain the best-effort credential pull-in");
-        assert!(daemon_wants
-            .split_whitespace()
-            .any(|dependency| dependency == "mcnf-cloud-arm-credential.service"));
         assert!(helper.contains("cmp -s \"$plain\" \"$decrypted\""));
-        assert!(helper.contains("systemctl try-restart mackesd.service"));
+        assert!(helper.contains("systemctl try-restart mackesd-compute.service"));
         assert!(helper.contains("systemctl try-restart mde-shell-egui.service"));
-        assert!(recipient_service
-            .lines()
-            .all(|line| !line.trim_start().starts_with("Before=mackesd.service")));
+        assert!(recipient_service.lines().all(|line| !line
+            .trim_start()
+            .starts_with("Before=mackesd-compute.service")));
     }
 }

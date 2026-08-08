@@ -1,0 +1,61 @@
+# Workload authority inventory
+
+This is the checked inventory for `WL-ARCH-010` S1. It describes the live
+authority graph; it is evidence for the canonical worklist, not another
+worklist. Repository paths are the durable owner identifiers.
+
+## Live authorities
+
+| Concern | Sole authority | Producers / readers | Boundary |
+| --- | --- | --- | --- |
+| Operation contract | `mackes-mesh-types::workloads` | Shell `workload_api`, onboarding, and daemon action adapters construct the same bounded type | `action/workload/operation` only |
+| Operation consumer, journal, reconciliation | `mackesd::workers::workload_compute` | no second consumer | persisted request precedes every side effect |
+| VM lifecycle adapter | `workload_compute::SystemWorkloadActuator` | libvirt / `virtqemud` via bounded `virsh` commands | only the reconciler invokes workload or cold-migration lifecycle effects; `compute_migrate` can submit bounded commands but has no adapter |
+| Container lifecycle adapter | `workload_compute::SystemWorkloadActuator` | rootful Quadlet / systemd and approved Podman image materialization | only the reconciler installs or removes a Workload Quadlet unit |
+| Runtime/readiness projection | `workload_compute::publish_projection` | shell `workload_api`, datacenter, desktop sources, and daemon IPC are read-only consumers | one bounded `state/workloads/<node>` snapshot |
+| Native presentation lease | `workload_compute` Display1 attachment runtime | shell `display1_client` consumes one-use local leases | lease metadata may be projected; descriptors stay on the authenticated Unix socket and never enter the Bus |
+| Session semantics | `session_broker` | chooser/session rail publish session intent; roaming reads session state | owns user/session focus only; cannot actuate a VM/container or mint a console endpoint |
+| Placement proposals | `scheduler` | publishes placement events | cannot publish Workload operations or invoke a runtime adapter |
+| Storage observation/provisioning | storage and compute-provision workers | read-only runtime probes and host storage-pool setup | cannot change an individual Workload power state |
+
+## Typed caller inventory
+
+- Browser, Workloads/IaC, Datacenter, Explorer, Front Door, chooser, first
+  desktop onboarding, and daemon action adapters publish the shared
+  `WorkloadOperationRequest` contract.
+- `Open` and `StartAndAttach` request a declared `WorkloadAttachmentProtocol`;
+  the shell never requests or decodes a raw console `host:port` record.
+- Cloud VM/container day-two verbs and the former cloud console verb are
+  unclassified and fail before authorization or backend dispatch.
+- Direct/manual RDP, VNC, and SPICE endpoints remain user-selected transport
+  inputs. They are not VM lifecycle or attachment authorities.
+
+## Retired reachability map
+
+| Retired topic or symbol | Replacement | Negative proof |
+| --- | --- | --- |
+| `action/vm/lifecycle` | `action/workload/operation` | authority lint scans production shell sources and daemon spawn wiring |
+| `action/container/lifecycle` | `action/workload/operation` | authority lint scans production shell sources and daemon spawn wiring |
+| `VmPowerRequest` / `LIFECYCLE_TOPIC` | `WorkloadOperationRequest` | authority lint rejects either shell symbol |
+| cloud `console-attach` dispatch | typed Workload `Open` / `StartAndAttach` | cloud hostile test requires unknown-verb refusal before backend dispatch |
+| `console_broker` worker and `state/vdi/console` | authenticated Workload Display1 lease | source modules and shell reader were deleted; authority lint rejects either file/module/topic |
+| Browser transport attach JSON schema/example/verifier | Workload attachment lease contract | obsolete package artifacts were deleted; package contract no longer invokes the retired verifier |
+
+## Known non-lifecycle runtime tools
+
+Repository-wide `virsh`, Podman, and systemd searches include storage probes,
+host pool provisioning, migration, and unrelated service supervision. They are
+not automatically lifecycle authorities. Each is classified by effect:
+
+- storage/runtime-probe calls are read-only;
+- compute-provision creates host storage pools, not domains;
+- service supervisors operate their named host services, not Workload units;
+- `compute_migrate` retains the distributed cold-migration protocol and bounded
+  `rsync` disk transfer, but has no libvirt adapter. Capture, shutdown,
+  observation, define/start, rollback, and relinquish commands cross an
+  in-process bounded command/reply channel and execute only when
+  `WorkloadComputeWorker` drains them through its owned actuator.
+
+The migration command queue is fail-closed and co-located in the Compute
+process group, but is not itself journaled. Restart-safe migration recovery and
+the broader live adapter/attachment proof therefore remain ARCH-010 work.

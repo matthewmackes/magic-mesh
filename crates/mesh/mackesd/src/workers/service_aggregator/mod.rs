@@ -35,24 +35,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::resources::{
-    ClientCapabilityRegistry, RESOURCE_CATALOG_TOPIC, RESOURCE_DISCOVERY_TOPIC,
-    RESOURCE_PUBLISHER_ATTESTATION_KEY_ID, RESOURCE_PUBLISHER_ATTESTATION_TTL_MS, ResourceCatalog,
-    ResourcePublisherAttestation, resource_publisher_attestation_topic,
+    resource_publisher_attestation_topic, ClientCapabilityRegistry, ResourceCatalog,
+    ResourcePublisherAttestation, RESOURCE_CATALOG_TOPIC, RESOURCE_DISCOVERY_TOPIC,
+    RESOURCE_PUBLISHER_ATTESTATION_KEY_ID, RESOURCE_PUBLISHER_ATTESTATION_TTL_MS,
 };
 use mackes_mesh_types::service_record::ServicesState;
 
-use aggregate::{ProbeInput, PublishedInput, aggregate};
+use aggregate::{aggregate, ProbeInput, PublishedInput};
 
 use super::desktop_sources::{
     DesktopProtocol, DesktopSource, DesktopSourcesState, LaneStatus, ProtocolOffer, Reachability,
-    SOURCES_TOPIC, SourceOrigin,
+    SourceOrigin, SOURCES_TOPIC,
 };
-use super::ssh_x11_sources::{SSH_X11_SOURCES_TOPIC, SshX11SourcesState, decode_sources_state};
+use super::ssh_x11_sources::{decode_sources_state, SshX11SourcesState, SSH_X11_SOURCES_TOPIC};
 use super::upnp_sources::{
-    UPNP_SOURCES_TOPIC, UpnpSourcesState, decode_sources_state as decode_upnp_sources_state,
+    decode_sources_state as decode_upnp_sources_state, UpnpSourcesState, UPNP_SOURCES_TOPIC,
 };
 use super::{ShutdownToken, Worker};
-use crate::ipc::secret_store::{SecretStore, repo_root};
+use crate::ipc::secret_store::{repo_root, SecretStore};
 
 const RESOURCE_PUBLISHER_KEY_REF: &str = "resource/publisher-hmac";
 
@@ -878,9 +878,7 @@ mod tests {
         let first = initial_phase("seat-oak", poll);
         assert_eq!(first, initial_phase("seat-oak", poll));
         assert!(first < MAX_INITIAL_PHASE);
-        assert!(
-            initial_phase("seat-oak", Duration::from_millis(100)) < Duration::from_millis(100)
-        );
+        assert!(initial_phase("seat-oak", Duration::from_millis(100)) < Duration::from_millis(100));
         assert_eq!(initial_phase("seat-oak", Duration::ZERO), Duration::ZERO);
     }
 

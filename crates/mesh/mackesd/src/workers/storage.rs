@@ -696,8 +696,12 @@ fn ensure_managed_directory(path: &Path) -> Result<(), String> {
             parent.display()
         ));
     }
-    let canonical_parent = fs::canonicalize(parent)
-        .map_err(|error| format!("canonicalize managed path parent {}: {error}", parent.display()))?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "canonicalize managed path parent {}: {error}",
+            parent.display()
+        )
+    })?;
     if canonical_parent != parent {
         return Err(format!(
             "managed path parent {} must not contain a symlink",
@@ -706,16 +710,19 @@ fn ensure_managed_directory(path: &Path) -> Result<(), String> {
     }
 
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(format!("managed path {} must not be a symlink", path.display()))
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            Err(format!("managed path {} must be a directory", path.display()))
-        }
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "managed path {} must not be a symlink",
+            path.display()
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(format!(
+            "managed path {} must be a directory",
+            path.display()
+        )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path)
-                .map_err(|create_error| format!("create managed path {}: {create_error}", path.display()))?;
+            fs::create_dir(path).map_err(|create_error| {
+                format!("create managed path {}: {create_error}", path.display())
+            })?;
             match fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
                     "managed path {} became a symlink during creation",
@@ -749,7 +756,9 @@ pub enum WorkloadStoragePlanError {
     #[error("workload storage size must be greater than zero")]
     InvalidSize,
     /// Auto-creating a table is a separate explicitly reviewed operation.
-    #[error("device {device} has no partition table; create-table requires a separate explicit review")]
+    #[error(
+        "device {device} has no partition table; create-table requires a separate explicit review"
+    )]
     NoPartitionTable {
         /// Device that lacks a partition table.
         device: String,
@@ -1989,9 +1998,10 @@ impl LiveGeometryTools {
 impl GeometryToolRunner for LiveGeometryTools {
     fn apply(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError> {
         match op {
-            StorageOp::CreateTable { device, table } => {
-                Self::parted(op, &[device.clone(), "mklabel".into(), table.as_str().into()])
-            }
+            StorageOp::CreateTable { device, table } => Self::parted(
+                op,
+                &[device.clone(), "mklabel".into(), table.as_str().into()],
+            ),
             StorageOp::CreatePartition {
                 device,
                 start_mib,
@@ -2028,10 +2038,7 @@ impl GeometryToolRunner for LiveGeometryTools {
                     op: op.kind(),
                     reason: "partition parent disk unresolved".into(),
                 })?;
-                Self::parted(
-                    op,
-                    &[disk.into(), "rm".into(), ctx.number.to_string()],
-                )
+                Self::parted(op, &[disk.into(), "rm".into(), ctx.number.to_string()])
             }
             StorageOp::SetFlags { flags, .. } => {
                 let disk = ctx.disk.as_deref().ok_or_else(|| StorageError::OpFailed {
@@ -2109,10 +2116,12 @@ pub fn configure_workload_pool_layout(
     if label != WORKLOAD_STORAGE_POOL_LABEL {
         return Ok(());
     }
-    let disk = staged.device(device).ok_or_else(|| StorageError::OpFailed {
-        op: "create_partition",
-        reason: format!("workload pool source disk {device} disappeared before layout"),
-    })?;
+    let disk = staged
+        .device(device)
+        .ok_or_else(|| StorageError::OpFailed {
+            op: "create_partition",
+            reason: format!("workload pool source disk {device} disappeared before layout"),
+        })?;
     let number = disk
         .partitions
         .iter()
@@ -3533,12 +3542,8 @@ mod tests {
             removable: false,
             partitions: vec![part("/dev/nvme0n1p1", 1, 1, 5_000)],
         }]);
-        let preview = preview_workload_storage(
-            &topo,
-            WorkloadStorageRole::Workstation,
-            8_000,
-        )
-        .expect("contiguous non-removable extent");
+        let preview = preview_workload_storage(&topo, WorkloadStorageRole::Workstation, 8_000)
+            .expect("contiguous non-removable extent");
         assert_eq!(preview.device, "/dev/nvme0n1");
         assert_eq!(preview.partition, "/dev/nvme0n1p2");
         assert_eq!(preview.filesystem, Filesystem::Xfs);
@@ -3547,12 +3552,9 @@ mod tests {
         validate_workload_storage_preview(&preview, &topo).expect("fresh preview");
 
         let mut drifted = topo.clone();
-        drifted.devices[0].partitions.push(part(
-            "/dev/nvme0n1p2",
-            2,
-            6_000,
-            2_000,
-        ));
+        drifted.devices[0]
+            .partitions
+            .push(part("/dev/nvme0n1p2", 2, 6_000, 2_000));
         assert!(validate_workload_storage_preview(&preview, &drifted).is_err());
         assert_eq!(
             preview_workload_storage(&topo, WorkloadStorageRole::Lighthouse, 8_000),
@@ -3629,7 +3631,10 @@ mod tests {
         let linked_subtree = linked_pool.join(WORKLOAD_STORAGE_CONTAINER_SUBTREE);
         let error = validate_workload_storage_layout(&linked_pool, &linked_subtree)
             .expect_err("pool symlink must be refused");
-        assert!(error.contains("mountpoint must be a real directory"), "{error}");
+        assert!(
+            error.contains("mountpoint must be a real directory"),
+            "{error}"
+        );
     }
 
     #[test]

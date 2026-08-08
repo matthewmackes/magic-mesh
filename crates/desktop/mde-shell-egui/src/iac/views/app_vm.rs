@@ -51,10 +51,9 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     muted_note(
         ui,
         "Launch app opens the admitted catalog identity through session_broker (VDI app-mode). \
-         Console remains the whole-VM fallback; guest readiness and reconnect state stay separate \
-         from the transport link.",
+         Open uses the typed Workload attachment lane; guest readiness and reconnect state stay \
+         separate from the transport link.",
     );
-    super::super::console_section(ui, state);
 }
 
 // ───────────────────────── application-family information architecture ─────
@@ -335,7 +334,7 @@ fn application_family_card(ui: &mut egui::Ui, projection: &ApplicationFamilyProj
 }
 
 /// One app-VM card — name · `app-mode` tag · status · drift, the metrics, then the
-/// whole-VM verbs (console-attach + lifecycle, destructive ones typed-armed).
+/// whole-VM typed attachment and lifecycle verbs.
 fn app_card(
     ui: &mut egui::Ui,
     state: &mut WorkloadsState,
@@ -356,16 +355,40 @@ fn app_card(
                 state.issue_console_attach(&row.node, &row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
-                state.issue_workload_direct("instance-start", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-start",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_workload_direct("instance-stop", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-stop",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-reboot", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-reboot",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-delete", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-delete",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
         });
         if let Some(reason) = model.launch.block_reason() {

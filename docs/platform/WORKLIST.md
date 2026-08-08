@@ -96,6 +96,14 @@ behavioral evidence is not completion.
   consumes only `action/workload/operation` and typed Workload projections;
   self-test passed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-live-proof-typed-operation-r1.md`.
+- **Console authority removal checkpoint (2026-08-08):** the raw console relay,
+  cloud console dispatch, shell endpoint reader, obsolete Browser attach
+  envelope, and matching live verifier were deleted. Typed Workload Open plus
+  authenticated Display1 leases remain; fail-closed lint and focused BigBoy/
+  `.90` gates pass. A follow-up bounded channel now lets only the Workload
+  reconciler execute cold-migration VM effects; restart journaling remains.
+  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON
   admission rejects duplicate top-level and nested keys; `.50` passed 9/9.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
@@ -255,6 +263,10 @@ behavioral evidence is not completion.
   checks allowlists, deterministic manifests, idempotent reruns, symlink rejection,
   and secret non-export; local and `.50` probes passed. Evidence:
   `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-boundary-validator-r1.md`.
+- **Host Browser negative-boundary checkpoint (2026-08-08):** the host engine,
+  bundled rules, workspace/package edges, and CEF/web kickstart policy were
+  removed; adfilter only replicates guest policy. Boundary lint, locked
+  metadata, and 11/11 `.90` tests pass. Evidence: `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
@@ -328,13 +340,15 @@ behavioral evidence is not completion.
 - Current state: all 145 production starts are registered and sampled with bounded generations; the shared runtime contract rejects unknown schema versions at
   every versioned boundary. Process split, complete ownership, providers, UI
   cutover, and fleet evidence remain.
-- **Process-boundary checkpoint (2026-08-06):** source validator and complete-fixture self-test pass; checkout validation correctly reports missing six group units/target and the
-  monolith. Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-06-process-boundary-r1.md`.
-- **Process-group admission checkpoint (2026-08-06):** exact six-token group
-  parsing and canonical-registry worker admission pass 3/3 on BigBoy; `serve
-  --group` is exposed. The six-unit cutover, responder partitioning, and
-  single-writer/resource/live proofs remain open. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-06-process-group-admission-r1.md`.
+- **Process-group cutover checkpoint (2026-08-08):** `serve --group` is
+  mandatory; RPM/bootc ship six budgeted services under `mackesd.target`, no
+  monolith, and the package validator passes. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-required-process-group-r1.md`,
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-grouped-systemd-cutover-r1.md`.
+- **SQLite-owner checkpoint (2026-08-08):** control now hosts a bounded typed
+  writer for seven mutations; five groups order behind its readiness and a gate
+  freezes 61 residual direct-write sites. Full enforcement/live proof remain:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-writer-boundary-r1.md`.
 - Remaining work:
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
@@ -518,12 +532,18 @@ behavioral evidence is not completion.
 - Problem: Clipboard is text-only and cannot safely negotiate rich MIME payloads across local seat, mesh peers, and guest VDI.
 - Required outcome: one versioned bounded clipboard contract supports text, HTML, images, files, and typed metadata through direct DRM, authenticated mesh, and VDI paths
   with explicit permission, limits, and cleanup.
-- Current state: text shortcuts, direct DRM copy/cut/paste, bounded envelopes, and transfer scaffolding exist; rich MIME negotiation, guest bridges, and live proof
-  remain.
+- Current state: text shortcuts, direct DRM copy/cut/paste, bounded rich contracts, authenticated mesh adapters, and transfer scaffolding exist; live DRM/mesh,
+  guest adapters, permissions, CAS cleanup, and proof remain.
 - **JSON-admission checkpoint (2026-08-06):** nested duplicate object keys are
   rejected before rich clipboard admission; the signed-envelope hostile test
   passed 1/1 on `.50`. Evidence:
   `docs/platform/evidence/WL-FUNC-016-2026-08-06-clipboard-json-admission-r1.md`.
+- **S1 rich-contract checkpoint (2026-08-08):** canonical V2 rich offers,
+  exact-generation selection, limits, secret policy, and typed denials passed 72/72 on `.50`. Evidence:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
+- **S3 mesh-transport checkpoint (2026-08-08):** target-specific signed frames
+  passed 7/7 hostile/restart checks on `.50`; physical cross-node and Files CAS proof remain. Evidence:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
 - Remaining work:
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
@@ -925,14 +945,13 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live
-  proof.
+- Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
 - Required outcome: a near-Spotify workspace uses daemon-owned typed catalog, queue, playback, bookmarks, cache, and source authority; mde-media-core provides real mpv
   frame/audio playback; Media UI covers local/Jellyfin/library flows; discovery, DLNA/cast, peer handoff, and live visual/audio proof pass.
 - Current state: daemon-owned catalog/queue/cache and typed playback, artwork,
   browse/detail, and signed radio pass. Release 11 executes on all five seats;
   named 38 Special, Black Ice, and Podcast details pass on Dell without the old
-  stale error; one daemon owns each seat; CPU/NWS and provider loss pass. Renderer and handoff remain.
+  stale error; one daemon owns each seat; CPU/NWS and provider loss pass. Live renderer and handoff proof remain.
 - **Daemon projection validation checkpoint (2026-08-06):** invalid newer `MusicWorkspaceSnapshotV1` content is refused and the last valid projection is retained;
   revision zero is rejected; Music UI 4/4 `.50`, daemon validation 1/1 `.90`. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
@@ -987,7 +1006,9 @@ behavioral evidence is not completion.
   `install-helpers/verify-music-cast-loopback.sh`;
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
 - **Roaming admission (2026-08-06):** 11/11; live two-seat proof open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`.
-- **Handoff replay (2026-08-06):** 1/1; live owner-yield/resume open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-handoff-replay-r1.md`.
+- **Exact two-seat handoff checkpoint (2026-08-08):** bounded owner yield
+  transfers the exact queue/playhead once; replay, expiry, failed target start,
+  and delayed cleanup fail closed (`.50` 1/1, `.90` state 18/18). Physical two-seat proof remains. Evidence: `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`.
 - **Cast runtime audit checkpoint (2026-08-06):** read-only seat inspection
   found no physical UPnP renderer, usable Chromecast discovery path, target
   cast-receiver unit, or second admitted peer. Typed mesh transfer and the
@@ -1003,14 +1024,13 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-two-catalog-outage-r1.md`.
 - **Jellyfin outage (2026-08-06):** known-good cache survives failures; truncated manifests refused; 90 unit/12 browse/1 outage/9 playback/doctest pass; live proof remains.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-jellyfin-outage-r1.md`.
-- **UI authority checkpoint (2026-08-06):** embedded Music blocks legacy catalog/playback/worker fallbacks and reports missing daemon writers honestly.
-  Standalone compatibility remains explicit.
-  Music UI passed 52/52; live shell action traces, render captures, and standalone migration remain open.
-  `docs/platform/evidence/WL-FUNC-021-2026-08-06-ui-authority-r1.md`.
-- **Worker authority checkpoint (2026-08-07):** standalone compatibility pause/resume
-  is inert before an active track and after stop/natural end, so it cannot emit
-  invented playback state; worker tests passed 3/3 on `.50` and targeted format
-  passed on BigBoy. `docs/platform/evidence/WL-FUNC-021-2026-08-06-worker-authority-r2.md`.
+- **GUI authority checkpoint (2026-08-08):** embedded and standalone Music both
+  consume daemon projections, start no provider/playback worker, and fail closed
+  without an authenticated writer. Focused `.50` regression passed. Evidence:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-08-standalone-daemon-authority-r1.md`.
+- **Renderer recovery checkpoint (2026-08-08):** renderer failure revokes playback/MPRIS authority; reacquisition resumes the exact finite track at its audible
+  position unless a control cancels it. Two hostile `.50` regressions passed; physical PipeWire/audible and two-seat proof remain. Evidence:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-08-renderer-recovery-r1.md`.
 - **Real-mpv Media UI checkpoint (2026-08-07):** mde-media-egui 110/110; mde-media-core mpv 257 unit,
   1 real-mpv fixture, and 1 doctest passed. Loading clears stale video frames.
   Physical renderer, provider-loss, handoff, and second-seat proof remain open.

@@ -40,8 +40,10 @@ use super::{ShutdownToken, Worker};
 /// Retained source topic reserved for the eventual live UPnP publisher.
 pub const UPNP_SOURCES_TOPIC: &str = "state/resources/upnp";
 /// SSDP's IPv4 discovery group and port.
-pub const SSDP_MULTICAST_V4: SocketAddr =
-    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(239, 255, 255, 250)), 1_900);
+pub const SSDP_MULTICAST_V4: SocketAddr = SocketAddr::new(
+    IpAddr::V4(std::net::Ipv4Addr::new(239, 255, 255, 250)),
+    1_900,
+);
 
 /// Maximum UDP payload accepted by this seam.
 pub const MAX_SSDP_PACKET_BYTES: usize = 8 * 1024;
@@ -174,7 +176,10 @@ impl TrustedLanInterface {
     }
 
     fn allows(&self, source: IpAddr) -> bool {
-        self.subnets.iter().copied().any(|subnet| subnet.contains(source))
+        self.subnets
+            .iter()
+            .copied()
+            .any(|subnet| subnet.contains(source))
     }
 }
 
@@ -238,9 +243,7 @@ impl UpnpDiscoveryPolicy {
     }
 
     /// Build the standard bounded policy for an explicit interface list.
-    pub fn default_for(
-        interfaces: Vec<TrustedLanInterface>,
-    ) -> Result<Self, UpnpPolicyError> {
+    pub fn default_for(interfaces: Vec<TrustedLanInterface>) -> Result<Self, UpnpPolicyError> {
         Self::new(
             interfaces,
             MAX_UPNP_RECORDS,
@@ -330,9 +333,9 @@ fn valid_interface_name(name: &str) -> bool {
         && name.len() <= 64
         && name.trim() == name
         && name.is_ascii()
-        && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'%')
-        })
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'%'))
 }
 
 /// Metadata a future rupnp receiver must attach to one datagram.
@@ -441,7 +444,6 @@ impl UpnpHttpScheme {
             Self::Https => 443,
         }
     }
-
 }
 
 /// URL-free, typed representation of an SSDP LOCATION.
@@ -510,8 +512,7 @@ impl UpnpSourceRecord {
         }
         if self.observed_at_ms == 0
             || self.expires_at_ms <= self.observed_at_ms
-            || self.expires_at_ms - self.observed_at_ms
-                < MIN_UPNP_TTL_MS
+            || self.expires_at_ms - self.observed_at_ms < MIN_UPNP_TTL_MS
             || self.expires_at_ms - self.observed_at_ms > MAX_UPNP_TTL_MS
         {
             return Err(ResourceValidationError::InvalidTtl("upnp.freshness"));
@@ -755,8 +756,8 @@ impl UpnpDiscoveryAdapter {
                     .ok_or(UpnpDiscoveryError::MissingHeader("NT"))?
             }
         };
-        let kind =
-            UpnpResourceKind::from_target(target_name).ok_or(UpnpDiscoveryError::UnsupportedTarget)?;
+        let kind = UpnpResourceKind::from_target(target_name)
+            .ok_or(UpnpDiscoveryError::UnsupportedTarget)?;
         let usn = headers
             .get("USN")
             .ok_or(UpnpDiscoveryError::MissingHeader("USN"))?;
@@ -806,9 +807,13 @@ fn parse_headers(
     }
     let header_end = text
         .find("\r\n\r\n")
-        .ok_or(UpnpDiscoveryError::MalformedPacket("missing header terminator"))?;
+        .ok_or(UpnpDiscoveryError::MalformedPacket(
+            "missing header terminator",
+        ))?;
     if header_end + 4 != text.len() {
-        return Err(UpnpDiscoveryError::MalformedPacket("SSDP body is not admitted"));
+        return Err(UpnpDiscoveryError::MalformedPacket(
+            "SSDP body is not admitted",
+        ));
     }
     let header_block = &text[..header_end];
     let mut lines = header_block.split("\r\n");
@@ -820,7 +825,9 @@ fn parse_headers(
     } else if start.eq_ignore_ascii_case("NOTIFY * HTTP/1.1") {
         SsdpMessageKind::Alive
     } else {
-        return Err(UpnpDiscoveryError::MalformedPacket("unsupported start line"));
+        return Err(UpnpDiscoveryError::MalformedPacket(
+            "unsupported start line",
+        ));
     };
 
     let mut headers = BTreeMap::new();
@@ -924,7 +931,9 @@ fn parse_max_age(value: &str) -> Result<u64, UpnpDiscoveryError> {
 
 fn parse_location(value: &str, source: IpAddr) -> Result<UpnpLocation, UpnpDiscoveryError> {
     if value.len() > MAX_SSDP_HEADER_LINE_BYTES
-        || value.chars().any(|character| character.is_ascii_control() || character.is_whitespace())
+        || value
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_whitespace())
     {
         return Err(UpnpDiscoveryError::InvalidLocation("length or whitespace"));
     }
@@ -947,12 +956,13 @@ fn parse_location(value: &str, source: IpAddr) -> Result<UpnpLocation, UpnpDisco
         let host: IpAddr = authority[1..close]
             .parse()
             .map_err(|_| UpnpDiscoveryError::InvalidLocation("IPv6 host"))?;
-        let port = authority[close + 1..]
-            .strip_prefix(':')
-            .map_or(Ok(scheme.default_port()), |raw| {
-                raw.parse()
-                    .map_err(|_| UpnpDiscoveryError::InvalidLocation("port"))
-            })?;
+        let port =
+            authority[close + 1..]
+                .strip_prefix(':')
+                .map_or(Ok(scheme.default_port()), |raw| {
+                    raw.parse()
+                        .map_err(|_| UpnpDiscoveryError::InvalidLocation("port"))
+                })?;
         (host, port)
     } else {
         if authority.matches(':').count() > 1 {
@@ -970,7 +980,11 @@ fn parse_location(value: &str, source: IpAddr) -> Result<UpnpLocation, UpnpDisco
         })?;
         (host, port)
     };
-    if port == 0 || host != source || host.is_unspecified() || host.is_loopback() || host.is_multicast()
+    if port == 0
+        || host != source
+        || host.is_unspecified()
+        || host.is_loopback()
+        || host.is_multicast()
     {
         return Err(UpnpDiscoveryError::InvalidLocation("source binding"));
     }
@@ -1278,8 +1292,7 @@ impl UpnpRoster {
 
     /// Remove observations whose TTL has elapsed.
     pub fn prune_expired(&mut self, now_ms: u64) {
-        self.records
-            .retain(|_, record| record.is_fresh(now_ms));
+        self.records.retain(|_, record| record.is_fresh(now_ms));
     }
 
     /// Return deterministic source order.
@@ -1300,7 +1313,10 @@ pub struct UpnpSourcesWorker {
 
 impl UpnpSourcesWorker {
     /// Construct a worker with an explicit node identity and trust policy.
-    pub fn new(node: impl Into<String>, policy: UpnpDiscoveryPolicy) -> Result<Self, UpnpDiscoveryError> {
+    pub fn new(
+        node: impl Into<String>,
+        policy: UpnpDiscoveryPolicy,
+    ) -> Result<Self, UpnpDiscoveryError> {
         let adapter = UpnpDiscoveryAdapter::new(policy.clone());
         let roster = UpnpRoster::new(policy.max_records())?;
         Ok(Self {
@@ -1398,7 +1414,7 @@ mod tests {
     fn policy() -> UpnpDiscoveryPolicy {
         let subnet = TrustedLanSubnet::new("172.20.146.0".parse().unwrap(), 24).unwrap();
         UpnpDiscoveryPolicy::default_for(vec![
-            TrustedLanInterface::new("enp0s31f6", vec![subnet]).unwrap(),
+            TrustedLanInterface::new("enp0s31f6", vec![subnet]).unwrap()
         ])
         .unwrap()
     }
@@ -1427,10 +1443,7 @@ SERVER: Linux/6.1 UPnP/1.0 MCNF/1.0\r\n\r\n"
     fn trusted_response_becomes_typed_card_without_claiming_connectivity() {
         let adapter = UpnpDiscoveryAdapter::new(policy());
         let record = adapter
-            .admit_packet(
-                &media_server_packet("max-age=120"),
-                &context(NOW),
-            )
+            .admit_packet(&media_server_packet("max-age=120"), &context(NOW))
             .unwrap();
         assert_eq!(record.kind, UpnpResourceKind::MediaServer);
         assert_eq!(record.location.port, 8200);
@@ -1572,12 +1585,10 @@ SERVER: Linux/6.1 UPnP/1.0 MCNF/1.0\r\n\r\n"
         let encoded = serde_json::to_string(&state).unwrap();
         let decoded = decode_sources_state(&encoded).unwrap();
         assert_eq!(decoded, state);
-        assert!(decode_sources_state(
-            &encoded.replace(
-                "\"published_at_ms\":1700000000001",
-                "\"published_at_ms\":1700000000001,\"unexpected\":true"
-            )
-        )
+        assert!(decode_sources_state(&encoded.replace(
+            "\"published_at_ms\":1700000000001",
+            "\"published_at_ms\":1700000000001,\"unexpected\":true"
+        ))
         .is_err());
     }
 

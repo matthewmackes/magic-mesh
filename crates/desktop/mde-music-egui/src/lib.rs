@@ -1,18 +1,9 @@
 //! `mde-music-egui` — the MCNF **E12 "Construct"** egui music surface (E12-5).
 //!
-//! A standalone eframe surface on the shared [`mde_egui`] harness that REUSES the
-//! `mde-musicd` service crate end-to-end (governance §6 — glue, not
-//! reimplementation):
-//!
-//! * the Subsonic/Airsonic REST [`mde_musicd::airsonic::Client`] lists the album
-//!   library and builds the authenticated `stream` URL,
-//! * the shared [`mde_musicd::creds`] loader supplies the server + credentials,
-//! * the codec classifier + native [`mde_musicd::engine::Engine`] play the track.
-//!
-//! Everything renders through the shared [`mde_egui::Style`]. The async airsonic
-//! calls and the audio engine live on a [`worker`] thread so the egui UI thread
-//! never blocks; the render-agnostic view-model in [`model`] is unit-tested
-//! without a GPU or a sound device.
+//! A daemon-projected eframe surface on the shared [`mde_egui`] harness. Catalog,
+//! queue, and playback truth come from retained `mde-bus` state written by
+//! `mde-musicd`; the surface emits mutations only through a host-installed,
+//! authenticated Bus publisher. It never starts a provider or playback worker.
 //!
 //! Under E12 "Construct" the mesh-control surfaces are **panels inside the one shell**
 //! (`mde-shell-egui`), not separate clients (§5, the EMBED model — there is no

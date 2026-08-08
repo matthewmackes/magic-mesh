@@ -75,10 +75,10 @@ fi
 #    everywhere) and then flipped together in one fast pass.
 if [ "$NO_FLIP" -eq 0 ]; then
   log "restarting mackesd onto the etcd substrate"
-  systemctl restart mackesd.service 2>/dev/null || true
+  systemctl restart mackesd.target 2>/dev/null || true
 else
   log "mackesd flip DEFERRED (--no-flip; etcd staged, mackesd not yet restarted)"
-  log "  flip the whole fleet together with: systemctl restart mackesd"
+  log "  flip the whole fleet together with: systemctl restart mackesd.target"
 fi
 
 log "done — node is on etcd (coordination) + Syncthing (files). Verify:"

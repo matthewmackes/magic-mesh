@@ -72,9 +72,7 @@ pub(super) fn placement_picker(ui: &mut egui::Ui, state: &mut WorkloadsState) ->
         state
             .states()
             .iter()
-            .find(|cloud| {
-                cloud.host == selected && cloud.role == DeploymentRole::Workstation
-            })
+            .find(|cloud| cloud.host == selected && cloud.role == DeploymentRole::Workstation)
             .cloned()
     });
 

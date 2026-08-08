@@ -16,9 +16,9 @@ use std::time::Duration;
 use mackes_mesh_types::health::{
     node_health_topic, ExpectedReturn, NodeAvailabilityAssessment, NodeAvailabilityIntent,
     NodeAvailabilityPolicy, NodeAvailabilityState, NodeAvailabilityValidationError,
-    NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass,
-    MAX_NODE_AVAILABILITY_ID_BYTES, MAX_NODE_AVAILABILITY_INTENT_TTL_MS,
-    NODE_AVAILABILITY_INTENT_SCHEMA_VERSION, NODE_HEALTH_TOPIC_PREFIX,
+    NodeConnectionType, NodeConnectivitySummary, NodeDeviceClass, MAX_NODE_AVAILABILITY_ID_BYTES,
+    MAX_NODE_AVAILABILITY_INTENT_TTL_MS, NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+    NODE_HEALTH_TOPIC_PREFIX,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, PersistError};
@@ -625,12 +625,15 @@ impl RuntimeAvailabilityPublisher {
     /// Correct a durable-only sink result forward without minting another
     /// generation. This is useful on a no-op reconciliation pass where there is
     /// no newer transition to trigger [`Self::publish_at`].
-    pub fn correct_forward(&self) -> Result<Option<NodeAvailabilityIntent>, RuntimeAvailabilityError> {
+    pub fn correct_forward(
+        &self,
+    ) -> Result<Option<NodeAvailabilityIntent>, RuntimeAvailabilityError> {
         let publication_lock = RUNTIME_PUBLICATION_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = publication_lock
             .lock()
             .map_err(|_| RuntimeAvailabilityError::PublicationLockPoisoned)?;
-        let mut persist = Persist::open(self.bus_root.clone()).map_err(RuntimeAvailabilityError::Bus)?;
+        let mut persist =
+            Persist::open(self.bus_root.clone()).map_err(RuntimeAvailabilityError::Bus)?;
         let current = self.current_intent()?;
         if let Some(intent) = &current {
             retry_durable_publication(&mut persist, intent)?;
@@ -648,7 +651,8 @@ impl RuntimeAvailabilityPublisher {
         let _guard = publication_lock
             .lock()
             .map_err(|_| RuntimeAvailabilityError::PublicationLockPoisoned)?;
-        let mut persist = Persist::open(self.bus_root.clone()).map_err(RuntimeAvailabilityError::Bus)?;
+        let mut persist =
+            Persist::open(self.bus_root.clone()).map_err(RuntimeAvailabilityError::Bus)?;
         let previous = self.current_intent()?;
 
         if let Some(previous) = &previous {
@@ -719,8 +723,7 @@ fn build_runtime_intent(
     request: RuntimeAvailabilityRequest,
     now_ms: u64,
 ) -> Result<NodeAvailabilityIntent, RuntimeAvailabilityError> {
-    let generation = previous
-        .map_or(1, |intent| intent.generation.saturating_add(1));
+    let generation = previous.map_or(1, |intent| intent.generation.saturating_add(1));
     if generation == 0 || previous.is_some_and(|intent| generation <= intent.generation) {
         return Err(RuntimeAvailabilityError::GenerationExhausted);
     }
@@ -757,7 +760,9 @@ fn build_runtime_intent(
         .old_connectivity
         .as_ref()
         .or(request.new_connectivity.as_ref())
-        .map_or(NodeConnectionType::Unknown, |summary| summary.connection_type);
+        .map_or(NodeConnectionType::Unknown, |summary| {
+            summary.connection_type
+        });
     let intent = NodeAvailabilityIntent {
         schema_version: NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
         node_id: node_id.to_string(),
@@ -875,7 +880,10 @@ impl fmt::Display for RuntimeAvailabilityError {
                 formatter.write_str("availability publication lock poisoned")
             }
             Self::UnsupportedRuntimeState(state) => {
-                write!(formatter, "unsupported runtime availability state {state:?}")
+                write!(
+                    formatter,
+                    "unsupported runtime availability state {state:?}"
+                )
             }
             Self::DurableFilesystem(error) => {
                 write!(formatter, "availability durable filesystem: {error}")
@@ -977,9 +985,7 @@ fn lifecycle_filesystem_error(
 
 /// Read the exact durable record without following any path component. Missing
 /// state is normal; malformed paths and special/oversized files fail closed.
-fn read_lifecycle_intent_record(
-    path: &Path,
-) -> Result<Option<Vec<u8>>, RuntimeAvailabilityError> {
+fn read_lifecycle_intent_record(path: &Path) -> Result<Option<Vec<u8>>, RuntimeAvailabilityError> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use std::ffi::OsString;
     use std::io::Read as _;
@@ -1075,7 +1081,10 @@ fn read_lifecycle_intent_record(
         FileType::RegularFile => {}
         _ => {
             return Err(RuntimeAvailabilityError::DurableFilesystem(
-                lifecycle_filesystem_error("inspect durable record", "target is not a regular file"),
+                lifecycle_filesystem_error(
+                    "inspect durable record",
+                    "target is not a regular file",
+                ),
             ));
         }
     }
@@ -1953,9 +1962,7 @@ mod tests {
                 RuntimeAvailabilityRequest::lifecycle(
                     NodeAvailabilityState::Sleeping,
                     "host-state-power",
-                    "x".repeat(
-                        mackes_mesh_types::health::MAX_NODE_AVAILABILITY_REASON_BYTES + 1,
-                    ),
+                    "x".repeat(mackes_mesh_types::health::MAX_NODE_AVAILABILITY_REASON_BYTES + 1),
                     Some(Duration::from_secs(60)),
                 ),
                 30_000,
@@ -1963,9 +1970,9 @@ mod tests {
             .expect_err("over-bound reason must fail closed");
         assert!(matches!(
             error,
-            RuntimeAvailabilityError::Contract(
-                NodeAvailabilityValidationError::FieldTooLong("reason")
-            )
+            RuntimeAvailabilityError::Contract(NodeAvailabilityValidationError::FieldTooLong(
+                "reason"
+            ))
         ));
         assert!(!durable.exists());
     }

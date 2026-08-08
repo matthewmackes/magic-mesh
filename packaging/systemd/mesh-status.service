@@ -1,7 +1,7 @@
 [Unit]
 Description=MCNF — refresh the mesh-status snapshot (prompt + greeting data plane)
 Documentation=https://github.com/matthewmackes/magic-mesh
-After=mackesd.service
+After=mackesd.target
 
 [Service]
 Type=oneshot

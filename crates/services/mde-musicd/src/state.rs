@@ -24,6 +24,8 @@ use std::sync::OnceLock;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::queue::Queue;
+
 /// A music-state record is considered stale (the playing peer went
 /// away without clearing it) after 15 s — three missed 5 s writes.
 pub const STATE_STALE_MS: u64 = 15_000;
@@ -35,6 +37,10 @@ pub const MAX_HANDOFF_INTENTS: usize = 64;
 pub const MAX_PEER_STATE_SNAPSHOTS: usize = 64;
 /// Maximum number of handoff completions admitted by one target-side read.
 pub const MAX_HANDOFF_COMPLETIONS: usize = 64;
+/// A yielded transfer must be acknowledged before the source may reclaim it.
+/// The deadline is deliberately the same three-heartbeat window used to
+/// decide that a playback owner disappeared.
+pub const HANDOFF_ACK_TIMEOUT_MS: u64 = STATE_STALE_MS;
 
 const MAX_STATE_RECORD_BYTES: u64 = 16 * 1024;
 const MAX_PEER_NAME_BYTES: usize = 128;
@@ -86,10 +92,20 @@ pub struct HandoffCompletion {
     pub owner_peer: String,
     /// Queue song preserved by the yielding owner.
     pub song_id: String,
+    /// Exact admitted queue identity at the yield boundary. The queue is
+    /// transferred rather than inferred from a target-local song lookup, so a
+    /// seat with a different ordering or duplicate song cannot fabricate
+    /// continuity.
+    #[serde(default)]
+    pub queue: Queue,
     /// Exact position within `song_id` at the yield boundary.
     pub position_ms: u64,
     /// Epoch-ms when the completion was recorded.
     pub completed_ms: u64,
+    /// Last epoch-ms at which the target may start playback from this record.
+    /// After this deadline the source is allowed to reclaim authority.
+    #[serde(default)]
+    pub expires_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +146,18 @@ fn valid_completion_record(completion: &HandoffCompletion) -> bool {
         && valid_component(&completion.owner_peer, MAX_PEER_NAME_BYTES)
         && !completion.song_id.is_empty()
         && valid_song_id(&completion.song_id)
+        && !completion.queue.songs.is_empty()
+        && completion.queue.current < completion.queue.songs.len()
+        && completion.queue.current() == Some(completion.song_id.as_str())
+        && completion
+            .queue
+            .songs
+            .iter()
+            .all(|song| valid_song_id(song))
+        && completion.expires_ms
+            == completion
+                .completed_ms
+                .saturating_add(HANDOFF_ACK_TIMEOUT_MS)
 }
 
 fn canonical_handoff_path(path: &Path, intent_id: &str) -> bool {
@@ -230,6 +258,7 @@ pub fn completion_matches_intent(
     completion: &HandoffCompletion,
     intents: &[HandoffIntent],
     target_peer: &str,
+    now_ms: u64,
 ) -> bool {
     let Some(current_intent) = intents
         .iter()
@@ -252,6 +281,7 @@ pub fn completion_matches_intent(
             .as_deref()
             .is_none_or(|owner| owner == completion.owner_peer)
         && completion.completed_ms >= current_intent.issued_ms
+        && now_ms <= completion.expires_ms
 }
 
 // ───────────────────────── file layout ─────────────────────────
@@ -385,8 +415,7 @@ pub fn read_intents(dir: &Path) -> Vec<HandoffIntent> {
                 if let Some(intent) = read_bounded_bytes(&p)
                     .and_then(|bytes| decode_bounded::<HandoffIntent>(&bytes))
                     .filter(|intent| {
-                        valid_intent_record(intent)
-                            && canonical_handoff_path(&p, &intent.intent_id)
+                        valid_intent_record(intent) && canonical_handoff_path(&p, &intent.intent_id)
                     })
                 {
                     out.push(intent);
@@ -455,8 +484,7 @@ pub fn read_all_peer_states(dir: &Path) -> Vec<MusicState> {
                             .or_else(|| decode_bounded::<MusicState>(&bytes))
                     })
                     .filter(|state| {
-                        valid_state_record(state)
-                            && canonical_peer_state_path(&p, &state.peer)
+                        valid_state_record(state) && canonical_peer_state_path(&p, &state.peer)
                     })
                 {
                     out.push(state);
@@ -525,6 +553,12 @@ pub fn write_completion(dir: &Path, completion: &HandoffCompletion) -> std::io::
     std::fs::create_dir_all(&directory)?;
     let body = serde_json::to_vec_pretty(completion)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if body.len() as u64 > MAX_STATE_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "handoff completion exceeds its bounded record contract",
+        ));
+    }
     std::fs::write(
         directory.join(format!("{}.json", completion.intent_id)),
         body,
@@ -627,6 +661,29 @@ mod tests {
         }
     }
 
+    fn completion(
+        id: &str,
+        from: &str,
+        owner: &str,
+        song: &str,
+        position_ms: u64,
+        completed_ms: u64,
+    ) -> HandoffCompletion {
+        HandoffCompletion {
+            intent_id: id.into(),
+            from_peer: from.into(),
+            owner_peer: owner.into(),
+            song_id: song.into(),
+            queue: Queue {
+                songs: vec!["queue-before".into(), song.into(), "queue-after".into()],
+                current: 1,
+            },
+            position_ms,
+            completed_ms,
+            expires_ms: completed_ms.saturating_add(HANDOFF_ACK_TIMEOUT_MS),
+        }
+    }
+
     #[test]
     fn claimed_by_other_when_fresh_playing_elsewhere() {
         let s = state("anvil", true, 1000);
@@ -697,18 +754,12 @@ mod tests {
     #[test]
     fn handoff_completion_requires_a_live_request_and_matching_owner() {
         let request = intent("handoff-1", "forge", Some("anvil"), 100);
-        let completion = HandoffCompletion {
-            intent_id: "handoff-1".into(),
-            from_peer: "forge".into(),
-            owner_peer: "anvil".into(),
-            song_id: "song-7".into(),
-            position_ms: 42_500,
-            completed_ms: 101,
-        };
+        let completion = completion("handoff-1", "forge", "anvil", "song-7", 42_500, 101);
         assert!(completion_matches_intent(
             &completion,
             std::slice::from_ref(&request),
-            "forge"
+            "forge",
+            101,
         ));
 
         let mut spoofed_requester = completion.clone();
@@ -716,26 +767,30 @@ mod tests {
         assert!(!completion_matches_intent(
             &spoofed_requester,
             std::slice::from_ref(&request),
-            "forge"
+            "forge",
+            101,
         ));
 
         // A replay after the request has been consumed has no authorization.
-        assert!(!completion_matches_intent(&completion, &[], "forge"));
+        assert!(!completion_matches_intent(&completion, &[], "forge", 101));
 
         let mut wrong_owner = completion.clone();
         wrong_owner.owner_peer = "beacon".into();
         assert!(!completion_matches_intent(
             &wrong_owner,
             std::slice::from_ref(&request),
-            "forge"
+            "forge",
+            101,
         ));
 
         let mut stale = completion;
         stale.completed_ms = 99;
+        stale.expires_ms = 99 + HANDOFF_ACK_TIMEOUT_MS;
         assert!(!completion_matches_intent(
             &stale,
             std::slice::from_ref(&request),
-            "forge"
+            "forge",
+            101,
         ));
     }
 
@@ -743,33 +798,22 @@ mod tests {
     fn handoff_completion_rejects_a_superseded_request_for_the_target() {
         let old_request = intent("handoff-old", "forge", Some("anvil"), 100);
         let current_request = intent("handoff-current", "forge", Some("beacon"), 200);
-        let old_completion = HandoffCompletion {
-            intent_id: old_request.intent_id.clone(),
-            from_peer: "forge".into(),
-            owner_peer: "anvil".into(),
-            song_id: "song-7".into(),
-            position_ms: 42_500,
-            completed_ms: 101,
-        };
-        let current_completion = HandoffCompletion {
-            intent_id: current_request.intent_id.clone(),
-            from_peer: "forge".into(),
-            owner_peer: "beacon".into(),
-            song_id: "song-9".into(),
-            position_ms: 12_000,
-            completed_ms: 201,
-        };
+        let old_completion = completion("handoff-old", "forge", "anvil", "song-7", 42_500, 101);
+        let current_completion =
+            completion("handoff-current", "forge", "beacon", "song-9", 12_000, 201);
         let intents = [old_request, current_request];
 
         assert!(!completion_matches_intent(
             &old_completion,
             &intents,
-            "forge"
+            "forge",
+            201,
         ));
         assert!(completion_matches_intent(
             &current_completion,
             &intents,
-            "forge"
+            "forge",
+            201,
         ));
     }
 
@@ -801,14 +845,7 @@ mod tests {
     #[test]
     fn handoff_completion_round_trips_and_is_cleared_by_intent_id() {
         let dir = tempdir().unwrap();
-        let completion = HandoffCompletion {
-            intent_id: "intent-1".into(),
-            from_peer: "forge".into(),
-            owner_peer: "anvil".into(),
-            song_id: "song-7".into(),
-            position_ms: 42_500,
-            completed_ms: 88,
-        };
+        let completion = completion("intent-1", "forge", "anvil", "song-7", 42_500, 88);
         write_completion(dir.path(), &completion).unwrap();
         assert_eq!(read_completions(dir.path()), vec![completion]);
         clear_completion(dir.path(), "intent-1");
@@ -826,14 +863,7 @@ mod tests {
         std::fs::write(intents.join("replay-alias.json"), intent_json).unwrap();
         assert_eq!(read_intents(dir.path()), vec![intent]);
 
-        let completion = HandoffCompletion {
-            intent_id: "intent-1".into(),
-            from_peer: "forge".into(),
-            owner_peer: "anvil".into(),
-            song_id: "song-7".into(),
-            position_ms: 42_500,
-            completed_ms: 88,
-        };
+        let completion = completion("intent-1", "forge", "anvil", "song-7", 42_500, 88);
         let completions = completions_dir(dir.path());
         std::fs::create_dir_all(&completions).unwrap();
         let completion_json = serde_json::to_vec(&completion).unwrap();
@@ -848,14 +878,14 @@ mod tests {
         let completions = completions_dir(dir.path());
         std::fs::create_dir_all(&completions).unwrap();
         for index in 0..=MAX_HANDOFF_COMPLETIONS {
-            let completion = HandoffCompletion {
-                intent_id: format!("intent-{index:03}"),
-                from_peer: "forge".into(),
-                owner_peer: "anvil".into(),
-                song_id: format!("song-{index:03}"),
-                position_ms: index as u64,
-                completed_ms: index as u64,
-            };
+            let completion = completion(
+                &format!("intent-{index:03}"),
+                "forge",
+                "anvil",
+                &format!("song-{index:03}"),
+                index as u64,
+                index as u64,
+            );
             std::fs::write(
                 completions.join(format!("{}.json", completion.intent_id)),
                 serde_json::to_vec(&completion).unwrap(),

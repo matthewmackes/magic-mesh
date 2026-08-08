@@ -28,8 +28,8 @@ ConditionPathExists=/var/lib/mde/role.toml
 After=systemd-user-sessions.service plymouth-quit-wait.service magic-setup.service user@1000.service
 # The shell talks to mackesd over the shared bus spool; degrade gracefully if
 # the daemon is still coming up (panels show their honest empty states).
-After=mackesd.service
-Wants=mackesd.service
+After=mackesd.target
+Wants=mackesd.target
 # The physical-audio policy session belongs to the persistent primary seat user.
 # The root DRM shell connects to that PipeWire graph for native media and RDP
 # RDPSND playback; without this ordering/environment `pw-cat` has no sink.
@@ -55,7 +55,7 @@ StandardOutput=journal
 StandardError=journal
 TTYReset=yes
 TTYVHangup=yes
-# Match mackesd.service's shared-bus + mesh-storage pins so the shell resolves
+# Match the grouped mackesd units' shared-bus + mesh-storage pins so the shell resolves
 # the SAME bus spool + workgroup dir as the root daemon (the SETUP-fix split-brain).
 Environment=MDE_BUS_ROOT=/run/mde-bus
 Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
@@ -68,7 +68,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 # exists; without it every live action fails closed before publishing.
 # root is intentional for now: DRM master + /dev/input/* need seat ownership and
 # there is no logind/seatd integration yet (follow-up noted in
-# packaging/bootc/README.md). Containment doctrine follows mackesd.service.
+# packaging/bootc/README.md). Containment doctrine follows the grouped services.
 # Managed guest workloads may create child cgroups beneath the shell service.
 # Keep delegation at the service boundary; Browser engine confinement belongs to
 # the Browser VM rather than the host seat.

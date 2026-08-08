@@ -34,7 +34,7 @@ self_test() {
     "$template"
   grep -Fq "case \"\$argument\"" "$0"
   grep -Fq -- '--refresh' "$0"
-  grep -Fq 'systemctl try-restart mackesd.service' "$0"
+  grep -Fq 'systemctl try-restart mackesd-compute.service' "$0"
   grep -Fq 'systemctl try-restart mde-shell-egui.service' "$0"
   grep -Fq "cmp -s \"\$plain\" \"\$decrypted\"" "$0"
   rm -rf -- "$test_dir"
@@ -124,7 +124,9 @@ else
 fi
 
 dropin_changed=0
-for unit in mackesd.service mde-shell-egui.service; do
+# The cloud worker is governed by the compute process group. Do not expose this
+# mutation credential to the other five daemon processes.
+for unit in mackesd-compute.service mde-shell-egui.service; do
   dropin_path="/etc/systemd/system/$unit.d/50-cloud-arm-credential.conf"
   if [ -L "$dropin_path" ]; then
     echo "provision-cloud-arm-credential: refusing symlinked drop-in: $dropin_path" >&2
@@ -138,6 +140,12 @@ for unit in mackesd.service mde-shell-egui.service; do
     dropin_changed=1
   fi
 done
+legacy_dropin=/etc/systemd/system/mackesd.service.d/50-cloud-arm-credential.conf
+if [ -e "$legacy_dropin" ] || [ -L "$legacy_dropin" ]; then
+  rm -f -- "$legacy_dropin"
+  dropin_changed=1
+fi
+rmdir /etc/systemd/system/mackesd.service.d 2>/dev/null || :
 
 materialized_changed=$((credential_changed || dropin_changed))
 if [ "$materialized_changed" -eq 1 ]; then
@@ -153,7 +161,7 @@ if [ "$refresh" -eq 1 ] && [ "$force_restart" -eq 1 ] \
   && { [ "$materialized_changed" -eq 1 ] || [ "$force_restart" -eq 1 ]; }; then
   # --restart is intentionally the only path that can interrupt an active
   # seat. try-restart never starts an inactive unit.
-  systemctl try-restart mackesd.service
+  systemctl try-restart mackesd-compute.service
   systemctl try-restart mde-shell-egui.service
 elif [ "$refresh" -eq 1 ] && [ "$materialized_changed" -eq 1 ]; then
   echo "provision-cloud-arm-credential: staged for next controlled restart"

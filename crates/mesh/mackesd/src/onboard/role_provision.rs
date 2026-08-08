@@ -832,37 +832,23 @@ mod tests {
     }
 
     #[test]
-    fn mackesd_unit_raises_the_process_fd_budget() {
-        let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
-
-        assert!(
-            unit.contains("LimitNOFILE=65536"),
-            "mackesd must raise nofile above the default 1024 so worker fds cannot exhaust the process"
-        );
+    fn every_mackesd_group_raises_the_process_fd_budget() {
+        for unit in grouped_mackesd_units() {
+            assert!(
+                unit.contains("LimitNOFILE=65536"),
+                "every mackesd group must raise nofile above the default 1024"
+            );
+        }
     }
 
     #[test]
-    fn mackesd_unit_pins_the_packaged_repo_root() {
-        let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
-
-        assert!(
-            unit.contains("Environment=MCNF_REPO=/opt/mcnf"),
-            "mackesd must resolve packaged mesh helpers instead of a developer checkout"
-        );
-        assert!(
-            unit.contains("Wants=network-online.target nebula.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service"),
-            "node recipient registration must remain a best-effort daemon lane"
-        );
-        let daemon_after = unit
-            .lines()
-            .find(|line| line.trim_start().starts_with("After="))
-            .expect("mackesd must declare startup ordering");
-        assert!(
-            !daemon_after
-                .split_whitespace()
-                .any(|dependency| dependency == "mcnf-mesh-secret-recipient.service"),
-            "recipient registration must not gate mackesd startup"
-        );
+    fn every_mackesd_group_pins_the_packaged_repo_root() {
+        for unit in grouped_mackesd_units() {
+            assert!(
+                unit.contains("Environment=MCNF_REPO=/opt/mcnf"),
+                "mackesd must resolve packaged mesh helpers instead of a developer checkout"
+            );
+        }
     }
 
     #[test]
@@ -913,41 +899,25 @@ mod tests {
     }
 
     #[test]
-    fn mackesd_unit_does_not_abort_on_slow_stop() {
-        let unit = include_str!("../../../../../packaging/systemd/mackesd.service");
-        let dropin =
-            include_str!("../../../../../packaging/systemd/mackesd.service.d/90-stop-policy.conf");
-        let manifest: toml::Value =
-            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
-        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
-
-        assert!(
-            unit.contains("TimeoutStopSec=90"),
-            "mackesd must have enough stop time to drain live lighthouse workers during promotion"
-        );
-        assert!(
-            unit.contains("TimeoutStopFailureMode=terminate"),
-            "mackesd must override Fedora's global abort-on-timeout drop-in so promotion restarts do not create SIGABRT coredumps"
-        );
-        assert!(
-            dropin.contains("TimeoutStopSec=90")
-                && dropin.contains("TimeoutStopFailureMode=terminate"),
-            "mackesd must ship a per-service drop-in because Fedora's global service.d drop-in overrides the base unit file"
-        );
-        for assets in [
-            rpm["assets"].as_array().expect("base assets array"),
-            rpm["variants"]["server"]["assets"]
-                .as_array()
-                .expect("server assets array"),
-        ] {
+    fn grouped_mackesd_units_do_not_abort_on_slow_stop() {
+        for unit in grouped_mackesd_units() {
+            assert!(unit.contains("TimeoutStopSec=90"));
             assert!(
-                assets.iter().any(|asset| {
-                    asset["dest"].as_str()
-                        == Some("/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf")
-                }),
-                "each RPM shape must ship the mackesd per-service stop-policy drop-in"
+                unit.contains("TimeoutStopFailureMode=terminate"),
+                "every group must override Fedora's abort-on-timeout policy"
             );
         }
+    }
+
+    fn grouped_mackesd_units() -> [&'static str; 6] {
+        [
+            include_str!("../../../../../packaging/systemd/mackesd-control.service"),
+            include_str!("../../../../../packaging/systemd/mackesd-observation.service"),
+            include_str!("../../../../../packaging/systemd/mackesd-actions.service"),
+            include_str!("../../../../../packaging/systemd/mackesd-data.service"),
+            include_str!("../../../../../packaging/systemd/mackesd-compute.service"),
+            include_str!("../../../../../packaging/systemd/mackesd-integrations.service"),
+        ]
     }
 
     #[test]

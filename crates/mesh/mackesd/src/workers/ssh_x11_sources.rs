@@ -11,10 +11,10 @@ use mackes_mesh_types::resources::{
     ActionAvailability, ActionAvailabilityStatus, AuthMethod, AuthState, AuthStatus,
     ClientBoundary, ClientCapability, ClientCapabilityLimits, ClientFeature, DiscoverySource,
     FailureCode, FailureReason, HealthState, HealthStatus, IdentityAuthority, ProvenanceTrust,
-    RESOURCE_CONTRACT_VERSION, ResourceAction, ResourceActionTarget, ResourceActionVerb,
-    ResourceCard, ResourceClass, ResourceIdentity, ResourceOperatingRole, ResourceScope,
-    ResourceValidationError, SourceProvenance, TransportCandidate, TransportEndpoint,
-    TransportProtocol,
+    ResourceAction, ResourceActionTarget, ResourceActionVerb, ResourceCard, ResourceClass,
+    ResourceIdentity, ResourceOperatingRole, ResourceScope, ResourceValidationError,
+    SourceProvenance, TransportCandidate, TransportEndpoint, TransportProtocol,
+    RESOURCE_CONTRACT_VERSION,
 };
 use mackes_mesh_types::ssh_x11::{
     SftpBrowseRoot, SshAuthentication, SshEndpoint, SshX11Resource, X11DisplayBinding,
@@ -528,12 +528,11 @@ mod tests {
         assert_eq!(card.identity.class, ResourceClass::FileShare);
         assert_eq!(card.health.status, HealthStatus::Available);
         assert_eq!(card.transports[0].protocol, TransportProtocol::Ssh);
-        assert!(
-            card.actions
-                .iter()
-                .any(|action| action.verb == ResourceActionVerb::Connect
-                    && action.availability.status == ActionAvailabilityStatus::Ready)
-        );
+        assert!(card
+            .actions
+            .iter()
+            .any(|action| action.verb == ResourceActionVerb::Connect
+                && action.availability.status == ActionAvailabilityStatus::Ready));
         let encoded = serde_json::to_string(&card).expect("card JSON");
         assert!(!encoded.contains("command"));
         assert!(!encoded.contains("password"));
@@ -595,11 +594,10 @@ mod tests {
                 ..
             }
         ));
-        assert!(
-            card.actions
-                .iter()
-                .any(|action| action.availability.status == ActionAvailabilityStatus::Ready)
-        );
+        assert!(card
+            .actions
+            .iter()
+            .any(|action| action.availability.status == ActionAvailabilityStatus::Ready));
     }
 
     #[test]

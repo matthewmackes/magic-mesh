@@ -1,11 +1,8 @@
-//! BOOKMARKS-7 — the mackesd **adfilter worker** (the mesh-wide ad-blocker's
-//! Syncthing replication + leader compile).
+//! Browser-VM filter-policy replication and allowlist service.
 //!
-//! Builds on the landed pure [`mde_adblock`] crate — the [`FilterListStore`]
-//! (bundled seed + operator custom sources + per-site allowlist + [`Staleness`])
-//! and the compiled [`Engine`] — and adds the mesh-side plumbing the pure crate
-//! deliberately omits: persistence, the Syncthing-replicated store blob, the
-//! leader compile, upstream refresh, and the Bus surface.
+//! The host stores and replicates opaque filter-list policy for Browser VMs. It
+//! deliberately contains no URL matcher, cosmetic-rule engine, browser runtime,
+//! or bundled host rule set. Request enforcement belongs to the guest.
 //!
 //! ## What this worker owns
 //!
@@ -13,7 +10,7 @@
 //!   worker uses). Every node writes ONLY its own
 //!   `<share>/adfilter/<node>/store.json` (single-writer → Syncthing never sees a
 //!   write conflict) and *reads* every peer's store, folding them through the
-//!   store's last-writer-wins [`FilterListStore::merge`] into one converged store.
+//!   store's last-writer-wins merge into one converged store.
 //! * **Leader compile** (lock: one compiler mesh-wide). The elected leader
 //!   ([`crate::leader`], the shared `.mackesd-leader.lock`) serializes the
 //!   converged store into the compiled engine blob at
@@ -46,13 +43,12 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mde_adblock::{Engine, FilterListStore, Staleness};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -93,6 +89,187 @@ pub const DEFAULT_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// A wall-clock source (ms since the Unix epoch). Injected so the model stays pure
 /// and tests drive a deterministic fake clock.
 type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Honest freshness state for the replicated Browser-VM policy envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Staleness {
+    /// A policy payload was synchronized within the freshness window.
+    Fresh,
+    /// The newest synchronized policy is older than the freshness window.
+    Stale {
+        /// Milliseconds since the newest successful policy synchronization.
+        age_ms: u64,
+    },
+    /// No operator policy payload has synchronized yet.
+    NeverSynced,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FilterPolicySource {
+    name: String,
+    url: Option<String>,
+    raw: String,
+    enabled: bool,
+    updated_ms: u64,
+}
+
+impl FilterPolicySource {
+    fn mirror(name: String) -> Self {
+        Self {
+            url: Some(format!("mirror://{name}")),
+            name,
+            raw: String::new(),
+            enabled: true,
+            updated_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AllowlistEntry {
+    allowed: bool,
+    added_by: String,
+    updated_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FilterPolicyStore {
+    sources: Vec<FilterPolicySource>,
+    allowlist: BTreeMap<String, AllowlistEntry>,
+    synced_ms: Option<u64>,
+}
+
+impl FilterPolicyStore {
+    fn sources(&self) -> &[FilterPolicySource] {
+        &self.sources
+    }
+
+    fn enabled_sources(&self) -> impl Iterator<Item = &FilterPolicySource> {
+        self.sources.iter().filter(|source| source.enabled)
+    }
+
+    fn add_source(&mut self, source: FilterPolicySource) {
+        if self
+            .sources
+            .iter()
+            .all(|current| current.name != source.name)
+        {
+            self.sources.push(source);
+        }
+    }
+
+    fn update_source(&mut self, name: &str, raw: String, now_ms: u64) -> bool {
+        let Some(source) = self.sources.iter_mut().find(|source| source.name == name) else {
+            return false;
+        };
+        source.raw = raw;
+        source.updated_ms = now_ms;
+        self.synced_ms = Some(now_ms);
+        true
+    }
+
+    fn allow_site(&mut self, domain: &str, by: &str, now_ms: u64) {
+        self.set_site(domain, true, by, now_ms);
+    }
+
+    fn block_site(&mut self, domain: &str, by: &str, now_ms: u64) {
+        self.set_site(domain, false, by, now_ms);
+    }
+
+    fn set_site(&mut self, domain: &str, allowed: bool, by: &str, now_ms: u64) {
+        let domain = domain.to_ascii_lowercase();
+        if self
+            .allowlist
+            .get(&domain)
+            .is_none_or(|entry| now_ms >= entry.updated_ms)
+        {
+            self.allowlist.insert(
+                domain,
+                AllowlistEntry {
+                    allowed,
+                    added_by: by.to_string(),
+                    updated_ms: now_ms,
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn is_allowed(&self, domain: &str) -> bool {
+        self.allowlist
+            .get(&domain.to_ascii_lowercase())
+            .is_some_and(|entry| entry.allowed)
+    }
+
+    fn allowed_count(&self) -> usize {
+        self.allowlist
+            .values()
+            .filter(|entry| entry.allowed)
+            .count()
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for source in &other.sources {
+            match self
+                .sources
+                .iter_mut()
+                .find(|mine| mine.name == source.name)
+            {
+                Some(mine) if source.updated_ms > mine.updated_ms => *mine = source.clone(),
+                Some(_) => {}
+                None => self.sources.push(source.clone()),
+            }
+        }
+        for (domain, entry) in &other.allowlist {
+            if self
+                .allowlist
+                .get(domain)
+                .is_none_or(|mine| entry.updated_ms > mine.updated_ms)
+            {
+                self.allowlist.insert(domain.clone(), entry.clone());
+            }
+        }
+        self.synced_ms = self.synced_ms.max(other.synced_ms);
+    }
+
+    fn synced_ms(&self) -> Option<u64> {
+        self.synced_ms
+    }
+
+    fn staleness(&self, now_ms: u64, ttl_ms: u64) -> Staleness {
+        self.synced_ms.map_or(Staleness::NeverSynced, |synced_ms| {
+            let age_ms = now_ms.saturating_sub(synced_ms);
+            if age_ms <= ttl_ms {
+                Staleness::Fresh
+            } else {
+                Staleness::Stale { age_ms }
+            }
+        })
+    }
+
+    fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    fn rule_counts(&self) -> (usize, usize) {
+        self.enabled_sources()
+            .flat_map(|source| source.raw.lines())
+            .fold((0, 0), |(network, cosmetic), line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+                    (network, cosmetic)
+                } else if line.contains("##") || line.contains("#@#") {
+                    (network, cosmetic + 1)
+                } else {
+                    (network + 1, cosmetic)
+                }
+            })
+    }
+}
 
 // ── the upstream-refresh seam ────────────────────────────────────────────────
 
@@ -258,9 +435,9 @@ fn mirror_dir(root: &Path) -> PathBuf {
 
 /// Load a store from `path`, or `None` when absent / corrupt (a peer-supplied file
 /// never panics the reader).
-fn load_store(path: &Path) -> Option<FilterListStore> {
+fn load_store(path: &Path) -> Option<FilterPolicyStore> {
     let text = std::fs::read_to_string(path).ok()?;
-    FilterListStore::from_json(&text).ok()
+    FilterPolicyStore::from_json(&text).ok()
 }
 
 // ── the worker ───────────────────────────────────────────────────────────────
@@ -276,9 +453,9 @@ pub struct AdfilterWorker {
     /// The shared leader lock (reused across the leader-gated workers).
     leader_lock: PathBuf,
     /// This node's authoritative own store (bundled seed + local edits/refreshes).
-    own: FilterListStore,
+    own: FilterPolicyStore,
     /// The converged store (own ⊕ every peer) — published + compiled.
-    converged: FilterListStore,
+    converged: FilterPolicyStore,
     /// The injectable upstream-refresh seam.
     fetcher: Arc<dyn ListFetcher>,
     /// Freshness window (ms) for the staleness classification.
@@ -313,8 +490,8 @@ impl AdfilterWorker {
             node,
             local_root,
             share_root,
-            own: FilterListStore::with_bundled(),
-            converged: FilterListStore::with_bundled(),
+            own: FilterPolicyStore::default(),
+            converged: FilterPolicyStore::default(),
             freshness_ms: DEFAULT_FRESHNESS_MS,
             peer_count: 0,
             last_flush_ms: 0,
@@ -391,17 +568,11 @@ impl AdfilterWorker {
     }
 
     /// Restore this node's authoritative own store from `local_root` (offline-
-    /// proof), else seed the bundled lists, then rebuild the converged view.
+    /// proof), else start with an empty policy envelope, then rebuild the
+    /// converged view.
     fn load(&mut self) {
-        self.own = load_store(&store_path(&self.local_root, &self.node))
-            .unwrap_or_else(FilterListStore::with_bundled);
+        self.own = load_store(&store_path(&self.local_root, &self.node)).unwrap_or_default();
         self.rebuild_converged();
-    }
-
-    /// The compiled engine for the converged store (the same [`Engine`] the browser
-    /// builds from the replicated blob) — for the published rule counts.
-    fn engine(&self) -> Engine {
-        Engine::from_store(&self.converged)
     }
 
     /// Apply a typed action to the own store's allowlist (block-on-by-default
@@ -416,10 +587,23 @@ impl AdfilterWorker {
 
     /// LEADER-ONLY: attempt an upstream refresh of every enabled list via the
     /// fetcher, updating the own store on a fresh, changed body. Airgap-honest —
-    /// an [`RefreshOutcome::Unavailable`] leaves the last-synced / bundled copy and
+    /// an [`RefreshOutcome::Unavailable`] leaves the last-synced copy and
     /// never stamps a sync. Returns whether any list changed.
     fn refresh_lists(&mut self) -> bool {
         let now = self.now_ms();
+        if let Ok(entries) = std::fs::read_dir(mirror_dir(&self.share_root)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                self.own
+                    .add_source(FilterPolicySource::mirror(name.to_string()));
+            }
+        }
         // Snapshot the (name, url, current-raw) of enabled sources with an upstream.
         let targets: Vec<(String, String, String)> = self
             .own
@@ -501,8 +685,8 @@ impl AdfilterWorker {
         self.converged = converged;
     }
 
-    /// LEADER-ONLY: compile the converged store into the shared engine blob at
-    /// `<share>/adfilter/compiled/engine.json` — the single blob the browser reads.
+    /// LEADER-ONLY: serialize the converged policy envelope for Browser VMs at
+    /// `<share>/adfilter/compiled/engine.json`.
     /// A no-op while the share is down. Returns whether it wrote.
     fn compile_blob(&self) -> bool {
         if !self.share_writable() {
@@ -526,14 +710,14 @@ impl AdfilterWorker {
         let now = self.now_ms();
         let staleness = self.converged.staleness(now, self.freshness_ms);
         let age_ms = self.converged.synced_ms().map(|s| now.saturating_sub(s));
-        let engine = self.engine();
+        let (network_rules, cosmetic_rules) = self.converged.rule_counts();
         AdfilterStatus {
             node: self.node.clone(),
             enabled_sources: self.converged.enabled_sources().count(),
             total_sources: self.converged.sources().len(),
-            network_rules: engine.network_rule_count(),
-            cosmetic_rules: engine.cosmetic_rule_count(),
-            allowlisted_sites: self.converged.allowlist().domains().count(),
+            network_rules,
+            cosmetic_rules,
+            allowlisted_sites: self.converged.allowed_count(),
             staleness,
             age_ms,
             synced_ms: self.converged.synced_ms(),
@@ -757,24 +941,22 @@ mod tests {
         }
     }
 
-    // ── the crate's serde blob compiles + round-trips into a matching engine ──
+    // ── the guest policy envelope round-trips without a host matcher ──
 
     #[test]
-    fn compiled_blob_round_trips_and_blocks_a_tracker() {
-        let store = FilterListStore::with_bundled();
+    fn policy_blob_round_trips_opaque_filter_text() {
+        let mut store = FilterPolicyStore::default();
+        store.add_source(FilterPolicySource {
+            name: "operator-list".into(),
+            url: Some("mirror://operator-list".into()),
+            raw: "||tracker.example^\n##.advert\n".into(),
+            enabled: true,
+            updated_ms: 7,
+        });
         let json = store.to_json().expect("serialize");
-        let back = FilterListStore::from_json(&json).expect("deserialize");
+        let back = FilterPolicyStore::from_json(&json).expect("deserialize");
         assert_eq!(store, back, "the blob round-trips byte-for-byte");
-        let engine = Engine::from_store(&back);
-        // A bundled tracker rule matches through the recompiled engine.
-        assert!(engine
-            .match_request(
-                "https://doubleclick.net/ad",
-                mde_adblock::ResourceType::Script,
-                "news.example.com",
-            )
-            .is_block());
-        assert!(engine.network_rule_count() > 0);
+        assert_eq!(back.rule_counts(), (1, 1));
     }
 
     // ── leader refresh + the leader compile fold ──
@@ -786,6 +968,8 @@ mod tests {
         let share = tempfile::tempdir().unwrap();
         // The tmpdir share is always writable + this lone node wins leadership.
         let fresh = "||fresh-tracker.example^\n##.fresh-ad\n";
+        std::fs::create_dir_all(mirror_dir(share.path())).unwrap();
+        std::fs::write(mirror_dir(share.path()).join("operator.txt"), fresh).unwrap();
         let mut w = worker("solo", local.path(), share.path(), now)
             .with_fetcher(Arc::new(StaticFetcher(fresh.to_string())));
         w.load();
@@ -803,14 +987,7 @@ mod tests {
         let blob = compiled_path(share.path());
         assert!(blob.exists(), "the leader compiled the shared engine blob");
         let compiled = load_store(&blob).expect("compiled blob parses");
-        let engine = Engine::from_store(&compiled);
-        assert!(engine
-            .match_request(
-                "https://fresh-tracker.example/x",
-                mde_adblock::ResourceType::Script,
-                "site.example",
-            )
-            .is_block());
+        assert_eq!(compiled.rule_counts(), (1, 1));
     }
 
     #[test]
@@ -839,8 +1016,8 @@ mod tests {
         a.sync();
         b.sync();
         // Both nodes' converged allowlist carries A's opt-out.
-        assert!(a.converged.allowlist().is_allowed("news.example.com"));
-        assert!(b.converged.allowlist().is_allowed("news.example.com"));
+        assert!(a.converged.is_allowed("news.example.com"));
+        assert!(b.converged.is_allowed("news.example.com"));
         assert_eq!(a.status().peers, 1, "A merged B's store");
         assert_eq!(b.status().peers, 1, "B merged A's store");
     }
@@ -856,15 +1033,12 @@ mod tests {
             worker("solo", local.path(), share.path(), now).with_fetcher(Arc::new(DeadFetcher));
         w.load();
         w.sync();
-        // Never synced upstream → the bundled seed with an honest NeverSynced.
+        // Never synced upstream → no fabricated host rules and honest status.
         let status = w.status();
         assert_eq!(status.staleness, Staleness::NeverSynced);
         assert_eq!(status.age_ms, None);
-        assert!(
-            status.enabled_sources >= 3,
-            "the bundled seed is still active"
-        );
-        assert!(status.network_rules > 0, "the bundled rules still compile");
+        assert_eq!(status.enabled_sources, 0);
+        assert_eq!(status.network_rules, 0);
     }
 
     #[test]
@@ -872,6 +1046,12 @@ mod tests {
         let (clock, now) = fake_clock(1_000);
         let local = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mirror_dir(share.path())).unwrap();
+        std::fs::write(
+            mirror_dir(share.path()).join("operator.txt"),
+            "||x.example^\n",
+        )
+        .unwrap();
         let mut w = worker("solo", local.path(), share.path(), now)
             .with_fetcher(Arc::new(StaticFetcher("||x.example^\n".to_string())));
         w.load();
@@ -917,7 +1097,7 @@ mod tests {
             .with_fetcher(Arc::new(DeadFetcher))
             .with_share_gate(gate.clone());
         w2.load();
-        assert!(w2.converged.allowlist().is_allowed("news.example.com"));
+        assert!(w2.converged.is_allowed("news.example.com"));
 
         // Share reappears → the next sync mirrors the backlog out.
         gate.store(true, Ordering::SeqCst);
@@ -1072,7 +1252,7 @@ mod tests {
             "oversized.example",
         ] {
             assert!(
-                !worker.own.allowlist().is_allowed(domain),
+                !worker.own.is_allowed(domain),
                 "unauthorized request changed {domain}"
             );
         }
@@ -1087,7 +1267,7 @@ mod tests {
 
         write(&valid);
         worker.drain_requests(&persist);
-        assert!(worker.own.allowlist().is_allowed("authorized.example"));
+        assert!(worker.own.is_allowed("authorized.example"));
         let persisted = std::fs::read_to_string(store_path(local.path(), "local-host"))
             .expect("authorized request persists the local store");
         assert!(store_path(share.path(), "local-host").exists());
@@ -1102,7 +1282,7 @@ mod tests {
             persisted,
             "replayed capability must not apply or persist a second edit"
         );
-        assert_eq!(worker.own.allowlist().domains().count(), 1);
+        assert_eq!(worker.own.allowed_count(), 1);
     }
 
     // ── the published status shape ──
@@ -1122,7 +1302,7 @@ mod tests {
         assert_eq!(back, status);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["node"], "peer:eagle");
-        assert!(v["enabled_sources"].as_u64().unwrap() >= 3);
+        assert_eq!(v["enabled_sources"], 0);
         assert!(v.get("total_sources").is_some());
         assert!(v.get("network_rules").is_some());
         assert!(v.get("staleness").is_some());

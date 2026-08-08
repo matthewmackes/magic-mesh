@@ -65,6 +65,7 @@ use mde_collab_types::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+pub mod mesh;
 pub mod session;
 
 use super::clipboard_bridge::{ClipDirection, ClipPayload, ClipboardEvent};
@@ -109,6 +110,12 @@ pub const CLIPBOARD_ENVELOPE_V2_TOPIC: &str = "event/clipboard/envelope-v2";
 /// wire shape. Keeping both explicit preserves deployed VDI producers while
 /// allowing the collaboration contract to reach this worker's real intake.
 pub const COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC: &str = "event/clipboard/collab-envelope-v2";
+
+/// Payload-free cursor for local rich clipboard send requests.
+const MESH_SEND_CURSOR_FILE_NAME: &str = "clipboard-sync.mesh-send.cursor.json";
+
+/// Payload-free cursor for target-specific authenticated mesh frames.
+const MESH_RECEIVE_CURSOR_FILE_NAME: &str = "clipboard-sync.mesh-receive.cursor.json";
 
 /// Capability verb for the explicit clipboard publishing consent control.
 pub const CLIPBOARD_SESSION_CONSENT_AUTH_VERB: &str = "clipboard-session-consent";
@@ -1326,6 +1333,9 @@ pub struct ClipboardSyncWorker {
     /// Verifier for the root-authenticated clipboard session-consent control
     /// lane. Missing production credentials fail closed.
     consent_authorizer: Arc<ActionAuthorizer>,
+    /// Read-only enrollment key/availability projection used to bind signed
+    /// clipboard frames to authenticated mesh peers.
+    mesh_peer_directory: Arc<dyn mesh::MeshClipboardPeerDirectory>,
 }
 
 impl ClipboardSyncWorker {
@@ -1340,6 +1350,9 @@ impl ClipboardSyncWorker {
             poll: CLIP_EVENT_POLL_INTERVAL,
             vnc_action_signer: production_action_signer().ok(),
             consent_authorizer: Arc::new(ActionAuthorizer::production()),
+            mesh_peer_directory: Arc::new(mesh::SqliteMeshClipboardPeerDirectory::new(
+                crate::default_db_path(),
+            )),
         }
     }
 
@@ -1941,6 +1954,134 @@ impl ClipboardSyncWorker {
         true
     }
 
+    /// Drain locally authored canonical rich envelopes into target-specific,
+    /// enrollment-key-bound mesh frames. Every terminal refusal is typed and
+    /// acknowledged so an unavailable or hostile peer cannot pin the lane.
+    fn drain_mesh_send_requests(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: &Path,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let messages = match persist.list_since_limit(
+            mesh::MESH_SEND_TOPIC,
+            cursor.as_deref(),
+            mesh::MAX_MESH_FRAMES_PER_TICK,
+        ) {
+            Ok(messages) => messages,
+            Err(error) => {
+                debug!(target: "clipboard_sync", %error, "clipboard mesh send drain failed");
+                return 0;
+            }
+        };
+        let mut sent = 0;
+        for message in messages {
+            let body = message.body.as_deref().unwrap_or("");
+            let result = mesh::send_envelope(
+                persist,
+                self.mesh_peer_directory.as_ref(),
+                &self.target_node,
+                body.as_bytes(),
+                now_ms,
+            );
+            if let Err(reason) = result {
+                let (source_peer, target_peer) =
+                    CollabClipboardEnvelopeV2::from_json_bytes(body.as_bytes())
+                        .map(|envelope| {
+                            (
+                                envelope.source.node.to_string(),
+                                envelope.target.node.to_string(),
+                            )
+                        })
+                        .unwrap_or_default();
+                mesh::publish_result(
+                    persist,
+                    &mesh::ClipboardMeshResultV1::Refused {
+                        source_peer,
+                        target_peer,
+                        reason,
+                    },
+                );
+            } else {
+                sent += 1;
+            }
+            if let Err(error) =
+                mesh::write_mesh_cursor(checkpoint, mesh::MESH_SEND_TOPIC, &message.ulid)
+            {
+                warn!(target: "clipboard_sync", %error, "clipboard mesh send cursor checkpoint failed");
+                break;
+            }
+            *cursor = Some(message.ulid);
+        }
+        sent
+    }
+
+    /// Drain only this node's target-specific authenticated frame lane and
+    /// forward admitted canonical envelopes to the existing collaboration
+    /// authority. Replay state is payload-free and expiry-cleaned each tick.
+    fn drain_mesh_receive_frames(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: &Path,
+        ledger: &mut mesh::ClipboardMeshReplayLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        ledger.cleanup(now_ms);
+        let topic = mesh::mesh_frame_topic(&self.target_node);
+        let messages = match persist.list_since_limit(
+            &topic,
+            cursor.as_deref(),
+            mesh::MAX_MESH_FRAMES_PER_TICK,
+        ) {
+            Ok(messages) => messages,
+            Err(error) => {
+                debug!(target: "clipboard_sync", %error, "clipboard mesh receive drain failed");
+                return 0;
+            }
+        };
+        let mut admitted = 0;
+        for message in messages {
+            let body = message.body.as_deref().unwrap_or("");
+            match mesh::receive_frame(
+                persist,
+                self.mesh_peer_directory.as_ref(),
+                &self.target_node,
+                body.as_bytes(),
+                ledger,
+                now_ms,
+            ) {
+                Ok(result) => {
+                    mesh::publish_result(persist, &result);
+                    admitted += 1;
+                }
+                Err(reason) => {
+                    let (source_peer, target_peer) =
+                        mesh::ClipboardMeshFrameV1::from_json_bytes(body.as_bytes())
+                            .map(|frame| (frame.source_peer, frame.target_peer))
+                            .unwrap_or_default();
+                    mesh::publish_result(
+                        persist,
+                        &mesh::ClipboardMeshResultV1::Refused {
+                            source_peer,
+                            target_peer,
+                            reason,
+                        },
+                    );
+                }
+            }
+            if let Err(error) = mesh::write_mesh_cursor(checkpoint, &topic, &message.ulid) {
+                warn!(target: "clipboard_sync", %error, "clipboard mesh receive cursor checkpoint failed");
+                break;
+            }
+            *cursor = Some(message.ulid);
+        }
+        admitted
+    }
+
     /// Drain signed collaboration clipboard envelopes through bounded decode,
     /// exact-target, fresh-consent, replay, expiry, and echo admission. Only a
     /// sole inline `text/plain` offer can reach the existing seat handoff.
@@ -2224,6 +2365,33 @@ impl Worker for ClipboardSyncWorker {
         }
         let mut collab_v2_ledger = CollabClipboardEnvelopeV2Ledger::default();
         collab_v2_ledger.seed_from_retained(&persist);
+        let mesh_send_checkpoint = bus_root.join(MESH_SEND_CURSOR_FILE_NAME);
+        let mut mesh_send_cursor =
+            mesh::read_mesh_cursor(&mesh_send_checkpoint, mesh::MESH_SEND_TOPIC);
+        if mesh_send_cursor.is_none() {
+            // Local send requests are session actions, never durable desired
+            // state. A daemon restart starts at the tail rather than reviving
+            // an old clipboard generation.
+            mesh_send_cursor = persist.latest_ulid(mesh::MESH_SEND_TOPIC).ok().flatten();
+            if let Some(ulid) = mesh_send_cursor.as_deref() {
+                if let Err(error) =
+                    mesh::write_mesh_cursor(&mesh_send_checkpoint, mesh::MESH_SEND_TOPIC, ulid)
+                {
+                    warn!(target: "clipboard_sync", %error, "initial clipboard mesh send cursor checkpoint failed");
+                }
+            }
+        }
+        let mesh_receive_topic = mesh::mesh_frame_topic(&self.target_node);
+        let mesh_receive_checkpoint = bus_root.join(MESH_RECEIVE_CURSOR_FILE_NAME);
+        let mut mesh_receive_cursor =
+            mesh::read_mesh_cursor(&mesh_receive_checkpoint, &mesh_receive_topic);
+        // A receiver must inspect retained frames after first start or cursor
+        // loss. Rebuild the payload-free high-water marks from the canonical
+        // lane first, then signature/expiry admission safely rejects old or
+        // already-forwarded entries without dropping a still-fresh transfer.
+        let mut mesh_replay_ledger = mesh::ClipboardMeshReplayLedger::default();
+        let startup_now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        mesh_replay_ledger.seed_from_retained(&persist, startup_now_ms);
         // Consent starts disabled on every daemon/session start. Fresh signed
         // controls are drained before either V2 envelope lane on each tick.
         let mut v2_consent_ledger = ClipboardSessionConsentLedger::default();
@@ -2259,6 +2427,19 @@ impl Worker for ClipboardSyncWorker {
                             Some(&v2_checkpoint),
                             &mut v2_ledger,
                             &v2_consent_ledger,
+                            now_ms,
+                        );
+                        self.drain_mesh_send_requests(
+                            &mut persist,
+                            &mut mesh_send_cursor,
+                            &mesh_send_checkpoint,
+                            now_ms,
+                        );
+                        self.drain_mesh_receive_frames(
+                            &mut persist,
+                            &mut mesh_receive_cursor,
+                            &mesh_receive_checkpoint,
+                            &mut mesh_replay_ledger,
                             now_ms,
                         );
                         self.drain_collab_clipboard_envelopes(

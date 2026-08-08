@@ -542,9 +542,9 @@ fn valid_ssdp_interface_name(interface: &str) -> bool {
         && interface.len() <= 64
         && interface.trim() == interface
         && interface.is_ascii()
-        && interface.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'%')
-        })
+        && interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'%'))
 }
 
 /// Typed failures from the non-I/O SSDP resource adapter boundary.
@@ -570,13 +570,22 @@ impl std::fmt::Display for SsdpResourceAdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooManyRecords { count, max } => {
-                write!(f, "SSDP snapshot contains {count} records; maximum is {max}")
+                write!(
+                    f,
+                    "SSDP snapshot contains {count} records; maximum is {max}"
+                )
             }
             Self::InterfaceNotAllowed { interface } => {
-                write!(f, "SSDP interface is outside the trusted policy: {interface}")
+                write!(
+                    f,
+                    "SSDP interface is outside the trusted policy: {interface}"
+                )
             }
             Self::PublicationRejected { source_id, error } => {
-                write!(f, "SSDP publication {source_id} failed revalidation: {error}")
+                write!(
+                    f,
+                    "SSDP publication {source_id} failed revalidation: {error}"
+                )
             }
             Self::ConflictingIdentity { source_id } => {
                 write!(f, "SSDP identity has conflicting records: {source_id}")
@@ -654,10 +663,9 @@ impl SsdpResourceAdapter {
         for (source_id, records) in by_source {
             let mut unique: Vec<&SsdpPublishedAdvertisement> = Vec::with_capacity(records.len());
             for record in records {
-                if let Some(existing) = unique
-                    .iter()
-                    .find(|existing| existing.advertisement.protocol == record.advertisement.protocol)
-                {
+                if let Some(existing) = unique.iter().find(|existing| {
+                    existing.advertisement.protocol == record.advertisement.protocol
+                }) {
                     if *existing != record {
                         return Err(SsdpResourceAdapterError::ConflictingIdentity { source_id });
                     }
@@ -1583,8 +1591,9 @@ impl VmEnumerator for WorkloadEnumerator {
         let Some(body) = message.body.as_deref() else {
             return Ok(Vec::new());
         };
-        let snapshot: WorkloadStateSnapshot = serde_json::from_str(body)
-            .map_err(|error| VmEnumerateError::Backend(format!("decode Workload state: {error}")))?;
+        let snapshot: WorkloadStateSnapshot = serde_json::from_str(body).map_err(|error| {
+            VmEnumerateError::Backend(format!("decode Workload state: {error}"))
+        })?;
         Ok(snapshot
             .workloads
             .into_iter()
@@ -2194,11 +2203,7 @@ fn desktop_connect_availability(source: &DesktopSource) -> ActionAvailability {
     }
 }
 
-fn ssdp_health(
-    reachability: Reachability,
-    observed_at_ms: u64,
-    expires_at_ms: u64,
-) -> HealthState {
+fn ssdp_health(reachability: Reachability, observed_at_ms: u64, expires_at_ms: u64) -> HealthState {
     let (status, failure) = match reachability {
         Reachability::Reachable => (HealthStatus::Available, None),
         Reachability::Unknown => (
@@ -2270,7 +2275,11 @@ fn ssdp_resource_card_from_records(
             value: advertisement.source_id.clone(),
         }],
     )?;
-    let health = ssdp_health(advertisement.reachability.unwrap_or(first.reachability), observed_at_ms, expires_at_ms);
+    let health = ssdp_health(
+        advertisement.reachability.unwrap_or(first.reachability),
+        observed_at_ms,
+        expires_at_ms,
+    );
     let mut capabilities = Vec::new();
     let mut transports = Vec::new();
     let mut transport_fingerprints = BTreeSet::new();
@@ -3619,10 +3628,7 @@ mod tests {
         card.validate().expect("adapter emits a valid card");
         assert_eq!(card.identity.authority, IdentityAuthority::Device);
         assert_eq!(card.provenance[0].source, DiscoverySource::SsdpUpnp);
-        assert_eq!(
-            card.provenance[0].interface.as_deref(),
-            Some("enp0s31f6")
-        );
+        assert_eq!(card.provenance[0].interface.as_deref(), Some("enp0s31f6"));
         assert_eq!(card.provenance[0].trust, ProvenanceTrust::ObservedLan);
         assert_eq!(card.provenance[0].scope, ResourceScope::TrustedLan);
         assert_eq!(card.health.status, HealthStatus::Available);
@@ -3648,11 +3654,8 @@ mod tests {
     #[test]
     fn ssdp_resource_adapter_keeps_unknown_reachability_as_unready_evidence() {
         let context = ssdp_publication_context();
-        let admitted = admit_ssdp_publication(
-            trusted_ssdp_advertisement(None),
-            context.clone(),
-        )
-        .expect("unknown reachability is valid evidence");
+        let admitted = admit_ssdp_publication(trusted_ssdp_advertisement(None), context.clone())
+            .expect("unknown reachability is valid evidence");
         let cards = ssdp_resource_adapter(4)
             .adapt(std::slice::from_ref(&admitted), context.now_ms)
             .expect("unknown SSDP card");
@@ -3710,8 +3713,8 @@ mod tests {
             },
         )
         .expect("VNC advertisement");
-        let vnc = admit_ssdp_publication(vnc_advertisement, context.clone())
-            .expect("VNC publication");
+        let vnc =
+            admit_ssdp_publication(vnc_advertisement, context.clone()).expect("VNC publication");
         let cards = ssdp_resource_adapter(4)
             .adapt(&[rdp.clone(), rdp.clone(), vnc.clone()], context.now_ms)
             .expect("bounded multi-protocol snapshot");
@@ -3735,10 +3738,8 @@ mod tests {
         );
 
         assert!(matches!(
-            ssdp_resource_adapter(2).adapt(
-                &[rdp.clone(), rdp.clone(), vnc.clone()],
-                context.now_ms
-            ),
+            ssdp_resource_adapter(2)
+                .adapt(&[rdp.clone(), rdp.clone(), vnc.clone()], context.now_ms),
             Err(SsdpResourceAdapterError::TooManyRecords { count: 3, max: 2 })
         ));
 
@@ -4440,7 +4441,10 @@ mod tests {
     #[test]
     fn initial_phase_is_stable_bounded_and_keeps_first_scan_deadline() {
         let phase = initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL);
-        assert_eq!(phase, initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL));
+        assert_eq!(
+            phase,
+            initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL)
+        );
         assert!(phase <= MAX_INITIAL_PHASE);
         assert!(phase <= DEFAULT_TICK_INTERVAL);
         let first_delay = DEFAULT_TICK_INTERVAL.saturating_sub(phase);

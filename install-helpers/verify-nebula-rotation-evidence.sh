@@ -129,7 +129,8 @@ prepare_output_dir() {
       die "refusing to collect into non-empty output directory: $out_dir"
     fi
   else
-    mkdir -m 700 -p "$out_dir"
+    mkdir -p "$out_dir"
+    chmod 700 "$out_dir"
   fi
 }
 
@@ -149,6 +150,14 @@ bool_from_systemctl_active() {
     return 0
   fi
   systemctl is-active --quiet "$unit" 2>/dev/null && printf 'true\n' || printf 'false\n'
+}
+
+bool_from_grouped_mackesd_active() {
+  local unit
+  for unit in mackesd-{control,observation,actions,data,compute,integrations}.service; do
+    [ "$(bool_from_systemctl_active "$unit")" = true ] || { printf 'false\n'; return 0; }
+  done
+  printf 'true\n'
 }
 
 iface_up() {
@@ -376,7 +385,7 @@ blocklist_proof_mode() {
     local nebula_active mackesd_active link_up overlay_ip reachable="skipped"
     local reload_epoch="" reload_after_blocklist=false
     nebula_active="$(bool_from_systemctl_active nebula.service)"
-    mackesd_active="$(bool_from_systemctl_active mackesd.service)"
+    mackesd_active="$(bool_from_grouped_mackesd_active)"
     link_up="$(iface_up "$iface")"
     overlay_ip="$(overlay_ipv4 "$iface")"
     write_kv live_checks enabled
@@ -393,7 +402,7 @@ blocklist_proof_mode() {
       fi
     fi
     write_kv probe_reachable "$reachable"
-    systemctl show nebula.service mackesd.service \
+    systemctl show nebula.service mackesd-{control,observation,actions,data,compute,integrations}.service \
       -p Id -p LoadState -p ActiveState -p SubState -p NRestarts \
       -p ActiveEnterTimestamp -p ExecMainPID -p ReloadResult --no-pager \
       >"$out_dir/systemd-services.txt" 2>&1 || true
@@ -413,7 +422,7 @@ blocklist_proof_mode() {
       fail=1
     fi
     if [ "$mackesd_active" != "true" ]; then
-      printf 'FAIL mackesd.service is not active\n' >>"$summary"
+      printf 'FAIL one or more grouped mackesd services are not active\n' >>"$summary"
       fail=1
     fi
     if [ "$link_up" != "true" ] || [ -z "$overlay_ip" ]; then
@@ -652,7 +661,7 @@ collect_mode() {
   else
     local nebula_active mackesd_active link_up overlay_ip reachable="skipped"
     nebula_active="$(bool_from_systemctl_active nebula.service)"
-    mackesd_active="$(bool_from_systemctl_active mackesd.service)"
+    mackesd_active="$(bool_from_grouped_mackesd_active)"
     link_up="$(iface_up "$iface")"
     overlay_ip="$(overlay_ipv4 "$iface")"
     write_kv live_checks enabled
@@ -669,7 +678,7 @@ collect_mode() {
       fi
     fi
     write_kv probe_reachable "$reachable"
-    systemctl show nebula.service mackesd.service \
+    systemctl show nebula.service mackesd-{control,observation,actions,data,compute,integrations}.service \
       -p Id -p LoadState -p ActiveState -p SubState -p NRestarts \
       -p ActiveEnterTimestamp -p ExecMainPID --no-pager \
       >"$out_dir/systemd-services.txt" 2>&1 || true
@@ -745,7 +754,9 @@ compare_mode() {
         fi ;;
     esac
   done
-  [ -n "$before" ] && [ -n "$after" ] || die "compare needs BEFORE_DIR and AFTER_DIR"
+  if [ -z "$before" ] || [ -z "$after" ]; then
+    die "compare needs BEFORE_DIR and AFTER_DIR"
+  fi
 
   echo "== WL-SEC-006 Nebula rotation evidence compare =="
   if snapshot_has_clean_summary "$before"; then
@@ -869,7 +880,7 @@ make_fake_identity() {
 self_test() {
   local td fails=0
   td="$(mktemp -d "${TMPDIR:-/tmp}/nebula-rotation-evidence-test.XXXXXX")"
-  trap "rm -rf '$td'" EXIT
+  trap 'rm -rf "$td"' EXIT
 
   local config_dir="$td/etc/nebula" workgroup_root="$td/workgroup"
   local before="$td/before" after="$td/after" leak="$td/leak"

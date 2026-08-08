@@ -283,7 +283,10 @@ mod tests {
         assert!(
             initial_phase_for("seat-oak", Duration::from_millis(100)) < Duration::from_millis(100)
         );
-        assert_eq!(initial_phase_for("seat-oak", Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            initial_phase_for("seat-oak", Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     #[test]

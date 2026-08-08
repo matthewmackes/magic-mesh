@@ -433,133 +433,6 @@ fn invalid_desktop_endpoints_are_rejected_before_the_live_transport() {
     );
 }
 
-// ── VDI-VM-1: resolving the brokered console endpoint from the session record ──
-
-#[test]
-fn console_topic_matches_the_broker() {
-    // MUST equal mackesd::workers::console_broker::CONSOLE_TOPIC.
-    assert_eq!(CONSOLE_TOPIC, "state/vdi/console");
-}
-
-#[cfg(feature = "live-vdi")]
-#[test]
-fn console_reader_uses_a_bounded_tail_of_retained_state() {
-    let dir = tempfile::tempdir().expect("temp bus");
-    let persist = TestPersist::open(dir.path().to_path_buf()).expect("open console Bus");
-    for i in 0..=MAX_CONSOLE_MESSAGES_PER_POLL {
-        persist
-            .write(
-                CONSOLE_TOPIC,
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                Some(&format!("{{\"session_id\":\"s{i}\"}}")),
-            )
-            .expect("write retained console record");
-    }
-
-    let bodies = read_console_bodies(Some(dir.path()));
-    assert_eq!(
-        bodies.len(),
-        MAX_CONSOLE_MESSAGES_PER_POLL,
-        "console resolution must not materialize the entire retained topic"
-    );
-    assert!(
-        !bodies
-            .iter()
-            .any(|body| body.contains("\"session_id\":\"s0\"")),
-        "the oldest retained record must fall outside the bounded tail"
-    );
-    assert!(
-        bodies
-            .last()
-            .is_some_and(|body| body.contains("\"session_id\":\"s64\"")),
-        "the newest broker record must remain available for resolution"
-    );
-}
-
-fn brokered_body(session: &str, host: &str, port: u16) -> String {
-    format!(
-        r#"{{"session_id":"{session}","serving_node":"peer:oak","vm_id":"win11","status":{{"state":"brokered","protocol":"spice","host":"{host}","port":{port}}}}}"#
-    )
-}
-
-fn unbrokerable_body(session: &str, reason: &str) -> String {
-    format!(
-        r#"{{"session_id":"{session}","serving_node":"peer:oak","vm_id":"dev","status":{{"state":"unbrokerable","reason":"{reason}"}}}}"#
-    )
-}
-
-#[test]
-fn resolve_pending_when_no_record_for_the_session() {
-    // A record for another session must not resolve ours.
-    let bodies = vec![brokered_body("other", "10.42.0.7", 5900)];
-    assert_eq!(
-        resolve_brokered_console(&bodies, "mine"),
-        ConsoleResolution::Pending
-    );
-    assert_eq!(
-        resolve_brokered_console(&[], "mine"),
-        ConsoleResolution::Pending
-    );
-}
-
-#[test]
-fn resolve_ready_yields_the_overlay_endpoint() {
-    let bodies = vec![brokered_body("s1", "10.42.0.7", 5900)];
-    match resolve_brokered_console(&bodies, "s1") {
-        ConsoleResolution::Ready {
-            endpoint: ep,
-            protocol,
-        } => {
-            assert_eq!(ep.host, "10.42.0.7");
-            assert_eq!(ep.port, 5900);
-            assert_eq!(protocol, Some(VdiProtocol::Spice));
-        }
-        other => panic!("expected Ready, got {other:?}"),
-    }
-}
-
-#[test]
-fn resolve_unbrokerable_surfaces_the_honest_reason() {
-    let bodies = vec![unbrokerable_body("s1", "VM off")];
-    assert_eq!(
-        resolve_brokered_console(&bodies, "s1"),
-        ConsoleResolution::Unbrokerable("VM off".to_string())
-    );
-}
-
-#[test]
-fn resolve_latest_record_wins() {
-    // The broker republishes on state change: an initial gate, then a broker.
-    let bodies = vec![
-        unbrokerable_body("s1", "nebula overlay not up"),
-        brokered_body("s1", "10.42.0.7", 5931),
-    ];
-    assert!(matches!(
-        resolve_brokered_console(&bodies, "s1"),
-        ConsoleResolution::Ready { endpoint: ep, .. } if ep.port == 5931
-    ));
-}
-
-#[test]
-fn resolve_preserves_requested_protocol_compatibility_for_old_records() {
-    let body = r#"{"session_id":"s1","serving_node":"peer:oak","vm_id":"win11","status":{"state":"brokered","host":"10.42.0.7","port":3389}}"#;
-    assert!(matches!(
-        resolve_brokered_console(&[body.to_string()], "s1"),
-        ConsoleResolution::Ready { protocol: None, .. }
-    ));
-}
-
-#[test]
-fn resolve_ignores_malformed_and_zero_port_records() {
-    // A garbage body is skipped; a port-0 brokered record is honestly unusable.
-    let bodies = vec!["not json".to_string(), brokered_body("s1", "10.42.0.7", 0)];
-    assert!(matches!(
-        resolve_brokered_console(&bodies, "s1"),
-        ConsoleResolution::Unbrokerable(_)
-    ));
-}
-
 // ────────── vdi-vm-4 / shell-ux-1: session drop → reconnect → overlay ──────────
 //
 // The auto-reconnect + honest-overlay state machine, tested through the pure
@@ -1080,7 +953,10 @@ fn browser_activation_publishes_only_a_native_display1_workload_attachment() {
         .expect("Workload actions");
     assert_eq!(messages.len(), 1, "one click publishes one typed action");
     let request: mackes_mesh_types::workloads::WorkloadOperationRequest = serde_json::from_str(
-        messages[0].body.as_deref().expect("typed Workload action body"),
+        messages[0]
+            .body
+            .as_deref()
+            .expect("typed Workload action body"),
     )
     .expect("decode Workload action");
     assert_eq!(request.action, WorkloadOperationAction::StartAndAttach);
@@ -1092,7 +968,10 @@ fn browser_activation_publishes_only_a_native_display1_workload_attachment() {
     assert_eq!(request.expected_generation, 7);
     assert_eq!(request.resources, WorkloadProfile::Standard.resources());
     assert_eq!(request.image_ref.as_deref(), Some("browser:1.0"));
-    assert!(request.armed_token.is_some(), "request remains capability-bound");
+    assert!(
+        request.armed_token.is_some(),
+        "request remains capability-bound"
+    );
     assert!(
         persist
             .list_since("action/vdi/session", None)
@@ -1163,6 +1042,35 @@ fn session_preview_frame_requires_a_real_texture_and_carries_the_broker_id() {
     assert_eq!(preview.label, "web1");
     assert_eq!(preview.protocol, "RDP");
     assert_eq!(preview.texture.size(), [4, 3]);
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn endpointless_legacy_session_never_revives_raw_console_resolution() {
+    let mut state = VdiState::default();
+    state.request_connect(
+        ConnectRequest::new(
+            RequestedTarget::new("node-a", "legacy-vm"),
+            VdiProtocol::Vnc,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("node-a"),
+        )
+        .with_broker_session(BrokerSessionLifecycle::new("legacy-session", None)),
+    );
+
+    assert!(
+        state.broker_resolution_gated,
+        "an endpoint-less session must fail closed instead of polling a retired console topic"
+    );
+    assert!(
+        state
+            .live_status
+            .as_deref()
+            .is_some_and(|status| status.contains("typed Workload attachment lease")),
+        "the operator must receive the typed attachment remediation"
+    );
+    assert!(state.live_rdp.is_none() && state.live_vnc.is_none() && state.live_spice.is_none());
 }
 
 #[test]

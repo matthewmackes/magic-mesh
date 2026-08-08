@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 
 use mackes_mesh_types::android_apps::{
     pending_starter_entries, AndroidAppInventory, AndroidAppInventoryEntry, AndroidGuestBootState,
-    AndroidImageProvenance, AndroidLauncherResolvability, AndroidUnavailableReason,
-    AospStarterApp, AOSP_STARTER_APP_COUNT, MAX_ANDROID_OBSERVATION_AGE_MS,
+    AndroidImageProvenance, AndroidLauncherResolvability, AndroidUnavailableReason, AospStarterApp,
+    AOSP_STARTER_APP_COUNT, MAX_ANDROID_OBSERVATION_AGE_MS,
 };
 use mackes_mesh_types::cloud::MAX_ANDROID_INVENTORIES_PER_STATE;
 use mde_egui::egui::{self, RichText};
@@ -163,28 +163,22 @@ struct AndroidInventoryCardState {
 }
 
 impl AndroidInventoryCardState {
-    fn for_projection(
-        workload_id: Option<&str>,
-        inventory: Option<&AndroidAppInventory>,
-    ) -> Self {
+    fn for_projection(workload_id: Option<&str>, inventory: Option<&AndroidAppInventory>) -> Self {
         let progress = inventory_progress(inventory);
         let retry = match progress {
-            AndroidInventoryProgress::Pending(_) => {
-                AndroidInventoryRetryState::AwaitingObservation
-            }
+            AndroidInventoryProgress::Pending(_) => AndroidInventoryRetryState::AwaitingObservation,
             AndroidInventoryProgress::Stale => {
                 AndroidInventoryRetryState::Eligible(AndroidUnavailableReason::ObservationStale)
             }
-            AndroidInventoryProgress::Unavailable(reason) => reason.map_or(
-                AndroidInventoryRetryState::Blocked(None),
-                |reason| {
+            AndroidInventoryProgress::Unavailable(reason) => {
+                reason.map_or(AndroidInventoryRetryState::Blocked(None), |reason| {
                     if retryable_reason(reason) {
                         AndroidInventoryRetryState::Eligible(reason)
                     } else {
                         AndroidInventoryRetryState::Blocked(Some(reason))
                     }
-                },
-            ),
+                })
+            }
             AndroidInventoryProgress::Observed => AndroidInventoryRetryState::NotNeeded,
         };
         let inspect = if workload_id.is_some() {
@@ -722,10 +716,7 @@ fn launcher_label(resolvability: AndroidLauncherResolvability) -> &'static str {
 /// entry action contract. The strict `<` freshness check keeps an observation
 /// at the retention boundary disabled until a newer provider observation lands;
 /// the provider's stale projection also carries a closed unavailable reason.
-fn launch_is_enabled(
-    inventory: &AndroidAppInventory,
-    entry: &AndroidAppInventoryEntry,
-) -> bool {
+fn launch_is_enabled(inventory: &AndroidAppInventory, entry: &AndroidAppInventoryEntry) -> bool {
     inventory.validate().is_ok()
         && inventory.guest_boot_state == AndroidGuestBootState::Ready
         && inventory.image_provenance.is_some()
@@ -921,18 +912,14 @@ mod tests {
     #[test]
     fn card_state_uses_typed_progress_retry_and_inspect_for_each_inventory_state() {
         let observed = observed_inventory("android-observed");
-        let stale = unavailable_inventory(
-            "android-stale",
-            AndroidUnavailableReason::ObservationStale,
-        );
+        let stale =
+            unavailable_inventory("android-stale", AndroidUnavailableReason::ObservationStale);
         let transient = unavailable_inventory(
             "android-transient",
             AndroidUnavailableReason::GuestUnavailable,
         );
-        let image_unavailable = unavailable_inventory(
-            "android-image",
-            AndroidUnavailableReason::ImageUnavailable,
-        );
+        let image_unavailable =
+            unavailable_inventory("android-image", AndroidUnavailableReason::ImageUnavailable);
         let projections = vm_catalog(
             &[
                 workload("android-image", "android-image on eagle"),
@@ -1092,10 +1079,7 @@ mod tests {
         let mut boundary_age = inventory.clone();
         boundary_age.observation_age_ms = Some(MAX_ANDROID_OBSERVATION_AGE_MS);
         assert!(boundary_age.validate().is_ok());
-        assert!(!launch_is_enabled(
-            &boundary_age,
-            &boundary_age.entries[0]
-        ));
+        assert!(!launch_is_enabled(&boundary_age, &boundary_age.entries[0]));
 
         let mut not_admitted = inventory.clone();
         not_admitted.entries[0].descriptor.package_id =
@@ -1106,10 +1090,8 @@ mod tests {
 
     #[test]
     fn launch_is_enabled_rejects_stale_or_unscoped_entries() {
-        let stale = unavailable_inventory(
-            "android-stale",
-            AndroidUnavailableReason::ObservationStale,
-        );
+        let stale =
+            unavailable_inventory("android-stale", AndroidUnavailableReason::ObservationStale);
         assert!(!launch_is_enabled(&stale, &stale.entries[0]));
 
         let pending = AndroidAppInventory::pending("android-pending");

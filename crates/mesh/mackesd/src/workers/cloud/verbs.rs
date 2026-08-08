@@ -5,7 +5,7 @@
 //! verbs (list/status/provision/configure/instance-*) keep their behavior; legacy
 //! workspace-wide destroy is explicitly refused;
 //! the U1a Workloads verbs (set-desired/plan/inventory/output/image-build/
-//! container-deploy/console-attach/android-provision/browser-provision) land here as
+//! container-deploy/android-provision/browser-provision) land here as
 //! typed handlers or honest gates — recognized + routed, never faked (§7). U4–U10
 //! each own one handler, so this dispatch is the worker's serialize point.
 //!
@@ -23,10 +23,9 @@ use mackes_mesh_types::android_apps::{
     AndroidGuestInventoryRequest, AndroidGuestInventoryResponse,
 };
 use mackes_mesh_types::cloud::{
-    CloudReply, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE,
-    VERB_ANDROID_PROVISION, VERB_APP_PROVISION, VERB_BROWSER_PROVISION, VERB_CONSOLE_ATTACH,
-    VERB_CONTAINER_DEPLOY, VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN,
-    VERB_SET_DESIRED,
+    CloudReply, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE, VERB_ANDROID_PROVISION,
+    VERB_APP_PROVISION, VERB_BROWSER_PROVISION, VERB_CONTAINER_DEPLOY, VERB_IMAGE_BUILD,
+    VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
 };
 
 use super::runner::{default_browser_vm_image_source, CloudRunOutcome};
@@ -44,7 +43,6 @@ mod image;
 mod android; // U9 · android-provision
 mod app; // WL-FUNC-018 · app-provision
 mod browser; // WL-ARCH-008 · browser-provision
-mod console; // U8 · console-attach
 mod inventory; // U10 · inventory + output
 
 pub(crate) use android::{
@@ -115,8 +113,6 @@ pub(crate) enum CloudVerb {
     ImageBuild,
     /// `container-deploy` — render + hand off a Quadlet unit (MUTATION; skeleton, U8).
     ContainerDeploy,
-    /// `console-attach` — a SPICE/VNC console handle (MUTATION-placed; skeleton, U9).
-    ConsoleAttach,
     /// `android-provision` — the two-layer Cuttlefish path (MUTATION; skeleton, U10).
     AndroidProvision,
     /// `browser-provision` — declare the dedicated Desktop VM browser workload.
@@ -142,7 +138,6 @@ impl CloudVerb {
             v if v == VERB_SET_DESIRED => Self::SetDesired,
             v if v == VERB_IMAGE_BUILD => Self::ImageBuild,
             v if v == VERB_CONTAINER_DEPLOY => Self::ContainerDeploy,
-            v if v == VERB_CONSOLE_ATTACH => Self::ConsoleAttach,
             v if v == VERB_ANDROID_PROVISION => Self::AndroidProvision,
             v if v == VERB_BROWSER_PROVISION => Self::BrowserProvision,
             v if v == VERB_APP_PROVISION => Self::AppProvision,
@@ -164,7 +159,6 @@ impl CloudVerb {
                 | Self::SetDesired
                 | Self::ImageBuild
                 | Self::ContainerDeploy
-                | Self::ConsoleAttach
                 | Self::AndroidProvision
                 | Self::BrowserProvision
                 | Self::AppProvision
@@ -177,7 +171,10 @@ impl CloudVerb {
     #[must_use]
     pub const fn requires_placement(self) -> bool {
         self.is_mutation()
-            || matches!(self, Self::LocalList | Self::Inventory | Self::Output | Self::Plan)
+            || matches!(
+                self,
+                Self::LocalList | Self::Inventory | Self::Output | Self::Plan
+            )
     }
 
     /// Whether performing this verb is destructive (`destroy` / a destructive
@@ -362,17 +359,10 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
         // unclassified, so old publishers receive an unknown-verb refusal
         // before auth, replay, or any backend can be reached.
 
-        // ── wired MUTATIONS — console-attach (U8), android-provision (U9),
-        // browser-provision (WL-ARCH-008) ──
-        CloudVerb::ConsoleAttach => {
-            let Some(target) = console::authorization_target(&body) else {
-                return console::handle(verb_name, &body);
-            };
-            if let Some(reply) = authorization_refusal(w, verb_name, &body, target, raw) {
-                return reply;
-            }
-            console::handle(verb_name, &body)
-        }
+        // ── wired MUTATIONS — android-provision (U9), browser-provision
+        // (WL-ARCH-008). Presentation attachment is owned exclusively by the
+        // typed Workload Open/StartAndAttach lane; the retired cloud
+        // `console-attach` verb is intentionally unclassified.
         CloudVerb::AndroidProvision => {
             let target = android::authorization_target(&body);
             if let Some(reply) = authorization_refusal(w, verb_name, &body, &target, raw) {

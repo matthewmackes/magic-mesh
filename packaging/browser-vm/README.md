@@ -143,13 +143,10 @@ endpoint and a host decoder exist; the shell presents that state instead of
 substituting a different protocol. This is a source-seam guard, not live VDI
 proof.
 
-`browser-vm-transport-attach.schema.json` defines the minimal attach envelope
-that the existing `state/vdi/console` shell mirror can consume without a
-Browser helper crate. The envelope is an RDP brokered endpoint bound to the
-Browser VM workload, Browser surface, session generation, and mesh-safe
-`host:port`; it carries no ticket, credential, command, path, or URL. The
-example and `verify-transport-attach.sh` keep the RDP/SPICE wire shape
-fail-closed.
+Browser presentation is requested through the typed Workload `Open` or
+`StartAndAttach` operation. The bounded `state/workloads/<node>` projection
+carries an expiring node-local Display1 lease; no raw host, port, ticket,
+credential, command, path, or URL is published as an attachment envelope.
 
 The declarative audio boundary can be checked with
 `install-helpers/verify-browser-vm-audio.sh --domain <name>` (or an XML file).

@@ -1140,11 +1140,10 @@ enum Cmd {
         /// Override the stable node id (defaults to `peer:<hostname>`).
         #[arg(long)]
         node_id: Option<String>,
-        /// Start exactly one ARCH-009 worker process group. Omitting this
-        /// option retains the transitional monolithic supervisor for local
-        /// development until the six-unit package cutover is complete.
+        /// Start exactly one ARCH-009 worker process group. The group is
+        /// mandatory: the retired in-process all-groups daemon cannot start.
         #[arg(long, value_parser = mackesd_core::worker_role::WorkerGroup::parse)]
-        group: Option<mackesd_core::worker_role::WorkerGroup>,
+        group: mackesd_core::worker_role::WorkerGroup,
     },
 
     // AUD3 S-3 (2026-06-12): `PeerCard` (PC-3.a) removed — it spawned
@@ -2502,7 +2501,7 @@ fn bus_retention_policy(bus_root: &std::path::Path) -> mde_bus::retention::Reten
 fn run_serve(
     workgroup_root: Option<PathBuf>,
     node_id: Option<String>,
-    worker_group: Option<mackesd_core::worker_role::WorkerGroup>,
+    worker_group: mackesd_core::worker_role::WorkerGroup,
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
@@ -2514,6 +2513,12 @@ fn run_serve(
     use tokio::sync::RwLock;
     let workgroup_root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
     let node_id = node_id.unwrap_or_else(default_node_id);
+
+    // WL-ARCH-009 — the control group starts the persistent writer below;
+    // migrated canonical mutations cross its typed, bounded local socket.
+    // Direct-SQL residuals retain compatibility and are locked by the authority
+    // inventory until each gains a typed operation; do not claim full exclusivity.
+    mackesd_core::store::writer::configure_serve_process(None)?;
 
     // SUBSTRATE-V2 — fail-loud shared-state assertion. On a deployed node the
     // workgroup root is the plain Syncthing directory at /mnt/mesh-storage; if
@@ -2571,6 +2576,17 @@ fn run_serve(
         tracing::info!("mackesd serve: starting supervisor + workers");
         let shutdown = Arc::new(AtomicBool::new(false));
         install_signal_handlers(Arc::clone(&shutdown)).context("installing signal handlers")?;
+        let sqlite_writer = if worker_group
+            == mackesd_core::worker_role::WorkerGroup::Control
+        {
+            Some(mackesd_core::store::writer::start(
+                &db_path,
+                mackesd_core::store::writer::configured_socket()?,
+                Arc::clone(&shutdown),
+            )?)
+        } else {
+            None
+        };
 
         // HYP-8.5 — load operator tag manifests on startup +
         // publish one Bus event per loaded tag. Fail-open: missing
@@ -2628,10 +2644,8 @@ fn run_serve(
         // a dedicated OS thread inside the worker (so it can't stall the
         // tokio scheduler), but the supervisor owns its restart/breaker.
         let mut sup = Supervisor::new();
-        if let Some(group) = worker_group {
-            tracing::info!(group = %group, "WL-ARCH-009: enforcing one worker process group");
-            sup.set_worker_group(group);
-        }
+        tracing::info!(group = %worker_group, "WL-ARCH-009: enforcing one worker process group");
+        sup.set_worker_group(worker_group);
         // EFF-24 — the live per-worker status registry: the supervisor
         // records alive/restarts/breaker transitions; the Bus healthz
         // folds them into the readiness verdict and the exporter emits
@@ -3272,6 +3286,9 @@ fn run_serve(
                 Err(e) => tracing::warn!(worker = %name, error = ?e, "joined with error"),
             }
         }
+        if let Some(writer) = sqlite_writer {
+            writer.join()?;
+        }
         // mackesd-06 — reconcile is drained by sup.shutdown_and_join() above
         // (it is a supervised worker now, not a standalone JoinHandle to join).
         tracing::info!("mackesd serve: all workers joined; exit");
@@ -3337,6 +3354,26 @@ mod join_cli_role_tests {
             ])
             .as_deref(),
             Some("lighthouse")
+        );
+    }
+}
+
+#[cfg(test)]
+mod serve_process_group_cli_tests {
+    use super::Cli;
+    use clap::{error::ErrorKind, Parser as _};
+
+    #[test]
+    fn serve_without_a_process_group_fails_closed() {
+        let error = match Cli::try_parse_from(["mackesd", "serve"]) {
+            Ok(_) => panic!("the retired all-groups serve mode must be unreachable"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("--group <GROUP>"),
+            "missing-group error must identify the isolation boundary: {rendered}"
         );
     }
 }

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Verify the WL-ARCH-009 mackesd process-boundary packaging contract.
 
-This is a source/package validator, not a runtime substitute.  It deliberately
-fails while the repository only ships the monolithic ``mackesd.service``.  A
-passing result requires the six independently supervised group units and an
-aggregating ``mackesd.target``; it does not create units, start services, or
-claim that process isolation has been proven live.
+This is a source/package validator, not a runtime substitute.  A passing result
+requires the six independently supervised group units and an aggregating
+``mackesd.target``; it does not create units, start services, or claim that
+process isolation has been proven live.
 
 Usage:
   verify-mackesd-process-boundary.py [--repo-root PATH]
@@ -101,24 +100,33 @@ def validate_group(unit: UnitFile, group: str) -> list[str]:
         errors.append(f"{unit.path.name}: require exactly one [Service] ExecStart")
     else:
         tokens = exec_tokens(command_lines[0], unit.path)
-        if len(tokens) < 4 or tokens[0:2] != ["/usr/bin/mackesd", "serve"]:
+        expected = ["/usr/bin/mackesd", "serve", "--group", group]
+        if tokens != expected:
             errors.append(
-                f"{unit.path.name}: ExecStart must invoke '/usr/bin/mackesd serve --group {group}'"
+                f"{unit.path.name}: ExecStart must be exactly '/usr/bin/mackesd serve --group {group}'"
             )
-        elif tokens.count("--group") != 1:
-            errors.append(f"{unit.path.name}: ExecStart must contain exactly one --group")
-        else:
-            index = tokens.index("--group")
-            if index + 1 >= len(tokens) or tokens[index + 1] != group:
-                errors.append(f"{unit.path.name}: ExecStart must bind --group {group}")
-        has_writer = "--sqlite-writer" in tokens
-        if group == "data" and not has_writer:
-            errors.append(f"{unit.path.name}: data is the sole SQLite writer; add --sqlite-writer")
-        if group != "data" and has_writer:
-            errors.append(f"{unit.path.name}: only mackesd-data.service may use --sqlite-writer")
 
     if TARGET not in words(unit, "Unit", "PartOf"):
         errors.append(f"{unit.path.name}: [Unit] PartOf must include {TARGET}")
+    if group != "control":
+        owner = "mackesd-control.service"
+        if owner not in words(unit, "Unit", "Requires"):
+            errors.append(f"{unit.path.name}: [Unit] Requires must include {owner}")
+        if owner not in words(unit, "Unit", "After"):
+            errors.append(f"{unit.path.name}: [Unit] After must include {owner}")
+    required_service_directives = (
+        "Type",
+        "WatchdogSec",
+        "Restart",
+        "MemoryHigh",
+        "MemoryMax",
+        "CPUQuota",
+        "TasksMax",
+        "IOWeight",
+    )
+    for directive in required_service_directives:
+        if not values(unit, "Service", directive):
+            errors.append(f"{unit.path.name}: [Service] requires {directive}")
     return errors
 
 
@@ -136,11 +144,17 @@ def validate_source(repo_root: Path) -> list[str]:
     else:
         try:
             target = read_unit(target_path)
-            required = set(GROUPS)
+            required = {f"mackesd-{group}.service" for group in GROUPS}
             declared = words(target, "Unit", "Requires")
-            missing = {f"mackesd-{group}.service" for group in required} - declared
+            declared_groups = {
+                unit for unit in declared if unit.startswith("mackesd-") and unit.endswith(".service")
+            }
+            missing = required - declared_groups
             if missing:
                 errors.append(f"{TARGET}: [Unit] Requires is missing {', '.join(sorted(missing))}")
+            extra = declared_groups - required
+            if extra:
+                errors.append(f"{TARGET}: [Unit] Requires has unknown groups {', '.join(sorted(extra))}")
             if values(target, "Service", "ExecStart"):
                 errors.append(f"{TARGET}: targets must aggregate units, not run an ExecStart")
             if "multi-user.target" not in words(target, "Install", "WantedBy"):
@@ -158,21 +172,50 @@ def validate_source(repo_root: Path) -> list[str]:
         except ValueError as exc:
             errors.append(str(exc))
 
+    expected_group_files = {f"mackesd-{group}.service" for group in GROUPS}
+    actual_group_files = {path.name for path in unit_dir.glob("mackesd-*.service")}
+    extra_group_files = actual_group_files - expected_group_files
+    if extra_group_files:
+        errors.append(f"unknown grouped unit files: {', '.join(sorted(extra_group_files))}")
+
     monolith_path = unit_dir / MONOLITH
-    if monolith_path.is_file():
-        try:
-            monolith = read_unit(monolith_path)
-            if any(
-                tokens[:2] == ["/usr/bin/mackesd", "serve"]
-                for value in values(monolith, "Service", "ExecStart")
-                for tokens in [exec_tokens(value, monolith_path)]
-            ):
-                errors.append(
-                    "monolithic mackesd.service still starts '/usr/bin/mackesd serve'; "
-                    "remove it from the packaged runtime before declaring ARCH-009 S4 complete"
-                )
-        except ValueError as exc:
-            errors.append(str(exc))
+    if monolith_path.exists():
+        errors.append(
+            "retired mackesd.service still exists; package and enable mackesd.target instead"
+        )
+    return errors
+
+
+def validate_bootc_packaging(repo_root: Path) -> list[str]:
+    """Prove that the immutable-image lane installs and enables the boundary."""
+
+    errors: list[str] = []
+    preset_path = repo_root / "packaging" / "bootc" / "system-preset" / "45-mcnf-quasar.preset"
+    containerfile_path = repo_root / "packaging" / "bootc" / "Containerfile"
+    verifier_path = repo_root / "packaging" / "bootc" / "verify-image.sh"
+    try:
+        preset = preset_path.read_text(encoding="utf-8")
+        containerfile = containerfile_path.read_text(encoding="utf-8")
+        verifier = verifier_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"cannot read bootc package contract: {exc}"]
+
+    if "enable mackesd.target" not in preset.splitlines():
+        errors.append(f"{preset_path.name}: must enable mackesd.target")
+    if "disable mackesd.service" not in preset.splitlines():
+        errors.append(f"{preset_path.name}: must disable retired mackesd.service")
+    if "systemctl enable mackesd.target" not in containerfile:
+        errors.append("bootc Containerfile must enable mackesd.target")
+    if "rm -f /usr/lib/systemd/system/mackesd.service" not in containerfile:
+        errors.append("bootc Containerfile must remove the RPM-installed monolithic unit")
+
+    for name in (TARGET, *(f"mackesd-{group}.service" for group in GROUPS)):
+        copy = f"COPY packaging/systemd/{name} /usr/lib/systemd/system/{name}"
+        if copy not in containerfile:
+            errors.append(f"bootc Containerfile does not install {name}")
+    group_loop = f"for group in {' '.join(GROUPS)}; do"
+    if TARGET not in verifier or group_loop not in verifier or 'unit="mackesd-$group.service"' not in verifier:
+        errors.append("bootc image verifier does not assert the target and exact six group units")
     return errors
 
 
@@ -185,16 +228,27 @@ def write_fixture(root: Path, *, valid: bool = True) -> None:
         encoding="utf-8",
     )
     for group in GROUPS:
-        writer = " --sqlite-writer" if group == "data" else ""
+        owner_order = ""
+        if group != "control":
+            owner_order = (
+                "Requires=mackesd-control.service\n"
+                "After=mackesd-control.service\n"
+            )
         (unit_dir / f"mackesd-{group}.service").write_text(
-            "[Unit]\nPartOf=mackesd.target\n\n[Service]\n"
-            f"ExecStart=/usr/bin/mackesd serve --group {group}{writer}\n",
+            f"[Unit]\nPartOf=mackesd.target\n{owner_order}\n[Service]\n"
+            f"ExecStart=/usr/bin/mackesd serve --group {group}\n"
+            "Type=notify\nWatchdogSec=180\nRestart=on-failure\n"
+            "MemoryHigh=256M\nMemoryMax=512M\nCPUQuota=100%\n"
+            "TasksMax=512\nIOWeight=100\n",
             encoding="utf-8",
         )
     if not valid:
         (unit_dir / "mackesd-data.service").write_text(
             "[Unit]\nPartOf=mackesd.target\n\n[Service]\n"
-            "ExecStart=/usr/bin/mackesd serve --group data\n",
+            "ExecStart=/usr/bin/mackesd serve --group data --sqlite-writer\n"
+            "Type=notify\nWatchdogSec=180\nRestart=on-failure\n"
+            "MemoryHigh=256M\nMemoryMax=512M\nCPUQuota=100%\n"
+            "TasksMax=512\nIOWeight=100\n",
             encoding="utf-8",
         )
 
@@ -208,7 +262,7 @@ def self_test() -> None:
         writer_errors_root = root / "writer-errors"
         write_fixture(writer_errors_root, valid=False)
         writer_errors = validate_source(writer_errors_root)
-        assert any("sole SQLite writer" in error for error in writer_errors), writer_errors
+        assert any("must be exactly" in error for error in writer_errors), writer_errors
 
         source_like_root = root / "source-like"
         source_units = source_like_root / "packaging" / "systemd"
@@ -218,7 +272,7 @@ def self_test() -> None:
         )
         source_errors = validate_source(source_like_root)
         assert any("missing mackesd.target" in error for error in source_errors), source_errors
-        assert any("monolithic mackesd.service" in error for error in source_errors), source_errors
+        assert any("retired mackesd.service" in error for error in source_errors), source_errors
 
     print("verify-mackesd-process-boundary.py: self-test passed")
 
@@ -240,6 +294,7 @@ def main(argv: list[str]) -> int:
         return 0
     root = (args.repo_root or Path(__file__).resolve().parent.parent).resolve()
     errors = validate_source(root)
+    errors.extend(validate_bootc_packaging(root))
     if errors:
         print("mackesd process boundary: FAIL", file=sys.stderr)
         for error in errors:

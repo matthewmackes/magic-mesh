@@ -357,6 +357,16 @@ struct Shared {
     /// audible queue index is `play_base + current_track_index()`. The serve
     /// loop's auto-advance driver reads this to move the persisted queue cursor.
     play_base: AtomicUsize,
+    /// Set by cpal's asynchronous stream-error callback. Once the physical
+    /// renderer is gone this engine must never continue claiming playback;
+    /// the daemon drops it and acquires a fresh default device.
+    renderer_failed: AtomicBool,
+    /// Snapshot captured by the stream-error callback before authority is
+    /// revoked. Only finite, actively playing media is eligible for automatic
+    /// continuation on a replacement renderer.
+    renderer_interrupted_playing: AtomicBool,
+    renderer_interrupted_seekable: AtomicBool,
+    renderer_interrupted_position_ms: AtomicU64,
 }
 
 impl Shared {
@@ -486,6 +496,10 @@ impl Engine {
             device_channels,
             target_ring,
             play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
         });
 
         let stream = match sample_format {
@@ -565,7 +579,7 @@ impl EngineHandle {
         initial_position_ms: Option<u64>,
     ) -> bool {
         self.stop();
-        if tracks.is_empty() {
+        if tracks.is_empty() || self.shared.renderer_failed.load(Ordering::Acquire) {
             return false;
         }
         self.shared.stop.store(false, Ordering::Relaxed);
@@ -673,7 +687,9 @@ impl EngineHandle {
 
     /// Resume after a [`pause`](Engine::pause).
     pub fn resume(&self) {
-        self.shared.playing.store(true, Ordering::Relaxed);
+        if !self.shared.renderer_failed.load(Ordering::Acquire) {
+            self.shared.playing.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Stop playback: signal + join the decode thread and clear the ring.
@@ -785,6 +801,35 @@ impl EngineHandle {
                 .is_empty()
     }
 
+    /// Whether the physical output stream is still usable. cpal reports
+    /// renderer loss asynchronously, so the owning daemon polls this cheap
+    /// signal and replaces the complete engine instead of retaining a silent,
+    /// failed stream.
+    #[must_use]
+    pub fn is_renderer_healthy(&self) -> bool {
+        !self.shared.renderer_failed.load(Ordering::Acquire)
+    }
+
+    /// Audible position captured when the physical renderer failed. Live
+    /// streams and idle/paused engines return `None`: restarting either would
+    /// invent continuity the daemon cannot prove.
+    #[must_use]
+    pub fn interrupted_position_ms(&self) -> Option<u64> {
+        (self
+            .shared
+            .renderer_interrupted_playing
+            .load(Ordering::Acquire)
+            && self
+                .shared
+                .renderer_interrupted_seekable
+                .load(Ordering::Acquire))
+        .then(|| {
+            self.shared
+                .renderer_interrupted_position_ms
+                .load(Ordering::Acquire)
+        })
+    }
+
     /// Is the current track within [`GAPLESS_LEAD_MS`] of its end? The
     /// signal the queue driver (AIR-2.c) uses to resolve the next track.
     #[must_use]
@@ -814,6 +859,7 @@ where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     let channels = shared.device_channels.max(1) as usize;
+    let error_shared = shared.clone();
     device.build_output_stream(
         config,
         move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
@@ -839,9 +885,46 @@ where
                 .frames_played
                 .fetch_add((real / channels) as u64, Ordering::Relaxed);
         },
-        |err| tracing::warn!(error = %err, "audio stream error"),
+        {
+            move |err| {
+                tracing::warn!(error = %err, "physical audio renderer failed; daemon will reacquire output");
+                mark_renderer_failed(&error_shared);
+            }
+        },
         None,
     )
+}
+
+/// Revoke playback authority immediately after an asynchronous renderer loss.
+/// Clearing buffered samples is intentional: they were counted as decoded but
+/// can no longer be proven audible, and must not leak into a replacement device
+/// as stale output.
+fn mark_renderer_failed(shared: &Shared) {
+    let interrupted_playing = shared.playing.load(Ordering::Acquire);
+    let interrupted_seekable = shared.seekable.load(Ordering::Acquire);
+    let interrupted_position_ms = shared.position_ms();
+    shared
+        .renderer_interrupted_position_ms
+        .store(interrupted_position_ms, Ordering::Release);
+    shared
+        .renderer_interrupted_seekable
+        .store(interrupted_seekable, Ordering::Release);
+    shared
+        .renderer_interrupted_playing
+        .store(interrupted_playing, Ordering::Release);
+    shared.renderer_failed.store(true, Ordering::Release);
+    shared.stop.store(true, Ordering::Relaxed);
+    shared.playing.store(false, Ordering::Relaxed);
+    shared.seekable.store(false, Ordering::Relaxed);
+    shared
+        .ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    shared.frames_enqueued.store(
+        shared.frames_played.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
 }
 
 /// MUSIC-RFX-2 — apply a pending seek (if any) to a seekable `format`. Consumes
@@ -929,8 +1012,11 @@ fn decode_track_at(
             &request_url,
             resume_ms.map(|_| Duration::from_secs(RECONNECT_REQUEST_TIMEOUT_SECS)),
         )
-        .and_then(|response| response.error_for_status().map_err(|error| error.to_string()))
-        {
+        .and_then(|response| {
+            response
+                .error_for_status()
+                .map_err(|error| error.to_string())
+        }) {
             Ok(resp) => {
                 // AIR — radio/live streams are infinite (no Content-Length / chunked), so
                 // buffering the whole body with `.bytes()` never returns → "error decoding
@@ -1341,6 +1427,64 @@ mod tests {
     }
 
     #[test]
+    fn renderer_failure_revokes_authority_and_refuses_stale_restart() {
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::from([0.75, -0.75, 0.5, -0.5])),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            frames_played: AtomicU64::new(2),
+            frames_enqueued: AtomicU64::new(4),
+            track_starts: Mutex::new(vec![0]),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(true),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
+        });
+        let handle = EngineHandle {
+            shared: shared.clone(),
+            decode: Arc::new(Mutex::new(None)),
+        };
+
+        mark_renderer_failed(&shared);
+
+        assert!(!handle.is_renderer_healthy());
+        assert!(!handle.is_playing(), "failed output must yield ownership");
+        assert!(!handle.is_seekable());
+        assert!(
+            shared
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "samples not proven audible must be discarded"
+        );
+        assert_eq!(shared.frames_enqueued.load(Ordering::Relaxed), 2);
+
+        handle.resume();
+        assert!(
+            !handle.is_playing(),
+            "a stale handle cannot reclaim playback"
+        );
+        assert!(!handle.play_from_candidates_at(
+            vec![PlaybackTrack::single(
+                "https://provider.invalid/stale.mp3".to_string(),
+                SourceCodec::Mp3,
+            )],
+            0,
+            0,
+        ));
+        assert!(!handle.is_playing());
+    }
+
+    #[test]
     fn track_at_frame_maps_the_playhead_to_a_gapless_track() {
         // AIR-2.c — three tracks starting at frames 0, 100, 250 in the
         // continuous output stream.
@@ -1431,16 +1575,18 @@ mod tests {
             let mut request = [0_u8; 2048];
             let _ = stream.read(&mut request);
             stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
                 .expect("write stalled headers");
             thread::sleep(Duration::from_millis(250));
         });
 
         let url = format!("http://127.0.0.1:{}/rest/stream?id=song-7", address.port());
         let result = fetch_stream_response(&url, Some(Duration::from_millis(50)))
-            .and_then(|response| response.error_for_status().map_err(|error| error.to_string()))
+            .and_then(|response| {
+                response
+                    .error_for_status()
+                    .map_err(|error| error.to_string())
+            })
             .and_then(|mut response| {
                 let mut body = Vec::new();
                 response
@@ -1449,7 +1595,10 @@ mod tests {
                     .map_err(|error| error.to_string())
             });
 
-        assert!(result.is_err(), "a stalled resumed body must fail boundedly");
+        assert!(
+            result.is_err(),
+            "a stalled resumed body must fail boundedly"
+        );
         server.join().expect("stalled provider completed");
     }
 
@@ -1479,6 +1628,10 @@ mod tests {
             device_channels: 2,
             target_ring: 96_000,
             play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
         });
 
         assert!(!reconnect_after_loss(
@@ -1533,6 +1686,10 @@ mod tests {
             device_channels: 2,
             target_ring: 96_000,
             play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
         });
         let handle = EngineHandle {
             shared: shared.clone(),
@@ -1557,8 +1714,14 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(shared.decode_done.load(Ordering::Relaxed));
-        assert!(!handle.is_playing(), "failed provider must not retain ownership");
-        assert!(!handle.is_active(), "failed provider must leave no active audio");
+        assert!(
+            !handle.is_playing(),
+            "failed provider must not retain ownership"
+        );
+        assert!(
+            !handle.is_active(),
+            "failed provider must leave no active audio"
+        );
 
         handle.stop();
         server.join().expect("failed provider fixture completed");
@@ -1692,6 +1855,10 @@ mod tests {
             device_channels: 2,
             target_ring: 1_000_000,
             play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
         });
         let handle = EngineHandle {
             shared: shared.clone(),
@@ -1851,6 +2018,10 @@ mod tests {
             device_channels: 2,
             target_ring: 1_000_000,
             play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
         });
         shared.begin_track();
 
@@ -1970,6 +2141,10 @@ mod tests {
             device_channels: 2,
             target_ring: 1_000_000,
             play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
         });
         let handle = EngineHandle {
             shared: shared.clone(),

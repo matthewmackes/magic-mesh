@@ -171,7 +171,7 @@ pub struct VdiSession {
 /// arch-2 (2026-07-11) — the type itself now lives in
 /// [`mackes_mesh_types::vdi_session`] so the shell's `discovery` / `session_rail`
 /// mirrors reuse it instead of maintaining byte-compatible copies; it's re-exported
-/// here so existing `session_broker::SessionRequest` paths (and `console_broker`,
+/// here so existing `session_broker::SessionRequest` paths
 /// `onboard::first_desktop`) keep resolving unchanged. The wire shape is
 /// byte-identical: the broker's [`SessionId`] / [`NodeId`] / [`VmId`] are all
 /// `= String` aliases, so the shared `String`-typed fields serialise the same.

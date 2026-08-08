@@ -91,9 +91,7 @@ pub fn status_retry_jitter(node_id: &str) -> Duration {
 /// Return the next bounded retry delay for a rejected supervisor sample.
 #[must_use]
 pub fn next_status_failure_retry(current: Duration) -> Duration {
-    current
-        .saturating_mul(2)
-        .min(STATUS_FAILURE_RETRY_MAX)
+    current.saturating_mul(2).min(STATUS_FAILURE_RETRY_MAX)
 }
 
 /// One canonical retained lane written by a status publication.

@@ -1030,12 +1030,10 @@ mod tests {
 
         w.tick_once(&persist, &mut st, 1, 100_000);
         assert_eq!(count_topic_msgs(&persist, "event/notify/node-grade"), 0);
-        assert!(
-            persist
-                .list_since(&NotifySegment::Alerts.topic(), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(persist
+            .list_since(&NotifySegment::Alerts.topic(), None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 import hashlib
-import ipaddress
 from io import StringIO
 import json
 import math
@@ -49,10 +48,8 @@ DEFAULT_BUS_ROOT = Path("/run/mde-bus")
 OVERLAY_PREFIX = "state/overlay/"
 AIRSPACE_PREFIX = "state/airspace/"
 VEHICLE_PREFIX = "state/vehicle/"
-VDI_CONSOLE_TOPIC = "state/vdi/console"
 VDI_SESSION_TOPIC = "action/vdi/session"
 MAX_TOPIC_SCAN_ROWS = 256
-ALLOWED_VDI_PROTOCOLS = frozenset({"rdp", "vnc", "spice"})
 ALLOWED_OVERLAY_LICENSE_TIERS = frozenset(
     {
         # Locked zero-cost overlay catalog tiers. Keep this list in sync with the
@@ -656,131 +653,6 @@ def _indexed_age_check(row: dict[str, Any], now_ms: int, max_age_ms: int) -> tup
     return max(age, 0), errors
 
 
-def _host_is_not_remote_endpoint(host: str) -> bool:
-    normalized = host.strip().strip("[]").lower()
-    if normalized in {"", "localhost", "0.0.0.0", "::", "::1"}:
-        return True
-    try:
-        ip = ipaddress.ip_address(normalized)
-    except ValueError:
-        return False
-    return ip.is_loopback or ip.is_unspecified
-
-
-def validate_vdi_console(
-    bus_root: Path,
-    session_id: str,
-    now_ms: int,
-    max_age_ms: int,
-    require_brokered: bool,
-    expected_protocol: str | None = None,
-    expected_serving_node: str | None = None,
-    expected_vm_id: str | None = None,
-) -> dict[str, Any]:
-    rows = _read_topic_rows(bus_root, VDI_CONSOLE_TOPIC, MAX_TOPIC_SCAN_ROWS)
-    selected: tuple[dict[str, Any], dict[str, Any], dict[str, Any], str] | None = None
-    for row, envelope, payload, digest in rows:
-        if payload.get("session_id") == session_id:
-            selected = (row, envelope, payload, digest)
-            break
-    if selected is None:
-        raise MirrorError(
-            f"no {VDI_CONSOLE_TOPIC} record for session {session_id!r} "
-            f"in newest {MAX_TOPIC_SCAN_ROWS} rows"
-        )
-    row, _envelope, payload, digest = selected
-    result = _base_result(VDI_CONSOLE_TOPIC, row, payload, digest)
-    errors: list[str] = []
-    age_ms, age_errors = _indexed_age_check(row, now_ms, max_age_ms)
-    errors.extend(age_errors)
-
-    payload_session = payload.get("session_id")
-    serving_node = payload.get("serving_node")
-    vm_id = payload.get("vm_id")
-    if payload_session != session_id:
-        errors.append(f"payload session_id {payload_session!r} does not match {session_id!r}")
-    if not isinstance(serving_node, str) or not serving_node:
-        errors.append("serving_node is missing or not a non-empty string")
-    elif expected_serving_node is not None and serving_node != expected_serving_node:
-        errors.append(f"serving_node {serving_node!r} does not match {expected_serving_node!r}")
-    if not isinstance(vm_id, str) or not vm_id:
-        errors.append("vm_id is missing or not a non-empty string")
-    elif expected_vm_id is not None and vm_id != expected_vm_id:
-        errors.append(f"vm_id {vm_id!r} does not match {expected_vm_id!r}")
-
-    status = payload.get("status")
-    status_state: str | None = None
-    protocol: str | None = None
-    endpoint_host: str | None = None
-    endpoint_port: int | None = None
-    reason: str | None = None
-    if not isinstance(status, dict):
-        errors.append("status object missing")
-        status = {}
-    raw_state = status.get("state")
-    if isinstance(raw_state, str):
-        status_state = raw_state
-    else:
-        errors.append("status.state is missing or not a string")
-
-    if status_state == "brokered":
-        raw_protocol = status.get("protocol")
-        if isinstance(raw_protocol, str):
-            protocol = raw_protocol
-            if protocol not in ALLOWED_VDI_PROTOCOLS:
-                errors.append(f"protocol {protocol!r} is not one of {sorted(ALLOWED_VDI_PROTOCOLS)}")
-            if expected_protocol is not None and protocol != expected_protocol:
-                errors.append(f"protocol {protocol!r} does not match {expected_protocol!r}")
-        else:
-            errors.append("brokered status is missing protocol")
-        raw_host = status.get("host")
-        if isinstance(raw_host, str) and raw_host.strip():
-            endpoint_host = raw_host
-            if _host_is_not_remote_endpoint(raw_host):
-                errors.append(
-                    f"brokered endpoint host {raw_host!r} is not a remote-reachable mesh endpoint"
-                )
-        else:
-            errors.append("brokered status is missing a non-empty host")
-        raw_port = status.get("port")
-        if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
-            endpoint_port = raw_port
-        else:
-            errors.append("brokered status port is not a TCP port")
-    elif status_state == "unbrokerable":
-        raw_reason = status.get("reason")
-        if isinstance(raw_reason, str) and raw_reason.strip():
-            reason = raw_reason
-        else:
-            errors.append("unbrokerable status is missing a non-empty reason")
-        if require_brokered:
-            errors.append(f"VDI console is unbrokerable: {reason or 'no reason'}")
-    else:
-        if status_state is not None:
-            errors.append(f"unknown status.state {status_state!r}")
-        if require_brokered:
-            errors.append("VDI console is not brokered")
-
-    result.update(
-        {
-            "kind": "vdi_console",
-            "age_ms": age_ms,
-            "fresh": not age_errors,
-            "session_id": payload_session,
-            "serving_node": serving_node,
-            "vm_id": vm_id,
-            "status": status_state,
-            "brokered": status_state == "brokered",
-            "protocol": protocol,
-            "endpoint_host": endpoint_host,
-            "endpoint_port": endpoint_port,
-            "reason": reason,
-            "errors": errors,
-        }
-    )
-    return result
-
-
 def validate_vdi_session_rail(
     bus_root: Path,
     session_id: str,
@@ -1068,51 +940,27 @@ def run(args: argparse.Namespace) -> int:
             result = {"kind": "airspace", "topic": f"{AIRSPACE_PREFIX}{node}", "errors": [str(exc)]}
         results.append(result)
         failures.extend(result.get("errors", []))
-    if args.vdi_console_session:
-        console_result: dict[str, Any] | None = None
+    if args.vdi_session:
         try:
-            console_result = validate_vdi_console(
+            rail_result = validate_vdi_session_rail(
                 root,
-                args.vdi_console_session,
+                args.vdi_session,
                 now_ms,
                 max_age_ms,
-                args.require_vdi_brokered,
-                args.expected_vdi_protocol,
+                args.require_vdi_status_rail or args.require_vdi_status_rail_live,
+                args.require_vdi_status_rail_live,
                 args.expected_vdi_serving_node,
                 args.expected_vdi_vm,
+                args.expected_vdi_client_peer,
             )
         except MirrorError as exc:
-            console_result = {"kind": "vdi_console", "topic": VDI_CONSOLE_TOPIC, "errors": [str(exc)]}
-        result = console_result
-        results.append(result)
-        failures.extend(result.get("errors", []))
-        if args.require_vdi_status_rail or args.require_vdi_status_rail_live or args.expected_vdi_client_peer:
-            expected_serving_node = args.expected_vdi_serving_node
-            expected_vm_id = args.expected_vdi_vm
-            if expected_serving_node is None and isinstance(console_result.get("serving_node"), str):
-                expected_serving_node = console_result["serving_node"]
-            if expected_vm_id is None and isinstance(console_result.get("vm_id"), str):
-                expected_vm_id = console_result["vm_id"]
-            try:
-                rail_result = validate_vdi_session_rail(
-                    root,
-                    args.vdi_console_session,
-                    now_ms,
-                    max_age_ms,
-                    args.require_vdi_status_rail or args.require_vdi_status_rail_live,
-                    args.require_vdi_status_rail_live,
-                    expected_serving_node,
-                    expected_vm_id,
-                    args.expected_vdi_client_peer,
-                )
-            except MirrorError as exc:
-                rail_result = {
-                    "kind": "vdi_status_rail",
-                    "topic": VDI_SESSION_TOPIC,
-                    "errors": [str(exc)],
-                }
-            results.append(rail_result)
-            failures.extend(rail_result.get("errors", []))
+            rail_result = {
+                "kind": "vdi_status_rail",
+                "topic": VDI_SESSION_TOPIC,
+                "errors": [str(exc)],
+            }
+        results.append(rail_result)
+        failures.extend(rail_result.get("errors", []))
     report = {
         "observed_at_ms": now_ms,
         "bus_root": str(root.resolve()) if root.exists() else str(root),
@@ -1280,21 +1128,6 @@ def _self_test() -> None:
             },
         )
         add(
-            "01J00000000000000000000005",
-            VDI_CONSOLE_TOPIC,
-            {
-                "session_id": "vdi-1-win11",
-                "serving_node": "peer:oak",
-                "vm_id": "win11",
-                "status": {
-                    "state": "brokered",
-                    "protocol": "spice",
-                    "host": "10.42.0.7",
-                    "port": 5900,
-                },
-            },
-        )
-        add(
             "01J00000000000000000000009",
             VDI_SESSION_TOPIC,
             {
@@ -1318,19 +1151,6 @@ def _self_test() -> None:
             },
         )
         add(
-            "01J00000000000000000000006",
-            VDI_CONSOLE_TOPIC,
-            {
-                "session_id": "vdi-2-off",
-                "serving_node": "peer:oak",
-                "vm_id": "off",
-                "status": {
-                    "state": "unbrokerable",
-                    "reason": "unresolved: VM is shut off",
-                },
-            },
-        )
-        add(
             "01J00000000000000000000011",
             VDI_SESSION_TOPIC,
             {
@@ -1341,21 +1161,6 @@ def _self_test() -> None:
                 "serving_peer": "peer:oak",
                 "vm_id": "off",
                 "client_peer": "seat-15",
-            },
-        )
-        add(
-            "01J00000000000000000000007",
-            VDI_CONSOLE_TOPIC,
-            {
-                "session_id": "vdi-3-loopback",
-                "serving_node": "peer:oak",
-                "vm_id": "bad",
-                "status": {
-                    "state": "brokered",
-                    "protocol": "spice",
-                    "host": "127.0.0.1",
-                    "port": 5900,
-                },
             },
         )
         add_catalog_node(
@@ -1527,18 +1332,6 @@ def _self_test() -> None:
         airspace = validate_airspace(root, "test-node", now_ms, 30_000, True, True)
         assert not airspace["errors"], airspace
         assert airspace["ready"] is True and airspace["scanner_fresh"] is True, airspace
-        vdi = validate_vdi_console(
-            root,
-            "vdi-1-win11",
-            now_ms,
-            30_000,
-            True,
-            "spice",
-            "peer:oak",
-            "win11",
-        )
-        assert not vdi["errors"], vdi
-        assert vdi["brokered"] is True and vdi["endpoint_port"] == 5900, vdi
         rail = validate_vdi_session_rail(
             root,
             "vdi-1-win11",
@@ -1552,11 +1345,6 @@ def _self_test() -> None:
         )
         assert not rail["errors"], rail
         assert rail["active"] is True and rail["rail_badge"] == "LIVE", rail
-        unbrokerable = validate_vdi_console(
-            root, "vdi-2-off", now_ms, 30_000, False
-        )
-        assert not unbrokerable["errors"], unbrokerable
-        assert unbrokerable["status"] == "unbrokerable", unbrokerable
         requested_rail = validate_vdi_session_rail(
             root,
             "vdi-2-off",
@@ -1571,14 +1359,6 @@ def _self_test() -> None:
         assert requested_rail["visible_in_status_rail"] is True, requested_rail
         assert requested_rail["rail_badge"] == "VDI", requested_rail
         assert any("not LIVE" in error for error in requested_rail["errors"]), requested_rail
-        required_vdi = validate_vdi_console(
-            root, "vdi-2-off", now_ms, 30_000, True
-        )
-        assert any("unbrokerable" in error for error in required_vdi["errors"]), required_vdi
-        loopback_vdi = validate_vdi_console(
-            root, "vdi-3-loopback", now_ms, 30_000, True
-        )
-        assert any("remote-reachable" in error for error in loopback_vdi["errors"]), loopback_vdi
         missing_host_payload = {
             "fetched_at_ms": now_ms - 10_000,
             "events": [],
@@ -1646,7 +1426,7 @@ def _self_test() -> None:
             catalog_overlay_node=[],
             overlay=["state/overlay/usgs-earthquakes/test-node"],
             airspace_node=["test-node"],
-            vdi_console_session="vdi-1-win11",
+            vdi_session="vdi-1-win11",
             require_online=True,
             require_fix=False,
             expected_model="MG90",
@@ -1657,10 +1437,8 @@ def _self_test() -> None:
             require_same_host=True,
             require_airspace_ready=True,
             require_airspace_contacts=True,
-            require_vdi_brokered=True,
             require_vdi_status_rail=True,
             require_vdi_status_rail_live=True,
-            expected_vdi_protocol="spice",
             expected_vdi_serving_node="peer:oak",
             expected_vdi_vm="win11",
             expected_vdi_client_peer="seat-15",
@@ -1846,19 +1624,9 @@ def main(argv: list[str] | None = None) -> int:
         help="require state/airspace/<node> to retain at least one contact",
     )
     parser.add_argument(
-        "--vdi-console-session",
+        "--vdi-session",
         metavar="SESSION_ID",
-        help=f"validate a retained brokered-console record on {VDI_CONSOLE_TOPIC}",
-    )
-    parser.add_argument(
-        "--require-vdi-brokered",
-        action="store_true",
-        help="require the VDI console record to carry a remote-reachable brokered endpoint",
-    )
-    parser.add_argument(
-        "--expected-vdi-protocol",
-        choices=sorted(ALLOWED_VDI_PROTOCOLS),
-        help="require the brokered VDI console protocol",
+        help=f"validate a retained session lifecycle on {VDI_SESSION_TOPIC}",
     )
     parser.add_argument("--expected-vdi-serving-node")
     parser.add_argument("--expected-vdi-vm")
@@ -1894,11 +1662,11 @@ def main(argv: list[str] | None = None) -> int:
         and not args.overlay
         and not args.catalog_overlay_node
         and not args.airspace_node
-        and not args.vdi_console_session
+        and not args.vdi_session
     ):
         parser.error(
             "provide --vehicle-node, --overlay, --catalog-overlay-node, --airspace-node, "
-            "--vdi-console-session, or --self-test"
+            "--vdi-session, or --self-test"
         )
     if args.require_same_host and not args.vehicle_node:
         parser.error("--require-same-host requires --vehicle-node")
@@ -1913,16 +1681,14 @@ def main(argv: list[str] | None = None) -> int:
     if (args.require_airspace_ready or args.require_airspace_contacts) and not args.airspace_node:
         parser.error("airspace expectations require --airspace-node")
     vdi_args = (
-        args.require_vdi_brokered,
         args.require_vdi_status_rail,
         args.require_vdi_status_rail_live,
-        args.expected_vdi_protocol,
         args.expected_vdi_serving_node,
         args.expected_vdi_vm,
         args.expected_vdi_client_peer,
     )
-    if any(vdi_args) and not args.vdi_console_session:
-        parser.error("VDI console expectations require --vdi-console-session")
+    if any(vdi_args) and not args.vdi_session:
+        parser.error("VDI session expectations require --vdi-session")
     if args.max_age_seconds < 0:
         parser.error("--max-age-seconds must be non-negative")
     return run(args)

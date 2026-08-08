@@ -39,8 +39,7 @@ fn initial_phase_for(host: &str, cap: Duration) -> Duration {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     Duration::from_millis(
-        (hash % (MAX_INITIAL_PHASE.as_millis() as u64 + 1))
-            .min(cap.as_millis() as u64),
+        (hash % (MAX_INITIAL_PHASE.as_millis() as u64 + 1)).min(cap.as_millis() as u64),
     )
 }
 
@@ -953,7 +952,9 @@ END_BT_INQUIRY RC=0
         let phase = initial_phase_for("seat-15", POLL);
         assert_eq!(phase, initial_phase_for("seat-15", POLL));
         assert!(phase <= MAX_INITIAL_PHASE);
-        assert!(initial_phase_for("seat-15", Duration::from_millis(10)) <= Duration::from_millis(10));
+        assert!(
+            initial_phase_for("seat-15", Duration::from_millis(10)) <= Duration::from_millis(10)
+        );
         assert_ne!(phase, initial_phase_for("dell-laptop", POLL));
     }
 

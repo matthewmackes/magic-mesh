@@ -80,12 +80,22 @@ grep -q '^OnFailure=getty@tty1.service$' /usr/lib/systemd/system/mde-shell-egui.
     || bad "seat unit still has unconditional ExecStopPost recovery"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
-for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \
+for u in mde-shell-egui.service podman.socket mackesd.target nebula.service \
          magic-setup.service mesh-health.timer \
          cloud-init-local.service cloud-init.service cloud-config.service \
          cloud-final.service qemu-guest-agent.service openvswitch.service; do
     state="$(systemctl is-enabled "$u" 2>/dev/null || true)"
     [ "$state" = enabled ] && ok "enabled: $u" || bad "$u is '$state' (want enabled)"
+done
+[ ! -e /usr/lib/systemd/system/mackesd.service ] \
+    && ok "retired monolithic mackesd.service is absent" \
+    || bad "retired monolithic mackesd.service remains installed"
+for group in control observation actions data compute integrations; do
+    unit="mackesd-$group.service"
+    [ -f "/usr/lib/systemd/system/$unit" ] \
+        && ok "group unit installed: $unit" || bad "group unit missing: $unit"
+    grep -q "^ExecStart=/usr/bin/mackesd serve --group $group$" "/usr/lib/systemd/system/$unit" 2>/dev/null \
+        && ok "group command pinned: $unit" || bad "group command invalid: $unit"
 done
 [ "$(systemctl get-default 2>/dev/null)" = graphical.target ] \
     && ok "default target = graphical" || bad "default target != graphical"

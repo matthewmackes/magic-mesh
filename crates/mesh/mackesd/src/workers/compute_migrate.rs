@@ -3,8 +3,8 @@
 //! Each peer drains the single `action/compute/migrate` Bus topic.
 //! For each request where `source_peer == own_nebula_ip`, the worker:
 //!
-//! 1. `virsh shutdown <vm_id>` (graceful ACPI shutdown).
-//! 2. Polls `virsh domstate <vm_id>` every 2 s until `shut off` or
+//! 1. Requests graceful ACPI shutdown through the Workload migration adapter.
+//! 2. Polls that adapter every 2 s until the domain is stopped or
 //!    120 s timeout.
 //! 3. `rsync --compress --progress <disk_path> <target>:<target_dir>`
 //!    over the Nebula overlay.
@@ -14,7 +14,7 @@
 //!    DEFINED-BUT-SHUTOFF as a rollback anchor.
 //! 5. Waits for the target's `event/compute/migrate-committed` ack
 //!    (correlated by request ULID, bounded by
-//!    [`DEFAULT_COMMIT_TIMEOUT`]) and only THEN `virsh undefine`s the
+//!    [`DEFAULT_COMMIT_TIMEOUT`]) and only THEN asks the adapter to relinquish the
 //!    source-side definition. On a `migrate-failed` event or a commit
 //!    timeout the source instead RE-DEFINES + re-starts the retained
 //!    domain XML (rollback), so a failed migration never loses the VM
@@ -54,6 +54,7 @@ use crate::ipc::action_auth::{
     MAX_AUTH_TTL_MS,
 };
 
+use super::workload_compute::{WorkloadActuatorError, WorkloadMigrationClient};
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains.
@@ -257,8 +258,42 @@ pub enum MigrationOutcome {
         /// Description of the rsync failure.
         exit_description: String,
     },
-    /// `virsh` shell-out couldn't be spawned (binary missing).
-    VirshUnavailable,
+    /// The sole Workload migration adapter refused or could not complete a
+    /// definition/power operation.
+    AuthorityFailure {
+        /// Bounded adapter failure description.
+        reason: String,
+    },
+}
+
+trait MigrationAuthority: Send + Sync {
+    fn capture_definition(&self, vm_id: &str) -> Result<String, WorkloadActuatorError>;
+    fn request_stop(&self, vm_id: &str) -> Result<(), WorkloadActuatorError>;
+    fn is_stopped(&self, vm_id: &str) -> Result<bool, WorkloadActuatorError>;
+    fn define_and_start(&self, vm_id: &str, domain_xml: &str) -> Result<(), WorkloadActuatorError>;
+    fn relinquish_definition(&self, vm_id: &str) -> Result<(), WorkloadActuatorError>;
+}
+
+impl MigrationAuthority for WorkloadMigrationClient {
+    fn capture_definition(&self, vm_id: &str) -> Result<String, WorkloadActuatorError> {
+        (*self).capture_definition(vm_id)
+    }
+
+    fn request_stop(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        (*self).request_stop(vm_id)
+    }
+
+    fn is_stopped(&self, vm_id: &str) -> Result<bool, WorkloadActuatorError> {
+        (*self).is_stopped(vm_id)
+    }
+
+    fn define_and_start(&self, vm_id: &str, domain_xml: &str) -> Result<(), WorkloadActuatorError> {
+        (*self).define_and_start(vm_id, domain_xml)
+    }
+
+    fn relinquish_definition(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        (*self).relinquish_definition(vm_id)
+    }
 }
 
 /// Parse a migration-request body.
@@ -346,46 +381,6 @@ pub fn is_source_peer(req: &MigrateRequest, own_nebula_ip: &str) -> bool {
     !own_nebula_ip.is_empty() && req.source_peer == own_nebula_ip
 }
 
-/// Build the args for `virsh shutdown <vm_id>`.
-#[must_use]
-pub fn build_virsh_shutdown_args(vm_id: &str) -> Vec<String> {
-    vec!["shutdown".into(), vm_id.into()]
-}
-
-/// Build the args for `virsh domstate <vm_id>`.
-#[must_use]
-pub fn build_virsh_domstate_args(vm_id: &str) -> Vec<String> {
-    vec!["domstate".into(), vm_id.into()]
-}
-
-/// Build the args for `virsh undefine <vm_id>`.
-#[must_use]
-pub fn build_virsh_undefine_args(vm_id: &str) -> Vec<String> {
-    vec!["undefine".into(), vm_id.into()]
-}
-
-/// Build the args for `virsh dumpxml <vm_id>` (source side captures
-/// the domain definition before shutdown so the target can recreate
-/// it verbatim).
-#[must_use]
-pub fn build_virsh_dumpxml_args(vm_id: &str) -> Vec<String> {
-    vec!["dumpxml".into(), vm_id.into()]
-}
-
-/// Build the args for `virsh define <xml_path>` (target side defines
-/// the migrated VM from the captured XML).
-#[must_use]
-pub fn build_virsh_define_args(xml_path: &str) -> Vec<String> {
-    vec!["define".into(), xml_path.into()]
-}
-
-/// Build the args for `virsh start <vm_id>` (target side boots the
-/// migrated VM).
-#[must_use]
-pub fn build_virsh_start_args(vm_id: &str) -> Vec<String> {
-    vec!["start".into(), vm_id.into()]
-}
-
 /// `true` when this peer is the target for a migrate-ready event.
 #[must_use]
 pub fn is_target_peer(event: &MigrateReadyEvent, own_nebula_ip: &str) -> bool {
@@ -399,26 +394,6 @@ pub fn is_target_peer(event: &MigrateReadyEvent, own_nebula_ip: &str) -> bool {
 /// Returns a human-readable error on malformed JSON.
 pub fn parse_migrate_ready_event(body: &str) -> Result<MigrateReadyEvent, String> {
     serde_json::from_str(body).map_err(|e| format!("malformed migrate-ready event: {e}"))
-}
-
-/// Parse `virsh domstate <vm>` output into a trimmed state token
-/// (`"running"`, `"shut off"`, `"paused"`, ...). Returns `None`
-/// when stdout is empty.
-#[must_use]
-pub fn parse_virsh_domstate(stdout: &str) -> Option<String> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-/// `true` when the state token indicates the guest has reached
-/// the ACPI-shutdown end state.
-#[must_use]
-pub fn is_shutoff(state: &str) -> bool {
-    state.eq_ignore_ascii_case("shut off")
 }
 
 /// Build the `rsync --compress` args for shipping a disk from the
@@ -534,47 +509,6 @@ pub fn classify_commit(
     CommitResolution::Pending
 }
 
-/// Pure waiter: take a state-observer closure, poll until the
-/// observer returns "shut off" (any case) or the deadline passes.
-/// Returns `true` on shutoff, `false` on timeout.
-///
-/// `poll_interval` is the inter-observation sleep; `attempts` is the
-/// hard cap so tests can drive deterministic behavior without
-/// wall-clock waits.
-pub fn wait_for_shutoff<F>(mut observer: F, attempts: usize) -> bool
-where
-    F: FnMut() -> Option<String>,
-{
-    for _ in 0..attempts {
-        if let Some(state) = observer() {
-            if is_shutoff(&state) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn binary_present(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().is_ok()
-}
-
-fn run_virsh(args: &[String]) -> Option<String> {
-    let output = Command::new("virsh").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn run_virsh_status(args: &[String]) -> bool {
-    Command::new("virsh")
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn run_rsync(args: &[String]) -> Result<(), String> {
     let mut cmd = Command::new("rsync");
     cmd.args(args);
@@ -614,33 +548,48 @@ fn local_nebula_addr(interface: &str) -> String {
 }
 
 /// Drive the source-side migration flow for one request. Returns the
-/// terminal outcome. Subprocess shell-outs are real (virsh + rsync);
-/// the timeout uses [`DEFAULT_SHUTDOWN_TIMEOUT`] /
+/// terminal outcome. VM lifecycle calls cross the Workload migration adapter;
+/// the disk-copy subprocess remains here. The timeout uses [`DEFAULT_SHUTDOWN_TIMEOUT`] /
 /// [`DEFAULT_SHUTDOWN_POLL`] under the hood.
-fn run_migration(req: &MigrateRequest) -> MigrationOutcome {
-    if !binary_present("virsh") {
-        return MigrationOutcome::VirshUnavailable;
-    }
-
+fn run_migration(req: &MigrateRequest, actuator: &dyn MigrationAuthority) -> MigrationOutcome {
     // Step 0: capture the domain XML WHILE the VM is still defined,
     // so the target can recreate it verbatim. Empty on failure — the
     // target handler surfaces a clear migrate-failed in that case.
-    let domain_xml = run_virsh(&build_virsh_dumpxml_args(&req.vm_id)).unwrap_or_default();
+    let domain_xml = match actuator.capture_definition(&req.vm_id) {
+        Ok(xml) => xml,
+        Err(error) => {
+            return MigrationOutcome::AuthorityFailure {
+                reason: error.to_string(),
+            };
+        }
+    };
 
     // Step 1: ACPI shutdown.
-    let _ = run_virsh_status(&build_virsh_shutdown_args(&req.vm_id));
+    if let Err(error) = actuator.request_stop(&req.vm_id) {
+        return MigrationOutcome::AuthorityFailure {
+            reason: error.to_string(),
+        };
+    }
 
     // Step 2: poll for shutoff.
     let attempts =
         (DEFAULT_SHUTDOWN_TIMEOUT.as_millis() / DEFAULT_SHUTDOWN_POLL.as_millis()) as usize;
-    let domstate_args = build_virsh_domstate_args(&req.vm_id);
-    let shutoff = wait_for_shutoff(
-        || {
-            std::thread::sleep(DEFAULT_SHUTDOWN_POLL);
-            run_virsh(&domstate_args).and_then(|s| parse_virsh_domstate(&s))
-        },
-        attempts,
-    );
+    let mut shutoff = false;
+    for _ in 0..attempts {
+        std::thread::sleep(DEFAULT_SHUTDOWN_POLL);
+        match actuator.is_stopped(&req.vm_id) {
+            Ok(true) => {
+                shutoff = true;
+                break;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return MigrationOutcome::AuthorityFailure {
+                    reason: error.to_string(),
+                };
+            }
+        }
+    }
     if !shutoff {
         return MigrationOutcome::ShutdownTimeout;
     }
@@ -663,43 +612,6 @@ fn run_migration(req: &MigrateRequest) -> MigrationOutcome {
     MigrationOutcome::Ok { domain_xml }
 }
 
-/// Recreate a VM from captured domain XML: write it to a temp file,
-/// `virsh define` it, then `virsh start <vm_id>`. Shared by the target's
-/// provision step (VIRT-8.b) and the source's rollback (vdi-vm-5) —
-/// both bring a VM up from a retained `virsh dumpxml`, and the disk the
-/// XML references is already in place (the target's was rsync'd; the
-/// source's never moved).
-///
-/// The payload is validated (non-empty XML) BEFORE touching the
-/// environment, so a malformed input is rejected deterministically (and
-/// testably) regardless of whether virsh is installed.
-///
-/// # Errors
-///
-/// Returns a description when the XML is empty (source dumpxml failed),
-/// virsh is absent, or define/start exits non-zero.
-fn define_and_start_from_xml(vm_id: &str, domain_xml: &str) -> Result<(), String> {
-    if domain_xml.trim().is_empty() {
-        return Err("no domain_xml (source dumpxml failed)".into());
-    }
-    if !binary_present("virsh") {
-        return Err("virsh not available".into());
-    }
-    let tmp_dir = std::env::temp_dir().join("mde-vm-migrate");
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir tmp: {e}"))?;
-    let xml_path = tmp_dir.join(format!("{vm_id}.xml"));
-    std::fs::write(&xml_path, domain_xml).map_err(|e| format!("write xml: {e}"))?;
-    let define_ok = run_virsh_status(&build_virsh_define_args(&xml_path.to_string_lossy()));
-    let _ = std::fs::remove_file(&xml_path);
-    if !define_ok {
-        return Err(format!("virsh define failed for {vm_id}"));
-    }
-    if !run_virsh_status(&build_virsh_start_args(vm_id)) {
-        return Err(format!("virsh start failed for {vm_id}"));
-    }
-    Ok(())
-}
-
 /// VIRT-8.b — target-side: define + start the migrated VM from the
 /// captured XML. The disk is already in place (rsync'd by the
 /// source) at the matching `/var/lib/mde-vms/<vm>.qcow2` path the
@@ -710,8 +622,13 @@ fn define_and_start_from_xml(vm_id: &str, domain_xml: &str) -> Result<(), String
 ///
 /// Returns a description when virsh is absent, the XML is empty
 /// (source dumpxml failed), or define/start exits non-zero.
-fn run_migrate_target(event: &MigrateReadyEvent) -> Result<(), String> {
-    define_and_start_from_xml(&event.vm_id, &event.domain_xml)
+fn run_migrate_target(
+    event: &MigrateReadyEvent,
+    actuator: &dyn MigrationAuthority,
+) -> Result<(), String> {
+    actuator
+        .define_and_start(&event.vm_id, &event.domain_xml)
+        .map_err(|error| error.to_string())
 }
 
 /// vdi-vm-5 — source-side rollback: re-define + re-start the retained
@@ -721,16 +638,24 @@ fn run_migrate_target(event: &MigrateReadyEvent) -> Result<(), String> {
 ///
 /// # Errors
 ///
-/// Same as [`define_and_start_from_xml`].
-fn run_source_rollback(vm_id: &str, domain_xml: &str) -> Result<(), String> {
-    define_and_start_from_xml(vm_id, domain_xml)
+/// Returns the Workload adapter's bounded failure description.
+fn run_source_rollback(
+    vm_id: &str,
+    domain_xml: &str,
+    actuator: &dyn MigrationAuthority,
+) -> Result<(), String> {
+    actuator
+        .define_and_start(vm_id, domain_xml)
+        .map_err(|error| error.to_string())
 }
 
 /// vdi-vm-5 — the DEFERRED destructive step: remove the source-side
 /// definition, run only once the target has acked with
 /// `migrate-committed`. Returns whether virsh reported success.
-fn run_source_undefine(vm_id: &str) -> bool {
-    run_virsh_status(&build_virsh_undefine_args(vm_id))
+fn run_source_undefine(vm_id: &str, actuator: &dyn MigrationAuthority) -> Result<(), String> {
+    actuator
+        .relinquish_definition(vm_id)
+        .map_err(|error| error.to_string())
 }
 
 fn build_authorized_migrate_event_body<T: serde::Serialize>(
@@ -982,6 +907,7 @@ pub struct ComputeMigrateWorker {
     commit_timeout: Duration,
     bus_root_override: Option<PathBuf>,
     authorizer: Arc<ActionAuthorizer>,
+    migration_client: WorkloadMigrationClient,
 }
 
 impl Default for ComputeMigrateWorker {
@@ -1001,6 +927,7 @@ impl ComputeMigrateWorker {
             commit_timeout: DEFAULT_COMMIT_TIMEOUT,
             bus_root_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
+            migration_client: WorkloadMigrationClient,
         }
     }
 
@@ -1207,7 +1134,8 @@ impl Worker for ComputeMigrateWorker {
                     // runtime worker or starve the watchdog beat (mackesd-02).
                     for (ulid, req) in drain_source_jobs(&persist, self, &mut source_cursor) {
                         let req_run = req.clone();
-                        match tokio::task::spawn_blocking(move || run_migration(&req_run)).await {
+                        let client = self.migration_client;
+                        match tokio::task::spawn_blocking(move || run_migration(&req_run, &client)).await {
                             Ok(MigrationOutcome::Ok { domain_xml }) => {
                                 let event = build_migrate_ready_event(
                                     &req,
@@ -1245,7 +1173,8 @@ impl Worker for ComputeMigrateWorker {
                     // with migrate-committed so the source can undefine (vdi-vm-5).
                     for event in drain_target_jobs(&persist, self, &mut target_cursor) {
                         let event_run = event.clone();
-                        match tokio::task::spawn_blocking(move || run_migrate_target(&event_run)).await {
+                        let client = self.migration_client;
+                        match tokio::task::spawn_blocking(move || run_migrate_target(&event_run, &client)).await {
                             Ok(Ok(())) => {
                                 tracing::info!(vm_id = %event.vm_id, "compute_migrate: migrated VM defined + started on target");
                                 publish_migrate_committed(&persist, &event);
@@ -1294,17 +1223,23 @@ impl Worker for ComputeMigrateWorker {
                             ) {
                                 CommitResolution::Undefine => {
                                     let vm = pc.vm_id.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        run_source_undefine(&vm)
+                                    let client = self.migration_client;
+                                    match tokio::task::spawn_blocking(move || {
+                                        run_source_undefine(&vm, &client)
                                     })
-                                    .await;
-                                    tracing::info!(vm_id = %pc.vm_id, "compute_migrate: target committed; source undefined (migration complete)");
+                                    .await
+                                    {
+                                        Ok(Ok(())) => tracing::info!(vm_id = %pc.vm_id, "compute_migrate: target committed; source definition relinquished (migration complete)"),
+                                        Ok(Err(error)) => tracing::error!(vm_id = %pc.vm_id, %error, "compute_migrate: target committed but source definition relinquish failed"),
+                                        Err(error) => tracing::error!(vm_id = %pc.vm_id, %error, "compute_migrate: source definition relinquish task failed"),
+                                    }
                                 }
                                 CommitResolution::RollBack { reason } => {
                                     let vm = pc.vm_id.clone();
                                     let xml = pc.domain_xml.clone();
+                                    let client = self.migration_client;
                                     match tokio::task::spawn_blocking(move || {
-                                        run_source_rollback(&vm, &xml)
+                                        run_source_rollback(&vm, &xml, &client)
                                     })
                                     .await
                                     {
@@ -1331,7 +1266,66 @@ mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use mackes_mesh_types::cloud::CloudArmSigner;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeMigrationActuator {
+        calls: Mutex<Vec<String>>,
+        stop_error: bool,
+    }
+
+    impl FakeMigrationActuator {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("fake calls").clone()
+        }
+
+        fn record(&self, call: impl Into<String>) {
+            self.calls.lock().expect("fake calls").push(call.into());
+        }
+    }
+
+    impl MigrationAuthority for FakeMigrationActuator {
+        fn capture_definition(&self, vm_id: &str) -> Result<String, WorkloadActuatorError> {
+            self.record(format!("capture:{vm_id}"));
+            Ok(format!("<domain><name>{vm_id}</name></domain>"))
+        }
+
+        fn request_stop(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+            self.record(format!("stop:{vm_id}"));
+            if self.stop_error {
+                Err(WorkloadActuatorError::Retryable(
+                    "hostile stop refusal".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn is_stopped(&self, vm_id: &str) -> Result<bool, WorkloadActuatorError> {
+            self.record(format!("observe:{vm_id}"));
+            Ok(true)
+        }
+
+        fn define_and_start(
+            &self,
+            vm_id: &str,
+            domain_xml: &str,
+        ) -> Result<(), WorkloadActuatorError> {
+            self.record(format!("define-start:{vm_id}"));
+            if domain_xml.trim().is_empty() {
+                Err(WorkloadActuatorError::Permanent(
+                    "migration definition is empty".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn relinquish_definition(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+            self.record(format!("relinquish:{vm_id}"));
+            Ok(())
+        }
+    }
 
     const AUTH_KEY: &[u8] = b"compute-migrate-test-key";
     const AUTH_NOW_MS: i64 = 1_700_000_000_000;
@@ -1483,43 +1477,6 @@ mod tests {
         assert!(!is_source_peer(&req, ""));
     }
 
-    // ── virsh arg builders ──
-
-    #[test]
-    fn shutdown_args_are_minimal() {
-        assert_eq!(build_virsh_shutdown_args("abc"), vec!["shutdown", "abc"]);
-    }
-
-    #[test]
-    fn domstate_args_are_minimal() {
-        assert_eq!(build_virsh_domstate_args("abc"), vec!["domstate", "abc"]);
-    }
-
-    #[test]
-    fn undefine_args_are_minimal() {
-        assert_eq!(build_virsh_undefine_args("abc"), vec!["undefine", "abc"]);
-    }
-
-    // ── parse_virsh_domstate + is_shutoff ──
-
-    #[test]
-    fn parse_domstate_trims_whitespace() {
-        assert_eq!(parse_virsh_domstate("  running \n"), Some("running".into()));
-    }
-
-    #[test]
-    fn parse_domstate_none_when_empty() {
-        assert!(parse_virsh_domstate("   \n").is_none());
-    }
-
-    #[test]
-    fn is_shutoff_matches_canonical_token() {
-        assert!(is_shutoff("shut off"));
-        assert!(is_shutoff("SHUT OFF"));
-        assert!(!is_shutoff("running"));
-        assert!(!is_shutoff("paused"));
-    }
-
     // ── rsync args ──
 
     #[test]
@@ -1569,18 +1526,6 @@ mod tests {
         assert_eq!(ev.request_ulid, "01JAN");
         assert_eq!(ev.target_disk_path, "/var/lib/mde-vms/abc.qcow2");
         assert_eq!(ev.domain_xml, "<domain>…</domain>");
-    }
-
-    // ── VIRT-8.b — target-side define/start ──
-
-    #[test]
-    fn dumpxml_define_start_args_are_minimal() {
-        assert_eq!(build_virsh_dumpxml_args("abc"), vec!["dumpxml", "abc"]);
-        assert_eq!(
-            build_virsh_define_args("/t/abc.xml"),
-            vec!["define", "/t/abc.xml"]
-        );
-        assert_eq!(build_virsh_start_args("abc"), vec!["start", "abc"]);
     }
 
     #[test]
@@ -1634,8 +1579,9 @@ mod tests {
             request_ulid: "01JAN".into(),
             domain_xml: "   ".into(),
         };
-        let err = run_migrate_target(&ev).expect_err("empty xml must fail");
-        assert!(err.contains("no domain_xml"), "{err}");
+        let actuator = FakeMigrationActuator::default();
+        let err = run_migrate_target(&ev, &actuator).expect_err("empty xml must fail");
+        assert!(err.contains("definition is empty"), "{err}");
     }
 
     #[test]
@@ -1667,33 +1613,6 @@ mod tests {
         assert!(MIGRATE_FAILED_TOPIC.starts_with("event/"));
     }
 
-    // ── Required scenario 2: shutdown timeout ──
-
-    #[test]
-    fn wait_for_shutoff_returns_false_when_state_never_flips() {
-        // Observer always returns "running" — never shut off.
-        let observed = wait_for_shutoff(|| Some("running".into()), 5);
-        assert!(!observed);
-    }
-
-    #[test]
-    fn wait_for_shutoff_returns_true_on_first_shutoff_observation() {
-        let mut calls = 0;
-        let observed = wait_for_shutoff(
-            || {
-                calls += 1;
-                if calls < 3 {
-                    Some("running".into())
-                } else {
-                    Some("shut off".into())
-                }
-            },
-            10,
-        );
-        assert!(observed);
-        assert_eq!(calls, 3, "should stop polling at first shutoff");
-    }
-
     // ── Required scenario 3: rsync failure (via the MigrationOutcome
     //    variant + the test that run_migration would surface it; we
     //    cover the failure-shape here without invoking rsync) ──
@@ -1714,10 +1633,7 @@ mod tests {
     // ── Required scenario 1: happy path planning ──
 
     #[test]
-    fn happy_path_plan_compose() {
-        // The full source-side flow is a deterministic composition of
-        // the pure helpers — this test asserts the planned shape so a
-        // regression in any helper breaks the chain visibly.
+    fn migration_power_and_definition_paths_use_workload_adapter() {
         let req = MigrateRequest {
             source_peer: "10.42.0.1".into(),
             target_peer: "10.42.0.2".into(),
@@ -1725,28 +1641,52 @@ mod tests {
             disk_path: "/var/lib/mde-vms/abc-uuid.qcow2".into(),
         };
         assert!(is_source_peer(&req, "10.42.0.1"));
-        let shutdown_args = build_virsh_shutdown_args(&req.vm_id);
-        assert!(shutdown_args.contains(&"abc-uuid".to_string()));
-        let domstate_args = build_virsh_domstate_args(&req.vm_id);
-        assert!(domstate_args.contains(&"abc-uuid".to_string()));
-        let rsync_args = build_rsync_args(&req.disk_path, &req.target_peer, DEFAULT_TARGET_VM_DIR);
-        assert_eq!(rsync_args.last().unwrap(), "10.42.0.2:/var/lib/mde-vms/");
-        let undef_args = build_virsh_undefine_args(&req.vm_id);
-        assert!(undef_args.contains(&"abc-uuid".to_string()));
-        let dumpxml_args = build_virsh_dumpxml_args(&req.vm_id);
-        assert!(dumpxml_args.contains(&"abc-uuid".to_string()));
-        let target_path = target_disk_path_for(&req.disk_path, DEFAULT_TARGET_VM_DIR);
-        let event = build_migrate_ready_event(
-            &req,
-            target_path,
-            "01JANULID".into(),
-            "<domain type='kvm'/>".into(),
+        let actuator = FakeMigrationActuator {
+            stop_error: true,
+            ..FakeMigrationActuator::default()
+        };
+        assert!(matches!(
+            run_migration(&req, &actuator),
+            MigrationOutcome::AuthorityFailure { .. }
+        ));
+        assert_eq!(actuator.calls(), ["capture:abc-uuid", "stop:abc-uuid"]);
+    }
+
+    #[test]
+    fn compute_migrate_has_no_direct_libvirt_lifecycle_subprocess() {
+        let production = include_str!("compute_migrate.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(!production.contains("Command::new(\"virsh\")"));
+        assert!(!production.contains("run_virsh"));
+        assert!(!production.contains("SystemWorkloadActuator"));
+    }
+
+    #[test]
+    fn target_rollback_and_commit_cleanup_route_through_workload_adapter() {
+        let actuator = FakeMigrationActuator::default();
+        let event = MigrateReadyEvent {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-adapter-route".into(),
+            target_disk_path: "/var/lib/mde-vms/vm-adapter-route.qcow2".into(),
+            request_ulid: "01ADAPTER".into(),
+            domain_xml: "<domain><name>vm-adapter-route</name></domain>".into(),
+        };
+
+        run_migrate_target(&event, &actuator).expect("target define/start");
+        run_source_rollback(&event.vm_id, &event.domain_xml, &actuator).expect("source rollback");
+        run_source_undefine(&event.vm_id, &actuator).expect("source relinquish");
+
+        assert_eq!(
+            actuator.calls(),
+            [
+                "define-start:vm-adapter-route",
+                "define-start:vm-adapter-route",
+                "relinquish:vm-adapter-route",
+            ]
         );
-        assert_eq!(event.target_peer, "10.42.0.2");
-        assert_eq!(event.request_ulid, "01JANULID");
-        // Target side recreates from the captured XML.
-        assert!(is_target_peer(&event, "10.42.0.2"));
-        assert!(build_virsh_define_args("/t/x.xml").contains(&"define".to_string()));
     }
 
     // ── ACTION_TOPIC prefix lock ──
@@ -2334,8 +2274,9 @@ mod tests {
         // Rollback re-defines from the retained dumpxml; an empty XML (source
         // dumpxml had failed) is rejected before touching the environment, so
         // this is deterministic whether or not virsh is installed.
-        let err = run_source_rollback("abc", "   ").expect_err("empty xml must fail");
-        assert!(err.contains("no domain_xml"), "{err}");
+        let actuator = FakeMigrationActuator::default();
+        let err = run_source_rollback("abc", "   ", &actuator).expect_err("empty xml must fail");
+        assert!(err.contains("definition is empty"), "{err}");
     }
 
     #[test]

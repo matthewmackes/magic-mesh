@@ -177,14 +177,28 @@ mod tests {
             parse_virsh_domblklist("Type Device Target Source\nfile disk vda /pool/a.qcow2"),
             Some("/pool/a.qcow2".to_string())
         );
-        let rows = parse_podman_ps_json(r#"[{"Id":"abc","Names":["web"],"State":"running","Image":"nginx"}]"#);
+        let rows = parse_podman_ps_json(
+            r#"[{"Id":"abc","Names":["web"],"State":"running","Image":"nginx"}]"#,
+        );
         assert_eq!(rows[0].name, "web");
     }
 
     #[test]
     fn publish_gate_coalesces_unchanged_state() {
         let now = Instant::now();
-        assert!(!should_publish(Some("same"), "same", Some(now), now, Duration::from_secs(1)));
-        assert!(should_publish(Some("same"), "changed", Some(now), now, Duration::from_secs(1)));
+        assert!(!should_publish(
+            Some("same"),
+            "same",
+            Some(now),
+            now,
+            Duration::from_secs(1)
+        ));
+        assert!(should_publish(
+            Some("same"),
+            "changed",
+            Some(now),
+            now,
+            Duration::from_secs(1)
+        ));
     }
 }

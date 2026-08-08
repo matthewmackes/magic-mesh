@@ -352,7 +352,11 @@ def active_unit(seat: Seat, pattern: str) -> str:
 
 
 def recovery_cycle(seat: Seat) -> list[str]:
-    units = [active_unit(seat, "nebula*.service"), active_unit(seat, "syncthing*.service"), "mackesd.service"]
+    units = [
+        active_unit(seat, "nebula*.service"),
+        active_unit(seat, "syncthing*.service"),
+        "mackesd.target",
+    ]
     for unit in units:
         seat.run(
             f"systemctl stop {shlex.quote(unit)}; systemctl start {shlex.quote(unit)}; "

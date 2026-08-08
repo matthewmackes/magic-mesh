@@ -117,13 +117,6 @@ mde-collab-core = { path = "../../services/mde-collab-core", optional = true }
 # state/bookmarks/*. Optional under async-services (the worker is
 # async-services-gated); `uuid` (v4) mints the per-item CRDT ids the ops carry.
 mde-bookmarks = { path = "../../services/mde-bookmarks", optional = true }
-# BOOKMARKS-7 — the adfilter worker drives the pure mde-adblock engine + store
-# (FilterListStore serde blob / Engine::from_store / Staleness / LWW merge). It
-# replicates each node's serialized store over Syncthing, leader-compiles the
-# converged engine blob, and drains action/adfilter/{allow,block} into the
-# mesh-synced allowlist. Optional under async-services (the worker is
-# async-services-gated), a services-tier (inward) dep like mde-bookmarks.
-mde-adblock = { path = "../../services/mde-adblock", optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 # E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
 # pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
@@ -358,7 +351,6 @@ async-services = [
     "dep:mde-collab-types",
     "dep:mde-collab-core",
     "dep:mde-bookmarks",
-    "dep:mde-adblock",
     "dep:uuid",
     # reqwest backs the async-services HTTP consumers (music_autoconfig,
     # transfers/lane/browser_media).
@@ -382,7 +374,7 @@ workspace = true
 # control-plane RPM.
 # The
 # install-time role chooser (PKG-5) + the
-# self-gating mackesd.service (PKG-3) decide what actually runs per node.
+# self-gating six-process mackesd.target (PKG-3) decides what actually runs per node.
 # Workstations use the base package; compute nodes use the GUI-less Server
 # variant; DigitalOcean lighthouses use the dedicated control-plane-only
 # Lighthouse variant. RPM GPG signing + the ISO stay operator-gated.
@@ -418,7 +410,9 @@ payload_compress = "xz"
 # startup replaces the worker's early retained write.
 # -12 (2026-08-08): put Music ownership/handoff records on the Syncthing mesh
 # plane and preserve alternate admitted providers behind the selected source.
-release = "12"
+# -13 (2026-08-08): replace the monolithic daemon unit with six independently
+# supervised process groups and migrate package activation/drop-ins atomically.
+release = "13"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -478,8 +472,14 @@ assets = [
     # with it; the Front Door launcher now lives inside mde-shell-egui.
     # AUD-6 / PKG-5 — the first-run deployment-role chooser GUI (autostart below).
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
-    # PKG-3 — the self-gating daemon unit + the role-gated app units.
-    { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    # WL-ARCH-009 — six independently supervised daemon process groups.
+    { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
+    { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-data.service", dest = "/usr/lib/systemd/system/mackesd-data.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-compute.service", dest = "/usr/lib/systemd/system/mackesd-compute.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-integrations.service", dest = "/usr/lib/systemd/system/mackesd-integrations.service", mode = "644" },
     # WL-CRIT-007 — authenticated post-overlay claim snapshot prerequisite.
     # These units remain deliberately disabled/inert until the typed pre-Nebula
     # authority-transport blocker is closed.
@@ -491,7 +491,6 @@ assets = [
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.timer", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer", mode = "644" },
-    { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     # ONBOARD-9 — the service manager: a health watchdog (recovery) + a
     # failure-notification handler. mesh-health.timer drives the watchdog;
     # mesh-alert@.service is fired by OnFailure= on mackesd/nebula; the
@@ -776,23 +775,29 @@ if [ -f /etc/systemd/system/qnm-shared.service ] || [ -f /usr/lib/systemd/system
         /etc/systemd/system/qnm-shared.service.d/10-xpa8-4-shipped-loop.conf || :
   rmdir /etc/systemd/system/qnm-shared.service.d 2>/dev/null || :
 fi
-rm -f /etc/systemd/system/mackesd.service.d/20-qnm.conf || :
-# REL-2 — early live lighthouses may carry a local watchdog drop-in that
-# shortens mackesd stop time to 20s and forces abort-on-timeout. That overrides
-# the packaged unit during RPM upgrades, so remove only that stale policy before
-# restart/promotion validation. The base unit still owns the live watchdog.
-if [ -f /etc/systemd/system/mackesd.service.d/watchdog.conf ] && \
-   grep -Eq 'TimeoutStop(FailureMode=abort|USec=20s|Sec=20)' /etc/systemd/system/mackesd.service.d/watchdog.conf; then
-  rm -f /etc/systemd/system/mackesd.service.d/watchdog.conf || :
-fi
+mackesd_was_active=0
+systemctl is-active --quiet mackesd.service && mackesd_was_active=1
+systemctl disable --now mackesd.service >/dev/null 2>&1 || :
+rm -f /etc/systemd/system/mackesd.service \
+      /etc/systemd/system/mackesd.service.d/20-qnm.conf \
+      /etc/systemd/system/mackesd.service.d/watchdog.conf \
+      /etc/systemd/system/mackesd.service.d/40-startup-timeout.conf \
+      /etc/systemd/system/mackesd.service.d/50-cloud-arm-credential.conf \
+      /etc/systemd/system/mackesd.service.d/unifi-host.conf \
+      /usr/lib/systemd/system/mackesd.service \
+      /usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf || :
 rmdir /etc/systemd/system/mackesd.service.d 2>/dev/null || :
+rmdir /usr/lib/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
 # Service manager (ONBOARD-9): the daemon, the overlay, and the health
 # watchdog all start at boot. nebula.service ships disabled by the stock
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
-# the mackesd supervisor. (mackesd self-gates on a pinned role, so enabling
-# it pre-enrollment is safe — it idles until `found`/`join` pins a role.)
-systemctl enable mackesd.service mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+# the grouped mackesd supervisor. Each process self-gates on the pinned role,
+# so enabling the target pre-enrollment is safe.
+systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+if [ "$mackesd_was_active" -eq 1 ]; then
+  systemctl start mackesd.target >/dev/null 2>&1 || :
+fi
 # MESHSHELL — the mesh-status snapshot timer feeds the bash prompt + greeting
 # on every role.
 systemctl enable --now mesh-status.timer >/dev/null 2>&1 || :
@@ -929,11 +934,11 @@ timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
 # process. Restart only already-active system authorities after package setup so
 # upgrades cannot leave the old shell or daemon mapped through a deleted inode;
 # fresh installs remain governed by the normal role/start gates.
-systemctl try-restart mackesd.service mde-shell-egui.service >/dev/null 2>&1 || :
+systemctl try-restart mde-shell-egui.service >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
-  systemctl --no-reload disable --now mackesd.service mcnf-mesh-secret-recipient.timer mesh-health.timer >/dev/null 2>&1 || :
+  systemctl --no-reload disable --now mackesd.target mcnf-mesh-secret-recipient.timer mesh-health.timer >/dev/null 2>&1 || :
 fi
 """
 post_uninstall_script = """
@@ -1220,7 +1225,7 @@ summary = "MCNF thin DigitalOcean lighthouse — Nebula relay, etcd quorum, and 
 payload_compress = "xz"
 # Keep the role variants monotonic with the base package for corrected-forward
 # fleet deployment.
-release = "5"
+release = "6"
 license = "GPL-3.0-or-later AND MPL-2.0"
 # The thin variant must replace (not co-install with) any role package that
 # owns the same daemon/unit paths.  An operator can use `dnf swap` for an
@@ -1229,7 +1234,13 @@ conflicts = { magic-mesh = "*", magic-mesh-server = "*" }
 assets = [
     { source = "target/release/mackesd", dest = "/usr/bin/mackesd", mode = "755" },
     { source = "target/release/meshctl", dest = "/usr/bin/meshctl", mode = "755" },
-    { source = "packaging/systemd/mackesd.service", dest = "/usr/lib/systemd/system/mackesd.service", mode = "644" },
+    { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
+    { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-data.service", dest = "/usr/lib/systemd/system/mackesd-data.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-compute.service", dest = "/usr/lib/systemd/system/mackesd-compute.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-integrations.service", dest = "/usr/lib/systemd/system/mackesd-integrations.service", mode = "644" },
     # WL-CRIT-007 — ship the disabled producer and inert guard prerequisite on
     # the thin control-plane role without adding an activation edge.
     { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
@@ -1242,7 +1253,6 @@ assets = [
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.timer", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer", mode = "644" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service", dest = "/usr/lib/systemd/system/mesh-health.service", mode = "644" },
     { source = "packaging/systemd/mesh-health.timer", dest = "/usr/lib/systemd/system/mesh-health.timer", mode = "644" },
     { source = "packaging/systemd/mesh-alert@.service", dest = "/usr/lib/systemd/system/mesh-alert@.service", mode = "644" },
@@ -1269,15 +1279,30 @@ assets = [
     { source = "NOTICE", dest = "/usr/share/licenses/magic-mesh-lighthouse/NOTICE", mode = "644" },
 ]
 post_install_script = """
+mackesd_was_active=0
+systemctl is-active --quiet mackesd.service && mackesd_was_active=1
+systemctl disable --now mackesd.service >/dev/null 2>&1 || :
+rm -f /etc/systemd/system/mackesd.service \
+      /etc/systemd/system/mackesd.service.d/20-qnm.conf \
+      /etc/systemd/system/mackesd.service.d/watchdog.conf \
+      /etc/systemd/system/mackesd.service.d/40-startup-timeout.conf \
+      /etc/systemd/system/mackesd.service.d/50-cloud-arm-credential.conf \
+      /etc/systemd/system/mackesd.service.d/unifi-host.conf \
+      /usr/lib/systemd/system/mackesd.service \
+      /usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf || :
+rmdir /etc/systemd/system/mackesd.service.d /usr/lib/systemd/system/mackesd.service.d 2>/dev/null || :
 systemctl daemon-reload >/dev/null 2>&1 || :
-systemctl enable mackesd.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+if [ "$mackesd_was_active" -eq 1 ]; then
+  systemctl start mackesd.target >/dev/null 2>&1 || :
+fi
 systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
 timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 install -d -m 0700 /etc/mackesd >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
-  systemctl --no-reload disable --now mackesd.service mcnf-mesh-secret-recipient.timer mesh-health.timer etcd.service >/dev/null 2>&1 || :
+  systemctl --no-reload disable --now mackesd.target mcnf-mesh-secret-recipient.timer mesh-health.timer etcd.service >/dev/null 2>&1 || :
 fi
 """
 post_uninstall_script = """
@@ -1329,8 +1354,14 @@ assets = [
     { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
     { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
-    # PKG-3 — the self-gating daemon unit + the health/alert watchdog.
-    { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    # WL-ARCH-009 — six independently supervised daemon process groups.
+    { source = "packaging/systemd/mackesd.target", dest = "/usr/lib/systemd/system/mackesd.target", mode = "644" },
+    { source = "packaging/systemd/mackesd-control.service", dest = "/usr/lib/systemd/system/mackesd-control.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-observation.service", dest = "/usr/lib/systemd/system/mackesd-observation.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-actions.service", dest = "/usr/lib/systemd/system/mackesd-actions.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-data.service", dest = "/usr/lib/systemd/system/mackesd-data.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-compute.service", dest = "/usr/lib/systemd/system/mackesd-compute.service", mode = "644" },
+    { source = "packaging/systemd/mackesd-integrations.service", dest = "/usr/lib/systemd/system/mackesd-integrations.service", mode = "644" },
     # WL-CRIT-007 — the same disabled/inert authenticated snapshot
     # prerequisite shipped by every role package.
     { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
@@ -1343,7 +1374,6 @@ assets = [
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.timer", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer", mode = "644" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
-    { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
     { source = "packaging/systemd/mesh-health.service",  dest = "/usr/lib/systemd/system/mesh-health.service",  mode = "644" },
     { source = "packaging/systemd/mesh-health.timer",    dest = "/usr/lib/systemd/system/mesh-health.timer",    mode = "644" },
     { source = "packaging/systemd/mesh-alert@.service",  dest = "/usr/lib/systemd/system/mesh-alert@.service",  mode = "644" },

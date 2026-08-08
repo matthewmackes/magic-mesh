@@ -116,6 +116,15 @@ EXEMPT_SURFACES=()
 readonly BASE_KEY_BINS=("mde-shell-egui" "mackesd")
 readonly SERVER_KEY_BINS=("mackesd")
 readonly LIGHTHOUSE_KEY_BINS=("mackesd")
+readonly GROUPED_MACKESD_ASSETS=(
+  "packaging/systemd/mackesd.target"
+  "packaging/systemd/mackesd-control.service"
+  "packaging/systemd/mackesd-observation.service"
+  "packaging/systemd/mackesd-actions.service"
+  "packaging/systemd/mackesd-data.service"
+  "packaging/systemd/mackesd-compute.service"
+  "packaging/systemd/mackesd-integrations.service"
+)
 readonly BASE_VDI_HOST_REQUIRES=(
   "libvirt"
   "qemu-kvm"
@@ -162,11 +171,58 @@ parse_assets_for() {
 # Main/base, server variant, and thin lighthouse variant
 # asset readers.
 parse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm"; }
+# shellcheck disable=SC2317 # invoked indirectly by name in the variant loop
 parse_server_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.server"; }
 parse_lighthouse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.lighthouse"; }
 parse_all_shipped_assets() {
   parse_assets "$1"
   parse_lighthouse_assets "$1"
+}
+
+# WL-ARCH-009 — variants replace the base asset array, so every RPM shape must
+# independently ship the target and all six group units. The retired monolith
+# must not survive in any manifest table.
+check_grouped_mackesd_assets() {
+  hdr "grouped mackesd process boundary — every RPM variant"
+  local label parser source dest expected expected_dest
+  for label in base server lighthouse; do
+    case "$label" in
+      base) parser=parse_assets ;;
+      server) parser=parse_server_assets ;;
+      lighthouse) parser=parse_lighthouse_assets ;;
+    esac
+    local -A present=()
+    while IFS=$'\t' read -r source dest; do
+      [ -n "$source" ] && present["$source"]="$dest"
+    done < <($parser "$CARGO_TOML")
+    for expected in "${GROUPED_MACKESD_ASSETS[@]}"; do
+      expected_dest="/usr/lib/systemd/system/${expected##*/}"
+      if [ "${present["$expected"]:-}" = "$expected_dest" ]; then
+        ok "$label asset    $expected -> $expected_dest"
+      else
+        fail "$label asset    $expected MISSING or has the wrong destination"
+      fi
+    done
+    if [ -n "${present["packaging/systemd/mackesd.service"]:-}" ]; then
+      fail "$label asset    retired packaging/systemd/mackesd.service remains"
+    else
+      ok "$label asset    retired mackesd.service absent"
+    fi
+  done
+
+  local lifecycle_token
+  for lifecycle_token in \
+    'systemctl disable --now mackesd.service' \
+    '/etc/systemd/system/mackesd.service.d/50-cloud-arm-credential.conf' \
+    '/usr/lib/systemd/system/mackesd.service' \
+    'systemctl enable mackesd.target' \
+    'systemctl start mackesd.target'; do
+    if grep -Fq "$lifecycle_token" "$CARGO_TOML"; then
+      ok "upgrade lifecycle contains: $lifecycle_token"
+    else
+      fail "upgrade lifecycle MISSING: $lifecycle_token"
+    fi
+  done
 }
 
 # Emit each direct key in a TOML table. This intentionally stops at the next
@@ -328,6 +384,7 @@ check_payload_dryrun() {
   done
 
   check_vdi_host_requires
+  check_grouped_mackesd_assets
 }
 
 # Read the RPM file list (real, or a fake listing for --self-test).
@@ -379,6 +436,8 @@ check_payload_rpm() {
     magic-mesh-server-*) shape="server" ;;
     magic-mesh-lighthouse-*) shape="lighthouse" ;;
   esac
+
+  check_grouped_mackesd_assets
 
   # Key bins: exact install-path assertions (the DoD line for a strip/replace).
   hdr "key replacement binaries present in payload"
@@ -876,6 +935,7 @@ main() {
       [ -z "${1:-}" ] || check_built_rpm_vdi_host_requires "$1"
       ;;
     overlay-claims-package) check_overlay_claims_package ;;
+    grouped-process) check_grouped_mackesd_assets ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")   check_payload_dryrun; check_surfaces ;;

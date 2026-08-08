@@ -41,19 +41,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use mackes_mesh_types::health::{NodeAvailabilityState, NodeDeviceClass};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
-use mackes_mesh_types::health::{NodeAvailabilityState, NodeDeviceClass};
 use serde::{Deserialize, Serialize};
 
 use super::cloud::{
     claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
     DEFAULT_AUTH_ROOT,
 };
-use super::{ShutdownToken, Worker};
 use super::node_availability::{
     runtime_availability_path, RuntimeAvailabilityPublisher, RuntimeAvailabilityRequest,
 };
+use super::{ShutdownToken, Worker};
 use crate::leader::read_current_lease;
 
 /// The local topic the shell publishes its seat snapshot on (this node only).
@@ -739,9 +739,8 @@ impl HostStateWorker {
                 let current = publisher
                     .current_intent()
                     .map_err(|error| error.to_string())?;
-                if !current.is_some_and(|intent| {
-                    intent.state == NodeAvailabilityState::Maintenance
-                }) {
+                if !current.is_some_and(|intent| intent.state == NodeAvailabilityState::Maintenance)
+                {
                     return Err("maintenance end has no active maintenance intent".to_string());
                 }
                 publisher
@@ -956,8 +955,10 @@ async fn lifecycle_monitor_session(
         .await
         .map_err(|error| format!("subscribe PrepareForShutdown: {error}"))?;
 
-    if publisher.current_intent().map_err(|error| error.to_string())?.is_some_and(
-        |intent| {
+    if publisher
+        .current_intent()
+        .map_err(|error| error.to_string())?
+        .is_some_and(|intent| {
             matches!(
                 intent.state,
                 NodeAvailabilityState::ScheduledReboot
@@ -965,8 +966,8 @@ async fn lifecycle_monitor_session(
                     | NodeAvailabilityState::ShuttingDown
                     | NodeAvailabilityState::ShutDown
             )
-        },
-    ) {
+        })
+    {
         let stable = tokio::select! {
             result = wait_for_network_manager_stability(&connection) => result?,
             () = shutdown.wait() => return Ok(()),
@@ -1111,9 +1112,7 @@ fn publish_return_after_stability(
     Ok(true)
 }
 
-async fn wait_for_network_manager_stability(
-    connection: &zbus::Connection,
-) -> Result<bool, String> {
+async fn wait_for_network_manager_stability(connection: &zbus::Connection) -> Result<bool, String> {
     let network_manager = zbus::Proxy::new(
         connection,
         "org.freedesktop.NetworkManager",
@@ -1155,9 +1154,7 @@ impl Worker for HostStateWorker {
             tracing::debug!(target: "mackesd::host_state", "no bus root; worker idle");
             return Ok(());
         };
-        let lifecycle_publisher = self
-            .availability_publisher()
-            .map_err(anyhow::Error::msg)?;
+        let lifecycle_publisher = self.availability_publisher().map_err(anyhow::Error::msg)?;
         let lifecycle_monitor = tokio::spawn(run_system_lifecycle_monitor(
             lifecycle_publisher,
             shutdown.clone(),

@@ -87,8 +87,8 @@ use mackes_mesh_types::android_apps::{
 };
 use mackes_mesh_types::workloads::{
     workload_state_topic, WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId,
-    WorkloadOperationAction, WorkloadOperationRequest, WorkloadProfile, WORKLOAD_CONTRACT_SCHEMA_VERSION,
-    WORKLOAD_OPERATION_TOPIC,
+    WorkloadOperationAction, WorkloadOperationRequest, WorkloadProfile,
+    WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 
 use super::cloud::{
@@ -497,13 +497,7 @@ fn plan_workload_service_lifecycle(
         .map_err(|error| format!("service_lifecycle: invalid workload identity: {error}"))?;
     let (resources, expected_generation, image_ref) = state
         .filter(|status| status.workload_id == workload_id && status.backend == backend)
-        .map(|status| {
-            (
-                status.resources,
-                status.generation,
-                None::<String>,
-            )
-        })
+        .map(|status| (status.resources, status.generation, None::<String>))
         .unwrap_or((WorkloadProfile::Small.resources(), 0, None));
     let deadline_at_ms = now_ms
         .saturating_add(MAX_AUTH_TTL_MS as u64)
@@ -998,10 +992,11 @@ impl ActionWorker {
                             .into_iter()
                             .find(|status| status.workload_id == seed.workload_id)
                     });
-                let request = match plan_workload_service_lifecycle(req, ulid, state.as_ref(), now_ms) {
-                    Ok(request) => request,
-                    Err(reason) => return ActionReply::rejected(reason),
-                };
+                let request =
+                    match plan_workload_service_lifecycle(req, ulid, state.as_ref(), now_ms) {
+                        Ok(request) => request,
+                        Err(reason) => return ActionReply::rejected(reason),
+                    };
                 let body = match self.arm_workload_request(&request, now_ms) {
                     Ok(body) => body,
                     Err(reason) => return ActionReply::rejected(reason),
@@ -1254,10 +1249,7 @@ mod tests {
 
     fn read_workload_operation(tmp: &std::path::Path) -> Option<WorkloadOperationRequest> {
         let persist = Persist::open(tmp.join("bus")).ok()?;
-        let body = persist
-            .read_latest(WORKLOAD_OPERATION_TOPIC)
-            .ok()??
-            .body?;
+        let body = persist.read_latest(WORKLOAD_OPERATION_TOPIC).ok()??.body?;
         let now = u64::try_from(wall_now_ms()).ok()?;
         WorkloadOperationRequest::from_json(&body, now).ok()
     }

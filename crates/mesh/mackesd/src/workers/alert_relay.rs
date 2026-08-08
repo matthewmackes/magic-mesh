@@ -583,24 +583,21 @@ mod tests {
         assert_eq!(crit[0], "mde-bus");
         assert_eq!(crit[1], "publish");
         assert_eq!(crit[2], "fdo/MCNF Alerts");
-        assert!(
-            crit.windows(2)
-                .any(|w| w[0] == "--priority" && w[1] == "urgent")
-        );
+        assert!(crit
+            .windows(2)
+            .any(|w| w[0] == "--priority" && w[1] == "urgent"));
         assert!(crit.iter().any(|s| s == "[anvil] disk_full"));
         assert!(crit.iter().any(|s| s == "--no-broker"));
         // Severity → priority mapping + the chart-url hint.
         let warn = bus_publish_argv("mde-bus", &mk("WARNING", "http://c/1"));
-        assert!(
-            warn.windows(2)
-                .any(|w| w[0] == "--priority" && w[1] == "default")
-        );
+        assert!(warn
+            .windows(2)
+            .any(|w| w[0] == "--priority" && w[1] == "default"));
         assert!(warn.iter().any(|s| s == "string:chart-url:http://c/1"));
         let info = bus_publish_argv("mde-bus", &mk("INFO", ""));
-        assert!(
-            info.windows(2)
-                .any(|w| w[0] == "--priority" && w[1] == "min")
-        );
+        assert!(info
+            .windows(2)
+            .any(|w| w[0] == "--priority" && w[1] == "min"));
         assert!(!info.iter().any(|s| s.starts_with("string:chart-url")));
     }
 
@@ -633,10 +630,9 @@ mod tests {
             chart_url: "https://peer:alice:19999/#menu_nebula".into(),
         };
         let argv = notify_send_argv("notify-send", &event);
-        assert!(
-            argv.iter()
-                .any(|s| s == "--hint=string:chart-url:https://peer:alice:19999/#menu_nebula")
-        );
+        assert!(argv
+            .iter()
+            .any(|s| s == "--hint=string:chart-url:https://peer:alice:19999/#menu_nebula"));
     }
 
     #[test]
@@ -650,11 +646,9 @@ mod tests {
             chart_url: String::new(),
         };
         let argv = notify_send_argv("notify-send", &event);
-        assert!(
-            !argv
-                .iter()
-                .any(|s| s.starts_with("--hint=string:chart-url:"))
-        );
+        assert!(!argv
+            .iter()
+            .any(|s| s.starts_with("--hint=string:chart-url:")));
     }
 
     #[test]

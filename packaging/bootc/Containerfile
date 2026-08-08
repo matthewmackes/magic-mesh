@@ -252,6 +252,13 @@ RUN set -eux; \
 # The DRM-seat unit + its preset. Boot-to-seat: quasar-vdi-desktop.md lock 34.
 # The RPM lane ships the same unit through generate-rpm (SEAT-BOOT-1).
 COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-shell-egui.service
+COPY packaging/systemd/mackesd.target /usr/lib/systemd/system/mackesd.target
+COPY packaging/systemd/mackesd-control.service /usr/lib/systemd/system/mackesd-control.service
+COPY packaging/systemd/mackesd-observation.service /usr/lib/systemd/system/mackesd-observation.service
+COPY packaging/systemd/mackesd-actions.service /usr/lib/systemd/system/mackesd-actions.service
+COPY packaging/systemd/mackesd-data.service /usr/lib/systemd/system/mackesd-data.service
+COPY packaging/systemd/mackesd-compute.service /usr/lib/systemd/system/mackesd-compute.service
+COPY packaging/systemd/mackesd-integrations.service /usr/lib/systemd/system/mackesd-integrations.service
 COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
 COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-mesh.toml
 # Virtualization/VDI kernel args (IOMMU + VFIO passthrough + nested virt) baked
@@ -272,6 +279,9 @@ RUN set -eux; \
     # instead of killing the image build. (fedora-bootc:44's cloud-init 24.x dropped
     # cloud-init.service in favour of cloud-init-network.service; the base image's
     # package presets already enable most of these on install anyway.)
+    systemctl disable mackesd.service 2>/dev/null || true; \
+    rm -f /usr/lib/systemd/system/mackesd.service; \
+    systemctl enable mackesd.target; \
     systemctl enable mde-shell-egui.service; \
     for u in podman.socket qemu-guest-agent.service openvswitch.service \
              cloud-init.target cloud-init-local.service cloud-init-network.service \

@@ -17,26 +17,37 @@ PROFILE="${1:-small}"
 
 install -d -m 0755 \
     /etc/mackesd \
-    /etc/systemd/system/mackesd.service.d \
     /etc/systemd/system/etcd.service.d \
     /etc/systemd/system/nebula.service.d \
     /etc/systemd/system/caddy.service.d \
     /etc/systemd/journald.conf.d \
     /etc/sysctl.d
 
-cat >/etc/systemd/system/mackesd.service.d/20-small-lighthouse.conf <<'UNIT'
-[Service]
-# Keep the relay daemon below the 512 MiB host ceiling while leaving room for
-# etcd, Nebula and the Fedora base.  Swap is an emergency cushion, not a cache.
-Environment=MDE_LIGHTHOUSE_PROFILE=small
+cat >/etc/systemd/system/mackesd-small.slice <<'UNIT'
+[Unit]
+Description=Aggregate resource budget for grouped mackesd on a small lighthouse
+
+[Slice]
+# Preserve the old monolith's aggregate budget across all six process groups.
 MemoryAccounting=true
 MemoryHigh=240M
 MemoryMax=320M
 MemorySwapMax=256M
 CPUQuota=100%
 TasksMax=512
+UNIT
+
+for mackesd_group in control observation actions data compute integrations; do
+    install -d -m 0755 "/etc/systemd/system/mackesd-${mackesd_group}.service.d"
+    cat >"/etc/systemd/system/mackesd-${mackesd_group}.service.d/20-small-lighthouse.conf" <<'UNIT'
+[Service]
+Environment=MDE_LIGHTHOUSE_PROFILE=small
+Slice=mackesd-small.slice
 OOMScoreAdjust=200
 UNIT
+done
+rm -f /etc/systemd/system/mackesd.service.d/20-small-lighthouse.conf
+rmdir /etc/systemd/system/mackesd.service.d 2>/dev/null || true
 
 cat >/etc/systemd/system/etcd.service.d/20-small-lighthouse.conf <<'UNIT'
 [Service]
@@ -117,9 +128,9 @@ systemctl daemon-reload
 sysctl --system >/dev/null 2>&1 || true
 # Reload limits immediately when bootstrap already started the services; a
 # future boot applies them even if a service is currently absent.
-systemctl try-restart nebula.service etcd.service caddy.service mackesd.service \
+systemctl try-restart nebula.service etcd.service caddy.service mackesd.target \
     >/dev/null 2>&1 || true
-systemctl enable nebula.service mackesd.service mesh-health.timer >/dev/null 2>&1 || true
+systemctl enable nebula.service mackesd.target mesh-health.timer >/dev/null 2>&1 || true
 
 install -m 0644 /dev/null /etc/mackesd/lighthouse-profile
 printf '%s\n' 'small' >/etc/mackesd/lighthouse-profile

@@ -6,3 +6,5 @@
 # "enable" here never lights a seat on a Lighthouse.
 enable mde-shell-egui.service
 enable podman.socket
+enable mackesd.target
+disable mackesd.service

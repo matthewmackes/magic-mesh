@@ -1,0 +1,51 @@
+[Unit]
+Description=MCNF control-plane daemon (actions group)
+Documentation=https://github.com/matthewmackes/magic-mesh
+PartOf=mackesd.target
+Requires=mackesd-control.service
+After=network-online.target nebula.service mackesd-control.service
+OnFailure=mesh-alert@%n.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+WatchdogSec=180
+Environment=MDE_BUS_ROOT=/run/mde-bus
+Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
+Environment=MCNF_REPO=/opt/mcnf
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+ExecStartPre=-/usr/bin/install -d -m 0700 /var/lib/mackesd
+ExecStart=/usr/bin/mackesd serve --group actions
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=90
+TimeoutStopFailureMode=terminate
+CapabilityBoundingSet=~CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_BOOT CAP_SYS_TIME
+CapabilityBoundingSet=~CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_AUDIT_WRITE
+CapabilityBoundingSet=~CAP_MAC_ADMIN CAP_MAC_OVERRIDE
+CapabilityBoundingSet=~CAP_BLOCK_SUSPEND CAP_WAKE_ALARM CAP_LEASE CAP_LINUX_IMMUTABLE
+CapabilityBoundingSet=~CAP_SYS_PACCT CAP_SYS_TTY_CONFIG CAP_IPC_LOCK
+ProtectSystem=true
+PrivateTmp=true
+MountFlags=shared
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+LimitNOFILE=65536
+TasksMax=512
+CPUAccounting=true
+CPUQuota=100%
+IOWeight=200
+MemoryAccounting=true
+MemoryHigh=384M
+MemoryMax=512M

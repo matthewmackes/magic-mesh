@@ -309,7 +309,9 @@ mod music_action_auth {
             .trim();
         let bytes = decode_hex(text)
             .filter(|bytes| bytes.len() == 32)
-            .ok_or_else(|| "music action public key must encode 32 hexadecimal bytes".to_string())?;
+            .ok_or_else(|| {
+                "music action public key must encode 32 hexadecimal bytes".to_string()
+            })?;
         let bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|_| "music action public key must encode 32 bytes".to_string())?;
@@ -1295,13 +1297,7 @@ fn podcast_episode_catalog_item(
     parent_title: &str,
 ) -> Option<CatalogItem> {
     Some(CatalogItem {
-        id: normalized_identity(
-            ContentKind::Episode,
-            &episode.title,
-            "",
-            parent_title,
-            None,
-        ),
+        id: normalized_identity(ContentKind::Episode, &episode.title, "", parent_title, None),
         kind: ContentKind::Episode,
         title: episode.title.clone(),
         creator: String::new(),
@@ -1484,11 +1480,7 @@ fn record_catalog_response(dir: &Path, client: &Client, verb: &str, body: &str, 
     }
 
     match verb {
-        "list-albums"
-        | "albums-by-genre"
-        | "albums-by-artist"
-        | "get-artist"
-        | "get-album" => {
+        "list-albums" | "albums-by-genre" | "albums-by-artist" | "get-artist" | "get-album" => {
             let starred = false;
             merge_catalog_items(
                 &mut file.albums,
@@ -1566,37 +1558,29 @@ fn record_catalog_response(dir: &Path, client: &Client, verb: &str, body: &str, 
                 .filter_map(|station| radio_catalog_item(&source_id, station))
                 .collect(),
         ),
-        "podcast-episodes" => merge_catalog_items(
-            &mut file.episodes,
-            {
-                let channel_id = serde_json::from_str::<Value>(body)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
+        "podcast-episodes" => merge_catalog_items(&mut file.episodes, {
+            let channel_id = serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            let parent_title = file
+                .podcasts
+                .iter()
+                .find(|podcast| {
+                    podcast.variants.iter().any(|variant| {
+                        variant.content.source_id == source_id
+                            && variant.content.remote_id == channel_id
                     })
-                    .unwrap_or_default();
-                let parent_title = file
-                    .podcasts
-                    .iter()
-                    .find(|podcast| {
-                        podcast.variants.iter().any(|variant| {
-                            variant.content.source_id == source_id
-                                && variant.content.remote_id == channel_id
-                        })
-                    })
-                    .map(|podcast| podcast.title.as_str())
-                    .unwrap_or_default();
-                decode_catalog_rows::<crate::airsonic::PodcastEpisode>(result, "episodes")
-                    .iter()
-                    .filter_map(|episode| {
-                        podcast_episode_catalog_item(&source_id, episode, parent_title)
-                    })
-                    .collect()
-            },
-        ),
+                })
+                .map(|podcast| podcast.title.as_str())
+                .unwrap_or_default();
+            decode_catalog_rows::<crate::airsonic::PodcastEpisode>(result, "episodes")
+                .iter()
+                .filter_map(|episode| {
+                    podcast_episode_catalog_item(&source_id, episode, parent_title)
+                })
+                .collect()
+        }),
         "get-song" => {
             if let Some(song) = result.get("song").and_then(|value| {
                 serde_json::from_value::<crate::airsonic::Song>(value.clone()).ok()
@@ -2012,6 +1996,104 @@ pub const TRANSPORT_VERBS: [&str; 7] = [
 /// state files (`music-state-by-peer/`, handoff intents) and need neither
 /// the engine nor the airsonic client.
 pub const PEER_VERBS: [&str; 2] = ["peer-states", "take-over"];
+
+/// Last-seen control cursors at the instant a renderer fails. A replacement
+/// renderer may continue playback only if no queue or transport request was
+/// observed in the meantime. This deliberately includes refused controls: an
+/// operator pressing Stop while audio is unavailable must never be surprised
+/// by an automatic restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlMarker(Vec<(String, String)>);
+
+fn control_marker(cursors: &HashMap<String, String>) -> ControlMarker {
+    let mut topics = ACTION_VERBS
+        .iter()
+        .copied()
+        .filter(|verb| *verb != "get-queue")
+        .chain(
+            TRANSPORT_VERBS
+                .iter()
+                .copied()
+                .filter(|verb| *verb != "get-state"),
+        )
+        .map(|verb| format!("action/music/{verb}"))
+        .collect::<Vec<_>>();
+    topics.push(format!("action/music/{WORKSPACE_ACTION_VERB}"));
+    topics.sort_unstable();
+    ControlMarker(
+        topics
+            .into_iter()
+            .map(|topic| {
+                let cursor = cursors.get(&topic).cloned().unwrap_or_default();
+                (topic, cursor)
+            })
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct InterruptedPlayback {
+    generation: u64,
+    queue: Queue,
+    position_ms: u64,
+    controls: ControlMarker,
+}
+
+#[derive(Debug, Default)]
+struct RendererRecovery {
+    generation: u64,
+    pending: Option<InterruptedPlayback>,
+}
+
+impl RendererRecovery {
+    fn advance_generation(&mut self) -> Option<u64> {
+        self.generation = self.generation.checked_add(1)?;
+        Some(self.generation)
+    }
+
+    fn capture(&mut self, queue: Queue, position_ms: Option<u64>, controls: ControlMarker) {
+        self.pending = None;
+        let Some(generation) = self.advance_generation() else {
+            return;
+        };
+        if position_ms.is_some() && queue.current().is_some() {
+            self.pending = Some(InterruptedPlayback {
+                generation,
+                queue,
+                position_ms: position_ms.unwrap_or_default(),
+                controls,
+            });
+        }
+    }
+
+    fn invalidate_if_controls_changed(&mut self, controls: &ControlMarker) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| &pending.controls != controls)
+        {
+            self.pending = None;
+            let _ = self.advance_generation();
+        }
+    }
+
+    fn resumable(&self, queue: &Queue, engine_idle: bool) -> Option<&InterruptedPlayback> {
+        self.pending.as_ref().filter(|pending| {
+            engine_idle && pending.generation == self.generation && pending.queue == *queue
+        })
+    }
+
+    fn complete(&mut self, generation: u64) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.pending = None;
+            let _ = self.advance_generation();
+        }
+    }
+}
 
 /// Authoritative-state write cadence while playing (AIR-8's 5 s heartbeat,
 /// so a stale owner frees the mesh after `STATE_STALE_MS`).
@@ -2620,11 +2702,7 @@ fn dispatch_browse(
             "list-albums" => {
                 let request = browse_page_request(body);
                 client
-                    .get_album_list2_page(
-                        "newest",
-                        request.size as u32,
-                        request.offset as u32,
-                    )
+                    .get_album_list2_page("newest", request.size as u32, request.offset as u32)
                     .await
                     .map(|page| {
                         let has_more = page.albums.len() == page.page_size as usize;
@@ -3934,6 +4012,55 @@ fn handoff_state(queue: &Queue, peer: &str, position_ms: u64) -> MusicState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerHandoffAction {
+    Yield(state::HandoffIntent),
+    AwaitTarget,
+    RetireCommitted,
+    Reclaim(state::HandoffCompletion),
+}
+
+/// Decide the source side of the one-use handoff lease. Once a completion is
+/// durable the source must not pause/yield a second time. If the target never
+/// commits an honest playing state, expiry returns authority to the source.
+fn owner_handoff_action(
+    intent: state::HandoffIntent,
+    completions: &[state::HandoffCompletion],
+    peer_states: &[MusicState],
+    now_ms: u64,
+) -> OwnerHandoffAction {
+    completions
+        .iter()
+        .find(|completion| completion.intent_id == intent.intent_id)
+        .map_or(OwnerHandoffAction::Yield(intent), |completion| {
+            let target_committed = peer_states.iter().any(|peer| {
+                peer.peer == completion.from_peer
+                    && peer.playing
+                    && peer.updated_ms >= completion.completed_ms
+                    && peer.song_id == completion.song_id
+            });
+            if target_committed {
+                OwnerHandoffAction::RetireCommitted
+            } else if now_ms > completion.expires_ms {
+                OwnerHandoffAction::Reclaim(completion.clone())
+            } else {
+                OwnerHandoffAction::AwaitTarget
+            }
+        })
+}
+
+/// Admit only the exact queue carried by a fresh, target-owned one-use
+/// completion. Callers must re-run this immediately before starting audio.
+fn admitted_handoff_queue(
+    completion: &state::HandoffCompletion,
+    intents: &[state::HandoffIntent],
+    target_peer: &str,
+    now_ms: u64,
+) -> Option<Queue> {
+    state::completion_matches_intent(completion, intents, target_peer, now_ms)
+        .then(|| completion.queue.clone())
+}
+
 /// Yield the local engine to the newest admitted takeover intent. The intent
 /// remains beside the durable completion until the requester consumes both;
 /// that binding prevents a stale or spoofed completion from authorizing a
@@ -3947,20 +4074,62 @@ fn apply_pending_handoff(engine: Option<&Engine>, queue_path: &Path) {
     let Some(intent) = state::pending_takeover_for(&intents, &my_host) else {
         return;
     };
-    // Do not rewrite a completion that is waiting for its requester. Keeping
-    // the intent live makes it the authorization record for the target-side
-    // consumer and keeps retries idempotent across responder sweeps.
-    if state::read_completions(&dir)
-        .iter()
-        .any(|completion| completion.intent_id == intent.intent_id)
-    {
-        return;
+    let completions = state::read_completions(&dir);
+    let peer_states = state::read_all_peer_states(&dir);
+    match owner_handoff_action(intent.clone(), &completions, &peer_states, state::now_ms()) {
+        OwnerHandoffAction::AwaitTarget => return,
+        OwnerHandoffAction::RetireCommitted => {
+            state::clear_intent(&dir, &intent.intent_id);
+            state::clear_completion(&dir, &intent.intent_id);
+            return;
+        }
+        OwnerHandoffAction::Reclaim(completion) => {
+            let queue = queue::read_from(queue_path);
+            if queue != completion.queue || !engine.is_active() {
+                state::clear_intent(&dir, &completion.intent_id);
+                state::clear_completion(&dir, &completion.intent_id);
+                let _ = state::write_state(
+                    &dir,
+                    &handoff_state(&queue, &my_host, engine.position_ms()),
+                );
+                tracing::warn!(
+                    intent_id = %completion.intent_id,
+                    "expired music handoff was retired without resume because source identity changed"
+                );
+                return;
+            }
+            let position_ms = completion.position_ms;
+            let reclaimed = MusicState {
+                peer: my_host,
+                playing: true,
+                song_id: queue.current().unwrap_or_default().to_string(),
+                position_ms,
+                updated_ms: state::now_ms(),
+            };
+            if let Err(error) = state::write_state(&dir, &reclaimed) {
+                tracing::warn!(%error, intent_id = %completion.intent_id, "expired music handoff could not restore source authority; retaining lease for retry");
+                return;
+            }
+            state::clear_intent(&dir, &completion.intent_id);
+            state::clear_completion(&dir, &completion.intent_id);
+            engine.resume();
+            tracing::warn!(
+                intent_id = %completion.intent_id,
+                song_id = %reclaimed.song_id,
+                position_ms,
+                "music handoff target did not commit; source reclaimed sole playback authority"
+            );
+            return;
+        }
+        OwnerHandoffAction::Yield(_) if !engine.is_playing() => return,
+        OwnerHandoffAction::Yield(_) => {}
     }
     let queue = queue::read_from(queue_path);
     let position_ms = engine.position_ms();
     engine.pause();
     let snapshot = handoff_state(&queue, &my_host, position_ms);
     if let Err(error) = state::write_state(&dir, &snapshot) {
+        engine.resume();
         tracing::warn!(%error, intent_id = %intent.intent_id, "music handoff state could not be persisted; retaining intent");
         return;
     }
@@ -3969,10 +4138,24 @@ fn apply_pending_handoff(engine: Option<&Engine>, queue_path: &Path) {
         from_peer: intent.from_peer.clone(),
         owner_peer: my_host.clone(),
         song_id: snapshot.song_id.clone(),
+        queue: queue.clone(),
         position_ms: snapshot.position_ms,
         completed_ms: snapshot.updated_ms,
+        expires_ms: snapshot
+            .updated_ms
+            .saturating_add(state::HANDOFF_ACK_TIMEOUT_MS),
     };
     if let Err(error) = state::write_completion(&dir, &completion) {
+        let restored = MusicState {
+            peer: my_host,
+            playing: true,
+            song_id: snapshot.song_id,
+            position_ms: snapshot.position_ms,
+            updated_ms: state::now_ms(),
+        };
+        if state::write_state(&dir, &restored).is_ok() {
+            engine.resume();
+        }
         tracing::warn!(%error, intent_id = %intent.intent_id, "music handoff completion could not be persisted; retaining intent");
         return;
     }
@@ -3996,8 +4179,9 @@ fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients
     let dir = state::coordination_dir();
     let my_host = state::local_host();
     let intents = state::read_intents(&dir);
+    let now_ms = state::now_ms();
     for completion in state::read_completions(&dir) {
-        if !state::completion_matches_intent(&completion, &intents, &my_host) {
+        if !state::completion_matches_intent(&completion, &intents, &my_host, now_ms) {
             tracing::warn!(
                 intent_id = %completion.intent_id,
                 from_peer = %completion.from_peer,
@@ -4007,20 +4191,11 @@ fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients
             state::clear_completion(&dir, &completion.intent_id);
             continue;
         }
-        let mut queue = queue::read_from(queue_path);
-        let Some(queue_index) = queue
-            .songs
-            .iter()
-            .position(|song_id| song_id == &completion.song_id)
-        else {
-            tracing::warn!(
-                intent_id = %completion.intent_id,
-                song_id = %completion.song_id,
-                "music handoff completion does not match the local queue; retaining it"
-            );
+        let previous_queue = queue::read_from(queue_path);
+        let Some(queue) = admitted_handoff_queue(&completion, &intents, &my_host, now_ms) else {
+            state::clear_completion(&dir, &completion.intent_id);
             continue;
         };
-        queue.current = queue_index;
         if queue::write_to(queue_path, &queue).is_err() {
             tracing::warn!(intent_id = %completion.intent_id, "music handoff queue could not be persisted; retaining completion");
             continue;
@@ -4033,14 +4208,27 @@ fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients
                     .collect::<Vec<_>>()
             })
         } else {
-            let catalog = load_catalog(&dir).unwrap_or_default();
+            let catalog = load_catalog(&state::data_dir()).unwrap_or_default();
             source_aware_upcoming_candidates(&queue, clients, &catalog)
         };
         let Some(upcoming) = upcoming.filter(|tracks| !tracks.is_empty()) else {
+            let _ = queue::write_to(queue_path, &previous_queue);
             tracing::warn!(intent_id = %completion.intent_id, "music handoff target has no admitted playback source; retaining completion");
             continue;
         };
+        // Revalidate the one-use lease immediately before acquiring audible
+        // authority. This closes the potentially slow source-resolution window
+        // and makes an expired or source-reclaimed transfer fail closed.
+        let current_intents = state::read_intents(&dir);
+        if admitted_handoff_queue(&completion, &current_intents, &my_host, state::now_ms()).as_ref()
+            != Some(&queue)
+        {
+            let _ = queue::write_to(queue_path, &previous_queue);
+            state::clear_completion(&dir, &completion.intent_id);
+            continue;
+        }
         if !engine.play_from_candidates_at(upcoming, queue.current, completion.position_ms) {
+            let _ = queue::write_to(queue_path, &previous_queue);
             tracing::warn!(intent_id = %completion.intent_id, "music handoff target could not start the native engine; retaining completion");
             continue;
         }
@@ -4052,7 +4240,10 @@ fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients
             updated_ms: state::now_ms(),
         };
         if let Err(error) = state::write_state(&dir, &target_state) {
-            tracing::warn!(%error, intent_id = %completion.intent_id, "music handoff target state could not be persisted; heartbeat will repair it");
+            engine.pause();
+            let _ = queue::write_to(queue_path, &previous_queue);
+            tracing::warn!(%error, intent_id = %completion.intent_id, "music handoff target state could not be persisted; audible authority revoked and completion retained");
+            continue;
         }
         // Retire the authorization record first. If cleanup is interrupted
         // after this point, the completion is no longer eligible for replay.
@@ -4717,6 +4908,52 @@ fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
     }
 }
 
+/// Continue finite media after the daemon has acquired a replacement physical
+/// renderer. The recovery record is consumed only after the exact queue and
+/// control generation still match and the fresh engine accepts the seeked
+/// source list. Source unavailability leaves the intent pending for a later
+/// bounded sweep; any user control invalidates it permanently.
+fn resume_interrupted_playback(
+    recovery: &mut RendererRecovery,
+    engine: Option<&Engine>,
+    queue_path: &Path,
+    clients: &[&Client],
+    controls: &ControlMarker,
+) -> bool {
+    recovery.invalidate_if_controls_changed(controls);
+    let Some(engine) = engine else { return false };
+    let queue = queue::read_from(queue_path);
+    let Some(interrupted) = recovery.resumable(&queue, !engine.is_active()).cloned() else {
+        return false;
+    };
+    let upcoming = if clients.is_empty() {
+        cached_upcoming_tracks(&queue, &crate::cache::cache_dir()).map(|tracks| {
+            tracks
+                .into_iter()
+                .map(|(url, codec)| PlaybackTrack::single(url, codec))
+                .collect::<Vec<_>>()
+        })
+    } else {
+        let catalog = load_catalog(&state::data_dir()).unwrap_or_default();
+        source_aware_upcoming_candidates(&queue, clients, &catalog)
+    };
+    let Some(upcoming) = upcoming else {
+        return false;
+    };
+    if !engine.play_from_candidates_at(upcoming, queue.current, interrupted.position_ms) {
+        return false;
+    }
+    write_playback_state(true, queue.current().unwrap_or(""), interrupted.position_ms);
+    recovery.complete(interrupted.generation);
+    tracing::info!(
+        generation = interrupted.generation,
+        song_id = queue.current().unwrap_or(""),
+        position_ms = interrupted.position_ms,
+        "music playback continued on replacement physical renderer"
+    );
+    true
+}
+
 /// Run the Bus responder loop.
 ///
 /// Polls the queue-control, library-browse, and transport
@@ -4847,6 +5084,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             state::coordination_dir(),
         )
     });
+    let mut renderer_recovery = RendererRecovery::default();
     let mut workspace_revision = match load_workspace_revision(&state::data_dir()) {
         Ok(revision) => Some(revision),
         Err(error) => {
@@ -4913,6 +5151,37 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         std::thread::sleep(remaining.min(Duration::from_millis(20)));
     }
     while !should_stop() {
+        // MUSIC-RENDERER-RECOVERY-1 — a cpal stream can fail after successful
+        // startup when PipeWire restarts or the default device disappears.
+        // Retaining that Engine would advertise audio_available forever while
+        // its callback can no longer emit samples. Revoke the old MPRIS/control
+        // surface and let the existing bounded acquisition cadence create a
+        // completely fresh stream against the current default device.
+        if engine
+            .as_ref()
+            .is_some_and(|current| !current.is_renderer_healthy())
+        {
+            let interrupted_position_ms = engine
+                .as_ref()
+                .and_then(|current| current.interrupted_position_ms());
+            let interrupted_queue = queue::read_from(queue_path);
+            renderer_recovery.capture(
+                interrupted_queue.clone(),
+                interrupted_position_ms,
+                control_marker(&cursors),
+            );
+            write_playback_state(
+                false,
+                interrupted_queue.current().unwrap_or(""),
+                interrupted_position_ms.unwrap_or_default(),
+            );
+            tracing::warn!(
+                "audio renderer became unavailable — playback disabled pending bounded reacquisition"
+            );
+            _mpris = None;
+            engine = None;
+            last_audio_retry = Instant::now();
+        }
         if engine.is_none() && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL {
             last_audio_retry = Instant::now();
             if let Ok(e) = Engine::new() {
@@ -4982,6 +5251,13 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         poll_peers_with_authorizer(&persist, &mut cursors, &authorizer);
         apply_pending_handoff(engine.as_ref(), queue_path);
         apply_handoff_completions(engine.as_ref(), queue_path, &clients);
+        let _ = resume_interrupted_playback(
+            &mut renderer_recovery,
+            engine.as_ref(),
+            queue_path,
+            &clients,
+            &control_marker(&cursors),
+        );
         if browse_poll_due || last_browse_poll.elapsed() >= BROWSE_POLL_INTERVAL {
             poll_browse_with_clients(&persist, &rt, &mut cursors, &clients, &authorizer);
             last_browse_poll = Instant::now();
@@ -5175,6 +5451,48 @@ mod tests {
 
     const AUTH_KEY: &[u8] = b"music-action-auth-test-key";
     const AUTH_NOW_MS: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn renderer_recovery_refuses_stale_generation_after_intervening_control() {
+        let queue = Queue {
+            songs: vec!["interrupted-track".to_string(), "next-track".to_string()],
+            current: 0,
+        };
+        let before = ControlMarker(vec![(
+            "action/music/stop".to_string(),
+            "01-before".to_string(),
+        )]);
+        let after_stop = ControlMarker(vec![(
+            "action/music/stop".to_string(),
+            "02-hostile-stop".to_string(),
+        )]);
+        let mut recovery = RendererRecovery::default();
+        recovery.capture(queue.clone(), Some(42_000), before);
+        let stale_generation = recovery
+            .resumable(&queue, true)
+            .expect("finite interrupted playback is initially resumable")
+            .generation;
+
+        recovery.invalidate_if_controls_changed(&after_stop);
+        assert!(
+            recovery.resumable(&queue, true).is_none(),
+            "a Stop observed while the renderer is absent must cancel continuation"
+        );
+
+        recovery.capture(queue.clone(), Some(43_000), after_stop);
+        recovery.complete(stale_generation);
+        let current = recovery
+            .resumable(&queue, true)
+            .expect("a stale completion cannot consume the newer generation");
+        assert_ne!(current.generation, stale_generation);
+
+        let mut replaced_queue = queue;
+        replaced_queue.songs[0] = "operator-selected-track".to_string();
+        assert!(
+            recovery.resumable(&replaced_queue, true).is_none(),
+            "continuation must retain the exact interrupted queue identity"
+        );
+    }
 
     #[test]
     fn bookmark_projection_keeps_resume_position_and_rejects_unknown_media() {
@@ -5616,6 +5934,141 @@ mod tests {
         assert!(!snapshot.playing);
         assert_eq!(snapshot.song_id, "song-b");
         assert_eq!(snapshot.position_ms, 42_500);
+    }
+
+    #[test]
+    fn two_seat_handoff_is_exact_once_replay_safe_and_failure_honest() {
+        let source_queue = Queue {
+            songs: vec![
+                "admitted-before".into(),
+                "admitted-current".into(),
+                "admitted-after".into(),
+            ],
+            current: 1,
+        };
+        let intent = state::HandoffIntent {
+            intent_id: "two-seat-transfer-1".into(),
+            from_peer: "target-seat".into(),
+            to_peer: Some("source-seat".into()),
+            issued_ms: 1_000,
+        };
+        let completion = state::HandoffCompletion {
+            intent_id: intent.intent_id.clone(),
+            from_peer: intent.from_peer.clone(),
+            owner_peer: "source-seat".into(),
+            song_id: "admitted-current".into(),
+            queue: source_queue.clone(),
+            position_ms: 42_500,
+            completed_ms: 1_001,
+            expires_ms: 1_001 + state::HANDOFF_ACK_TIMEOUT_MS,
+        };
+
+        let mut source_yields = 0;
+        let mut source_playing = true;
+        let mut target_playing = false;
+        if matches!(
+            owner_handoff_action(intent.clone(), &[], &[], 1_000),
+            OwnerHandoffAction::Yield(_)
+        ) {
+            source_yields += 1;
+            source_playing = false;
+        }
+        assert!(!source_playing && !target_playing);
+        for now_ms in [1_001, 1_002, completion.expires_ms] {
+            assert_eq!(
+                owner_handoff_action(
+                    intent.clone(),
+                    std::slice::from_ref(&completion),
+                    &[],
+                    now_ms,
+                ),
+                OwnerHandoffAction::AwaitTarget,
+                "a durable completion must suppress duplicate source yields"
+            );
+        }
+        assert_eq!(source_yields, 1, "source owner must yield exactly once");
+
+        let resumed_queue = admitted_handoff_queue(
+            &completion,
+            std::slice::from_ref(&intent),
+            "target-seat",
+            1_002,
+        )
+        .expect("fresh target-owned transfer is admitted");
+        assert_eq!(resumed_queue, source_queue);
+        assert_eq!(resumed_queue.current(), Some("admitted-current"));
+        assert_eq!(completion.position_ms, 42_500);
+        target_playing = true;
+        assert_ne!(source_playing, target_playing, "success has one owner");
+        let target_commit = MusicState {
+            peer: "target-seat".into(),
+            playing: true,
+            song_id: "admitted-current".into(),
+            position_ms: 42_500,
+            updated_ms: 1_003,
+        };
+        assert_eq!(
+            owner_handoff_action(
+                intent.clone(),
+                std::slice::from_ref(&completion),
+                std::slice::from_ref(&target_commit),
+                completion.expires_ms + 1,
+            ),
+            OwnerHandoffAction::RetireCommitted,
+            "delayed cleanup must not let the source split authority after target commit"
+        );
+
+        let mut target_refused = target_commit.clone();
+        target_refused.playing = false;
+        assert!(
+            matches!(
+                owner_handoff_action(
+                    intent.clone(),
+                    std::slice::from_ref(&completion),
+                    std::slice::from_ref(&target_refused),
+                    completion.expires_ms + 1,
+                ),
+                OwnerHandoffAction::Reclaim(candidate) if candidate == completion
+            ),
+            "an idle target state is not proof that audible authority transferred"
+        );
+
+        assert!(
+            admitted_handoff_queue(&completion, &[], "target-seat", 1_003).is_none(),
+            "a consumed completion cannot replay without its one-use intent"
+        );
+        let superseding = state::HandoffIntent {
+            intent_id: "two-seat-transfer-2".into(),
+            issued_ms: 1_004,
+            ..intent.clone()
+        };
+        assert!(
+            admitted_handoff_queue(
+                &completion,
+                &[intent.clone(), superseding],
+                "target-seat",
+                1_004,
+            )
+            .is_none(),
+            "a completion from a superseded transfer cannot seize authority"
+        );
+
+        // Hostile target-start failure: no target heartbeat is committed and
+        // the completion remains. At lease expiry the production source-side
+        // decision restores the paused source, leaving exactly one honest
+        // playing owner instead of silent or split-brain authority.
+        target_playing = false;
+        assert!(matches!(
+            owner_handoff_action(
+                intent,
+                std::slice::from_ref(&completion),
+                &[],
+                completion.expires_ms + 1,
+            ),
+            OwnerHandoffAction::Reclaim(candidate) if candidate == completion
+        ));
+        source_playing = true;
+        assert_ne!(source_playing, target_playing, "failure leaves one owner");
     }
 
     #[test]
@@ -6511,7 +6964,10 @@ mod tests {
         for (cover_id, path) in [
             ("feed-art", "/var/cache/mde/music/artwork/feed-art.jpg"),
             ("radio-art", "/var/cache/mde/music/artwork/radio-art.jpg"),
-            ("episode-art", "/var/cache/mde/music/artwork/episode-art.jpg"),
+            (
+                "episode-art",
+                "/var/cache/mde/music/artwork/episode-art.jpg",
+            ),
         ] {
             record_catalog_response(
                 dir.path(),
@@ -6632,12 +7088,7 @@ mod tests {
         assert_eq!(file.albums.len(), 1);
         assert_eq!(
             file.albums[0].variants[0].content,
-            ContentRef::new(
-                "airsonic:http://music.test",
-                "album-1",
-                ContentKind::Album
-            )
-            .unwrap()
+            ContentRef::new("airsonic:http://music.test", "album-1", ContentKind::Album).unwrap()
         );
         assert!(file.songs.iter().any(|item| {
             item.kind == ContentKind::Music
@@ -6653,10 +7104,7 @@ mod tests {
                 && item.variants.len() == 1
                 && item.variants[0].content.source_id == "airsonic:http://music.test"
         }));
-        assert_eq!(
-            file.episodes[0].variants[0].content.remote_id,
-            "episode-0"
-        );
+        assert_eq!(file.episodes[0].variants[0].content.remote_id, "episode-0");
 
         let snapshot = workspace_snapshot_from_dir(&Queue::default(), None, 10, dir.path());
         let episodes = snapshot

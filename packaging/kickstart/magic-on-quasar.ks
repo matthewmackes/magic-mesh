@@ -58,8 +58,8 @@ rootpw --lock
 #     assets ~L675-682; post_install_script enables the oneshot ~L823) whose loader
 #     install-helpers/setup-selinux-policy.sh persists SELINUX=enforcing, loads
 #     magicmesh-base.cil, and — when the current boot is PERMISSIVE — runs
-#     `setenforce 1` (its L77). Plus two confined ENFORCING browser domains
-#     (mde_web_preview_t / mde_web_cef_t) that self-skip ONLY where SELinux is off.
+#     `setenforce 1` (its L77). Browser engines are confined to Browser VMs and
+#     therefore require no host Browser policy domains.
 #   - `--disabled` installed the filesystem UNLABELED and defeated all of the
 #     above: the oneshot would still rewrite the config to enforcing, so the NEXT
 #     reboot would try to come up Enforcing on an unlabeled FS — a brick risk on an
@@ -193,7 +193,7 @@ if [ -f /etc/magic-mesh/join-token ]; then
   cat > /etc/systemd/system/mde-firstboot-join.service <<'UNIT'
 [Unit]
 Description=MCNF firstboot auto-join (single-use bearer)
-After=network-online.target mackesd.service
+After=network-online.target mackesd.target
 Wants=network-online.target
 ConditionPathExists=/etc/magic-mesh/join-token
 

@@ -10,7 +10,7 @@
 
 [Unit]
 Description=RTPengine media relay (MCNF voice instance)
-After=network-online.target mackesd.service
+After=network-online.target mackesd.target
 Wants=network-online.target
 
 [Service]
@@ -23,7 +23,7 @@ PIDFile=/run/rtpengine-mde.pid
 Restart=on-failure
 RestartSec=5
 
-# Hardening (mirrors mackesd.service's EFF-12 baseline).
+# Hardening (mirrors the grouped mackesd service baseline).
 ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true

@@ -75,7 +75,8 @@ avoids the dnf channel. Everything else fails **typed** (rc 3, above).
 
 The image enables **`mde-shell-egui.service`** (new, this directory) +
 **`podman.socket`**, sets `graphical.target`, and inherits the RPM
-post-install's all-roles set: `mackesd.service`, `nebula.service` (+ the
+post-install's all-roles set: `mackesd.target` and its six process groups,
+`nebula.service` (+ the
 `nebula.service.d/10-mesh-recovery.conf` drop-in), `mesh-health.timer`,
 `mesh-status.timer`, `magic-setup.service` (first-run wizard),
 the first-boot fetch oneshots
@@ -162,7 +163,7 @@ alongside the RPM channel publish (/release).
   live with an RFC-2606 `.invalid` registry → `GATED[E12-13/base-image]`,
   rc 3.
 - Every doctrine claim grep-verified at source: role regex ≡
-  `mde-shell-egui.service`; bus/workgroup env pins ≡ `mackesd.service`;
+  `mde-shell-egui.service`; bus/workgroup env pins ≡ the grouped mackesd units;
   the enabled-unit set ≡ the RPM `post_install_script`; tmpfiles + `/etc`
   unit + `.repo` destinations ≡ the `generate-rpm` assets.
 

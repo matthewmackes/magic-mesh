@@ -13,18 +13,18 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mackes_mesh_types::workloads::{
-    HostCapacity, MAX_WORKLOAD_WIRE_BYTES, WORKLOAD_CONTRACT_SCHEMA_VERSION,
-    WORKLOAD_OPERATION_TOPIC, WorkloadAdmission, WorkloadAttachmentLease,
-    WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction,
+    admit_workload_for_backend, workload_state_topic, HostCapacity, WorkloadAdmission,
+    WorkloadAttachmentLease, WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction,
     WorkloadOperationErrorCode, WorkloadOperationPhase, WorkloadOperationReply,
     WorkloadOperationRequest, WorkloadOperationStatus, WorkloadPowerState, WorkloadReadiness,
     WorkloadRuntimeSignals, WorkloadStateSnapshot, WorkloadStorageCapacity,
-    admit_workload_for_backend, workload_state_topic,
+    MAX_WORKLOAD_WIRE_BYTES, WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -32,13 +32,13 @@ use mde_bus::rpc::reply_topic;
 use sha2::{Digest, Sha256};
 
 use super::cloud::{
-    DEFAULT_AUTH_ROOT, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict, claim_nonce,
-    verify_token,
+    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
+    DEFAULT_AUTH_ROOT,
 };
-use super::proc::{DEFAULT_CMD_TIMEOUT, output_with_timeout, status_with_timeout};
+use super::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::{ShutdownToken, Worker};
 use crate::display1_broker::{
-    DISPLAY1_SOCKET_ROOT, Display1AttachmentServer, Display1Peer, register_display1_listener,
+    register_display1_listener, Display1AttachmentServer, Display1Peer, DISPLAY1_SOCKET_ROOT,
 };
 use crate::workload_reconciler::WorkloadOperationLedger;
 
@@ -167,6 +167,183 @@ pub trait WorkloadActuator: Send + Sync {
     /// no-op. The compute worker calls it after reconciling in-flight work so
     /// a recovered lease can be refreshed before stale resources are removed.
     fn reap_expired(&self, _now_ms: u64) {}
+
+    /// Capture the current libvirt definition before the source is stopped.
+    fn migration_capture_definition(&self, _vm_id: &str) -> Result<String, WorkloadActuatorError> {
+        Err(WorkloadActuatorError::Permanent(
+            "migration definition capture is not supported by this Workload actuator".into(),
+        ))
+    }
+
+    /// Ask libvirt to stop the source domain gracefully.
+    fn migration_request_stop(&self, _vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        Err(WorkloadActuatorError::Permanent(
+            "migration stop is not supported by this Workload actuator".into(),
+        ))
+    }
+
+    /// Return whether libvirt observes the domain in its stopped state.
+    fn migration_is_stopped(&self, _vm_id: &str) -> Result<bool, WorkloadActuatorError> {
+        Err(WorkloadActuatorError::Permanent(
+            "migration observation is not supported by this Workload actuator".into(),
+        ))
+    }
+
+    /// Define the retained XML and start the domain on this node.
+    fn migration_define_and_start(
+        &self,
+        _vm_id: &str,
+        _domain_xml: &str,
+    ) -> Result<(), WorkloadActuatorError> {
+        Err(WorkloadActuatorError::Permanent(
+            "migration define/start is not supported by this Workload actuator".into(),
+        ))
+    }
+
+    /// Remove only the source domain definition after the target commits.
+    fn migration_relinquish_definition(&self, _vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        Err(WorkloadActuatorError::Permanent(
+            "migration definition relinquish is not supported by this Workload actuator".into(),
+        ))
+    }
+}
+
+enum WorkloadMigrationCommand {
+    CaptureDefinition { vm_id: String },
+    RequestStop { vm_id: String },
+    ObserveStopped { vm_id: String },
+    DefineAndStart { vm_id: String, domain_xml: String },
+    RelinquishDefinition { vm_id: String },
+}
+
+enum WorkloadMigrationReply {
+    Definition(String),
+    Stopped(bool),
+    Complete,
+}
+
+struct WorkloadMigrationEnvelope {
+    command: WorkloadMigrationCommand,
+    reply: SyncSender<Result<WorkloadMigrationReply, WorkloadActuatorError>>,
+}
+
+static WORKLOAD_MIGRATION_EXECUTOR: OnceLock<Mutex<Option<SyncSender<WorkloadMigrationEnvelope>>>> =
+    OnceLock::new();
+
+fn migration_executor_registry() -> &'static Mutex<Option<SyncSender<WorkloadMigrationEnvelope>>> {
+    WORKLOAD_MIGRATION_EXECUTOR.get_or_init(|| Mutex::new(None))
+}
+
+/// Command-side handle for cold migration. It has no actuator and cannot
+/// execute libvirt; the receiving [`WorkloadComputeWorker`] owns execution.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkloadMigrationClient;
+
+impl WorkloadMigrationClient {
+    fn dispatch(
+        self,
+        command: WorkloadMigrationCommand,
+    ) -> Result<WorkloadMigrationReply, WorkloadActuatorError> {
+        let (reply_tx, reply_rx) = sync_channel(1);
+        let mut envelope = WorkloadMigrationEnvelope {
+            command,
+            reply: reply_tx,
+        };
+        let deadline = std::time::Instant::now() + DEFAULT_CMD_TIMEOUT;
+        loop {
+            let sender = migration_executor_registry()
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(sender) = sender {
+                match sender.try_send(envelope) {
+                    Ok(()) => {
+                        return reply_rx
+                            .recv_timeout(DEFAULT_CMD_TIMEOUT)
+                            .map_err(|error| {
+                                WorkloadActuatorError::Retryable(format!(
+                                    "Workload migration reconciler reply unavailable: {error}"
+                                ))
+                            })?;
+                    }
+                    Err(TrySendError::Full(returned) | TrySendError::Disconnected(returned)) => {
+                        envelope = returned;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WorkloadActuatorError::Retryable(
+                    "Workload migration reconciler is unavailable".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Ask the reconciler to capture the current domain definition.
+    pub fn capture_definition(self, vm_id: &str) -> Result<String, WorkloadActuatorError> {
+        match self.dispatch(WorkloadMigrationCommand::CaptureDefinition {
+            vm_id: vm_id.to_owned(),
+        })? {
+            WorkloadMigrationReply::Definition(xml) => Ok(xml),
+            _ => Err(WorkloadActuatorError::Permanent(
+                "Workload migration reconciler returned the wrong capture reply".into(),
+            )),
+        }
+    }
+
+    /// Ask the reconciler to request graceful source shutdown.
+    pub fn request_stop(self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        match self.dispatch(WorkloadMigrationCommand::RequestStop {
+            vm_id: vm_id.to_owned(),
+        })? {
+            WorkloadMigrationReply::Complete => Ok(()),
+            _ => Err(WorkloadActuatorError::Permanent(
+                "Workload migration reconciler returned the wrong stop reply".into(),
+            )),
+        }
+    }
+
+    /// Ask the reconciler for the source domain's stopped observation.
+    pub fn is_stopped(self, vm_id: &str) -> Result<bool, WorkloadActuatorError> {
+        match self.dispatch(WorkloadMigrationCommand::ObserveStopped {
+            vm_id: vm_id.to_owned(),
+        })? {
+            WorkloadMigrationReply::Stopped(stopped) => Ok(stopped),
+            _ => Err(WorkloadActuatorError::Permanent(
+                "Workload migration reconciler returned the wrong observation reply".into(),
+            )),
+        }
+    }
+
+    /// Ask the reconciler to define and start a retained migration definition.
+    pub fn define_and_start(
+        self,
+        vm_id: &str,
+        domain_xml: &str,
+    ) -> Result<(), WorkloadActuatorError> {
+        match self.dispatch(WorkloadMigrationCommand::DefineAndStart {
+            vm_id: vm_id.to_owned(),
+            domain_xml: domain_xml.to_owned(),
+        })? {
+            WorkloadMigrationReply::Complete => Ok(()),
+            _ => Err(WorkloadActuatorError::Permanent(
+                "Workload migration reconciler returned the wrong define reply".into(),
+            )),
+        }
+    }
+
+    /// Ask the reconciler to relinquish the committed source definition.
+    pub fn relinquish_definition(self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        match self.dispatch(WorkloadMigrationCommand::RelinquishDefinition {
+            vm_id: vm_id.to_owned(),
+        })? {
+            WorkloadMigrationReply::Complete => Ok(()),
+            _ => Err(WorkloadActuatorError::Permanent(
+                "Workload migration reconciler returned the wrong relinquish reply".into(),
+            )),
+        }
+    }
 }
 
 /// Authorization boundary.  Production verifies a short-lived armed token;
@@ -255,9 +432,13 @@ const DISPLAY1_REGISTRATION_READY: u8 = 2;
 const DISPLAY1_REGISTRATION_FAILED: u8 = 3;
 
 impl Display1AttachmentRuntime {
-    fn start(root: &Path, lease: WorkloadAttachmentLease) -> Result<Arc<Self>, WorkloadActuatorError> {
-        let server = Display1AttachmentServer::start_at(root, lease)
-            .map_err(|error| WorkloadActuatorError::Retryable(format!("start Display1 broker: {error}")))?;
+    fn start(
+        root: &Path,
+        lease: WorkloadAttachmentLease,
+    ) -> Result<Arc<Self>, WorkloadActuatorError> {
+        let server = Display1AttachmentServer::start_at(root, lease).map_err(|error| {
+            WorkloadActuatorError::Retryable(format!("start Display1 broker: {error}"))
+        })?;
         Ok(Arc::new(Self {
             server: Arc::new(server),
             peer: Arc::new(Mutex::new(None)),
@@ -287,7 +468,10 @@ impl Display1AttachmentRuntime {
         let error = Arc::clone(&self.error);
         let shutdown = Arc::clone(&self.shutdown);
         let thread = thread::Builder::new()
-            .name(format!("display1-register-{}", self.server.lease().lease_id))
+            .name(format!(
+                "display1-register-{}",
+                self.server.lease().lease_id
+            ))
             .spawn(move || {
                 let result = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -299,7 +483,9 @@ impl Display1AttachmentRuntime {
                                 Duration::from_secs(5),
                                 register_display1_listener(&qemu_address, sink),
                             ))
-                            .map_err(|_| "QEMU Display1 listener registration timed out".to_string())?
+                            .map_err(|_| {
+                                "QEMU Display1 listener registration timed out".to_string()
+                            })?
                             .map_err(|attach| format!("register QEMU Display1 listener: {attach}"))
                     });
                 match result {
@@ -328,14 +514,16 @@ impl Display1AttachmentRuntime {
                     *slot = Some(thread);
                 } else {
                     self.shutdown.store(true, Ordering::Release);
-                    self.registration.store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
+                    self.registration
+                        .store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
                 }
             }
             Err(error) => {
                 if let Ok(mut slot) = self.error.lock() {
                     *slot = Some(format!("spawn Display1 registration: {error}"));
                 }
-                self.registration.store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
+                self.registration
+                    .store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
             }
         }
     }
@@ -414,10 +602,9 @@ impl SystemWorkloadActuator {
         now_ms: u64,
     ) -> Result<Arc<Display1AttachmentRuntime>, WorkloadActuatorError> {
         let key = request.workload_id.as_str().to_owned();
-        let mut attachments = self
-            .attachments
-            .lock()
-            .map_err(|_| WorkloadActuatorError::Retryable("Display1 attachment store poisoned".into()))?;
+        let mut attachments = self.attachments.lock().map_err(|_| {
+            WorkloadActuatorError::Retryable("Display1 attachment store poisoned".into())
+        })?;
         if let Some(runtime) = attachments.get(&key) {
             if runtime.server.lease().generation == generation
                 && runtime.server.lease().expires_at_ms > now_ms
@@ -427,9 +614,9 @@ impl SystemWorkloadActuator {
             attachments.remove(&key);
         }
         let lease = Self::attachment_lease(request, generation, now_ms);
-        lease
-            .validate(now_ms)
-            .map_err(|error| WorkloadActuatorError::Permanent(format!("invalid Display1 lease: {error}")))?;
+        lease.validate(now_ms).map_err(|error| {
+            WorkloadActuatorError::Permanent(format!("invalid Display1 lease: {error}"))
+        })?;
         let runtime = Display1AttachmentRuntime::start(&self.display1_root, lease)?;
         attachments.insert(key, Arc::clone(&runtime));
         Ok(runtime)
@@ -466,7 +653,9 @@ impl SystemWorkloadActuator {
             let runtime = Display1AttachmentRuntime::start(&self.display1_root, lease.clone())?;
             self.attachments
                 .lock()
-                .map_err(|_| WorkloadActuatorError::Retryable("Display1 attachment store poisoned".into()))?
+                .map_err(|_| {
+                    WorkloadActuatorError::Retryable("Display1 attachment store poisoned".into())
+                })?
                 .insert(key, Arc::clone(&runtime));
             return Ok(runtime);
         }
@@ -496,7 +685,9 @@ impl SystemWorkloadActuator {
         }
     }
 
-    fn qemu_display1_address(request: &WorkloadOperationRequest) -> Result<String, WorkloadActuatorError> {
+    fn qemu_display1_address(
+        request: &WorkloadOperationRequest,
+    ) -> Result<String, WorkloadActuatorError> {
         let mut command = Command::new("virsh");
         command.args([
             "--connect",
@@ -506,8 +697,9 @@ impl SystemWorkloadActuator {
             "dbus",
             Self::libvirt_domain(request),
         ]);
-        let output = output_with_timeout(command, DEFAULT_CMD_TIMEOUT)
-            .map_err(|error| WorkloadActuatorError::Retryable(format!("Display1 address probe failed: {error}")))?;
+        let output = output_with_timeout(command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+            WorkloadActuatorError::Retryable(format!("Display1 address probe failed: {error}"))
+        })?;
         if !output.status.success() {
             return Err(WorkloadActuatorError::Retryable(
                 "libvirt has not published a QEMU Display1 address".into(),
@@ -618,7 +810,9 @@ impl SystemWorkloadActuator {
                     && crate::image_catalog::ImageKind::parse(&manifest.kind)
                         == Some(crate::image_catalog::ImageKind::Container)
             })
-            .ok_or_else(|| format!("approved container image {name}:{version} is not in the catalog"))?;
+            .ok_or_else(|| {
+                format!("approved container image {name}:{version} is not in the catalog")
+            })?;
         let marker = crate::image_catalog::images_dir(&self.workgroup_root)
             .join(name)
             .join("PROMOTED");
@@ -633,8 +827,9 @@ impl SystemWorkloadActuator {
             .join(&manifest.name)
             .join(&manifest.version)
             .join(format!("{}-{}.oci.tar", manifest.name, manifest.version));
-        let metadata = fs::symlink_metadata(&artifact)
-            .map_err(|error| format!("approved container image artifact is unavailable: {error}"))?;
+        let metadata = fs::symlink_metadata(&artifact).map_err(|error| {
+            format!("approved container image artifact is unavailable: {error}")
+        })?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err("approved container image artifact is not a regular file".to_string());
         }
@@ -678,8 +873,8 @@ impl SystemWorkloadActuator {
         );
         let mut image_command = Command::new("qemu-img");
         image_command.args(&image_args);
-        let image_status = status_with_timeout(image_command, DEFAULT_CMD_TIMEOUT)
-            .map_err(|error| {
+        let image_status =
+            status_with_timeout(image_command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
                 WorkloadActuatorError::Retryable(format!(
                     "VM overlay creation failed to start: {error}"
                 ))
@@ -698,10 +893,9 @@ impl SystemWorkloadActuator {
         };
         let xml = crate::workers::workload_vm::build_domain_xml(&spec, &disk_string);
         let xml_path = std::env::temp_dir().join(format!("mde-workload-{domain}.xml"));
-        fs::write(&xml_path, xml.as_bytes())
-            .map_err(|error| {
-                WorkloadActuatorError::Retryable(format!("write VM definition: {error}"))
-            })?;
+        fs::write(&xml_path, xml.as_bytes()).map_err(|error| {
+            WorkloadActuatorError::Retryable(format!("write VM definition: {error}"))
+        })?;
         let mut define_command = Command::new("virsh");
         define_command.args([
             "--connect",
@@ -709,8 +903,8 @@ impl SystemWorkloadActuator {
             "define",
             &xml_path.to_string_lossy(),
         ]);
-        let define_result = status_with_timeout(define_command, DEFAULT_CMD_TIMEOUT)
-            .map_err(|error| {
+        let define_result =
+            status_with_timeout(define_command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
                 WorkloadActuatorError::Retryable(format!("VM definition failed to start: {error}"))
             });
         let _ = fs::remove_file(&xml_path);
@@ -745,11 +939,13 @@ impl SystemWorkloadActuator {
     fn runtime_name(request: &WorkloadOperationRequest) -> String {
         let mut name = String::from("mde-workload-");
         for value in request.workload_id.as_str().chars() {
-            name.push(if value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.') {
-                value
-            } else {
-                '-'
-            });
+            name.push(
+                if value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.') {
+                    value
+                } else {
+                    '-'
+                },
+            );
         }
         let digest = Sha256::digest(request.workload_id.as_str().as_bytes());
         name.push('-');
@@ -791,10 +987,19 @@ impl SystemWorkloadActuator {
             .map_err(WorkloadActuatorError::Permanent)?;
 
         let mut image_exists = Command::new("podman");
-        image_exists.args(["--root", CONTAINER_STORAGE_PATH, "image", "exists", image_ref]);
-        let image_status = status_with_timeout(image_exists, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-            WorkloadActuatorError::Retryable(format!("podman image check failed to start: {error}"))
-        })?;
+        image_exists.args([
+            "--root",
+            CONTAINER_STORAGE_PATH,
+            "image",
+            "exists",
+            image_ref,
+        ]);
+        let image_status =
+            status_with_timeout(image_exists, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                WorkloadActuatorError::Retryable(format!(
+                    "podman image check failed to start: {error}"
+                ))
+            })?;
         if !image_status.success() {
             let mut load = Command::new("podman");
             load.args([
@@ -805,7 +1010,9 @@ impl SystemWorkloadActuator {
                 &artifact.to_string_lossy(),
             ]);
             let load_status = status_with_timeout(load, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-                WorkloadActuatorError::Retryable(format!("podman image load failed to start: {error}"))
+                WorkloadActuatorError::Retryable(format!(
+                    "podman image load failed to start: {error}"
+                ))
             })?;
             if !load_status.success() {
                 return Err(WorkloadActuatorError::Retryable(
@@ -849,7 +1056,9 @@ impl SystemWorkloadActuator {
         let mut reload = Command::new("systemctl");
         reload.args(["--system", "daemon-reload"]);
         let reload_status = status_with_timeout(reload, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-            WorkloadActuatorError::Retryable(format!("systemd daemon-reload failed to start: {error}"))
+            WorkloadActuatorError::Retryable(format!(
+                "systemd daemon-reload failed to start: {error}"
+            ))
         })?;
         if !reload_status.success() {
             return Err(WorkloadActuatorError::Retryable(
@@ -882,8 +1091,7 @@ impl SystemWorkloadActuator {
     }
 
     fn vm_overlay_path(request: &WorkloadOperationRequest) -> PathBuf {
-        Path::new("/var/lib/mde-vms")
-            .join(format!("{}.qcow2", Self::libvirt_domain(request)))
+        Path::new("/var/lib/mde-vms").join(format!("{}.qcow2", Self::libvirt_domain(request)))
     }
 
     /// Tear down one managed VM in an idempotent, ordered sequence.  The
@@ -932,7 +1140,10 @@ impl SystemWorkloadActuator {
         match fs::remove_file(&disk) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("remove managed VM overlay {}: {error}", disk.display())),
+            Err(error) => Err(format!(
+                "remove managed VM overlay {}: {error}",
+                disk.display()
+            )),
         }
     }
 
@@ -988,6 +1199,116 @@ impl SystemWorkloadActuator {
     }
 }
 
+impl SystemWorkloadActuator {
+    fn checked_domain(vm_id: &str) -> Result<String, WorkloadActuatorError> {
+        mackes_mesh_types::workloads::WorkloadId::new(vm_id.trim())
+            .map(|id| id.into_string())
+            .map_err(|error| {
+                WorkloadActuatorError::Permanent(format!(
+                    "invalid migration workload identity: {error}"
+                ))
+            })
+    }
+
+    fn virsh_output(
+        vm_id: &str,
+        verb: &str,
+    ) -> Result<std::process::Output, WorkloadActuatorError> {
+        let domain = Self::checked_domain(vm_id)?;
+        let mut command = Command::new("virsh");
+        command.args(["--connect", "qemu:///system", verb, &domain]);
+        output_with_timeout(command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+            WorkloadActuatorError::Retryable(format!(
+                "migration {verb} actuator failed to start: {error}"
+            ))
+        })
+    }
+
+    fn require_success(
+        output: std::process::Output,
+        verb: &str,
+    ) -> Result<std::process::Output, WorkloadActuatorError> {
+        if output.status.success() {
+            return Ok(output);
+        }
+        Err(WorkloadActuatorError::Retryable(format!(
+            "migration {verb} actuator exited with {}: {}",
+            output.status,
+            bounded_reason(String::from_utf8_lossy(&output.stderr).trim())
+        )))
+    }
+}
+
+impl SystemWorkloadActuator {
+    fn migration_capture_definition_impl(
+        &self,
+        vm_id: &str,
+    ) -> Result<String, WorkloadActuatorError> {
+        let output = Self::require_success(Self::virsh_output(vm_id, "dumpxml")?, "dumpxml")?;
+        let xml = String::from_utf8_lossy(&output.stdout).into_owned();
+        if xml.trim().is_empty() {
+            return Err(WorkloadActuatorError::Permanent(
+                "migration dumpxml returned an empty definition".into(),
+            ));
+        }
+        Ok(xml)
+    }
+
+    fn migration_request_stop_impl(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        Self::require_success(Self::virsh_output(vm_id, "shutdown")?, "shutdown").map(|_| ())
+    }
+
+    fn migration_is_stopped_impl(&self, vm_id: &str) -> Result<bool, WorkloadActuatorError> {
+        let output = Self::require_success(Self::virsh_output(vm_id, "domstate")?, "domstate")?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .eq_ignore_ascii_case("shut off"))
+    }
+
+    fn migration_define_and_start_impl(
+        &self,
+        vm_id: &str,
+        domain_xml: &str,
+    ) -> Result<(), WorkloadActuatorError> {
+        let domain = Self::checked_domain(vm_id)?;
+        if domain_xml.trim().is_empty() {
+            return Err(WorkloadActuatorError::Permanent(
+                "migration definition is empty".into(),
+            ));
+        }
+        let xml_path = std::env::temp_dir().join(format!(
+            "mde-workload-migrate-{domain}-{}-{}.xml",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::write(&xml_path, domain_xml).map_err(|error| {
+            WorkloadActuatorError::Retryable(format!("write migration definition: {error}"))
+        })?;
+        let mut define = Command::new("virsh");
+        define.args([
+            "--connect",
+            "qemu:///system",
+            "define",
+            &xml_path.to_string_lossy(),
+        ]);
+        let define_result = output_with_timeout(define, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+            WorkloadActuatorError::Retryable(format!(
+                "migration define actuator failed to start: {error}"
+            ))
+        });
+        let _ = fs::remove_file(&xml_path);
+        Self::require_success(define_result?, "define")?;
+        Self::require_success(Self::virsh_output(&domain, "start")?, "start").map(|_| ())
+    }
+
+    fn migration_relinquish_definition_impl(
+        &self,
+        vm_id: &str,
+    ) -> Result<(), WorkloadActuatorError> {
+        Self::require_success(Self::virsh_output(vm_id, "undefine")?, "undefine").map(|_| ())
+    }
+}
+
 fn libvirt_domain_absent_or_stopped(detail: &str) -> bool {
     let normalized = detail.to_ascii_lowercase();
     normalized.contains("domain not found")
@@ -996,6 +1317,30 @@ fn libvirt_domain_absent_or_stopped(detail: &str) -> bool {
 }
 
 impl WorkloadActuator for SystemWorkloadActuator {
+    fn migration_capture_definition(&self, vm_id: &str) -> Result<String, WorkloadActuatorError> {
+        self.migration_capture_definition_impl(vm_id)
+    }
+
+    fn migration_request_stop(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        self.migration_request_stop_impl(vm_id)
+    }
+
+    fn migration_is_stopped(&self, vm_id: &str) -> Result<bool, WorkloadActuatorError> {
+        self.migration_is_stopped_impl(vm_id)
+    }
+
+    fn migration_define_and_start(
+        &self,
+        vm_id: &str,
+        domain_xml: &str,
+    ) -> Result<(), WorkloadActuatorError> {
+        self.migration_define_and_start_impl(vm_id, domain_xml)
+    }
+
+    fn migration_relinquish_definition(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
+        self.migration_relinquish_definition_impl(vm_id)
+    }
+
     fn reap_expired(&self, now_ms: u64) {
         if let Ok(mut attachments) = self.attachments.lock() {
             attachments.retain(|_, runtime| runtime.server.lease().expires_at_ms > now_ms);
@@ -1038,9 +1383,9 @@ impl WorkloadActuator for SystemWorkloadActuator {
                     request.expected_generation.saturating_add(1).max(1),
                     now_ms(),
                 )?
-                    .server
-                    .lease()
-                    .clone(),
+                .server
+                .lease()
+                .clone(),
             )
         } else {
             None
@@ -1050,7 +1395,9 @@ impl WorkloadActuator for SystemWorkloadActuator {
             WorkloadOperationAction::StartAndAttach | WorkloadOperationAction::Start
         ) {
             match request.backend {
-                WorkloadBackend::LibvirtVirtqemud if request.action == WorkloadOperationAction::StartAndAttach => {
+                WorkloadBackend::LibvirtVirtqemud
+                    if request.action == WorkloadOperationAction::StartAndAttach =>
+                {
                     self.define_vm(request)?;
                 }
                 WorkloadBackend::QuadletSystemd => {}
@@ -1258,7 +1605,9 @@ impl WorkloadActuator for SystemWorkloadActuator {
                         power: WorkloadPowerState::Running,
                         readiness: WorkloadReadiness::PreparingDisplay,
                         retryable: true,
-                        reason: Some("Workload is running; registering the QEMU Display1 listener".into()),
+                        reason: Some(
+                            "Workload is running; registering the QEMU Display1 listener".into(),
+                        ),
                         remediation: Some(
                             "keep the shell attached; completion requires a validated first frame"
                                 .into(),
@@ -1294,19 +1643,18 @@ impl WorkloadActuator for SystemWorkloadActuator {
                             attachment: Some(runtime.server.lease().clone()),
                         }));
                     }
-                    let (phase, reason) = if runtime.registration_state()
-                        == DISPLAY1_REGISTRATION_PENDING
-                    {
-                        (
-                            WorkloadOperationPhase::PreparingDisplay,
-                            "waiting for QEMU to accept the authenticated Display1 listener",
-                        )
-                    } else {
-                        (
-                            WorkloadOperationPhase::WaitingForFirstFrame,
-                            "Display1 has not delivered a validated first frame yet",
-                        )
-                    };
+                    let (phase, reason) =
+                        if runtime.registration_state() == DISPLAY1_REGISTRATION_PENDING {
+                            (
+                                WorkloadOperationPhase::PreparingDisplay,
+                                "waiting for QEMU to accept the authenticated Display1 listener",
+                            )
+                        } else {
+                            (
+                                WorkloadOperationPhase::WaitingForFirstFrame,
+                                "Display1 has not delivered a validated first frame yet",
+                            )
+                        };
                     WorkloadActuatorOutcome {
                         phase,
                         power: WorkloadPowerState::Running,
@@ -1424,6 +1772,8 @@ pub struct WorkloadComputeWorker {
     storage_capacity_override: Option<WorkloadStorageCapacity>,
     cursor: Option<String>,
     last_projection: Option<Vec<WorkloadOperationStatus>>,
+    migration_sender: SyncSender<WorkloadMigrationEnvelope>,
+    migration_commands: Receiver<WorkloadMigrationEnvelope>,
 }
 
 impl WorkloadComputeWorker {
@@ -1431,6 +1781,7 @@ impl WorkloadComputeWorker {
     /// when explicitly targeted and are rejected by `role_rank == 0`.
     #[must_use]
     pub fn new(node_id: String, role_rank: u8) -> Self {
+        let (migration_tx, migration_commands) = sync_channel(16);
         let signer: Box<dyn TokenSigner> = HmacTokenSigner::from_systemd_credential()
             .map(|signer| Box::new(signer) as Box<dyn TokenSigner>)
             .unwrap_or_else(|_| Box::new(NullSigner));
@@ -1458,6 +1809,46 @@ impl WorkloadComputeWorker {
             storage_capacity_override: None,
             cursor: None,
             last_projection: None,
+            migration_sender: migration_tx,
+            migration_commands,
+        }
+    }
+
+    fn register_migration_executor(&self) {
+        if let Ok(mut slot) = migration_executor_registry().lock() {
+            *slot = Some(self.migration_sender.clone());
+        }
+    }
+
+    fn drain_migration_commands(&self) {
+        loop {
+            let envelope = match self.migration_commands.try_recv() {
+                Ok(envelope) => envelope,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let result = match envelope.command {
+                WorkloadMigrationCommand::CaptureDefinition { vm_id } => self
+                    .actuator
+                    .migration_capture_definition(&vm_id)
+                    .map(WorkloadMigrationReply::Definition),
+                WorkloadMigrationCommand::RequestStop { vm_id } => self
+                    .actuator
+                    .migration_request_stop(&vm_id)
+                    .map(|()| WorkloadMigrationReply::Complete),
+                WorkloadMigrationCommand::ObserveStopped { vm_id } => self
+                    .actuator
+                    .migration_is_stopped(&vm_id)
+                    .map(WorkloadMigrationReply::Stopped),
+                WorkloadMigrationCommand::DefineAndStart { vm_id, domain_xml } => self
+                    .actuator
+                    .migration_define_and_start(&vm_id, &domain_xml)
+                    .map(|()| WorkloadMigrationReply::Complete),
+                WorkloadMigrationCommand::RelinquishDefinition { vm_id } => self
+                    .actuator
+                    .migration_relinquish_definition(&vm_id)
+                    .map(|()| WorkloadMigrationReply::Complete),
+            };
+            let _ = envelope.reply.send(result);
         }
     }
 
@@ -1645,12 +2036,8 @@ impl WorkloadComputeWorker {
                 None => return,
             };
             let (host, storage) = self.capacities(ledger.statuses());
-            let admission = admit_workload_for_backend(
-                request.resources,
-                request.backend,
-                host,
-                storage,
-            );
+            let admission =
+                admit_workload_for_backend(request.resources, request.backend, host, storage);
             if !admission.admitted {
                 let (reason, remediation) = admission_message(admission);
                 self.fail(ledger, &request, status, reason, remediation, false, now_ms);
@@ -2109,10 +2496,8 @@ impl WorkloadComputeWorker {
             if phase == outcome.phase {
                 status.power = outcome.power;
                 status.readiness = outcome.readiness;
-                status.signals = WorkloadRuntimeSignals::from_readiness(
-                    outcome.phase,
-                    outcome.readiness,
-                );
+                status.signals =
+                    WorkloadRuntimeSignals::from_readiness(outcome.phase, outcome.readiness);
                 status.retryable = outcome.retryable;
                 status.next_retry_at_ms = 0;
                 status.reason = outcome.reason.clone();
@@ -2210,6 +2595,7 @@ impl WorkloadComputeWorker {
         ledger: &mut WorkloadOperationLedger,
         mut persist: Option<&mut Persist>,
     ) {
+        self.drain_migration_commands();
         let now = now_ms();
         if let Some(persist_ref) = persist.as_deref_mut() {
             let messages = persist_ref.list_since_limit(
@@ -2275,6 +2661,7 @@ impl Worker for WorkloadComputeWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        self.register_migration_executor();
         let mut ledger = WorkloadOperationLedger::open(&self.state_root)
             .map_err(|error| anyhow::anyhow!("open workload operation journal: {error}"))?;
         let mut persist = self
@@ -2328,7 +2715,10 @@ fn live_capacity<'a>(
     let mut allocated_memory_mb = 0_u32;
     let mut allocated_vm_storage_gb = 0_u32;
     let mut allocated_container_storage_gb = 0_u32;
-    for status in latest.into_values().filter(|status| !status.phase.is_terminal()) {
+    for status in latest
+        .into_values()
+        .filter(|status| !status.phase.is_terminal())
+    {
         allocated_vcpu = allocated_vcpu.saturating_add(status.resources.vcpu);
         allocated_memory_mb = allocated_memory_mb.saturating_add(status.resources.memory_mb);
         match status.backend {
@@ -2337,8 +2727,8 @@ fn live_capacity<'a>(
                     allocated_vm_storage_gb.saturating_add(status.resources.disk_gb);
             }
             WorkloadBackend::QuadletSystemd => {
-                allocated_container_storage_gb = allocated_container_storage_gb
-                    .saturating_add(status.resources.disk_gb);
+                allocated_container_storage_gb =
+                    allocated_container_storage_gb.saturating_add(status.resources.disk_gb);
             }
         }
     }
@@ -2514,6 +2904,11 @@ mod tests {
         calls: Arc<Mutex<u32>>,
     }
     impl WorkloadActuator for FakeActuator {
+        fn migration_request_stop(&self, _: &str) -> Result<(), WorkloadActuatorError> {
+            *self.calls.lock().expect("calls") += 1;
+            Ok(())
+        }
+
         fn apply(
             &self,
             _: &WorkloadOperationRequest,
@@ -2552,6 +2947,26 @@ mod tests {
         ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
             Ok(None)
         }
+    }
+
+    #[test]
+    fn migration_command_executes_only_when_workload_reconciler_drains() {
+        let calls = Arc::new(Mutex::new(0));
+        let worker =
+            WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }));
+        worker.register_migration_executor();
+        let request = std::thread::spawn(|| {
+            WorkloadMigrationClient
+                .request_stop("vm-reconciler-owned")
+                .expect("reconciler command")
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(*calls.lock().expect("calls"), 0);
+        worker.drain_migration_commands();
+        request.join().expect("client join");
+        assert_eq!(*calls.lock().expect("calls"), 1);
     }
 
     struct RetryOnObserveActuator {
@@ -2847,8 +3262,8 @@ mod tests {
     fn expired_display1_runtime_is_reaped_and_socket_is_removed() {
         let temp = tempfile::tempdir().expect("temp");
         let display_root = temp.path().join("display1");
-        let actuator = SystemWorkloadActuator::new(temp.path().join("state"))
-            .with_display1_root(display_root);
+        let actuator =
+            SystemWorkloadActuator::new(temp.path().join("state")).with_display1_root(display_root);
         let runtime = actuator
             .ensure_attachment(&request(), 1, now_ms())
             .expect("server");
@@ -2975,8 +3390,8 @@ mod tests {
     fn quadlet_materialization_is_tied_to_typed_workload_identity() {
         let mut request = request();
         request.backend = WorkloadBackend::QuadletSystemd;
-        request.workload_id = WorkloadId::new("container:seat15:mesh-api")
-            .expect("typed workload id");
+        request.workload_id =
+            WorkloadId::new("container:seat15:mesh-api").expect("typed workload id");
         request.image_ref = Some("mesh-api:1.0".into());
 
         let unit = SystemWorkloadActuator::render_quadlet(
@@ -2987,11 +3402,9 @@ mod tests {
         assert!(unit.contains("Image=mesh-api:1.0"));
         assert!(unit.contains("ContainerName=mde-workload-container-seat15-mesh-api-"));
         assert!(!unit.contains("ContainerName=mde-workload-container:seat15:mesh-api"));
-        assert!(
-            SystemWorkloadActuator::runtime_name(&request)
-                .chars()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
-        );
+        assert!(SystemWorkloadActuator::runtime_name(&request)
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.')));
         assert_eq!(
             SystemWorkloadActuator::quadlet_unit_path(&request),
             Path::new(QUADLET_RUNTIME_ROOT).join(format!(
@@ -3070,7 +3483,7 @@ mod tests {
             .with_capacity(test_capacity())
             .with_actuator(Box::new(FakeActuator {
                 calls: calls.clone(),
-        }));
+            }));
         let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
         let mut target = request();
         target.request_id = "target-1".into();
@@ -3125,11 +3538,17 @@ mod tests {
 
         assert_eq!(*calls.lock().expect("calls"), 2);
         assert_eq!(
-            ledger.status("target-running").expect("target status").phase,
+            ledger
+                .status("target-running")
+                .expect("target status")
+                .phase,
             WorkloadOperationPhase::Cancelled
         );
         assert_eq!(
-            ledger.status("cancel-running").expect("cancel status").phase,
+            ledger
+                .status("cancel-running")
+                .expect("cancel status")
+                .phase,
             WorkloadOperationPhase::Completed
         );
     }
@@ -3147,8 +3566,7 @@ mod tests {
             .with_actuator(Box::new(FakeActuator {
                 calls: calls.clone(),
             }));
-        let mut ledger =
-            WorkloadOperationLedger::open(temp.path().join("state")).expect("ledger");
+        let mut ledger = WorkloadOperationLedger::open(temp.path().join("state")).expect("ledger");
         let request = request();
         let raw = serde_json::to_string(&request).expect("wire");
         let action = persist
@@ -3224,7 +3642,10 @@ mod tests {
 
         worker.tick_once(&mut ledger, Some(&mut persist));
         let page_last = MAX_OPERATION_MESSAGES_PER_TICK - 1;
-        assert_eq!(worker.cursor.as_deref(), Some(actions[page_last].ulid.as_str()));
+        assert_eq!(
+            worker.cursor.as_deref(),
+            Some(actions[page_last].ulid.as_str())
+        );
         assert_eq!(
             persist
                 .list_since(&reply_topic(&actions[page_last].ulid), None)
@@ -3232,15 +3653,13 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            persist
-                .list_since(
-                    &reply_topic(&actions[MAX_OPERATION_MESSAGES_PER_TICK].ulid),
-                    None
-                )
-                .expect("reply")
-                .is_empty()
-        );
+        assert!(persist
+            .list_since(
+                &reply_topic(&actions[MAX_OPERATION_MESSAGES_PER_TICK].ulid),
+                None
+            )
+            .expect("reply")
+            .is_empty());
 
         worker.tick_once(&mut ledger, Some(&mut persist));
         assert_eq!(
@@ -3288,15 +3707,13 @@ mod tests {
     fn lighthouse_rejects_every_workload_action_and_backend_including_android() {
         let temp = tempfile::tempdir().expect("temp");
         let calls = Arc::new(Mutex::new(0));
-        let mut worker = WorkloadComputeWorker::new(
-            "lh-1".into(),
-            mde_role::Role::Lighthouse.rank(),
-        )
-        .with_authorizer(Box::new(AllowAuthorizer))
-            .with_capacity(test_capacity())
-            .with_actuator(Box::new(FakeActuator {
-                calls: calls.clone(),
-            }));
+        let mut worker =
+            WorkloadComputeWorker::new("lh-1".into(), mde_role::Role::Lighthouse.rank())
+                .with_authorizer(Box::new(AllowAuthorizer))
+                .with_capacity(test_capacity())
+                .with_actuator(Box::new(FakeActuator {
+                    calls: calls.clone(),
+                }));
         let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
         let actions = [
             WorkloadOperationAction::StartAndAttach,

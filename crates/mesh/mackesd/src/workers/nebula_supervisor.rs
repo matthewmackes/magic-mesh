@@ -2661,9 +2661,15 @@ mod tests {
     #[test]
     fn initial_phase_is_stable_bounded_and_identity_scoped() {
         let phase = initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL);
-        assert_eq!(phase, initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL));
+        assert_eq!(
+            phase,
+            initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL)
+        );
         assert!(phase <= MAX_INITIAL_PHASE);
-        assert_ne!(phase, initial_phase_for("peer:seat16", DEFAULT_TICK_INTERVAL));
+        assert_ne!(
+            phase,
+            initial_phase_for("peer:seat16", DEFAULT_TICK_INTERVAL)
+        );
         assert_eq!(initial_phase_for("", DEFAULT_TICK_INTERVAL), Duration::ZERO);
         assert_eq!(
             initial_phase_for("peer:seat15", Duration::from_millis(1)),

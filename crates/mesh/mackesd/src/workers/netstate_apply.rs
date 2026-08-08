@@ -18,12 +18,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use magic_fleet::netstate::{
-    apply_with_self_test, ApplyOutcome, LinkState, NetInterface, NetOps, NetState, SystemNetOps,
-};
 use mackes_mesh_types::health::{
     NodeAddressFamily, NodeAvailabilityState, NodeConnectionType, NodeConnectivitySummary,
     NodeDeviceClass, MAX_NODE_CONNECTIVITY_INTERFACE_BYTES,
+};
+use magic_fleet::netstate::{
+    apply_with_self_test, ApplyOutcome, LinkState, NetInterface, NetOps, NetState, SystemNetOps,
 };
 
 use super::node_availability::{
@@ -408,12 +408,10 @@ mod tests {
                 .into_iter()
                 .any(|message| {
                     message.body.as_deref().is_some_and(|body| {
-                        serde_json::from_str::<
-                            mackes_mesh_types::health::NodeAvailabilityIntent,
-                        >(body)
-                        .is_ok_and(|intent| {
-                            intent.state == NodeAvailabilityState::AdapterMigration
-                        })
+                        serde_json::from_str::<mackes_mesh_types::health::NodeAvailabilityIntent>(
+                            body,
+                        )
+                        .is_ok_and(|intent| intent.state == NodeAvailabilityState::AdapterMigration)
                     })
                 });
             self.saw_intent_before_apply
@@ -524,7 +522,10 @@ mod tests {
             saw_intent_before_apply: Arc::clone(&saw_intent_before_apply),
         };
 
-        assert_eq!(worker.converge_with_availability(&ops), ApplyOutcome::Committed);
+        assert_eq!(
+            worker.converge_with_availability(&ops),
+            ApplyOutcome::Committed
+        );
         assert!(saw_intent_before_apply.load(Ordering::SeqCst));
 
         let persist = mde_bus::persist::Persist::open(bus_root).unwrap();
@@ -551,7 +552,10 @@ mod tests {
             Some(true)
         );
         let wire = serde_json::to_string(&intents).unwrap();
-        assert!(!wire.contains("10.42.0.7"), "raw addresses must not be published");
+        assert!(
+            !wire.contains("10.42.0.7"),
+            "raw addresses must not be published"
+        );
     }
 
     #[test]

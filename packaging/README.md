@@ -11,9 +11,9 @@ and the default YAMIS platform icon theme lives in `../assets/icons/YAMIS/`.
   through `/usr/share/icons/YAMIS`)
 - `autostart/`    → `/etc/xdg/autostart/` (the SVC-4 voice agent autostart —
   Cosmic honors XDG autostart)
-- `systemd/`      → `/usr/lib/systemd/system/` (ENT-6: `mackesd.service`,
-  Restart=on-failure — kill -9 recovers in seconds; in-daemon worker
-  restarts are the supervisor's bounded-backoff + circuit-breaker job).
+- `systemd/`      → `/usr/lib/systemd/system/` (WL-ARCH-009:
+  `mackesd.target` plus six independently budgeted process-group services;
+  `Restart=on-failure` recovers one failed group without recycling the others).
   `mde-musicd.service` is a user unit (`default.target`) whose
   `ExecCondition=mackesd role-gate --min-rank 1` skips it cleanly on
   Servers/Lighthouses (SVC-7/Q70 — desktop services are Workstation

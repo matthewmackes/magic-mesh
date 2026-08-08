@@ -1469,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_lifecycle_topics_are_refused_before_auth_or_backend() {
+    fn retired_lifecycle_and_console_verbs_are_refused_before_auth_or_backend() {
         let runner = Arc::new(FakeRunner::default());
         let w = staged_worker(runner.clone());
         for verb in [
@@ -1483,12 +1483,14 @@ mod tests {
             "container-restart",
             "container-logs",
             "container-destroy",
+            "console-attach",
         ] {
             let reply = w.handle(verb, r#"{"schema_version":1,"node":"me","instance":"web"}"#);
             assert!(!reply.ok);
-            assert!(reply.error.as_deref().is_some_and(|error| {
-                error.contains("unknown cloud verb")
-            }));
+            assert!(reply
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("unknown cloud verb") }));
         }
         assert!(runner.calls.lock().unwrap().is_empty());
         assert!(runner.tool_calls.lock().unwrap().is_empty());
@@ -1503,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_desired_android_and_console_actions_change_or_disclose_nothing() {
+    fn unauthenticated_desired_and_android_actions_change_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let worker = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
             .with_signer(Arc::new(signer()))
@@ -1519,7 +1521,6 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.contains("not authorized")));
         assert!(reconcile::read_desired_slice(tmp.path(), "me").is_empty());
-
         let android = worker.handle(
             "android-provision",
             r#"{"schema_version":1,"node":"me","name":"poison-android"}"#,
@@ -1530,17 +1531,6 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.contains("not authorized")));
         assert!(reconcile::read_desired_slice(tmp.path(), "me").is_empty());
-
-        let console = worker.handle(
-            "console-attach",
-            r#"{"schema_version":1,"node":"me","instance":"secret-vm"}"#,
-        );
-        assert!(!console.ok);
-        assert!(console.console.is_none());
-        assert!(console
-            .gated
-            .as_deref()
-            .is_some_and(|reason| reason.contains("not authorized")));
     }
 
     #[test]
@@ -1599,8 +1589,8 @@ mod tests {
     #[test]
     fn every_workloads_verb_is_wired_no_skeleton_remains() {
         // All eight Workloads verbs are wired: set-desired/plan (U4), image-build (U6),
-        // container-deploy (U7), inventory/output (U10), console-attach (U8),
-        // android-provision (U9). None may still surface the U2 "not yet wired"
+        // container-deploy (U7), inventory/output (U10), and android-provision
+        // (U9). None may still surface the U2 "not yet wired"
         // skeleton — a verb may honestly gate (armed-token / tool-absent), but the
         // skeleton message is a regression. Each verb's real behavior is covered by
         // its own module tests.
@@ -1612,7 +1602,6 @@ mod tests {
             "container-deploy",
             "inventory",
             "output",
-            "console-attach",
             "android-provision",
         ] {
             let reply = w.handle(verb, r#"{"schema_version":1,"node":"me"}"#);

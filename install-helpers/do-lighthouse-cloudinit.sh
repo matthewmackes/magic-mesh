@@ -98,7 +98,7 @@ fi
 # 5. Start the services — the daemon (run_serve spawns the nebula-enroll-listener
 #    so peers can `mackesd join` immediately), the overlay, and the health
 #    watchdog. enable = boot-durable (ONBOARD-9 service manager).
-systemctl enable --now nebula.service mackesd.service mesh-health.timer \
+systemctl enable --now nebula.service mackesd.target mesh-health.timer \
     || fail "could not start mesh services"
 log "services up (boot-durable) — /enroll endpoint live on $PUBLIC_IP:$ENROLL_PORT"
 

@@ -17,9 +17,9 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::desktop_sources::{DesktopSourcesState, resource_card_from_desktop_source};
-use super::ssh_x11_sources::{SshX11SourcesState, append_ssh_x11_cards};
-use super::upnp_sources::{UpnpSourcesState, append_upnp_cards};
+use super::desktop_sources::{resource_card_from_desktop_source, DesktopSourcesState};
+use super::ssh_x11_sources::{append_ssh_x11_cards, SshX11SourcesState};
+use super::upnp_sources::{append_upnp_cards, UpnpSourcesState};
 
 const FRESH_MS: u64 = 60_000;
 const CARD_MS: u64 = 120_000;
@@ -1288,17 +1288,12 @@ mod tests {
     #[test]
     fn optional_upnp_state_adds_trusted_media_cards_to_the_universal_catalog() {
         let root = tempfile::tempdir().unwrap();
-        let subnet = super::super::upnp_sources::TrustedLanSubnet::new(
-            "172.20.146.0".parse().unwrap(),
-            24,
-        )
-        .unwrap();
+        let subnet =
+            super::super::upnp_sources::TrustedLanSubnet::new("172.20.146.0".parse().unwrap(), 24)
+                .unwrap();
         let policy = super::super::upnp_sources::UpnpDiscoveryPolicy::default_for(vec![
-            super::super::upnp_sources::TrustedLanInterface::new(
-                "enp0s31f6",
-                vec![subnet],
-            )
-            .unwrap(),
+            super::super::upnp_sources::TrustedLanInterface::new("enp0s31f6", vec![subnet])
+                .unwrap(),
         ])
         .unwrap();
         let adapter = super::super::upnp_sources::UpnpDiscoveryAdapter::new(policy);

@@ -1,7 +1,7 @@
 //! U16 — the **Android VM** delivery view: Android delivered via the **two-layer
 //! Cuttlefish** backend. An outer L1 Linux VM (libvirt/KVM) hosts `cvd` (crosvm),
 //! which boots the actual Android guest inside it. The roster makes the two layers
-//! explicit: lifecycle verbs act on the **outer** L1 VM, while console-attach
+//! explicit: lifecycle verbs act on the **outer** L1 VM, while typed Open
 //! returns the **inner** cvd screen as a VNC/WebRTC head (not a libvirt SPICE
 //! display). Live status · drift · metrics come from the outer domain.
 
@@ -44,9 +44,9 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     muted_note(
         ui,
         "Start / Stop / Reboot / Destroy act on the outer L1 VM; the inner Android (cvd) boots \
-         within it. Console returns the cvd's VNC/WebRTC head, not a libvirt SPICE display.",
+         within it. Open requests a typed node-local attachment; no raw console endpoint is \
+         published on the Bus.",
     );
-    super::super::console_section(ui, state);
 }
 
 /// One Android card — name · the `L1 VM \u{203A} cvd` two-layer tag · status ·
@@ -61,16 +61,40 @@ fn android_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow
                 state.issue_console_attach(&row.node, &row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
-                state.issue_workload_direct("instance-start", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-start",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_workload_direct("instance-stop", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-stop",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-reboot", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-reboot",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-delete", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-delete",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
         });
     });

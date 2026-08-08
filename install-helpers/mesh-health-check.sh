@@ -38,10 +38,13 @@ MESH_ALERT_BIN="${MESH_ALERT_BIN:-/usr/libexec/mackesd/mesh-alert}"
 # spam) that the watchdog had to act. systemd's OnFailure= covers clean
 # crashes; this covers the wedged-but-not-failed cases the watchdog catches.
 alert() {
-    local stamp="$HEALTH_RUN_DIR/$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_').alerted"
+    local stamp
+    stamp="$HEALTH_RUN_DIR/$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_').alerted"
     mkdir -p "$HEALTH_RUN_DIR" 2>/dev/null
     if [ -z "$(find "$stamp" -newermt '-10 minutes' 2>/dev/null)" ]; then
-        [ -x "$MESH_ALERT_BIN" ] && "$MESH_ALERT_BIN" "$1" crit "watchdog recovering $1 on $(hostname): $2" || true
+        if [ -x "$MESH_ALERT_BIN" ]; then
+            "$MESH_ALERT_BIN" "$1" crit "watchdog recovering $1 on $(hostname): $2" || true
+        fi
         : > "$stamp"
     fi
 }
@@ -58,7 +61,6 @@ restart() {
 #    Syncthing daemon.
 ETCD_ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
 SYNCTHING_FOLDER_ID="${MCNF_SYNCTHING_FOLDER_ID:-mcnf-mesh}"
-QNM="${MDE_WORKGROUP_ROOT:-${QNM_PATH:-/mnt/mesh-storage}}"
 if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
     # etcd coordination plane: quorum health (any reachable client endpoint).
     EPS="$(tr '\n' ',' < "$ETCD_ENDPOINTS_FILE" | sed 's/,$//')"
@@ -157,11 +159,21 @@ if [ -n "${RUN_AVAIL:-}" ] && [ -n "${RUN_TOTAL:-}" ] && [ "$RUN_TOTAL" -gt 0 ];
     fi
 fi
 
-# 1. The worker daemon must be active. If it stopped (incl. StartLimit
-#    exhaustion → 'failed'), restart resets the counter and revives it.
-if ! systemctl is-active --quiet mackesd.service; then
-    restart mackesd.service "not active"
-fi
+# 1. Every independently supervised worker group must be active. Checking only
+#    mackesd.target would miss a group that failed after the target started.
+MACKESD_GROUP_UNITS=(
+    mackesd-control.service
+    mackesd-observation.service
+    mackesd-actions.service
+    mackesd-data.service
+    mackesd-compute.service
+    mackesd-integrations.service
+)
+for mackesd_group_unit in "${MACKESD_GROUP_UNITS[@]}"; do
+    if ! systemctl is-active --quiet "$mackesd_group_unit"; then
+        restart "$mackesd_group_unit" "process group not active"
+    fi
+done
 
 # 2. nebula must be active AND own the overlay interface.
 if ! systemctl is-active --quiet nebula.service; then

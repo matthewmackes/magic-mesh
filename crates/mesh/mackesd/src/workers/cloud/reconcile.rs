@@ -537,12 +537,7 @@ pub(crate) fn rendered_tfvars_for_node(
 ) -> Result<String, String> {
     path_key::segment("node", node)?;
     let specs = read_desired_slice_strict(state_root, node)?;
-    render::render_tfvars(
-        node,
-        &specs,
-        libvirt_uri,
-        browser_base_image_source,
-    )
+    render::render_tfvars(node, &specs, libvirt_uri, browser_base_image_source)
 }
 
 /// Render node `node`'s desired slice into tfvars and shell `tofu plan -json`

@@ -42,14 +42,13 @@ use serde::Deserialize;
 use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::{carbon_icon, card, field, muted_note, Style};
 
-use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
 use mackes_mesh_types::android_apps::AospStarterApp;
+use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
 use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
-    CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, DeploymentRole,
-    DriftFlag, WorkloadRow, WorkloadSpec, APP_VM_ALLOWED_CAPABILITIES, CLOUD_ACTION_SCHEMA_VERSION,
-    CLOUD_ARM_CREDENTIAL, CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION,
-    VERB_PLAN, VERB_SET_DESIRED,
+    CloudReply as WireCloudReply, CloudState, DeliveryType, DeploymentRole, DriftFlag, WorkloadRow,
+    WorkloadSpec, APP_VM_ALLOWED_CAPABILITIES, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
+    CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION, VERB_PLAN, VERB_SET_DESIRED,
 };
 use mackes_mesh_types::music_auth::{self, MusicAuthContext};
 use mackes_mesh_types::workloads::{
@@ -899,20 +898,6 @@ pub(super) enum ProvisionProgress {
     Applied,
 }
 
-/// The most recently resolved `console-attach` handle — the workload it answers
-/// paired with its [`ConsoleEndpoint`] (decoded from the full-payload
-/// [`WireCloudReply`], which the lean mutation mirror above deliberately drops).
-/// Rendered by every delivery view that offers a Console verb; `None` reads
-/// honestly as "not resolved yet" (§7 — never a fabricated handle).
-#[derive(Debug, Clone)]
-struct ResolvedConsole {
-    /// The workload name the handle was requested for (recorded at issue time,
-    /// so the resolve is attributed rather than guessed).
-    name: String,
-    /// The resolved endpoint.
-    endpoint: ConsoleEndpoint,
-}
-
 // ───────────────────────────── mutation review ──────────────────────────────
 
 /// What a confirmed review-sheet echo releases onto the Bus (RUN-006 idiom).
@@ -1339,14 +1324,6 @@ pub struct WorkloadsState {
     workload_pending: Option<(String, String, Instant)>,
     /// The session audit trail (newest last), capped at [`MAX_AUDIT`].
     audit: Vec<AuditEntry>,
-    /// The workload name a just-issued `console-attach` targeted, so the reply's
-    /// decoded [`ConsoleEndpoint`] is attributed honestly rather than guessed.
-    /// Cleared once the mutation settles (resolved or not).
-    console_target: Option<String>,
-    /// The most recently resolved console-attach handle. `None` until a reply
-    /// decodes one — an honest "not resolved yet", never fabricated (§7).
-    console: Option<ResolvedConsole>,
-
     /// Test-only signer injection. Production has no programmatic key seam and
     /// must obtain the credential from systemd in a root process.
     #[cfg(test)]
@@ -1409,8 +1386,6 @@ impl Default for WorkloadsState {
             note: None,
             workload_pending: None,
             audit: Vec::new(),
-            console_target: None,
-            console: None,
             #[cfg(test)]
             arm_key_override: None,
             view: DeliveryView::default(),
@@ -1470,9 +1445,6 @@ impl WorkloadsState {
             return;
         };
         if let Some(reply) = self.read_reply(&ulid) {
-            if reply.verb == "console-attach" {
-                self.resolve_console_endpoint(&ulid, reply.ok);
-            }
             let (note, entry) = fold_mutation(&reply);
             self.record_audit(entry);
             if reply.ok {
@@ -1494,7 +1466,6 @@ impl WorkloadsState {
                      request may still finish; check Audit before retrying."
             ));
             self.mutation_pending = None;
-            self.console_target = None;
         }
     }
 
@@ -1521,7 +1492,11 @@ impl WorkloadsState {
             .unwrap_or_else(|| format!("workload operation reached {:?}", status.phase));
         self.record_audit(AuditEntry {
             verb: "workload-operation".to_string(),
-            outcome: if ok { AuditOutcome::Applied } else { AuditOutcome::Failed },
+            outcome: if ok {
+                AuditOutcome::Applied
+            } else {
+                AuditOutcome::Failed
+            },
             detail: detail.clone(),
         });
         self.note = Some(if ok {
@@ -1531,24 +1506,6 @@ impl WorkloadsState {
         });
         self.workload_pending = None;
         self.forced = true;
-    }
-
-    /// Decode the settled `console-attach` reply's [`ConsoleEndpoint`] (the
-    /// full-payload [`WireCloudReply`] the lean mutation mirror above drops) and
-    /// pair it with the workload name recorded at issue time
-    /// ([`Self::console_target`]) — an honest resolve, never fabricated (§7).
-    /// Clears the target either way so a stale target never mislabels a later
-    /// console.
-    fn resolve_console_endpoint(&mut self, ulid: &str, ok: bool) {
-        let Some(name) = self.console_target.take() else {
-            return;
-        };
-        if !ok {
-            return;
-        }
-        if let Some(endpoint) = self.read_wire_reply(ulid).and_then(|r| r.console) {
-            self.console = Some(ResolvedConsole { name, endpoint });
-        }
     }
 
     /// Fold every `state/cloud/<node>` mirror off the Bus into the host-sorted
@@ -1583,10 +1540,9 @@ impl WorkloadsState {
         serde_json::from_str::<CloudReply>(body).ok()
     }
 
-    /// Read the reply on `reply/<ulid>` as the full-payload [`WireCloudReply`] —
-    /// the same body [`Self::read_reply`] reads, decoded a second time for the
-    /// one rich payload field a caller needs (`console` here). `None` when
-    /// nothing has landed yet or the body doesn't decode.
+    /// Read a reply with its complete typed payload. Specialized workflows such
+    /// as image-build and configure use fields intentionally omitted from the
+    /// compact mutation mirror.
     fn read_wire_reply(&self, ulid: &str) -> Option<WireCloudReply> {
         let persist = self.persist()?;
         let msgs = persist.list_since_limit(&reply_topic(ulid), None, 1).ok()?;
@@ -1831,11 +1787,15 @@ impl WorkloadsState {
                 ..
             } => {
                 if !armed(typed, &echo) {
-                    self.note = Some("Workload confirmation did not match; nothing was sent.".to_string());
+                    self.note =
+                        Some("Workload confirmation did not match; nothing was sent.".to_string());
                     return;
                 }
                 let Some(root) = self.bus_root.as_deref() else {
-                    self.note = Some("Could not request workload: the local mesh Bus is unavailable.".to_string());
+                    self.note = Some(
+                        "Could not request workload: the local mesh Bus is unavailable."
+                            .to_string(),
+                    );
                     return;
                 };
                 match crate::workload_api::publish(root, &request) {
@@ -1845,7 +1805,9 @@ impl WorkloadsState {
                             request.workload_id.as_str().to_string(),
                             Instant::now(),
                         ));
-                        self.note = Some(format!("Requested {label}; waiting for Workload readiness."));
+                        self.note = Some(format!(
+                            "Requested {label}; waiting for Workload readiness."
+                        ));
                     }
                     Err(error) => self.note = Some(format!("Could not request {label}: {error}")),
                 }
@@ -1866,12 +1828,9 @@ impl WorkloadsState {
                     return;
                 }
                 match self.authorize_body(&body, EXEC_AUTH_VERB, EXEC_AUTH_NODE, &target) {
-                    Ok(body) => self.issue_topic(
-                        EXEC_ACTION_TOPIC,
-                        "android-app-launch",
-                        &body,
-                        &label,
-                    ),
+                    Ok(body) => {
+                        self.issue_topic(EXEC_ACTION_TOPIC, "android-app-launch", &body, &label)
+                    }
                     Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
                 }
             }
@@ -1918,9 +1877,7 @@ impl WorkloadsState {
                     "live configuration (apply)".to_string(),
                 )
             }
-            ArmAction::Lifecycle {
-                verb, name, ..
-            } => {
+            ArmAction::Lifecycle { verb, name, .. } => {
                 self.note = Some(format!(
                     "Legacy lifecycle action {verb} for {name} is retired; use the typed Workload operation. Nothing was sent."
                 ));
@@ -1934,12 +1891,12 @@ impl WorkloadsState {
                 label,
                 ..
             } => (verb, node, target, body, label),
-            ArmAction::Workload { .. } => unreachable!(
-                "typed Workload operations are handled before the cloud dispatcher"
-            ),
-            ArmAction::ExecPrepared { .. } => unreachable!(
-                "Android execution actions are handled before the cloud dispatcher"
-            ),
+            ArmAction::Workload { .. } => {
+                unreachable!("typed Workload operations are handled before the cloud dispatcher")
+            }
+            ArmAction::ExecPrepared { .. } => {
+                unreachable!("Android execution actions are handled before the cloud dispatcher")
+            }
         };
         if requires_apply_capability && !self.selected_node_apply_armed() {
             self.note = Some(
@@ -2115,10 +2072,9 @@ impl WorkloadsState {
         });
     }
 
-    /// Issue the `console-attach` lifecycle verb, tracking the target workload
-    /// name ([`Self::console_target`]) so the resolved [`ConsoleEndpoint`] is
-    /// attributed honestly rather than guessed. The roster rows' Console button
-    /// calls this instead of the generic direct-issue seam.
+    /// Issue a typed Workload Open request for the selected presentation. The
+    /// authoritative projection carries the expiring Display1 attachment lease;
+    /// no cloud console verb or raw endpoint is involved.
     pub(super) fn issue_console_attach(&mut self, node: &str, instance_id: &str, name: &str) {
         let node = node.trim();
         let instance_id = instance_id.trim();
@@ -2794,7 +2750,8 @@ fn lifecycle_resource_route_for_filter(
             .iter()
             .flat_map(|cloud_state| cloud_state.android_inventories.iter().cloned())
             .collect::<Vec<_>>();
-        if let Some(selection) = android_apps::catalog_panel(ui, &vm_workloads, &android_inventories)
+        if let Some(selection) =
+            android_apps::catalog_panel(ui, &vm_workloads, &android_inventories)
         {
             state.arm_android_app_launch(
                 &selection.target_host,
@@ -2802,9 +2759,6 @@ fn lifecycle_resource_route_for_filter(
                 selection.app,
             );
         }
-    }
-    if matches!(mode, ResourceTableMode::Plan | ResourceTableMode::Run) {
-        console_section(ui, state);
     }
 }
 
@@ -3038,11 +2992,7 @@ fn resource_row_actions(
             if ui
                 .add_enabled(
                     launch_enabled,
-                    egui::Button::new(
-                        RichText::new("Open app")
-                            .size(Style::SMALL)
-                            .color(color),
-                    ),
+                    egui::Button::new(RichText::new("Open app").size(Style::SMALL).color(color)),
                 )
                 .clicked()
             {
@@ -3062,17 +3012,14 @@ fn resource_row_actions(
 fn app_vm_launch_allowed(row: &WorkloadRow, mode: ResourceTableMode) -> bool {
     mode == ResourceTableMode::Run
         && row.delivery_type == DeliveryType::AppVm
-        && row
-            .app
-            .as_ref()
-            .is_some_and(|request| {
-                request.validate().is_ok()
-                    && is_valid_flatpak_app_id(&request.app_id)
-                    && request
-                        .requested_capabilities
-                        .iter()
-                        .all(|capability| APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str()))
-            })
+        && row.app.as_ref().is_some_and(|request| {
+            request.validate().is_ok()
+                && is_valid_flatpak_app_id(&request.app_id)
+                && request
+                    .requested_capabilities
+                    .iter()
+                    .all(|capability| APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str()))
+        })
 }
 
 fn vm_lifecycle_actions(
@@ -3102,14 +3049,14 @@ fn vm_lifecycle_actions(
             &row.name,
         );
     }
-            if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.issue_workload_direct(
-                    "instance-reboot",
-                    &row.node,
-                    &row.name,
-                    row.delivery_type,
-                    &row.name,
-                );
+    if row_button(ui, "Reboot\u{2026}", true).clicked() {
+        state.issue_workload_direct(
+            "instance-reboot",
+            &row.node,
+            &row.name,
+            row.delivery_type,
+            &row.name,
+        );
     }
     if row_button(ui, "Destroy\u{2026}", true).clicked() {
         state.issue_workload_direct(
@@ -3669,68 +3616,6 @@ pub(super) fn mirror_summary(ui: &mut egui::Ui, state: &WorkloadsState) {
             "state/cloud mirror: {nodes} node(s) \u{00B7} {workloads} workload(s) folded{freshness}."
         ),
     );
-}
-
-/// The most recently resolved console-attach handle — the workload it answers +
-/// its [`ConsoleEndpoint`] (protocol, dial uri, and a masked one-time ticket when
-/// the head is ticketed). Rendered by every delivery view that offers a Console
-/// verb, below its roster; `None` reads an honest "not resolved yet" (§7 — never
-/// a fabricated handle). Painting the endpoint into an in-cockpit VDI surface is
-/// a distinct system (`crate::vdi`'s mesh-brokered `console_broker` path,
-/// unrelated to this cloud backend's console-attach verb) — out of reach here;
-/// the resolved handle surfaces honestly meanwhile.
-pub(super) fn console_section(ui: &mut egui::Ui, state: &WorkloadsState) {
-    ui.label(
-        RichText::new("Console")
-            .size(Style::BODY)
-            .strong()
-            .color(Style::TEXT),
-    );
-    match &state.console {
-        None => {
-            mde_egui::muted_note(
-                ui,
-                "No console resolved yet \u{2014} Console requests the live SPICE/VNC/WebRTC head \
-                 via the backend console-attach verb.",
-            );
-        }
-        Some(resolved) => {
-            mde_egui::card().show(ui, |ui| {
-                mde_egui::field(ui, "workload", &resolved.name, Style::TEXT);
-                mde_egui::field(
-                    ui,
-                    "protocol",
-                    console_proto_label(resolved.endpoint.proto),
-                    Style::TEXT,
-                );
-                mde_egui::field(ui, "uri", &resolved.endpoint.uri, Style::TEXT);
-                if resolved.endpoint.ticket.is_some() {
-                    mde_egui::field(
-                        ui,
-                        "ticket",
-                        "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} (one-time, masked)",
-                        Style::TEXT_DIM,
-                    );
-                }
-            });
-            mde_egui::muted_note(
-                ui,
-                "Painting this handle into an in-cockpit VDI surface lands with the cockpit's \
-                 VDI-attach unit; the resolved handle surfaces honestly here meanwhile.",
-            );
-        }
-    }
-    ui.add_space(Style::SP_S);
-}
-
-/// The console protocol's display word.
-const fn console_proto_label(proto: mackes_mesh_types::cloud::ConsoleProto) -> &'static str {
-    use mackes_mesh_types::cloud::ConsoleProto;
-    match proto {
-        ConsoleProto::Spice => "SPICE",
-        ConsoleProto::Vnc => "VNC",
-        ConsoleProto::WebRtc => "WebRTC",
-    }
 }
 
 /// The session audit trail — the workspace's honest record of the ops it

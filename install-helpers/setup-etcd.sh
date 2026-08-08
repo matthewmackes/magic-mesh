@@ -130,9 +130,11 @@ WantedBy=multi-user.target
 UNIT
   mkdir -p "$DATA_DIR"
   chown -R etcd:etcd "$DATA_DIR" 2>/dev/null || true
-  # mackesd is ordered after etcd (never after a mount) — SUBSTRATE-7.
-  mkdir -p /etc/systemd/system/mackesd.service.d
-  cat > /etc/systemd/system/mackesd.service.d/20-etcd.conf <<EOF
+  # Every mackesd process group is ordered after etcd (never after a mount) —
+  # SUBSTRATE-7. Variant groups independently run the startup coordination probe.
+  for mackesd_unit in control observation actions data compute integrations; do
+    mkdir -p "/etc/systemd/system/mackesd-${mackesd_unit}.service.d"
+    cat > "/etc/systemd/system/mackesd-${mackesd_unit}.service.d/20-etcd.conf" <<EOF
 [Unit]
 # SUBSTRATE-7: mackesd coordinates via etcd, so gate it on etcd (Wants+After),
 # NOT on any filesystem mount. A Syncthing/file-sync hiccup never stalls mesh
@@ -140,6 +142,9 @@ UNIT
 After=etcd.service
 Wants=etcd.service
 EOF
+  done
+  rm -f /etc/systemd/system/mackesd.service.d/20-etcd.conf
+  rmdir /etc/systemd/system/mackesd.service.d 2>/dev/null || true
   systemctl daemon-reload
   systemctl enable etcd.service >/dev/null 2>&1 || true
   systemctl restart etcd.service
@@ -196,7 +201,7 @@ log "etcd endpoints: $EPS  → $ENDPOINTS_FILE"
 
 # Best-effort readiness probe for member roles.
 if [ "$MODE" != "client" ]; then
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     if ETCDCTL_API=3 etcdctl --endpoints="http://$LISTEN:2379" endpoint health >/dev/null 2>&1; then
       log "etcd healthy on $LISTEN:2379"; break
     fi

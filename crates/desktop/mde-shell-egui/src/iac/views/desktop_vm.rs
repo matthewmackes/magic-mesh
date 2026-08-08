@@ -1,7 +1,7 @@
 //! U16 — the **Desktop VM** delivery view: full VM desktops delivered as native
 //! VDI seats. Renders the seat roster from the folded `state/cloud` mirror (live
 //! status · drift · cpu/mem/disk), an honest empty state, and per-seat lifecycle
-//! verbs (console-attach / start / stop, reboot + destroy typed-armed) over the
+//! typed Workload verbs (open / start / stop, reboot + destroy) over the
 //! landed backend seams.
 
 use mackes_mesh_types::cloud::{DriftFlag, WorkloadRow};
@@ -39,11 +39,10 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             seat_card(ui, state, row);
         }
     }
-    super::super::console_section(ui, state);
 }
 
 /// One seat card — name · placement · live status · drift, the live metrics, then
-/// the seat's lifecycle verbs (console-attach first, destructive ones typed-armed).
+/// the seat's lifecycle verbs (typed Open first, destructive ones confirmed).
 fn seat_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
     card().show(ui, |ui| {
         header_row(ui, row);
@@ -54,16 +53,40 @@ fn seat_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
                 state.issue_console_attach(&row.node, &row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
-                state.issue_workload_direct("instance-start", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-start",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_workload_direct("instance-stop", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-stop",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-reboot", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-reboot",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-delete", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-delete",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
         });
     });

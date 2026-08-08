@@ -1,10 +1,8 @@
-//! The eframe app (E12-5): the egui music surface. It loads the shared Airsonic
-//! credentials, spawns the [`worker`] thread, and renders the [`MusicState`]
-//! entirely through the shared [`Style`] — a library listing, an album's track
-//! list, and a transport strip. Clicks become [`Command`]s for the worker; the
-//! worker's [`Update`]s are drained each frame. Nothing here fakes data: with no
-//! creds yet it shows the daemon's own first-run hint, and load/playback failures
-//! render as honest error lines (§7).
+//! The eframe app (E12-5): a read-only projection of the daemon-owned Music
+//! workspace. Catalog and playback state arrive through retained `mde-bus`
+//! snapshots; mutations are emitted only through an installed authenticated Bus
+//! publisher. The legacy worker remains quarantined for removal, but no runtime
+//! constructor starts it or accepts it as a fallback authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,9 +131,9 @@ pub struct MusicApp {
     /// mutation path or mint credentials outside the root shell authority.
     workspace_action_publisher:
         Option<Box<dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static>>,
-    /// Optional shell-owned writer for read-only daemon browse requests. The
-    /// embedded surface uses this for Search; the standalone client retains
-    /// the Airsonic worker fallback until it has no direct provider seam.
+    /// Optional host-owned writer for read-only daemon browse requests. Without
+    /// one, embedded and standalone surfaces report browse actions unavailable;
+    /// neither may fall back to direct provider access.
     workspace_browse_publisher:
         Option<Box<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync + 'static>>,
     /// Search field state and debounce bookkeeping.
@@ -205,10 +203,10 @@ enum LibraryFilter {
 }
 
 impl MusicApp {
-    /// Build the surface: load the shared Airsonic credentials and, when present,
-    /// spawn the worker and kick off the library load. With no creds yet the
-    /// surface opens to an honest "connect a server" state instead of faking a
-    /// library.
+    /// Build the standalone review surface as the same daemon-projected client
+    /// used by the shell. A standalone window has no signing authority, so
+    /// mutations remain honestly unavailable until an authenticated publisher is
+    /// installed by its host.
     #[must_use]
     pub fn new(cc: &CreationContext<'_>) -> Self {
         Self::new_with_ctx(&cc.egui_ctx)
@@ -216,11 +214,11 @@ impl MusicApp {
 
     /// Build over an egui [`egui::Context`] directly — the DRM-seat shell path
     /// (`mde-shell-egui --features drm`) has no eframe `CreationContext`, only the
-    /// bare `Context` the DRM runner drives. Both entry points converge here so the
-    /// worker still gets a repaint handle in either runner.
+    /// bare `Context` the DRM runner drives. Both entry points converge on the
+    /// same daemon-projected state reader.
     #[must_use]
     pub fn new_with_ctx(ctx: &egui::Context) -> Self {
-        Self::new_with_mode(ctx, true)
+        Self::new_with_mode(ctx, false)
     }
 
     /// Build the embedded shell surface without starting the standalone
@@ -819,10 +817,10 @@ impl MusicApp {
         self.route = MusicRoute::Library;
     }
 
-    /// Publish a daemon-owned transport action when the authenticated shell
-    /// writer is installed. Standalone Music has no writer and returns `false`
-    /// so its existing local worker seam remains the explicit compatibility
-    /// path until the full catalog/worker migration is complete.
+    /// Publish a daemon-owned transport action when the authenticated host
+    /// writer is installed. A surface without that writer consumes the intent
+    /// with an honest unavailable error so no caller can fall back to local
+    /// playback authority.
     fn try_publish_transport_action(
         &mut self,
         action: &str,
@@ -1055,9 +1053,8 @@ impl MusicApp {
     }
 
     /// Render the daemon's bounded collections when its retained workspace
-    /// projection is available. This is the authority cut for Library: the
-    /// legacy Airsonic album worker remains only for standalone clients that
-    /// have not received a daemon snapshot yet.
+    /// projection is available. This is the authority cut for Library on every
+    /// public construction path.
     fn render_daemon_library(&mut self, ui: &mut egui::Ui, snapshot: &MusicWorkspaceSnapshotV1) {
         let wanted_kind = match self.library_filter {
             LibraryFilter::All => None,
@@ -1687,10 +1684,9 @@ fn seat_connections(c: &mde_musicd::creds::Creds) -> Vec<(SeatServer, Client)> {
 
 /// Render the music surface's central content into the given `ui`.
 ///
-/// Draws the honest "connect a server" state when no credentials are configured,
-/// then any transient engine-error line, and finally either the open album's track
-/// list or the library listing. Clicks still flow to the worker through `app`'s
-/// command channel, exactly as the standalone binary drives them.
+/// Draws the honest daemon-unavailable state before a retained projection
+/// arrives, then renders the daemon-owned workspace. Mutating clicks require a
+/// host-installed authenticated Bus publisher.
 ///
 /// This is the one body shared by the standalone binary's `CentralPanel` and the
 /// embedded shell panel (E12-3b), so the surface renders identically whether it
@@ -4580,7 +4576,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_transport_publishes_typed_request_and_standalone_falls_back() {
+    fn shell_transport_publishes_typed_request_and_standalone_fails_closed() {
         let mut app = app_with(MusicState::new(), None);
         let (published_tx, published_rx) = mpsc::sync_channel::<String>(1);
         app.set_workspace_action_publisher(move |body| {
@@ -4597,7 +4593,39 @@ mod tests {
         assert!(request.armed_token.is_none());
 
         let mut standalone = app_with(MusicState::new(), None);
-        assert!(!standalone.try_publish_transport_action("pause", None, None));
+        standalone.worker_enabled = false;
+        assert!(standalone.try_publish_transport_action("pause", None, None));
+        assert_eq!(
+            standalone.state.error.as_deref(),
+            Some("Music transport is unavailable until the authenticated daemon action path is connected.")
+        );
+    }
+
+    #[test]
+    fn standalone_constructor_refuses_hostile_worker_playback_state() {
+        let mut app = MusicApp::new_with_ctx(&egui::Context::default());
+        assert!(
+            app.commands.is_none(),
+            "standalone must not start a provider worker"
+        );
+        assert!(!app.worker_enabled, "standalone must use daemon authority");
+
+        app.update_tx
+            .try_send(Update::Started(song("hostile-worker-track")))
+            .expect("hostile update should fit the bounded stale queue");
+        app.update_tx
+            .try_send(Update::Playing(true))
+            .expect("hostile update should fit the bounded stale queue");
+        music_pump(&mut app);
+
+        assert!(
+            app.state.now_playing.is_none(),
+            "GUI-owned worker state must not become now-playing authority"
+        );
+        assert!(
+            !app.state.playing,
+            "GUI-owned worker state must remain inert"
+        );
     }
 
     #[test]

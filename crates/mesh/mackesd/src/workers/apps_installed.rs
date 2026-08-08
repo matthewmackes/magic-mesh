@@ -310,7 +310,8 @@ mod tests {
         assert!(first_delay <= DEFAULT_TICK_INTERVAL);
         assert!(first_delay >= DEFAULT_TICK_INTERVAL - MAX_INITIAL_PHASE);
         assert_eq!(initial_phase("", DEFAULT_TICK_INTERVAL), Duration::ZERO);
-        assert!(initial_phase("peer:seat15", Duration::from_millis(100))
-            <= Duration::from_millis(100));
+        assert!(
+            initial_phase("peer:seat15", Duration::from_millis(100)) <= Duration::from_millis(100)
+        );
     }
 }

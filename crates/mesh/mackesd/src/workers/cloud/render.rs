@@ -270,13 +270,15 @@ mod tests {
             "appvm-writer",
             app,
         );
-        let value: serde_json::Value = serde_json::from_str(&render_tfvars(
-            "eagle",
-            &[spec],
-            "qemu:///system",
-            super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+        let value: serde_json::Value = serde_json::from_str(
+            &render_tfvars(
+                "eagle",
+                &[spec],
+                "qemu:///system",
+                super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            )
+            .expect("app storage target renders"),
         )
-        .expect("app storage target renders"))
         .expect("valid tfvars");
         let app = &value[TFVARS_VMS]["appvm-writer"]["app"];
         assert_eq!(app["app_id"], "org.example.Writer");
@@ -296,13 +298,15 @@ mod tests {
         let mut spec = mackes_mesh_types::cloud::BrowserVmProfile::default()
             .workload_spec("eagle", "browser-vm");
         spec.image_digest = Some(digest.to_string());
-        let value: serde_json::Value = serde_json::from_str(&render_tfvars(
-            "eagle",
-            &[spec],
-            "qemu:///system",
-            "/srv/browser/disk.qcow2",
+        let value: serde_json::Value = serde_json::from_str(
+            &render_tfvars(
+                "eagle",
+                &[spec],
+                "qemu:///system",
+                "/srv/browser/disk.qcow2",
+            )
+            .expect("browser storage target renders"),
         )
-        .expect("browser storage target renders"))
         .expect("valid tfvars");
 
         assert_eq!(

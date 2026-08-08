@@ -14,7 +14,7 @@
 [Unit]
 Description=Kamailio SIP proxy (MCNF voice instance)
 Documentation=man:kamailio(8)
-After=network-online.target mackesd.service
+After=network-online.target mackesd.target
 Wants=network-online.target
 
 [Service]
@@ -27,7 +27,7 @@ ExecStart=/usr/sbin/kamailio -DD -E -f /etc/kamailio-mde/kamailio.cfg
 Restart=on-failure
 RestartSec=5
 
-# Hardening (mirrors mackesd.service's EFF-12 baseline).
+# Hardening (mirrors the grouped mackesd service baseline).
 ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true

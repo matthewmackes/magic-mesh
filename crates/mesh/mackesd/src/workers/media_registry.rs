@@ -460,9 +460,9 @@ mod tests {
                 next_failure_retry(next_failure_retry(next_failure_retry(
                     DEFAULT_TICK_INTERVAL,
                 ))),
-                next_failure_retry(next_failure_retry(next_failure_retry(
-                    next_failure_retry(DEFAULT_TICK_INTERVAL),
-                ))),
+                next_failure_retry(next_failure_retry(next_failure_retry(next_failure_retry(
+                    DEFAULT_TICK_INTERVAL
+                ),))),
             ],
             [
                 Duration::from_secs(30),

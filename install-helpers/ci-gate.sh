@@ -90,6 +90,7 @@ CRATES_SERIAL=(mackesd mde-term-egui)
 # scans the real tree; lints without a self-test still run as hard checks.
 POLICY_LINTS=(
   lint-bus-names.sh
+  lint-browser-vm-boundary.sh
   lint-layered-tiers.sh
   lint-style-leaks.sh
   lint-brand-identity.sh
@@ -100,6 +101,7 @@ POLICY_LINTS=(
 )
 POLICY_SELF_TESTS=(
   lint-bus-names.sh
+  lint-browser-vm-boundary.sh
   lint-layered-tiers.sh
   lint-brand-identity.sh
   lint-doc-supersession.sh

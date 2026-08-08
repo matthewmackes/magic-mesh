@@ -86,7 +86,7 @@ if [ -f /etc/magic-mesh/join-token ]; then
   cat > /etc/systemd/system/mde-firstboot-join.service <<'UNIT'
 [Unit]
 Description=MCNF firstboot auto-join (single-use bearer)
-After=network-online.target mackesd.service
+After=network-online.target mackesd.target
 Wants=network-online.target
 ConditionPathExists=/etc/magic-mesh/join-token
 

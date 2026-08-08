@@ -39,6 +39,12 @@ pub const MAX_CLIPBOARD_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_CLIPBOARD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// Maximum number of node identities retained by the echo guard.
 pub const MAX_CLIPBOARD_ECHO_HOPS: usize = 8;
+/// Maximum encoded JSON body accepted for one MIME selection decision.
+pub const MAX_CLIPBOARD_SELECTION_V2_JSON_BYTES: usize = 16 * 1024;
+/// Maximum image dimension admitted by typed clipboard metadata.
+pub const MAX_CLIPBOARD_IMAGE_DIMENSION_PX: u32 = 65_535;
+/// Maximum number of files represented by one clipboard file-list offer.
+pub const MAX_CLIPBOARD_FILE_ITEMS: u32 = 4_096;
 
 /// A bounded identity validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +274,78 @@ impl ClipboardMimeKind {
     }
 }
 
+/// Finite metadata attached to a representation; arbitrary metadata maps are
+/// deliberately absent so paths, commands, credentials, and unbounded values
+/// cannot acquire wire semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum ClipboardTypedMetadataV2 {
+    /// Compatibility state for an offer whose producer has no richer facts.
+    #[default]
+    Unspecified,
+    /// UTF-8 text or HTML.
+    Text {
+        /// Whether the representation contains markup rather than plain text.
+        markup: bool,
+    },
+    /// Raster image dimensions.
+    Image {
+        /// Pixel width, starting at one.
+        width_px: u32,
+        /// Pixel height, starting at one.
+        height_px: u32,
+    },
+    /// Number of opaque Files objects represented by a file-list offer.
+    Files {
+        /// Number of objects, starting at one.
+        item_count: u32,
+    },
+}
+
+impl ClipboardTypedMetadataV2 {
+    const fn is_unspecified(&self) -> bool {
+        matches!(self, Self::Unspecified)
+    }
+}
+
+/// Source policy classification. Secret-bearing offers are representable for
+/// audit but can never be selected or materialized by this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardDisclosureV2 {
+    /// Content may cross the explicitly approved clipboard boundary.
+    #[default]
+    Shareable,
+    /// Content was classified as secret and must fail closed.
+    Secret,
+}
+
+impl ClipboardDisclosureV2 {
+    const fn is_shareable(&self) -> bool {
+        matches!(self, Self::Shareable)
+    }
+}
+
+/// Stable denial vocabulary shared by DRM, mesh, and VDI adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardDenialReasonV2 {
+    /// The peer supplied a schema version this implementation does not know.
+    UnknownVersion,
+    /// An encoded body, representation, or metadata value exceeded a bound.
+    Oversized,
+    /// The offer or selection has expired.
+    Stale,
+    /// Source policy classified the representation as secret.
+    SecretBearing,
+    /// The selected MIME kind or its transport state is unsupported.
+    Unsupported,
+    /// The generation was already admitted for this source/session.
+    Replayed,
+    /// The payload, digest, identity, or selection does not match its offer.
+    InvalidPayload,
+}
+
 /// An explicit capability refusal for one representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -338,6 +416,15 @@ pub struct ClipboardMimeOfferV2 {
     /// Bounded display-only preview; never a path, URL, command, or secret.
     #[serde(default)]
     pub preview: Option<String>,
+    /// Finite representation facts consumed without parsing payload bytes.
+    #[serde(
+        default,
+        skip_serializing_if = "ClipboardTypedMetadataV2::is_unspecified"
+    )]
+    pub metadata: ClipboardTypedMetadataV2,
+    /// Explicit source policy classification.
+    #[serde(default, skip_serializing_if = "ClipboardDisclosureV2::is_shareable")]
+    pub disclosure: ClipboardDisclosureV2,
     /// Inline text, an opaque Files reference, or an explicit state.
     pub payload: ClipboardPayloadV2,
 }
@@ -354,6 +441,8 @@ impl ClipboardMimeOfferV2 {
             byte_count: text.len() as u64,
             content_sha256_hex: Some(sha256_hex(text.as_bytes())),
             preview: None,
+            metadata: ClipboardTypedMetadataV2::Unspecified,
+            disclosure: ClipboardDisclosureV2::Shareable,
             payload: ClipboardPayloadV2::InlineText { text },
         };
         offer.validate()?;
@@ -372,6 +461,8 @@ impl ClipboardMimeOfferV2 {
             byte_count,
             content_sha256_hex: Some(content_sha256_hex.into()),
             preview: None,
+            metadata: ClipboardTypedMetadataV2::Unspecified,
+            disclosure: ClipboardDisclosureV2::Shareable,
             payload: ClipboardPayloadV2::FilesReference { file_ref },
         };
         offer.validate()?;
@@ -386,6 +477,8 @@ impl ClipboardMimeOfferV2 {
             byte_count: 0,
             content_sha256_hex: None,
             preview: None,
+            metadata: ClipboardTypedMetadataV2::Unspecified,
+            disclosure: ClipboardDisclosureV2::Shareable,
             payload: ClipboardPayloadV2::Unsupported { reason },
         }
     }
@@ -398,12 +491,19 @@ impl ClipboardMimeOfferV2 {
             byte_count: 0,
             content_sha256_hex: None,
             preview: None,
+            metadata: ClipboardTypedMetadataV2::Unspecified,
+            disclosure: ClipboardDisclosureV2::Shareable,
             payload: ClipboardPayloadV2::Unavailable { reason },
         }
     }
 
     /// Validate representation bounds, digest metadata, and payload shape.
     pub fn validate(&self) -> Result<(), ClipboardEnvelopeV2ValidationError> {
+        if self.disclosure == ClipboardDisclosureV2::Secret {
+            return Err(ClipboardEnvelopeV2ValidationError::Denied {
+                reason: ClipboardDenialReasonV2::SecretBearing,
+            });
+        }
         if self.byte_count > MAX_CLIPBOARD_PAYLOAD_BYTES {
             return Err(ClipboardEnvelopeV2ValidationError::OutOfBounds {
                 field: "offers.byte_count",
@@ -413,6 +513,7 @@ impl ClipboardMimeOfferV2 {
         if let Some(preview) = &self.preview {
             validate_metadata_text(preview, "offers.preview")?;
         }
+        self.validate_typed_metadata()?;
 
         match &self.payload {
             ClipboardPayloadV2::InlineText { text } => {
@@ -471,6 +572,291 @@ impl ClipboardMimeOfferV2 {
             }
         }
         Ok(())
+    }
+
+    const fn validate_typed_metadata(&self) -> Result<(), ClipboardEnvelopeV2ValidationError> {
+        match self.metadata {
+            ClipboardTypedMetadataV2::Unspecified => Ok(()),
+            ClipboardTypedMetadataV2::Text { markup }
+                if matches!(
+                    (self.mime, markup),
+                    (
+                        ClipboardMimeKind::TextPlain | ClipboardMimeKind::TextRtf,
+                        false
+                    ) | (ClipboardMimeKind::TextHtml, true)
+                ) =>
+            {
+                Ok(())
+            }
+            ClipboardTypedMetadataV2::Image {
+                width_px,
+                height_px,
+            } if matches!(
+                self.mime,
+                ClipboardMimeKind::ImagePng | ClipboardMimeKind::ImageJpeg
+            ) =>
+            {
+                if width_px == 0 || height_px == 0 {
+                    return Err(ClipboardEnvelopeV2ValidationError::InvalidOffer {
+                        field: "offers.metadata.image",
+                    });
+                }
+                if width_px > MAX_CLIPBOARD_IMAGE_DIMENSION_PX
+                    || height_px > MAX_CLIPBOARD_IMAGE_DIMENSION_PX
+                {
+                    return Err(ClipboardEnvelopeV2ValidationError::OutOfBounds {
+                        field: "offers.metadata.image_dimension_px",
+                        max: MAX_CLIPBOARD_IMAGE_DIMENSION_PX as u64,
+                    });
+                }
+                Ok(())
+            }
+            ClipboardTypedMetadataV2::Files { item_count }
+                if matches!(self.mime, ClipboardMimeKind::FileList) =>
+            {
+                if item_count == 0 {
+                    return Err(ClipboardEnvelopeV2ValidationError::InvalidOffer {
+                        field: "offers.metadata.files",
+                    });
+                }
+                if item_count > MAX_CLIPBOARD_FILE_ITEMS {
+                    return Err(ClipboardEnvelopeV2ValidationError::OutOfBounds {
+                        field: "offers.metadata.file_items",
+                        max: MAX_CLIPBOARD_FILE_ITEMS as u64,
+                    });
+                }
+                Ok(())
+            }
+            ClipboardTypedMetadataV2::Text { .. }
+            | ClipboardTypedMetadataV2::Image { .. }
+            | ClipboardTypedMetadataV2::Files { .. } => {
+                Err(ClipboardEnvelopeV2ValidationError::InvalidOffer {
+                    field: "offers.metadata",
+                })
+            }
+        }
+    }
+}
+
+/// The receiver's explicit decision for one offered representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "decision", deny_unknown_fields)]
+pub enum ClipboardSelectionDecisionV2 {
+    /// Materialize the selected representation after contract admission.
+    Selected,
+    /// Refuse materialization with a stable reason suitable for UI and audit.
+    Denied {
+        /// Why the selection was refused.
+        reason: ClipboardDenialReasonV2,
+    },
+}
+
+/// Versioned receiver selection bound to one offer generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardSelectionV2 {
+    /// Wire schema discriminator.
+    pub schema_version: u16,
+    /// Offer identity being selected.
+    pub clip_id: ClipboardClipId,
+    /// Source login session that owns the offer generation.
+    pub session: ClipboardSessionId,
+    /// Exact source generation (`ClipboardEnvelopeV2::sequence`).
+    pub generation: u64,
+    /// Exact finite MIME representation selected or denied.
+    pub mime: ClipboardMimeKind,
+    /// Digest copied from the selected offer; absent for an explicit denial.
+    #[serde(default)]
+    pub content_sha256_hex: Option<String>,
+    /// Receiver decision.
+    pub decision: ClipboardSelectionDecisionV2,
+}
+
+impl ClipboardSelectionV2 {
+    /// Build an accepted selection from an exact offer generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed denial when the MIME kind was not offered or its digest
+    /// cannot form a valid accepted selection.
+    pub fn selected(
+        envelope: &ClipboardEnvelopeV2,
+        mime: ClipboardMimeKind,
+    ) -> Result<Self, ClipboardDenialReasonV2> {
+        let offer = envelope
+            .offers
+            .iter()
+            .find(|offer| offer.mime == mime)
+            .ok_or(ClipboardDenialReasonV2::Unsupported)?;
+        let selection = Self {
+            schema_version: CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION,
+            clip_id: envelope.clip_id,
+            session: envelope.session,
+            generation: envelope.sequence,
+            mime,
+            content_sha256_hex: offer.content_sha256_hex.clone(),
+            decision: ClipboardSelectionDecisionV2::Selected,
+        };
+        selection.validate_shape()?;
+        Ok(selection)
+    }
+
+    /// Build an explicit typed denial for an exact offer generation.
+    #[must_use]
+    pub const fn denied(
+        envelope: &ClipboardEnvelopeV2,
+        mime: ClipboardMimeKind,
+        reason: ClipboardDenialReasonV2,
+    ) -> Self {
+        Self {
+            schema_version: CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION,
+            clip_id: envelope.clip_id,
+            session: envelope.session,
+            generation: envelope.sequence,
+            mime,
+            content_sha256_hex: None,
+            decision: ClipboardSelectionDecisionV2::Denied { reason },
+        }
+    }
+
+    /// Decode a bounded selection body with unknown and duplicate fields denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded decode error for an oversized, malformed, ambiguous,
+    /// unknown, or intrinsically invalid selection.
+    pub fn from_json_bytes(body: &[u8]) -> Result<Self, ClipboardSelectionV2DecodeError> {
+        if body.len() > MAX_CLIPBOARD_SELECTION_V2_JSON_BYTES {
+            return Err(ClipboardSelectionV2DecodeError::BodyTooLarge {
+                bytes: body.len(),
+                max: MAX_CLIPBOARD_SELECTION_V2_JSON_BYTES,
+            });
+        }
+        reject_duplicate_json_keys(body).map_err(ClipboardSelectionV2DecodeError::Json)?;
+        let selection =
+            serde_json::from_slice::<Self>(body).map_err(ClipboardSelectionV2DecodeError::Json)?;
+        selection
+            .validate_shape()
+            .map_err(ClipboardSelectionV2DecodeError::Denied)?;
+        Ok(selection)
+    }
+
+    /// Admit a selected payload against its signed offer, injected time, and
+    /// receiver-owned source/session generation high-water mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable denial reason when the offer is stale, replayed,
+    /// secret-bearing, unsupported, or does not exactly match the selection.
+    pub fn admit<'a>(
+        &self,
+        envelope: &'a ClipboardEnvelopeV2,
+        now_unix_ms: u64,
+        last_generation: Option<u64>,
+    ) -> Result<&'a ClipboardMimeOfferV2, ClipboardDenialReasonV2> {
+        self.validate_shape()?;
+        envelope
+            .validate_at(now_unix_ms, last_generation)
+            .map_err(|error| error.denial_reason())?;
+        if self.clip_id != envelope.clip_id || self.session != envelope.session {
+            return Err(ClipboardDenialReasonV2::InvalidPayload);
+        }
+        if self.generation != envelope.sequence {
+            return Err(ClipboardDenialReasonV2::InvalidPayload);
+        }
+        let offer = envelope
+            .offers
+            .iter()
+            .find(|offer| offer.mime == self.mime)
+            .ok_or(ClipboardDenialReasonV2::Unsupported)?;
+        offer.validate().map_err(|error| error.denial_reason())?;
+        match self.decision {
+            ClipboardSelectionDecisionV2::Denied { reason } => Err(reason),
+            ClipboardSelectionDecisionV2::Selected => {
+                if matches!(
+                    offer.payload,
+                    ClipboardPayloadV2::Unsupported { .. } | ClipboardPayloadV2::Unavailable { .. }
+                ) {
+                    return Err(ClipboardDenialReasonV2::Unsupported);
+                }
+                if self.content_sha256_hex != offer.content_sha256_hex {
+                    return Err(ClipboardDenialReasonV2::InvalidPayload);
+                }
+                Ok(offer)
+            }
+        }
+    }
+
+    fn validate_shape(&self) -> Result<(), ClipboardDenialReasonV2> {
+        if self.schema_version != CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION {
+            return Err(ClipboardDenialReasonV2::UnknownVersion);
+        }
+        if self.clip_id.is_nil() || self.session.is_nil() || self.generation == 0 {
+            return Err(ClipboardDenialReasonV2::InvalidPayload);
+        }
+        match self.decision {
+            ClipboardSelectionDecisionV2::Selected => {
+                let digest = self
+                    .content_sha256_hex
+                    .as_deref()
+                    .ok_or(ClipboardDenialReasonV2::InvalidPayload)?;
+                if !is_lower_hex(digest, 64) {
+                    return Err(ClipboardDenialReasonV2::InvalidPayload);
+                }
+            }
+            ClipboardSelectionDecisionV2::Denied { .. } => {
+                if self.content_sha256_hex.is_some() {
+                    return Err(ClipboardDenialReasonV2::InvalidPayload);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why a bounded selection body could not be decoded or admitted.
+#[derive(Debug)]
+pub enum ClipboardSelectionV2DecodeError {
+    /// The body exceeded the pre-serde allocation boundary.
+    BodyTooLarge {
+        /// Supplied bytes.
+        bytes: usize,
+        /// Maximum admitted bytes.
+        max: usize,
+    },
+    /// JSON was malformed, ambiguous, or contained unknown fields.
+    Json(serde_json::Error),
+    /// The decoded selection failed its typed shape admission.
+    Denied(ClipboardDenialReasonV2),
+}
+
+impl fmt::Display for ClipboardSelectionV2DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BodyTooLarge { bytes, max } => {
+                write!(
+                    formatter,
+                    "clipboard selection is {bytes} bytes; maximum is {max}"
+                )
+            }
+            Self::Json(error) => write!(formatter, "invalid clipboard selection JSON: {error}"),
+            Self::Denied(reason) => write!(formatter, "clipboard selection denied: {reason:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardSelectionV2DecodeError {}
+
+impl ClipboardSelectionV2DecodeError {
+    /// Collapse wire-decode failures into the same stable adapter vocabulary
+    /// used after successful deserialization.
+    #[must_use]
+    pub const fn denial_reason(&self) -> ClipboardDenialReasonV2 {
+        match self {
+            Self::BodyTooLarge { .. } => ClipboardDenialReasonV2::Oversized,
+            Self::Json(_) => ClipboardDenialReasonV2::InvalidPayload,
+            Self::Denied(reason) => *reason,
+        }
     }
 }
 
@@ -720,8 +1106,7 @@ impl ClipboardEnvelopeV2 {
                 max: MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES,
             });
         }
-        serde_json::from_slice::<NoDuplicateJson>(body)
-            .map_err(ClipboardEnvelopeV2DecodeError::Json)?;
+        reject_duplicate_json_keys(body).map_err(ClipboardEnvelopeV2DecodeError::Json)?;
         let wire = serde_json::from_slice::<ClipboardEnvelopeV2Wire>(body)
             .map_err(ClipboardEnvelopeV2DecodeError::Json)?;
         Self::from_wire(wire).map_err(ClipboardEnvelopeV2DecodeError::Validation)
@@ -932,6 +1317,38 @@ pub enum ClipboardEnvelopeV2ValidationError {
     MalformedSignature,
     /// The signature did not verify over the current envelope.
     InvalidSignature,
+    /// A policy-bearing offer failed closed with a stable adapter reason.
+    Denied {
+        /// Typed refusal reason.
+        reason: ClipboardDenialReasonV2,
+    },
+}
+
+impl ClipboardEnvelopeV2ValidationError {
+    /// Collapse detailed validation diagnostics into the stable cross-adapter
+    /// denial vocabulary without leaking payload details.
+    #[must_use]
+    pub const fn denial_reason(&self) -> ClipboardDenialReasonV2 {
+        match self {
+            Self::UnsupportedSchema { .. } => ClipboardDenialReasonV2::UnknownVersion,
+            Self::OutOfBounds { .. } | Self::TooManyOffers { .. } | Self::ExpiryTooLong { .. } => {
+                ClipboardDenialReasonV2::Oversized
+            }
+            Self::Expired { .. } | Self::NotYetValid { .. } => ClipboardDenialReasonV2::Stale,
+            Self::Replay { .. } | Self::EchoLoop => ClipboardDenialReasonV2::Replayed,
+            Self::Denied { reason } => *reason,
+            Self::NoOffers | Self::DuplicateMime { .. } => ClipboardDenialReasonV2::Unsupported,
+            Self::NilClipId
+            | Self::NilSessionId
+            | Self::InvalidSequence
+            | Self::InvalidTimestamp
+            | Self::InvalidOffer { .. }
+            | Self::InvalidDigest { .. }
+            | Self::InvalidAttribution
+            | Self::MalformedSignature
+            | Self::InvalidSignature => ClipboardDenialReasonV2::InvalidPayload,
+        }
+    }
 }
 
 impl fmt::Display for ClipboardEnvelopeV2ValidationError {
@@ -992,6 +1409,7 @@ impl fmt::Display for ClipboardEnvelopeV2ValidationError {
             Self::InvalidAttribution => formatter.write_str("invalid clipboard attribution"),
             Self::MalformedSignature => formatter.write_str("malformed clipboard signature"),
             Self::InvalidSignature => formatter.write_str("invalid clipboard signature"),
+            Self::Denied { reason } => write!(formatter, "clipboard offer denied: {reason:?}"),
         }
     }
 }
@@ -1043,6 +1461,16 @@ impl std::error::Error for ClipboardEnvelopeV2DecodeError {
 /// last-value-wins rule, which is unsafe for a signed, versioned envelope:
 /// different consumers could attribute a different meaning to the same body.
 struct NoDuplicateJson;
+
+/// Reject duplicate object keys recursively before a signed clipboard wrapper
+/// applies serde's otherwise ambiguous last-value-wins behavior.
+///
+/// # Errors
+///
+/// Returns the JSON diagnostic for malformed input or the first duplicate key.
+pub fn reject_duplicate_json_keys(body: &[u8]) -> Result<(), serde_json::Error> {
+    serde_json::from_slice::<NoDuplicateJson>(body).map(|_| ())
+}
 
 impl<'de> Deserialize<'de> for NoDuplicateJson {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1437,8 +1865,8 @@ mod tests {
             .collect();
         assert!(matches!(
             too_many.validate(),
-            Err(ClipboardEnvelopeV2ValidationError::TooManyOffers { .. })
-                | Err(ClipboardEnvelopeV2ValidationError::DuplicateMime { .. })
+            Err(ClipboardEnvelopeV2ValidationError::TooManyOffers { .. }
+                | ClipboardEnvelopeV2ValidationError::DuplicateMime { .. })
         ));
 
         let oversized = vec![b' '; MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES + 1];
@@ -1451,17 +1879,18 @@ mod tests {
     #[test]
     fn signed_wire_admission_rejects_ambiguous_duplicate_json_keys() {
         let json = serde_json::to_string(&sample()).expect("serialize signed envelope");
-        let ambiguous = json.replacen(
-            "\"sequence\":1",
-            "\"sequence\":1,\"sequence\":1",
-            1,
+        let ambiguous = json.replacen("\"sequence\":1", "\"sequence\":1,\"sequence\":1", 1);
+        assert_ne!(
+            ambiguous, json,
+            "fixture must contain the signed sequence field"
         );
-        assert_ne!(ambiguous, json, "fixture must contain the signed sequence field");
 
         let error = ClipboardEnvelopeV2::from_json(&ambiguous)
             .expect_err("duplicate signed field must never use last-value-wins admission");
         assert!(matches!(error, ClipboardEnvelopeV2DecodeError::Json(_)));
-        assert!(error.to_string().contains("duplicate JSON object key \"sequence\""));
+        assert!(error
+            .to_string()
+            .contains("duplicate JSON object key \"sequence\""));
     }
 
     #[test]
@@ -1485,5 +1914,190 @@ mod tests {
             envelope.validate(),
             Err(ClipboardEnvelopeV2ValidationError::InvalidOffer { .. })
         ));
+    }
+
+    #[test]
+    fn rich_offer_selection_and_payload_contract_round_trips_all_required_kinds() {
+        let mut image = ClipboardMimeOfferV2::files_reference(
+            ClipboardMimeKind::ImagePng,
+            FileRefId::new(),
+            4_096,
+            "a".repeat(64),
+        )
+        .expect("bounded image offer");
+        image.metadata = ClipboardTypedMetadataV2::Image {
+            width_px: 32,
+            height_px: 32,
+        };
+        let offers = vec![
+            ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextPlain, "plain")
+                .expect("plain text"),
+            ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextHtml, "<b>rich</b>")
+                .expect("html"),
+            image,
+            ClipboardMimeOfferV2::files_reference(
+                ClipboardMimeKind::FileList,
+                FileRefId::new(),
+                8_192,
+                "b".repeat(64),
+            )
+            .expect("file list"),
+        ];
+        let envelope = ClipboardEnvelopeV2::new(
+            ClipboardClipId::from_uuid(Uuid::from_u128(11)),
+            ClipboardSourceV2::new(node("eagle"), seat("seat-1")),
+            ClipboardTargetV2::new(node("dell-15"), seat("seat-1")),
+            ClipboardSessionId::from_uuid(Uuid::from_u128(12)),
+            7,
+            1_720_000_000_000,
+            1_720_000_060_000,
+            offers,
+        )
+        .expect("rich offer")
+        .signed(&key());
+        let selection = ClipboardSelectionV2::selected(&envelope, ClipboardMimeKind::ImagePng)
+            .expect("image selection");
+        let json = serde_json::to_vec(&selection).expect("selection JSON");
+        let decoded = ClipboardSelectionV2::from_json_bytes(&json).expect("bounded selection");
+        let selected = decoded
+            .admit(&envelope, 1_720_000_000_001, Some(6))
+            .expect("exact generation selected");
+        assert!(matches!(
+            selected.metadata,
+            ClipboardTypedMetadataV2::Image {
+                width_px: 32,
+                height_px: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn rich_contract_fixture_hashes_are_stable() {
+        let envelope = sample();
+        let selection = ClipboardSelectionV2::selected(&envelope, ClipboardMimeKind::TextPlain)
+            .expect("fixture selection");
+        let envelope_json = serde_json::to_vec(&envelope).expect("fixture envelope JSON");
+        let selection_json = serde_json::to_vec(&selection).expect("fixture selection JSON");
+        assert_eq!(
+            sha256_hex(&envelope_json),
+            "4b970f57631ebdfa9e850c362e600e2403e4b1f02d956e4740df145224569fc1"
+        );
+        assert_eq!(
+            sha256_hex(&selection_json),
+            "771917de2d79ccf4b2131b3812cb00ad1b499427f397f9fc42d1b2078c63c31f"
+        );
+    }
+
+    #[test]
+    fn hostile_unknown_selection_version_and_mime_fail_closed() {
+        let selection = ClipboardSelectionV2::selected(&sample(), ClipboardMimeKind::TextPlain)
+            .expect("selection");
+        let mut unknown_version = serde_json::to_value(&selection).expect("selection value");
+        unknown_version["schema_version"] = json!(99);
+        assert!(matches!(
+            ClipboardSelectionV2::from_json_bytes(unknown_version.to_string().as_bytes()),
+            Err(ClipboardSelectionV2DecodeError::Denied(
+                ClipboardDenialReasonV2::UnknownVersion
+            ))
+        ));
+
+        let mut unknown_mime = serde_json::to_value(&selection).expect("selection value");
+        unknown_mime["mime"] = json!("application_x_executable");
+        let error = ClipboardSelectionV2::from_json_bytes(unknown_mime.to_string().as_bytes())
+            .expect_err("unknown MIME must fail closed");
+        assert_eq!(
+            error.denial_reason(),
+            ClipboardDenialReasonV2::InvalidPayload
+        );
+    }
+
+    #[test]
+    fn hostile_oversized_payload_and_metadata_fail_with_typed_denial() {
+        let oversized = "x".repeat(MAX_CLIPBOARD_INLINE_TEXT_BYTES + 1);
+        let error = ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextPlain, oversized)
+            .expect_err("oversized inline data must fail");
+        assert_eq!(error.denial_reason(), ClipboardDenialReasonV2::Oversized);
+
+        let mut image = ClipboardMimeOfferV2::files_reference(
+            ClipboardMimeKind::ImagePng,
+            FileRefId::new(),
+            1,
+            "a".repeat(64),
+        )
+        .expect("base image offer");
+        image.metadata = ClipboardTypedMetadataV2::Image {
+            width_px: MAX_CLIPBOARD_IMAGE_DIMENSION_PX + 1,
+            height_px: 1,
+        };
+        assert_eq!(
+            image
+                .validate()
+                .expect_err("oversized typed metadata must fail")
+                .denial_reason(),
+            ClipboardDenialReasonV2::Oversized
+        );
+    }
+
+    #[test]
+    fn hostile_stale_and_replayed_selections_fail_with_distinct_typed_denials() {
+        let envelope = sample();
+        let selection = ClipboardSelectionV2::selected(&envelope, ClipboardMimeKind::TextPlain)
+            .expect("selection");
+        assert_eq!(
+            selection
+                .admit(&envelope, envelope.expires_unix_ms, None)
+                .expect_err("expired selection must fail"),
+            ClipboardDenialReasonV2::Stale
+        );
+        assert_eq!(
+            selection
+                .admit(
+                    &envelope,
+                    envelope.created_unix_ms + 1,
+                    Some(envelope.sequence)
+                )
+                .expect_err("replayed generation must fail"),
+            ClipboardDenialReasonV2::Replayed
+        );
+    }
+
+    #[test]
+    fn hostile_secret_bearing_offer_cannot_be_selected_or_materialized() {
+        let mut envelope = sample();
+        envelope.offers[0].disclosure = ClipboardDisclosureV2::Secret;
+        envelope.sign(&key());
+        let selection = ClipboardSelectionV2::selected(&envelope, ClipboardMimeKind::TextPlain)
+            .expect("selection shape remains auditable");
+        assert_eq!(
+            selection
+                .admit(&envelope, envelope.created_unix_ms + 1, None)
+                .expect_err("secret-bearing offer must fail"),
+            ClipboardDenialReasonV2::SecretBearing
+        );
+    }
+
+    #[test]
+    fn hostile_unsupported_payload_cannot_be_selected_as_success() {
+        let mut envelope = sample();
+        envelope.offers = vec![ClipboardMimeOfferV2::unsupported(
+            ClipboardMimeKind::ImageJpeg,
+            ClipboardUnsupportedReason::TransportUnsupported,
+        )];
+        envelope.sign(&key());
+        let selection = ClipboardSelectionV2 {
+            schema_version: CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION,
+            clip_id: envelope.clip_id,
+            session: envelope.session,
+            generation: envelope.sequence,
+            mime: ClipboardMimeKind::ImageJpeg,
+            content_sha256_hex: Some("a".repeat(64)),
+            decision: ClipboardSelectionDecisionV2::Selected,
+        };
+        assert_eq!(
+            selection
+                .admit(&envelope, envelope.created_unix_ms + 1, None)
+                .expect_err("unsupported representation must not claim success"),
+            ClipboardDenialReasonV2::Unsupported
+        );
     }
 }

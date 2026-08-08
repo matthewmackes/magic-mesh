@@ -12,6 +12,8 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::Result;
 
+pub mod writer;
+
 /// Numbered migration. Run in order; once applied, the version is
 /// recorded in `schema_migrations`.
 struct Migration {
@@ -160,6 +162,13 @@ pub fn rollback_to_revision(
     new_id: &str,
     author: &str,
 ) -> Result<usize> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::RollbackToRevision {
+        target_id: target_id.to_owned(),
+        new_id: new_id.to_owned(),
+        author: author.to_owned(),
+    })? {
+        return response.into_count();
+    }
     with_transaction(conn, |tx| {
         let payload: String = tx
             .query_row(
@@ -257,6 +266,13 @@ pub fn insert_event(
     actor: &str,
     payload_json: &str,
 ) -> Result<i64> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::InsertEvent {
+        kind: kind.to_owned(),
+        actor: actor.to_owned(),
+        payload_json: payload_json.to_owned(),
+    })? {
+        return response.into_row_id();
+    }
     with_transaction(conn, |tx| {
         let prev_hash_hex: String = tx
             .query_row(
@@ -341,6 +357,12 @@ pub fn load_audit_rows(conn: &Connection) -> Result<Vec<crate::audit::AuditRow>>
 /// Returns an error when the update fails (node missing, role
 /// rejected by CHECK constraint, etc).
 pub fn set_node_role(conn: &Connection, node_id: &str, role: &str) -> Result<usize> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::SetNodeRole {
+        node_id: node_id.to_owned(),
+        role: role.to_owned(),
+    })? {
+        return response.into_count();
+    }
     conn.execute(
         "UPDATE nodes SET role = ? WHERE node_id = ?",
         (role, node_id),
@@ -362,6 +384,12 @@ pub fn set_node_role(conn: &Connection, node_id: &str, role: &str) -> Result<usi
 ///
 /// Returns an error when the read-then-update transaction fails.
 pub fn set_node_health(conn: &Connection, node_id: &str, health: &str) -> Result<bool> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::SetNodeHealth {
+        node_id: node_id.to_owned(),
+        health: health.to_owned(),
+    })? {
+        return response.into_changed();
+    }
     let prior: Option<String> = conn
         .query_row(
             "SELECT health FROM nodes WHERE node_id = ?",
@@ -396,6 +424,12 @@ pub fn set_node_mde_version_by_name(
     name: &str,
     version: Option<&str>,
 ) -> Result<bool> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::SetNodeVersion {
+        name: name.to_owned(),
+        version: version.map(str::to_owned),
+    })? {
+        return response.into_changed();
+    }
     let n = conn
         .execute(
             "UPDATE nodes SET mde_version = ? WHERE name = ?",
@@ -418,6 +452,12 @@ pub fn refresh_node_credentials(
     node_id: &str,
     new_public_key: &str,
 ) -> Result<usize> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::RefreshNodeCredentials {
+        node_id: node_id.to_owned(),
+        new_public_key: new_public_key.to_owned(),
+    })? {
+        return response.into_count();
+    }
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE nodes SET public_key = ?, enrolled_at = ? WHERE node_id = ?",
@@ -440,6 +480,14 @@ pub fn upsert_node(
     public_key: &str,
     region: Option<&str>,
 ) -> Result<usize> {
+    if let Some(response) = writer::request_if_serving(writer::WriteOp::UpsertNode {
+        node_id: node_id.to_owned(),
+        name: name.to_owned(),
+        public_key: public_key.to_owned(),
+        region: region.map(str::to_owned),
+    })? {
+        return response.into_count();
+    }
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO nodes (node_id, name, public_key, enrolled_at, region) \

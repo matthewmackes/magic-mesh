@@ -1,0 +1,15 @@
+# DATACENTER-14 — activate the UniFi gateway source on an on-prem LAN node.
+#
+# The datacenter_orchestrator worker belongs to WL-ARCH-009's compute process
+# group. Install this only on the LAN node that runs that worker, can reach the
+# gateway, and has the sealed `unifi-cred` secret available.
+#
+# Install:
+#   install -Dm644 packaging/systemd/mackesd-compute.service.d/unifi-host.conf.example \
+#       /etc/systemd/system/mackesd-compute.service.d/unifi-host.conf
+#   systemctl daemon-reload && systemctl restart mackesd-compute.service
+#
+# The credential is not stored here. Set or rotate it with:
+#   printf 'ubnt:<password>' | automation/secrets/mcnf-secret.sh put unifi-cred
+[Service]
+Environment=MCNF_UNIFI_HOST=172.20.0.1

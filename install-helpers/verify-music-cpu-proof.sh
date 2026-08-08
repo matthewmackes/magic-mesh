@@ -210,16 +210,27 @@ printf '[OK] installed package identity matches magic-mesh-%s-%s.%s\n' \
     exit 3
 }
 
-systemctl is-active --quiet mackesd.service || {
-    printf '[REFUSAL] mackesd.service is not active\n'
-    exit 3
-}
-main_pid="$(systemctl show -p MainPID --value mackesd.service 2>/dev/null || true)"
-[[ "$main_pid" =~ ^[1-9][0-9]*$ && -r "/proc/$main_pid/stat" ]] || {
-    printf '[REFUSAL] mackesd MainPID is unavailable\n'
-    exit 3
-}
-restarts_before="$(systemctl show -p NRestarts --value mackesd.service 2>/dev/null || true)"
+mackesd_units=(
+    mackesd-control.service mackesd-observation.service
+    mackesd-actions.service mackesd-data.service
+    mackesd-compute.service mackesd-integrations.service
+)
+main_pids=()
+restarts_before=()
+for mackesd_unit in "${mackesd_units[@]}"; do
+    systemctl is-active --quiet "$mackesd_unit" || {
+        printf '[REFUSAL] %s is not active\n' "$mackesd_unit"
+        exit 3
+    }
+    unit_pid="$(systemctl show -p MainPID --value "$mackesd_unit" 2>/dev/null || true)"
+    [[ "$unit_pid" =~ ^[1-9][0-9]*$ && -r "/proc/$unit_pid/stat" ]] || {
+        printf '[REFUSAL] %s MainPID is unavailable\n' "$mackesd_unit"
+        exit 3
+    }
+    main_pids+=("$unit_pid")
+    restarts_before+=("$(systemctl show -p NRestarts --value "$mackesd_unit" 2>/dev/null || true)")
+done
+main_pid="${main_pids[0]}"
 
 process_exe=''
 process_exe_source=''
@@ -234,7 +245,7 @@ if [[ -n "$process_exe" ]]; then
     }
     process_exe_source='procfs'
 else
-    exec_start="$(systemctl show -p ExecStart --value mackesd.service 2>/dev/null || true)"
+    exec_start="$(systemctl show -p ExecStart --value mackesd-control.service 2>/dev/null || true)"
     case "$exec_start" in
         *"path=$expected_executable ;"*)
             process_exe="$expected_executable"
@@ -283,6 +294,14 @@ printf '[OK] mackesd provenance executable=%s source=%s package=magic-mesh-%s-%s
 proc_ticks() {
     awk '{ print $14 + $15 }' "/proc/$1/stat" 2>/dev/null || printf '0\n'
 }
+group_proc_ticks() {
+    local pid total=0 ticks
+    for pid in "${main_pids[@]}"; do
+        ticks="$(proc_ticks "$pid")"
+        total=$((total + ticks))
+    done
+    printf '%s\n' "$total"
+}
 total_ticks() {
     awk '$1 == "cpu" { total = 0; for (i = 2; i <= NF; i++) total += $i; print total; exit }' /proc/stat
 }
@@ -306,10 +325,10 @@ max_seen=0
 sum_seen=0
 valid=0
 for ((sample = 1; sample <= sample_count; sample++)); do
-    process_before="$(proc_ticks "$main_pid")"
+    process_before="$(group_proc_ticks)"
     total_before="$(total_ticks)"
     sleep "$sample_interval"
-    process_after="$(proc_ticks "$main_pid")"
+    process_after="$(group_proc_ticks)"
     total_after="$(total_ticks)"
     process_delta=$((process_after - process_before))
     total_delta=$((total_after - total_before))
@@ -324,15 +343,19 @@ for ((sample = 1; sample <= sample_count; sample++)); do
     printf '[sample %d/%d] mackesd_cpu_permille_one_core=%s\n' "$sample" "$sample_count" "$permille"
 done
 
-restarts_after="$(systemctl show -p NRestarts --value mackesd.service 2>/dev/null || true)"
-main_pid_after="$(systemctl show -p MainPID --value mackesd.service 2>/dev/null || true)"
+restarts_after=()
+main_pids_after=()
+for mackesd_unit in "${mackesd_units[@]}"; do
+    restarts_after+=("$(systemctl show -p NRestarts --value "$mackesd_unit" 2>/dev/null || true)")
+    main_pids_after+=("$(systemctl show -p MainPID --value "$mackesd_unit" 2>/dev/null || true)")
+done
 mean_seen=$((sum_seen / valid))
-printf '[RESULT] pid=%s samples=%s max_permille_one_core=%s mean_permille_one_core=%s restarts=%s->%s\n' \
-    "$main_pid" "$valid" "$max_seen" "$mean_seen" "$restarts_before" "$restarts_after"
-if [[ ! "$restarts_before" =~ ^[0-9]+$ || "$restarts_before" != "$restarts_after" ||
-    "$main_pid" != "$main_pid_after" ]]; then
-    printf '[FAIL] mackesd process identity changed during CPU proof (pid=%s->%s)\n' \
-        "$main_pid" "${main_pid_after:-<unavailable>}"
+printf '[RESULT] pids=%s samples=%s max_permille_one_core=%s mean_permille_one_core=%s restarts=%s->%s\n' \
+    "${main_pids[*]}" "$valid" "$max_seen" "$mean_seen" "${restarts_before[*]}" "${restarts_after[*]}"
+if [[ "${restarts_before[*]}" != "${restarts_after[*]}" ||
+    "${main_pids[*]}" != "${main_pids_after[*]}" ]]; then
+    printf '[FAIL] grouped mackesd process identity changed during CPU proof (pids=%s->%s)\n' \
+        "${main_pids[*]}" "${main_pids_after[*]}"
     exit 1
 fi
 if (( max_seen > max_threshold || mean_seen > mean_threshold )); then

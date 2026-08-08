@@ -77,8 +77,8 @@ use mde_bus::rpc::{publish_request, reply_topic};
 use crate::ipc::action_auth::{production_action_signer, ActionAuthorizer, MutationContext};
 
 use super::cert_authority::ACTION_TOPIC as CERT_SIGN_TOPIC;
-use super::runtime_probe;
 use super::nebula_supervisor;
+use super::runtime_probe;
 use super::{ShutdownToken, Worker};
 
 /// Topic prefix this worker subscribes to (suffix = own overlay IP).

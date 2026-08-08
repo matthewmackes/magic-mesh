@@ -65,14 +65,18 @@ pub mod value;
 mod tests;
 
 pub use clipboard_v2::{
-    ClipboardClipId, ClipboardEchoGuardV2, ClipboardEnvelopeV2, ClipboardEnvelopeV2DecodeError,
+    reject_duplicate_json_keys, ClipboardClipId, ClipboardDenialReasonV2, ClipboardDisclosureV2,
+    ClipboardEchoGuardV2, ClipboardEnvelopeV2, ClipboardEnvelopeV2DecodeError,
     ClipboardEnvelopeV2ValidationError, ClipboardIdentityValidationError, ClipboardMimeKind,
-    ClipboardMimeOfferV2, ClipboardNodeId, ClipboardPayloadV2, ClipboardSeatId, ClipboardSessionId,
-    ClipboardSignedAttributionV2, ClipboardSourceV2, ClipboardTargetV2, ClipboardUnavailableReason,
-    ClipboardUnsupportedReason, CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION, MAX_CLIPBOARD_ECHO_HOPS,
-    MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES, MAX_CLIPBOARD_ID_BYTES, MAX_CLIPBOARD_INLINE_TEXT_BYTES,
-    MAX_CLIPBOARD_OFFERS, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_CLIPBOARD_PREVIEW_BYTES,
-    MAX_CLIPBOARD_TTL_MS,
+    ClipboardMimeOfferV2, ClipboardNodeId, ClipboardPayloadV2, ClipboardSeatId,
+    ClipboardSelectionDecisionV2, ClipboardSelectionV2, ClipboardSelectionV2DecodeError,
+    ClipboardSessionId, ClipboardSignedAttributionV2, ClipboardSourceV2, ClipboardTargetV2,
+    ClipboardTypedMetadataV2, ClipboardUnavailableReason, ClipboardUnsupportedReason,
+    CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION, MAX_CLIPBOARD_ECHO_HOPS,
+    MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES, MAX_CLIPBOARD_FILE_ITEMS, MAX_CLIPBOARD_ID_BYTES,
+    MAX_CLIPBOARD_IMAGE_DIMENSION_PX, MAX_CLIPBOARD_INLINE_TEXT_BYTES, MAX_CLIPBOARD_OFFERS,
+    MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_CLIPBOARD_PREVIEW_BYTES,
+    MAX_CLIPBOARD_SELECTION_V2_JSON_BYTES, MAX_CLIPBOARD_TTL_MS,
 };
 pub use clock::{ActorClock, ActorId};
 pub use command::{

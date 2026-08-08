@@ -8,7 +8,6 @@ PROFILE="$BROWSER_VM/profile.env"
 PROFILE_VERIFY="$BROWSER_VM/verify-profile.sh"
 VALIDATOR="$BROWSER_VM/validate-runtime-inputs.sh"
 ACTIVATION_VERIFY="$BROWSER_VM/verify-activation-contract.sh"
-ATTACH_VERIFY="$BROWSER_VM/verify-transport-attach.sh"
 RUNTIME_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-runtime-evidence.py"
 IMAGE_BUILD="$BROWSER_VM/build-image.sh"
 IMAGE_VERIFY="$BROWSER_VM/verify-image.sh"
@@ -38,7 +37,6 @@ fail() {
 [ -x "$PROFILE_VERIFY" ] || fail "profile verifier is not executable"
 [ -x "$VALIDATOR" ] || fail "runtime validator is not executable"
 [ -x "$ACTIVATION_VERIFY" ] || fail "activation verifier is not executable"
-[ -x "$ATTACH_VERIFY" ] || fail "transport attach verifier is not executable"
 [ -x "$RUNTIME_EVIDENCE_VERIFY" ] || fail "runtime evidence verifier is not executable"
 [ -x "$IMAGE_BUILD" ] || fail "image builder is not executable"
 [ -x "$IMAGE_VERIFY" ] || fail "image verifier is not executable"
@@ -59,7 +57,7 @@ fail() {
 [ -f "$PRODUCTION_CONTROL_UNIT" ] || fail "production-control guest service unit is missing"
 [ -f "$PRODUCTION_CONTROL_CONFIG" ] || fail "production-control guest config is missing"
 [ -f "$PRODUCTION_CONTROL_POLICY" ] || fail "production-control Chromium policy is missing"
-bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$SESSION_INPUT_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
+bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$SESSION_INPUT_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
 python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY" "$PRODUCTION_CONTROL_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
@@ -127,7 +125,6 @@ grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce th
 "$DEPLOY_IMAGE" --self-test >/dev/null
 "$PROFILE_VERIFY" --source "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null
-"$ATTACH_VERIFY" >/dev/null
 
 profile_fixture=$(mktemp)
 trap 'rm -rf "$fixture" "$profile_fixture"' EXIT

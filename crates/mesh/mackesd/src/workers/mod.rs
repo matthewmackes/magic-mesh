@@ -682,13 +682,9 @@ pub mod fs_tools;
 // (a running VM's image / a mounted volume), published to the sibling
 // `state/storage/<node>/virtual` mirror. Owned by the storage worker (no new spawn).
 pub mod virtual_storage;
-// MV-5a — the scheduler worker: the placement slice of the no-center scheduler.
-// Drains `action/schedule/place`, folds each node's latest `event/kvm/services`
-// capacity, chooses the target node (healthy pin → most-active → node_id
-// tie-break), and forwards a host-targeted create/run onto
-// `action/vm/lifecycle` / `action/container/lifecycle` (plus the decision to
-// `event/schedule/placements`). Rank-0-default like vm_lifecycle/container; an
-// interim lowest-node-id single-actor election prevents duplicate placements.
+// MV-5a — the scheduler worker records placement proposals and desired
+// placement events. It has no VM/container actuator and cannot publish a
+// lifecycle operation.
 pub mod scheduler;
 // E12-5b — the session_broker worker: the mackesd side of the E12-5 VDI
 // remote-desktop milestone. Drains `action/vdi/session`, folds each op into the
@@ -732,20 +728,9 @@ pub mod clipboard_bridge;
 // Reachability derives from roster presence / VM power state — never a
 // blocking probe (design lock 14).
 pub mod desktop_sources;
-pub mod upnp_sources;
 /// WL-FUNC-019 — typed SSH/SFTP and X11 resource-card projection.
 pub mod ssh_x11_sources;
-// VDI-VM-1 — the console_broker worker: makes a LOCAL KVM VM's loopback SPICE/VNC
-// console reachable on the mesh. Every VM binds its graphics to 127.0.0.1
-// (vm_lifecycle's domain XML), so a peer can open a broker session for a local VM
-// yet never has a reachable `host:port` to dial. Serving-peer-gated: for each VDI
-// `Open` naming a VM this node serves, it resolves the live console via `virsh
-// domdisplay`, relays that loopback port onto the Nebula overlay with a scoped
-// `socat` (the compute_expose forwarding pattern), and publishes the overlay
-// endpoint back on the session record (`state/vdi/console`, keyed by session id)
-// for the client shell to resolve. Honest-gates (never a fake endpoint) when the
-// VM is off / has no graphics / socat|virsh|overlay is absent — §7.
-pub mod console_broker;
+pub mod upnp_sources;
 // MEDIA-14 — the media_sources worker: the mesh-side (§6) media-source
 // discovery aggregator behind the mde-media Sources panel (docs/design/
 // mesh-media-player.md, row 26). Folds two lanes into one deduped roster

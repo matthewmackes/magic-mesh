@@ -28,7 +28,8 @@ required = {
     "duplicate owner cleanup": 'mcnf_user_systemctl "$candidate" disable --now mde-musicd.service',
     "direct user bus": 'DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$mcnf_uid/bus"',
     "music activation": 'mcnf_user_systemctl "$candidate" restart mde-musicd.service',
-    "system activation": "systemctl try-restart mackesd.service mde-shell-egui.service",
+    "grouped upgrade activation": "systemctl start mackesd.target",
+    "system activation": "systemctl try-restart mde-shell-egui.service",
 }
 for label, token in required.items():
     if token not in script:
@@ -42,7 +43,7 @@ for forbidden in (
         raise SystemExit(f"forbidden activation path remains: {forbidden}")
 
 setup_end = script.find("timeout 60 update-desktop-database")
-system_restart = script.find("systemctl try-restart mackesd.service mde-shell-egui.service")
+system_restart = script.find("systemctl try-restart mde-shell-egui.service")
 if setup_end < 0 or system_restart <= setup_end:
     raise SystemExit("system service restart must occur after package setup")
 

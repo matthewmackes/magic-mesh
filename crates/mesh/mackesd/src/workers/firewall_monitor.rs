@@ -667,9 +667,15 @@ mod tests {
     #[test]
     fn initial_phase_is_stable_bounded_and_preserves_first_probe_deadline() {
         let phase = initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL);
-        assert_eq!(phase, initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL));
+        assert_eq!(
+            phase,
+            initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL)
+        );
         assert!(phase <= MAX_INITIAL_PHASE);
-        assert_ne!(phase, initial_phase_for("peer:seat16", DEFAULT_TICK_INTERVAL));
+        assert_ne!(
+            phase,
+            initial_phase_for("peer:seat16", DEFAULT_TICK_INTERVAL)
+        );
 
         let first_delay = DEFAULT_TICK_INTERVAL.saturating_sub(phase);
         assert!(first_delay >= DEFAULT_TICK_INTERVAL - MAX_INITIAL_PHASE);

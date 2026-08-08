@@ -1060,9 +1060,8 @@ pub(crate) fn start_platform_bus_responders(
                         )
                         .build_directory(now)
                     };
-                    let inv_doc = move || {
-                        mackesd_core::ipc::apps::read_local_workload_state(&inv_node)
-                    };
+                    let inv_doc =
+                        move || mackesd_core::ipc::apps::read_local_workload_state(&inv_node);
                     mackesd_core::ipc::apps::serve_bus(
                         &persist,
                         &apps_svc,
@@ -1558,13 +1557,8 @@ pub(crate) fn spawn_compute_lifecycle_workers(
         },
     );
     // MV-5a — the scheduler worker: the placement slice of the no-center
-    // scheduler. Drains `action/schedule/place`, folds each node's latest
-    // `event/kvm/services` capacity, chooses the target node (healthy pin →
-    // most-active → node_id tie-break), and forwards a host-targeted
-    // create/run onto `action/vm/lifecycle` / `action/container/lifecycle`
-    // (plus the decision to `event/schedule/placements`). Rank-0-default like
-    // vm_lifecycle/container (runs everywhere); an interim lowest-node-id
-    // single-actor election keeps N nodes from emitting duplicate placements.
+    // scheduler. It records bounded placement proposals and desired placement
+    // events but has no VM/container actuator and publishes no lifecycle op.
     // Failover re-election + etcd desired-state persistence are MV-5b.
     spawn_tiered(sup, worker_names, role_rank, "scheduler", || {
         mackesd_core::workers::scheduler::SchedulerWorker::new(node_id.clone())
@@ -1584,10 +1578,6 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             node_id.clone(),
         )
     });
-    // WL-ARCH-010 — Display1 attachment is issued by workload_compute only.
-    // The retired console_broker cannot be spawned: its raw overlay endpoint
-    // relay would be a second presentation authority beside the authenticated,
-    // expiring local Workload attachment lease.
     // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
     // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
     // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —
@@ -1701,8 +1691,8 @@ pub(crate) fn spawn_mesh_plumbing_workers(
     db_path: &PathBuf,
 ) {
     use mackesd_core::workers::{
-        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile, job_exec,
-        mesh_dns, netstate_apply, presence_watch, router_action, ssh_pubkey_gossip,
+        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile, job_exec, mesh_dns,
+        netstate_apply, presence_watch, router_action, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, validation_suite, RestartPolicy, Spawn,
     };
     // NF-21.1 — sshd overlay-bind worker. Polls

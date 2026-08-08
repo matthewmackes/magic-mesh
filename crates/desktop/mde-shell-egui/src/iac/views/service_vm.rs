@@ -42,7 +42,7 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     muted_note(
         ui,
         "Reachability is folded from the overlay keepalive lease + *.mesh resolution. A headless \
-         service has no graphics head, so console-attach is deliberately absent here.",
+         service has no graphics head, so attachment is deliberately absent here.",
     );
 }
 
@@ -55,16 +55,40 @@ fn service_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Start", false).clicked() {
-                state.issue_workload_direct("instance-start", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-start",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_workload_direct("instance-stop", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-stop",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-reboot", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-reboot",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct("instance-delete", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "instance-delete",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
         });
     });

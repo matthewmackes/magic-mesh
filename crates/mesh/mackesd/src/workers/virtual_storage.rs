@@ -974,7 +974,11 @@ fn validate_image_path(path: &Path, local_dir: &Path) -> Result<(), VopInvalid> 
     }
     let canonical_root = match std::fs::canonicalize(local_dir) {
         Ok(root) => root,
-        Err(error) => return reject(&format!("managed image root cannot be canonicalized: {error}")),
+        Err(error) => {
+            return reject(&format!(
+                "managed image root cannot be canonicalized: {error}"
+            ))
+        }
     };
     // Reject a root containing a symlinked ancestor as well as a symlink at the
     // final component. The executor must receive one stable root identity.
@@ -990,9 +994,7 @@ fn validate_image_path(path: &Path, local_dir: &Path) -> Result<(), VopInvalid> 
         Err(_) => return reject("image path escapes the managed image root"),
     };
     let components: Vec<_> = relative.components().collect();
-    if components.len() != 1
-        || !matches!(components[0], std::path::Component::Normal(_))
-    {
+    if components.len() != 1 || !matches!(components[0], std::path::Component::Normal(_)) {
         return reject("image path must be one direct child without . or .. components");
     }
     if !is_image_file(path) {
@@ -1004,7 +1006,9 @@ fn validate_image_path(path: &Path, local_dir: &Path) -> Result<(), VopInvalid> 
         Ok(_) => {
             let canonical_path = match std::fs::canonicalize(path) {
                 Ok(path) => path,
-                Err(error) => return reject(&format!("image path cannot be canonicalized: {error}")),
+                Err(error) => {
+                    return reject(&format!("image path cannot be canonicalized: {error}"))
+                }
             };
             if canonical_path != path || !canonical_path.starts_with(&canonical_root) {
                 return reject("image path is not a canonical child of the managed root");
@@ -1017,10 +1021,7 @@ fn validate_image_path(path: &Path, local_dir: &Path) -> Result<(), VopInvalid> 
 }
 
 /// Apply-time image-root validation for the production sub-worker.
-fn validate_vop_in_dir(
-    op: &VirtualStorageOp,
-    local_dir: &Path,
-) -> Result<(), VopInvalid> {
+fn validate_vop_in_dir(op: &VirtualStorageOp, local_dir: &Path) -> Result<(), VopInvalid> {
     for path in image_paths(op) {
         validate_image_path(path, local_dir)?;
     }

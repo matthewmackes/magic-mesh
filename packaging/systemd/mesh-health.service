@@ -4,8 +4,8 @@
 # interface, or an alive-but-unreachable overlay) and notifies on recovery.
 [Unit]
 Description=MCNF node health watchdog (recovery + alerting)
-After=mackesd.service
-Wants=mackesd.service
+After=mackesd.target
+Wants=mackesd.target
 
 [Service]
 Type=oneshot

@@ -471,7 +471,10 @@ def check_services(args: argparse.Namespace, checks: list[Check], require_mackes
         checks.append(Check("systemd", status, "systemctl is unavailable", require_mackesd or args.require_seat))
         return
     service_requirements = {
-        "mackesd.service": require_mackesd,
+        **{
+            f"mackesd-{group}.service": require_mackesd
+            for group in ("control", "observation", "actions", "data", "compute", "integrations")
+        },
         "mde-shell-egui.service": args.require_all or args.require_seat,
     }
     for unit, required in service_requirements.items():
@@ -532,7 +535,7 @@ def check_cloud_arm(args: argparse.Namespace, checks: list[Check]) -> None:
         return
 
     dropins = [
-        Path("/etc/systemd/system/mackesd.service.d/50-cloud-arm-credential.conf"),
+        Path("/etc/systemd/system/mackesd-compute.service.d/50-cloud-arm-credential.conf"),
         Path("/etc/systemd/system/mde-shell-egui.service.d/50-cloud-arm-credential.conf"),
     ]
     missing: list[str] = []

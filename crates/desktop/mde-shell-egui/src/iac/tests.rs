@@ -60,8 +60,7 @@ fn music_auth_hostname_prefers_the_daemon_compatible_command_source() {
 
 #[test]
 fn music_auth_body_verifies_against_the_daemon_contract() {
-    let unsigned =
-        r#"{"schema_version":1,"action":"set_volume","request_id":"auth-test","volume_milli":1000}"#;
+    let unsigned = r#"{"schema_version":1,"action":"set_volume","request_id":"auth-test","volume_milli":1000}"#;
     let signed = authorize_music_mutation_body(unsigned).expect("Music body signs");
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
     let node = music_local_hostname();
@@ -321,11 +320,14 @@ fn android_starter_launch_uses_the_audited_typed_exec_lane() {
         "android-eagle",
         mackes_mesh_types::android_apps::AospStarterApp::Browser,
     );
-    assert!(state.has_arming(), "launch must open its explicit review gate");
+    assert!(
+        state.has_arming(),
+        "launch must open its explicit review gate"
+    );
     confirm_pending(&mut state);
 
-    let persist = Persist::open(state.bus_root.clone().expect("fixture bus root"))
-        .expect("open fixture bus");
+    let persist =
+        Persist::open(state.bus_root.clone().expect("fixture bus root")).expect("open fixture bus");
     let messages = persist
         .list_since("action/exec/request", None)
         .expect("read typed exec request topic");
@@ -1203,12 +1205,25 @@ fn ui_mutation_requests_carry_their_explicit_placement_node() {
     state.issue_console_attach("otter", "seat-1", "seat-1");
     assert!(state.mutation_pending.is_none());
     confirm_pending(&mut state);
-    let console = emitted_request(&state, "console-attach");
-    assert_eq!(console["schema_version"], 1);
-    assert_eq!(console["node"], "otter");
-    assert_eq!(console["instance"], "seat-1");
-    let console_token = CloudArmedToken::parse(console["armed_token"].as_str().unwrap()).unwrap();
-    assert_eq!(console_token.target, "seat-1");
+    let persist =
+        Persist::open(state.bus_root.clone().expect("fixture bus root")).expect("open fixture bus");
+    let operation = persist
+        .read_latest(mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC)
+        .expect("read typed Workload topic")
+        .and_then(|message| message.body)
+        .expect("typed Workload operation body");
+    let operation: mackes_mesh_types::workloads::WorkloadOperationRequest =
+        serde_json::from_str(&operation).expect("decode typed Workload operation");
+    assert_eq!(operation.target_node, "otter");
+    assert_eq!(operation.workload_id.as_str(), "seat-1");
+    assert_eq!(
+        operation.action,
+        mackes_mesh_types::workloads::WorkloadOperationAction::Open
+    );
+    assert_eq!(
+        operation.preferred_attachment,
+        Some(mackes_mesh_types::workloads::WorkloadAttachmentProtocol::QemuDisplay1Dmabuf)
+    );
 }
 
 #[test]
@@ -1529,10 +1544,6 @@ fn lifecycle_and_console_actions_reject_incomplete_workload_identity() {
         !state.has_arming(),
         "blank console instance ids must not open attachment confirmation"
     );
-    assert!(
-        state.console_target.is_none(),
-        "a rejected console request must not retain a stale target"
-    );
 }
 
 #[test]
@@ -1659,128 +1670,6 @@ fn rendered_text_at_height(height: f32, mut run: impl FnMut(&mut egui::Ui)) -> S
         collect(&clipped.shape, &mut text);
     }
     text
-}
-
-#[test]
-fn console_attach_decodes_the_endpoint_and_renders_it_honestly() {
-    // Before any resolve, the section reads honestly — no fabricated handle.
-    let unresolved = WorkloadsState::default();
-    let before = rendered_text(|ui| console_section(ui, &unresolved));
-    assert!(
-        before.contains("No console resolved"),
-        "an unresolved console must read honestly: {before}"
-    );
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let bus_root = tmp.path().join("bus");
-    let mut state = WorkloadsState::default();
-    state.bus_root = Some(bus_root.clone());
-    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
-
-    // Dispatch console-attach the way the roster's Console button does.
-    state.issue_console_attach("eagle", "seat-1", "seat-1");
-    assert!(
-        state.mutation_pending.is_none(),
-        "unconfirmed console request is not published"
-    );
-    confirm_pending(&mut state);
-    let ulid = state
-        .mutation_pending
-        .as_ref()
-        .expect("console-attach published a pending request")
-        .ulid
-        .clone();
-
-    // Write the fixture full-payload WireCloudReply the worker would answer with.
-    let persist = Persist::open(bus_root).expect("open the fixture bus");
-    let body = serde_json::json!({
-        "ok": true,
-        "verb": "console-attach",
-        "audited": false,
-        "console": {
-            "proto": "spice",
-            "uri": "spice://10.42.0.7:5901",
-            "ticket": "one-time-token"
-        }
-    })
-    .to_string();
-    persist
-        .write(&reply_topic(&ulid), Priority::Default, None, Some(&body))
-        .expect("write the fixture reply");
-
-    state.resolve_mutation();
-
-    let resolved = state
-        .console
-        .as_ref()
-        .expect("the console endpoint decoded from the full-payload wire reply");
-    assert_eq!(resolved.name, "seat-1");
-    assert_eq!(
-        resolved.endpoint.proto,
-        mackes_mesh_types::cloud::ConsoleProto::Spice
-    );
-    assert_eq!(resolved.endpoint.uri, "spice://10.42.0.7:5901");
-    assert_eq!(resolved.endpoint.ticket.as_deref(), Some("one-time-token"));
-    assert!(
-        state.console_target.is_none(),
-        "the target is cleared once resolved"
-    );
-
-    // The panel renders the resolved handle; the one-time ticket stays masked
-    // (never painted in the clear, §7).
-    let after = rendered_text(|ui| console_section(ui, &state));
-    assert!(after.contains("spice://10.42.0.7:5901"), "{after}");
-    assert!(after.contains("SPICE"), "{after}");
-    assert!(
-        !after.contains("one-time-token"),
-        "the ticket must render masked: {after}"
-    );
-}
-
-#[test]
-fn workload_reply_reader_keeps_oldest_reply_without_scanning_history() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let bus_root = tmp.path().join("bus");
-    let mut state = WorkloadsState::default();
-    state.bus_root = Some(bus_root.clone());
-    let persist = Persist::open(bus_root).expect("open the fixture bus");
-    let ulid = "01JREPLYBOUNDEDSLICE000000";
-    let reply = |uri: &str| {
-        serde_json::json!({
-            "ok": true,
-            "verb": "console-attach",
-            "audited": false,
-            "console": {"proto": "spice", "uri": uri}
-        })
-        .to_string()
-    };
-
-    persist
-        .write(
-            &reply_topic(ulid),
-            Priority::Default,
-            None,
-            Some(&reply("spice://10.42.0.7:5900")),
-        )
-        .expect("write oldest reply");
-    for _ in 0..64 {
-        persist
-            .write(
-                &reply_topic(ulid),
-                Priority::Default,
-                None,
-                Some(&reply("spice://10.42.0.7:5901")),
-            )
-            .expect("write retained duplicate reply");
-    }
-
-    let decoded = state
-        .read_wire_reply(ulid)
-        .expect("oldest reply remains readable");
-    assert_eq!(
-        decoded.console.expect("console endpoint").uri,
-        "spice://10.42.0.7:5900"
-    );
 }
 
 #[test]
