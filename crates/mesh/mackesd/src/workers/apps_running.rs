@@ -39,8 +39,27 @@ use crate::ipc::apps::{default_app_dirs, scan_local_apps};
 /// running badges refresh on the same beat as the workload rows.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Bound the first `/proc` scan and replicated write so seats do not all do
+/// the same process walk immediately after a fleet restart.
+pub const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+
 /// File this node's running-app set is mirrored to under its QNM-Shared dir.
 pub const SHARED_RUNNING_FILE: &str = "running-apps.json";
+
+/// Derive a stable, bounded startup phase from the publishing hostname.
+#[must_use]
+pub fn initial_phase_for(hostname: &str, tick: Duration) -> Duration {
+    let bound = MAX_INITIAL_PHASE.min(tick);
+    if bound.is_zero() {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in hostname.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Duration::from_nanos(hash % bound.as_nanos() as u64)
+}
 
 /// The published running-app document for one node. `ids` are the `.desktop`
 /// file ids (the launcher's stable [`crate::ipc::apps::AppEntry::id`] for local
@@ -166,6 +185,11 @@ pub fn write_shared_running(mount: &Path, doc: &RunningApps) {
     };
     let tmp = dir.join("running-apps.json.tmp");
     let final_path = dir.join(SHARED_RUNNING_FILE);
+    if let Ok(existing) = std::fs::read(&final_path) {
+        if existing == body.as_bytes() {
+            return;
+        }
+    }
     if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
         tracing::warn!("apps_running: write {} failed: {e}", tmp.display());
         return;
@@ -207,7 +231,7 @@ impl AppsRunningWorker {
     fn tick_once(&self) {
         // Only publish when the share is a real mount — never write to a bare
         // local dir masquerading as the share (the WORKLOAD-FLEET-1 guard).
-        if !crate::workers::compute_registry::is_meshfs_mounted(&self.mount) {
+        if !crate::workers::runtime_probe::is_meshfs_mounted(&self.mount) {
             return;
         }
         let running = running_process_basenames();
@@ -227,6 +251,13 @@ impl Worker for AppsRunningWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        let first_delay = self
+            .tick
+            .saturating_sub(initial_phase_for(&self.hostname, self.tick));
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(first_delay) => {}
+        }
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.tick) => {
@@ -242,6 +273,18 @@ impl Worker for AppsRunningWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_phase_is_stable_and_bounded_by_tick() {
+        let tick = Duration::from_secs(10);
+        let phase = initial_phase_for("seat-oak", tick);
+        assert_eq!(phase, initial_phase_for("seat-oak", tick));
+        assert!(phase < MAX_INITIAL_PHASE);
+        assert!(
+            initial_phase_for("seat-oak", Duration::from_millis(100)) < Duration::from_millis(100)
+        );
+        assert_eq!(initial_phase_for("seat-oak", Duration::ZERO), Duration::ZERO);
+    }
 
     #[test]
     fn exec_basename_strips_field_codes_path_and_env() {
@@ -345,6 +388,23 @@ mod tests {
             .join("fedora")
             .join("running-apps.json.tmp")
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_running_document_does_not_rewrite_the_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = RunningApps {
+            hostname: "fedora".into(),
+            ids: vec!["firefox".into()],
+        };
+        write_shared_running(tmp.path(), &doc);
+        let path = tmp.path().join("fedora").join(SHARED_RUNNING_FILE);
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        write_shared_running(tmp.path(), &doc);
+        assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
     }
 
     #[test]

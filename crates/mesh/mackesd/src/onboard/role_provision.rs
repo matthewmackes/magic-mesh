@@ -850,8 +850,18 @@ mod tests {
             "mackesd must resolve packaged mesh helpers instead of a developer checkout"
         );
         assert!(
-            unit.contains("mcnf-mesh-secret-recipient.service"),
-            "node recipient registration must run before mesh-key installation"
+            unit.contains("Wants=network-online.target nebula.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service"),
+            "node recipient registration must remain a best-effort daemon lane"
+        );
+        let daemon_after = unit
+            .lines()
+            .find(|line| line.trim_start().starts_with("After="))
+            .expect("mackesd must declare startup ordering");
+        assert!(
+            !daemon_after
+                .split_whitespace()
+                .any(|dependency| dependency == "mcnf-mesh-secret-recipient.service"),
+            "recipient registration must not gate mackesd startup"
         );
     }
 

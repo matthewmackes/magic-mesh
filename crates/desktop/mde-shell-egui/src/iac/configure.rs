@@ -14,17 +14,14 @@
 //! keeps only the `ok`/`gated`/`error` tri-state — it drops the rich `inventory`
 //! and `outputs` payloads. So the READ verbs run through a small **self-contained
 //! resolve lane** here (reusing the preserved `publish`/`persist` Bus seams and
-//! the full-payload wire [`WireCloudReply`]): it fetches once on first entry,
+//! the full-payload wire cloud reply): it fetches once on first entry,
 //! the operator drives Refresh after, and every state reads honestly — an empty
 //! roster is a real "not resolved yet", never fabricated (§7).
 
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::{carbon_icon, Style};
 
-use mackes_mesh_types::cloud::{
-    CloudReply as WireCloudReply, InventoryHost, TofuOutput, VERB_INVENTORY, VERB_OUTPUT,
-};
-use mde_bus::rpc::reply_topic;
+use mackes_mesh_types::cloud::{InventoryHost, TofuOutput, VERB_INVENTORY, VERB_OUTPUT};
 
 use super::WorkloadsState;
 
@@ -310,7 +307,7 @@ fn advance(state: &mut WorkloadsState) {
         .as_ref()
         .map(|p| (p.ulid.clone(), p.sent))
     {
-        if let Some(reply) = read_reply(state, &ulid) {
+        if let Some(reply) = state.read_wire_reply(&ulid) {
             state.configure.inventory_req = None;
             if let Some(hosts) = reply.inventory {
                 state.configure.status =
@@ -339,24 +336,13 @@ fn advance(state: &mut WorkloadsState) {
         .as_ref()
         .map(|p| (p.ulid.clone(), p.sent))
     {
-        if let Some(reply) = read_reply(state, &ulid) {
+        if let Some(reply) = state.read_wire_reply(&ulid) {
             state.configure.output_req = None;
             state.configure.outputs = reply.outputs.unwrap_or_default();
         } else if sent.elapsed() >= super::REQUEST_TIMEOUT {
             state.configure.output_req = None;
         }
     }
-}
-
-/// Read the wire cloud reply on `reply/<ulid>` off the Bus, if one has landed —
-/// the full-payload [`WireCloudReply`] (carrying `inventory` / `outputs`), which
-/// the shell's own lean mutation mirror deliberately drops. Returns owned data so
-/// the immutable Bus borrow ends before the caller writes the result back.
-fn read_reply(state: &WorkloadsState, ulid: &str) -> Option<WireCloudReply> {
-    let persist = state.persist()?;
-    let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
-    let body = msgs.first()?.body.as_deref()?;
-    serde_json::from_str(body).ok()
 }
 
 /// A lens section heading — a Workloads-accent Carbon glyph + a strong label.

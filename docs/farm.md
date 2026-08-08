@@ -118,13 +118,16 @@ ssh mm@172.20.0.90 \
 
 The verifier accepts `source: "farm"` for pre-live evidence, but production
 promotion must invoke it with `--require-live`; that rejects farm-only records.
-Schema-3 `release-evidence.sh` envelopes bind the topology bundle digest and
+Schema-5 `release-evidence.sh` envelopes bind the topology bundle digest and
 verifier summary, require its `revision` to equal `source_commit`, and rerun the
-verifier during validation. Preview envelopes may carry farm-only topology
-evidence; production envelopes cannot. The helper does not probe nodes,
-manufacture observations, or turn unavailable hardware into a pass. No
-six-node or live result is valid until a real bundle is supplied and the same
-helper exits zero under the promotion freshness policy.
+verifier during validation. They also positionally bind farm job/slot pairs and
+require the authenticated CI log to bind the exact revision and final artifact
+descriptors. Generate that input with `release-evidence.sh write-binding`, then
+publish it with `ci-gate.sh bind-release` before writing the envelope. Preview
+envelopes may carry farm-only topology evidence; production envelopes cannot.
+The helper does not probe nodes, manufacture observations, or turn unavailable
+hardware into a pass. No six-node or live result is valid until a real bundle is
+supplied and the same helper exits zero under the promotion freshness policy.
 
 **What it runs** (routed to BigBoy `172.20.0.130`, the long-pole node, on a
 dedicated warm slot `magic-mesh-farm-ci`), fail-fast like `xcp-build.sh gates`:

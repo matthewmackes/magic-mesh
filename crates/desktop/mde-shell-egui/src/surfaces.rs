@@ -11,7 +11,10 @@ use mde_theme::brand::icons::{icon_image, IconId};
 /// Which surface fills the shell body.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Surface {
-    /// Unified fleet, mesh-map, workbench, and discovered-unit interface.
+    /// Unified worker tree, node operations, network operations, and discovery
+    /// interface. This is the only canonical node-management workspace.
+    Workers,
+    /// Legacy deep-link alias for the Workers control tab.
     FleetMesh,
     /// Legacy deep-link alias for the Workbench tab inside [`Surface::FleetMesh`].
     Workbench,
@@ -32,8 +35,6 @@ pub enum Surface {
     Files,
     /// Sandboxed browser.
     Browser,
-    /// Bookmarks manager.
-    Bookmarks,
     /// Maps, location, and vehicle management.
     MapsLocation,
     /// Local and remote terminal.
@@ -42,7 +43,7 @@ pub enum Surface {
     Phones,
     /// Collaboration and communications hub.
     Communications,
-    /// Unified node-local settings, storage, and hardware/identity interface.
+    /// Legacy deep-link alias for the Workers local-node tab.
     ThisNode,
     /// Host settings and controls.
     System,
@@ -59,25 +60,23 @@ pub enum Surface {
 #[allow(clippy::use_self)]
 impl Surface {
     /// Every Springboard/Spotlight surface in canonical keyboard order.
-    pub(crate) const ALL: [Surface; 13] = [
-        Surface::FleetMesh,
+    pub(crate) const ALL: [Surface; 10] = [
+        Surface::Workers,
         Surface::InfraCode,
         Surface::Desktop,
         Surface::Music,
         Surface::Media,
         Surface::Files,
         Surface::Browser,
-        Surface::Bookmarks,
         Surface::MapsLocation,
         Surface::Terminal,
-        Surface::Phones,
-        Surface::ThisNode,
         Surface::Communications,
     ];
 
     /// The shared icon-registry glyph for this surface.
     pub(crate) const fn icon_id(self) -> IconId {
         match self {
+            Surface::Workers | Surface::ThisNode | Surface::System => IconId::Node,
             Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
                 IconId::MeshView
             }
@@ -88,14 +87,10 @@ impl Surface {
             Surface::Media => IconId::Media,
             Surface::Files => IconId::Files,
             Surface::Browser => IconId::Browser,
-            Surface::Bookmarks => IconId::Bookmarks,
             Surface::MapsLocation => IconId::MapsLocation,
             Surface::Terminal => IconId::Terminal,
             Surface::Phones => IconId::Phones,
             Surface::Communications => IconId::Teams,
-            // This Node is a workspace identity, not a notification stream;
-            // use the clean node glyph instead of the settings glyph's dot.
-            Surface::ThisNode | Surface::System => IconId::Node,
             Surface::Storage => IconId::Storage,
             Surface::About | Surface::Timers => IconId::Mark,
         }
@@ -104,6 +99,7 @@ impl Surface {
     /// Human-facing label shared by every launcher and switcher.
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Surface::Workers => "Workers",
             Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
                 "Fleet & Mesh"
             }
@@ -113,7 +109,6 @@ impl Surface {
             Surface::Media => "Media",
             Surface::Files => "Files",
             Surface::Browser => "Browser",
-            Surface::Bookmarks => "Bookmarks",
             Surface::MapsLocation => "Maps & Location",
             Surface::Terminal => "Terminal",
             Surface::Phones => "Phones",
@@ -128,12 +123,10 @@ impl Surface {
 /// Workspaces owned by the notification/tool tray. These remain fully
 /// launchable through direct routes and keyboard shortcuts, but are not
 /// duplicated in the central launcher taxonomy.
-pub(crate) const TOOL_TRAY_SURFACES: [Surface; 6] = [
-    Surface::FleetMesh,
+pub(crate) const TOOL_TRAY_SURFACES: [Surface; 4] = [
+    Surface::Workers,
     Surface::Music,
     Surface::Media,
-    Surface::Phones,
-    Surface::ThisNode,
     Surface::Terminal,
 ];
 
@@ -141,13 +134,36 @@ pub(crate) const TOOL_TRAY_SURFACES: [Surface; 6] = [
 pub(crate) const fn is_tool_tray_surface(surface: Surface) -> bool {
     matches!(
         surface,
-        Surface::FleetMesh
+        Surface::Workers
+            | Surface::FleetMesh
             | Surface::Music
             | Surface::Media
-            | Surface::Phones
             | Surface::ThisNode
+            | Surface::System
+            | Surface::Storage
+            | Surface::About
             | Surface::Terminal
     )
+}
+
+/// Collapse every historical node-management route to the single Workers
+/// workspace. The legacy variants remain in the enum only so persisted
+/// preferences, alerts, and external deep links can be migrated safely.
+#[must_use]
+pub(crate) const fn canonical_workspace_surface(surface: Surface) -> Surface {
+    match surface {
+        Surface::Workers
+        | Surface::FleetMesh
+        | Surface::Workbench
+        | Surface::MeshView
+        | Surface::Explorer
+        | Surface::ThisNode
+        | Surface::System
+        | Surface::Storage
+        | Surface::About => Surface::Workers,
+        Surface::Phones => Surface::Workers,
+        surface => surface,
+    }
 }
 
 /// Desktop egui crates embedded by the shell's launchable surface catalog.
@@ -157,8 +173,7 @@ pub(crate) const fn is_tool_tray_surface(surface: Surface) -> bool {
 /// workspace but is no longer reachable from the shipped shell. The panel
 /// client and the shell host are deliberately outside this list.
 #[allow(dead_code)]
-pub(crate) const EMBEDDED_SURFACE_CRATES: [&str; 8] = [
-    "mde-bookmarks-egui",
+pub(crate) const EMBEDDED_SURFACE_CRATES: [&str; 7] = [
     "mde-collab-egui",
     "mde-editor-egui",
     "mde-files-egui",
@@ -231,7 +246,7 @@ pub(crate) struct SurfaceVisualInventory {
 }
 
 const PARTIAL_CONSTRUCT_VISUAL: SurfaceVisualInventory = SurfaceVisualInventory {
-    surface: Surface::FleetMesh,
+    surface: Surface::Workers,
     boundary: VisualBoundary::Construct,
     // Every normal Construct surface now uses the shared workspace chrome. The
     // remaining Partial fields below are independent concerns (states,
@@ -255,7 +270,7 @@ const PARTIAL_CONSTRUCT_VISUAL: SurfaceVisualInventory = SurfaceVisualInventory 
 /// the shared system. Only the three named visual boundaries depart from the
 /// normal Construct workspace rule.
 #[allow(dead_code)]
-pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 12] = [
+pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 10] = [
     PARTIAL_CONSTRUCT_VISUAL,
     SurfaceVisualInventory {
         surface: Surface::InfraCode,
@@ -286,10 +301,6 @@ pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 12] = [
         ..PARTIAL_CONSTRUCT_VISUAL
     },
     SurfaceVisualInventory {
-        surface: Surface::Bookmarks,
-        ..PARTIAL_CONSTRUCT_VISUAL
-    },
-    SurfaceVisualInventory {
         surface: Surface::MapsLocation,
         boundary: VisualBoundary::MapsContentColour,
         ..PARTIAL_CONSTRUCT_VISUAL
@@ -299,11 +310,7 @@ pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 12] = [
         ..PARTIAL_CONSTRUCT_VISUAL
     },
     SurfaceVisualInventory {
-        surface: Surface::Phones,
-        ..PARTIAL_CONSTRUCT_VISUAL
-    },
-    SurfaceVisualInventory {
-        surface: Surface::ThisNode,
+        surface: Surface::Files,
         ..PARTIAL_CONSTRUCT_VISUAL
     },
     SurfaceVisualInventory {
@@ -340,7 +347,7 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 4] = [
     LauncherGroup {
         label: "Web",
         accent: Style::ACCENT_WEB,
-        surfaces: &[Surface::Browser, Surface::Bookmarks],
+        surfaces: &[Surface::Browser],
     },
     LauncherGroup {
         label: "Mesh Teams",
@@ -698,25 +705,27 @@ mod tests {
             .collect();
         assert_eq!(
             projected.len(),
-            Surface::ALL.len() - TOOL_TRAY_SURFACES.len()
+            Surface::ALL.len() - TOOL_TRAY_SURFACES.len() - 1,
+            "Files remains a deliberate non-launcher shell route"
         );
         for surface in Surface::ALL {
             assert_eq!(
                 projected.iter().filter(|item| **item == surface).count(),
-                usize::from(!is_tool_tray_surface(surface)),
+                usize::from(
+                    !is_tool_tray_surface(surface) && !matches!(surface, Surface::Files)
+                ),
                 "{surface:?} has the wrong central-launcher membership"
             );
         }
-        assert!(Surface::ALL.contains(&Surface::ThisNode));
-        assert_eq!(Surface::ThisNode.icon_id(), IconId::Node);
+        assert!(Surface::ALL.contains(&Surface::Workers));
+        assert!(!Surface::ALL.contains(&Surface::Phones));
+        assert_eq!(Surface::Workers.icon_id(), IconId::Node);
         assert_eq!(
             TOOL_TRAY_SURFACES,
             [
-                Surface::FleetMesh,
+                Surface::Workers,
                 Surface::Music,
                 Surface::Media,
-                Surface::Phones,
-                Surface::ThisNode,
                 Surface::Terminal,
             ]
         );
@@ -730,6 +739,11 @@ mod tests {
             launcher_group_accent(Surface::Communications),
             Some(Style::ACCENT_TEAMS)
         );
+        let web = LAUNCHER_GROUPS
+            .iter()
+            .find(|group| group.label == "Web")
+            .expect("the Browser must own the Web launcher group");
+        assert_eq!(web.surfaces, &[Surface::Browser]);
     }
 
     #[test]
@@ -798,10 +812,9 @@ mod tests {
             .flat_map(|group| group.surfaces.iter().copied())
             .collect();
         for surface in [
-            Surface::FleetMesh,
+            Surface::Workers,
             Surface::InfraCode,
             Surface::Files,
-            Surface::Bookmarks,
             Surface::Phones,
             Surface::ThisNode,
         ] {
@@ -813,7 +826,7 @@ mod tests {
         assert_eq!(dock_launcher_group_label(Surface::Terminal), "Infra");
         assert_eq!(dock_launcher_group_label(Surface::Communications), "Ops");
         assert_eq!(dock_launcher_group_label(Surface::Browser), "Life");
-        assert_eq!(dock_launcher_group_label(Surface::FleetMesh), "");
+        assert_eq!(dock_launcher_group_label(Surface::Workers), "");
         assert_eq!(dock_launcher_surface_label(Surface::Desktop), "VMs");
         assert_eq!(
             dock_launcher_surface_label(Surface::MapsLocation),
@@ -823,7 +836,7 @@ mod tests {
 
     #[test]
     fn embedded_surface_catalog_excludes_the_shell_host() {
-        assert_eq!(EMBEDDED_SURFACE_CRATES.len(), 8);
+        assert_eq!(EMBEDDED_SURFACE_CRATES.len(), 7);
         assert!(EMBEDDED_SURFACE_CRATES
             .windows(2)
             .all(|pair| pair[0] < pair[1]));

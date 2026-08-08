@@ -192,6 +192,19 @@ Light is a production first-class appearance, both share azure accent
   neutral inventory; Fleet, Network, Provisioning, Workloads, Control Center,
   and Notification Center retain domain lifecycle state but no health rollup.
 
+### 2.4 Approved Music workspace chrome exception
+
+Music is an approved content-first exception to the generic Terminal-pattern
+workspace top bar. Its center pane owns a Spotify-class navigation strip with
+history controls, global catalog search, connectivity/profile status, and
+device access; the governed Construct taskbar remains outside and below the
+workspace. The resizable library rail, optional Now Playing rail, and persistent
+player are Music content chrome, not a second platform interface. All Music
+controls, state panels, typography, icons, colors, and motion still consume
+shared `mde-egui::Style`/`Motion`; this exception does not permit proprietary
+Spotify assets, fonts, copy, or artwork. The sole active owner and acceptance
+record is WL-FUNC-021.
+
 ### 2.5 Apps (Q17–Q20)
 
 - **Q17/Q18 — Full-screen only.** One surface per frame (the engine's native
@@ -345,22 +358,22 @@ cover every listed surface.
 
 | Launchable surface | Frame / nav / states / dialogs | Tooltips / icons / motion / lists | Appearance, licensing, and governed boundary |
 |---|---|---|---|
-| Fleet & Mesh | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Workers | Shared app frame adopted; control/network/discovery/local-node/Phones tabs are unified | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Infra as Code | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Remote Sessions | Frame exception while focused | Tooltip adopted; picker/state/motion/list migration partial | Focused VDI keeps full guest pixels; Dark/Light and licensing proof partial/gap |
 | Music | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Media | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Files | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Browser | Shared app frame adopted; guest viewport boundary retained | Tooltip adopted; local controller states/icons/motion/lists partial | Construct owns Browser connection/unavailable/diagnostic chrome; `browser-vm` Chromium remains outside Construct styling |
-| Bookmarks | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Maps & Location | Shared app frame adopted; content-color exception | Tooltip adopted; shell chrome, motion, and lists partial | Maps content may retain its palette; Car and Dark/Light proof partial; licensing gap |
 | Terminal | Shared app frame adopted; internal chrome partial | Tooltip adopted; tabs/toolbars/palettes/motion/lists partial | Dark/Light partial; licensing gap; normal Construct workspace |
-| Phones | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
-| This Node | Shared app frame adopted; other chrome partial | Tooltip adopted; state/dialog/motion/list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 | Mesh Teams | Shared app frame adopted; other chrome partial | Tooltip adopted; frame/state/dialog/motion/list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
 
-`System`, `Storage`, and `About` are legacy aliases that normalize to `This
-Node`; they are not separate launchable surfaces. The Editor is a Documents-mode
+`Fleet & Mesh`, `This Node`, `System`, `Storage`, and `About` are legacy aliases
+that normalize to `Workers`; they are not separate launchable surfaces. Phones is
+the Workers → Phones subtab and is intentionally absent from the launcher and
+taskbar pin catalog. Bookmark management lives in Browser-owned tabs/panels; the
+former standalone Bookmark workspace is retired. The Editor is a Documents-mode
 embed in Mesh Teams, exposed through the always-visible shared Editor taskbar icon
 as a direct launcher alias rather than a second surface authority. The inventory names only
 the three approved rendering boundaries: focused VDI pixels, Maps content color,

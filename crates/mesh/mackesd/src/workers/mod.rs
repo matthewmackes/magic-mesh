@@ -169,6 +169,10 @@ pub mod reconcile;
 // heartbeat file (peer hasn't enrolled yet) and the local peer
 // (heartbeat-self is unreachable by definition).
 pub mod health_reconciler;
+/// WL-UX-013 — bounded daemon-side admission for node availability intent.
+pub mod node_availability;
+/// WL-ARCH-009 — bounded, credential-free worker runtime status projection.
+pub mod worker_runtime_status;
 // EFF-9 — Prometheus textfile exporter. Snapshots store-derivable
 // control-plane gauges into <textfile_collector>/mackesd.prom on a
 // 30 s cadence; the renderer (metrics::write_textfile) existed with
@@ -278,7 +282,7 @@ pub mod selinux_monitor;
 // containers on a 10 s tick; publishes per-peer inventory to
 // `compute/inventory/<peer-nebula-addr>` per docs/design/v5.0.0-
 // compute.md §3. Silent no-op when virsh/podman are absent.
-pub mod compute_registry;
+pub mod runtime_probe;
 // ROUTER-3/4 — the router_registry worker: per-node + always-on. Discovers the
 // node's primary router/firewall (lowest-metric default route + gateway MAC),
 // matches a sealed `router/<mac>` cred + fingerprints it over the Vyatta CLI,
@@ -384,9 +388,6 @@ pub mod compute_expose;
 // `event/compute/migrate-ready` + virsh undefine. VIRT-8.b
 // (target-side compute_provision handler) ships with VIRT-6.
 pub mod compute_migrate;
-// VIRT-21 (v5.0.0) — desktop toasts on VM lifecycle changes. Drains
-// every `compute/event/<peer>` topic + fires `notify-send`.
-pub mod compute_event_toast;
 // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects the 9
 // items from docs/design/v6.0-mde-portal.md §7.1 (wifi / arp /
 // gateway-dns / public-ip / speedtest / ipv4-6 / mtu / tunnel /
@@ -525,8 +526,6 @@ pub mod netstate_apply;
 // PLANES-19 — the overlay-reachability validation suite: participate in
 // runs, leader mints nightly/run-now + writes the pass/fail verdict.
 pub mod validation_suite;
-// PD-11 — executes descriptor-gated container/VM lifecycle requests.
-pub mod lifecycle_exec;
 // DEVMGR-8 — executes privileged device-control ops (enable/disable, reload
 // module, rescan bus) on this node for the Device-Manager surface, over the
 // replicated fleet/device-control/<self> request dir.
@@ -626,22 +625,10 @@ pub mod xcp_provision;
 // summary to `event/kvm/services` so the Datacenter panels + the alert lane see
 // the live stack state. Universal — every mesh node runs the same KVM stack.
 pub mod kvm_health;
-// MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator (the
-// Fedora+KVM equivalent of xapi/xenopsd/sm/xcp-networkd). Drains
-// `action/vm/lifecycle` (create-from-image / start / stop / destroy / list,
-// each addressed to a target node id) and publishes this node's VM instance
-// roster to `event/vm/instances`. Shells `virsh`/`qemu-img` through the bounded
-// proc path behind an injectable `LibvirtBackend` trait. Universal, like
-// kvm_health — every node can host datacenter VMs.
-pub mod vm_lifecycle;
-// MV-4 — the container worker: the Podman container-lifecycle actuator (the
-// container half of the mesh management layer, companion to MV-3 vm_lifecycle).
-// Drains `action/container/lifecycle` (run / stop / rm / list, each addressed to a
-// target node id) via an injectable `PodmanBackend` that shells `podman` through
-// the bounded proc path, and publishes this node's container roster to
-// `event/podman/containers`. Universal like vm_lifecycle — every node can host
-// datacenter containers.
-pub mod container;
+/// WL-ARCH-010 — sole journal-backed Workload operation/reconciliation worker.
+pub mod workload_compute;
+/// Pure local libvirt definition helpers used only by [`workload_compute`].
+pub mod workload_vm;
 // WL-UX-005 — the peer_app_launch worker: the peer-app remote-execution executor.
 // Drains `action/apps/launch` (published by the shell's unified Front Door as
 // `{node, app_id, name}`) and, only for requests addressed to its own node id,
@@ -745,6 +732,9 @@ pub mod clipboard_bridge;
 // Reachability derives from roster presence / VM power state — never a
 // blocking probe (design lock 14).
 pub mod desktop_sources;
+pub mod upnp_sources;
+/// WL-FUNC-019 — typed SSH/SFTP and X11 resource-card projection.
+pub mod ssh_x11_sources;
 // VDI-VM-1 — the console_broker worker: makes a LOCAL KVM VM's loopback SPICE/VNC
 // console reachable on the mesh. Every VM binds its graphics to 127.0.0.1
 // (vm_lifecycle's domain XML), so a peer can open a broker session for a local VM
@@ -1162,6 +1152,10 @@ pub struct Supervisor {
     /// Defaults to the mesh Bus ([`default_breaker_alert_sink`]); tests
     /// inject a recorder via [`Supervisor::set_breaker_alert_sink`].
     alert_sink: Option<Arc<dyn BreakerAlertSink>>,
+    /// Optional ARCH-009 process-group boundary. `None` preserves the
+    /// transitional all-groups supervisor; `Some` admits only workers whose
+    /// canonical registry entry belongs to the selected process.
+    worker_group: Option<crate::worker_role::WorkerGroup>,
 }
 
 impl Default for Supervisor {
@@ -1183,6 +1177,7 @@ impl Supervisor {
             join: JoinSet::new(),
             status: None,
             alert_sink: default_breaker_alert_sink(),
+            worker_group: None,
         }
     }
 
@@ -1197,6 +1192,30 @@ impl Supervisor {
     /// Trip → alert path is asserted without a live Bus.
     pub fn set_breaker_alert_sink(&mut self, sink: Arc<dyn BreakerAlertSink>) {
         self.alert_sink = Some(sink);
+    }
+
+    /// Select one ARCH-009 process group. Every subsequent worker registration
+    /// is checked against the canonical worker registry before its task is
+    /// admitted; unknown names fail closed rather than becoming an accidental
+    /// seventh process surface.
+    pub fn set_worker_group(&mut self, group: crate::worker_role::WorkerGroup) {
+        self.worker_group = Some(group);
+    }
+
+    /// Whether a registered worker belongs to this supervisor's group. This is
+    /// also used by spawn helpers to avoid constructing filtered workers.
+    #[must_use]
+    pub fn accepts_worker(&self, name: &str) -> bool {
+        match self.worker_group {
+            None => true,
+            Some(group) => crate::worker_role::spec(name)
+                .map(|spec| spec.group == group)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "WL-ARCH-009: worker {name:?} is not registered; refusing process-group admission"
+                    )
+                }),
+        }
     }
 
     /// LIGHTHOUSE-8 — register the per-lighthouse deep-probe worker following the
@@ -1239,6 +1258,9 @@ impl Supervisor {
         let token = self.token();
         let Spawn { mut worker, policy } = spec;
         let name = worker.name();
+        if !self.accepts_worker(name) {
+            return;
+        }
         let shutdown = token;
         // EFF-24 — register + maintain the live status row.
         let status = self.status.clone();
@@ -1777,6 +1799,22 @@ mod tests {
                 RestartPolicy::Never | RestartPolicy::OnFailure | RestartPolicy::Always => {}
             }
         }
+    }
+
+    #[test]
+    fn process_group_admission_follows_the_canonical_registry() {
+        let mut supervisor = Supervisor::new();
+        supervisor.set_worker_group(crate::worker_role::WorkerGroup::Control);
+        let control = crate::worker_role::specs_for_group(crate::worker_role::WorkerGroup::Control)
+            .next()
+            .expect("control registry entry")
+            .name;
+        let other = crate::worker_role::specs_for_group(crate::worker_role::WorkerGroup::Data)
+            .next()
+            .expect("data registry entry")
+            .name;
+        assert!(supervisor.accepts_worker(control));
+        assert!(!supervisor.accepts_worker(other));
     }
 
     // ── mackesd-05: half-open recovery — behavioral (paused-time) ───

@@ -10,7 +10,7 @@
 //! via `block_on`; playback control (`play`/`pause`/`stop`) is synchronous and the
 //! engine spawns its own decode thread, so no Tokio runtime is ever nested.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::Context;
@@ -33,6 +33,15 @@ const LIBRARY_ORDER: &str = "alphabeticalByName";
 /// Fast enough for a smooth seconds readout, slow enough to stay off the UI.
 const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
+/// Bound UI intents so a stalled daemon/audio worker cannot turn repeated
+/// clicks into an unbounded heap allocation. The UI remains responsive while
+/// the worker drains network and engine work in order.
+pub(crate) const COMMAND_QUEUE_CAPACITY: usize = 64;
+
+/// Bound worker updates so a stalled egui frame cannot accumulate an unbounded
+/// result backlog. The worker applies backpressure at this boundary.
+pub(crate) const UPDATE_QUEUE_CAPACITY: usize = 256;
+
 /// Spawn the worker thread around `client`, returning the [`Command`] sender the
 /// UI drives it with. `ctx` is repainted after every [`Update`]; `updates`
 /// carries results back. If the thread cannot be spawned, an [`Update::Error`] is
@@ -40,9 +49,9 @@ const PROGRESS_TICK: Duration = Duration::from_millis(500);
 pub fn spawn(
     connections: Vec<(SeatServer, Client)>,
     ctx: Context,
-    updates: Sender<Update>,
-) -> Sender<Command> {
-    let (tx, rx) = mpsc::channel::<Command>();
+    updates: SyncSender<Update>,
+) -> SyncSender<Command> {
+    let (tx, rx) = mpsc::sync_channel::<Command>(COMMAND_QUEUE_CAPACITY);
     let err_tx = updates.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("mde-music-egui-worker".to_string())
@@ -63,7 +72,7 @@ struct Connection {
 fn run(
     connections: Vec<(SeatServer, Client)>,
     ctx: &Context,
-    updates: &Sender<Update>,
+    updates: &SyncSender<Update>,
     rx: &Receiver<Command>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -145,6 +154,22 @@ fn run(
                     }
                     let _ = updates.send(Update::Library(result));
                 }
+                Command::LoadStarred => {
+                    let result = rt
+                        .block_on(connections[active].client.get_starred2())
+                        .map_err(|e| e.to_string());
+                    let _ = updates.send(Update::Starred(result));
+                }
+                Command::Search { generation, query } => {
+                    let result = rt
+                        .block_on(connections[active].client.search3(&query))
+                        .map_err(|e| e.to_string());
+                    let _ = updates.send(Update::Search {
+                        generation,
+                        query,
+                        result,
+                    });
+                }
                 Command::LoadAlbum(id) => {
                     let result = rt
                         .block_on(connections[active].client.get_album(&id))
@@ -168,16 +193,26 @@ fn run(
                     track_loaded = play(&connections[active].client, &mut engine, updates, song)
                 }
                 Command::Pause => {
-                    if let Some(eng) = engine.as_ref() {
-                        eng.pause();
+                    let owns_active_track = engine.is_some() && track_loaded;
+                    if owns_active_track {
+                        if let Some(eng) = engine.as_ref() {
+                            eng.pause();
+                        }
                     }
-                    let _ = updates.send(Update::Playing(false));
+                    if let Some(update) = transport_update(false, engine.is_some(), track_loaded) {
+                        let _ = updates.send(update);
+                    }
                 }
                 Command::Resume => {
-                    if let Some(eng) = engine.as_ref() {
-                        eng.resume();
+                    let owns_active_track = engine.is_some() && track_loaded;
+                    if owns_active_track {
+                        if let Some(eng) = engine.as_ref() {
+                            eng.resume();
+                        }
                     }
-                    let _ = updates.send(Update::Playing(true));
+                    if let Some(update) = transport_update(true, engine.is_some(), track_loaded) {
+                        let _ = updates.send(update);
+                    }
                 }
                 Command::Stop => {
                     if let Some(eng) = engine.as_ref() {
@@ -202,6 +237,21 @@ fn run(
                     }
                 }
                 Command::RejectFailover => pending_failover = None,
+                Command::Seek(target_ms) => {
+                    if let Some(eng) = engine.as_ref() {
+                        if !eng.seek(target_ms) {
+                            let _ = updates
+                                .send(Update::Error("This stream cannot be scrubbed".to_string()));
+                        } else {
+                            let _ = updates.send(Update::Progress(target_ms));
+                        }
+                    }
+                }
+                Command::SetVolume(volume) => {
+                    if let Some(eng) = engine.as_ref() {
+                        eng.set_volume(volume);
+                    }
+                }
             }
             // Wake the UI to drain the update we just sent.
             ctx.request_repaint();
@@ -227,10 +277,18 @@ fn run(
     }
 }
 
+/// Publish transport state only while this compatibility worker actually owns
+/// an active track. An `Engine` can remain allocated after Stop or natural end,
+/// and an idle worker can receive a queued Pause/Resume before first Play; in
+/// both cases reporting `Playing` would invent playback authority.
+fn transport_update(playing: bool, engine_present: bool, track_loaded: bool) -> Option<Update> {
+    (engine_present && track_loaded).then_some(Update::Playing(playing))
+}
+
 fn propose_failover(
     connections: &[Connection],
     active: usize,
-    updates: &Sender<Update>,
+    updates: &SyncSender<Update>,
     pending: &mut Option<usize>,
     reason: &str,
 ) {
@@ -263,7 +321,7 @@ fn propose_failover(
 /// is available.
 fn ensure_engine<'a>(
     engine: &'a mut Option<Engine>,
-    updates: &Sender<Update>,
+    updates: &SyncSender<Update>,
 ) -> Option<&'a Engine> {
     if engine.is_none() {
         match Engine::new() {
@@ -285,7 +343,7 @@ fn ensure_engine<'a>(
 fn play(
     client: &Client,
     engine: &mut Option<Engine>,
-    updates: &Sender<Update>,
+    updates: &SyncSender<Update>,
     song: Song,
 ) -> bool {
     if let Some(eng) = ensure_engine(engine, updates) {
@@ -295,5 +353,55 @@ fn play(
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::TrySendError;
+
+    #[test]
+    fn music_worker_command_queue_is_bounded() {
+        let (tx, rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            tx.try_send(Command::LoadLibrary)
+                .expect("capacity should admit the configured command page");
+        }
+        assert!(matches!(
+            tx.try_send(Command::LoadLibrary),
+            Err(TrySendError::Full(Command::LoadLibrary))
+        ));
+        drop(rx);
+    }
+
+    #[test]
+    fn music_worker_update_queue_is_bounded() {
+        let (tx, rx) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
+        for _ in 0..UPDATE_QUEUE_CAPACITY {
+            tx.try_send(Update::Progress(0))
+                .expect("capacity should admit the configured update page");
+        }
+        assert!(matches!(
+            tx.try_send(Update::Progress(0)),
+            Err(TrySendError::Full(Update::Progress(0)))
+        ));
+        drop(rx);
+    }
+
+    #[test]
+    fn idle_worker_does_not_publish_transport_authority() {
+        for (engine_present, track_loaded) in [(false, false), (true, false), (false, true)] {
+            assert!(transport_update(true, engine_present, track_loaded).is_none());
+            assert!(transport_update(false, engine_present, track_loaded).is_none());
+        }
+        assert!(matches!(
+            transport_update(true, true, true),
+            Some(Update::Playing(true))
+        ));
+        assert!(matches!(
+            transport_update(false, true, true),
+            Some(Update::Playing(false))
+        ));
     }
 }

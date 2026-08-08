@@ -36,6 +36,12 @@ use super::{ShutdownToken, Worker};
 /// Default sweep cadence.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Bound the startup phase so bundle/config freshness and leadership
+/// transitions remain within the existing five-second cadence. The phase is
+/// derived from the node identity rather than process randomness, so a restart
+/// does not recreate the same common-mode timing on every seat.
+const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+
 /// A stale or unreachable coordination plane must not starve local Nebula
 /// config repair. Leadership reconciliation is advisory for this worker's
 /// config-refresh path, so fail closed quickly and retry on the next tick.
@@ -554,8 +560,16 @@ impl Worker for NebulaSupervisor {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        // One immediate tick so the marker / config land on
-        // boot before we wait the full interval.
+        // Spread the first full supervisor sweep across a bounded window. The
+        // tick body remains intact and ordered: config repair still precedes
+        // leadership/roster reconciliation, while the first pass is delayed
+        // by at most MAX_INITIAL_PHASE. Selecting shutdown during this delay
+        // keeps boot cancellation prompt.
+        let initial_phase = initial_phase_for(&self.node_id, self.tick_interval);
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(initial_phase) => {}
+        }
         self.tick().await;
         loop {
             tokio::select! {
@@ -565,6 +579,24 @@ impl Worker for NebulaSupervisor {
         }
         Ok(())
     }
+}
+
+/// Return a stable, bounded phase for the first supervisor sweep.
+///
+/// FNV-1a is sufficient here because this is scheduling spread, not a
+/// security primitive. An empty identity deliberately disables phasing so an
+/// unidentifiable node keeps the legacy immediate-start behavior.
+fn initial_phase_for(node_id: &str, tick: Duration) -> Duration {
+    let window_ms = tick.as_millis().min(MAX_INITIAL_PHASE.as_millis());
+    if node_id.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in node_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis((u128::from(hash) % (window_ms + 1)) as u64)
 }
 
 /// Distinct from `ca::sign::PeerRole` — this enum drives
@@ -2624,6 +2656,19 @@ mod tests {
             .await
             .expect("worker must exit");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn initial_phase_is_stable_bounded_and_identity_scoped() {
+        let phase = initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL);
+        assert_eq!(phase, initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert_ne!(phase, initial_phase_for("peer:seat16", DEFAULT_TICK_INTERVAL));
+        assert_eq!(initial_phase_for("", DEFAULT_TICK_INTERVAL), Duration::ZERO);
+        assert_eq!(
+            initial_phase_for("peer:seat15", Duration::from_millis(1)),
+            Duration::from_millis(0),
+        );
     }
 
     #[tokio::test]

@@ -8,15 +8,25 @@ ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44
 FROM ${APP_VM_BASE}
 
 ARG MCNF_RPM_LANE=repo
+ARG MCNF_APP_VM_SOURCE_COMMIT
+ARG MCNF_APP_VM_BASE_IMAGE_ID
 
 COPY packaging/app-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate
 COPY packaging/app-vm/mcnf-app-vm-launch.sh /tmp/mcnf-app-vm-launch
+COPY packaging/app-vm/mcnf-app-vm-runtime-probe.sh /tmp/mcnf-app-vm-runtime-probe
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 
 RUN set -eux; \
+    printf '%s\n' "${MCNF_APP_VM_BASE_IMAGE_ID}" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || { \
+        echo "FATAL: App VM base image provenance must be a complete sha256 digest" >&2; exit 1; }; \
+    case "${MCNF_APP_VM_SOURCE_COMMIT}" in \
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]... ) ;; \
+        *) echo "FATAL: App VM source commit must be a non-empty 40-character lowercase Git revision" >&2; exit 1 ;; \
+    esac; \
     install -D -m 0755 /tmp/mcnf-app-vm-validate /usr/local/libexec/mcnf-app-vm-validate; \
     install -D -m 0755 /tmp/mcnf-app-vm-launch /usr/local/libexec/mcnf-app-vm-launch; \
+    install -D -m 0755 /tmp/mcnf-app-vm-runtime-probe /usr/local/libexec/mcnf-app-vm-runtime-probe; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { \
             echo "FATAL: local App VM image lane needs a magic-mesh RPM"; exit 1; }; \
@@ -42,13 +52,34 @@ RUN set -eux; \
         'flatpak_remote=curated' \
         'network=deny-by-default' \
         > /usr/share/mcnf/app-vm/wayland-standard.profile; \
+    printf '%s\n' "${MCNF_APP_VM_SOURCE_COMMIT}" > /usr/share/mcnf/app-vm/source-commit; \
     printf '%s\n' \
         '{"schema_version":1,"profile":"wayland-standard","compositor":"sway",' \
         '"portal_frontend":"xdg-desktop-portal",' \
         '"portal_backends":["xdg-desktop-portal-wlr","xdg-desktop-portal-gtk"],' \
         '"flatpak_remote":"curated","network":"deny-by-default"}' \
         > /usr/share/mcnf/app-vm/image-contract.json; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-app-vm-validate /tmp/mcnf-app-vm-launch; \
+    printf '%s\n' \
+        'schema_version=1' \
+        'profile=wayland-standard-v1' \
+        "base_image_id=${MCNF_APP_VM_BASE_IMAGE_ID}" \
+        "source_commit=${MCNF_APP_VM_SOURCE_COMMIT}" \
+        > /usr/share/mcnf/app-vm/image-provenance; \
+    printf '%s\n' \
+        'schema_version=1' \
+        'profile=wayland-standard-v1' \
+        'compositor=sway' \
+        'compositor_executable=/usr/bin/sway' \
+        'compositor_ownership=guest' \
+        'supervisor_unit=mcnf-app-vm-runtime.service' \
+        'supervisor_entrypoint=/usr/local/libexec/mcnf-app-vm-launch' \
+        'supervisor_ownership=guest' \
+        'readiness_topic=state/vdi/app-runtime' \
+        'ready_state=connected' \
+        'not_ready_states=installing,starting_app,reconnecting,unavailable,failed' \
+        'host_fallback=disabled' \
+        > /usr/share/mcnf/app-vm/runtime-readiness; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-app-vm-validate /tmp/mcnf-app-vm-launch /tmp/mcnf-app-vm-runtime-probe; \
     dnf clean all
 
 # The curated Flatpak remote is deliberately not created here. Its signed

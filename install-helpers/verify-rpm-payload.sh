@@ -34,6 +34,7 @@
 #   install-helpers/verify-rpm-payload.sh requirements            # pin source metadata for base VDI-host hard Requires
 #   install-helpers/verify-rpm-payload.sh requirements a.rpm      # also inspect a built RPM's actual Requires header
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
+#   install-helpers/verify-rpm-payload.sh overlay-claims-package  # WL-CRIT-007 three-variant package/runtime shape
 #   install-helpers/verify-rpm-payload.sh surfaces       # surface-reachability check only
 #   install-helpers/verify-rpm-payload.sh --self-test    # exercise the parser on good+broken fixtures
 #   install-helpers/verify-rpm-payload.sh --help
@@ -450,6 +451,135 @@ check_payload() {
   fi
 }
 
+# WL-CRIT-007 — focused package/runtime-shape gate for the authenticated local
+# claim-snapshot prerequisite. cargo-generate-rpm variant asset arrays replace
+# the base array, so every role must carry all four files independently. This
+# gate also prevents a packaging-only change from accidentally activating the
+# post-overlay producer or the pre-Nebula guard while the typed transport blocker
+# remains open.
+check_overlay_claims_package() {
+  hdr "overlay identity claim prerequisite — three RPM variants"
+  local output rc
+  output="$(python3 - "$CARGO_TOML" "$REPO_ROOT" <<'PY'
+from __future__ import annotations
+
+import pathlib
+import sys
+import tomllib
+
+manifest_path = pathlib.Path(sys.argv[1])
+repo = pathlib.Path(sys.argv[2])
+data = tomllib.loads(manifest_path.read_text())
+rpm = data["package"]["metadata"]["generate-rpm"]
+
+expected = (
+    (
+        "install-helpers/mcnf-overlay-identity-claims-materializer.py",
+        "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py",
+        "755",
+    ),
+    (
+        "install-helpers/mcnf-overlay-identity-collision-guard.py",
+        "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py",
+        "755",
+    ),
+    (
+        "packaging/systemd/mcnf-overlay-identity-claims-materializer.service",
+        "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service",
+        "644",
+    ),
+    (
+        "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf",
+        "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf",
+        "644",
+    ),
+)
+shapes = {
+    "base": rpm,
+    "server": rpm["variants"]["server"],
+    "lighthouse": rpm["variants"]["lighthouse"],
+}
+errors: list[str] = []
+for shape, table in shapes.items():
+    assets = table.get("assets")
+    if not isinstance(assets, list):
+        errors.append(f"{shape}: assets is not an array")
+        continue
+    for source, dest, mode in expected:
+        matches = [
+            asset
+            for asset in assets
+            if isinstance(asset, dict)
+            and asset.get("source") == source
+            and asset.get("dest") == dest
+            and str(asset.get("mode")) == mode
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{shape}: expected exactly one {source} -> {dest} mode={mode}; "
+                f"found {len(matches)}"
+            )
+
+    lifecycle = "\n".join(
+        str(table.get(key, ""))
+        for key in ("post_install_script", "pre_uninstall_script", "post_uninstall_script")
+    )
+    if "mcnf-overlay-identity-claims-materializer" in lifecycle:
+        errors.append(f"{shape}: package lifecycle activates/references the disabled producer")
+    if "05-overlay-identity-collision-guard" in lifecycle:
+        errors.append(f"{shape}: package lifecycle activates/references the inert guard drop-in")
+    print(f"{shape}: four prerequisite assets present exactly once; lifecycle activation absent")
+
+for source, _dest, _mode in expected:
+    if not (repo / source).is_file():
+        errors.append(f"source file missing: {source}")
+
+materializer = (repo / expected[0][0]).read_text()
+guard = (repo / expected[1][0]).read_text()
+unit = (repo / expected[2][0]).read_text()
+dropin = (repo / expected[3][0]).read_text()
+private_snapshot = "/var/lib/mackesd/overlay-identity-claims/active-claims.json"
+if private_snapshot not in materializer or private_snapshot not in guard:
+    errors.append("producer and guard defaults do not share the dedicated private snapshot path")
+required_unit_lines = {
+    "StateDirectory=mackesd/overlay-identity-claims",
+    "StateDirectoryMode=0700",
+    "ReadWritePaths=/var/lib/mackesd/overlay-identity-claims /run/mackesd",
+    "ExecStart=/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py",
+}
+unit_lines = set(unit.splitlines())
+for line in sorted(required_unit_lines - unit_lines):
+    errors.append(f"materializer unit missing exact private-state contract: {line}")
+if "ReadWritePaths=/var/lib/mackesd /run/mackesd" in unit_lines:
+    errors.append("materializer unit still grants write access to shared /var/lib/mackesd")
+blocker = "ACTIVATION_BLOCKER=pre-nebula-current-authority-transport-unavailable"
+if blocker not in unit or blocker not in dropin:
+    errors.append("typed pre-Nebula transport activation blocker is missing")
+if any(line.strip() == "[Install]" for line in unit.splitlines()):
+    errors.append("materializer unit gained an [Install] activation section")
+for forbidden in ("[Unit]", "[Service]", "ExecStartPre="):
+    if any(line.strip().startswith(forbidden) for line in dropin.splitlines()):
+        errors.append(f"guard drop-in is no longer inert: {forbidden}")
+
+print("runtime: dedicated root 0700 state leaf declared; shared daemon state root not writable")
+print("activation: typed blocker present; producer disabled; Nebula drop-in inert")
+if errors:
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    while IFS= read -r line; do
+      [ -z "$line" ] || ok "$line"
+    done <<<"$output"
+  else
+    fail "overlay identity claim package shape rejected"
+    [ -z "$output" ] || printf '%s\n' "$output" >&2
+  fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # CHECK 2 — surface reachability (test-obs-4)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -745,6 +875,7 @@ main() {
       check_vdi_host_requires
       [ -z "${1:-}" ] || check_built_rpm_vdi_host_requires "$1"
       ;;
+    overlay-claims-package) check_overlay_claims_package ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
     all|"")   check_payload_dryrun; check_surfaces ;;

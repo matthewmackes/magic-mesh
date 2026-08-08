@@ -13,26 +13,30 @@
 //! the default build — the whole controller is unit-tested below (the transport glue
 //! against the real player, the browse/source/OSD folds as pure functions).
 
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
 use mackes_mesh_types::media_sources::{
-    MediaKind as MeshMediaKind, MediaSource as MeshMediaSource, MediaSourcesState,
-    Reachability as MeshReachability, SourceOrigin as MeshSourceOrigin,
-    JELLYFIN_GATEWAY_USER_SENTINEL,
+    JELLYFIN_GATEWAY_USER_SENTINEL, MediaKind as MeshMediaKind, MediaSource as MeshMediaSource,
+    MediaSourcesState, Reachability as MeshReachability, SourceOrigin as MeshSourceOrigin,
 };
 use mde_jellyfin::{
-    build_playback_decision, direct_play_url, BaseItemDto, CacheEntry, CacheRequest,
-    ClientCapabilities, HttpTransport, ItemsQuery, JellyfinAccessPolicy, JellyfinClient,
-    JellyfinError, MediaSourceInfo, MetadataCache, OfflineCache, PlaybackDecision, PlaybackMethod,
-    PlaybackReport, ServerAuth, ServerConfig, ServerStore, StreamMediaType,
+    BaseItemDto, CacheEntry, CacheRequest, ClientCapabilities, HttpTransport, ItemsQuery,
+    JellyfinAccessPolicy, JellyfinClient, JellyfinError, MediaSourceInfo, MetadataCache,
+    OfflineCache, PlaybackDecision, PlaybackMethod, PlaybackReport, ServerAuth, ServerConfig,
+    ServerStore, StreamMediaType, build_playback_decision, direct_play_url,
 };
 use mde_media_core::{
-    classify_url, discover_all, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice,
-    CaptureEnumerator, CaptureError, CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget,
-    Caster, EqBand, JoinOutcome, Library, LibraryItem, LoginOutcome, LoudnessNorm, MediaEngine,
-    MediaKind, MeshRoster, MpvCapabilities, NetworkCaster, PartyPoll, PartySession,
-    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, PollOutcome,
-    RendererDiscovery, RepeatMode, ReplayGainMode, RoamingSession, ScreenshotMode, SortKey,
-    SsdpProbe, SyncCommand, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
-    YtDlpResolver,
+    AbLoop, AudioConfig, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
+    CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget, Caster, EqBand, JoinOutcome,
+    Library, LibraryItem, LoginOutcome, LoudnessNorm, MediaEngine, MediaKind, MeshRoster,
+    MpvCapabilities, NetworkCaster, PartyPoll, PartySession, PlaybackControls, Player, PlayerEvent,
+    PlayerState, Playlist, PlaylistItem, PollOutcome, RendererDiscovery, RepeatMode,
+    ReplayGainMode, RoamingSession, ScreenshotMode, SortKey, SsdpProbe, SyncCommand, Track,
+    TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError, YtDlpResolver, classify_url,
+    discover_all, unix_millis,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -59,6 +63,16 @@ pub const EBU_R128_DEFAULT: LoudnessNorm = LoudnessNorm::Ebu {
     true_peak_db: -1.5,
     range_lu: 11.0,
 };
+
+/// Provisioning may materialize the Jellyfin token store after the shell is
+/// already open.  Poll at a human-paced cadence instead of every frame.
+const JELLYFIN_STORE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Keep repeated live cast-picker actions from launching another synchronous SSDP
+/// probe while the previous result is still fresh.  This matches the default SSDP
+/// receive window, so a repeated menu click cannot stack another potentially
+/// two-second network wait on top of the same discovery request.
+const CAST_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The four top-level views of the media app (design Q31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -561,6 +575,10 @@ pub struct MediaController<E: MediaEngine> {
     /// The core player state machine (transport + MEDIA-3/4/5/6 config + the queue +
     /// resume). All playback state lives here — the surface only drives + renders it.
     player: Player<E>,
+    /// Whether the current media has passed its most recent decoder/error boundary.
+    /// An error invalidates the last decoded frame; only a fresh `TracksChanged`
+    /// event from a successful file load makes that frame trustworthy again.
+    video_frame_valid: bool,
     /// The core local-media index (MEDIA-7). The surface browses it; it does not
     /// re-implement indexing.
     library: Library,
@@ -584,6 +602,14 @@ pub struct MediaController<E: MediaEngine> {
     cast: CastUiState,
     /// The non-core UI state.
     ui: UiState,
+    /// Earliest time at which the on-disk Jellyfin token store should be read
+    /// again.  This lets a root-owned shell converge on a user's store without
+    /// doing filesystem work on every frame.
+    next_jellyfin_store_refresh: Instant,
+    /// The start time of the last live cast discovery.  The live path combines a
+    /// mesh-roster read with a synchronous SSDP probe, so repeated actions are
+    /// coalesced while the prior target snapshot remains usable.
+    last_cast_discovery: Option<Instant>,
 }
 
 impl<E: MediaEngine> MediaController<E> {
@@ -592,6 +618,7 @@ impl<E: MediaEngine> MediaController<E> {
     pub fn new(player: Player<E>) -> Self {
         Self {
             player,
+            video_frame_valid: true,
             library: Library::new(),
             jellyfin: JellyfinState::default(),
             capture: CaptureUiState::default(),
@@ -599,6 +626,8 @@ impl<E: MediaEngine> MediaController<E> {
             party: None,
             cast: CastUiState::default(),
             ui: UiState::default(),
+            next_jellyfin_store_refresh: Instant::now(),
+            last_cast_discovery: None,
         }
     }
 
@@ -608,6 +637,16 @@ impl<E: MediaEngine> MediaController<E> {
     #[must_use]
     pub const fn player(&self) -> &Player<E> {
         &self.player
+    }
+
+    /// Whether a decoded video frame may be rendered for the current media.
+    ///
+    /// This is deliberately stricter than `player.media().is_some()`: the player
+    /// can retain a media URL after a decoder error, but its last frame is no
+    /// longer an honest representation of the current playback state.
+    #[must_use]
+    pub const fn video_frame_valid(&self) -> bool {
+        self.video_frame_valid
     }
 
     /// The core player (mutable — the app's per-frame `pump` drives it).
@@ -878,8 +917,18 @@ impl<E: MediaEngine> MediaController<E> {
             party.apply_pending(&mut self.player);
         }
         for event in self.player.drain_events() {
-            if let PlayerEvent::Error(msg) = event {
-                self.ui.status = Some(msg);
+            match event {
+                PlayerEvent::Error(msg) => {
+                    // Keep the exact error visible and invalidate any frame from
+                    // before it. A later pause/play event is not recovery; only a
+                    // fresh file-ready TracksChanged event below restores trust.
+                    self.video_frame_valid = false;
+                    self.ui.status = Some(msg);
+                }
+                PlayerEvent::TracksChanged(_) => {
+                    self.video_frame_valid = true;
+                }
+                _ => {}
             }
         }
     }
@@ -1059,7 +1108,26 @@ impl<E: MediaEngine> MediaController<E> {
     /// discovery, honest-gated to a network with responders.
     pub fn discover_cast_targets(&mut self) {
         let sources: [&dyn RendererDiscovery; 2] = [&MeshRoster, &SsdpProbe::default()];
-        self.refresh_cast_targets(&SliceDiscovery(&sources));
+        self.discover_cast_targets_with(&SliceDiscovery(&sources), Instant::now());
+    }
+
+    /// Run one live-style discovery at a supplied clock instant.  Keeping the
+    /// clock and discovery seam injectable makes the refresh coalescing policy
+    /// testable without opening a UDP socket.
+    fn discover_cast_targets_with<D: RendererDiscovery>(
+        &mut self,
+        discovery: &D,
+        now: Instant,
+    ) -> bool {
+        if !cast_discovery_is_due(self.last_cast_discovery, now) {
+            self.ui.status = Some(
+                "Cast discovery is cooling down; showing the last results.".to_owned(),
+            );
+            return false;
+        }
+        self.last_cast_discovery = Some(now);
+        self.refresh_cast_targets(discovery);
+        true
     }
 
     /// Cast the current playback to the discovered target `id` over an injected
@@ -1270,6 +1338,37 @@ impl<E: MediaEngine> MediaController<E> {
     /// [`ServerStore::load`] at startup (no network).
     pub fn set_jellyfin_store(&mut self, store: ServerStore) {
         self.jellyfin.store = store;
+        let selected_is_valid = self
+            .jellyfin
+            .selected
+            .as_deref()
+            .is_some_and(|id| self.jellyfin.store.get(id).is_some());
+        if !selected_is_valid {
+            self.jellyfin.selected = self
+                .jellyfin
+                .store
+                .servers
+                .first()
+                .map(|server| server.id.clone());
+        }
+    }
+
+    /// Refresh the on-disk Jellyfin token store when its active-seat path
+    /// becomes available after startup. Missing files remain a normal first
+    /// run; malformed/io failures are surfaced on the shared status line.
+    pub fn refresh_jellyfin_store(&mut self) {
+        let now = Instant::now();
+        if now < self.next_jellyfin_store_refresh {
+            return;
+        }
+        self.next_jellyfin_store_refresh = now + JELLYFIN_STORE_REFRESH_INTERVAL;
+        match ServerStore::load() {
+            Ok(store) if &store != self.jellyfin.store() => self.set_jellyfin_store(store),
+            Ok(_) | Err(mde_jellyfin::StoreError::Missing(_)) => {}
+            Err(error) => {
+                self.ui.status = Some(format!("Jellyfin server store: {error}"));
+            }
+        }
     }
 
     /// Override the negotiated capability profile (the default is the
@@ -1368,6 +1467,7 @@ impl<E: MediaEngine> MediaController<E> {
             .cache
             .entries()
             .iter()
+            .filter(|entry| self.jellyfin.cache.contains(&entry.item_id))
             .map(|entry| OfflineRow {
                 item_id: entry.item_id.clone(),
                 label: entry.title.clone(),
@@ -1553,11 +1653,7 @@ impl<E: MediaEngine> MediaController<E> {
         let Some(state) = self.jellyfin.mesh_sources() else {
             return Vec::new();
         };
-        let mut sources: Vec<&MeshMediaSource> = state
-            .sources
-            .iter()
-            .filter(|source| source.kind == MeshMediaKind::Jellyfin)
-            .collect();
+        let mut sources = project_mesh_jellyfin_sources(state);
         sources.sort_by(|a, b| {
             mesh_source_priority(a)
                 .cmp(&mesh_source_priority(b))
@@ -2044,6 +2140,14 @@ fn cast_err(kind: CastKind, error: &CastError) -> String {
     }
 }
 
+/// Whether another live cast discovery may start at `now`.
+#[must_use]
+fn cast_discovery_is_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| {
+        now.saturating_duration_since(last) >= CAST_DISCOVERY_REFRESH_INTERVAL
+    })
+}
+
 /// Fold a slice of discovery sources into one [`RendererDiscovery`] (MEDIA-17), so the
 /// live mesh-roster + SSDP probe present as a single de-duplicated source to
 /// [`MediaController::refresh_cast_targets`].
@@ -2090,6 +2194,129 @@ fn mesh_source_priority(source: &MeshMediaSource) -> (u8, u8, u8) {
         MeshReachability::Unreachable => 2,
     };
     (origin, default, reachability)
+}
+
+/// Project only unambiguous, dialable Jellyfin rows into the UI/controller.
+///
+/// The roster is a retained Bus record, so it is untrusted input even though it
+/// was decoded successfully.  Duplicate ids and duplicate upstream identities
+/// are rejected as groups (rather than allowing first-row-wins selection), and
+/// the endpoint is restricted to a bounded HTTP(S) origin plus a path with no
+/// authority injection, whitespace, query, fragment, or traversal.  This is the
+/// last pure boundary before a row can be selected or handed to
+/// [`JellyfinClient`].
+fn project_mesh_jellyfin_sources(state: &MediaSourcesState) -> Vec<&MeshMediaSource> {
+    let mut id_counts = HashMap::<&str, usize>::new();
+    let mut upstream_counts = HashMap::<&str, usize>::new();
+    for source in state
+        .sources
+        .iter()
+        .filter(|source| source.kind == MeshMediaKind::Jellyfin)
+    {
+        *id_counts.entry(source.id.as_str()).or_default() += 1;
+        *upstream_counts
+            .entry(mesh_source_upstream_identity(source))
+            .or_default() += 1;
+    }
+
+    state
+        .sources
+        .iter()
+        .filter(|source| source.kind == MeshMediaKind::Jellyfin)
+        .filter(|source| id_counts.get(source.id.as_str()) == Some(&1))
+        .filter(|source| upstream_counts.get(mesh_source_upstream_identity(source)) == Some(&1))
+        .filter(|source| mesh_source_identity_is_safe(source))
+        .filter(|source| mesh_jellyfin_endpoint_is_safe(&source.endpoint))
+        .collect()
+}
+
+fn mesh_source_upstream_identity(source: &MeshMediaSource) -> &str {
+    source
+        .upstream_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .unwrap_or(&source.endpoint)
+}
+
+fn mesh_source_identity_is_safe(source: &MeshMediaSource) -> bool {
+    let id = source.id.as_str();
+    !id.is_empty()
+        && id.len() <= 256
+        && id == id.trim()
+        && !id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
+fn mesh_jellyfin_endpoint_is_safe(endpoint: &str) -> bool {
+    const MAX_ENDPOINT_BYTES: usize = 2_048;
+
+    if endpoint.is_empty()
+        || endpoint.len() > MAX_ENDPOINT_BYTES
+        || endpoint != endpoint.trim()
+        || endpoint
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || endpoint
+            .chars()
+            .any(|character| matches!(character, '?' | '#' | '@' | '\\'))
+    {
+        return false;
+    }
+
+    let Some(rest) = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+    else {
+        return false;
+    };
+
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return false;
+    }
+
+    let authority_is_safe = if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return false;
+        };
+        let host = &authority[1..close];
+        let suffix = &authority[close + 1..];
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'))
+            && (suffix.is_empty()
+                || suffix
+                    .strip_prefix(':')
+                    .is_some_and(mesh_endpoint_port_is_safe))
+    } else {
+        let mut parts = authority.split(':');
+        let host = parts.next().unwrap_or_default();
+        let port = parts.next();
+        parts.next().is_none()
+            && !host.is_empty()
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            && port.is_none_or(mesh_endpoint_port_is_safe)
+    };
+    if !authority_is_safe {
+        return false;
+    }
+
+    let path = &rest[authority_end..];
+    !path.split('/').any(|segment| matches!(segment, "." | ".."))
+}
+
+fn mesh_endpoint_port_is_safe(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && port
+            .parse::<u16>()
+            .is_ok_and(|port_number| port_number != 0)
 }
 
 fn mesh_source_origin_label(source: &MeshMediaSource) -> String {
@@ -2513,12 +2740,13 @@ mod tests {
             MediaTab::Player,
             "resume jumps to the Player view"
         );
-        assert!(b
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("followed you"));
+        assert!(
+            b.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("followed you")
+        );
         b.pump(); // Loading → Playing, then the pending resume seek lands
         assert_eq!(b.player().state(), PlayerState::Paused);
         assert!((b.player().position() - 30.0).abs() < f64::EPSILON);
@@ -2528,12 +2756,13 @@ mod tests {
         assert_eq!(a.player().state(), PlayerState::Playing);
         a.poll_roaming();
         assert_eq!(a.player().state(), PlayerState::Paused);
-        assert!(a
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("another seat"));
+        assert!(
+            a.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another seat")
+        );
         // B still owns on its own poll.
         b.poll_roaming();
         assert_eq!(
@@ -2550,7 +2779,7 @@ mod tests {
         let mut c = loaded();
         assert!(!c.roaming_enabled());
         c.poll_roaming(); // no-op, no panic
-                          // Enabling over an unprovisioned root is honest offline — no resume, no status.
+        // Enabling over an unprovisioned root is honest offline — no resume, no status.
         let outcome = c.enable_roaming(RoamingSession::new(
             mde_media_core::RoamingStore::new(std::path::PathBuf::from("/no/such/mesh/root")),
             "matthew",
@@ -2615,12 +2844,13 @@ mod tests {
             (b.player().position() - 45.0).abs() < 1.0,
             "B seeked in sync"
         );
-        assert!(b
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("another seat"));
+        assert!(
+            b.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("another seat")
+        );
 
         // Leaving drops the seat from the party membership.
         b.leave_party();
@@ -2639,12 +2869,13 @@ mod tests {
             "seat-a",
         ));
         assert_eq!(outcome, JoinOutcome::Offline);
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("mesh volume"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mesh volume")
+        );
     }
 
     /// A canned discovery + a scripted caster, so the cast picker + throw are exercised
@@ -2678,6 +2909,40 @@ mod tests {
     }
 
     #[test]
+    fn live_cast_discovery_coalesces_duplicate_refreshes_and_expires() {
+        let mut c = loaded();
+        let first = Instant::now();
+        assert!(c.discover_cast_targets_with(
+            &FakeDiscovery(vec![dlna_target()]),
+            first,
+        ));
+
+        let mut replacement = dlna_target();
+        replacement.id = "tv-2".to_owned();
+        replacement.name = "Bedroom TV".to_owned();
+
+        // A repeated live action inside the SSDP receive window does no second
+        // discovery and keeps the last known snapshot available to the picker.
+        assert!(!c.discover_cast_targets_with(
+            &FakeDiscovery(vec![replacement.clone()]),
+            first + CAST_DISCOVERY_REFRESH_INTERVAL - Duration::from_millis(1),
+        ));
+        assert_eq!(c.cast().targets(), &[dlna_target()]);
+        assert_eq!(
+            c.ui().status.as_deref(),
+            Some("Cast discovery is cooling down; showing the last results.")
+        );
+
+        // Once the bounded interval expires, a deliberate refresh is allowed and
+        // the target snapshot can converge to the newly discovered renderer.
+        assert!(c.discover_cast_targets_with(
+            &FakeDiscovery(vec![replacement.clone()]),
+            first + CAST_DISCOVERY_REFRESH_INTERVAL,
+        ));
+        assert_eq!(c.cast().targets(), &[replacement]);
+    }
+
+    #[test]
     fn cast_lists_discovered_targets_and_throws_via_the_seam() {
         let mut c = loaded();
         c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
@@ -2685,12 +2950,13 @@ mod tests {
         assert_eq!(c.cast().targets().len(), 1);
 
         c.cast_to("tv-1", &FakeCaster(Ok(())));
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Casting to Living Room TV"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Casting to Living Room TV")
+        );
     }
 
     #[test]
@@ -2700,12 +2966,13 @@ mod tests {
         c.refresh_cast_targets(&FakeDiscovery(vec![]));
         assert!(c.cast().probed());
         assert!(c.cast().targets().is_empty());
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("No cast renderer"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No cast renderer")
+        );
 
         // A typed gate from the caster is surfaced with what it needs (never faked).
         c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
@@ -2716,12 +2983,13 @@ mod tests {
                 needs: "the CASTV2 launch handshake",
             })),
         );
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("CASTV2"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("CASTV2")
+        );
     }
 
     #[test]
@@ -2729,12 +2997,13 @@ mod tests {
         let mut c = controller(); // nothing loaded
         c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
         c.cast_to("tv-1", &FakeCaster(Ok(())));
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Load something to cast"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Load something to cast")
+        );
     }
 
     // ── network streams + yt-dlp (MEDIA-12) ──────────────────────────────────────
@@ -2852,12 +3121,13 @@ mod tests {
         // Nothing loaded, the field is kept so the operator can retry.
         assert_eq!(c.player().state(), PlayerState::Idle);
         assert_eq!(c.player().media(), None);
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap_or_default()
-            .contains("yt-dlp"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("yt-dlp")
+        );
     }
 
     #[test]
@@ -3053,11 +3323,12 @@ mod tests {
         let mut c = loaded();
         c.dispatch(TransportAction::SetSpeed(2.0));
         assert!((c.player().controls().speed - 2.0).abs() < f64::EPSILON);
-        assert!(c
-            .player()
-            .engine()
-            .applied_control_properties()
-            .contains(&("speed".to_owned(), "2".to_owned())));
+        assert!(
+            c.player()
+                .engine()
+                .applied_control_properties()
+                .contains(&("speed".to_owned(), "2".to_owned()))
+        );
     }
 
     #[test]
@@ -3073,11 +3344,12 @@ mod tests {
             c.player().controls().ab_loop,
             AbLoop::Range { a: 10.0, b: 30.0 }
         );
-        assert!(c
-            .player()
-            .engine()
-            .applied_control_properties()
-            .contains(&("ab-loop-a".to_owned(), "10".to_owned())));
+        assert!(
+            c.player()
+                .engine()
+                .applied_control_properties()
+                .contains(&("ab-loop-a".to_owned(), "10".to_owned()))
+        );
         // Clearing folds Off back to the engine.
         c.dispatch(TransportAction::ClearAbLoop);
         assert_eq!(c.player().controls().ab_loop, AbLoop::Off);
@@ -3099,11 +3371,12 @@ mod tests {
     fn select_track_folds_the_sid_to_the_engine() {
         let mut c = loaded();
         c.dispatch(TransportAction::SelectTrack(TrackKind::Subtitle, 1));
-        assert!(c
-            .player()
-            .engine()
-            .applied_track_properties()
-            .contains(&("sid".to_owned(), "1".to_owned())));
+        assert!(
+            c.player()
+                .engine()
+                .applied_track_properties()
+                .contains(&("sid".to_owned(), "1".to_owned()))
+        );
     }
 
     // ── queue glue ───────────────────────────────────────────────────────────────
@@ -3215,41 +3488,46 @@ mod tests {
     fn loudness_and_replaygain_and_gapless_fold_to_engine_properties() {
         let mut c = controller();
         // Default: PipeWire ao pinned first, null fallback available, gapless on.
-        assert!(c
-            .audio_config()
-            .properties()
-            .contains(&("ao".to_owned(), "pipewire,null".to_owned())));
+        assert!(
+            c.audio_config()
+                .properties()
+                .contains(&("ao".to_owned(), "pipewire,null".to_owned()))
+        );
 
         c.dispatch(TransportAction::SetLoudness(EBU_R128_DEFAULT));
         assert_eq!(c.audio_config().loudness, EBU_R128_DEFAULT);
-        assert!(c
-            .player()
-            .engine()
-            .applied_af()
-            .is_some_and(|af| af.contains("loudnorm=I=-16")));
+        assert!(
+            c.player()
+                .engine()
+                .applied_af()
+                .is_some_and(|af| af.contains("loudnorm=I=-16"))
+        );
 
         c.dispatch(TransportAction::SetLoudness(LoudnessNorm::Dynamic));
-        assert!(c
-            .player()
-            .engine()
-            .applied_af()
-            .is_some_and(|af| af.contains("dynaudnorm")));
+        assert!(
+            c.player()
+                .engine()
+                .applied_af()
+                .is_some_and(|af| af.contains("dynaudnorm"))
+        );
 
         c.dispatch(TransportAction::SetReplayGain(ReplayGainMode::Album));
-        assert!(c
-            .player()
-            .engine()
-            .applied_properties()
-            .contains(&("replaygain".to_owned(), "album".to_owned())));
+        assert!(
+            c.player()
+                .engine()
+                .applied_properties()
+                .contains(&("replaygain".to_owned(), "album".to_owned()))
+        );
 
         assert!(c.audio_config().gapless);
         c.dispatch(TransportAction::ToggleGapless);
         assert!(!c.audio_config().gapless);
-        assert!(c
-            .player()
-            .engine()
-            .applied_properties()
-            .contains(&("gapless-audio".to_owned(), "no".to_owned())));
+        assert!(
+            c.player()
+                .engine()
+                .applied_properties()
+                .contains(&("gapless-audio".to_owned(), "no".to_owned()))
+        );
     }
 
     // ── library browse fold ──────────────────────────────────────────────────────
@@ -3613,14 +3891,16 @@ mod tests {
     #[test]
     fn mesh_jellyfin_sources_project_gateway_rows_ahead_of_direct_sources() {
         let mut c = controller();
+        let mut direct = mesh_jellyfin_source(
+            "direct",
+            MeshSourceOrigin::MeshPeer,
+            MeshReachability::Reachable,
+        );
+        direct.upstream_key = Some("http://direct.mesh:8096".to_string());
         c.set_mesh_media_sources(Some(MediaSourcesState {
             node: "seat-15".to_string(),
             sources: vec![
-                mesh_jellyfin_source(
-                    "direct",
-                    MeshSourceOrigin::MeshPeer,
-                    MeshReachability::Reachable,
-                ),
+                direct,
                 mesh_jellyfin_source(
                     "gateway",
                     MeshSourceOrigin::Gateway,
@@ -3647,6 +3927,126 @@ mod tests {
             Some("media/jellyfin/shared-readonly")
         );
         assert_eq!(c.jellyfin().store().servers.len(), 0);
+    }
+
+    #[test]
+    fn mesh_jellyfin_projection_rejects_ambiguous_identity_and_unsafe_endpoint() {
+        let mut safe = mesh_jellyfin_source(
+            "safe",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        safe.upstream_key = Some("http://safe-jellyfin.lan:8096".to_string());
+
+        let mut duplicate_ok = mesh_jellyfin_source(
+            "duplicate",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        duplicate_ok.endpoint = "https://gateway-a.mesh:8097/mde/jellyfin/duplicate".to_string();
+
+        let mut duplicate_unsafe = duplicate_ok.clone();
+        duplicate_unsafe.endpoint =
+            "https://gateway-a.mesh:8097/mde/jellyfin/duplicate\r\nX-Injected: yes".to_string();
+
+        let mut invalid_identity = mesh_jellyfin_source(
+            "bad identity",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        invalid_identity.endpoint =
+            "https://gateway-a.mesh:8097/mde/jellyfin/bad-identity".to_string();
+
+        let mut invalid_scheme = mesh_jellyfin_source(
+            "invalid-scheme",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        invalid_scheme.endpoint =
+            "javascript://gateway-a.mesh/mde/jellyfin/invalid-scheme".to_string();
+
+        let mut c = controller();
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![
+            safe,
+            duplicate_ok,
+            duplicate_unsafe,
+            invalid_identity,
+            invalid_scheme,
+        ])));
+
+        let rows = c.mesh_jellyfin_sources();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["safe"]
+        );
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|row| row.id),
+            Some("safe".into())
+        );
+        assert!(!c.select_mesh_jellyfin_source("duplicate"));
+        assert!(!c.select_mesh_jellyfin_source("bad identity"));
+
+        let mut blocked = controller();
+        blocked.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
+            "unsafe-only",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        )])));
+        blocked
+            .jellyfin
+            .mesh_sources
+            .as_mut()
+            .expect("mesh state")
+            .sources[0]
+            .endpoint = "https://gateway-a.mesh:8097/mde/jellyfin/unsafe-only\n".to_string();
+        assert!(blocked.mesh_jellyfin_sources().is_empty());
+        assert!(
+            blocked
+                .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mesh_jellyfin_projection_rejects_duplicate_upstream_identity() {
+        let mut gateway = mesh_jellyfin_source(
+            "gateway-copy",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        gateway.upstream_key = Some("http://jellyfin.lan:8096".to_string());
+
+        let mut peer = mesh_jellyfin_source(
+            "peer-copy",
+            MeshSourceOrigin::MeshPeer,
+            MeshReachability::Reachable,
+        );
+        peer.upstream_key = Some(" http://jellyfin.lan:8096 ".to_string());
+
+        let mut c = controller();
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![
+            mesh_jellyfin_source(
+                "safe",
+                MeshSourceOrigin::Gateway,
+                MeshReachability::Reachable,
+            ),
+            gateway,
+            peer,
+        ])));
+
+        assert_eq!(
+            c.mesh_jellyfin_sources()
+                .iter()
+                .map(|source| source.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["safe"]
+        );
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|source| source.id),
+            Some("safe".into())
+        );
+        assert!(!c.select_mesh_jellyfin_source("gateway-copy"));
+        assert!(!c.select_mesh_jellyfin_source("peer-copy"));
     }
 
     #[test]
@@ -3781,8 +4181,8 @@ mod tests {
     }
 
     #[test]
-    fn mesh_gateway_jellyfin_client_uses_gateway_playback_role_without_server_store_materialization(
-    ) {
+    fn mesh_gateway_jellyfin_client_uses_gateway_playback_role_without_server_store_materialization()
+     {
         let mut c = controller();
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
             "gateway",
@@ -3822,10 +4222,11 @@ mod tests {
         );
         direct.mesh_default = None;
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![direct])));
-        assert!(c
-            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
-            .expect_err("direct is not a gateway")
-            .contains("not a gateway"));
+        assert!(
+            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+                .expect_err("direct is not a gateway")
+                .contains("not a gateway")
+        );
 
         let mut missing_credential = mesh_jellyfin_source(
             "gateway",
@@ -3834,10 +4235,11 @@ mod tests {
         );
         missing_credential.credential_ref = None;
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![missing_credential])));
-        assert!(c
-            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
-            .expect_err("credential ref is required")
-            .contains("missing a sealed credential"));
+        assert!(
+            c.mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+                .expect_err("credential ref is required")
+                .contains("missing a sealed credential")
+        );
     }
 
     #[derive(Debug)]
@@ -4111,19 +4513,21 @@ mod tests {
         assert!(row.signed_in);
         assert_eq!(row.active_profile.as_deref(), Some("matthew"));
         assert_eq!(row.profiles.len(), 2);
-        assert!(row
-            .profiles
-            .iter()
-            .any(|p| p.user_id == "user-a" && p.active));
+        assert!(
+            row.profiles
+                .iter()
+                .any(|p| p.user_id == "user-a" && p.active)
+        );
 
         // Switching flips the active profile — and the selected server's token.
         assert!(c.switch_jellyfin_profile("srv", "user-b"));
         let row = &c.jellyfin_sources()[0];
         assert_eq!(row.active_profile.as_deref(), Some("guest"));
-        assert!(row
-            .profiles
-            .iter()
-            .any(|p| p.user_id == "user-b" && p.active));
+        assert!(
+            row.profiles
+                .iter()
+                .any(|p| p.user_id == "user-b" && p.active)
+        );
         let active_token = c
             .jellyfin()
             .selected_server()
@@ -4133,12 +4537,13 @@ mod tests {
 
         // Switching to an unknown profile is refused honestly.
         assert!(!c.switch_jellyfin_profile("srv", "nobody"));
-        assert!(c
-            .ui()
-            .status
-            .as_deref()
-            .unwrap()
-            .contains("No such profile"));
+        assert!(
+            c.ui()
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("No such profile")
+        );
     }
 
     #[test]

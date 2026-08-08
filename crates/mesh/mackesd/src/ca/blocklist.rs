@@ -289,6 +289,65 @@ pub fn parse_fingerprint_json(raw: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Public identity facts printed by the authoritative `nebula-cert` parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NebulaPublicIdentity {
+    /// Exact certificate name.
+    pub(crate) name: String,
+    /// Canonical address from the certificate's sole `/17` overlay network.
+    pub(crate) address: String,
+    /// Nebula's lowercase, bare SHA-256 certificate fingerprint.
+    pub(crate) fingerprint: String,
+}
+
+/// Parse one V1 or V2 `nebula-cert print -json` document into the public facts
+/// needed by the live overlay claimant. Multiple certificates, multiple
+/// networks, non-canonical IPv4, a non-`/17` network, and malformed or
+/// placeholder fingerprints fail closed.
+#[must_use]
+pub(crate) fn parse_public_identity_json(raw: &str) -> Option<NebulaPublicIdentity> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let certificate = match value {
+        serde_json::Value::Array(ref certificates) if certificates.len() == 1 => {
+            certificates.first()?
+        }
+        serde_json::Value::Object(_) => &value,
+        _ => return None,
+    };
+    let details = certificate.get("details")?.as_object()?;
+    let name = details.get("name")?.as_str()?;
+    let networks = details
+        .get("ips")
+        .or_else(|| details.get("networks"))?
+        .as_array()?;
+    let [network] = networks.as_slice() else {
+        return None;
+    };
+    let network = network.as_str()?;
+    let (address_text, prefix) = network.split_once('/')?;
+    if prefix != "17" {
+        return None;
+    }
+    let address = address_text.parse::<std::net::Ipv4Addr>().ok()?;
+    if address.to_string() != address_text {
+        return None;
+    }
+    let fingerprint = certificate.get("fingerprint")?.as_str()?;
+    if fingerprint.len() != 64
+        || fingerprint.bytes().all(|byte| byte == b'0')
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    Some(NebulaPublicIdentity {
+        name: name.to_string(),
+        address: address.to_string(),
+        fingerprint: fingerprint.to_string(),
+    })
+}
+
 /// Fingerprint a cert PEM via `nebula-cert print -json` (the only
 /// authoritative source of Nebula's own fingerprint format). `None`
 /// when nebula-cert is unavailable — callers warn loudly (ENT-3 is

@@ -121,6 +121,14 @@ impl AppVmRuntimeEvidence {
                 return Err("invalid App VM runtime identity");
             }
         }
+        // A legacy generation-zero observation is useful for ordinary
+        // readiness compatibility, but it cannot identify which runtime
+        // incarnation owns a reconnect. Requiring an explicit generation here
+        // prevents a delayed pre-generation reconnect report from reopening a
+        // newer session after recovery.
+        if self.generation == 0 && self.state == AppVmRuntimeState::Reconnecting {
+            return Err("reconnecting App VM runtime evidence requires a generation");
+        }
         if self.reason.as_ref().is_some_and(|reason| {
             reason.len() > MAX_APP_VM_FIELD_BYTES || reason.chars().any(char::is_control)
         }) {
@@ -205,7 +213,8 @@ pub enum AppVmLaunchRequestError {
     InvalidField(&'static str),
     /// A field exceeded the bounded wire contract.
     FieldTooLong(&'static str),
-    /// A capability was repeated, blank, or contained a delimiter.
+    /// A capability was repeated, blank, contained a delimiter, or is outside
+    /// the admitted guest policy.
     InvalidCapability,
 }
 
@@ -214,7 +223,9 @@ impl core::fmt::Display for AppVmLaunchRequestError {
         match self {
             Self::InvalidField(field) => write!(f, "invalid App VM field: {field}"),
             Self::FieldTooLong(field) => write!(f, "App VM field exceeds 255 bytes: {field}"),
-            Self::InvalidCapability => f.write_str("invalid or duplicate App VM capability"),
+            Self::InvalidCapability => {
+                f.write_str("invalid, duplicate, or unadmitted App VM capability")
+            }
         }
     }
 }
@@ -278,6 +289,32 @@ impl AppVmLaunchRequest {
             {
                 return Err(AppVmLaunchRequestError::InvalidCapability);
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the request at the App VM admission/session boundary.
+    ///
+    /// [`Self::validate`] checks the bounded wire shape. This stronger check is
+    /// required before a request can become a Workloads/session-rail handoff:
+    /// the app identity must be a reverse-DNS Flatpak identity and every
+    /// capability must belong to the closed guest policy. Keeping this separate
+    /// preserves the ability to parse and report a syntactically valid but
+    /// unadmitted request without treating it as launchable.
+    pub fn validate_admitted(&self) -> Result<(), AppVmLaunchRequestError> {
+        self.validate()?;
+        if !crate::app_catalog::is_valid_flatpak_app_id(&self.app_id) {
+            return Err(AppVmLaunchRequestError::InvalidField("app_id"));
+        }
+        if self.requested_capabilities.len() > crate::cloud::APP_VM_MAX_CAPABILITIES
+            || self
+                .requested_capabilities
+                .iter()
+                .any(|capability| {
+                    !crate::cloud::APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str())
+                })
+        {
+            return Err(AppVmLaunchRequestError::InvalidCapability);
         }
         Ok(())
     }
@@ -543,6 +580,48 @@ mod tests {
     }
 
     #[test]
+    fn app_vm_launch_request_requires_admitted_identity_and_capabilities() {
+        let unadmitted_identity = AppVmLaunchRequest::new(
+            "host-command",
+            "catalog",
+            "wayland-standard",
+            Vec::new(),
+            "session",
+            false,
+        )
+        .expect("identity is syntactically bounded");
+        assert_eq!(
+            unadmitted_identity.validate_admitted(),
+            Err(AppVmLaunchRequestError::InvalidField("app_id"))
+        );
+
+        let unadmitted_capability = AppVmLaunchRequest::new(
+            "org.example.Editor",
+            "catalog",
+            "wayland-standard",
+            vec!["host_socket".into()],
+            "session",
+            false,
+        )
+        .expect("capability is syntactically bounded");
+        assert_eq!(
+            unadmitted_capability.validate_admitted(),
+            Err(AppVmLaunchRequestError::InvalidCapability)
+        );
+
+        let admitted = AppVmLaunchRequest::new(
+            "org.example.Editor",
+            "catalog",
+            "wayland-standard",
+            vec!["audio".into(), "clipboard".into()],
+            "session",
+            true,
+        )
+        .expect("admitted request");
+        assert_eq!(admitted.validate_admitted(), Ok(()));
+    }
+
+    #[test]
     fn app_vm_lifecycle_allows_idempotent_retries_but_rejects_false_jumps() {
         use AppVmLifecycleState::*;
 
@@ -584,6 +663,30 @@ mod tests {
             ..evidence
         };
         assert_eq!(invalid.validate(), Err("invalid App VM runtime identity"));
+    }
+
+    #[test]
+    fn reconnect_runtime_evidence_rejects_legacy_generation_replays() {
+        let legacy_reconnect = AppVmRuntimeEvidence {
+            session_id: "session-1".into(),
+            vm_id: "app-vm-1".into(),
+            app_id: "org.example.Editor".into(),
+            generation: 0,
+            state: AppVmRuntimeState::Reconnecting,
+            reason: Some("transport dropped".into()),
+        };
+        assert_eq!(
+            legacy_reconnect.validate(),
+            Err("reconnecting App VM runtime evidence requires a generation")
+        );
+
+        let numbered_reconnect = AppVmRuntimeEvidence {
+            generation: 1,
+            ..legacy_reconnect
+        };
+        numbered_reconnect
+            .validate()
+            .expect("reconnect evidence must identify its runtime generation");
     }
 
     #[test]

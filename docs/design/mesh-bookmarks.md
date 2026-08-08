@@ -1,7 +1,7 @@
 # Mesh Browser + Bookmarks — synced bookmarks, a sandboxed Servo browser, an ad-blocker service (BOOKMARKS-1..10)
 
 > **Status: LOCKED 2026-07-02** — a 100-question operator survey (+ the earlier core
-> survey), evolved live from a "Vault" brief. A new **`Surface::Bookmarks`** browser in the
+> survey), evolved live from a "Vault" brief. A Browser-owned bookmark panel in the
 > magic-mesh shell: import bookmarks from every major browser, manage them as a
 > mesh-synced CRDT collection, browse the web in an **out-of-process sandboxed Servo
 > engine**, all filtered by a **mesh-wide ad-blocker service**.
@@ -15,6 +15,11 @@
 > - **Carbon Design** for the GUI (via the platform §4 mde-egui `Style` tokens).
 > - Build **all-at-once**, **fleet-wide default-on** at release; Servo **always in the
 >   workspace build**.
+>
+> **Integration pivot 2026-08-07:** the Browser now owns the bookmark/provider panel;
+> there is no separate Bookmark shell surface or standalone bookmark client. The
+> collection, worker, and Bus contracts remain unchanged, with no data migration or
+> legacy route redirect.
 
 ## The locks (grouped)
 
@@ -126,7 +131,7 @@
 | Q45 | **Separate `bookmarks` + `adfilter` mackesd workers** (Syncthing-synced); the Servo helper is a **spawned bin**, not a worker. |
 | Q46 | **Fleet policy** (mesh-wide): per-role browser enable/disable, force ad-blocker on, URL allowlist, custom lists. |
 | Q62 | Policy **enforced by the local worker/launcher** (not just hidden in the UI). |
-| Q63 | Disable → **stop sync + hide surface, retain local data** (re-enable resumes); separate explicit purge. |
+| Q63 | Disable → **stop sync + hide the Browser bookmark panel, retain local data** (re-enable resumes); separate explicit purge. |
 | Q47 | **Leader / Media-style role fetches** filter updates; **failover** to another eligible node. |
 | Q48 | Per-node service state + stats **published to the Workbench fleet view**. |
 | Q78 | Browser is a **local shell surface only** (not injected into VMs); the collection still syncs mesh-wide. |
@@ -155,7 +160,7 @@
 ## Architecture
 
 ```
-Surface::Bookmarks (mde-shell-egui, Carbon §4)          mackesd (mesh tier)
+Browser-owned panel (mde-shell-egui, Carbon §4)         mackesd (mesh tier)
 ┌───────────────────────────────────────────┐          ┌───────────────────────────────┐
 │ folder tree · list · detail/browser pane   │ action/  │ bookmarks worker              │
 │ browser: tabs · addr bar · back/fwd · adblk│ bookmarks│  · UUID/tree/HLC CRDT ops      │
@@ -184,7 +189,7 @@ Surface::Bookmarks (mde-shell-egui, Carbon §4)          mackesd (mesh tier)
 - **BOOKMARKS-3 — importers.** Firefox sqlite (bookmarks only) / Chromium JSON / universal HTML;
   file/dir picker + auto-detect; FF-tags→tags, Chromium-roots→subfolders; normalized dedup;
   idempotent `Imported/<Browser>`. Fixture-tested per format. **No logins/cookies/history.**
-- **BOOKMARKS-4 — Surface::Bookmarks UI (Carbon §4).** Three-region; folder CRUD; manual+sort order;
+- **BOOKMARKS-4 — Browser-owned bookmark panel (Carbon §4).** Three-region; folder CRUD; manual+sort order;
   title+url search; multi-select bulk; DnD; add paths; favicon render; honest error/empty states
   (platform idiom). egui snapshot tests.
 - **BOOKMARKS-5 — the `mde-web-preview` Servo browser (bin).** Interactive Servo (JS-on, tabs, nav,

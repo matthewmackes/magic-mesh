@@ -21,7 +21,7 @@
 //!   - **open-path-in-Files** → [`crate::smart::LaunchRoute::Files`] on the
 //!     existing [`crate::smart::OPEN_TOPIC`] surface-launch path (the widget's own
 //!     [`crate::smart::LaunchBus`]).
-//!   - **open-URL-in-mesh-browser** → [`crate::smart::LaunchRoute::Bookmarks`] on
+//!   - **open-URL-in-mesh-browser** → [`crate::smart::LaunchRoute::Browser`] on
 //!     the same launch path.
 //!   - **new-terminal-here** → the TERM-4/5 pane spawn ([`crate::splits`]),
 //!     inheriting the current pane's cwd (the widget flags it, the split

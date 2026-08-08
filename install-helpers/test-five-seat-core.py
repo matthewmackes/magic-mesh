@@ -44,8 +44,8 @@ def seat_proxy_jump(label: str) -> str | None:
 
 
 SEATS = (
-    SeatSpec("t480", seat_address("t480", "172.20.146.82"), "mm", "password", "sudo-password", seat_proxy_jump("t480")),
-    SeatSpec("eagle", seat_address("eagle", "172.20.146.83"), "mm", "password", "sudo-password", seat_proxy_jump("eagle")),
+    SeatSpec("t480", seat_address("t480", "172.20.146.68"), "mm", "password", "sudo-password", seat_proxy_jump("t480")),
+    SeatSpec("eagle", seat_address("eagle", "172.20.146.88"), "mm", "password", "sudo-password", seat_proxy_jump("eagle")),
     SeatSpec("basement", seat_address("basement", "172.20.0.15"), "root", "key", "root", seat_proxy_jump("basement")),
     SeatSpec("dell", seat_address("dell", "172.20.146.225"), "mm", "key", "sudo-n", seat_proxy_jump("dell")),
     SeatSpec("surface", seat_address("surface", "172.20.146.79"), "root", "password", "root", seat_proxy_jump("surface")),

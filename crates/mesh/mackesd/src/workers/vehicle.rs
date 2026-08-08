@@ -5,7 +5,7 @@
 //! The worker is the mesh-side runner + status publisher for one on-owned-vehicle
 //! gateway. It:
 //!
-//! 1. **Reads three raw sources** through the injectable [`VehicleProbe`] seam
+//! 1. **Reads raw sources** through the injectable [`VehicleProbe`] seam
 //!    (production [`SshHttpProbe`]; tests inject a fake):
 //!    - the GNSS/IMU NMEA blob (`/var/run/omgtime.g.info`, over SSH),
 //!    - the LCI **general** status page (over the authed Tomcat HTTP session),
@@ -14,9 +14,11 @@
 //!    [`parse_gpgga`], IMU via [`parse_psiwmmpu`], and TOLERANT label→value
 //!    extractors over the (tag-stripped) HTML. Anything it cannot extract goes into
 //!    `gaps` (honest-partial, §7) rather than being fabricated.
-//! 3. **Publishes `state/vehicle/<node>`** (latest-wins) on a ~5 s poll that
-//!    doubles as the heartbeat, via [`crate::bus_publish::publish_json`] — exactly
-//!    like the `cloud` worker's mirror publish.
+//! 3. **Publishes `state/vehicle/<node>`** (latest-wins) immediately on change
+//!    and at least every two seconds as a heartbeat. Current LCI/status-beacon
+//!    work and slow GNSS/WAN/application enrichment have independent blocking
+//!    tasks, in-flight gates, and cadences, so enrichment cannot delay a cached
+//!    snapshot's heartbeat or erase fresher current fields.
 //! 4. **Drains `action/vehicle/*` control verbs** off the Bus
 //!    ([`VEHICLE_ACTION_PREFIX`]) and answers each on `reply/<ulid>` with a
 //!    [`VehicleReply`] — `get-config` (a READ that pulls a committed oMG config
@@ -57,7 +59,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -162,6 +164,46 @@ const VEHICLE_REBOOT_AUTH_TARGET: &str = "gateway";
 /// Poll cadence for a fresh MG90 observation. Heartbeats are independent and
 /// use [`ROSTER_HEARTBEAT`] so a slow gateway probe cannot make consumers stale.
 pub const POLL: Duration = Duration::from_secs(5);
+
+/// Slow GNSS/WAN/application enrichment cadence for the production adapter.
+pub const ENRICHMENT_POLL: Duration = Duration::from_secs(10);
+const FAILURE_RETRY_MAX: Duration = Duration::from_secs(60);
+const MAX_INITIAL_PHASE: Duration = Duration::from_millis(250);
+
+/// Spread the first gateway status batch across a small deterministic window.
+/// Later failures use the existing retry ladder; this phase prevents every
+/// configured seat from opening its expensive root-SSH/HTTP path together.
+#[must_use]
+fn initial_phase_for(host: &str, cap: Duration) -> Duration {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in host.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis(
+        (hash % (MAX_INITIAL_PHASE.as_millis() as u64 + 1))
+            .min(cap.as_millis() as u64),
+    )
+}
+
+/// Deadline after which an outstanding enrichment is marked unavailable while
+/// its blocking task remains gated until it actually exits.
+pub const ENRICHMENT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Deadline for one current-status batch. The blocking operation remains
+/// in-flight after this deadline until its bounded transport process exits.
+pub const CURRENT_STATUS_TIMEOUT: Duration = Duration::from_secs(8);
+
+const CURL_CONNECT_TIMEOUT_SECONDS: &str = "2";
+const CURL_MAX_TIME_SECONDS: &str = "6";
+
+/// Root-owned private directory for short-lived MG90 HTTP session jars. `/run`
+/// is the trust boundary: this leaf is created mode 0700 and rejected unless it
+/// is a real directory owned by the daemon's effective uid.
+const HTTP_COOKIE_RUNTIME_DIR: &str = "/run/mackesd-vehicle-http";
+
+const HTTP_COOKIE_RANDOM_BYTES: usize = 16;
+const HTTP_COOKIE_CREATE_ATTEMPTS: usize = 8;
 
 /// The oMG GNSS/IMU NMEA blob the SSH read `cat`s.
 const GPS_INFO_PATH: &str = "/var/run/omgtime.g.info";
@@ -306,16 +348,24 @@ impl SshHttpProbe {
         format!("http://{}/", self.ip)
     }
 
-    /// The per-process cookie jar the single authed session shares across the LCI
-    /// login + page fetches (mirrors the `-c jar -b jar` pattern).
-    fn jar_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("mde-vehicle-cookies-{}.jar", std::process::id()))
+    /// Create one unguessable, exclusive cookie jar in the daemon's private
+    /// runtime directory. Current-status and enrichment may safely run at once.
+    fn cookie_jar(&self) -> io::Result<TemporaryCookieJar> {
+        create_cookie_jar_in(Path::new(HTTP_COOKIE_RUNTIME_DIR))
     }
 
     /// Run `curl` with `args`, returning stdout. An empty `Ok("")` is a legitimate
     /// (empty-page) result; only a spawn failure / non-zero exit is an `Err`.
     fn curl(args: &[&str]) -> io::Result<String> {
-        let out = Command::new("curl").args(args).output()?;
+        let out = Command::new("curl")
+            .args([
+                "--connect-timeout",
+                CURL_CONNECT_TIMEOUT_SECONDS,
+                "--max-time",
+                CURL_MAX_TIME_SECONDS,
+            ])
+            .args(args)
+            .output()?;
         if !out.status.success() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -352,8 +402,8 @@ impl SshHttpProbe {
         auth_prefix: Option<&str>,
         page_url: &str,
     ) -> io::Result<String> {
-        let jar = self.jar_path();
-        let jar_str = jar.display().to_string();
+        let jar = self.cookie_jar()?;
+        let jar_str = jar.path().display().to_string();
         let base = if port == 80 {
             self.base_url()
         } else {
@@ -372,33 +422,35 @@ impl SshHttpProbe {
             format!("{login_base}j_security_check")
         };
         let page = format!("{base}{}", page_url.trim_start_matches('/'));
-        // 1) prime the Tomcat session (sets JSESSIONID in the jar).
-        Self::curl(&["-s", "-c", &jar_str, "-b", &jar_str, "-L", &login_base])?;
-        // 2) FORM auth — follow the 303 back to the app.
-        let mut login_args = vec!["-s", "-c", &jar_str, "-b", &jar_str, "-L"];
-        if app_plane {
-            login_args.extend([
-                "-e",
-                &login_base,
-                "--data-urlencode",
-                "username=admin",
-                "--data-urlencode",
-                "password=admin",
-                "--data-urlencode",
-                "from_page=http://172.20.0.25:11532/",
-            ]);
-        } else {
-            login_args.extend([
-                "--data-urlencode",
-                "j_username=admin",
-                "--data-urlencode",
-                "j_password=admin",
-            ]);
-        }
-        login_args.push(&login);
-        Self::curl(&login_args)?;
-        // 3) the authed page fetch.
-        Self::curl(&["-s", "-b", &jar_str, &page])
+        (|| {
+            // 1) prime the Tomcat session (sets JSESSIONID in the jar).
+            Self::curl(&["-s", "-c", &jar_str, "-b", &jar_str, "-L", &login_base])?;
+            // 2) FORM auth — follow the 303 back to the app.
+            let mut login_args = vec!["-s", "-c", &jar_str, "-b", &jar_str, "-L"];
+            if app_plane {
+                login_args.extend([
+                    "-e",
+                    &login_base,
+                    "--data-urlencode",
+                    "username=admin",
+                    "--data-urlencode",
+                    "password=admin",
+                    "--data-urlencode",
+                    "from_page=http://172.20.0.25:11532/",
+                ]);
+            } else {
+                login_args.extend([
+                    "--data-urlencode",
+                    "j_username=admin",
+                    "--data-urlencode",
+                    "j_password=admin",
+                ]);
+            }
+            login_args.push(&login);
+            Self::curl(&login_args)?;
+            // 3) the authed page fetch.
+            Self::curl(&["-s", "-b", &jar_str, &page])
+        })()
     }
 
     /// Run `remote_cmd` on the gateway over SSH, returning stdout. The oMG SSH host
@@ -472,6 +524,154 @@ impl SshHttpProbe {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+}
+
+/// One exclusively created HTTP cookie jar. The containing directory is private,
+/// and the path is removed whether authentication succeeds or returns early.
+struct TemporaryCookieJar {
+    path: PathBuf,
+}
+
+impl TemporaryCookieJar {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryCookieJar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Open or atomically establish the private cookie directory. The immediate
+/// parent must itself be a non-symlink, same-owner, non-writable trust anchor;
+/// this rejects a redirected `/run` boundary before creating anything.
+fn open_private_cookie_runtime_directory(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let trusted_uid = rustix::process::geteuid().as_raw();
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cookie runtime directory has no parent",
+        )
+    })?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != trusted_uid
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cookie runtime parent is not a trusted private boundary",
+        ));
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cookie runtime path is not a real directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(path) {
+                Ok(()) => {}
+                // The current and enrichment lanes can establish the shared
+                // directory concurrently. Open + validate the winner below.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    let directory: std::fs::File = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?
+    .into();
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != trusted_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cookie runtime directory has untrusted owner or mode",
+        ));
+    }
+    Ok(directory)
+}
+
+fn create_cookie_jar_file(
+    directory: &std::fs::File,
+    runtime_dir: &Path,
+    file_name: &str,
+) -> io::Result<TemporaryCookieJar> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let file: std::fs::File = rustix::fs::openat(
+        directory,
+        file_name,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )?
+    .into();
+    let jar = TemporaryCookieJar {
+        path: runtime_dir.join(file_name),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cookie jar has untrusted owner, type, or mode",
+        ));
+    }
+    drop(file);
+    Ok(jar)
+}
+
+fn create_cookie_jar_in(runtime_dir: &Path) -> io::Result<TemporaryCookieJar> {
+    use rand::RngCore as _;
+
+    let directory = open_private_cookie_runtime_directory(runtime_dir)?;
+    for _ in 0..HTTP_COOKIE_CREATE_ATTEMPTS {
+        let mut random = [0_u8; HTTP_COOKIE_RANDOM_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let file_name = format!(
+            ".mg90-cookie-{}.jar",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        match create_cookie_jar_file(&directory, runtime_dir, &file_name) {
+            Ok(jar) => return Ok(jar),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique MG90 cookie jar",
+    ))
 }
 
 /// Open the password file without following its final path component.
@@ -716,6 +916,13 @@ pub const MAX_VEHICLE_ROSTER_ASSIGNMENTS: usize = 32;
 /// multi-source roster. A slow poll must never make a retained snapshot stale.
 pub const ROSTER_HEARTBEAT: Duration = Duration::from_secs(2);
 
+/// Longest permitted publication heartbeat for a configured gateway.
+///
+/// Consumers expire vehicle domains after three declared intervals, so the
+/// scheduler rejects a slower cadence instead of accepting a plan that can
+/// recreate the historical live/stale flicker.
+pub const MAX_ROSTER_HEARTBEAT: Duration = Duration::from_secs(2);
+
 const MIN_ROSTER_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_ROSTER_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ROSTER_ID_BYTES: usize = 128;
@@ -846,13 +1053,16 @@ impl std::error::Error for VehicleRosterError {}
 
 /// Per-assignment polling and heartbeat cadence.
 ///
-/// `poll` is the full existing [`VehicleWorker`] fold. `heartbeat` only governs
-/// when a previously accepted snapshot may be emitted again; it never authorizes
-/// fabricating a fresh state when no accepted snapshot exists.
+/// The roster and production adapter expose current status, slow enrichment,
+/// and heartbeat as independent lanes. The synchronous [`VehicleWorker::build_state`]
+/// compatibility helper still returns one fully folded snapshot to direct callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VehiclePollPlan {
-    /// Full source poll interval.
+    /// Fast current-status poll interval.
     pub poll: Duration,
+    /// Slow enrichment interval. Enrichment has an independent in-flight gate
+    /// and cannot consume or postpone a status/heartbeat deadline.
+    pub enrichment: Duration,
     /// Independent latest-snapshot heartbeat interval.
     pub heartbeat: Duration,
 }
@@ -860,9 +1070,21 @@ pub struct VehiclePollPlan {
 impl VehiclePollPlan {
     /// Build a plan and reject zero, sub-millisecond, or excessively long periods.
     pub fn new(poll: Duration, heartbeat: Duration) -> Result<Self, VehicleRosterError> {
-        let plan = Self { poll, heartbeat };
+        let plan = Self {
+            poll,
+            enrichment: poll,
+            heartbeat,
+        };
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// Override the slow-enrichment cadence without coupling it to current
+    /// status or heartbeat scheduling.
+    pub fn with_enrichment(mut self, enrichment: Duration) -> Result<Self, VehicleRosterError> {
+        self.enrichment = enrichment;
+        self.validate()?;
+        Ok(self)
     }
 
     /// The compatibility plan for one gateway with an independent heartbeat.
@@ -870,6 +1092,7 @@ impl VehiclePollPlan {
     pub const fn single_gateway(poll: Duration) -> Self {
         Self {
             poll,
+            enrichment: poll,
             heartbeat: ROSTER_HEARTBEAT,
         }
     }
@@ -880,18 +1103,29 @@ impl VehiclePollPlan {
     pub const fn multi_source(poll: Duration) -> Self {
         Self {
             poll,
+            enrichment: poll,
             heartbeat: ROSTER_HEARTBEAT,
         }
     }
 
     fn validate(self) -> Result<(), VehicleRosterError> {
-        for (name, interval) in [("poll", self.poll), ("heartbeat", self.heartbeat)] {
+        for (name, interval) in [
+            ("poll", self.poll),
+            ("enrichment", self.enrichment),
+            ("heartbeat", self.heartbeat),
+        ] {
             if interval < MIN_ROSTER_INTERVAL || interval > MAX_ROSTER_INTERVAL {
                 return Err(VehicleRosterError::InvalidPollPlan(format!(
                     "{name} must be between {:?} and {:?}",
                     MIN_ROSTER_INTERVAL, MAX_ROSTER_INTERVAL
                 )));
             }
+        }
+        if self.heartbeat > MAX_ROSTER_HEARTBEAT {
+            return Err(VehicleRosterError::InvalidPollPlan(format!(
+                "heartbeat must be at most {:?}",
+                MAX_ROSTER_HEARTBEAT
+            )));
         }
         Ok(())
     }
@@ -906,13 +1140,15 @@ impl Default for VehiclePollPlan {
 /// One scheduled action returned by [`VehicleRoster::take_due`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VehicleScheduleKind {
-    /// Run the full real probe fold for the assignment.
-    Poll,
+    /// Read the current status plane for the assignment.
+    CurrentStatus,
     /// Emit the already accepted latest snapshot, if one exists.
     Heartbeat,
+    /// Run slow radio/GNSS/application enrichment independently.
+    Enrichment,
 }
 
-/// A source/manager assignment due for a poll or heartbeat.
+/// A source/manager assignment due for current status, heartbeat, or enrichment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleScheduledWork {
     /// Stable MG90 identity.
@@ -1134,6 +1370,47 @@ impl VehicleRosterSnapshot {
             // id is only a tie-breaker; it never beats a newer observation.
             .then_with(|| self.manager_id.cmp(&other.manager_id))
     }
+
+    fn content_eq(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        for snapshot in [&mut left.snapshot, &mut right.snapshot] {
+            snapshot.sequence = 0;
+            snapshot.observed_at_ms = 0;
+            snapshot.published_at_ms = 0;
+        }
+        left == right
+    }
+}
+
+/// Why an accepted MG90 snapshot is ready for publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehiclePublicationReason {
+    /// The selected accepted snapshot changed semantically.
+    Changed,
+    /// The selected snapshot is unchanged, but its bounded heartbeat is due.
+    Heartbeat,
+}
+
+/// One identity-bound publication selected by [`VehicleRoster`].
+///
+/// The snapshot is cloned exactly from an accepted manager row. Scheduling does
+/// not refresh timestamps, fill absent values, or otherwise manufacture fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VehicleRosterPublication {
+    /// Stable gateway identity.
+    pub source_id: VehicleSourceId,
+    /// Manager whose accepted row won deterministic freshness selection.
+    pub manager_id: String,
+    /// Immediate change or bounded heartbeat.
+    pub reason: VehiclePublicationReason,
+    /// Exact accepted snapshot to publish.
+    pub snapshot: VehicleStateV2,
+}
+
+struct VehiclePublishedState {
+    snapshot: VehicleRosterSnapshot,
+    published_at: Instant,
 }
 
 /// A configured source/manager assignment in the opt-in roster.
@@ -1186,8 +1463,10 @@ impl VehicleRosterSource {
 
 struct VehicleRosterAssignment {
     source: VehicleRosterSource,
-    next_poll: Instant,
+    next_status: Instant,
+    next_enrichment: Instant,
     next_heartbeat: Instant,
+    enrichment_in_flight: bool,
     latest: Option<VehicleRosterSnapshot>,
 }
 
@@ -1202,6 +1481,7 @@ struct VehicleRosterAssignment {
 /// freshest valid one for an MG90 without inventing an offline state.
 pub struct VehicleRoster {
     assignments: BTreeMap<(VehicleSourceId, String), VehicleRosterAssignment>,
+    published: BTreeMap<VehicleSourceId, VehiclePublishedState>,
     started_at: Instant,
 }
 
@@ -1212,6 +1492,7 @@ impl VehicleRoster {
     pub fn new(started_at: Instant) -> Self {
         Self {
             assignments: BTreeMap::new(),
+            published: BTreeMap::new(),
             started_at,
         }
     }
@@ -1261,8 +1542,10 @@ impl VehicleRoster {
             key,
             VehicleRosterAssignment {
                 source,
-                next_poll: self.started_at,
+                next_status: self.started_at,
+                next_enrichment: self.started_at,
                 next_heartbeat: self.started_at,
+                enrichment_in_flight: false,
                 latest: None,
             },
         );
@@ -1287,19 +1570,21 @@ impl VehicleRoster {
         ids
     }
 
-    /// Return all currently due poll/heartbeat work in stable source/manager
-    /// order. Missed intervals coalesce to one next deadline; the roster never
-    /// emits an unbounded catch-up burst.
+    /// Return all currently due status, heartbeat, and enrichment work in stable
+    /// source/manager order. Missed intervals coalesce to one next deadline; the
+    /// roster never emits an unbounded catch-up burst. A dispatched enrichment
+    /// remains in flight until [`Self::finish_enrichment`] is called, but it never
+    /// suppresses current-status or heartbeat work.
     pub fn take_due(&mut self, now: Instant) -> Vec<VehicleScheduledWork> {
         let mut due = Vec::new();
         for assignment in self.assignments.values_mut() {
-            if now >= assignment.next_poll {
+            if now >= assignment.next_status {
                 due.push(VehicleScheduledWork {
                     source_id: assignment.source.source_id.clone(),
                     manager_id: assignment.source.manager_id.clone(),
-                    kind: VehicleScheduleKind::Poll,
+                    kind: VehicleScheduleKind::CurrentStatus,
                 });
-                assignment.next_poll = next_deadline(now, assignment.source.plan.poll);
+                assignment.next_status = next_deadline(now, assignment.source.plan.poll);
             }
             if now >= assignment.next_heartbeat {
                 due.push(VehicleScheduledWork {
@@ -1309,6 +1594,15 @@ impl VehicleRoster {
                 });
                 assignment.next_heartbeat = next_deadline(now, assignment.source.plan.heartbeat);
             }
+            if now >= assignment.next_enrichment && !assignment.enrichment_in_flight {
+                due.push(VehicleScheduledWork {
+                    source_id: assignment.source.source_id.clone(),
+                    manager_id: assignment.source.manager_id.clone(),
+                    kind: VehicleScheduleKind::Enrichment,
+                });
+                assignment.next_enrichment = next_deadline(now, assignment.source.plan.enrichment);
+                assignment.enrichment_in_flight = true;
+            }
         }
         due.sort_by(|a, b| {
             a.source_id
@@ -1317,6 +1611,27 @@ impl VehicleRoster {
                 .then_with(|| a.kind.cmp(&b.kind))
         });
         due
+    }
+
+    /// Release one assignment's enrichment lane after either success or failure.
+    ///
+    /// This method deliberately carries no telemetry. A failed enrichment only
+    /// releases the lane; it cannot erase or synthesize fields in the retained
+    /// current snapshot.
+    pub fn finish_enrichment(
+        &mut self,
+        source_id: &VehicleSourceId,
+        manager_id: &str,
+    ) -> Result<(), VehicleRosterError> {
+        let key = (source_id.clone(), manager_id.to_string());
+        let Some(assignment) = self.assignments.get_mut(&key) else {
+            return Err(VehicleRosterError::UnregisteredAssignment {
+                source_id: source_id.clone(),
+                manager_id: manager_id.to_string(),
+            });
+        };
+        assignment.enrichment_in_flight = false;
+        Ok(())
     }
 
     /// Run one configured local worker poll and retain it only if its confirmed
@@ -1511,6 +1826,61 @@ impl VehicleRoster {
             .collect()
     }
 
+    /// Select change-driven publications plus an unchanged heartbeat no slower
+    /// than each source's configured (and validated) interval.
+    ///
+    /// Multiple managers for one MG90 collapse through [`Self::select_latest`];
+    /// multiple MG90 identities retain independent clocks and are returned in
+    /// stable source-id order. A source with no accepted snapshot emits nothing.
+    pub fn take_publications(&mut self, now: Instant) -> Vec<VehicleRosterPublication> {
+        let mut ready = Vec::new();
+        for source_id in self.source_ids() {
+            let VehicleRosterSelection::Selected(selected) = self.select_latest(&source_id) else {
+                continue;
+            };
+            let heartbeat = self
+                .assignments
+                .iter()
+                .filter(|((candidate, _), _)| candidate == &source_id)
+                .map(|(_, assignment)| assignment.source.plan.heartbeat)
+                .min()
+                .unwrap_or(ROSTER_HEARTBEAT);
+            let reason = match self.published.get(&source_id) {
+                None => Some(VehiclePublicationReason::Changed),
+                Some(previous) if !previous.snapshot.content_eq(&selected) => {
+                    Some(VehiclePublicationReason::Changed)
+                }
+                Some(previous)
+                    if now.saturating_duration_since(previous.published_at) >= heartbeat =>
+                {
+                    Some(VehiclePublicationReason::Heartbeat)
+                }
+                Some(_) => None,
+            };
+
+            if let Some(reason) = reason {
+                self.published.insert(
+                    source_id.clone(),
+                    VehiclePublishedState {
+                        snapshot: selected.clone(),
+                        published_at: now,
+                    },
+                );
+                ready.push(VehicleRosterPublication {
+                    source_id,
+                    manager_id: selected.manager_id.clone(),
+                    reason,
+                    snapshot: selected.snapshot,
+                });
+            } else if let Some(previous) = self.published.get_mut(&source_id) {
+                // Preserve the publication clock while retaining the newest
+                // observation for the next heartbeat.
+                previous.snapshot = selected;
+            }
+        }
+        ready
+    }
+
     /// Select the source snapshot that a heartbeat may repeat. No accepted
     /// snapshot means no publication, even when a heartbeat deadline is due.
     #[must_use]
@@ -1568,6 +1938,14 @@ fn next_deadline(now: Instant, interval: Duration) -> Instant {
     now.checked_add(interval).unwrap_or(now)
 }
 
+fn vehicle_state_content_eq(left: &VehicleState, right: &VehicleState) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.published_at_ms = 0;
+    right.published_at_ms = 0;
+    left == right
+}
+
 fn no_source_reason_from_roster_error(error: VehicleRosterError) -> VehicleNoSourceReason {
     match error {
         VehicleRosterError::IdentityMismatch { reported, .. } => {
@@ -1575,6 +1953,242 @@ fn no_source_reason_from_roster_error(error: VehicleRosterError) -> VehicleNoSou
         }
         _ => VehicleNoSourceReason::NoAcceptedSnapshot,
     }
+}
+
+#[derive(Debug, Clone)]
+struct VehicleCurrentStatusObservation {
+    online: bool,
+    model: Option<String>,
+    esn: Option<String>,
+    mgos_version: Option<String>,
+    battery_v: Option<f32>,
+    internal_temp_c: Option<f32>,
+    ignition_on: Option<bool>,
+    beacon_gps: Option<GpsFix>,
+    gaps: Vec<String>,
+    observed_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct VehicleEnrichmentObservation {
+    gps: Option<GpsFix>,
+    imu: Option<ImuSample>,
+    gps_gaps: Vec<String>,
+    wan: Option<WanStatus>,
+    wan_gaps: Vec<String>,
+    obd_probe_status: DeviceProbeStatus,
+    obd_gaps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VehicleRuntimeSnapshot {
+    host: String,
+    online: bool,
+    model: Option<String>,
+    esn: Option<String>,
+    mgos_version: Option<String>,
+    battery_v: Option<f32>,
+    internal_temp_c: Option<f32>,
+    ignition_on: Option<bool>,
+    beacon_gps: Option<GpsFix>,
+    enrichment_gps: Option<GpsFix>,
+    imu: Option<ImuSample>,
+    wan: Option<WanStatus>,
+    obd_probe_status: DeviceProbeStatus,
+    current_gaps: Vec<String>,
+    gps_gaps: Vec<String>,
+    wan_gaps: Vec<String>,
+    obd_gaps: Vec<String>,
+    observed_at_ms: i64,
+}
+
+impl VehicleRuntimeSnapshot {
+    fn pending(host: &str) -> Self {
+        Self::from_current(
+            host,
+            VehicleCurrentStatusObservation {
+                online: false,
+                model: None,
+                esn: None,
+                mgos_version: None,
+                battery_v: None,
+                internal_temp_c: None,
+                ignition_on: None,
+                beacon_gps: None,
+                gaps: vec!["current status pending".to_string()],
+                observed_at_ms: now_ms(),
+            },
+        )
+    }
+
+    fn from_current(host: &str, current: VehicleCurrentStatusObservation) -> Self {
+        let mut snapshot = Self {
+            host: host.to_string(),
+            online: false,
+            model: None,
+            esn: None,
+            mgos_version: None,
+            battery_v: None,
+            internal_temp_c: None,
+            ignition_on: None,
+            beacon_gps: None,
+            enrichment_gps: None,
+            imu: None,
+            wan: None,
+            obd_probe_status: DeviceProbeStatus::Unknown,
+            current_gaps: Vec::new(),
+            gps_gaps: vec!["gps/imu unavailable (enrichment pending)".to_string()],
+            wan_gaps: vec!["wan status unavailable (enrichment pending)".to_string()],
+            obd_gaps: vec!["OBD enrichment pending".to_string()],
+            observed_at_ms: current.observed_at_ms,
+        };
+        snapshot.apply_current(current);
+        snapshot
+    }
+
+    fn apply_current(&mut self, current: VehicleCurrentStatusObservation) {
+        self.online = current.online;
+        if let Some(value) = current.model {
+            self.model = Some(value);
+        }
+        if let Some(value) = current.esn {
+            self.esn = Some(value);
+        }
+        if let Some(value) = current.mgos_version {
+            self.mgos_version = Some(value);
+        }
+        if let Some(value) = current.battery_v {
+            self.battery_v = Some(value);
+        }
+        if let Some(value) = current.internal_temp_c {
+            self.internal_temp_c = Some(value);
+        }
+        if let Some(value) = current.ignition_on {
+            self.ignition_on = Some(value);
+        }
+        // A status batch owns only its current beacon sample. An absent packet
+        // falls back to retained NMEA enrichment rather than replaying a beacon
+        // as if it had been observed again.
+        self.beacon_gps = current.beacon_gps;
+        self.current_gaps = current.gaps;
+        self.observed_at_ms = current.observed_at_ms;
+    }
+
+    fn apply_enrichment(&mut self, enrichment: VehicleEnrichmentObservation) {
+        if let Some(gps) = enrichment.gps {
+            self.enrichment_gps = Some(gps);
+        }
+        if let Some(imu) = enrichment.imu {
+            self.imu = Some(imu);
+        }
+        if let Some(wan) = enrichment.wan {
+            match self.wan.as_mut() {
+                Some(current) => merge_sourced_wan(current, wan),
+                None => self.wan = Some(wan),
+            }
+        }
+        self.obd_probe_status = enrichment.obd_probe_status;
+        self.gps_gaps = enrichment.gps_gaps;
+        self.wan_gaps = enrichment.wan_gaps;
+        self.obd_gaps = enrichment.obd_gaps;
+    }
+
+    fn mark_enrichment_unavailable(&mut self, reason: &str) {
+        self.gps_gaps = vec![format!("gps/imu unavailable ({reason})")];
+        self.wan_gaps = vec![format!("wan status unavailable ({reason})")];
+        self.obd_gaps = vec![format!("OBD application unavailable ({reason})")];
+        if !matches!(self.obd_probe_status, DeviceProbeStatus::Supported) {
+            self.obd_probe_status = DeviceProbeStatus::Failed {
+                reason: reason.to_string(),
+            };
+        }
+    }
+
+    fn mark_current_unavailable(&mut self, reason: &str) {
+        self.online = false;
+        self.beacon_gps = None;
+        self.current_gaps = vec![format!("current status unavailable ({reason})")];
+        self.observed_at_ms = now_ms();
+    }
+
+    fn render(&self) -> VehicleState {
+        let mut gps = self.enrichment_gps.clone().unwrap_or_default();
+        if let Some(beacon) = self.beacon_gps.clone() {
+            gps = merge_beacon_gps(gps, beacon);
+        }
+        let mut gaps = Vec::with_capacity(
+            self.current_gaps.len()
+                + self.gps_gaps.len()
+                + self.wan_gaps.len()
+                + self.obd_gaps.len(),
+        );
+        gaps.extend(self.current_gaps.iter().cloned());
+        gaps.extend(self.gps_gaps.iter().cloned());
+        gaps.extend(self.wan_gaps.iter().cloned());
+        gaps.extend(self.obd_gaps.iter().cloned());
+        VehicleState {
+            host: self.host.clone(),
+            model: self.model.clone().unwrap_or_default(),
+            esn: self.esn.clone().unwrap_or_default(),
+            mgos_version: self.mgos_version.clone().unwrap_or_default(),
+            online: self.online,
+            gps: gps.clone(),
+            imu: self.imu.clone(),
+            wan: self.wan.clone().unwrap_or_default(),
+            telem: VehicleTelem {
+                battery_v: self.battery_v.unwrap_or_default(),
+                internal_temp_c: self.internal_temp_c.unwrap_or_default(),
+                ignition_on: self.ignition_on.unwrap_or_default(),
+                moving: gps.speed_mph > 0.5,
+                obd_present: self.obd_probe_status.is_supported(),
+                obd_probe_status: self.obd_probe_status.clone(),
+                ..Default::default()
+            },
+            gaps,
+            published_at_ms: self.observed_at_ms,
+        }
+    }
+}
+
+fn merge_sourced_wan(current: &mut WanStatus, observed: WanStatus) {
+    if !observed.active_wan.is_empty() {
+        current.active_wan = observed.active_wan;
+    }
+    if cell_link_has_observation(&observed.cellular_a) {
+        current.cellular_a = observed.cellular_a;
+    }
+    if cell_link_has_observation(&observed.cellular_b) {
+        current.cellular_b = observed.cellular_b;
+    }
+    if !observed.wifi_state.is_empty() {
+        current.wifi_state = observed.wifi_state;
+    }
+    if !observed.ethernet_state.is_empty() {
+        current.ethernet_state = observed.ethernet_state;
+    }
+    if !observed.vpn_state.is_empty() {
+        current.vpn_state = observed.vpn_state;
+    }
+    if observed.failover_events != 0 {
+        current.failover_events = observed.failover_events;
+    }
+    if observed.latency_ms != 0 {
+        current.latency_ms = observed.latency_ms;
+    }
+    if observed.packet_loss_percent != 0.0 {
+        current.packet_loss_percent = observed.packet_loss_percent;
+    }
+    if !observed.link_quality.is_empty() {
+        current.link_quality = observed.link_quality;
+    }
+}
+
+fn cell_link_has_observation(link: &CellLink) -> bool {
+    !link.sim_state.is_empty()
+        || !link.carrier.is_empty()
+        || link.signal_dbm != 0
+        || !link.technology.is_empty()
+        || !link.wan_ip.is_empty()
 }
 
 // ─────────────────────────── the worker ───────────────────────────
@@ -1597,6 +2211,8 @@ pub struct VehicleWorker {
     db_path: PathBuf,
     /// Poll + heartbeat cadence.
     poll: Duration,
+    heartbeat: Duration,
+    current_timeout: Duration,
     /// Per-management-node monotonic v2 snapshot sequence.
     sequence: AtomicU64,
     /// Shared, fail-closed authorization gate for destructive Bus mutations.
@@ -1619,6 +2235,8 @@ impl VehicleWorker {
             bus_root: crate::bus_publish::default_bus_root(),
             db_path: crate::default_db_path(),
             poll: POLL,
+            heartbeat: ROSTER_HEARTBEAT,
+            current_timeout: CURRENT_STATUS_TIMEOUT,
             sequence: AtomicU64::new(0),
             authorizer: Arc::new(ActionAuthorizer::production()),
         }
@@ -1653,6 +2271,34 @@ impl VehicleWorker {
         self
     }
 
+    #[cfg(test)]
+    fn with_heartbeat(mut self, heartbeat: Duration) -> Self {
+        assert!(heartbeat <= MAX_ROSTER_HEARTBEAT);
+        self.heartbeat = heartbeat;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_current_timeout(mut self, timeout: Duration) -> Self {
+        self.current_timeout = timeout;
+        self
+    }
+
+    fn spawn_current_status(
+        &self,
+        probe: Arc<dyn VehicleProbe>,
+    ) -> tokio::task::JoinHandle<VehicleCurrentStatusObservation> {
+        let host = self.host.clone();
+        tokio::task::spawn_blocking(move || Self::probe_current_status(&host, probe.as_ref()))
+    }
+
+    fn spawn_enrichment(
+        &self,
+        probe: Arc<dyn VehicleProbe>,
+    ) -> tokio::task::JoinHandle<VehicleEnrichmentObservation> {
+        tokio::task::spawn_blocking(move || Self::probe_enrichment(probe.as_ref()))
+    }
+
     /// Inject an isolated verifier and replay ledger for hostile action tests.
     #[cfg(test)]
     #[must_use]
@@ -1667,15 +2313,205 @@ impl VehicleWorker {
     /// degrade to a `gaps` note rather than blanking the mirror.
     #[must_use]
     pub fn build_state(&self, probe: &dyn VehicleProbe) -> VehicleState {
+        Self::build_state_for_host(&self.host, probe)
+    }
+
+    fn probe_current_status(
+        host: &str,
+        probe: &dyn VehicleProbe,
+    ) -> VehicleCurrentStatusObservation {
+        let observed_at_ms = now_ms();
+        let general = match probe.read_lci_general() {
+            Ok(general) => general,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mackesd::vehicle",
+                    host = %host,
+                    error = %error,
+                    "vehicle gateway LCI unreachable — retaining sourced fields as offline"
+                );
+                return VehicleCurrentStatusObservation {
+                    online: false,
+                    model: None,
+                    esn: None,
+                    mgos_version: None,
+                    battery_v: None,
+                    internal_temp_c: None,
+                    ignition_on: None,
+                    beacon_gps: None,
+                    gaps: vec!["gateway unreachable".to_string()],
+                    observed_at_ms,
+                };
+            }
+        };
+
+        let mut gaps = Vec::new();
+        let general_text = strip_html(&general);
+        let mut status_beacon = match probe.read_status_beacon() {
+            Ok(Some(raw)) => parse_status_beacon(&raw, &mut gaps),
+            Ok(None) => None,
+            Err(error) => {
+                let reason = if error.kind() == io::ErrorKind::InvalidInput {
+                    "configuration error"
+                } else {
+                    "unavailable"
+                };
+                gaps.push(format!("status broadcast {reason} (udp): {error}"));
+                None
+            }
+        };
+        let esn = find_token_after(&general_text, "ESN");
+        if esn.is_none() {
+            gaps.push("esn not reported by general.html".to_string());
+        }
+        validate_status_beacon_identity(
+            &mut status_beacon,
+            esn.as_deref().unwrap_or_default(),
+            &mut gaps,
+        );
+        let battery_v = status_beacon
+            .as_ref()
+            .and_then(|beacon| beacon.general_information.as_ref())
+            .and_then(|general| general.battery_v)
+            .or_else(|| find_number_after(&general_text, "Main Battery Voltage"));
+        if battery_v.is_none() {
+            gaps.push(
+                "telem.battery_v not reported by MG90 status/general.html or status broadcast"
+                    .to_string(),
+            );
+        }
+        let internal_temp_c = status_beacon
+            .as_ref()
+            .and_then(|beacon| beacon.general_information.as_ref())
+            .and_then(|general| general.internal_temp_c)
+            .or_else(|| find_number_after(&general_text, "Internal Temperature"));
+        if internal_temp_c.is_none() {
+            gaps.push(
+                "telem.internal_temp_c not reported by MG90 status/general.html or status broadcast"
+                    .to_string(),
+            );
+        }
+        let mgos_version = find_token_after(&general_text, "Version");
+        if mgos_version.is_none() {
+            gaps.push("mgos_version not reported by general.html".to_string());
+        }
+        let model = find_token_after(&general_text, "Model");
+        if model.is_none() {
+            gaps.push("model not reported by general.html".to_string());
+        }
+        let ignition_on = status_beacon
+            .as_ref()
+            .and_then(|beacon| beacon.general_information.as_ref())
+            .and_then(|general| general.ignition_on)
+            .or_else(|| parse_ignition_observation(&general_text, &mut gaps));
+        let beacon_gps = status_beacon
+            .as_ref()
+            .and_then(|beacon| status_beacon_gps(beacon, &mut gaps));
+
+        VehicleCurrentStatusObservation {
+            online: true,
+            model,
+            esn,
+            mgos_version,
+            battery_v,
+            internal_temp_c,
+            ignition_on,
+            beacon_gps,
+            gaps,
+            observed_at_ms,
+        }
+    }
+
+    fn probe_enrichment(probe: &dyn VehicleProbe) -> VehicleEnrichmentObservation {
+        let mut gps_gaps = Vec::new();
+        let (gps, imu) = match probe.read_gps_nmea() {
+            Ok(nmea) => {
+                let (gps, imu) = parse_gps_imu(&nmea, &mut gps_gaps);
+                ((!gps.fix_type.is_empty()).then_some(gps), imu)
+            }
+            Err(error) => {
+                gps_gaps.push(format!("gps/imu unavailable (ssh): {error}"));
+                (None, None)
+            }
+        };
+
+        let mut wan_gaps = Vec::new();
+        let wan = match probe.read_lci_wan() {
+            Ok(html) => Some(parse_wan(&html, &mut wan_gaps)),
+            Err(error) => {
+                wan_gaps.push(format!("wan status unavailable (http): {error}"));
+                None
+            }
+        };
+
+        let mut obd_gaps = Vec::new();
+        let obd_probe_status = match probe.read_obd_status() {
+            Ok(Some(raw)) if raw.trim().is_empty() => {
+                obd_gaps.push(
+                    "OBD application returned an empty response; typed OBD telemetry remains unavailable"
+                        .to_string(),
+                );
+                DeviceProbeStatus::Unsupported {
+                    reason: "OBD/HDOBD response schema is not verified".to_string(),
+                }
+            }
+            Ok(Some(_)) => {
+                obd_gaps.push(
+                    "OBD application HTTP response received; payload schema is not verified, so typed OBD telemetry remains unavailable"
+                        .to_string(),
+                );
+                DeviceProbeStatus::Unsupported {
+                    reason: "OBD/HDOBD response schema is not verified".to_string(),
+                }
+            }
+            Ok(None) => {
+                obd_gaps.push(format!(
+                    "OBD not wired; set {OBD_STATUS_PATH_ENV} to /obdii_status/ or /hdobd_status/ for a diagnostic read"
+                ));
+                DeviceProbeStatus::NotInstalled
+            }
+            Err(error) => {
+                let reason = if error.kind() == io::ErrorKind::Unsupported {
+                    "unsupported"
+                } else if error.kind() == io::ErrorKind::InvalidInput {
+                    "configuration error"
+                } else {
+                    "unavailable"
+                };
+                obd_gaps.push(format!("OBD application {reason} (HTTP): {error}"));
+                if error.kind() == io::ErrorKind::Unsupported {
+                    DeviceProbeStatus::Unsupported {
+                        reason: error.to_string(),
+                    }
+                } else {
+                    DeviceProbeStatus::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            }
+        };
+
+        VehicleEnrichmentObservation {
+            gps,
+            imu,
+            gps_gaps,
+            wan,
+            wan_gaps,
+            obd_probe_status,
+            obd_gaps,
+        }
+    }
+
+    fn build_state_for_host(host: &str, probe: &dyn VehicleProbe) -> VehicleState {
         let general = match probe.read_lci_general() {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
                     target: "mackesd::vehicle",
-                    host = %self.host, error = %e,
+                    host = %host, error = %e,
                     "vehicle gateway LCI unreachable — publishing offline mirror"
                 );
-                let mut s = VehicleState::offline(&self.host);
+                let mut s = VehicleState::offline(host);
                 s.published_at_ms = now_ms();
                 return s;
             }
@@ -1823,7 +2659,7 @@ impl VehicleWorker {
         };
 
         VehicleState {
-            host: self.host.clone(),
+            host: host.to_string(),
             model,
             esn,
             mgos_version,
@@ -1926,7 +2762,7 @@ impl VehicleWorker {
     fn publish_heartbeat(&self, observed: &VehicleState) {
         let mut legacy = observed.clone();
         legacy.published_at_ms = now_ms();
-        self.publish_pair(&legacy, observed, ROSTER_HEARTBEAT);
+        self.publish_pair(&legacy, observed, self.heartbeat);
     }
 
     // ─────────────────────── Phase 4 · action/vehicle/* control drain ───────────────────────
@@ -2253,25 +3089,151 @@ impl Worker for VehicleWorker {
         // Seed the action cursors so a (re)start doesn't replay a backlog of verbs.
         let mut cursors: HashMap<String, String> = HashMap::new();
         self.prime_cursors(&mut cursors);
-        // Preserve the existing immediate first observation, then keep polling
-        // and heartbeat deadlines independent. A heartbeat never invokes the
-        // slow gateway probe or refreshes the observation timestamp.
+        // Publish an honest pending snapshot and start the heartbeat before any
+        // potentially blocking gateway operation. A missing ESN withholds only
+        // the v2 identity topic; the legacy current-status lane still heartbeats.
         self.drain_actions(&mut cursors);
-        let mut cached = self.build_state(probe.as_ref());
+        let mut runtime = VehicleRuntimeSnapshot::pending(&self.host);
+        let mut cached = runtime.render();
         self.publish(&cached);
         let now = tokio::time::Instant::now();
-        let mut poll_tick = tokio::time::interval_at(now + self.poll, self.poll);
-        let mut heartbeat_tick = tokio::time::interval_at(now + ROSTER_HEARTBEAT, ROSTER_HEARTBEAT);
+        let phase = initial_phase_for(&self.host, self.poll);
+        let mut current_tick = tokio::time::interval_at(now + phase, self.poll);
+        let mut enrichment_tick = tokio::time::interval_at(now + ENRICHMENT_POLL, ENRICHMENT_POLL);
+        let mut heartbeat_tick = tokio::time::interval_at(now + self.heartbeat, self.heartbeat);
+        current_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        enrichment_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut current_task: Option<tokio::task::JoinHandle<VehicleCurrentStatusObservation>> =
+            None;
+        let mut current_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut current_timed_out = false;
+        let mut current_retry = self.poll;
+        let mut current_not_before: Option<tokio::time::Instant> = None;
+        let mut enrichment_task: Option<tokio::task::JoinHandle<VehicleEnrichmentObservation>> =
+            None;
+        let mut enrichment_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut enrichment_timed_out = false;
         loop {
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
-                _ = poll_tick.tick() => {
+                _ = current_tick.tick() => {
                     self.drain_actions(&mut cursors);
-                    cached = self.build_state(probe.as_ref());
-                    self.publish(&cached);
+                    let retry_ready = current_not_before
+                        .map_or(true, |not_before| tokio::time::Instant::now() >= not_before);
+                    if current_task.is_none() && retry_ready {
+                        current_not_before = None;
+                        current_task = Some(self.spawn_current_status(probe.clone()));
+                        current_deadline =
+                            Some(Box::pin(tokio::time::sleep(self.current_timeout)));
+                        current_timed_out = false;
+                    }
+                }
+                _ = enrichment_tick.tick() => {
+                    if runtime.online && enrichment_task.is_none() {
+                        enrichment_task = Some(self.spawn_enrichment(probe.clone()));
+                        enrichment_deadline = Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
+                        enrichment_timed_out = false;
+                    }
                 }
                 _ = heartbeat_tick.tick() => {
                     self.publish_heartbeat(&cached);
+                }
+                result = async {
+                    current_task.as_mut().expect("guarded current-status task").await
+                }, if current_task.is_some() => {
+                    current_task = None;
+                    current_deadline = None;
+                    if current_timed_out {
+                        current_timed_out = false;
+                    } else {
+                        let healthy = result.as_ref().is_ok_and(|current| current.online);
+                        let was_online = runtime.online;
+                        match result {
+                            Ok(current) => runtime.apply_current(current),
+                            Err(error) => runtime.mark_current_unavailable(
+                                &format!("task failed: {error}")
+                            ),
+                        }
+                        let next = runtime.render();
+                        let changed = !vehicle_state_content_eq(&cached, &next);
+                        cached = next;
+                        if changed {
+                            self.publish(&cached);
+                        }
+                        if !was_online && runtime.online && enrichment_task.is_none() {
+                            enrichment_task = Some(self.spawn_enrichment(probe.clone()));
+                            enrichment_deadline =
+                                Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
+                            enrichment_timed_out = false;
+                        }
+                        if healthy {
+                            current_retry = self.poll;
+                            current_not_before = None;
+                        } else {
+                            current_not_before =
+                                Some(tokio::time::Instant::now() + current_retry);
+                            current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+                        }
+                    }
+                }
+                () = async {
+                    current_deadline
+                        .as_mut()
+                        .expect("guarded current-status deadline")
+                        .as_mut()
+                        .await
+                }, if current_deadline.is_some() => {
+                    current_deadline = None;
+                    current_timed_out = true;
+                    current_not_before = Some(tokio::time::Instant::now() + current_retry);
+                    current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+                    runtime.mark_current_unavailable("current-status timeout");
+                    let next = runtime.render();
+                    let changed = !vehicle_state_content_eq(&cached, &next);
+                    cached = next;
+                    if changed {
+                        self.publish(&cached);
+                    }
+                }
+                result = async {
+                    enrichment_task.as_mut().expect("guarded enrichment task").await
+                }, if enrichment_task.is_some() => {
+                    enrichment_task = None;
+                    enrichment_deadline = None;
+                    if enrichment_timed_out {
+                        enrichment_timed_out = false;
+                    } else {
+                        match result {
+                            Ok(enrichment) => runtime.apply_enrichment(enrichment),
+                            Err(error) => runtime.mark_enrichment_unavailable(
+                                &format!("task failed: {error}")
+                            ),
+                        }
+                        let next = runtime.render();
+                        let changed = !vehicle_state_content_eq(&cached, &next);
+                        cached = next;
+                        if changed {
+                            self.publish(&cached);
+                        }
+                    }
+                }
+                () = async {
+                    enrichment_deadline
+                        .as_mut()
+                        .expect("guarded enrichment deadline")
+                        .as_mut()
+                        .await
+                }, if enrichment_deadline.is_some() => {
+                    enrichment_deadline = None;
+                    enrichment_timed_out = true;
+                    runtime.mark_enrichment_unavailable("enrichment timeout");
+                    let next = runtime.render();
+                    let changed = !vehicle_state_content_eq(&cached, &next);
+                    cached = next;
+                    if changed {
+                        self.publish(&cached);
+                    }
                 }
             }
         }
@@ -2751,21 +3713,25 @@ fn find_token_after(text: &str, label: &str) -> Option<String> {
 /// Fold the authenticated LCI MCU ignition-sense row. Unknown or missing values
 /// remain off and become an explicit gap; the worker never treats reachability or
 /// battery voltage as an ignition signal.
-fn parse_ignition_state(text: &str, gaps: &mut Vec<String>) -> bool {
+fn parse_ignition_observation(text: &str, gaps: &mut Vec<String>) -> Option<bool> {
     let Some(value) = find_token_after(text, "Ignition State") else {
         gaps.push("telem.ignition_on not reported by general.html".to_string());
-        return false;
+        return None;
     };
     match value.to_ascii_lowercase().as_str() {
-        "on" | "true" | "yes" | "active" => true,
-        "off" | "false" | "no" | "inactive" => false,
+        "on" | "true" | "yes" | "active" => Some(true),
+        "off" | "false" | "no" | "inactive" => Some(false),
         other => {
             gaps.push(format!(
                 "unrecognized ignition state in general.html: {other}"
             ));
-            false
+            None
         }
     }
+}
+
+fn parse_ignition_state(text: &str, gaps: &mut Vec<String>) -> bool {
+    parse_ignition_observation(text, gaps).unwrap_or_default()
 }
 
 /// The signed integer immediately preceding the first `dBm` token (e.g. `-72 dBm` ⇒
@@ -2828,6 +3794,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         ssh_out: Result<String, String>,
         ssh_calls: Arc<std::sync::Mutex<Vec<String>>>,
         general_calls: Arc<std::sync::Mutex<u32>>,
+        nmea_calls: Arc<std::sync::Mutex<u32>>,
+        wan_calls: Arc<std::sync::Mutex<u32>>,
+        obd_calls: Arc<std::sync::Mutex<u32>>,
     }
 
     impl FakeProbe {
@@ -2864,6 +3833,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 ssh_out: Ok(FAKE_YAML.to_string()),
                 ssh_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 general_calls: Arc::new(std::sync::Mutex::new(0)),
+                nmea_calls: Arc::new(std::sync::Mutex::new(0)),
+                wan_calls: Arc::new(std::sync::Mutex::new(0)),
+                obd_calls: Arc::new(std::sync::Mutex::new(0)),
             }
         }
 
@@ -2875,6 +3847,14 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         fn general_calls(&self) -> u32 {
             *self.general_calls.lock().unwrap()
         }
+
+        fn enrichment_calls(&self) -> (u32, u32, u32) {
+            (
+                *self.nmea_calls.lock().unwrap(),
+                *self.wan_calls.lock().unwrap(),
+                *self.obd_calls.lock().unwrap(),
+            )
+        }
     }
 
     fn to_io(r: &Result<String, String>) -> io::Result<String> {
@@ -2884,6 +3864,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
 
     impl VehicleProbe for FakeProbe {
         fn read_gps_nmea(&self) -> io::Result<String> {
+            *self.nmea_calls.lock().unwrap() += 1;
             to_io(&self.nmea)
         }
         fn read_lci_general(&self) -> io::Result<String> {
@@ -2891,6 +3872,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             to_io(&self.general)
         }
         fn read_lci_wan(&self) -> io::Result<String> {
+            *self.wan_calls.lock().unwrap() += 1;
             to_io(&self.wan)
         }
         fn read_status_beacon(&self) -> io::Result<Option<String>> {
@@ -2900,6 +3882,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             Ok(self.status.clone())
         }
         fn read_obd_status(&self) -> io::Result<Option<String>> {
+            *self.obd_calls.lock().unwrap() += 1;
             self.obd_status
                 .clone()
                 .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
@@ -2907,6 +3890,58 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         fn run_ssh(&self, cmd: &str) -> io::Result<String> {
             self.ssh_calls.lock().unwrap().push(cmd.to_string());
             to_io(&self.ssh_out)
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingCurrentProbe {
+        inner: FakeProbe,
+        gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl BlockingCurrentProbe {
+        fn new() -> Self {
+            Self {
+                inner: FakeProbe::real(),
+                gate: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            }
+        }
+
+        fn release(&self) {
+            let (lock, wake) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    impl VehicleProbe for BlockingCurrentProbe {
+        fn read_gps_nmea(&self) -> io::Result<String> {
+            self.inner.read_gps_nmea()
+        }
+
+        fn read_lci_general(&self) -> io::Result<String> {
+            let (lock, wake) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.inner.read_lci_general()
+        }
+
+        fn read_lci_wan(&self) -> io::Result<String> {
+            self.inner.read_lci_wan()
+        }
+
+        fn read_status_beacon(&self) -> io::Result<Option<String>> {
+            self.inner.read_status_beacon()
+        }
+
+        fn read_obd_status(&self) -> io::Result<Option<String>> {
+            self.inner.read_obd_status()
+        }
+
+        fn run_ssh(&self, cmd: &str) -> io::Result<String> {
+            self.inner.run_ssh(cmd)
         }
     }
 
@@ -3091,6 +4126,120 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(snapshot.schema_version, 2);
         assert_eq!(snapshot.management_node_id, "rig-1");
         assert_eq!(snapshot.mg90.esn, "ND84720078011035");
+    }
+
+    #[tokio::test]
+    async fn completed_probe_tasks_use_the_parent_publication_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let probe: Arc<dyn VehicleProbe> = Arc::new(FakeProbe::real());
+        let worker = worker().with_bus_root(Some(tmp.path().to_path_buf()));
+
+        let current = worker.spawn_current_status(probe.clone()).await.unwrap();
+        let mut runtime = VehicleRuntimeSnapshot::from_current("rig-1", current);
+        let first = runtime.render();
+        worker.publish(&first);
+        let enrichment = worker.spawn_enrichment(probe).await.unwrap();
+        runtime.apply_enrichment(enrichment);
+        let second = runtime.render();
+        worker.publish(&second);
+
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let topic = vehicle_state_v2_topic("rig-1", "ND84720078011035");
+        let snapshots = persist
+            .list_since(&topic, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                serde_json::from_str::<VehicleStateV2>(message.body.as_deref().unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn delayed_enrichment_cannot_block_or_erase_current_status() {
+        let probe = FakeProbe::real();
+        let current = VehicleWorker::probe_current_status("rig-1", &probe);
+        assert_eq!(
+            probe.enrichment_calls(),
+            (0, 0, 0),
+            "the current-status batch must not enter a slow enrichment method"
+        );
+        let mut runtime = VehicleRuntimeSnapshot::from_current("rig-1", current);
+        let before = runtime.render();
+        assert_eq!(before.esn, "ND84720078011035");
+        assert!((before.telem.battery_v - 12.60).abs() < 0.01);
+
+        // Advancing current status while enrichment remains in flight updates
+        // only sourced current fields.
+        let mut newer_probe = FakeProbe::real();
+        newer_probe.general = newer_probe
+            .general
+            .map(|html| html.replace("12.60v", "13.25v"));
+        runtime.apply_current(VehicleWorker::probe_current_status("rig-1", &newer_probe));
+        runtime.mark_enrichment_unavailable("enrichment timeout");
+        let after = runtime.render();
+
+        assert_eq!(after.esn, before.esn);
+        assert_eq!(after.model, before.model);
+        assert!((after.telem.battery_v - 13.25).abs() < 0.01);
+        assert!(after
+            .gaps
+            .iter()
+            .any(|gap| gap == "gps/imu unavailable (enrichment timeout)"));
+        assert!(after
+            .gaps
+            .iter()
+            .any(|gap| gap == "wan status unavailable (enrichment timeout)"));
+        assert_eq!(newer_probe.enrichment_calls(), (0, 0, 0));
+    }
+
+    #[test]
+    fn failed_enrichment_retains_last_sourced_domains_with_explicit_gaps() {
+        let current_probe = FakeProbe::real();
+        let current = VehicleWorker::probe_current_status("rig-1", &current_probe);
+        let mut runtime = VehicleRuntimeSnapshot::from_current("rig-1", current);
+        runtime.apply_enrichment(VehicleWorker::probe_enrichment(&FakeProbe::real()));
+        let sourced = runtime.render();
+
+        let failed = FakeProbe {
+            nmea: Err("ssh timeout".to_string()),
+            wan: Err("http timeout".to_string()),
+            obd_status: Err("application timeout".to_string()),
+            ..FakeProbe::real()
+        };
+        runtime.apply_enrichment(VehicleWorker::probe_enrichment(&failed));
+        let retained = runtime.render();
+
+        assert_eq!(failed.enrichment_calls(), (1, 1, 1));
+        assert_eq!(retained.gps, sourced.gps);
+        assert_eq!(retained.imu, sourced.imu);
+        assert_eq!(retained.wan, sourced.wan);
+        assert_eq!(retained.esn, sourced.esn);
+        assert_eq!(retained.telem.battery_v, sourced.telem.battery_v);
+        assert!(matches!(
+            retained.telem.obd_probe_status,
+            DeviceProbeStatus::Failed { ref reason } if reason == "application timeout"
+        ));
+        assert!(retained
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("gps/imu unavailable") && gap.contains("ssh timeout")));
+        assert!(retained
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("wan status unavailable") && gap.contains("http timeout")));
+        assert!(retained
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("OBD application unavailable")
+                && gap.contains("application timeout")));
     }
 
     #[test]
@@ -3540,6 +4689,58 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cookie_jar_is_private_exclusive_and_removed_on_drop() {
+        use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("vehicle-http");
+        let jar_path = {
+            let jar = create_cookie_jar_in(&runtime).expect("create private cookie jar");
+            let path = jar.path().to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            path
+        };
+        assert!(
+            !jar_path.exists(),
+            "cookie jar must be removed by the all-path RAII cleanup"
+        );
+
+        let target = tmp.path().join("attacker-target");
+        std::fs::write(&target, b"do not clobber").unwrap();
+        let hostile_name = ".mg90-cookie-hostile.jar";
+        symlink(&target, runtime.join(hostile_name)).unwrap();
+        let directory = open_private_cookie_runtime_directory(&runtime).unwrap();
+        let error = match create_cookie_jar_file(&directory, &runtime, hostile_name) {
+            Ok(_) => panic!("exclusive cookie creation followed a hostile symlink"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not clobber");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cookie_runtime_directory_rejects_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-runtime");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = tmp.path().join("redirected-runtime");
+        symlink(&target, &link).unwrap();
+
+        let error = open_private_cookie_runtime_directory(&link)
+            .err()
+            .expect("symlinked cookie runtime must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
     #[test]
     fn tolerant_extractors_ignore_tags_and_units() {
         let t = strip_html("<td>Main Battery Voltage </td><td> 12.60v</td>");
@@ -3550,6 +4751,15 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         );
         assert_eq!(find_signal_dbm("Signal   -72 dBm"), Some(-72));
         assert!(find_number_after("no number here", "Label").is_none());
+    }
+
+    #[test]
+    fn initial_gateway_phase_is_stable_bounded_and_capped_for_tests() {
+        let phase = initial_phase_for("seat-15", POLL);
+        assert_eq!(phase, initial_phase_for("seat-15", POLL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert!(initial_phase_for("seat-15", Duration::from_millis(10)) <= Duration::from_millis(10));
+        assert_ne!(phase, initial_phase_for("dell-laptop", POLL));
     }
 
     #[tokio::test]
@@ -3564,6 +4774,55 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         tx.send(true).expect("signal shutdown");
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "worker must exit promptly on shutdown");
+        assert!(joined.unwrap().expect("join").is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_continues_while_initial_current_probe_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(BlockingCurrentProbe::new());
+        let mut worker = worker()
+            .with_bus_root(Some(tmp.path().to_path_buf()))
+            .with_probe(probe.clone())
+            .with_poll(Duration::from_millis(10))
+            .with_heartbeat(Duration::from_millis(10))
+            .with_current_timeout(Duration::from_millis(15));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let messages = persist
+            .list_since(&vehicle_state_topic("rig-1"), None)
+            .unwrap();
+        assert!(
+            messages.len() >= 4,
+            "initial pending publication plus independent heartbeats expected, got {}",
+            messages.len()
+        );
+        let states = messages
+            .iter()
+            .map(|message| {
+                serde_json::from_str::<VehicleState>(message.body.as_deref().unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(states.iter().all(|state| !state.online));
+        assert!(states
+            .iter()
+            .any(|state| state.gaps.iter().any(|gap| gap == "current status pending")));
+        assert!(states.iter().any(|state| state
+            .gaps
+            .iter()
+            .any(|gap| { gap == "current status unavailable (current-status timeout)" })));
+
+        probe.release();
+        tx.send(true).expect("signal shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "blocked-probe worker must exit after release"
+        );
         assert!(joined.unwrap().expect("join").is_ok());
     }
 
@@ -3628,7 +4887,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 VehicleRosterSource::remote(
                     source.clone(),
                     "manager-b",
-                    VehiclePollPlan::new(Duration::from_secs(7), Duration::from_secs(3)).unwrap(),
+                    VehiclePollPlan::new(Duration::from_secs(7), ROSTER_HEARTBEAT).unwrap(),
                 )
                 .unwrap(),
             )
@@ -3678,7 +4937,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 VehicleRosterSource::remote(
                     source_b.clone(),
                     "manager-b",
-                    VehiclePollPlan::new(Duration::from_secs(7), Duration::from_secs(3)).unwrap(),
+                    VehiclePollPlan::new(Duration::from_secs(7), ROSTER_HEARTBEAT).unwrap(),
                 )
                 .unwrap(),
             )
@@ -3690,8 +4949,38 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 VehicleScheduledWork {
                     source_id: source_a.clone(),
                     manager_id: "manager-a".to_string(),
-                    kind: VehicleScheduleKind::Poll,
+                    kind: VehicleScheduleKind::CurrentStatus,
                 },
+                VehicleScheduledWork {
+                    source_id: source_a.clone(),
+                    manager_id: "manager-a".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+                VehicleScheduledWork {
+                    source_id: source_a.clone(),
+                    manager_id: "manager-a".to_string(),
+                    kind: VehicleScheduleKind::Enrichment,
+                },
+                VehicleScheduledWork {
+                    source_id: source_b.clone(),
+                    manager_id: "manager-b".to_string(),
+                    kind: VehicleScheduleKind::CurrentStatus,
+                },
+                VehicleScheduledWork {
+                    source_id: source_b.clone(),
+                    manager_id: "manager-b".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+                VehicleScheduledWork {
+                    source_id: source_b.clone(),
+                    manager_id: "manager-b".to_string(),
+                    kind: VehicleScheduleKind::Enrichment,
+                },
+            ]
+        );
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(2)),
+            vec![
                 VehicleScheduledWork {
                     source_id: source_a.clone(),
                     manager_id: "manager-a".to_string(),
@@ -3700,7 +4989,89 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 VehicleScheduledWork {
                     source_id: source_b.clone(),
                     manager_id: "manager-b".to_string(),
-                    kind: VehicleScheduleKind::Poll,
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+            ]
+        );
+        assert!(roster.take_due(t0 + Duration::from_secs(3)).is_empty());
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(4)),
+            vec![
+                VehicleScheduledWork {
+                    source_id: source_a.clone(),
+                    manager_id: "manager-a".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+                VehicleScheduledWork {
+                    source_id: source_b,
+                    manager_id: "manager-b".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+            ]
+        );
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(5)),
+            vec![VehicleScheduledWork {
+                source_id: source_a,
+                manager_id: "manager-a".to_string(),
+                kind: VehicleScheduleKind::CurrentStatus,
+            }]
+        );
+    }
+
+    #[test]
+    fn roster_rejects_a_heartbeat_slower_than_two_seconds() {
+        assert!(matches!(
+            VehiclePollPlan::new(Duration::from_secs(5), Duration::from_millis(2_001)),
+            Err(VehicleRosterError::InvalidPollPlan(detail))
+                if detail.contains("heartbeat must be at most")
+        ));
+    }
+
+    #[test]
+    fn delayed_or_failed_enrichment_does_not_delay_gateway_heartbeats() {
+        let source_a = VehicleSourceId::new("mg90-a").unwrap();
+        let source_b = VehicleSourceId::new("mg90-b").unwrap();
+        let t0 = Instant::now();
+        let plan = VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT)
+            .unwrap()
+            .with_enrichment(Duration::from_secs(30))
+            .unwrap();
+        let mut roster = VehicleRoster::new(t0);
+        for (source, manager) in [(&source_b, "manager-b"), (&source_a, "manager-a")] {
+            roster
+                .register(VehicleRosterSource::remote(source.clone(), manager, plan).unwrap())
+                .unwrap();
+            roster
+                .ingest(roster_snapshot(source, manager, 100, 100, 1))
+                .unwrap();
+        }
+
+        let initial = roster.take_due(t0);
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|work| work.kind == VehicleScheduleKind::Enrichment)
+                .map(|work| work.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mg90-a", "mg90-b"]
+        );
+        assert!(roster
+            .take_publications(t0)
+            .iter()
+            .all(|publication| publication.reason == VehiclePublicationReason::Changed));
+
+        // A remains delayed. B fails and only releases its enrichment lane;
+        // neither outcome is allowed to mutate accepted telemetry.
+        roster.finish_enrichment(&source_b, "manager-b").unwrap();
+        let heartbeat_work = roster.take_due(t0 + ROSTER_HEARTBEAT);
+        assert_eq!(
+            heartbeat_work,
+            vec![
+                VehicleScheduledWork {
+                    source_id: source_a.clone(),
+                    manager_id: "manager-a".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
                 },
                 VehicleScheduledWork {
                     source_id: source_b.clone(),
@@ -3709,38 +5080,78 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 },
             ]
         );
+
+        let publications = roster.take_publications(t0 + ROSTER_HEARTBEAT);
         assert_eq!(
-            roster.take_due(t0 + Duration::from_secs(2)),
-            vec![VehicleScheduledWork {
-                source_id: source_a.clone(),
-                manager_id: "manager-a".to_string(),
-                kind: VehicleScheduleKind::Heartbeat,
-            }]
+            publications
+                .iter()
+                .map(|publication| publication.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mg90-a", "mg90-b"]
+        );
+        assert!(publications
+            .iter()
+            .all(|publication| publication.reason == VehiclePublicationReason::Heartbeat));
+        assert_eq!(
+            publications[0].snapshot.telem,
+            roster_snapshot(&source_a, "manager-a", 100, 100, 1)
+                .snapshot
+                .telem
         );
         assert_eq!(
-            roster.take_due(t0 + Duration::from_secs(3)),
-            vec![VehicleScheduledWork {
-                source_id: source_b.clone(),
-                manager_id: "manager-b".to_string(),
-                kind: VehicleScheduleKind::Heartbeat,
-            }]
+            publications[1].snapshot.telem,
+            roster_snapshot(&source_b, "manager-b", 100, 100, 1)
+                .snapshot
+                .telem
         );
+    }
+
+    #[test]
+    fn gateway_change_and_heartbeat_publication_clocks_are_isolated() {
+        let source_a = VehicleSourceId::new("mg90-a").unwrap();
+        let source_b = VehicleSourceId::new("mg90-b").unwrap();
+        let t0 = Instant::now();
+        let plan = VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT).unwrap();
+        let mut roster = VehicleRoster::new(t0);
+        for (source, manager) in [(&source_b, "manager-b"), (&source_a, "manager-a")] {
+            roster
+                .register(VehicleRosterSource::remote(source.clone(), manager, plan).unwrap())
+                .unwrap();
+            roster
+                .ingest(roster_snapshot(source, manager, 100, 100, 1))
+                .unwrap();
+        }
+
+        let first = roster.take_publications(t0);
         assert_eq!(
-            roster.take_due(t0 + Duration::from_secs(4)),
-            vec![VehicleScheduledWork {
-                source_id: source_a.clone(),
-                manager_id: "manager-a".to_string(),
-                kind: VehicleScheduleKind::Heartbeat,
-            }]
+            first
+                .iter()
+                .map(|publication| publication.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mg90-a", "mg90-b"]
         );
-        assert_eq!(
-            roster.take_due(t0 + Duration::from_secs(5)),
-            vec![VehicleScheduledWork {
-                source_id: source_a,
-                manager_id: "manager-a".to_string(),
-                kind: VehicleScheduleKind::Poll,
-            }]
-        );
+
+        // A has a newer observation with identical reported fields. It refreshes
+        // the retained exact snapshot but does not trigger a false change.
+        let metadata_only_a = roster_snapshot(&source_a, "manager-a", 200, 200, 2);
+        assert!(roster.ingest(metadata_only_a.clone()).unwrap());
+
+        // B changes one real reported field and must publish immediately without
+        // disturbing A's independent heartbeat clock.
+        let mut changed_b = roster_snapshot(&source_b, "manager-b", 200, 200, 2);
+        changed_b.snapshot.telem.ignition_on = !changed_b.snapshot.telem.ignition_on;
+        roster.ingest(changed_b.clone()).unwrap();
+        let changed = roster.take_publications(t0 + Duration::from_secs(1));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].source_id, source_b);
+        assert_eq!(changed[0].reason, VehiclePublicationReason::Changed);
+        assert_eq!(changed[0].snapshot, changed_b.snapshot);
+
+        let heartbeat = roster.take_publications(t0 + ROSTER_HEARTBEAT);
+        assert_eq!(heartbeat.len(), 1);
+        assert_eq!(heartbeat[0].source_id, source_a);
+        assert_eq!(heartbeat[0].reason, VehiclePublicationReason::Heartbeat);
+        assert_eq!(heartbeat[0].snapshot, metadata_only_a.snapshot);
     }
 
     #[test]

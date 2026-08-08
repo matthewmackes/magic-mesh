@@ -20,6 +20,13 @@ OUT="$APP_VM_DIR/out"
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 
+SOURCE_COMMIT="${MCNF_APP_VM_SOURCE_COMMIT:-$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null || true)}"
+
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ "$SOURCE_COMMIT" == 0000000000000000000000000000000000000000 ]]; then
+    echo "FATAL: App VM source provenance is not a non-null 40-character Git revision" >&2
+    exit 2
+fi
+
 usage() {
     cat <<'EOF'
 Usage: packaging/app-vm/build-image.sh [--rpm PATH]... [--base IMAGE]
@@ -33,7 +40,8 @@ selected from catalog data.
 The build is fail-closed: a missing base image is pulled once with a bounded
 timeout, and an unreachable registry exits 3 before podman build starts. A
 successful image build is always passed through verify-image.sh before a disk
-artifact is emitted.
+artifact is emitted. The source revision is recorded in both the image label
+and the guest-readable provenance file.
 EOF
 }
 
@@ -141,12 +149,17 @@ fi
 
 CONTRACT_ID="wayland-standard-v1"
 
-args=(--build-arg "MCNF_RPM_LANE=$LANE")
+args=(
+    --build-arg "MCNF_RPM_LANE=$LANE"
+    --build-arg "MCNF_APP_VM_SOURCE_COMMIT=$SOURCE_COMMIT"
+    --build-arg "MCNF_APP_VM_BASE_IMAGE_ID=$BASE_ID"
+)
 [ -n "$BASE" ] && args+=(--build-arg "APP_VM_BASE=$BASE")
 podman build "${args[@]}" \
     --label "org.mcnf.app-vm.profile=$CONTRACT_ID" \
     --label "org.mcnf.app-vm.base-image=$EFFECTIVE_BASE" \
     --label "org.mcnf.app-vm.base-image-id=$BASE_ID" \
+    --label "org.mcnf.app-vm.source-commit=$SOURCE_COMMIT" \
     -t "$IMAGE" \
     --ignorefile "$APP_VM_DIR/context.containerignore" \
     -f "$CONTAINERFILE" \
@@ -160,12 +173,15 @@ podman build "${args[@]}" \
 IMAGE_ID="$(podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
 IMAGE_PROFILE="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.profile\"}}' "$IMAGE" 2>/dev/null || true)"
 IMAGE_BASE_ID="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.base-image-id\"}}' "$IMAGE" 2>/dev/null || true)"
-if [ -z "$IMAGE_ID" ] || [ "$IMAGE_PROFILE" != "$CONTRACT_ID" ] || [ "$IMAGE_BASE_ID" != "$BASE_ID" ]; then
+IMAGE_SOURCE_COMMIT="$(podman image inspect --format '{{index .Config.Labels \"org.mcnf.app-vm.source-commit\"}}' "$IMAGE" 2>/dev/null || true)"
+if [ -z "$IMAGE_ID" ] || [ "$IMAGE_PROFILE" != "$CONTRACT_ID" ] || \
+   [ "$IMAGE_BASE_ID" != "$BASE_ID" ] || [ "$IMAGE_SOURCE_COMMIT" != "$SOURCE_COMMIT" ]; then
     echo "FATAL: built App VM image failed immutable provenance verification" >&2
     echo "  image_id=$IMAGE_ID profile=$IMAGE_PROFILE base_id=$IMAGE_BASE_ID expected_base_id=$BASE_ID" >&2
+    echo "  source_commit=$IMAGE_SOURCE_COMMIT expected_source_commit=$SOURCE_COMMIT" >&2
     exit 2
 fi
-echo "==> App VM image verified: id=$IMAGE_ID base_id=$BASE_ID profile=$CONTRACT_ID"
+echo "==> App VM image verified: id=$IMAGE_ID base_id=$BASE_ID source_commit=$SOURCE_COMMIT profile=$CONTRACT_ID"
 
 if [ -n "$DISK" ]; then
     resolve_image "$BIB_IMAGE" "bootc-image-builder"

@@ -1,4 +1,9 @@
-# MCNF Worklist — Local-First Red Hat Virtualization and Containers
+# HISTORICAL / SUPERSEDED — Local-First Red Hat Virtualization and Containers
+
+This document is retained as design evidence only. The canonical active
+direction is [`WL-ARCH-010`](../platform/WORKLIST.md#wl-arch-010---make-workloads-the-sole-vmcontainer-runtime-readiness-and-presentation-authority)
+in `docs/platform/WORKLIST.md`. Do not treat this file as an active tracker or
+add new implementation status here.
 
 **Status:** ACTIVE / HARD CUTOVER  
 **Decision date:** 2026-07-16  

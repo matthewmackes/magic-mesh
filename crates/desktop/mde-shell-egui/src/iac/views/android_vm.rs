@@ -61,16 +61,16 @@ fn android_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow
                 state.issue_console_attach(&row.node, &row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
-                state.issue_lifecycle_direct("instance-start", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("instance-start", &row.node, &row.name, row.delivery_type, &row.name);
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_lifecycle_direct("instance-stop", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("instance-stop", &row.node, &row.name, row.delivery_type, &row.name);
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.arm_lifecycle("instance-reboot", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("instance-reboot", &row.node, &row.name, row.delivery_type, &row.name);
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.arm_lifecycle("instance-delete", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("instance-delete", &row.node, &row.name, row.delivery_type, &row.name);
             }
         });
     });
@@ -146,7 +146,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, DeliveryView::AndroidVm.icon(), Style::ICON_S);
+            carbon_icon(ui, DeliveryView::AndroidVm.icon(), Style::ICON_M);
         });
         ui.add_space(Style::SP_XS);
         ui.label(

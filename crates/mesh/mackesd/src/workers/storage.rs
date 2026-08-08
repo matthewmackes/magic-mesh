@@ -54,6 +54,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -63,7 +64,7 @@ use mde_bus::persist::Persist;
 use thiserror::Error;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
-use crate::workers::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
+use crate::workers::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 use super::fs_tools::{
     self, CapabilityRefusal, FsToolRunner, LiveFsTools, ResizeDirection, ResizeTarget,
@@ -529,6 +530,368 @@ impl BlockDevice {
     pub fn partition(&self, name: &str) -> Option<&Partition> {
         self.partitions.iter().find(|p| p.name == name)
     }
+
+    /// Return non-overlapping, MiB-aligned unpartitioned extents. The first
+    /// and last MiB are reserved for partition-table/alignment metadata.
+    /// Malformed or overlapping topology yields no extents (fail closed).
+    #[must_use]
+    pub fn free_extents(&self) -> Vec<FreeExtent> {
+        const GUARD_MIB: u64 = 1;
+        if self.size_mib <= GUARD_MIB.saturating_mul(2) {
+            return Vec::new();
+        }
+        let mut partitions = self.partitions.clone();
+        partitions.sort_by_key(|p| p.start_mib);
+        let mut cursor = GUARD_MIB;
+        let end = self.size_mib.saturating_sub(GUARD_MIB);
+        let mut extents = Vec::new();
+        for partition in partitions {
+            let part_end = partition.start_mib.saturating_add(partition.size_mib);
+            if partition.start_mib < cursor || part_end > end || part_end < partition.start_mib {
+                return Vec::new();
+            }
+            if partition.start_mib > cursor {
+                extents.push(FreeExtent {
+                    start_mib: cursor,
+                    size_mib: partition.start_mib.saturating_sub(cursor),
+                });
+            }
+            cursor = part_end;
+        }
+        if cursor < end {
+            extents.push(FreeExtent {
+                start_mib: cursor,
+                size_mib: end.saturating_sub(cursor),
+            });
+        }
+        extents
+    }
+}
+
+/// One contiguous, unpartitioned MiB-aligned extent on a disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FreeExtent {
+    /// Offset from the beginning of the disk.
+    pub start_mib: u64,
+    /// Length of the extent.
+    pub size_mib: u64,
+}
+
+/// Host role accepted by the workload-storage deployment planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadStorageRole {
+    /// A seated Workstation may offer local workload storage.
+    Workstation,
+    /// A Lighthouse may not host any workload storage.
+    Lighthouse,
+    /// Unknown role data must fail closed.
+    Unknown,
+}
+
+/// The exact, reviewable storage action shown before a destructive Yes/No apply.
+/// This is a preview, not a claim that the disk has already changed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkloadStoragePreview {
+    /// Version of this preview contract.
+    pub schema_version: u16,
+    /// Role observed when the preview was built.
+    pub role: WorkloadStorageRole,
+    /// Whole disk selected by the planner.
+    pub device: String,
+    /// Start offset of the new partition.
+    pub start_mib: u64,
+    /// Size of the new partition.
+    pub size_mib: u64,
+    /// Deterministic partition node expected after creation.
+    pub partition: String,
+    /// The only filesystem offered by the workload pool action.
+    pub filesystem: Filesystem,
+    /// Stable pool label.
+    pub label: String,
+    /// Required host mount point.
+    pub mountpoint: String,
+    /// Container storage subtree below the pool.
+    pub container_subtree: String,
+    /// Typed geometry/format operation presented to the apply worker.
+    pub queue: StorageQueue,
+}
+
+/// Preview contract version.
+pub const WORKLOAD_STORAGE_PREVIEW_SCHEMA_VERSION: u16 = 1;
+/// Stable pool label used by libvirt and Quadlet storage adapters.
+pub const WORKLOAD_STORAGE_POOL_LABEL: &str = "mde-vms";
+/// Host mount point for the workload pool.
+pub const WORKLOAD_STORAGE_MOUNTPOINT: &str = "/var/lib/mde-vms";
+/// Container data subtree below the workload pool.
+pub const WORKLOAD_STORAGE_CONTAINER_SUBTREE: &str = "containers";
+
+/// Return the one managed path used for container state.  Keeping this derived
+/// from the VM-pool mountpoint makes it impossible for the container adapter to
+/// silently select a second host filesystem.
+#[must_use]
+pub fn workload_storage_container_path() -> PathBuf {
+    Path::new(WORKLOAD_STORAGE_MOUNTPOINT).join(WORKLOAD_STORAGE_CONTAINER_SUBTREE)
+}
+
+/// Validate the existing managed workload-pool root and its optional container
+/// child.  The child is optional because the layout creator calls this before
+/// creating it; an existing child must be a real directory, never a symlink or
+/// another special file.
+fn validate_workload_storage_layout(mountpoint: &Path, subtree: &Path) -> Result<(), String> {
+    if !mountpoint.is_absolute() || !subtree.is_absolute() {
+        return Err("workload storage paths must be absolute".into());
+    }
+    let expected_subtree = mountpoint.join(WORKLOAD_STORAGE_CONTAINER_SUBTREE);
+    if subtree != expected_subtree {
+        return Err("container storage path must be the direct managed subtree".into());
+    }
+
+    let parent = mountpoint
+        .parent()
+        .ok_or_else(|| "workload pool mountpoint has no parent".to_string())?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("inspect workload pool parent: {error}"))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err("workload pool parent must be a real directory".into());
+    }
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("canonicalize workload pool parent: {error}"))?;
+    if canonical_parent != parent {
+        return Err("workload pool parent must not contain a symlink".into());
+    }
+
+    let mount_metadata = fs::symlink_metadata(mountpoint)
+        .map_err(|error| format!("inspect workload pool mountpoint: {error}"))?;
+    if mount_metadata.file_type().is_symlink() || !mount_metadata.is_dir() {
+        return Err("workload pool mountpoint must be a real directory".into());
+    }
+
+    match fs::symlink_metadata(subtree) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("container storage subtree must not be a symlink".into())
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            Err("container storage subtree must be a directory".into())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect container storage subtree: {error}")),
+    }
+}
+
+/// Create one managed directory without following a symlink in its parent or
+/// at the directory itself.  `create_dir` (rather than `create_dir_all`) keeps
+/// a race or a missing parent fail closed instead of creating through an
+/// unexpected path.
+fn ensure_managed_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("managed path {} has no parent", path.display()))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("inspect managed path parent {}: {error}", parent.display()))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!(
+            "managed path parent {} must be a real directory",
+            parent.display()
+        ));
+    }
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("canonicalize managed path parent {}: {error}", parent.display()))?;
+    if canonical_parent != parent {
+        return Err(format!(
+            "managed path parent {} must not contain a symlink",
+            parent.display()
+        ));
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("managed path {} must not be a symlink", path.display()))
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            Err(format!("managed path {} must be a directory", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path)
+                .map_err(|create_error| format!("create managed path {}: {create_error}", path.display()))?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                    "managed path {} became a symlink during creation",
+                    path.display()
+                )),
+                Ok(metadata) if !metadata.is_dir() => Err(format!(
+                    "managed path {} is not a directory after creation",
+                    path.display()
+                )),
+                Ok(_) => Ok(()),
+                Err(error) => Err(format!("recheck managed path {}: {error}", path.display())),
+            }
+        }
+        Err(error) => Err(format!("inspect managed path {}: {error}", path.display())),
+    }
+}
+
+/// Why a workload-storage preview was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorkloadStoragePlanError {
+    /// A non-Workstation role cannot host workload storage.
+    #[error("workload storage is allowed only on a Workstation")]
+    IneligibleRole,
+    /// The topology had no disk that met the safety conditions.
+    #[error("no non-removable disk has a contiguous unpartitioned extent of {required_mib} MiB")]
+    NoContiguousExtent {
+        /// Minimum contiguous extent requested by the plan.
+        required_mib: u64,
+    },
+    /// The requested amount was not meaningful.
+    #[error("workload storage size must be greater than zero")]
+    InvalidSize,
+    /// Auto-creating a table is a separate explicitly reviewed operation.
+    #[error("device {device} has no partition table; create-table requires a separate explicit review")]
+    NoPartitionTable {
+        /// Device that lacks a partition table.
+        device: String,
+    },
+}
+
+/// Return the canonical partition node for a whole-disk device and number.
+#[must_use]
+pub fn partition_device_name(device: &str, number: u32) -> String {
+    let base = device.rsplit('/').next().unwrap_or(device);
+    let separator = base.chars().last().is_some_and(|c| c.is_ascii_digit())
+        || base.starts_with("mmcblk")
+        || base.starts_with("nvme")
+        || base.starts_with("loop")
+        || base.starts_with("nbd")
+        || base.starts_with("md");
+    if separator {
+        format!("{device}p{number}")
+    } else {
+        format!("{device}{number}")
+    }
+}
+
+/// Build a fail-closed workload-pool preview from a live topology.
+///
+/// The planner never selects removable media, a disk without a partition table,
+/// a non-Workstation role, or a merely-total (but non-contiguous) free amount.
+/// Existing partitions are not modified; the queue contains one new XFS
+/// partition with a stable label.
+pub fn preview_workload_storage(
+    topology: &Topology,
+    role: WorkloadStorageRole,
+    required_mib: u64,
+) -> Result<WorkloadStoragePreview, WorkloadStoragePlanError> {
+    if !matches!(role, WorkloadStorageRole::Workstation) {
+        return Err(WorkloadStoragePlanError::IneligibleRole);
+    }
+    if required_mib == 0 {
+        return Err(WorkloadStoragePlanError::InvalidSize);
+    }
+    for disk in &topology.devices {
+        if disk.removable || disk.table.is_none() {
+            continue;
+        }
+        let Some(extent) = disk
+            .free_extents()
+            .into_iter()
+            .find(|extent| extent.size_mib >= required_mib)
+        else {
+            continue;
+        };
+        let number = disk
+            .partitions
+            .iter()
+            .map(|partition| partition.number)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let partition = partition_device_name(&disk.name, number);
+        let queue = StorageQueue::new(vec![StorageOp::CreatePartition {
+            device: disk.name.clone(),
+            start_mib: extent.start_mib,
+            size_mib: required_mib,
+            filesystem: Some(Filesystem::Xfs),
+            label: Some(WORKLOAD_STORAGE_POOL_LABEL.to_string()),
+        }]);
+        return Ok(WorkloadStoragePreview {
+            schema_version: WORKLOAD_STORAGE_PREVIEW_SCHEMA_VERSION,
+            role,
+            device: disk.name.clone(),
+            start_mib: extent.start_mib,
+            size_mib: required_mib,
+            partition,
+            filesystem: Filesystem::Xfs,
+            label: WORKLOAD_STORAGE_POOL_LABEL.to_string(),
+            mountpoint: WORKLOAD_STORAGE_MOUNTPOINT.to_string(),
+            container_subtree: WORKLOAD_STORAGE_CONTAINER_SUBTREE.to_string(),
+            queue,
+        });
+    }
+    Err(WorkloadStoragePlanError::NoContiguousExtent { required_mib })
+}
+
+/// Revalidate a displayed preview against a fresh topology before apply.
+pub fn validate_workload_storage_preview(
+    preview: &WorkloadStoragePreview,
+    topology: &Topology,
+) -> Result<(), WorkloadStoragePlanError> {
+    if preview.schema_version != WORKLOAD_STORAGE_PREVIEW_SCHEMA_VERSION
+        || !matches!(preview.role, WorkloadStorageRole::Workstation)
+    {
+        return Err(WorkloadStoragePlanError::IneligibleRole);
+    }
+    let Some(disk) = topology.device(&preview.device) else {
+        return Err(WorkloadStoragePlanError::NoContiguousExtent {
+            required_mib: preview.size_mib,
+        });
+    };
+    if disk.removable {
+        return Err(WorkloadStoragePlanError::NoContiguousExtent {
+            required_mib: preview.size_mib,
+        });
+    }
+    if disk.table.is_none() {
+        return Err(WorkloadStoragePlanError::NoPartitionTable {
+            device: preview.device.clone(),
+        });
+    }
+    let Some(extent) = disk.free_extents().into_iter().find(|extent| {
+        extent.start_mib == preview.start_mib && extent.size_mib >= preview.size_mib
+    }) else {
+        return Err(WorkloadStoragePlanError::NoContiguousExtent {
+            required_mib: preview.size_mib,
+        });
+    };
+    let next_number = disk
+        .partitions
+        .iter()
+        .map(|partition| partition.number)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let expected_queue = vec![StorageOp::CreatePartition {
+        device: preview.device.clone(),
+        start_mib: preview.start_mib,
+        size_mib: preview.size_mib,
+        filesystem: Some(Filesystem::Xfs),
+        label: Some(WORKLOAD_STORAGE_POOL_LABEL.to_string()),
+    }];
+    if preview.partition != partition_device_name(&disk.name, next_number)
+        || preview.filesystem != Filesystem::Xfs
+        || preview.label != WORKLOAD_STORAGE_POOL_LABEL
+        || preview.mountpoint != WORKLOAD_STORAGE_MOUNTPOINT
+        || preview.container_subtree != WORKLOAD_STORAGE_CONTAINER_SUBTREE
+        || preview.queue.ops != expected_queue
+        || extent.size_mib < preview.size_mib
+    {
+        return Err(WorkloadStoragePlanError::NoContiguousExtent {
+            required_mib: preview.size_mib,
+        });
+    }
+    Ok(())
 }
 
 /// The live block-device topology — the model the mirror publishes and the queue validates against.
@@ -681,14 +1044,17 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
                     device: device.clone(),
                 });
             }
-            let _ = start_mib; // start offset is executor-validated at sector level
-            let free = disk.free_mib();
-            // Advisory MiB math (the executor does the authoritative sector math).
-            if *size_mib > free {
+            let fits_contiguous = disk.free_extents().into_iter().any(|extent| {
+                *start_mib >= extent.start_mib
+                    && *size_mib <= extent.size_mib
+                    && start_mib.saturating_add(*size_mib)
+                        <= extent.start_mib.saturating_add(extent.size_mib)
+            });
+            if !fits_contiguous {
                 return Err(OpInvalid::NotEnoughSpace {
                     device: device.clone(),
                     need_mib: *size_mib,
-                    free_mib: free,
+                    free_mib: disk.free_mib(),
                 });
             }
             Ok(())
@@ -1301,7 +1667,7 @@ impl ComputeInUseProbe {
     }
 
     /// Snapshot the in-use disks via virsh/podman, or `None` when neither tool is
-    /// usable (⇒ assume-in-use). Reuses [`super::compute_registry`]'s parsers so
+    /// usable (⇒ assume-in-use). Reuses [`super::runtime_probe`]'s parsers so
     /// there's no parallel model. Best-effort + bounded (EFF-20 timeout).
     fn snapshot(&self) -> Option<InUseSnapshot> {
         let _ = self;
@@ -1312,9 +1678,9 @@ impl ComputeInUseProbe {
         // ── virsh: running domains → their first disk source path ──
         if let Some(uuids) = virsh_output(&["list", "--state-running", "--uuid"]) {
             any_tool = true;
-            for uuid in super::compute_registry::parse_virsh_uuid_list(&uuids) {
+            for uuid in super::runtime_probe::parse_virsh_uuid_list(&uuids) {
                 if let Some(blk) = virsh_output(&["domblklist", "--details", &uuid]) {
-                    if let Some(src) = super::compute_registry::parse_virsh_domblklist(&blk) {
+                    if let Some(src) = super::runtime_probe::parse_virsh_domblklist(&blk) {
                         let name = virsh_output(&["domname", &uuid])
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
@@ -1329,7 +1695,7 @@ impl ComputeInUseProbe {
         if let Some(json) = podman_output(&["ps", "--format", "json", "--filter", "status=running"])
         {
             any_tool = true;
-            for c in super::compute_registry::parse_podman_ps_json(&json) {
+            for c in super::runtime_probe::parse_podman_ps_json(&json) {
                 if let Some(mounts) = podman_output(&[
                     "inspect",
                     "--format",
@@ -1500,6 +1866,19 @@ pub fn resolve_context(op: &StorageOp, live: &Topology) -> OpContext {
     if let StorageOp::Format { filesystem, .. } = op {
         ctx.filesystem = Some(*filesystem);
     }
+    if let StorageOp::CreatePartition { device, .. } = op {
+        if let Some(disk) = live.device(device) {
+            ctx.disk = Some(disk.name.clone());
+            ctx.number = disk
+                .partitions
+                .iter()
+                .map(|partition| partition.number)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+        }
+        return ctx;
+    }
     let Some(part_name) = op.partition() else {
         return ctx;
     };
@@ -1570,6 +1949,263 @@ pub trait StorageExecutor: Send + Sync {
     fn apply(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError>;
 }
 
+/// Injectable geometry backend. The production implementation invokes the
+/// bounded parted/xfsprogs/mount verbs without a shell; tests can record calls.
+pub trait GeometryToolRunner: Send + Sync {
+    /// Apply one partition-table or mount operation.
+    fn apply(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError>;
+}
+
+/// Production geometry backend for the explicitly previewed storage action.
+#[derive(Clone, Default)]
+pub struct LiveGeometryTools;
+
+impl LiveGeometryTools {
+    fn command_status(command: Command, op: &StorageOp) -> Result<(), StorageError> {
+        let status = status_with_timeout(command, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+            StorageError::OpFailed {
+                op: op.kind(),
+                reason: format!("geometry command failed to start: {error}"),
+            }
+        })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(StorageError::OpFailed {
+                op: op.kind(),
+                reason: format!("geometry command exited with {status}"),
+            })
+        }
+    }
+
+    fn parted(op: &StorageOp, args: &[String]) -> Result<(), StorageError> {
+        let mut command = Command::new("parted");
+        command.arg("--script");
+        command.args(args);
+        Self::command_status(command, op)
+    }
+}
+
+impl GeometryToolRunner for LiveGeometryTools {
+    fn apply(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError> {
+        match op {
+            StorageOp::CreateTable { device, table } => {
+                Self::parted(op, &[device.clone(), "mklabel".into(), table.as_str().into()])
+            }
+            StorageOp::CreatePartition {
+                device,
+                start_mib,
+                size_mib,
+                filesystem,
+                label,
+            } => {
+                let end_mib = start_mib.saturating_add(*size_mib);
+                Self::parted(
+                    op,
+                    &[
+                        device.clone(),
+                        "mkpart".into(),
+                        "primary".into(),
+                        filesystem.map_or_else(|| "none".into(), |fs| fs.as_str().into()),
+                        format!("{start_mib}MiB"),
+                        format!("{end_mib}MiB"),
+                    ],
+                )?;
+                if let Some(filesystem) = filesystem {
+                    let partition = partition_device_name(device, ctx.number);
+                    let mut mkfs = Command::new(format!("mkfs.{}", filesystem.as_str()));
+                    mkfs.arg("-f");
+                    if let Some(label) = label {
+                        mkfs.args(["-L", label]);
+                    }
+                    mkfs.arg(partition);
+                    Self::command_status(mkfs, op)?;
+                }
+                Ok(())
+            }
+            StorageOp::DeletePartition { partition: _ } => {
+                let disk = ctx.disk.as_deref().ok_or_else(|| StorageError::OpFailed {
+                    op: op.kind(),
+                    reason: "partition parent disk unresolved".into(),
+                })?;
+                Self::parted(
+                    op,
+                    &[disk.into(), "rm".into(), ctx.number.to_string()],
+                )
+            }
+            StorageOp::SetFlags { flags, .. } => {
+                let disk = ctx.disk.as_deref().ok_or_else(|| StorageError::OpFailed {
+                    op: op.kind(),
+                    reason: "partition parent disk unresolved".into(),
+                })?;
+                for flag in flags {
+                    Self::parted(
+                        op,
+                        &[
+                            disk.into(),
+                            "set".into(),
+                            ctx.number.to_string(),
+                            flag.clone(),
+                            "on".into(),
+                        ],
+                    )?;
+                }
+                Ok(())
+            }
+            StorageOp::Mount {
+                partition,
+                mountpoint,
+            } => {
+                let mut command = Command::new("mount");
+                command.args([partition, mountpoint]);
+                Self::command_status(command, op)
+            }
+            StorageOp::Unmount { partition } => {
+                let mut command = Command::new("umount");
+                command.arg(partition);
+                Self::command_status(command, op)
+            }
+            StorageOp::Move { .. } => Err(StorageError::IntegrationGated(
+                "partition move requires an explicit offline relocation plan".into(),
+            )),
+            StorageOp::Format { .. }
+            | StorageOp::SetLabel { .. }
+            | StorageOp::Grow { .. }
+            | StorageOp::Shrink { .. }
+            | StorageOp::LuksFormat { .. }
+            | StorageOp::LuksOpen { .. }
+            | StorageOp::LuksClose { .. }
+            | StorageOp::SubvolumeCreate { .. }
+            | StorageOp::SubvolumeDelete { .. }
+            | StorageOp::SubvolumeSnapshot { .. } => Err(StorageError::IntegrationGated(
+                "non-geometry operation sent to geometry backend".into(),
+            )),
+        }
+    }
+}
+
+/// Apply the post-partition layout for the one approved workload-pool plan.
+/// This is deliberately separate from the generic queue because the new
+/// partition is not present in the pre-apply topology: the partition queue is
+/// authoritative first, then this exact derived mount/subtree/SELinux action
+/// runs with the same bounded command policy. No caller can redirect it to an
+/// arbitrary path or existing partition.
+pub fn configure_workload_pool_layout(
+    queue: &StorageQueue,
+    staged: &Topology,
+) -> Result<(), StorageError> {
+    if queue.ops.len() != 1 {
+        return Ok(());
+    }
+    let StorageOp::CreatePartition {
+        device,
+        filesystem: Some(Filesystem::Xfs),
+        label: Some(label),
+        ..
+    } = &queue.ops[0]
+    else {
+        return Ok(());
+    };
+    if label != WORKLOAD_STORAGE_POOL_LABEL {
+        return Ok(());
+    }
+    let disk = staged.device(device).ok_or_else(|| StorageError::OpFailed {
+        op: "create_partition",
+        reason: format!("workload pool source disk {device} disappeared before layout"),
+    })?;
+    let number = disk
+        .partitions
+        .iter()
+        .map(|partition| partition.number)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let partition = partition_device_name(device, number);
+    let mountpoint = Path::new(WORKLOAD_STORAGE_MOUNTPOINT);
+    let subtree = workload_storage_container_path();
+    ensure_managed_directory(mountpoint).map_err(|reason| StorageError::OpFailed {
+        op: "mount_workload_pool",
+        reason,
+    })?;
+    validate_workload_storage_layout(mountpoint, &subtree).map_err(|reason| {
+        StorageError::OpFailed {
+            op: "mount_workload_pool",
+            reason,
+        }
+    })?;
+    let mountpoint_string = mountpoint.to_string_lossy().into_owned();
+    let mut mount = Command::new("mount");
+    mount.args([partition.as_str(), mountpoint_string.as_str()]);
+    let mount_status = status_with_timeout(mount, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+        StorageError::OpFailed {
+            op: "mount_workload_pool",
+            reason: format!("mount workload pool failed to start: {error}"),
+        }
+    })?;
+    if !mount_status.success() {
+        return Err(StorageError::OpFailed {
+            op: "mount_workload_pool",
+            reason: format!("mount workload pool exited with {mount_status}"),
+        });
+    }
+    validate_workload_storage_layout(mountpoint, &subtree).map_err(|reason| {
+        StorageError::OpFailed {
+            op: "create_workload_subtree",
+            reason,
+        }
+    })?;
+    ensure_managed_directory(&subtree).map_err(|reason| StorageError::OpFailed {
+        op: "create_workload_subtree",
+        reason,
+    })?;
+    let rules = [
+        (mountpoint, "virt_image_t"),
+        (subtree.as_path(), "container_file_t"),
+    ];
+    for (path, context) in rules {
+        let pattern = format!("{}(/.*)?", path.display());
+        let mut modify = Command::new("semanage");
+        modify.args(["fcontext", "-m", "-t", context, &pattern]);
+        let modify_status = status_with_timeout(modify, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+            StorageError::OpFailed {
+                op: "label_workload_pool",
+                reason: format!("SELinux fcontext update failed to start: {error}"),
+            }
+        })?;
+        if !modify_status.success() {
+            let mut add = Command::new("semanage");
+            add.args(["fcontext", "-a", "-t", context, &pattern]);
+            let add_status = status_with_timeout(add, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                StorageError::OpFailed {
+                    op: "label_workload_pool",
+                    reason: format!("SELinux fcontext add failed to start: {error}"),
+                }
+            })?;
+            if !add_status.success() {
+                return Err(StorageError::OpFailed {
+                    op: "label_workload_pool",
+                    reason: format!("SELinux fcontext rule rejected for {}", path.display()),
+                });
+            }
+        }
+    }
+    let mut restore = Command::new("restorecon");
+    restore.args(["-RF", mountpoint_string.as_str()]);
+    let restore_status = status_with_timeout(restore, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+        StorageError::OpFailed {
+            op: "restore_workload_pool",
+            reason: format!("restorecon failed to start: {error}"),
+        }
+    })?;
+    if !restore_status.success() {
+        return Err(StorageError::OpFailed {
+            op: "restore_workload_pool",
+            reason: format!("restorecon exited with {restore_status}"),
+        });
+    }
+    Ok(())
+}
+
 /// Production [`StorageExecutor`]: the per-fs tooling + shrink/move choreography over
 /// the injectable [`FsToolRunner`] (production [`LiveFsTools`] shells the real tools).
 ///
@@ -1582,6 +2218,7 @@ pub trait StorageExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct UDisks2Executor {
     tools: Arc<dyn FsToolRunner>,
+    geometry: Arc<dyn GeometryToolRunner>,
 }
 
 impl Default for UDisks2Executor {
@@ -1594,26 +2231,27 @@ impl UDisks2Executor {
     /// The production executor over the live fs tooling.
     #[must_use]
     pub fn new() -> Self {
+        let tools: Arc<dyn FsToolRunner> = Arc::new(LiveFsTools::new());
         Self {
-            tools: Arc::new(LiveFsTools::new()),
+            tools,
+            geometry: Arc::new(LiveGeometryTools),
         }
     }
 
     /// Inject the fs-tool runner (tests).
     #[must_use]
     pub fn with_tools(tools: Arc<dyn FsToolRunner>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            geometry: Arc::new(LiveGeometryTools),
+        }
     }
 
-    /// A parted geometry op this fs-depth slice doesn't wire — a typed honest gate.
-    fn gated_geometry(op: &StorageOp) -> StorageError {
-        StorageError::IntegrationGated(format!(
-            "{} → partition-table geometry (create/delete table+partition, flags, \
-             mount/unmount, move) is UDisks2/parted work outside the E12-23 fs-depth \
-             slice; the filesystem/LUKS/subvolume verbs + the shrink/move \
-             choreography are live",
-            op.kind()
-        ))
+    /// Inject a geometry runner for tests or a future native UDisks2 adapter.
+    #[must_use]
+    pub fn with_geometry_tools(mut self, geometry: Arc<dyn GeometryToolRunner>) -> Self {
+        self.geometry = geometry;
+        self
     }
 
     /// Run a resize choreography (lock 4) through the tool runner, mapping a
@@ -1732,14 +2370,14 @@ impl StorageExecutor for UDisks2Executor {
             StorageOp::SubvolumeCreate { .. }
             | StorageOp::SubvolumeDelete { .. }
             | StorageOp::SubvolumeSnapshot { .. } => self.apply_subvolume(op, ctx),
-            // ── partition-table geometry: outside this fs-depth slice ──
+            // ── typed parted/xfsprogs geometry ──
             StorageOp::CreateTable { .. }
             | StorageOp::CreatePartition { .. }
             | StorageOp::DeletePartition { .. }
             | StorageOp::SetFlags { .. }
             | StorageOp::Mount { .. }
             | StorageOp::Unmount { .. }
-            | StorageOp::Move { .. } => Err(Self::gated_geometry(op)),
+            | StorageOp::Move { .. } => self.geometry.apply(op, ctx),
         }
     }
 }
@@ -2601,13 +3239,13 @@ impl StorageWorker {
         let interlocks = Arc::clone(&self.interlocks);
         let executor = Arc::clone(&self.executor);
         let progress_bus_root = bus_root.map(Path::to_path_buf);
-        let staged = staged.clone();
-        let queue = queue.clone();
+        let staged_for_apply = staged.clone();
+        let queue_for_apply = queue.clone();
         let live_for_apply = live;
         let outcome = tokio::task::spawn_blocking(move || {
             apply_queue(
-                &queue,
-                &staged,
+                &queue_for_apply,
+                &staged_for_apply,
                 &live_for_apply,
                 &interlocks,
                 &*executor,
@@ -2618,7 +3256,7 @@ impl StorageWorker {
                             device: dev.clone(),
                             op_index: idx,
                             total,
-                            op_kind: queue_op_kind(&queue, idx),
+                            op_kind: queue_op_kind(&queue_for_apply, idx),
                             state,
                             published_at_ms: now_ms(),
                         };
@@ -2636,6 +3274,17 @@ impl StorageWorker {
                         "ALERT (warn): storage queue on {device} halted at op {:?} ({} applied)",
                         o.halted_at, o.applied
                     );
+                } else if o.applied > 0 {
+                    // The generic queue creates and formats the exact new XFS
+                    // partition. Only that reviewed workload-pool shape gets
+                    // the derived mount/subtree/SELinux layout; arbitrary
+                    // storage queues never gain these privileged side effects.
+                    if let Err(error) = configure_workload_pool_layout(&queue, &staged) {
+                        tracing::warn!(
+                            target: "mackesd::alert",
+                            "ALERT (warn): workload pool layout incomplete — {error}"
+                        );
+                    }
                 }
                 o.applied > 0
             }
@@ -2847,6 +3496,155 @@ mod tests {
         assert_eq!(d.free_mib(), 90 * 1024);
     }
 
+    #[test]
+    fn free_extents_are_contiguous_not_total_free() {
+        let disk = BlockDevice {
+            name: "/dev/nvme0n1".into(),
+            size_mib: 10_000,
+            table: Some(PartitionTable::Gpt),
+            removable: false,
+            partitions: vec![
+                part("/dev/nvme0n1p1", 1, 1, 4_000),
+                part("/dev/nvme0n1p2", 2, 6_000, 3_000),
+            ],
+        };
+        assert_eq!(
+            disk.free_extents(),
+            vec![
+                FreeExtent {
+                    start_mib: 4_001,
+                    size_mib: 1_999
+                },
+                FreeExtent {
+                    start_mib: 9_000,
+                    size_mib: 999
+                }
+            ]
+        );
+        assert!(disk.free_extents().iter().all(|e| e.size_mib < 2_500));
+    }
+
+    #[test]
+    fn workload_storage_preview_is_workstation_only_and_rechecks_exact_extent() {
+        let topo = Topology::new(vec![BlockDevice {
+            name: "/dev/nvme0n1".into(),
+            size_mib: 20_000,
+            table: Some(PartitionTable::Gpt),
+            removable: false,
+            partitions: vec![part("/dev/nvme0n1p1", 1, 1, 5_000)],
+        }]);
+        let preview = preview_workload_storage(
+            &topo,
+            WorkloadStorageRole::Workstation,
+            8_000,
+        )
+        .expect("contiguous non-removable extent");
+        assert_eq!(preview.device, "/dev/nvme0n1");
+        assert_eq!(preview.partition, "/dev/nvme0n1p2");
+        assert_eq!(preview.filesystem, Filesystem::Xfs);
+        assert_eq!(preview.mountpoint, WORKLOAD_STORAGE_MOUNTPOINT);
+        assert_eq!(preview.queue.ops.len(), 1);
+        validate_workload_storage_preview(&preview, &topo).expect("fresh preview");
+
+        let mut drifted = topo.clone();
+        drifted.devices[0].partitions.push(part(
+            "/dev/nvme0n1p2",
+            2,
+            6_000,
+            2_000,
+        ));
+        assert!(validate_workload_storage_preview(&preview, &drifted).is_err());
+        assert_eq!(
+            preview_workload_storage(&topo, WorkloadStorageRole::Lighthouse, 8_000),
+            Err(WorkloadStoragePlanError::IneligibleRole)
+        );
+    }
+
+    #[test]
+    fn workload_storage_preview_rejects_removable_and_fragmented_disks() {
+        let removable = Topology::new(vec![BlockDevice {
+            name: "/dev/sdb".into(),
+            size_mib: 20_000,
+            table: Some(PartitionTable::Gpt),
+            removable: true,
+            partitions: vec![],
+        }]);
+        assert!(matches!(
+            preview_workload_storage(&removable, WorkloadStorageRole::Workstation, 1_000),
+            Err(WorkloadStoragePlanError::NoContiguousExtent { .. })
+        ));
+        let fragmented = Topology::new(vec![BlockDevice {
+            name: "/dev/sdc".into(),
+            size_mib: 20_000,
+            table: Some(PartitionTable::Gpt),
+            removable: false,
+            partitions: vec![
+                part("/dev/sdc1", 1, 1, 9_000),
+                part("/dev/sdc2", 2, 10_000, 9_000),
+            ],
+        }]);
+        assert!(matches!(
+            preview_workload_storage(&fragmented, WorkloadStorageRole::Workstation, 1_500),
+            Err(WorkloadStoragePlanError::NoContiguousExtent { .. })
+        ));
+    }
+
+    #[test]
+    fn container_storage_path_is_one_direct_child_of_the_vm_pool() {
+        let pool = Path::new(WORKLOAD_STORAGE_MOUNTPOINT);
+        assert_eq!(workload_storage_container_path(), pool.join("containers"));
+
+        let dir = tempfile::tempdir().expect("temporary storage root");
+        let managed_pool = dir.path().join("mde-vms");
+        fs::create_dir(&managed_pool).expect("managed pool");
+        let managed_subtree = managed_pool.join(WORKLOAD_STORAGE_CONTAINER_SUBTREE);
+        validate_workload_storage_layout(&managed_pool, &managed_subtree)
+            .expect("missing managed subtree is creatable");
+
+        let escaped = managed_pool.join("..").join("outside");
+        let error = validate_workload_storage_layout(&managed_pool, &escaped)
+            .expect_err("container storage cannot escape the VM pool");
+        assert!(error.contains("direct managed subtree"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_container_storage_links_are_refused_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temporary storage root");
+        let pool = dir.path().join("mde-vms");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&pool).expect("managed pool");
+        fs::create_dir(&outside).expect("outside directory");
+
+        let subtree = pool.join(WORKLOAD_STORAGE_CONTAINER_SUBTREE);
+        symlink(&outside, &subtree).expect("hostile subtree symlink");
+        let error = validate_workload_storage_layout(&pool, &subtree)
+            .expect_err("subtree symlink must be refused");
+        assert!(error.contains("must not be a symlink"), "{error}");
+
+        let linked_pool = dir.path().join("linked-pool");
+        symlink(&outside, &linked_pool).expect("hostile pool symlink");
+        let linked_subtree = linked_pool.join(WORKLOAD_STORAGE_CONTAINER_SUBTREE);
+        let error = validate_workload_storage_layout(&linked_pool, &linked_subtree)
+            .expect_err("pool symlink must be refused");
+        assert!(error.contains("mountpoint must be a real directory"), "{error}");
+    }
+
+    #[test]
+    fn non_directory_container_storage_is_refused() {
+        let dir = tempfile::tempdir().expect("temporary storage root");
+        let pool = dir.path().join("mde-vms");
+        fs::create_dir(&pool).expect("managed pool");
+        let subtree = pool.join(WORKLOAD_STORAGE_CONTAINER_SUBTREE);
+        fs::write(&subtree, b"not a directory").expect("hostile regular file");
+
+        let error = validate_workload_storage_layout(&pool, &subtree)
+            .expect_err("regular file cannot be container storage");
+        assert!(error.contains("must be a directory"), "{error}");
+    }
+
     // ── validation ──
 
     #[test]
@@ -2854,7 +3652,7 @@ mod tests {
         let topo = sample_topo();
         let ok = StorageOp::CreatePartition {
             device: "/dev/sdb".into(),
-            start_mib: 1,
+            start_mib: 10 * 1024 + 1,
             size_mib: 50 * 1024,
             filesystem: None,
             label: None,
@@ -2862,7 +3660,7 @@ mod tests {
         assert!(validate_op(&ok, &topo).is_ok());
         let too_big = StorageOp::CreatePartition {
             device: "/dev/sdb".into(),
-            start_mib: 1,
+            start_mib: 10 * 1024 + 1,
             size_mib: 200 * 1024,
             filesystem: None,
             label: None,

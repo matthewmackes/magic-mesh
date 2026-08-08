@@ -21,6 +21,7 @@
 #   xcp-build.sh shell                interactive ssh into the build VM
 #   xcp-build.sh route <cargo args>   print the shape-routed host + reason (dry; no sync/build)
 #   xcp-build.sh --route-test         run the routing self-test (offline; no farm contact)
+#   xcp-build.sh --rpm-target-test    run the RPM target-Fedora guard self-test (offline)
 #   xcp-build.sh --check-features     print the canonical RPM feature set + --locked policy (build-deploy-3)
 #
 # Env overrides: MCNF_BUILD_HOST (for example 172.20.0.130), MCNF_BUILD_USER (mm),
@@ -96,13 +97,46 @@ remote() {
   # environment. Forward only the bounded endpoint inputs approved by the
   # ignored live tests; arbitrary local environment must not cross the farm
   # boundary or alter a remote build.
-  for name in MDE_SPICE_LIVE_TARGET MDE_VNC_LIVE_TARGET MDE_RDP_LIVE_TARGET; do
+  for name in MDE_SPICE_LIVE_TARGET MDE_VNC_LIVE_TARGET MDE_RDP_LIVE_TARGET \
+    MCNF_APP_VM_SOURCE_COMMIT; do
     if [[ -n "${!name+x}" ]]; then
       printf -v quoted '%q' "${!name}"
       remote_env+=" $name=$quoted"
     fi
   done
   "${SSH[@]}" "$DEST" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && env$remote_env $*"
+}
+
+# RPM ELF dependencies are build-host facts, not adjustable header metadata.
+# A media-enabled shell cut on Fedora 42, for example, needs FFmpeg-7 sonames
+# and cannot safely be deployed to a Fedora 44 Workstation with FFmpeg-8.  A
+# caller that knows its target release therefore opts into this hard check:
+#
+#   MCNF_RPM_TARGET_FEDORA=44 MCNF_BUILD_HOST=172.20.0.131 xcp-build.sh rpm
+#
+# Keeping it explicit preserves the F42 bootc/local-artifact lane while making
+# a physical-seat F44 release fail before a long, unusable native farm cut.
+valid_rpm_target_fedora() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+assert_rpm_target_fedora() {
+  local wanted="${MCNF_RPM_TARGET_FEDORA:-}" actual
+  [ -z "$wanted" ] && return 0
+  valid_rpm_target_fedora "$wanted" || {
+    warn "MCNF_RPM_TARGET_FEDORA must be a Fedora numeric release (got '$wanted')"
+    return 2
+  }
+  actual="$(remote 'rpm -E %fedora' | tr -d '[:space:]')"
+  if [ "$actual" != "$wanted" ]; then
+    warn "refusing RPM cut: requested Fedora $wanted target but $BUILD_HOST is Fedora ${actual:-unknown}"
+    warn "ELF sonames must be built for the target release; select a matching builder (F44 Workstations: 172.20.0.131)."
+    return 2
+  fi
+  log "RPM target-Fedora guard: builder Fedora $actual matches requested target Fedora $wanted"
 }
 
 quote_args() {
@@ -429,6 +463,14 @@ route_self_test() {
 # --- offline subcommands (no host resolution / farm contact) -------------------
 case "${1:-}" in
   --route-test | route-test) route_self_test; exit $? ;;
+  --rpm-target-test)
+    valid_rpm_target_fedora 44 && ! valid_rpm_target_fedora f44 \
+      && ! valid_rpm_target_fedora 44.0 \
+      && ! valid_rpm_target_fedora '' \
+      && { echo "RPM target-Fedora guard self-test: PASS"; exit 0; }
+    echo "RPM target-Fedora guard self-test: FAIL" >&2
+    exit 1
+    ;;
   route) shift; resolve_host "$@"; exit 0 ;; # resolve_host already logged host+reason
   # build-deploy-3 self-check: print the canonical RPM cut knobs THIS path uses.
   # Both cut paths source install-helpers/rpm-features.sh, so this doubles as the
@@ -493,6 +535,7 @@ case "${1:-}" in
 
   rpm)
     do_sync
+    assert_rpm_target_fedora
     # build-deploy-7 — cargo-generate-rpm is NOT installed per-cut on this path;
     # it is pinned at VM-PROVISIONING time to CGR_VERSION by
     # setup-build-vm-toolchain.sh + infra/ansible build-vm-toolchain.yml (pinned by

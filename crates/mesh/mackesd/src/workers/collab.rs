@@ -79,12 +79,9 @@ const ALERT_LANE_PREFIXES: &[&str] = &[
     "event/security/",
     "fleet/sec",
     "event/firewall",
-    "compute/event/",
     "event/compute/",
     "event/kvm/",
     "event/dc/",
-    "event/vm/",
-    "event/podman/",
     "fdo/",
     "event/notify/",
     "fleet/health/",
@@ -171,6 +168,7 @@ const COMMAND_VERBS: &[&str] = &[
     "request_review",
     "submit_review",
     "link_file",
+    "commit_file_generation",
     "unlink_file",
     "start_transfer",
     "control_transfer",
@@ -296,7 +294,7 @@ impl CollabWorker {
     /// One poll pass — the headless-testable core (drives the whole worker with
     /// an injected Persist + tempdir roots, no tokio timer, no live mesh).
     fn tick_once(&self, persist: &Persist, state: &mut CollabState, now_ms: i64) {
-        let mut touched: BTreeSet<SpaceId> = BTreeSet::new();
+        let mut touched = std::mem::take(&mut state.pending_file_projection_spaces);
         let mut changed = false;
         self.drain_commands(persist, state, now_ms, &mut touched, &mut changed);
         self.drain_inbound(persist, state, &mut touched, &mut changed);
@@ -859,12 +857,14 @@ impl CollabWorker {
                 clipboard,
             );
             let files = state.engine.projection().file_references(space);
-            publish_state(
+            if !publish_state(
                 persist,
                 &mut state.last_published,
                 &topics::space_state_topic(proj::FILE_REFERENCES, space),
                 files,
-            );
+            ) {
+                state.pending_file_projection_spaces.insert(space);
+            }
             let docs = state.engine.projection().document_sessions(Some(space));
             publish_state(
                 persist,
@@ -1024,6 +1024,10 @@ struct CollabState {
     /// The last published body per `state/collab/*` topic — skip republishing an
     /// identical read model (latest-wins churn guard).
     last_published: BTreeMap<String, String>,
+    /// Spaces whose canonical Files projection failed to publish. The signed
+    /// actor log and folded engine are already authoritative, so later ticks
+    /// retry only the derived retained view until it catches up.
+    pending_file_projection_spaces: BTreeSet<SpaceId>,
     /// Worker-owned DigitalOcean AI request/cancel sidecar state.
     ai_requests: AiRequestBoard,
 }
@@ -1040,6 +1044,7 @@ impl CollabState {
             log_live_offsets: BTreeMap::new(),
             prefer_recent_log_backfill: true,
             last_published: BTreeMap::new(),
+            pending_file_projection_spaces: BTreeSet::new(),
             ai_requests: AiRequestBoard::default(),
         })
     }
@@ -1674,11 +1679,8 @@ fn alert_flag(topic: &str) -> &'static str {
         "notify"
     } else if topic.starts_with("fdo/") {
         "desktop"
-    } else if topic.starts_with("compute/event/")
-        || topic.starts_with("event/compute/")
+    } else if topic.starts_with("event/compute/")
         || topic.starts_with("event/kvm/")
-        || topic.starts_with("event/vm/")
-        || topic.starts_with("event/podman/")
         || topic.starts_with("event/dc/")
     {
         "compute"
@@ -1986,11 +1988,11 @@ mod tests {
                 cmd.verb()
             );
         }
-        // The count must equal the full taxonomy (42 verbs) so a NEW command
+        // The count must equal the full taxonomy (43 verbs) so a NEW command
         // variant forces an update here.
         assert_eq!(
             COMMAND_VERBS.len(),
-            42,
+            43,
             "COMMAND_VERBS drifted from the taxonomy"
         );
     }

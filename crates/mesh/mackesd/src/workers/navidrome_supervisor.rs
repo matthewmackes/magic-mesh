@@ -29,6 +29,10 @@ use super::{ShutdownToken, Worker};
 /// fast path, so this only needs to catch down/missing within ~30 s.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Keep the first synchronous systemd probe inside the existing cadence while
+/// spreading identical daemon startups across a small, deterministic window.
+const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+
 /// The systemd unit `setup-media-navidrome.sh` installs.
 const UNIT: &str = "mcnf-navidrome.service";
 /// RPM-shipped bring-up script (MEDIA-pkg asset → /usr/libexec/mackesd/...).
@@ -68,6 +72,7 @@ fn decide(active: bool, unit_installed: bool, creds_present: bool) -> Action {
 /// The MEDIA-pkg-2 worker.
 pub struct NavidromeSupervisor {
     tick: Duration,
+    hostname: String,
 }
 
 impl NavidromeSupervisor {
@@ -75,6 +80,7 @@ impl NavidromeSupervisor {
     pub fn new() -> Self {
         Self {
             tick: DEFAULT_TICK_INTERVAL,
+            hostname: local_hostname(),
         }
     }
 
@@ -121,6 +127,18 @@ impl Worker for NavidromeSupervisor {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // The supervisor's first pass shells out to systemd twice, and may
+        // issue a third command when recovery is needed. Keep that work no
+        // later than the old first tick while avoiding one common startup
+        // boundary across all media-capable seats.
+        let first_delay = self
+            .tick
+            .saturating_sub(initial_phase_for(&self.hostname, self.tick));
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(first_delay) => {}
+        }
+        self.tick_once();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.tick) => { self.tick_once(); }
@@ -129,6 +147,33 @@ impl Worker for NavidromeSupervisor {
         }
         Ok(())
     }
+}
+
+/// Read the local hostname without spawning a process. An unavailable or
+/// blank hostname deliberately disables phasing and retains the legacy timing.
+fn local_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+/// Return a stable, bounded delay subtracted from the first tick.
+///
+/// FNV-1a is sufficient because this is scheduling spread, not a security
+/// primitive. The same hostname keeps the same phase after a daemon restart.
+fn initial_phase_for(hostname: &str, tick: Duration) -> Duration {
+    let bound = MAX_INITIAL_PHASE.min(tick);
+    if hostname.is_empty() || bound.is_zero() {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in hostname.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_nanos(hash % (bound.as_nanos() as u64 + 1))
 }
 
 #[cfg(test)]
@@ -147,5 +192,18 @@ mod tests {
         assert_eq!(decide(false, false, true), Action::Reprovision);
         // missing + no creds → needs setup
         assert_eq!(decide(false, false, false), Action::NeedsSetup);
+    }
+
+    #[test]
+    fn initial_phase_is_stable_bounded_and_preserves_first_tick_deadline() {
+        let phase = initial_phase_for("seat15", DEFAULT_TICK_INTERVAL);
+        assert_eq!(phase, initial_phase_for("seat15", DEFAULT_TICK_INTERVAL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        let first_delay = DEFAULT_TICK_INTERVAL.saturating_sub(phase);
+        assert!(first_delay <= DEFAULT_TICK_INTERVAL);
+        assert!(first_delay >= DEFAULT_TICK_INTERVAL - MAX_INITIAL_PHASE);
+        assert_eq!(initial_phase_for("", DEFAULT_TICK_INTERVAL), Duration::ZERO);
+        assert!(initial_phase_for("seat15", Duration::from_millis(100))
+            <= Duration::from_millis(100));
     }
 }

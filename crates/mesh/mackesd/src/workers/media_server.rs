@@ -476,6 +476,11 @@ pub fn write_manifest(mount: &Path, host: &str, manifest: &ShareManifest) {
     };
     let tmp = dir.join(".media-library.json.tmp");
     let final_path = dir.join(MESH_LIBRARY_MANIFEST_FILE);
+    if let Ok(existing) = std::fs::read(&final_path) {
+        if existing == body.as_bytes() {
+            return;
+        }
+    }
     if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
         tracing::warn!(target: "mackesd::media_server", "write {} failed: {e}", tmp.display());
         return;
@@ -1257,6 +1262,20 @@ mod tests {
         let (m, _) = build_manifest("n", "", MESH_MEDIA_PORT, &[]);
         write_manifest(tmp.path(), "", &m);
         assert!(read_manifests(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_manifest_does_not_rewrite_the_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (manifest, _) = build_manifest("peer:oak", "oak", MESH_MEDIA_PORT, &[]);
+        write_manifest(tmp.path(), "oak", &manifest);
+        let path = tmp.path().join("oak").join(MESH_LIBRARY_MANIFEST_FILE);
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        write_manifest(tmp.path(), "oak", &manifest);
+        assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
     }
 
     // ── the aggregation merge fold (the acceptance-pinned deliverable) ──

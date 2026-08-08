@@ -1507,11 +1507,11 @@ impl TerminalWidget {
     }
 
     /// Open the selection as a URL in the mesh browser (TERM-15) — reuse the
-    /// TERM-9 [`smart::LaunchRoute::Bookmarks`] surface-launch path.
+    /// TERM-9 [`smart::LaunchRoute::Browser`] surface-launch path.
     pub(crate) fn open_selection_url(&self, selection: &str) {
         let _ = self
             .launch_bus
-            .open(&smart::LaunchRoute::Bookmarks(selection.to_string()));
+            .open(&smart::LaunchRoute::Browser(selection.to_string()));
     }
 
     /// Mouse selection + the smart-clipboard gestures (TERM-9): double-click
@@ -1568,7 +1568,7 @@ impl TerminalWidget {
             return;
         }
         // Ctrl+click a detected URL/path → dispatch it to its surface over the
-        // Bus (URL → Bookmarks, path → Files). A miss falls through to a click.
+        // Bus (URL → Browser, path → Files). A miss falls through to a click.
         if response.clicked() && (modifiers.command || modifiers.ctrl) {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (row, col) = pos_to_local(pos);
@@ -3185,13 +3185,13 @@ mod tests {
 
         // open-path-in-Files → the TERM-9 Files surface-launch route.
         w.open_selection_in_files("/etc/hosts");
-        // open-URL-in-mesh-browser → the TERM-9 Bookmarks route.
+        // open-URL-in-mesh-browser → the TERM-9 Browser route.
         w.open_selection_url("https://mesh.local");
         assert_eq!(
             launch.routes.lock().expect("lock").as_slice(),
             &[
                 smart::LaunchRoute::Files("/etc/hosts".to_string()),
-                smart::LaunchRoute::Bookmarks("https://mesh.local".to_string()),
+                smart::LaunchRoute::Browser("https://mesh.local".to_string()),
             ]
         );
 

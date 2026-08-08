@@ -12,6 +12,11 @@ option for supplying counter values.  Extended QEMU/Chromium memory and CPU
 measurements go to a private sidecar because the collector's exact v4 sample
 shape has no fields for them.
 
+For a bounded local diagnostic before committing a live acceptance run, use the
+separate ``preflight`` subcommand.  It writes an NDJSON sample window labeled
+``diagnostic-preflight-non-acceptance``; that output is intentionally not an
+acceptance stream and does not change the production collector protocol.
+
 Typical Dell invocation (run as root after the seat warning):
 
   serve-browser-vm-performance.py serve \
@@ -68,6 +73,10 @@ STREAM_SCHEMA_VERSION = 4
 SAMPLE_INTERVAL_SECONDS = 5.0
 COLLECTION_SECONDS = 905.0
 HIDE_AT_SECONDS = 600.0
+PREFLIGHT_DEFAULT_SECONDS = 30
+PREFLIGHT_MIN_SECONDS = 10
+PREFLIGHT_MAX_SECONDS = 120
+DIAGNOSTIC_EVIDENCE_CLASS = "diagnostic-preflight-non-acceptance"
 MIN_TABS = 5
 WIDTH = 1920
 HEIGHT = 1080
@@ -161,6 +170,50 @@ def validate_source(source_commit: str, image_digest: str) -> None:
         or image_digest == "sha256:" + "0" * 64
     ):
         fail("image digest must be a full non-null lowercase sha256 reference")
+
+
+def validate_diagnostic_seconds(value: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not PREFLIGHT_MIN_SECONDS <= value <= PREFLIGHT_MAX_SECONDS
+    ):
+        fail(
+            "diagnostic seconds must be an integer between "
+            f"{PREFLIGHT_MIN_SECONDS} and {PREFLIGHT_MAX_SECONDS}"
+        )
+    return value
+
+
+def diagnostic_metadata(seconds: int) -> dict[str, Any]:
+    seconds = validate_diagnostic_seconds(seconds)
+    return {
+        "evidence_class": DIAGNOSTIC_EVIDENCE_CLASS,
+        "acceptance_eligible": False,
+        "acceptance_status": "not-run",
+        "sample_window_seconds": seconds,
+        "acceptance_gate_seconds": COLLECTION_SECONDS,
+        "hidden_phase_observed": False,
+    }
+
+
+def diagnostic_failure_record(
+    args: argparse.Namespace,
+    evidence_metadata: dict[str, Any],
+    error: HarnessError,
+) -> dict[str, Any]:
+    """Return a bounded, non-acceptance record for a failed preflight setup."""
+    return {
+        "type": "diagnostic-failure",
+        "status": "rejected",
+        "source_commit": str(args.source_commit)[:64],
+        "image_digest": str(args.image_digest)[:71],
+        "domain": str(args.domain)[:128],
+        "guest_ip": str(args.guest_ip)[:64],
+        "reason": str(error)[:1024],
+        "recorded_at": utc_now(),
+        **evidence_metadata,
+    }
 
 
 def validate_domain(value: str) -> str:
@@ -2359,9 +2412,14 @@ def minimize_chromium_windows(tabs: list[CdpTab]) -> list[int]:
     return sorted(windows)
 
 
-def make_header(context: HarnessContext, nonce: str) -> dict[str, Any]:
+def make_header(
+    context: HarnessContext,
+    nonce: str,
+    *,
+    evidence_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     identity = context.identity
-    return {
+    header = {
         "schema_version": STREAM_SCHEMA_VERSION,
         "kind": "browser_vm_performance_stream",
         "source": "live-browser-vm-session-endpoint",
@@ -2384,15 +2442,36 @@ def make_header(context: HarnessContext, nonce: str) -> dict[str, Any]:
         "tab_ids": identity.tab_ids,
         "supported_target_fps": TARGET_FPS,
     }
+    if evidence_metadata is not None:
+        header.update(evidence_metadata)
+    return header
 
 
-def run_live_stream(context: HarnessContext, nonce: str, output: BinaryIO) -> None:
+def run_live_stream(
+    context: HarnessContext,
+    nonce: str,
+    output: BinaryIO,
+    *,
+    collection_seconds: float = COLLECTION_SECONDS,
+    evidence_metadata: dict[str, Any] | None = None,
+) -> int:
     if NONCE_RE.fullmatch(nonce) is None:
         fail("collector challenge is malformed")
+    if collection_seconds <= 0:
+        fail("collection window must be positive")
+    if evidence_metadata is not None:
+        if (
+            evidence_metadata.get("evidence_class") != DIAGNOSTIC_EVIDENCE_CLASS
+            or evidence_metadata.get("acceptance_eligible") is not False
+            or collection_seconds >= HIDE_AT_SECONDS
+        ):
+            fail("diagnostic stream metadata is malformed or exceeds the visible preflight window")
     digest = hashlib.sha256()
     sample_count = 0
     completion_status = "completed"
-    header = make_header(context, nonce)
+    header = make_header(
+        context, nonce, evidence_metadata=evidence_metadata
+    )
     context.sidecar.write(
         {
             "type": "header",
@@ -2565,7 +2644,7 @@ def run_live_stream(context: HarnessContext, nonce: str, output: BinaryIO) -> No
                 }
             )
 
-            if elapsed_ms >= int(COLLECTION_SECONDS * 1_000):
+            if elapsed_ms >= int(collection_seconds * 1_000):
                 break
             sample_index += 1
     except Exception:
@@ -2579,19 +2658,23 @@ def run_live_stream(context: HarnessContext, nonce: str, output: BinaryIO) -> No
             "sample_count": sample_count,
             "stream_sha256": "sha256:" + digest.hexdigest(),
         }
+        if evidence_metadata is not None:
+            complete.update(evidence_metadata)
         # The complete record binds the exact header+sample prefix and therefore
         # is intentionally not included in its own digest.
         output.write(compact_json(complete) + b"\n")
         output.flush()
-        context.sidecar.write(
-            {
-                "type": "complete",
-                "recorded_at": utc_now(),
-                "status": completion_status,
-                "sample_count": sample_count,
-                "stream_sha256": complete["stream_sha256"],
-            }
-        )
+        sidecar_complete = {
+            "type": "complete",
+            "recorded_at": utc_now(),
+            "status": completion_status,
+            "sample_count": sample_count,
+            "stream_sha256": complete["stream_sha256"],
+        }
+        if evidence_metadata is not None:
+            sidecar_complete.update(evidence_metadata)
+        context.sidecar.write(sidecar_complete)
+    return sample_count
 
 
 class PerformanceHandler(BaseHTTPRequestHandler):
@@ -2829,6 +2912,71 @@ def serve(args: argparse.Namespace) -> int:
             remove_runtime_password(context.credential_runtime_root)
 
 
+def preflight(args: argparse.Namespace) -> int:
+    seconds = validate_diagnostic_seconds(args.seconds)
+    evidence_metadata = diagnostic_metadata(seconds)
+    diagnostic_stream = SidecarWriter(args.out)
+    context: HarnessContext | None = None
+    media: MediaServer | None = None
+    try:
+        try:
+            context, media = build_context(args)
+            sample_count = run_live_stream(
+                context,
+                secrets.token_hex(32),
+                diagnostic_stream.handle,
+                collection_seconds=seconds,
+                evidence_metadata=evidence_metadata,
+            )
+        except HarnessError as exc:
+            diagnostic_stream.write(
+                diagnostic_failure_record(args, evidence_metadata, exc)
+            )
+            diagnostic_stream.handle.flush()
+            raise
+        print(
+            json.dumps(
+                {
+                    "status": "diagnostic-complete",
+                    "sample_count": sample_count,
+                    "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
+                    "output": str(args.out),
+                    "sidecar": str(args.sidecar_out),
+                    **evidence_metadata,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 0
+    finally:
+        diagnostic_stream.close()
+        if context is not None and media is not None:
+            for tab in context.tabs:
+                tab.close()
+            try:
+                stop_guest_controlled_chromium(
+                    context.guest,
+                    context.guest_ip,
+                    context.guest_run_id,
+                    required=True,
+                )
+                if context.staged_guest_helper_path is not None:
+                    shutdown_runtime_guest_controller(
+                        context.guest, context.guest_ip, required=True
+                    )
+            finally:
+                context.probe.stop()
+                if context.staged_guest_helper_path is not None:
+                    context.guest.remove_runtime_helper(
+                        context.staged_guest_helper_path, required=False
+                    )
+                media.stop()
+                context.firewall.close()
+                context.sidecar.close()
+                remove_runtime_password(context.credential_runtime_root)
+
+
 def percentile(values: list[int], fraction: float) -> int | None:
     if not values:
         return None
@@ -2906,6 +3054,45 @@ def self_test() -> None:
     assert compact_json({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
     assert TARGET_FPS == 30
     assert MIN_VISIBLE_DELIVERY_FPS == 27
+    assert validate_diagnostic_seconds(PREFLIGHT_DEFAULT_SECONDS) == (
+        PREFLIGHT_DEFAULT_SECONDS
+    )
+    for invalid_seconds in (
+        PREFLIGHT_MIN_SECONDS - 1,
+        PREFLIGHT_MAX_SECONDS + 1,
+        0,
+        True,
+    ):
+        try:
+            validate_diagnostic_seconds(invalid_seconds)  # type: ignore[arg-type]
+        except HarnessError as exc:
+            assert "diagnostic seconds" in str(exc)
+        else:
+            raise AssertionError("invalid diagnostic window was accepted")
+    preflight_labels = diagnostic_metadata(PREFLIGHT_DEFAULT_SECONDS)
+    assert preflight_labels["evidence_class"] == DIAGNOSTIC_EVIDENCE_CLASS
+    assert preflight_labels["acceptance_eligible"] is False
+    assert preflight_labels["acceptance_status"] == "not-run"
+    assert preflight_labels["sample_window_seconds"] == PREFLIGHT_DEFAULT_SECONDS
+    assert preflight_labels["acceptance_gate_seconds"] == COLLECTION_SECONDS
+    assert preflight_labels["hidden_phase_observed"] is False
+    failure = diagnostic_failure_record(
+        argparse.Namespace(
+            source_commit="a" * 40,
+            image_digest="sha256:" + "b" * 64,
+            domain="browser-vm",
+            guest_ip="192.168.122.225",
+        ),
+        preflight_labels,
+        HarnessError("controlled tab cadence rejected"),
+    )
+    assert failure["type"] == "diagnostic-failure"
+    assert failure["status"] == "rejected"
+    assert failure["acceptance_eligible"] is False
+    assert failure["acceptance_status"] == "not-run"
+    assert failure["acceptance_gate_seconds"] == COLLECTION_SECONDS
+    assert failure["reason"] == "controlled tab cadence rejected"
+    assert "credential" not in json.dumps(failure).lower()
     probe_tab_ids = [f"cdp-tab-{index}" for index in range(1, MIN_TABS + 1)]
     slow_background_rates = [27.0, 0.25, 1.0, 12.0, 26.0]
     probe_accepted, probe_diagnostic = evaluate_tab_rate_probe(
@@ -3058,6 +3245,46 @@ def main(argv: list[str]) -> int:
     serve_parser.add_argument("--sidecar-out", required=True, type=Path)
     serve_parser.add_argument("--accept-timeout-seconds", type=int, default=300)
 
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="collect a bounded diagnostic window; never acceptance evidence",
+        description=(
+            "Collect a short live Browser VM sample window. The output is "
+            "explicitly non-acceptance evidence and cannot replace the "
+            f"{int(COLLECTION_SECONDS)}-second collector gate."
+        ),
+    )
+    preflight_parser.add_argument("--bind", default="127.0.0.1")
+    preflight_parser.add_argument("--media-bind", default="192.168.122.1")
+    preflight_parser.add_argument("--media-port", type=int, default=9081)
+    preflight_parser.add_argument("--domain", required=True)
+    preflight_parser.add_argument("--guest-ip", required=True)
+    preflight_parser.add_argument("--source-commit", required=True)
+    preflight_parser.add_argument("--image-digest", required=True)
+    preflight_parser.add_argument("--rdp-user", required=True)
+    preflight_parser.add_argument("--rdp-port", type=int, default=3389)
+    preflight_parser.add_argument("--credential-file", required=True, type=Path)
+    preflight_parser.add_argument("--rdp-probe", required=True, type=Path)
+    preflight_parser.add_argument("--guest-helper", required=True, type=Path)
+    preflight_parser.add_argument("--sidecar-out", required=True, type=Path)
+    preflight_parser.add_argument(
+        "--out",
+        required=True,
+        type=Path,
+        help="new private NDJSON output path for non-acceptance diagnostics",
+    )
+    preflight_parser.add_argument(
+        "--diagnostic-seconds",
+        dest="seconds",
+        type=int,
+        default=PREFLIGHT_DEFAULT_SECONDS,
+        help=(
+            f"bounded visible diagnostic window in seconds "
+            f"({PREFLIGHT_MIN_SECONDS}-{PREFLIGHT_MAX_SECONDS}; "
+            "default: %(default)s)"
+        ),
+    )
+
     summarize_parser = subparsers.add_parser(
         "summarize", help="summarize the private extended live sidecar"
     )
@@ -3076,9 +3303,13 @@ def main(argv: list[str]) -> int:
             if not 60 <= args.accept_timeout_seconds <= 3_600:
                 fail("accept timeout must be between 60 and 3600 seconds")
             return serve(args)
+        if args.command == "preflight":
+            if not 1 <= args.rdp_port <= 65_535:
+                fail("RDP port must be between 1 and 65535")
+            return preflight(args)
         if args.command == "summarize":
             return summarize(args)
-        parser.error("choose serve, summarize, or --self-test")
+        parser.error("choose serve, preflight, summarize, or --self-test")
     except HarnessError as exc:
         print(f"serve-browser-vm-performance: rejected: {exc}", file=sys.stderr)
         return 2

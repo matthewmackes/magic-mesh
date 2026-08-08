@@ -51,6 +51,9 @@ const OVERFLOW_GAP: f32 = 4.0;
 /// Maximum number of chooser-pinned sources shown in the dock. The full
 /// chooser remains the unbounded discovery surface; the dock is a quick rail.
 const MAX_PINNED_SOURCES: usize = 8;
+/// The placement pin is intentionally visually subordinate to the navigation
+/// glyphs while retaining the same full-size hit target and accessibility box.
+const PIN_ICON_SCALE: f32 = 0.4;
 /// The transition first slides left, then melts into the vertical rail.
 const SLIDE_FRACTION: f32 = 0.34;
 /// Total normal-mode transition length: short enough to feel direct, long enough
@@ -67,11 +70,11 @@ const FIRST_BOOT_SELECTOR_W: f32 = 560.0;
 const FIRST_BOOT_SELECTOR_H: f32 = 720.0;
 static NAV_LAYER_ID_MAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Ordered first-boot and personalization catalog. The public labels for the
-/// two consolidated surfaces deliberately differ from their internal enum
-/// names so migrated/deep-link compatibility never leaks into the taskbar UI.
-const PIN_CATALOG: [Surface; 12] = [
-    Surface::FleetMesh,
+/// Ordered first-boot and personalization catalog. Workers is the only
+/// node-management entry; historical Fleet & Mesh / This Node keys are
+/// decoded below and collapsed into it.
+const PIN_CATALOG: [Surface; 9] = [
+    Surface::Workers,
     Surface::InfraCode,
     Surface::Desktop,
     Surface::Terminal,
@@ -80,9 +83,6 @@ const PIN_CATALOG: [Surface; 12] = [
     Surface::Music,
     Surface::Media,
     Surface::Browser,
-    Surface::Bookmarks,
-    Surface::Phones,
-    Surface::ThisNode,
 ];
 
 /// One action emitted by the painted controls.
@@ -161,6 +161,7 @@ fn default_taskbar_pins() -> Vec<Surface> {
 
 fn surface_key(surface: Surface) -> &'static str {
     match surface {
+        Surface::Workers => "workers",
         Surface::FleetMesh => "fleet-mesh",
         Surface::InfraCode => "workloads",
         Surface::Desktop => "desktop",
@@ -168,7 +169,6 @@ fn surface_key(surface: Surface) -> &'static str {
         Surface::Media => "media",
         Surface::Files => "files",
         Surface::Browser => "browser",
-        Surface::Bookmarks => "bookmarks",
         Surface::MapsLocation => "maps-location",
         Surface::Terminal => "terminal",
         Surface::Phones => "phones",
@@ -186,16 +186,19 @@ fn surface_key(surface: Surface) -> &'static str {
 }
 
 fn surface_from_key(key: &str) -> Option<Surface> {
-    // Persisted profiles can predate the consolidated Fleet & Mesh and This
-    // Node entries. Decode through the full enum, then canonicalize aliases,
+    // Persisted profiles can predate the canonical Workers entry. Decode old
+    // keys explicitly, then canonicalize aliases,
     // so migration preserves those pins instead of silently dropping them.
     PIN_CATALOG
         .into_iter()
         .find(|surface| surface_key(*surface) == key)
         .or_else(|| match key {
+            "fleet-mesh" | "fleetmesh" => Some(Surface::FleetMesh),
             "workbench" => Some(Surface::Workbench),
             "mesh-view" => Some(Surface::MeshView),
             "explorer" => Some(Surface::Explorer),
+            "this-node" | "thisnode" => Some(Surface::ThisNode),
+            "phones" | "phone" => Some(Surface::Phones),
             "system" => Some(Surface::System),
             "storage" => Some(Surface::Storage),
             "about" => Some(Surface::About),
@@ -206,12 +209,16 @@ fn surface_from_key(key: &str) -> Option<Surface> {
 
 fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
     let canonical = match surface {
-        Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
-            Some(Surface::FleetMesh)
-        }
-        Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
-            Some(Surface::ThisNode)
-        }
+        Surface::Workers
+        | Surface::FleetMesh
+        | Surface::Workbench
+        | Surface::MeshView
+        | Surface::Explorer
+        | Surface::ThisNode
+        | Surface::System
+        | Surface::Storage
+        | Surface::About
+        | Surface::Phones => Some(Surface::Workers),
         // Standalone Files is a compatibility deep link only; persisted pins
         // migrate to the one Mesh Teams collaboration destination.
         Surface::Files => Some(Surface::Communications),
@@ -252,6 +259,7 @@ fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
 
 fn taskbar_surface_label(surface: Surface) -> &'static str {
     match surface {
+        Surface::Workers => "Workers",
         Surface::FleetMesh => "Fleet & Mesh",
         Surface::InfraCode => "Workloads",
         surface => surface.label(),
@@ -271,9 +279,10 @@ fn pin_catalog_contains(surface: Surface) -> bool {
 fn taskbar_surface_search_terms(surface: Surface) -> &'static str {
     match surface {
         // These are navigation aliases, not additional taskbar entries. Keep
-        // them on the canonical Fleet & Mesh result so a Start search or the
+        // them on the canonical Workers result so a Start search or the
         // first-boot selector cannot strand the operator on a legacy deep link.
         // Query hyphens are normalized to spaces by `filtered_pin_catalog`.
+        Surface::Workers => "workers fleet mesh fleet & mesh this node node workbench mesh map mesh view meshmap meshview explorer system storage about phones phone",
         Surface::FleetMesh => {
             "fleet mesh fleet & mesh workbench mesh map mesh view meshmap meshview explorer"
         }
@@ -785,11 +794,13 @@ impl State {
                     // The Area's content UI is created with its absolute screen
                     // rect as max_rect, so these interaction rectangles stay in
                     // the same screen space as the painter and AccessKit tree.
-                    let response = ui.interact(
-                        control.rect,
-                        control_id(self.mode, *control),
-                        egui::Sense::click(),
-                    );
+                    let response = ui
+                        .interact(
+                            control.rect,
+                            control_id(self.mode, *control),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
                     let hovered = response.hovered();
                     let clicked = response.clicked();
                     if nav_bar_proof_enabled() {
@@ -828,19 +839,15 @@ impl State {
                             Style::NAV_BAR_HOVER,
                         );
                     }
+                    let icon_size =
+                        control_icon_size(*control, control.rect.height().min(Style::ICON_L));
                     let icon_rect = egui::Rect::from_center_size(
                         control.rect.center(),
-                        egui::vec2(
-                            control.rect.height().min(24.0),
-                            control.rect.height().min(24.0),
-                        ),
+                        egui::vec2(icon_size, icon_size),
                     );
-                    if let Some(texture) = icon_texture(
-                        ctx,
-                        control_icon(*control),
-                        control.rect.height().min(24.0),
-                        Style::NAV_BAR_ICON,
-                    ) {
+                    if let Some(texture) =
+                        icon_texture(ctx, control_icon(*control), icon_size, Style::NAV_BAR_ICON)
+                    {
                         painter.image(
                             texture.id(),
                             icon_rect,
@@ -1011,6 +1018,8 @@ impl State {
                                     egui::vec2(ui.available_width(), CONTROL_EDGE),
                                     egui::Sense::click(),
                                 );
+                                let response =
+                                    response.on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if selected_row {
                                     ui.painter().rect_filled(
                                         rect,
@@ -1021,12 +1030,12 @@ impl State {
                                 if let Some(texture) = icon_texture(
                                     ctx,
                                     surface.icon_id(),
-                                    24.0,
+                                    Style::ICON_L,
                                     Style::resolve_color(ctx, Style::TEXT),
                                 ) {
                                     let icon_rect = egui::Rect::from_center_size(
                                         egui::pos2(rect.left() + Style::SP_L, rect.center().y),
-                                        egui::vec2(24.0, 24.0),
+                                        egui::vec2(Style::ICON_L, Style::ICON_L),
                                     );
                                     ui.painter().image(
                                         texture.id(),
@@ -1303,10 +1312,10 @@ impl ControlKind {
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Editor => IconId::Editor,
-            // The placement toggle lives at the far edge of both layouts; the
-            // Carbon application-menu glyph reads as a panel/layout control
-            // without implying that the button opens a desktop surface.
-            Self::Pin => IconId::Menu,
+            // The placement toggle lives at the far edge of both layouts; use
+            // Carbon's canonical PIN glyph so the control communicates its
+            // pinning action instead of borrowing the application-menu icon.
+            Self::Pin => IconId::Pin,
             Self::Overflow => IconId::MoreHorizontal,
             Self::SurfaceLauncher => IconId::Mark,
             Self::PinnedDesktop => IconId::Desktop,
@@ -1984,6 +1993,7 @@ fn paint_overflow_popup(
 
     for (item, row) in items.iter().copied().zip(layout.rows) {
         let (row, response) = ui.allocate_exact_size(row.size(), egui::Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         let control = overflow_item_control(item, row);
         let label = control_label(control, pinned_sources, connected_sessions);
         if response.hovered() {
@@ -1993,12 +2003,13 @@ fn paint_overflow_popup(
         if let Some(texture) = icon_texture(
             ui.ctx(),
             control_icon(control),
-            row.height().min(24.0),
+            control_icon_size(control, row.height().min(Style::ICON_L)),
             text,
         ) {
+            let icon_size = control_icon_size(control, row.height().min(Style::ICON_L));
             let icon_rect = egui::Rect::from_center_size(
                 egui::pos2(row.left() + Style::SP_L, row.center().y),
-                egui::vec2(row.height().min(24.0), row.height().min(24.0)),
+                egui::vec2(icon_size, icon_size),
             );
             ui.painter().image(
                 texture.id(),
@@ -2130,6 +2141,14 @@ fn control_icon(control: Control) -> IconId {
         return surface.icon_id();
     }
     control.kind.icon()
+}
+
+fn control_icon_size(control: Control, standard: f32) -> f32 {
+    if control.kind == ControlKind::Pin {
+        standard * PIN_ICON_SCALE
+    } else {
+        standard
+    }
 }
 
 /// Return the one rendered taskbar control that represents the active shell
@@ -2510,6 +2529,30 @@ mod tests {
     }
 
     #[test]
+    fn placement_pin_uses_carbon_pin_and_is_sixty_percent_smaller() {
+        let pin = Control {
+            kind: ControlKind::Pin,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: None,
+        };
+        let standard = Style::ICON_L;
+        assert_eq!(control_icon(pin), IconId::Pin);
+        assert!((control_icon_size(pin, standard) - standard * 0.4).abs() < f32::EPSILON);
+        assert!(
+            (control_icon_size(
+                Control {
+                    kind: ControlKind::Start,
+                    ..pin
+                },
+                standard,
+            ) - standard)
+                .abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
     fn floating_and_docked_geometry_have_the_locked_edges() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let floating = floating_geometry(screen);
@@ -2634,7 +2677,7 @@ mod tests {
     }
 
     #[test]
-    fn taskbar_catalog_aliases_focus_the_canonical_fleet_mesh_entry() {
+    fn taskbar_catalog_aliases_do_not_create_duplicate_workers_entries() {
         for query in [
             "Fleet & Mesh",
             "Workbench",
@@ -2825,9 +2868,9 @@ mod tests {
     #[test]
     fn first_boot_catalog_is_ordered_and_uses_operator_aliases() {
         assert_eq!(
-            PIN_CATALOG[..10],
+            PIN_CATALOG[..9],
             [
-                Surface::FleetMesh,
+                Surface::Workers,
                 Surface::InfraCode,
                 Surface::Desktop,
                 Surface::Terminal,
@@ -2836,9 +2879,9 @@ mod tests {
                 Surface::Music,
                 Surface::Media,
                 Surface::Browser,
-                Surface::Bookmarks,
             ]
         );
+        assert_eq!(taskbar_surface_label(Surface::Workers), "Workers");
         assert_eq!(taskbar_surface_label(Surface::FleetMesh), "Fleet & Mesh");
         assert_eq!(taskbar_surface_label(Surface::InfraCode), "Workloads");
         assert_eq!(filtered_pin_catalog("fleet & mesh"), Vec::<Surface>::new());
@@ -4149,8 +4192,6 @@ mod tests {
                 Surface::MapsLocation,
                 Surface::Communications,
                 Surface::Browser,
-                Surface::Bookmarks,
-                Surface::Phones,
             ],
             "the taskbar must use the searchable pin catalog order"
         );

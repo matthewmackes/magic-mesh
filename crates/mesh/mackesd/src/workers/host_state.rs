@@ -40,8 +40,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+use mackes_mesh_types::health::{NodeAvailabilityState, NodeDeviceClass};
 use serde::{Deserialize, Serialize};
 
 use super::cloud::{
@@ -49,6 +51,9 @@ use super::cloud::{
     DEFAULT_AUTH_ROOT,
 };
 use super::{ShutdownToken, Worker};
+use super::node_availability::{
+    runtime_availability_path, RuntimeAvailabilityPublisher, RuntimeAvailabilityRequest,
+};
 use crate::leader::read_current_lease;
 
 /// The local topic the shell publishes its seat snapshot on (this node only).
@@ -81,6 +86,16 @@ const AUTH_VERB: &str = "host-state";
 
 /// Poll cadence — responsive to a remote control action without hammering the Bus.
 pub const POLL: Duration = Duration::from_secs(2);
+
+const SUSPEND_EXPECTED_RETURN: Duration = Duration::from_secs(12 * 60 * 60);
+const REBOOT_EXPECTED_RETURN: Duration = Duration::from_secs(10 * 60);
+const POWEROFF_EXPECTED_RETURN: Duration = Duration::from_secs(24 * 60 * 60);
+const MAINTENANCE_EXPECTED_RETURN: Duration = Duration::from_secs(4 * 60 * 60);
+const LIFECYCLE_MONITOR_RETRY: Duration = Duration::from_secs(5);
+const NETWORK_STABILITY_POLL: Duration = Duration::from_millis(500);
+const NETWORK_STABILITY_TIMEOUT: Duration = Duration::from_secs(60);
+const NETWORK_MANAGER_CONNECTED_SITE: u32 = 60;
+const NETWORK_STABILITY_SAMPLES: u8 = 2;
 
 /// The replicated per-node seat-mirror topic other peers read.
 #[must_use]
@@ -211,6 +226,17 @@ pub enum HostVerb {
         #[serde(default)]
         confirm: bool,
     },
+    /// Enter or end this node's explicit maintenance window. The daemon owns
+    /// this state directly; it is not forwarded to the seat hardware lane.
+    Maintenance {
+        /// `true` enters maintenance; `false` ends it with an explicit return.
+        enabled: bool,
+        /// Bounded operator reason retained by the shared health contract.
+        reason: String,
+        /// Optional expected window length. Zero is rejected by publication.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_return_seconds: Option<u32>,
+    },
 }
 
 impl HostVerb {
@@ -224,6 +250,7 @@ impl HostVerb {
             Self::Bluetooth { adapter, .. } => format!("bluetooth:{adapter}"),
             Self::Display { monitor, .. } => format!("display:{monitor}"),
             Self::Power { action, .. } => format!("power:{action:?}"),
+            Self::Maintenance { enabled, .. } => format!("maintenance:{enabled}"),
         }
     }
 
@@ -492,6 +519,7 @@ fn authorize_capability(
 pub struct HostStateWorker {
     node_id: String,
     lock_path: PathBuf,
+    availability_durable_path: PathBuf,
     bus_root: Option<PathBuf>,
     poll: Duration,
     /// Root-credential HMAC verifier. Missing production credentials install a
@@ -511,7 +539,8 @@ impl HostStateWorker {
     /// (matching `leader_election`), the default Bus root, and the [`POLL`] cadence.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
-        // Consume `workgroup_root` into the lease path (mirrors `leader_election`).
+        let availability_durable_path = runtime_availability_path(&workgroup_root, &node_id);
+        // Consume a clone into the lease path (mirrors `leader_election`).
         let mut lock_path = workgroup_root;
         lock_path.push(LEADER_LOCK);
         let signer: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
@@ -528,6 +557,7 @@ impl HostStateWorker {
         Self {
             lock_path,
             node_id,
+            availability_durable_path,
             bus_root: default_bus_root(),
             poll: POLL,
             signer,
@@ -565,6 +595,13 @@ impl HostStateWorker {
     fn with_authorization(mut self, signer: Arc<dyn TokenSigner>, auth_root: PathBuf) -> Self {
         self.signer = signer;
         self.auth_root = auth_root;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_availability_durable_path(mut self, path: PathBuf) -> Self {
+        self.availability_durable_path = path;
         self
     }
 
@@ -620,6 +657,131 @@ impl HostStateWorker {
             .unwrap_or_default()
     }
 
+    fn availability_publisher(&self) -> Result<RuntimeAvailabilityPublisher, String> {
+        let bus_root = self
+            .bus_root
+            .clone()
+            .ok_or_else(|| "shared Bus root is unavailable".to_string())?;
+        Ok(RuntimeAvailabilityPublisher::new(
+            self.node_id.clone(),
+            self.node_id.clone(),
+            NodeDeviceClass::Unknown,
+            bus_root,
+            self.availability_durable_path.clone(),
+        ))
+    }
+
+    /// Publish lifecycle evidence before forwarding a host-down operation.
+    /// `Ok(true)` means the seat apply still needs forwarding; `Ok(false)` is a
+    /// daemon-owned maintenance transition that is already complete.
+    fn publish_before_apply(&self, verb: &HostVerb) -> Result<bool, String> {
+        let request = match verb {
+            HostVerb::Power {
+                action: PowerAction::Suspend,
+                ..
+            } => RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::Sleeping,
+                "host-state-power",
+                "managed suspend",
+                Some(SUSPEND_EXPECTED_RETURN),
+            ),
+            HostVerb::Power {
+                action: PowerAction::Reboot,
+                ..
+            } => RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::ScheduledReboot,
+                "host-state-power",
+                "managed reboot",
+                Some(REBOOT_EXPECTED_RETURN),
+            ),
+            HostVerb::Power {
+                action: PowerAction::PowerOff,
+                ..
+            } => RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::ShuttingDown,
+                "host-state-power",
+                "managed shutdown",
+                Some(POWEROFF_EXPECTED_RETURN),
+            ),
+            HostVerb::Power {
+                action: PowerAction::Lock,
+                ..
+            }
+            | HostVerb::Volume { .. }
+            | HostVerb::Mute { .. }
+            | HostVerb::Bluetooth { .. }
+            | HostVerb::Display { .. } => return Ok(true),
+            HostVerb::Maintenance {
+                enabled: true,
+                reason,
+                expected_return_seconds,
+            } => {
+                if expected_return_seconds == &Some(0) {
+                    return Err("maintenance duration must be greater than zero".to_string());
+                }
+                RuntimeAvailabilityRequest::lifecycle(
+                    NodeAvailabilityState::Maintenance,
+                    "host-state-maintenance",
+                    reason.clone(),
+                    Some(
+                        expected_return_seconds
+                            .map(|seconds| Duration::from_secs(u64::from(seconds)))
+                            .unwrap_or(MAINTENANCE_EXPECTED_RETURN),
+                    ),
+                )
+            }
+            HostVerb::Maintenance {
+                enabled: false,
+                reason,
+                ..
+            } => {
+                let publisher = self.availability_publisher()?;
+                let current = publisher
+                    .current_intent()
+                    .map_err(|error| error.to_string())?;
+                if !current.is_some_and(|intent| {
+                    intent.state == NodeAvailabilityState::Maintenance
+                }) {
+                    return Err("maintenance end has no active maintenance intent".to_string());
+                }
+                publisher
+                    .publish(RuntimeAvailabilityRequest::lifecycle(
+                        NodeAvailabilityState::Returned,
+                        "host-state-maintenance",
+                        reason.clone(),
+                        None,
+                    ))
+                    .map_err(|error| error.to_string())?;
+                return Ok(false);
+            }
+        };
+        self.availability_publisher()?
+            .publish(request)
+            .map_err(|error| error.to_string())?;
+        Ok(!matches!(verb, HostVerb::Maintenance { .. }))
+    }
+
+    fn correct_failed_power_forward(&self, verb: &HostVerb) -> Result<(), String> {
+        if !matches!(
+            verb,
+            HostVerb::Power {
+                action: PowerAction::Suspend | PowerAction::Reboot | PowerAction::PowerOff,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+        self.availability_publisher()?
+            .publish(RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::Returned,
+                "host-state-power",
+                "managed power action was not forwarded",
+                None,
+            ))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     /// Drain the remote-verb action lane, authorize each against the mirror + the
     /// interlocks, and either forward an approved verb to the shell's apply lane or
     /// echo a typed refusal on the result lane.
@@ -667,9 +829,31 @@ impl HostStateWorker {
     fn emit_decision(&self, persist: &Persist, req: &VerbRequest, decision: Decision) {
         match decision {
             Decision::Apply(verb) => {
+                let forward_to_seat = match self.publish_before_apply(&verb) {
+                    Ok(forward) => forward,
+                    Err(error) => {
+                        self.emit_result(
+                            persist,
+                            &req.requester,
+                            "availability-intent-failed",
+                            &error,
+                        );
+                        return;
+                    }
+                };
                 let body = serde_json::to_string(&verb).unwrap_or_default();
-                if let Err(e) = persist.write(APPLY_TOPIC, Priority::High, None, Some(&body)) {
-                    tracing::debug!(target: "mackesd::host_state", error = %e, "apply forward failed");
+                if forward_to_seat {
+                    if let Err(e) = persist.write(APPLY_TOPIC, Priority::High, None, Some(&body)) {
+                        tracing::debug!(target: "mackesd::host_state", error = %e, "apply forward failed");
+                        let detail = match self.correct_failed_power_forward(&verb) {
+                            Ok(()) => format!("apply forward failed: {e}; availability corrected"),
+                            Err(correction) => format!(
+                                "apply forward failed: {e}; availability correction failed: {correction}"
+                            ),
+                        };
+                        self.emit_result(persist, &req.requester, "refused", &detail);
+                        return;
+                    }
                 }
                 self.emit_result(persist, &req.requester, "applied", &body);
             }
@@ -724,6 +908,242 @@ fn now_s() -> u64 {
         .unwrap_or(0)
 }
 
+async fn run_system_lifecycle_monitor(
+    publisher: RuntimeAvailabilityPublisher,
+    mut shutdown: ShutdownToken,
+) {
+    loop {
+        if let Err(error) = lifecycle_monitor_session(&publisher, &mut shutdown).await {
+            tracing::warn!(
+                target: "mackesd::host_state",
+                %error,
+                "system lifecycle monitor disconnected"
+            );
+        }
+        if shutdown.is_shutdown() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LIFECYCLE_MONITOR_RETRY) => {}
+            () = shutdown.wait() => return,
+        }
+    }
+}
+
+async fn lifecycle_monitor_session(
+    publisher: &RuntimeAvailabilityPublisher,
+    shutdown: &mut ShutdownToken,
+) -> Result<(), String> {
+    let connection = zbus::Connection::system()
+        .await
+        .map_err(|error| format!("connect system Bus: {error}"))?;
+    let login = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .map_err(|error| format!("create logind manager proxy: {error}"))?;
+    // Subscribe before startup recovery so a concurrent transition remains
+    // queued while NetworkManager stabilization is checked.
+    let mut sleep_signals = login
+        .receive_signal("PrepareForSleep")
+        .await
+        .map_err(|error| format!("subscribe PrepareForSleep: {error}"))?;
+    let mut shutdown_signals = login
+        .receive_signal("PrepareForShutdown")
+        .await
+        .map_err(|error| format!("subscribe PrepareForShutdown: {error}"))?;
+
+    if publisher.current_intent().map_err(|error| error.to_string())?.is_some_and(
+        |intent| {
+            matches!(
+                intent.state,
+                NodeAvailabilityState::ScheduledReboot
+                    | NodeAvailabilityState::Rebooting
+                    | NodeAvailabilityState::ShuttingDown
+                    | NodeAvailabilityState::ShutDown
+            )
+        },
+    ) {
+        let stable = tokio::select! {
+            result = wait_for_network_manager_stability(&connection) => result?,
+            () = shutdown.wait() => return Ok(()),
+        };
+        publish_return_after_stability(
+            publisher,
+            &[
+                NodeAvailabilityState::ScheduledReboot,
+                NodeAvailabilityState::Rebooting,
+                NodeAvailabilityState::ShuttingDown,
+                NodeAvailabilityState::ShutDown,
+            ],
+            stable,
+            "system boot network stabilized",
+        )?;
+    }
+
+    loop {
+        tokio::select! {
+            message = sleep_signals.next() => {
+                let Some(message) = message else {
+                    return Err("PrepareForSleep signal stream ended".to_string());
+                };
+                let preparing = message.body().deserialize::<bool>()
+                    .map_err(|error| format!("decode PrepareForSleep: {error}"))?;
+                if preparing {
+                    publish_logind_intent(
+                        publisher,
+                        NodeAvailabilityState::Sleeping,
+                        "system sleep preparation",
+                        SUSPEND_EXPECTED_RETURN,
+                    )?;
+                } else {
+                    let stable = tokio::select! {
+                        result = wait_for_network_manager_stability(&connection) => result?,
+                        () = shutdown.wait() => return Ok(()),
+                    };
+                    publish_return_after_stability(
+                        publisher,
+                        &[NodeAvailabilityState::Sleeping],
+                        stable,
+                        "system resume network stabilized",
+                    )?;
+                }
+            }
+            message = shutdown_signals.next() => {
+                let Some(message) = message else {
+                    return Err("PrepareForShutdown signal stream ended".to_string());
+                };
+                let preparing = message.body().deserialize::<bool>()
+                    .map_err(|error| format!("decode PrepareForShutdown: {error}"))?;
+                if preparing {
+                    publish_logind_intent(
+                        publisher,
+                        NodeAvailabilityState::ShuttingDown,
+                        "system shutdown preparation",
+                        POWEROFF_EXPECTED_RETURN,
+                    )?;
+                } else {
+                    let stable = tokio::select! {
+                        result = wait_for_network_manager_stability(&connection) => result?,
+                        () = shutdown.wait() => return Ok(()),
+                    };
+                    publish_return_after_stability(
+                        publisher,
+                        &[
+                            NodeAvailabilityState::ScheduledReboot,
+                            NodeAvailabilityState::ShuttingDown,
+                        ],
+                        stable,
+                        "cancelled shutdown network stabilized",
+                    )?;
+                }
+            }
+            () = shutdown.wait() => return Ok(()),
+        }
+    }
+}
+
+fn publish_logind_intent(
+    publisher: &RuntimeAvailabilityPublisher,
+    state: NodeAvailabilityState,
+    reason: &'static str,
+    expected_return: Duration,
+) -> Result<(), String> {
+    if publisher
+        .current_intent()
+        .map_err(|error| error.to_string())?
+        .is_some_and(|intent| {
+            intent.state == state
+                || (state == NodeAvailabilityState::ShuttingDown
+                    && matches!(
+                        intent.state,
+                        NodeAvailabilityState::ScheduledReboot
+                            | NodeAvailabilityState::Rebooting
+                            | NodeAvailabilityState::ShuttingDown
+                    ))
+        })
+    {
+        publisher
+            .correct_forward()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    publisher
+        .publish(RuntimeAvailabilityRequest::lifecycle(
+            state,
+            "host-state-logind",
+            reason,
+            Some(expected_return),
+        ))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn publish_return_after_stability(
+    publisher: &RuntimeAvailabilityPublisher,
+    expected_states: &[NodeAvailabilityState],
+    stable: bool,
+    reason: &'static str,
+) -> Result<bool, String> {
+    if !stable {
+        return Ok(false);
+    }
+    let Some(current) = publisher
+        .current_intent()
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    if !expected_states.contains(&current.state) {
+        return Ok(false);
+    }
+    publisher
+        .publish(RuntimeAvailabilityRequest::lifecycle(
+            NodeAvailabilityState::Returned,
+            "host-state-logind",
+            reason,
+            None,
+        ))
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+async fn wait_for_network_manager_stability(
+    connection: &zbus::Connection,
+) -> Result<bool, String> {
+    let network_manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager",
+        "org.freedesktop.NetworkManager",
+    )
+    .await
+    .map_err(|error| format!("create NetworkManager proxy: {error}"))?;
+    let deadline = tokio::time::Instant::now() + NETWORK_STABILITY_TIMEOUT;
+    let mut consecutive = 0_u8;
+    loop {
+        let state = network_manager
+            .get_property::<u32>("State")
+            .await
+            .map_err(|error| format!("read NetworkManager State: {error}"))?;
+        if state >= NETWORK_MANAGER_CONNECTED_SITE {
+            consecutive = consecutive.saturating_add(1);
+            if consecutive >= NETWORK_STABILITY_SAMPLES {
+                return Ok(true);
+            }
+        } else {
+            consecutive = 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(NETWORK_STABILITY_POLL).await;
+    }
+}
+
 #[async_trait::async_trait]
 impl Worker for HostStateWorker {
     fn name(&self) -> &'static str {
@@ -735,6 +1155,13 @@ impl Worker for HostStateWorker {
             tracing::debug!(target: "mackesd::host_state", "no bus root; worker idle");
             return Ok(());
         };
+        let lifecycle_publisher = self
+            .availability_publisher()
+            .map_err(anyhow::Error::msg)?;
+        let lifecycle_monitor = tokio::spawn(run_system_lifecycle_monitor(
+            lifecycle_publisher,
+            shutdown.clone(),
+        ));
         loop {
             match Persist::open(root.clone()) {
                 Ok(persist) => self.poll_once(&persist),
@@ -744,7 +1171,10 @@ impl Worker for HostStateWorker {
             }
             tokio::select! {
                 () = tokio::time::sleep(self.poll) => {}
-                () = shutdown.wait() => return Ok(()),
+                () = shutdown.wait() => {
+                    lifecycle_monitor.abort();
+                    return Ok(());
+                },
             }
         }
     }
@@ -1350,5 +1780,225 @@ mod tests {
         let body = results[0].body.as_deref().unwrap();
         assert!(body.contains("refused"), "{body}");
         assert!(body.contains("not-allowlisted"), "{body}");
+    }
+
+    #[test]
+    fn managed_suspend_publishes_intent_before_seat_forward() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open Bus");
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_availability_durable_path(temp.path().join("availability/current.json"));
+        let request = req(
+            HostVerb::Power {
+                action: PowerAction::Suspend,
+                confirm: false,
+            },
+            Phase::Confirm,
+        );
+
+        worker.emit_decision(&persist, &request, Decision::Apply(request.verb.clone()));
+
+        let verify = Persist::open(temp.path().join("bus")).expect("reopen Bus");
+        let health = verify
+            .list_since(&mackes_mesh_types::health::node_health_topic("nodeA"), None)
+            .expect("health rows");
+        let apply = verify.list_since(APPLY_TOPIC, None).expect("apply rows");
+        assert_eq!(health.len(), 1);
+        assert_eq!(apply.len(), 1);
+        assert!(
+            health[0].ulid < apply[0].ulid,
+            "availability intent must be durable and visible before disappearance is requested"
+        );
+        let intent: mackes_mesh_types::health::NodeAvailabilityIntent =
+            serde_json::from_str(health[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(intent.state, NodeAvailabilityState::Sleeping);
+        assert_eq!(intent.generation, 1);
+    }
+
+    #[test]
+    fn availability_failure_blocks_host_down_forward() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open Bus");
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let linked = temp.path().join("linked");
+        symlink(&real, &linked).unwrap();
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_availability_durable_path(linked.join("current.json"));
+        let request = req(
+            HostVerb::Power {
+                action: PowerAction::PowerOff,
+                confirm: true,
+            },
+            Phase::Confirm,
+        );
+
+        worker.emit_decision(&persist, &request, Decision::Apply(request.verb.clone()));
+
+        let verify = Persist::open(temp.path().join("bus")).expect("reopen Bus");
+        assert!(verify.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+        let result = verify
+            .list_since(&result_topic("nodeA"), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .expect("failure result");
+        assert!(result.contains("availability-intent-failed"), "{result}");
+    }
+
+    #[test]
+    fn failed_apply_enqueue_is_refused_and_compensates_the_power_intent() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open Bus");
+        let connection = rusqlite::Connection::open(bus.join("index.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_host_apply BEFORE INSERT ON messages
+                 WHEN NEW.topic = 'action/host/local/apply'
+                 BEGIN SELECT RAISE(FAIL, 'host apply rejected'); END;",
+            )
+            .unwrap();
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus.clone())
+            .with_availability_durable_path(temp.path().join("availability/current.json"));
+        let request = req(
+            HostVerb::Power {
+                action: PowerAction::Suspend,
+                confirm: false,
+            },
+            Phase::Confirm,
+        );
+
+        worker.emit_decision(&persist, &request, Decision::Apply(request.verb.clone()));
+
+        let verify = Persist::open(bus).unwrap();
+        assert!(verify.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+        let intents = verify
+            .list_since(&mackes_mesh_types::health::node_health_topic("nodeA"), None)
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                serde_json::from_str::<mackes_mesh_types::health::NodeAvailabilityIntent>(
+                    message.body.as_deref().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].state, NodeAvailabilityState::Sleeping);
+        assert_eq!(intents[1].state, NodeAvailabilityState::Returned);
+        assert_eq!((intents[0].generation, intents[1].generation), (1, 2));
+        let result = verify
+            .list_since(&result_topic("nodeA"), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap();
+        assert!(result.contains(r#""outcome":"refused""#), "{result}");
+        assert!(result.contains("availability corrected"), "{result}");
+        assert!(!result.contains(r#""outcome":"applied""#), "{result}");
+    }
+
+    #[test]
+    fn return_publication_requires_a_real_stability_verdict() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus.clone())
+            .with_availability_durable_path(temp.path().join("availability/current.json"));
+        let publisher = worker.availability_publisher().unwrap();
+        publisher
+            .publish(RuntimeAvailabilityRequest::lifecycle(
+                NodeAvailabilityState::Sleeping,
+                "host-state-logind",
+                "system sleep preparation",
+                Some(SUSPEND_EXPECTED_RETURN),
+            ))
+            .unwrap();
+
+        assert!(!publish_return_after_stability(
+            &publisher,
+            &[NodeAvailabilityState::Sleeping],
+            false,
+            "system resume network stabilized",
+        )
+        .unwrap());
+        assert_eq!(
+            Persist::open(bus.clone())
+                .unwrap()
+                .list_since(&mackes_mesh_types::health::node_health_topic("nodeA"), None)
+                .unwrap()
+                .len(),
+            1,
+            "no NetworkManager stability must leave the expected absence active"
+        );
+
+        assert!(publish_return_after_stability(
+            &publisher,
+            &[NodeAvailabilityState::Sleeping],
+            true,
+            "system resume network stabilized",
+        )
+        .unwrap());
+        let returned = publisher.current_intent().unwrap().unwrap();
+        assert_eq!(returned.state, NodeAvailabilityState::Returned);
+        assert_eq!(returned.generation, 2);
+    }
+
+    #[test]
+    fn maintenance_start_and_end_are_daemon_owned_monotonic_transitions() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open Bus");
+        let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_availability_durable_path(temp.path().join("availability/current.json"));
+        let start = req(
+            HostVerb::Maintenance {
+                enabled: true,
+                reason: "planned package maintenance".to_string(),
+                expected_return_seconds: Some(600),
+            },
+            Phase::Confirm,
+        );
+        worker.emit_decision(&persist, &start, Decision::Apply(start.verb.clone()));
+        let end = req(
+            HostVerb::Maintenance {
+                enabled: false,
+                reason: "maintenance completed".to_string(),
+                expected_return_seconds: None,
+            },
+            Phase::Confirm,
+        );
+        worker.emit_decision(&persist, &end, Decision::Apply(end.verb.clone()));
+
+        let verify = Persist::open(temp.path().join("bus")).expect("reopen Bus");
+        assert!(
+            verify.list_since(APPLY_TOPIC, None).unwrap().is_empty(),
+            "maintenance is daemon state, not a seat hardware verb"
+        );
+        let intents = verify
+            .list_since(&mackes_mesh_types::health::node_health_topic("nodeA"), None)
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                serde_json::from_str::<mackes_mesh_types::health::NodeAvailabilityIntent>(
+                    message.body.as_deref().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].state, NodeAvailabilityState::Maintenance);
+        assert_eq!(intents[1].state, NodeAvailabilityState::Returned);
+        assert_eq!(intents[0].generation, 1);
+        assert_eq!(intents[1].generation, 2);
     }
 }

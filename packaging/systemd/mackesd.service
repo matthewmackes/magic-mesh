@@ -4,7 +4,10 @@ Documentation=https://github.com/matthewmackes/magic-mesh
 # Start only after the overlay manager has been started.  This does not make
 # Nebula a hard dependency (a client can still come up degraded), but avoids
 # racing enrollment/peer publication against creation of nebula1 at boot.
-After=network-online.target nebula.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service
+# Mesh-secret recipient registration is deliberately a parallel, best-effort
+# reconciliation; it must never hold the control plane behind a slow secret
+# store or a first-boot network retry.
+After=network-online.target nebula.service
 Wants=network-online.target nebula.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service
 # Service-manager policy: keep retrying across a generous window (a fixed role
 # / mount brings it up without manual help) but don't tight-loop forever; the
@@ -155,6 +158,12 @@ RestrictSUIDSGID=true
 ExecStartPre=-/usr/bin/install -d -m 0700 /var/lib/mackesd
 LimitNOFILE=65536
 TasksMax=4096
+CPUAccounting=true
+# Keep the control plane from competing with the first-class guest workload
+# on small four-thread Workstations; libvirt's VM cgroups remain separate.
+CPUQuota=200%
+IOReadBandwidthMax=/var/lib/mde-vms 200M
+IOWriteBandwidthMax=/var/lib/mde-vms 200M
 MemoryAccounting=true
 # A control-plane regression must restart the daemon, never hang the seat.
 # These limits sit above the documented <1 GiB settled / <2 GiB peak contract.

@@ -1,4 +1,4 @@
-//! The egui rendering of the Bookmarks surface (BOOKMARKS-4).
+//! The egui rendering of the Browser-owned Bookmarks panel (BOOKMARKS-4).
 //!
 //! Every widget reads the render-agnostic [`Manager`] and draws through the
 //! shared [`Style`] — no raw colours or spacing (governance §4). The view never
@@ -99,11 +99,11 @@ enum Action {
     },
 }
 
-/// Render the whole Bookmarks surface into `ui` — the one reusable entry point.
+/// Render the whole Browser-owned Bookmarks panel into `ui` — the reusable
+/// entry point consumed by the shell.
 ///
-/// (E12-3, EMBED.) The standalone binary calls it inside its window
-/// [`egui::CentralPanel`]; the E12 shell mounts the SAME fn as a panel. The
-/// internal regions use `show_inside`, so the surface lays out within whatever
+/// The Browser owns the window and calls this function with its panel `ui`. The
+/// internal regions use `show_inside`, so the panel lays out within whatever
 /// `ui` it is handed.
 pub fn bookmarks_panel(ui: &mut egui::Ui, m: &mut Manager) {
     let mut actions: Vec<Action> = Vec::new();
@@ -152,7 +152,7 @@ fn handle_keys(ui: &egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 
 fn header(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
     egui::TopBottomPanel::top("bm-header").show_inside(ui, |ui| {
-        // The workspace begins with the shared app frame. The
+        // The embedded panel begins with the shared navigation frame. The
         // search/sort/location strip below is intentionally domain-specific:
         // it is the Bookmarks query control, not a second navigation system.
         let _ = AppFrame::new("Bookmarks").leading_title().show(ui);
@@ -1207,18 +1207,18 @@ mod tests {
         );
     }
 
-    /// PLATFORM-INTERFACES Q19: the main workspace and detail pane both use the
+    /// PLATFORM-INTERFACES Q19: the main panel and detail pane both use the
     /// shared navigation frame. Bookmarks keeps its fused query/sort/location
     /// strip below that frame because it is domain content, not duplicate chrome.
     #[test]
-    fn bookmarks_workspace_and_detail_headers_ride_shared_navigation() {
+    fn bookmarks_panel_and_detail_headers_ride_shared_navigation() {
         let mut m = manager();
         let texts = painted_text(&render_shapes(&mut m));
         assert!(
             texts.iter().any(|(t, s)| {
                 t == "Bookmarks" && (*s - Style::TYPE_HEADLINE).abs() < f32::EPSILON
             }),
-            "the workspace title must render on the shared AppFrame Headline rung: {texts:?}"
+            "the panel title must render on the shared AppFrame Headline rung: {texts:?}"
         );
         assert!(
             texts
@@ -1229,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn bookmarks_workspace_frame_tessellates_on_desktop_narrow_and_large_text() {
+    fn bookmarks_panel_tessellates_on_desktop_narrow_and_large_text() {
         for (viewport, density) in [
             (vec2(1100.0, 700.0), Density::Mouse),
             (vec2(480.0, 800.0), Density::Mouse),
@@ -1239,7 +1239,7 @@ mod tests {
             let shapes = render_shapes_at(&mut m, viewport, density);
             assert!(
                 !shapes.is_empty(),
-                "Bookmarks frame must paint at {viewport:?} / {density:?}"
+                "Bookmarks panel must paint at {viewport:?} / {density:?}"
             );
         }
     }
@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn renders_the_empty_first_run_state() {
         // The honest first-run state: an empty collection paints its "No bookmarks
-        // yet" copy and the standalone detail/rail seams — no fabricated data (§7).
+        // yet" copy and the detail/rail regions — no fabricated data (§7).
         let mut m = manager();
         assert!(m.is_empty());
         render(&mut m);

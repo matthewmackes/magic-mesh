@@ -7,7 +7,8 @@
 //! tab, Q26). When another peer wants to take over, it drops a
 //! `music-handoff-intent/<ulid>.json`; the current peer reads it,
 //! pauses, surfaces an "Operator-Mac took over" notification, and
-//! deletes the intent.
+//! writes a completion. The requesting peer deletes the intent only after
+//! it has consumed the matching completion.
 //!
 //! All the coordination decisions are pure functions
 //! (`is_claimed_by_other`, `pending_takeover_for`, `latest_intent`) so
@@ -16,13 +17,29 @@
 //! `mde-musicd state {show,by-peer,takeover}` is the reachable entry
 //! point exercising the files.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// A music-state record is considered stale (the playing peer went
 /// away without clearing it) after 15 s — three missed 5 s writes.
 pub const STATE_STALE_MS: u64 = 15_000;
+/// Version of the durable playback-state envelope.
+pub const STATE_SCHEMA_VERSION: u16 = 1;
+/// Maximum number of retained handoff intents admitted by one state read.
+pub const MAX_HANDOFF_INTENTS: usize = 64;
+/// Maximum number of peer heartbeat snapshots admitted by one roster read.
+pub const MAX_PEER_STATE_SNAPSHOTS: usize = 64;
+/// Maximum number of handoff completions admitted by one target-side read.
+pub const MAX_HANDOFF_COMPLETIONS: usize = 64;
+
+const MAX_STATE_RECORD_BYTES: u64 = 16 * 1024;
+const MAX_PEER_NAME_BYTES: usize = 128;
+const MAX_SONG_ID_BYTES: usize = 256;
+const MAX_INTENT_ID_BYTES: usize = 64;
 
 /// Authoritative "who is playing what" record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +70,96 @@ pub struct HandoffIntent {
     pub to_peer: Option<String>,
     /// Epoch-ms the intent was issued (conflict tiebreak: latest wins).
     pub issued_ms: u64,
+}
+
+/// Durable completion written by the yielding owner after it has persisted its
+/// paused state. The requesting peer consumes this record to resume the same
+/// queue song at the owner's exact position; it is coordination metadata, not
+/// a second playback state authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffCompletion {
+    /// The intent that caused the yield.
+    pub intent_id: String,
+    /// Peer that requested the handoff and must consume this completion.
+    pub from_peer: String,
+    /// Peer that yielded and wrote the paused state.
+    pub owner_peer: String,
+    /// Queue song preserved by the yielding owner.
+    pub song_id: String,
+    /// Exact position within `song_id` at the yield boundary.
+    pub position_ms: u64,
+    /// Epoch-ms when the completion was recorded.
+    pub completed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateFileV1 {
+    schema_version: u16,
+    #[serde(flatten)]
+    state: MusicState,
+}
+
+fn valid_component(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .chars()
+            .all(|character| !character.is_control() && character != '/' && character != '\\')
+}
+
+fn valid_song_id(value: &str) -> bool {
+    value.len() <= MAX_SONG_ID_BYTES && value.chars().all(|character| !character.is_control())
+}
+
+fn valid_state_record(state: &MusicState) -> bool {
+    valid_component(&state.peer, MAX_PEER_NAME_BYTES) && valid_song_id(&state.song_id)
+}
+
+fn valid_intent_record(intent: &HandoffIntent) -> bool {
+    valid_component(&intent.intent_id, MAX_INTENT_ID_BYTES)
+        && valid_component(&intent.from_peer, MAX_PEER_NAME_BYTES)
+        && intent
+            .to_peer
+            .as_deref()
+            .is_none_or(|peer| valid_component(peer, MAX_PEER_NAME_BYTES))
+}
+
+fn valid_completion_record(completion: &HandoffCompletion) -> bool {
+    valid_component(&completion.intent_id, MAX_INTENT_ID_BYTES)
+        && valid_component(&completion.from_peer, MAX_PEER_NAME_BYTES)
+        && valid_component(&completion.owner_peer, MAX_PEER_NAME_BYTES)
+        && !completion.song_id.is_empty()
+        && valid_song_id(&completion.song_id)
+}
+
+fn canonical_handoff_path(path: &Path, intent_id: &str) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == intent_id)
+}
+
+fn canonical_peer_state_path(path: &Path, peer: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == format!("{peer}.json"))
+}
+
+fn read_bounded_bytes(path: &Path) -> Option<Vec<u8>> {
+    let length = std::fs::metadata(path).ok()?.len();
+    if length > MAX_STATE_RECORD_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    let mut file = std::fs::File::open(path).ok()?;
+    file.by_ref()
+        .take(MAX_STATE_RECORD_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_STATE_RECORD_BYTES).then_some(bytes)
+}
+
+fn decode_bounded<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    serde_json::from_slice(bytes).ok()
 }
 
 // ───────────────────────── pure decisions ─────────────────────────
@@ -86,8 +193,14 @@ pub fn is_claimed_by_other(
 pub fn pending_takeover_for(intents: &[HandoffIntent], my_host: &str) -> Option<HandoffIntent> {
     intents
         .iter()
-        .filter(|i| i.to_peer.as_deref() == Some(my_host) && i.from_peer != my_host)
-        .max_by_key(|i| i.issued_ms)
+        .filter(|i| {
+            i.to_peer.as_deref().is_none_or(|target| target == my_host) && i.from_peer != my_host
+        })
+        .max_by(|a, b| {
+            a.issued_ms
+                .cmp(&b.issued_ms)
+                .then_with(|| a.intent_id.cmp(&b.intent_id))
+        })
         .cloned()
 }
 
@@ -105,6 +218,42 @@ pub fn latest_intent(intents: &[HandoffIntent]) -> Option<HandoffIntent> {
         .cloned()
 }
 
+/// Whether a completion is authorized by the target's newest still-pending
+/// request. Binding the completion to the current request prevents a stale
+/// file (or a writer that merely spoofs the target in `from_peer`) from
+/// starting playback without a live, target-owned intent. A targeted intent
+/// also binds the completion to the owner that was asked to yield; general
+/// claims still require a distinct owner. The owner timestamp must not
+/// precede the request.
+#[must_use]
+pub fn completion_matches_intent(
+    completion: &HandoffCompletion,
+    intents: &[HandoffIntent],
+    target_peer: &str,
+) -> bool {
+    let Some(current_intent) = intents
+        .iter()
+        .filter(|intent| valid_intent_record(intent) && intent.from_peer == target_peer)
+        .max_by(|left, right| {
+            left.issued_ms
+                .cmp(&right.issued_ms)
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        })
+    else {
+        return false;
+    };
+
+    valid_completion_record(completion)
+        && current_intent.intent_id == completion.intent_id
+        && completion.from_peer == current_intent.from_peer
+        && completion.owner_peer != target_peer
+        && current_intent
+            .to_peer
+            .as_deref()
+            .is_none_or(|owner| owner == completion.owner_peer)
+        && completion.completed_ms >= current_intent.issued_ms
+}
+
 // ───────────────────────── file layout ─────────────────────────
 
 /// `$HOME/.local/share/mde/` — the mesh-shared music data root.
@@ -114,19 +263,43 @@ pub fn data_dir() -> PathBuf {
     Path::new(&home).join(".local/share/mde")
 }
 
+/// Syncthing-replicated ownership and handoff root.
+///
+/// Catalogs, credentials, replay nonces, downloads, and the playback queue
+/// remain seat-local under [`data_dir`]. Only the bounded per-peer heartbeat,
+/// handoff-intent, and handoff-completion records belong on the mesh file
+/// plane. Keeping this resolver separate prevents a shared-root setting from
+/// accidentally turning local credentials or mutable queue state into
+/// workgroup-wide authority.
+#[must_use]
+pub fn coordination_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("MDE_MUSIC_COORDINATION_DIR") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("MDE_WORKGROUP_ROOT")
+        .map_or_else(data_dir, |root| PathBuf::from(root).join("music/session"))
+}
+
 /// This peer's hostname — the `peer` field on every [`MusicState`] this
 /// host writes.
 ///
-/// Falls back to `localhost` when the `hostname` command is unavailable.
+/// Falls back to `localhost` when the `hostname` command is unavailable. The
+/// result is cached because this helper is used by state, handoff, MPRIS, and
+/// catalog paths; repeated process spawning would amplify across seats.
 #[must_use]
 pub fn local_host() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".to_string())
+    static LOCAL_HOST: OnceLock<String> = OnceLock::new();
+    LOCAL_HOST
+        .get_or_init(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "localhost".to_string())
+        })
+        .clone()
 }
 
 /// Epoch-ms now (the `updated_ms` / `issued_ms` timestamp source).
@@ -156,22 +329,40 @@ pub fn intents_dir(dir: &Path) -> PathBuf {
     dir.join("music-handoff-intent")
 }
 
+/// Durable handoff-completion directory shared by the music peers.
+#[must_use]
+pub fn completions_dir(dir: &Path) -> PathBuf {
+    dir.join("music-handoff-complete")
+}
+
 /// Read `music-state.json` (None when absent/malformed).
 #[must_use]
 pub fn read_state(dir: &Path) -> Option<MusicState> {
-    std::fs::read_to_string(state_path(dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let bytes = read_bounded_bytes(&state_path(dir))?;
+    decode_bounded::<StateFileV1>(&bytes)
+        .filter(|file| file.schema_version == STATE_SCHEMA_VERSION)
+        .map(|file| file.state)
+        .filter(valid_state_record)
+        .or_else(|| decode_bounded::<MusicState>(&bytes).filter(valid_state_record))
 }
 
 /// Write `music-state.json` (+ this peer's by-peer snapshot).
 ///
 /// # Errors
-/// IO / serialization failures.
+/// IO / serialization failures, or an unsafe state identity.
 pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
+    if !valid_state_record(state) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "music state identity or song id exceeds its contract",
+        ));
+    }
     std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_string_pretty(&StateFileV1 {
+        schema_version: STATE_SCHEMA_VERSION,
+        state: state.clone(),
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(state_path(dir), &json)?;
     let bp = by_peer_path(dir, &state.peer);
     if let Some(parent) = bp.parent() {
@@ -180,7 +371,10 @@ pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
     std::fs::write(bp, json)
 }
 
-/// Read every handoff intent in the intents dir (skips malformed).
+/// Read the newest bounded handoff-intent projection from the intents dir.
+/// Malformed, oversized, and unsafe records are ignored. The return order is
+/// newest first so callers can inspect the winning request without depending
+/// on filesystem directory order.
 #[must_use]
 pub fn read_intents(dir: &Path) -> Vec<HandoffIntent> {
     let mut out = Vec::new();
@@ -188,21 +382,64 @@ pub fn read_intents(dir: &Path) -> Vec<HandoffIntent> {
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().is_some_and(|x| x == "json") {
-                if let Some(i) = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
+                if let Some(intent) = read_bounded_bytes(&p)
+                    .and_then(|bytes| decode_bounded::<HandoffIntent>(&bytes))
+                    .filter(|intent| {
+                        valid_intent_record(intent)
+                            && canonical_handoff_path(&p, &intent.intent_id)
+                    })
                 {
-                    out.push(i);
+                    out.push(intent);
                 }
             }
         }
     }
+    out.sort_unstable_by(|a, b| {
+        b.issued_ms
+            .cmp(&a.issued_ms)
+            .then_with(|| b.intent_id.cmp(&a.intent_id))
+    });
+    out.truncate(MAX_HANDOFF_INTENTS);
     out
 }
 
-/// Read every peer's last activity snapshot from `music-state-by-peer/`
-/// (the AIR-15.b.5 Peers-tab roster) — the dir [`write_state`] heartbeats
-/// each peer's snapshot into. Skips malformed files; sorted by host.
+/// Read newest bounded handoff completions for target-side resume. Malformed,
+/// oversized, and unsafe records are ignored; filesystem ordering is never
+/// used as a conflict decision.
+#[must_use]
+pub fn read_completions(dir: &Path) -> Vec<HandoffCompletion> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(completions_dir(dir)) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                if let Some(completion) = read_bounded_bytes(&path)
+                    .and_then(|bytes| decode_bounded::<HandoffCompletion>(&bytes))
+                    .filter(|completion| {
+                        valid_completion_record(completion)
+                            && canonical_handoff_path(&path, &completion.intent_id)
+                    })
+                {
+                    out.push(completion);
+                }
+            }
+        }
+    }
+    out.sort_unstable_by(|a, b| {
+        b.completed_ms
+            .cmp(&a.completed_ms)
+            .then_with(|| b.intent_id.cmp(&a.intent_id))
+    });
+    out.truncate(MAX_HANDOFF_COMPLETIONS);
+    out
+}
+
+/// Read the newest bounded peer heartbeat projection from
+/// `music-state-by-peer/`. Malformed, oversized, and unsafe records are
+/// ignored; the final roster remains sorted by peer for stable UI output.
 #[must_use]
 pub fn read_all_peer_states(dir: &Path) -> Vec<MusicState> {
     let mut out = Vec::new();
@@ -210,16 +447,32 @@ pub fn read_all_peer_states(dir: &Path) -> Vec<MusicState> {
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().is_some_and(|x| x == "json") {
-                if let Some(st) = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<MusicState>(&s).ok())
+                if let Some(state) = read_bounded_bytes(&p)
+                    .and_then(|bytes| {
+                        decode_bounded::<StateFileV1>(&bytes)
+                            .filter(|file| file.schema_version == STATE_SCHEMA_VERSION)
+                            .map(|file| file.state)
+                            .or_else(|| decode_bounded::<MusicState>(&bytes))
+                    })
+                    .filter(|state| {
+                        valid_state_record(state)
+                            && canonical_peer_state_path(&p, &state.peer)
+                    })
                 {
-                    out.push(st);
+                    out.push(state);
+                    if out.len() > MAX_PEER_STATE_SNAPSHOTS {
+                        out.sort_unstable_by(|a, b| {
+                            b.updated_ms
+                                .cmp(&a.updated_ms)
+                                .then_with(|| b.peer.cmp(&a.peer))
+                        });
+                        out.truncate(MAX_PEER_STATE_SNAPSHOTS);
+                    }
                 }
             }
         }
     }
-    out.sort_by(|a, b| a.peer.cmp(&b.peer));
+    out.sort_unstable_by(|a, b| a.peer.cmp(&b.peer));
     out
 }
 
@@ -234,6 +487,16 @@ pub fn post_takeover(
     to_peer: Option<String>,
     now_ms: u64,
 ) -> std::io::Result<HandoffIntent> {
+    if !valid_component(from_peer, MAX_PEER_NAME_BYTES)
+        || to_peer
+            .as_deref()
+            .is_some_and(|peer| !valid_component(peer, MAX_PEER_NAME_BYTES))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "handoff peer identity exceeds its contract",
+        ));
+    }
     let id = ulid::Ulid::new().to_string();
     let intent = HandoffIntent {
         intent_id: id.clone(),
@@ -249,9 +512,39 @@ pub fn post_takeover(
     Ok(intent)
 }
 
-/// Delete a handoff intent by id (the yielding peer clears it after
-/// pausing). Best-effort.
+/// Persist a completion after the owner has durably written its paused state.
+/// The target can safely retry this record until it has started playback.
+pub fn write_completion(dir: &Path, completion: &HandoffCompletion) -> std::io::Result<()> {
+    if !valid_completion_record(completion) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "handoff completion identity or song id exceeds its contract",
+        ));
+    }
+    let directory = completions_dir(dir);
+    std::fs::create_dir_all(&directory)?;
+    let body = serde_json::to_vec_pretty(completion)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    std::fs::write(
+        directory.join(format!("{}.json", completion.intent_id)),
+        body,
+    )
+}
+
+/// Delete a consumed handoff completion by its validated intent id.
+pub fn clear_completion(dir: &Path, intent_id: &str) {
+    if !valid_component(intent_id, MAX_INTENT_ID_BYTES) {
+        return;
+    }
+    let _ = std::fs::remove_file(completions_dir(dir).join(format!("{intent_id}.json")));
+}
+
+/// Delete a handoff intent by id after the requester has consumed its
+/// matching completion. Best-effort.
 pub fn clear_intent(dir: &Path, intent_id: &str) {
+    if !valid_component(intent_id, MAX_INTENT_ID_BYTES) {
+        return;
+    }
     let _ = std::fs::remove_file(intents_dir(dir).join(format!("{intent_id}.json")));
 }
 
@@ -289,6 +582,29 @@ mod tests {
         assert_eq!(all[0].peer, "anvil");
         assert_eq!(all[1].peer, "forge");
         assert!(read_all_peer_states(tempfile::TempDir::new().unwrap().path()).is_empty());
+    }
+
+    #[test]
+    fn peer_state_reader_rejects_snapshot_with_mismatched_peer_filename() {
+        let dir = tempdir().unwrap();
+        let peers = dir.path().join("music-state-by-peer");
+        std::fs::create_dir_all(&peers).unwrap();
+        let snapshot = serde_json::to_vec(&StateFileV1 {
+            schema_version: STATE_SCHEMA_VERSION,
+            state: MusicState {
+                peer: "seat-15".into(),
+                playing: false,
+                song_id: String::new(),
+                position_ms: 0,
+                updated_ms: 100,
+            },
+        })
+        .unwrap();
+        std::fs::write(peers.join("seat-16.json"), &snapshot).unwrap();
+        assert!(read_all_peer_states(dir.path()).is_empty());
+
+        std::fs::write(peers.join("seat-15.json"), snapshot).unwrap();
+        assert_eq!(read_all_peer_states(dir.path()).len(), 1);
     }
     use tempfile::tempdir;
 
@@ -355,6 +671,13 @@ mod tests {
         let got = pending_takeover_for(&intents, "anvil").unwrap();
         assert_eq!(got.intent_id, "b");
         assert_eq!(got.from_peer, "beacon");
+        let general = vec![intent("general", "beacon", None, 40)];
+        assert_eq!(
+            pending_takeover_for(&general, "anvil")
+                .expect("general takeover applies to the local owner")
+                .intent_id,
+            "general"
+        );
         // A peer never yields to its own intent.
         let self_only = vec![intent("x", "anvil", Some("anvil"), 5)];
         assert!(pending_takeover_for(&self_only, "anvil").is_none());
@@ -369,6 +692,85 @@ mod tests {
         ];
         assert_eq!(latest_intent(&intents).unwrap().intent_id, "z");
         assert!(latest_intent(&[]).is_none());
+    }
+
+    #[test]
+    fn handoff_completion_requires_a_live_request_and_matching_owner() {
+        let request = intent("handoff-1", "forge", Some("anvil"), 100);
+        let completion = HandoffCompletion {
+            intent_id: "handoff-1".into(),
+            from_peer: "forge".into(),
+            owner_peer: "anvil".into(),
+            song_id: "song-7".into(),
+            position_ms: 42_500,
+            completed_ms: 101,
+        };
+        assert!(completion_matches_intent(
+            &completion,
+            std::slice::from_ref(&request),
+            "forge"
+        ));
+
+        let mut spoofed_requester = completion.clone();
+        spoofed_requester.from_peer = "intruder".into();
+        assert!(!completion_matches_intent(
+            &spoofed_requester,
+            std::slice::from_ref(&request),
+            "forge"
+        ));
+
+        // A replay after the request has been consumed has no authorization.
+        assert!(!completion_matches_intent(&completion, &[], "forge"));
+
+        let mut wrong_owner = completion.clone();
+        wrong_owner.owner_peer = "beacon".into();
+        assert!(!completion_matches_intent(
+            &wrong_owner,
+            std::slice::from_ref(&request),
+            "forge"
+        ));
+
+        let mut stale = completion;
+        stale.completed_ms = 99;
+        assert!(!completion_matches_intent(
+            &stale,
+            std::slice::from_ref(&request),
+            "forge"
+        ));
+    }
+
+    #[test]
+    fn handoff_completion_rejects_a_superseded_request_for_the_target() {
+        let old_request = intent("handoff-old", "forge", Some("anvil"), 100);
+        let current_request = intent("handoff-current", "forge", Some("beacon"), 200);
+        let old_completion = HandoffCompletion {
+            intent_id: old_request.intent_id.clone(),
+            from_peer: "forge".into(),
+            owner_peer: "anvil".into(),
+            song_id: "song-7".into(),
+            position_ms: 42_500,
+            completed_ms: 101,
+        };
+        let current_completion = HandoffCompletion {
+            intent_id: current_request.intent_id.clone(),
+            from_peer: "forge".into(),
+            owner_peer: "beacon".into(),
+            song_id: "song-9".into(),
+            position_ms: 12_000,
+            completed_ms: 201,
+        };
+        let intents = [old_request, current_request];
+
+        assert!(!completion_matches_intent(
+            &old_completion,
+            &intents,
+            "forge"
+        ));
+        assert!(completion_matches_intent(
+            &current_completion,
+            &intents,
+            "forge"
+        ));
     }
 
     #[test]
@@ -397,8 +799,158 @@ mod tests {
     }
 
     #[test]
+    fn handoff_completion_round_trips_and_is_cleared_by_intent_id() {
+        let dir = tempdir().unwrap();
+        let completion = HandoffCompletion {
+            intent_id: "intent-1".into(),
+            from_peer: "forge".into(),
+            owner_peer: "anvil".into(),
+            song_id: "song-7".into(),
+            position_ms: 42_500,
+            completed_ms: 88,
+        };
+        write_completion(dir.path(), &completion).unwrap();
+        assert_eq!(read_completions(dir.path()), vec![completion]);
+        clear_completion(dir.path(), "intent-1");
+        assert!(read_completions(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn handoff_readers_reject_alias_files_that_can_replay_same_handoff() {
+        let dir = tempdir().unwrap();
+        let intent = intent("intent-1", "forge", Some("anvil"), 77);
+        let intents = intents_dir(dir.path());
+        std::fs::create_dir_all(&intents).unwrap();
+        let intent_json = serde_json::to_vec(&intent).unwrap();
+        std::fs::write(intents.join("intent-1.json"), &intent_json).unwrap();
+        std::fs::write(intents.join("replay-alias.json"), intent_json).unwrap();
+        assert_eq!(read_intents(dir.path()), vec![intent]);
+
+        let completion = HandoffCompletion {
+            intent_id: "intent-1".into(),
+            from_peer: "forge".into(),
+            owner_peer: "anvil".into(),
+            song_id: "song-7".into(),
+            position_ms: 42_500,
+            completed_ms: 88,
+        };
+        let completions = completions_dir(dir.path());
+        std::fs::create_dir_all(&completions).unwrap();
+        let completion_json = serde_json::to_vec(&completion).unwrap();
+        std::fs::write(completions.join("intent-1.json"), &completion_json).unwrap();
+        std::fs::write(completions.join("replay-alias.json"), completion_json).unwrap();
+        assert_eq!(read_completions(dir.path()), vec![completion]);
+    }
+
+    #[test]
+    fn handoff_completion_reader_keeps_newest_bounded_backlog() {
+        let dir = tempdir().unwrap();
+        let completions = completions_dir(dir.path());
+        std::fs::create_dir_all(&completions).unwrap();
+        for index in 0..=MAX_HANDOFF_COMPLETIONS {
+            let completion = HandoffCompletion {
+                intent_id: format!("intent-{index:03}"),
+                from_peer: "forge".into(),
+                owner_peer: "anvil".into(),
+                song_id: format!("song-{index:03}"),
+                position_ms: index as u64,
+                completed_ms: index as u64,
+            };
+            std::fs::write(
+                completions.join(format!("{}.json", completion.intent_id)),
+                serde_json::to_vec(&completion).unwrap(),
+            )
+            .unwrap();
+        }
+        let retained = read_completions(dir.path());
+        assert_eq!(retained.len(), MAX_HANDOFF_COMPLETIONS);
+        assert_eq!(retained.first().unwrap().completed_ms, 64);
+        assert!(!retained.iter().any(|item| item.intent_id == "intent-000"));
+    }
+
+    #[test]
+    fn handoff_intent_reader_keeps_newest_bounded_backlog() {
+        let dir = tempdir().unwrap();
+        let intents = intents_dir(dir.path());
+        std::fs::create_dir_all(&intents).unwrap();
+        for index in 0..=MAX_HANDOFF_INTENTS {
+            let intent = intent(
+                &format!("intent-{index:03}"),
+                &format!("peer-{index:03}"),
+                Some("anvil"),
+                index as u64,
+            );
+            std::fs::write(
+                intents.join(format!("{}.json", intent.intent_id)),
+                serde_json::to_vec(&intent).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let retained = read_intents(dir.path());
+        assert_eq!(retained.len(), MAX_HANDOFF_INTENTS);
+        assert_eq!(
+            retained.first().unwrap().issued_ms,
+            MAX_HANDOFF_INTENTS as u64
+        );
+        assert_eq!(retained.last().unwrap().issued_ms, 1);
+        assert!(retained.iter().all(|item| item.issued_ms > 0));
+        assert_eq!(
+            latest_intent(&retained).unwrap().issued_ms,
+            MAX_HANDOFF_INTENTS as u64
+        );
+    }
+
+    #[test]
+    fn peer_state_reader_keeps_newest_bounded_backlog() {
+        let dir = tempdir().unwrap();
+        for index in 0..=MAX_PEER_STATE_SNAPSHOTS {
+            write_state(
+                dir.path(),
+                &state(&format!("peer-{index:03}"), index % 2 == 0, index as u64),
+            )
+            .unwrap();
+        }
+
+        let retained = read_all_peer_states(dir.path());
+        assert_eq!(retained.len(), MAX_PEER_STATE_SNAPSHOTS);
+        assert!(!retained.iter().any(|item| item.peer == "peer-000"));
+        assert!(retained.iter().any(|item| item.peer == "peer-064"));
+        assert!(retained
+            .windows(2)
+            .all(|items| items[0].peer <= items[1].peer));
+    }
+
+    #[test]
+    fn oversized_handoff_state_records_are_ignored() {
+        let dir = tempdir().unwrap();
+        let intents = intents_dir(dir.path());
+        std::fs::create_dir_all(&intents).unwrap();
+        std::fs::write(
+            intents.join("oversized.json"),
+            vec![b'x'; MAX_STATE_RECORD_BYTES as usize + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            state_path(dir.path()),
+            vec![b'x'; MAX_STATE_RECORD_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_intents(dir.path()).is_empty());
+        assert!(read_completions(dir.path()).is_empty());
+        assert!(read_state(dir.path()).is_none());
+    }
+
+    #[test]
     fn read_state_absent_is_none() {
         let dir = tempdir().unwrap();
         assert_eq!(read_state(dir.path()), None);
+    }
+
+    #[test]
+    fn local_host_is_stable_across_repeated_state_calls() {
+        let first = local_host();
+        assert!(!first.is_empty());
+        assert_eq!(first, local_host());
     }
 }

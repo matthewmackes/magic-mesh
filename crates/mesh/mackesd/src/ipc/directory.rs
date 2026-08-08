@@ -47,6 +47,11 @@ pub const LIFECYCLE_TOPIC: &str = "action/services/lifecycle";
 /// (`found: false` while the executor hasn't answered yet).
 pub const LIFECYCLE_RESULT_TOPIC: &str = "action/services/lifecycle-result";
 
+/// Maximum number of retained lifecycle messages admitted by one responder
+/// tick. The retired compatibility lanes still need to answer old clients,
+/// but they must not materialize an unbounded backlog while doing so.
+pub const MAX_LIFECYCLE_MESSAGES_PER_POLL: usize = 64;
+
 /// Responder poll interval (matches the fleet responder).
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -539,7 +544,11 @@ pub fn poll_lifecycle_result_once(
     svc: &DirectoryService,
     cursor: &mut Option<String>,
 ) {
-    let msgs = match persist.list_since(LIFECYCLE_RESULT_TOPIC, cursor.as_deref()) {
+    let msgs = match persist.list_since_limit(
+        LIFECYCLE_RESULT_TOPIC,
+        cursor.as_deref(),
+        MAX_LIFECYCLE_MESSAGES_PER_POLL,
+    ) {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -608,7 +617,11 @@ pub fn poll_lifecycle_result_once(
 /// Keeping the responder during cutover prevents old clients from mistaking a
 /// timeout for success while closing the public-Bus mutation bypass.
 pub fn poll_lifecycle_once(persist: &Persist, svc: &DirectoryService, cursor: &mut Option<String>) {
-    let msgs = match persist.list_since(LIFECYCLE_TOPIC, cursor.as_deref()) {
+    let msgs = match persist.list_since_limit(
+        LIFECYCLE_TOPIC,
+        cursor.as_deref(),
+        MAX_LIFECYCLE_MESSAGES_PER_POLL,
+    ) {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -1190,7 +1203,102 @@ mod tests {
         .unwrap();
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("authenticated"));
-        assert!(crate::lifecycle::take_requests(tmp.path(), "oak").is_empty());
+        assert!(
+            !tmp.path().join("fleet/lifecycle").exists(),
+            "retired refusal must not create a replicated request tree"
+        );
+    }
+
+    #[test]
+    fn retired_lifecycle_reader_admits_bounded_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).unwrap();
+        let workgroup = tmp.path().join("workgroup");
+        let svc = DirectoryService::new(&workgroup, None);
+        let mut ids = Vec::new();
+        for index in 0..=MAX_LIFECYCLE_MESSAGES_PER_POLL {
+            let body = serde_json::json!({
+                "peer": "oak",
+                "kind": "container",
+                "name": format!("service-{index}"),
+                "op": "start",
+            })
+            .to_string();
+            ids.push(
+                persist
+                    .write(LIFECYCLE_TOPIC, Priority::Default, None, Some(&body))
+                    .unwrap()
+                    .ulid,
+            );
+        }
+
+        let mut cursor = None;
+        poll_lifecycle_once(&persist, &svc, &mut cursor);
+        assert_eq!(
+            cursor.as_deref(),
+            Some(ids[MAX_LIFECYCLE_MESSAGES_PER_POLL - 1].as_str())
+        );
+        for id in &ids[..MAX_LIFECYCLE_MESSAGES_PER_POLL] {
+            assert_eq!(persist.list_since(&reply_topic(id), None).unwrap().len(), 1);
+        }
+        assert!(persist
+            .list_since(&reply_topic(&ids[MAX_LIFECYCLE_MESSAGES_PER_POLL]), None)
+            .unwrap()
+            .is_empty());
+
+        poll_lifecycle_once(&persist, &svc, &mut cursor);
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&ids[MAX_LIFECYCLE_MESSAGES_PER_POLL]), None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_result_reader_admits_bounded_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).unwrap();
+        let workgroup = tmp.path().join("workgroup");
+        let svc = DirectoryService::new(&workgroup, None);
+        let mut ids = Vec::new();
+        for _ in 0..=MAX_LIFECYCLE_MESSAGES_PER_POLL {
+            ids.push(
+                persist
+                    .write(
+                        LIFECYCLE_RESULT_TOPIC,
+                        Priority::Default,
+                        None,
+                        Some(r#"{"schema_version":1}"#),
+                    )
+                    .unwrap()
+                    .ulid,
+            );
+        }
+
+        let mut cursor = None;
+        poll_lifecycle_result_once(&persist, &svc, &mut cursor);
+        assert_eq!(
+            cursor.as_deref(),
+            Some(ids[MAX_LIFECYCLE_MESSAGES_PER_POLL - 1].as_str())
+        );
+        for id in &ids[..MAX_LIFECYCLE_MESSAGES_PER_POLL] {
+            assert_eq!(persist.list_since(&reply_topic(id), None).unwrap().len(), 1);
+        }
+        assert!(persist
+            .list_since(&reply_topic(&ids[MAX_LIFECYCLE_MESSAGES_PER_POLL]), None)
+            .unwrap()
+            .is_empty());
+
+        poll_lifecycle_result_once(&persist, &svc, &mut cursor);
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&ids[MAX_LIFECYCLE_MESSAGES_PER_POLL]), None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! config dir instead.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,9 @@ use crate::models::AuthenticationResult;
 
 /// The store path relative to the user config dir.
 pub const STORE_REL_PATH: &str = "mde/jellyfin/servers.json";
+
+/// Optional absolute path override for system/package sessions.
+pub const STORE_PATH_ENV: &str = "MDE_JELLYFIN_STORE";
 
 /// A server's saved authentication — the token + user the browse calls use.
 ///
@@ -273,9 +277,18 @@ impl ServerStore {
     /// The default store path: `<config dir>/mde/jellyfin/servers.json`.
     ///
     /// Uses `dirs::config_dir()` (honoring `XDG_CONFIG_HOME`), falling back to
-    /// `$HOME/.config` when it cannot be resolved.
+    /// `$HOME/.config` when it cannot be resolved.  A root-owned DRM shell
+    /// follows the active seat's home when `XDG_RUNTIME_DIR=/run/user/<uid>`
+    /// identifies a non-root user.  `MDE_JELLYFIN_STORE` is an explicit path
+    /// override for packaged layouts.
     #[must_use]
     pub fn default_path() -> PathBuf {
+        if let Some(path) = std::env::var_os(STORE_PATH_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            return path;
+        }
         config_base()
             .join("mde")
             .join("jellyfin")
@@ -327,7 +340,7 @@ impl ServerStore {
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| StoreError::Parse(e.to_string()))?;
-        write_private(path, json.as_bytes()).map_err(|e| StoreError::Io(e.to_string()))
+        write_private_atomic(path, json.as_bytes()).map_err(|e| StoreError::Io(e.to_string()))
     }
 
     /// Write the store to [`default_path`](Self::default_path) with `0600`.
@@ -359,35 +372,129 @@ impl AuthenticationResult {
 /// falling back to `$HOME/.config`. Shared by the server store + the offline
 /// cache ([`crate::cache`]) so both root under the same `mde/jellyfin/` tree.
 pub(crate) fn config_base() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| {
+    let configured = dirs::config_dir().unwrap_or_else(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         Path::new(&home).join(".config")
+    });
+    // `dirs` quite correctly returns `/root/.config` for the DRM process, but
+    // that process is only the renderer.  Keep cache and token paths aligned
+    // with the actual interactive seat instead of creating a second, empty
+    // root-owned Jellyfin profile.
+    if configured == Path::new("/root/.config") {
+        if let Some(home) = active_seat_home() {
+            return home.join(".config");
+        }
+    }
+    configured
+}
+
+/// Resolve the active non-root seat home when this process has the root shell's
+/// environment.  The runtime directory is owned by the logged-in user and is
+/// the only session-specific value the DRM shell reliably exports.
+fn active_seat_home() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if home
+        .as_deref()
+        .is_some_and(|path| path != Path::new("/root"))
+    {
+        return None;
+    }
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    let uid = runtime.file_name()?.to_str()?.parse::<u32>().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd_home_from(uid, &passwd)
+}
+
+/// Resolve a uid's home from passwd text.  The fifth field is the optional
+/// GECOS/comment field; the home directory is the sixth field.
+fn passwd_home_from(uid: u32, passwd: &str) -> Option<PathBuf> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let _name = fields.next()?;
+        let _password = fields.next()?;
+        let entry_uid = fields.next()?.parse::<u32>().ok()?;
+        let _gid = fields.next()?;
+        let _gecos = fields.next()?;
+        let home = fields.next()?;
+        (entry_uid == uid && !home.is_empty()).then(|| PathBuf::from(home))
     })
 }
 
 /// Write `bytes` to `path` with owner-only (`0600`) permissions.
 ///
-/// On Unix the file is created `0600` and its mode is re-asserted (covering a
-/// pre-existing file with looser perms); elsewhere it is a plain write.
+/// The new contents are written and synced to a same-directory temporary file
+/// before the final rename. A crash therefore leaves either the previous
+/// complete token store or the new complete store, never a truncated JSON
+/// document. On Unix the temporary file is created `0600` and its mode is
+/// re-asserted before the file is synced; elsewhere the same atomic rename seam
+/// is used without Unix-specific mode flags.
 #[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let temporary = temporary_store_path(path);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        sync_store_parent(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temporary = temporary_store_path(path);
+    let result = (|| {
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn temporary_store_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("servers.json");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        timestamp
+    ))
+}
+
+#[cfg(unix)]
+fn sync_store_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_store_parent(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -468,6 +575,34 @@ mod tests {
     }
 
     #[test]
+    fn save_replaces_existing_store_without_leaking_temporary_files() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        let first = sample_store();
+        first.save_to(&path).expect("first save");
+
+        let mut second = sample_store();
+        second.servers[0].name = "Anvil revised".into();
+        second.save_to(&path).expect("atomic replacement");
+
+        assert_eq!(
+            ServerStore::load_from(&path).expect("load").servers[0].name,
+            "Anvil revised"
+        );
+        let temporary_count = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".servers.json.")
+            })
+            .count();
+        assert_eq!(temporary_count, 0);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn saved_file_is_owner_only_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -515,11 +650,31 @@ mod tests {
 
     #[test]
     fn default_path_ends_with_the_store_rel_path() {
+        std::env::remove_var(STORE_PATH_ENV);
         let p = ServerStore::default_path();
         assert!(
             p.ends_with("mde/jellyfin/servers.json"),
             "got {}",
             p.display()
+        );
+    }
+
+    #[test]
+    fn explicit_path_override_wins() {
+        std::env::set_var(STORE_PATH_ENV, "/run/mde/jellyfin.json");
+        assert_eq!(
+            ServerStore::default_path(),
+            Path::new("/run/mde/jellyfin.json")
+        );
+        std::env::remove_var(STORE_PATH_ENV);
+    }
+
+    #[test]
+    fn passwd_parser_uses_home_not_gecos() {
+        let passwd = "mm:x:1000:1000:Seat User:/home/mm:/bin/bash\n";
+        assert_eq!(
+            passwd_home_from(1000, passwd),
+            Some(PathBuf::from("/home/mm"))
         );
     }
 

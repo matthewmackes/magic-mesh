@@ -38,6 +38,17 @@ use super::{ShutdownToken, Worker};
 /// Default sweep cadence — 5 s.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Maximum deterministic spread before the first synchronous journal pass.
+/// The monitor's idle backoff only applies after that pass, so without this
+/// phase every seat still forks `journalctl` and performs retention I/O in the
+/// same startup burst.
+pub const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+
+/// Maximum cadence after repeated empty or failed journal passes. Firewall
+/// observation remains prompt while active, but a quiet/unavailable journal
+/// must not keep launching synchronous work on every fixed tick.
+pub const MAX_IDLE_TICK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Firewall subdirectory inside mesh-storage.
 pub const FIREWALL_SUBDIR: &str = "firewall";
 
@@ -53,6 +64,10 @@ pub const DEFAULT_THRESHOLD: usize = 10;
 
 /// Alert dedup window — one Bus event per source per 60 minutes.
 pub const ALERT_WINDOW_MS: u64 = 60 * 60 * 1_000;
+
+/// Retention rewrites are maintenance, not per-packet work. Rewriting the
+/// complete JSONL file once per hour is sufficient for the seven-day view.
+pub const RETENTION_SWEEP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 
 /// One denied-packet record.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -205,6 +220,7 @@ pub struct FirewallMonitorWorker {
     tick: Duration,
     cursor_path: PathBuf,
     threshold: usize,
+    last_trim_ms: i64,
     /// `src_ip → last_alerted_at_ms`.  Prevents re-firing the Bus
     /// event on every tick once a source has crossed the threshold.
     alerted: Mutex<BTreeMap<String, i64>>,
@@ -223,6 +239,7 @@ impl FirewallMonitorWorker {
             tick: DEFAULT_TICK_INTERVAL,
             cursor_path: PathBuf::from(DEFAULT_CURSOR_PATH),
             threshold: DEFAULT_THRESHOLD,
+            last_trim_ms: 0,
             alerted: Mutex::new(BTreeMap::new()),
         }
     }
@@ -255,15 +272,10 @@ impl FirewallMonitorWorker {
     }
 
     /// Read new kernel journal lines since the last cursor.
-    fn read_new_lines(&self) -> Vec<String> {
-        if std::process::Command::new("journalctl")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return vec![];
-        }
-
+    ///
+    /// The command itself is the availability check. A separate
+    /// `journalctl --version` probe would fork a second process on every pass.
+    fn read_new_lines(&self) -> Option<Vec<String>> {
         let now_ms = now_epoch_ms();
         let since_ms = std::fs::read_to_string(&self.cursor_path)
             .ok()
@@ -280,21 +292,19 @@ impl FirewallMonitorWorker {
 
         let _ = std::fs::write(&self.cursor_path, now_ms.to_string());
 
-        output
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
+        output.ok().filter(|o| o.status.success()).map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(String::from)
+                .collect()
+        })
     }
 
-    fn tick_once(&self) {
+    /// Run one synchronous observation pass. Returns whether a new accepted
+    /// denial was found, which drives the idle backoff in [`Self::run`].
+    fn tick_once(&mut self) -> bool {
         let now_ms = now_epoch_ms();
-        let lines = self.read_new_lines();
+        let lines = self.read_new_lines().unwrap_or_default();
 
         let events: Vec<DeniedEvent> = lines
             .iter()
@@ -320,9 +330,15 @@ impl FirewallMonitorWorker {
             }
         }
 
-        // 7-day trim on every tick (cheap: skips when file absent).
-        let cutoff = now_ms - RETENTION_MS;
-        let _ = trim_older_than(&self.jsonl_path(), cutoff);
+        // 7-day trim is maintenance; avoid rereading and rewriting the full
+        // retained file on every quiet journal poll.
+        if self.last_trim_ms == 0
+            || now_ms.saturating_sub(self.last_trim_ms) >= RETENTION_SWEEP_INTERVAL_MS
+        {
+            let cutoff = now_ms - RETENTION_MS;
+            let _ = trim_older_than(&self.jsonl_path(), cutoff);
+            self.last_trim_ms = now_ms;
+        }
 
         // FWMON-4: threshold alert per source.
         let unique_srcs: std::collections::BTreeSet<&str> =
@@ -349,7 +365,36 @@ impl FirewallMonitorWorker {
                 .expect("alerted mutex")
                 .insert(src.to_string(), now_ms);
         }
+
+        !events.is_empty()
     }
+}
+
+fn next_tick_interval(current: Duration, had_events: bool) -> Duration {
+    if had_events {
+        return DEFAULT_TICK_INTERVAL;
+    }
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_IDLE_TICK_INTERVAL)
+        .min(MAX_IDLE_TICK_INTERVAL)
+}
+
+/// Derive a stable, bounded startup phase from the local firewall log owner.
+/// FNV-1a is sufficient here because this is scheduling spread, not a security
+/// primitive. An empty identity deliberately disables the phase.
+fn initial_phase_for(host: &str, tick: Duration) -> Duration {
+    let window_ms = tick.as_millis().min(MAX_INITIAL_PHASE.as_millis());
+    if host.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in host.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Duration::from_millis((u128::from(hash) % (window_ms + 1) as u128) as u64)
 }
 
 fn now_epoch_ms() -> i64 {
@@ -390,10 +435,26 @@ impl Worker for FirewallMonitorWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // Keep the first synchronous journal/filesystem pass within the old
+        // five-second freshness deadline, but spread it by stable host
+        // identity so seats do not all fork `journalctl` together. Shutdown
+        // remains prompt during the phase delay.
+        let first_delay = self
+            .tick
+            .saturating_sub(initial_phase_for(&self.host, self.tick));
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(first_delay) => {}
+        }
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.tick) => {
-                    self.tick_once();
+                    // journalctl plus filesystem reads are synchronous. Keep
+                    // them off the Tokio scheduler, and slow quiet/failed
+                    // passes so an unavailable or empty journal is not a
+                    // common-seat CPU source.
+                    let had_events = tokio::task::block_in_place(|| self.tick_once());
+                    self.tick = next_tick_interval(self.tick, had_events);
                 }
                 _ = shutdown.wait() => break,
             }
@@ -585,5 +646,37 @@ mod tests {
         // 1.1.1.1 has 3, 9.9.9.9 has 3 — check they're counted independently
         assert!(threshold_tripped(&evs, "1.1.1.1", 5000, 10_000, 3));
         assert!(!threshold_tripped(&evs, "1.1.1.1", 5000, 10_000, 4));
+    }
+
+    #[test]
+    fn idle_tick_backoff_is_bounded_and_activity_resets_it() {
+        assert_eq!(
+            next_tick_interval(DEFAULT_TICK_INTERVAL, false),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            next_tick_interval(Duration::from_secs(60), false),
+            MAX_IDLE_TICK_INTERVAL
+        );
+        assert_eq!(
+            next_tick_interval(Duration::from_secs(60), true),
+            DEFAULT_TICK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn initial_phase_is_stable_bounded_and_preserves_first_probe_deadline() {
+        let phase = initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL);
+        assert_eq!(phase, initial_phase_for("peer:seat15", DEFAULT_TICK_INTERVAL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert_ne!(phase, initial_phase_for("peer:seat16", DEFAULT_TICK_INTERVAL));
+
+        let first_delay = DEFAULT_TICK_INTERVAL.saturating_sub(phase);
+        assert!(first_delay >= DEFAULT_TICK_INTERVAL - MAX_INITIAL_PHASE);
+        assert!(first_delay <= DEFAULT_TICK_INTERVAL);
+        assert_eq!(initial_phase_for("", DEFAULT_TICK_INTERVAL), Duration::ZERO);
+
+        let short_tick = Duration::from_millis(100);
+        assert!(initial_phase_for("peer:seat15", short_tick) <= short_tick);
     }
 }

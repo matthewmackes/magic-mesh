@@ -22,6 +22,8 @@ pub mod air_quality;
 pub mod aircraft;
 /// Typed AOSP starter-app catalog and per-Android-VM inventory contracts.
 pub mod android_apps;
+/// WL-FUNC-020 — bounded Cuttlefish Android VM provider/lifecycle contracts.
+pub mod android_provider;
 /// WL-FUNC-018 — versioned, signed-provenance Flatpak catalog records for App VMs.
 pub mod app_catalog;
 /// WL-FUNC-012 / OVERLAY-5 — Caltrans CWWP2 camera snapshots shared by the
@@ -74,6 +76,10 @@ pub mod lighthouse_probe;
 /// WL-FUNC-015 — shared `state/media/sources` wire records published by
 /// `mackesd` and consumed by the Media Workspace without a daemon dependency.
 pub mod media_sources;
+/// WL-FUNC-021 — public-verifier contract for Music workspace mutations.
+pub mod music_auth;
+/// WL-FUNC-011 / WL-FUNC-019 — bounded OpenSubsonic-compatible media admission.
+pub mod subsonic;
 /// Typed, credential-free NetworkManager/ModemManager link observations for
 /// the additive `network.interfaces[]` mesh-status field.
 pub mod network_status;
@@ -96,8 +102,12 @@ pub mod peers;
 /// WL-FUNC-019 — versioned universal resource identity, capability, transport,
 /// provenance, auth/health, catalog, and bounded-action contracts.
 pub mod resources;
+/// WL-ARCH-009 — neutral, strict-versioned worker runtime and change-set contracts.
+pub mod worker_runtime;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
+/// WL-FUNC-019 — bounded SSH/SFTP browsing and X11 resource admission.
+pub mod ssh_x11;
 // WL-RUN-006 (2026-07-19) — the router firewall-edit verb (`action/router/*`
 // `RouterActionRequest`) + its tamper-evident audit schema. The "mutations
 // fast-follow" of the router-control read slice: the shell's Device-Manager
@@ -144,6 +154,8 @@ pub mod vpn_egress;
 /// VPN-GW-5 — first-class provider adapters (Mullvad/Proton/IVPN/Nord/Surfshark)
 /// + the generic "paste WG config" / "import .ovpn" config-generation paths.
 pub mod vpn_providers;
+/// WL-ARCH-010 — the sole versioned workload operation/state contract.
+pub mod workloads;
 
 pub use android_apps::{
     AndroidAppAvailability, AndroidAppCategory, AndroidAppInventory, AndroidAppInventoryEntry,
@@ -160,6 +172,26 @@ pub use resources::{
     ServiceConfigurationField, ServiceConfigurationFieldKind, ServiceInterface,
     ServiceLifecycleStatus, ServiceStackPlane, ServiceStackTier, SourceProvenance,
     TransportCandidate, RESOURCE_CATALOG_TOPIC,
+};
+pub use worker_runtime::{
+    WorkerAction, WorkerChangeSetItem, WorkerChangeSetItemOutcome, WorkerChangeSetOperation,
+    WorkerChangeSetOutcome, WorkerChangeSetRequest, WorkerChangeSetResult, WorkerChangeSetTarget,
+    WorkerContract, WorkerGroup, WorkerRelation, WorkerRelationEndpoint, WorkerRelationKind,
+    WorkerRuntimeContractError, WorkerRuntimeReason, WorkerRuntimeSnapshot, WorkerRuntimeState,
+    WorkerTimelineEvent, WorkerTimelineEventKind,
+};
+pub use workloads::{
+    admit_workload, host_reserve, valid_phase_transition, workload_state_topic, AdmissionDenial,
+    HostCapacity, WorkloadAdmission, WorkloadAttachmentLease, WorkloadAttachmentProtocol,
+    WorkloadBackend,
+    WorkloadContractError, WorkloadDesiredState, WorkloadId, WorkloadKind, WorkloadOperationAction,
+    WorkloadHealth, WorkloadOperationPhase, WorkloadOperationRequest, WorkloadOperationStatus,
+    WorkloadPowerState, WorkloadPressure, WorkloadProfile, WorkloadReadiness,
+    WorkloadResources, WorkloadRuntimeSignals, WorkloadStateSnapshot,
+    MAX_WORKLOAD_ATTACHMENTS, MAX_WORKLOAD_DEADLINE_MS, MAX_WORKLOAD_IDENTIFIER_BYTES,
+    MAX_WORKLOAD_TEXT_BYTES, MAX_WORKLOAD_WIRE_BYTES, MAX_WORKLOADS_PER_NODE,
+    MIN_HOST_CPU_RESERVE, MIN_HOST_MEMORY_RESERVE_MB, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+    WORKLOAD_OPERATION_TOPIC, WORKLOAD_STATE_TOPIC_PREFIX,
 };
 pub use tags::{Tag, TagFlavor, TagMember, TagStore, TagStoreError};
 

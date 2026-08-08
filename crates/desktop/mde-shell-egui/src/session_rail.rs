@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use mackes_mesh_types::vdi_session::{AppVmLifecycleState, SessionRequest};
+use mackes_mesh_types::vdi_session::{AppVmLaunchRequest, AppVmLifecycleState, SessionRequest};
 // arch-11: prod now opens via the BusReader seam; only the tests still name
 // `Persist` (through `use super::*`), so the import is test-only.
 #[cfg(test)]
@@ -37,20 +37,20 @@ struct RailSession {
     vm_id: String,
     client_peer: String,
     state: SessionState,
-    app_id: Option<String>,
+    app: Option<AppVmLaunchRequest>,
     app_state: Option<AppVmLifecycleState>,
     app_reason: Option<String>,
 }
 
 /// The app-specific half of a focused rail session. The shell consumes this
-/// once and hands it to the existing VDI broker path; it never invents a
-/// second app-launch transport or re-derives a session id from UI text.
+/// once and hands the complete admitted declaration to the existing VDI broker
+/// path; it never invents a second app-launch transport or re-derives a session
+/// id from UI text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppSessionHandoff {
-    pub(crate) id: String,
+    pub(crate) request: AppVmLaunchRequest,
     pub(crate) serving_peer: String,
     pub(crate) vm_id: String,
-    pub(crate) app_id: String,
 }
 
 /// Identity-only focus intent for an ordinary brokered desktop session.
@@ -163,12 +163,11 @@ impl SessionRailState {
             SessionState::Requested | SessionState::Active | SessionState::Disconnected
         ) {
             session.state = SessionState::Active;
-            if let Some(app_id) = session.app_id.clone() {
+            if let Some(request) = session.app.clone() {
                 self.pending_app_handoff = Some(AppSessionHandoff {
-                    id: session.id.clone(),
+                    request,
                     serving_peer: session.serving_peer.clone(),
                     vm_id: session.vm_id.clone(),
-                    app_id,
                 });
             } else {
                 self.pending_desktop_focus = Some(DesktopSessionFocus {
@@ -229,7 +228,7 @@ impl SessionRailState {
                         vm_id,
                         client_peer,
                         state: SessionState::Requested,
-                        app_id: None,
+                        app: None,
                         app_state: None,
                         app_reason: None,
                     },
@@ -241,8 +240,27 @@ impl SessionRailState {
                 vm_id,
                 client_peer,
                 app_id,
-                ..
+                catalog_revision,
+                guest_profile,
+                requested_capabilities,
+                resume,
             } => {
+                // The public action log is an untrusted projection boundary.
+                // Admit the complete typed declaration before it can become a
+                // focusable handoff; syntactic serde success is not launch
+                // provenance. Invalid records remain absent from the rail
+                // rather than becoming a host-side fallback.
+                let Ok(app_request) = AppVmLaunchRequest::new(
+                    app_id,
+                    catalog_revision,
+                    guest_profile,
+                    requested_capabilities,
+                    id.clone(),
+                    resume,
+                )
+                .and_then(|request| request.validate_admitted().map(|()| request)) else {
+                    return;
+                };
                 self.sessions.insert(
                     id.clone(),
                     RailSession {
@@ -251,7 +269,7 @@ impl SessionRailState {
                         vm_id,
                         client_peer,
                         state: SessionState::Requested,
-                        app_id: Some(app_id),
+                        app: Some(app_request),
                         app_state: Some(AppVmLifecycleState::WaitingForPlacement),
                         app_reason: None,
                     },
@@ -280,7 +298,7 @@ impl SessionRailState {
 
     fn set_app_state(&mut self, id: &str, state: AppVmLifecycleState, reason: Option<String>) {
         if let Some(session) = self.sessions.get_mut(id) {
-            if session.app_id.is_some() {
+            if session.app.is_some() {
                 session.app_state = Some(state);
                 session.app_reason = bound_app_reason(reason);
             }
@@ -345,8 +363,8 @@ const fn app_retry_guidance(state: AppVmLifecycleState) -> Option<&'static str> 
 }
 
 fn session_label(session: &RailSession) -> String {
-    if let Some(app_id) = &session.app_id {
-        return format!("{} · {}", app_id, session.serving_peer);
+    if let Some(app) = &session.app {
+        return format!("{} · {}", app.app_id, session.serving_peer);
     }
     if session.vm_id.is_empty() {
         session.serving_peer.clone()
@@ -672,16 +690,43 @@ mod tests {
         assert_eq!(
             state.take_app_handoff(),
             Some(AppSessionHandoff {
-                id: "app-session-1".to_owned(),
+                request: AppVmLaunchRequest::new(
+                    "org.example.Writer",
+                    "catalog-7",
+                    "wayland-standard",
+                    vec!["audio".to_owned()],
+                    "app-session-1",
+                    true,
+                )
+                .expect("admitted App VM request"),
                 serving_peer: "oak".to_owned(),
                 vm_id: "appvm-writer".to_owned(),
-                app_id: "org.example.Writer".to_owned(),
             })
         );
         assert!(
             state.take_app_handoff().is_none(),
             "focus is consumed once; it must not retrigger a VDI launch"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unadmitted_open_app_records_never_enter_the_focus_handoff() {
+        let root = temp_bus("app-admission");
+        publish(
+            &root,
+            r#"{"op":"open_app","id":"bad-identity","serving_peer":"oak","vm_id":"appvm-bad","client_peer":"eagle","app_id":"host-command","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":["audio"],"resume":true}"#,
+        );
+        publish(
+            &root,
+            r#"{"op":"open_app","id":"bad-capability","serving_peer":"oak","vm_id":"appvm-bad-cap","client_peer":"eagle","app_id":"org.example.Writer","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":["host_socket"],"resume":true}"#,
+        );
+
+        let mut state = SessionRailState::with_bus_root(root.clone());
+        assert!(state.entries("eagle").is_empty());
+        assert!(!state.focus_session("bad-identity"));
+        assert!(!state.focus_session("bad-capability"));
+        assert!(state.take_app_handoff().is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

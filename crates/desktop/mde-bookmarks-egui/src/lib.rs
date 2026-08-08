@@ -1,7 +1,7 @@
-//! `mde-bookmarks-egui` — the MCNF **E12 "Construct"** egui Bookmarks surface
-//! (BOOKMARKS-4; design: `docs/design/mesh-bookmarks.md`).
+//! `mde-bookmarks-egui` — the MCNF **E12 "Construct"** Browser-owned Bookmarks
+//! panel (BOOKMARKS-4; design: `docs/design/mesh-bookmarks.md`).
 //!
-//! An `eframe` app on the shared [`mde_egui`] harness that reuses
+//! A reusable egui panel on the shared [`mde_egui`] toolkit that reuses
 //! `mde-bookmarks`' pure model + CRDT — the `Collection`/`Bookmark`/`Folder` tree
 //! and the append-only `Op` set — and renders the locked three-region manager
 //! (folder tree · list · detail pane) plus the enterprise addenda's left vertical
@@ -27,8 +27,6 @@ use std::time::{Duration, Instant};
 /// input-driven repaint; gating the spool open + index probes to 2 Hz removes the
 /// churn while a user-initiated bookmarks action is delayed at most this long.
 const BOOKMARKS_REFRESH: Duration = Duration::from_millis(500);
-
-use mde_egui::{eframe, egui};
 
 pub use model::Manager;
 pub use view::bookmarks_panel;
@@ -187,49 +185,13 @@ impl Default for BookmarksBus {
 
 /// Build the production [`Manager`] under the best-effort local identity.
 ///
-/// The identity is the OS user and the hostname. This is the one construction
-/// path for a live Bookmarks model, shared by the standalone [`BookmarksApp`] and
-/// the E12 shell — the shell owns the [`Manager`] directly and mounts it with
-/// [`bookmarks_panel`], so it doesn't have to know how the local author is derived.
+/// The identity is the OS user and the hostname. This is the construction path
+/// for a live Browser-owned Bookmarks model; the shell can own the [`Manager`]
+/// directly and mount it with [`bookmarks_panel`] without duplicating local
+/// author derivation.
 #[must_use]
 pub fn real_manager() -> Manager {
     Manager::local()
-}
-
-/// The eframe application: a single [`Manager`] rendered each frame.
-pub struct BookmarksApp {
-    manager: Manager,
-    bus: BookmarksBus,
-}
-
-impl BookmarksApp {
-    /// Build the surface over a fresh local [`Manager`].
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            manager: real_manager(),
-            bus: BookmarksBus::default(),
-        }
-    }
-}
-
-impl Default for BookmarksApp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl eframe::App for BookmarksApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.bus.pump(&mut self.manager);
-        // Thin frame wrapper (E12-3, EMBED): the binary owns only the window
-        // `CentralPanel`; the surface itself renders through the shared
-        // [`bookmarks_panel`] fn — the exact call the E12 shell makes to mount
-        // Bookmarks as an embedded panel, so standalone and embedded are identical.
-        egui::CentralPanel::default().show(ctx, |ui| {
-            bookmarks_panel(ui, &mut self.manager);
-        });
-    }
 }
 
 #[cfg(test)]

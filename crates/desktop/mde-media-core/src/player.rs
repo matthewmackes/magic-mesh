@@ -26,6 +26,16 @@ use crate::resume::ResumeState;
 use crate::subtitle::{track_by_language, SubtitleConfig, TrackSelect, TrackSelection};
 use crate::video::VideoConfig;
 
+/// Bound the event handoff to a stalled surface. Position updates are
+/// coalescible; state, track, end, and error events retain their ordering until
+/// the queue is full, at which point the oldest lower-value entry is evicted.
+pub const MAX_PENDING_EVENTS: usize = 256;
+
+/// Bound automatic recovery after a decoder/network end-file error. A user
+/// loading a new item resets this counter; a repeatedly failing source must
+/// eventually surface a terminal stopped state rather than spin forever.
+pub const MAX_RECOVERY_ATTEMPTS: u8 = 3;
+
 /// The authoritative playback state.
 ///
 /// Exactly one is current at any time; [`Player::state`] returns it and every
@@ -144,6 +154,8 @@ pub struct Player<E: MediaEngine> {
     /// [`play_next`](Player::play_next)/[`play_prev`](Player::play_prev) and
     /// auto-advances it on end-of-file per its [`RepeatMode`](crate::RepeatMode).
     playlist: Playlist,
+    /// Number of automatic same-source recovery attempts for the current load.
+    recovery_attempts: u8,
     /// The resume / watch-history store (MEDIA-7). The player resumes from the stored
     /// position when a title finishes loading, updates it on seek / stop, marks a
     /// title completed at its natural end, and counts a play on each load. Empty by
@@ -170,6 +182,7 @@ impl<E: MediaEngine> Player<E> {
             subtitle: SubtitleConfig::new(),
             controls: PlaybackControls::new(),
             playlist: Playlist::new(),
+            recovery_attempts: 0,
             resume: ResumeState::new(),
             events: VecDeque::new(),
         }
@@ -312,6 +325,7 @@ impl<E: MediaEngine> Player<E> {
         let url = url.into();
         self.engine.load_file(&url)?;
         self.media = Some(url);
+        self.recovery_attempts = 0;
         self.paused_intent = false;
         self.position = 0.0;
         self.duration = None;
@@ -706,7 +720,7 @@ impl<E: MediaEngine> Player<E> {
         let idx = self.playlist.current_index();
         self.load(url)?;
         if let Some(i) = idx {
-            self.events.push_back(PlayerEvent::PlaylistAdvanced(i));
+            self.push_event(PlayerEvent::PlaylistAdvanced(i));
         }
         Ok(idx)
     }
@@ -721,11 +735,11 @@ impl<E: MediaEngine> Player<E> {
         };
         let idx = self.playlist.current_index();
         if let Err(err) = self.load(url) {
-            self.events.push_back(PlayerEvent::Error(err.to_string()));
+            self.push_event(PlayerEvent::Error(err.to_string()));
             return false;
         }
         if let Some(i) = idx {
-            self.events.push_back(PlayerEvent::PlaylistAdvanced(i));
+            self.push_event(PlayerEvent::PlaylistAdvanced(i));
         }
         true
     }
@@ -766,11 +780,14 @@ impl<E: MediaEngine> Player<E> {
                     }
                     let tracks = self.engine.tracks();
                     self.tracks.clone_from(&tracks);
-                    self.events.push_back(PlayerEvent::TracksChanged(tracks));
-                    // MEDIA-7: count a play, and resume from the stored position when
-                    // one exists (empty history → a no-op, so the load is unchanged).
+                    self.push_event(PlayerEvent::TracksChanged(tracks));
+                    // MEDIA-7: count a play only for an explicit load. A recovery
+                    // reload must not inflate play counts, but it does resume from
+                    // the position checkpoint recorded before the retry.
                     if let Some(media) = self.media.clone() {
-                        self.resume.mark_started(&media);
+                        if self.recovery_attempts == 0 {
+                            self.resume.mark_started(&media);
+                        }
                         if let Some(pos) = self.resume.resume_position(&media) {
                             let target = self.clamp_position(pos);
                             if self.engine.seek_absolute(target).is_ok() {
@@ -797,7 +814,7 @@ impl<E: MediaEngine> Player<E> {
                     // auto-advances the player; an empty/exhausted queue ends it.
                     if !self.try_advance_on_eof() {
                         self.set_state(PlayerState::Ended);
-                        self.events.push_back(PlayerEvent::EndReached);
+                        self.push_event(PlayerEvent::EndReached);
                     }
                 }
             }
@@ -809,14 +826,43 @@ impl<E: MediaEngine> Player<E> {
                 }
             }
             EngineSignal::EndFile(EndReason::Error) => {
-                self.events
-                    .push_back(PlayerEvent::Error("playback ended on error".into()));
-                if self.state != PlayerState::Stopped {
+                let Some(media) = self.media.clone() else {
+                    self.push_event(PlayerEvent::Error("playback ended on error".into()));
                     self.set_state(PlayerState::Stopped);
+                    return;
+                };
+                if self.recovery_attempts < MAX_RECOVERY_ATTEMPTS
+                    && self.state != PlayerState::Stopped
+                {
+                    self.recovery_attempts += 1;
+                    let attempt = self.recovery_attempts;
+                    let was_paused = self.state == PlayerState::Paused;
+                    self.resume
+                        .record_position(&media, self.position, self.duration);
+                    match self.engine.load_file(&media) {
+                        Ok(()) => {
+                            self.paused_intent = was_paused;
+                            self.push_event(PlayerEvent::Error(format!(
+                                "playback ended on error; retrying source (attempt {attempt}/{MAX_RECOVERY_ATTEMPTS})"
+                            )));
+                            self.set_state(PlayerState::Loading);
+                            return;
+                        }
+                        Err(error) => {
+                            self.push_event(PlayerEvent::Error(format!(
+                                "playback ended on error; retry {attempt} could not start: {error}"
+                            )));
+                        }
+                    }
                 }
+                self.push_event(PlayerEvent::Error(format!(
+                    "playback ended on error after {} recovery attempts",
+                    self.recovery_attempts
+                )));
+                self.set_state(PlayerState::Stopped);
             }
             EngineSignal::Error(msg) => {
-                self.events.push_back(PlayerEvent::Error(msg));
+                self.push_event(PlayerEvent::Error(msg));
             }
         }
     }
@@ -832,18 +878,52 @@ impl<E: MediaEngine> Player<E> {
     fn set_state(&mut self, next: PlayerState) {
         if self.state != next {
             self.state = next;
-            self.events.push_back(PlayerEvent::StateChanged(next));
+            self.push_event(PlayerEvent::StateChanged(next));
         }
     }
 
     fn set_position(&mut self, pos: f64) {
         self.position = pos;
-        self.events.push_back(PlayerEvent::PositionChanged(pos));
+        self.push_event(PlayerEvent::PositionChanged(pos));
     }
 
     fn set_duration(&mut self, dur: f64) {
         self.duration = Some(dur);
-        self.events.push_back(PlayerEvent::DurationChanged(dur));
+        self.push_event(PlayerEvent::DurationChanged(dur));
+    }
+
+    /// Admit one observable event without allowing a stalled surface to grow
+    /// the player indefinitely. Position updates keep only their newest value;
+    /// when a critical event arrives at capacity it first evicts a stale
+    /// position, then the oldest remaining event as the final bounded fallback.
+    fn push_event(&mut self, event: PlayerEvent) {
+        if matches!(event, PlayerEvent::PositionChanged(_)) {
+            if let Some(existing) = self
+                .events
+                .iter_mut()
+                .rev()
+                .find(|queued| matches!(queued, PlayerEvent::PositionChanged(_)))
+            {
+                *existing = event;
+                return;
+            }
+            if self.events.len() == MAX_PENDING_EVENTS {
+                return;
+            }
+        }
+
+        if self.events.len() >= MAX_PENDING_EVENTS {
+            if let Some(index) = self
+                .events
+                .iter()
+                .position(|queued| matches!(queued, PlayerEvent::PositionChanged(_)))
+            {
+                self.events.remove(index);
+            } else {
+                self.events.pop_front();
+            }
+        }
+        self.events.push_back(event);
     }
 
     fn clamp_position(&self, pos: f64) -> f64 {
@@ -939,6 +1019,32 @@ mod tests {
         assert_eq!(p.duration(), None);
         assert!(p.tracks().is_empty());
         assert_eq!(p.media(), None);
+    }
+
+    #[test]
+    fn pending_events_coalesce_positions_and_bound_stalled_surfaces() {
+        let mut p = player();
+        p.push_event(PlayerEvent::PositionChanged(1.0));
+        p.push_event(PlayerEvent::PositionChanged(2.0));
+        assert_eq!(p.drain_events(), vec![PlayerEvent::PositionChanged(2.0)]);
+
+        for index in 0..(MAX_PENDING_EVENTS - 1) {
+            p.push_event(PlayerEvent::Error(format!("error-{index}")));
+        }
+        p.push_event(PlayerEvent::PositionChanged(30.0));
+        p.push_event(PlayerEvent::Error("critical-after-position".to_string()));
+
+        assert_eq!(p.events.len(), MAX_PENDING_EVENTS);
+        assert!(p
+            .events
+            .iter()
+            .any(|event| event == &PlayerEvent::Error("critical-after-position".to_string())));
+        assert!(
+            !p.events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::PositionChanged(_))),
+            "a stale position is evicted before a critical event"
+        );
     }
 
     #[test]
@@ -1137,17 +1243,63 @@ mod tests {
     }
 
     #[test]
-    fn playback_error_end_stops_and_surfaces() {
+    fn playback_error_retries_and_preserves_resume_position() {
         let mut p = player();
         p.load("x").expect("load");
+        p.pump();
+        p.engine_mut().advance(30.0);
         p.pump();
         let _ = p.drain_events(); // discard the load→play transitions
         p.engine_mut().fail_playback();
         p.pump();
-        assert_eq!(p.state(), PlayerState::Stopped);
+        assert_eq!(p.state(), PlayerState::Loading);
         let ev = p.drain_events();
-        assert!(ev.iter().any(|e| matches!(e, PlayerEvent::Error(_))));
-        assert_eq!(states(&ev), vec![PlayerState::Stopped]);
+        assert!(ev.iter().any(|e| {
+            matches!(e, PlayerEvent::Error(message) if message.contains("retrying source"))
+        }));
+        assert_eq!(states(&ev), vec![PlayerState::Loading]);
+
+        // The next FileLoaded resumes the retained position instead of silently
+        // restarting the source at zero.
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+        assert!((p.position() - 30.0).abs() < f64::EPSILON);
+        assert_eq!(
+            p.engine()
+                .commands()
+                .iter()
+                .filter(|c| c.as_str() == "loadfile x")
+                .count(),
+            2
+        );
+        assert_eq!(
+            p.resume_state().get("x").expect("resume entry").play_count,
+            1
+        );
+    }
+
+    #[test]
+    fn playback_error_recovery_is_bounded_and_eventually_stops() {
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+        let _ = p.drain_events();
+
+        for attempt in 0..=usize::from(MAX_RECOVERY_ATTEMPTS) {
+            p.engine_mut().fail_playback();
+            p.pump();
+            if attempt < usize::from(MAX_RECOVERY_ATTEMPTS) {
+                assert_eq!(p.state(), PlayerState::Loading);
+                p.pump();
+                assert_eq!(p.state(), PlayerState::Playing);
+            } else {
+                assert_eq!(p.state(), PlayerState::Stopped);
+            }
+        }
+        let ev = p.drain_events();
+        assert!(ev.iter().any(|event| {
+            matches!(event, PlayerEvent::Error(message) if message.contains("after 3 recovery attempts"))
+        }));
     }
 
     #[test]

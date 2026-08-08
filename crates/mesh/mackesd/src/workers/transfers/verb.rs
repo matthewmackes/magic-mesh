@@ -20,10 +20,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mde_collab_types::{TransferControlV2, TransferId, TransferJobV2};
 use serde::{Deserialize, Serialize};
 
 use super::job::TransferJob;
 use super::sync_pair::SyncPair;
+
+/// Hard ceiling for one node-local command envelope. This bounds legacy jobs
+/// too, so selecting a V2 variant cannot be used to smuggle an allocation-sized
+/// body through the shared inbox parser.
+pub const MAX_TRANSFER_VERB_BYTES: usize = 1024 * 1024;
 
 /// The typed verb set (Q14). `Submit` carries the whole client-minted job; the
 /// lifecycle verbs carry a job id.
@@ -32,12 +38,17 @@ use super::sync_pair::SyncPair;
 pub enum TransferVerb {
     /// `transfer.submit(job)` — enqueue a new job.
     Submit(TransferJob),
+    /// Admit a strict typed job to the daemon-owned V2 ledger. Endpoint
+    /// execution waits for a typed Files resolver; no raw path is inferred.
+    SubmitV2(TransferJobV2),
     /// `transfer.cancel(id)` — remove a job (frees any slot it held).
     Cancel(String),
     /// `transfer.pause(id)` — hold a Queued/Running job.
     Pause(String),
     /// `transfer.resume(id)` — re-arm a Paused job.
     Resume(String),
+    /// Apply a typed lifecycle control to an admitted V2 record.
+    ControlV2(TransferV2Control),
     /// Save or update a recurring rsync sync pair.
     SaveSyncPair(SyncPair),
     /// Remove a recurring sync pair by id.
@@ -52,14 +63,29 @@ impl TransferVerb {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Submit(_) => "submit",
+            Self::SubmitV2(_) => "submit-v2",
             Self::Cancel(_) => "cancel",
             Self::Pause(_) => "pause",
             Self::Resume(_) => "resume",
+            Self::ControlV2(_) => "control-v2",
             Self::SaveSyncPair(_) => "save-sync-pair",
             Self::RemoveSyncPair(_) => "remove-sync-pair",
             Self::List => "list",
         }
     }
+}
+
+/// Replay-safe V2 lifecycle command. The daemon refuses timestamps that do not
+/// advance the durable record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferV2Control {
+    /// Opaque durable transfer identity.
+    pub transfer: TransferId,
+    /// Closed lifecycle operation.
+    pub control: TransferControlV2,
+    /// Caller-observed update clock; must advance the durable record.
+    pub updated_unix_ms: u64,
 }
 
 /// The inbox directory the CLI writes verbs into and the worker drains.
@@ -82,6 +108,12 @@ pub fn write_verb(store_root: &Path, verb: &TransferVerb) -> io::Result<()> {
     let stem = format!("{:020}-{}", next_seq(), verb.name());
     let body =
         serde_json::to_string(verb).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if body.len() > MAX_TRANSFER_VERB_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer verb exceeds the byte limit",
+        ));
+    }
     let tmp = dir.join(format!(".{stem}.json.tmp"));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, dir.join(format!("{stem}.json")))
@@ -112,7 +144,7 @@ pub fn take_verbs(store_root: &Path) -> Vec<TransferVerb> {
     paths.sort();
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let parsed = std::fs::read_to_string(&path)
+        let parsed = read_verb_record(&path)
             .ok()
             .and_then(|d| serde_json::from_str::<TransferVerb>(&d).ok());
         // Consume the file either way (a corrupt inbox entry must not replay forever).
@@ -122,6 +154,54 @@ pub fn take_verbs(store_root: &Path) -> Vec<TransferVerb> {
         }
     }
     out
+}
+
+/// Read an inbox command through a bounded regular-file descriptor without
+/// following a final symlink or blocking on a special file.
+fn read_verb_record(path: &Path) -> io::Result<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        std::fs::File::from(fd)
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transfer verb is a final symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_TRANSFER_VERB_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer verb is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_TRANSFER_VERB_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_TRANSFER_VERB_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer verb exceeds the byte limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Monotonic per-process sequence so two verbs minted in the same millisecond keep a
@@ -198,5 +278,39 @@ mod tests {
         assert!(take_verbs(tmp.path()).is_empty(), "corrupt entry skipped");
         // ...and consumed, so it never replays.
         assert!(take_verbs(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn oversized_inbox_entry_is_consumed_without_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = inbox_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("00000000000000000001-submit-v2.json");
+        std::fs::write(&path, vec![b'x'; MAX_TRANSFER_VERB_BYTES + 1]).unwrap();
+        assert!(take_verbs(tmp.path()).is_empty());
+        assert!(!path.exists(), "hostile record is consumed, not replayed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_inbox_entry_is_consumed_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = inbox_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            serde_json::to_string(&TransferVerb::List).unwrap(),
+        )
+        .unwrap();
+        let link = dir.join("00000000000000000001-list.json");
+        symlink(&outside, &link).unwrap();
+        assert!(take_verbs(tmp.path()).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "{\"verb\":\"list\"}"
+        );
     }
 }

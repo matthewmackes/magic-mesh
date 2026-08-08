@@ -434,6 +434,7 @@ mod tests {
             vcpu: 2,
             memory_mb: 2048,
             disk_gb: 20,
+            storage_pool: mackes_mesh_types::cloud::StoragePool::default(),
             image: None,
             image_digest: None,
             network_isolation: false,

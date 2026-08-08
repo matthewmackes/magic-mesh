@@ -81,7 +81,7 @@ use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 pub const ACTION_PREFIX: &str = "action/bookmarks/";
 
 /// Retained-latest topic carrying the converged [`Collection`] snapshot the
-/// `Surface::Bookmarks` UI (BOOKMARKS-4) renders.
+/// Browser-owned bookmark panel (BOOKMARKS-4) renders.
 pub const STATE_COLLECTION: &str = "state/bookmarks/collection";
 
 /// Retained-latest topic carrying the [`SyncStatus`] (the freshness / "not

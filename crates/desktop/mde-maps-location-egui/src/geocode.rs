@@ -23,6 +23,11 @@ use rusqlite::{params, Connection, OpenFlags};
 /// generated prefix expression bounded.
 const MAX_GEOCODER_QUERY_BYTES: usize = 4 * 1024;
 
+/// Maximum UTF-8 byte length accepted for an individual gazetteer display
+/// field. The gazetteer is an installed artifact, but its rows still cross an
+/// untrusted persistence boundary before becoming navigation labels.
+const MAX_GEOCODER_RESULT_TEXT_BYTES: usize = 512;
+
 /// One gazetteer hit. Text columns are always present (empty, never `NULL`), so
 /// the UI can compose a title/subtitle without option juggling.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +46,31 @@ pub struct GeoResult {
     pub lon: f64,
     /// OSM-derived kind (`street`, `poi`, `address`, `place:town`, …).
     pub kind: String,
+}
+
+/// Accept only results that can safely become a destination pin and UI text.
+///
+/// `query_db` is the trust boundary between an installed SQLite artifact and
+/// navigation state. In particular, accepting an out-of-range coordinate here
+/// could make `Destination::from_geo` create a nonsensical route preview, and
+/// unbounded/control-bearing labels would be rendered directly by the map UI.
+fn valid_geo_result(result: &GeoResult) -> bool {
+    result.lat.is_finite()
+        && (-90.0..=90.0).contains(&result.lat)
+        && result.lon.is_finite()
+        && (-180.0..=180.0).contains(&result.lon)
+        && [
+            &result.name,
+            &result.housenumber,
+            &result.street,
+            &result.city,
+            &result.kind,
+        ]
+        .into_iter()
+        .all(|text| {
+            text.len() <= MAX_GEOCODER_RESULT_TEXT_BYTES
+                && !text.chars().any(char::is_control)
+        })
 }
 
 impl GeoResult {
@@ -157,7 +187,7 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
             kind: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
         })
     })?;
-    Ok(rows.flatten().collect())
+    Ok(rows.flatten().filter(valid_geo_result).collect())
 }
 
 /// Reject symlinked or non-directory parent components before SQLite sees the
@@ -485,6 +515,44 @@ mod tests {
             }
             other => panic!("unexpected oversized-query error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn hostile_gazetteer_rows_cannot_create_navigation_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("g.sqlite");
+        synth_gazetteer(&db);
+        let conn = Connection::open(&db).unwrap();
+        let hostile_rows = [
+            (5, "Out of range", 91.0, -95.8549),
+            (6, "Bad longitude", 32.2044, 181.0),
+        ];
+        for (id, name, lat, lon) in hostile_rows {
+            conn.execute(
+                "INSERT INTO places VALUES (?1, ?2, '', '', 'Athens', ?3, ?4, 'poi')",
+                params![id, name, lat, lon],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO places VALUES (?1, ?2, '', '', 'Athens', ?3, ?4, 'poi')",
+            params![
+                7,
+                format!("malformed{}", '\u{0007}'),
+                32.2044_f64,
+                -95.8549_f64
+            ],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO places_fts(places_fts) VALUES('rebuild')", [])
+            .unwrap();
+
+        let hits = query_db(&db, "athen", 10).unwrap();
+        assert_eq!(hits.len(), 3, "only valid synthetic rows may cross the boundary");
+        assert!(hits.iter().all(valid_geo_result));
+        assert!(hits.iter().all(|hit| hit.name != "Out of range"));
+        assert!(hits.iter().all(|hit| hit.name != "Bad longitude"));
+        assert!(hits.iter().all(|hit| !hit.name.contains('\u{0007}')));
     }
 
     #[test]

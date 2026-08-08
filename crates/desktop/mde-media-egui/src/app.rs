@@ -186,6 +186,7 @@ impl App for MediaApp {
 /// Advance the core one tick — the per-frame state pump (mirrors the sibling surfaces'
 /// `*_pump`). The standalone app calls it each frame; a shell embed would too.
 pub fn media_pump<E: MediaEngine>(controller: &mut MediaController<E>) {
+    controller.refresh_jellyfin_store();
     controller.pump();
 }
 
@@ -196,6 +197,10 @@ pub fn media_pump<E: MediaEngine>(controller: &mut MediaController<E>) {
 #[derive(Debug, Clone)]
 pub struct BusMediaSources {
     bus_root: Option<PathBuf>,
+    /// The last roster applied to the controller.  Bus reads remain on their
+    /// human-paced cadence, but an unchanged retained record must not replace
+    /// the controller state and re-run its source projection on every poll.
+    last_applied_state: Option<MediaSourcesState>,
 }
 
 impl BusMediaSources {
@@ -204,13 +209,17 @@ impl BusMediaSources {
     pub fn from_env() -> Self {
         Self {
             bus_root: mde_bus::client_data_dir(),
+            last_applied_state: None,
         }
     }
 
     /// Construct with an explicit spool root; tests use tempdirs.
     #[must_use]
     pub const fn with_root(bus_root: Option<PathBuf>) -> Self {
-        Self { bus_root }
+        Self {
+            bus_root,
+            last_applied_state: None,
+        }
     }
 
     /// Read the newest retained `state/media/sources` record.
@@ -223,11 +232,9 @@ impl BusMediaSources {
         let persist = mde_bus::persist::Persist::open(root)
             .map_err(|e| format!("open Bus media-source store: {e}"))?;
         let body = persist
-            .list_since(MEDIA_SOURCES_TOPIC, None)
+            .read_latest(MEDIA_SOURCES_TOPIC)
             .map_err(|e| format!("read {MEDIA_SOURCES_TOPIC}: {e}"))?
-            .into_iter()
-            .filter_map(|message| message.body)
-            .next_back();
+            .and_then(|message| message.body);
         body.map_or(Ok(None), |json| {
             serde_json::from_str::<MediaSourcesState>(&json)
                 .map(Some)
@@ -237,9 +244,13 @@ impl BusMediaSources {
 
     /// Apply the latest roster to a controller. Errors become visible status, not
     /// panics; a missing Bus/record leaves the current controller state unchanged.
-    pub fn refresh_controller<E: MediaEngine>(&self, controller: &mut MediaController<E>) {
+    pub fn refresh_controller<E: MediaEngine>(&mut self, controller: &mut MediaController<E>) {
         match self.read_latest() {
-            Ok(Some(state)) => controller.set_mesh_media_sources(Some(state)),
+            Ok(Some(state)) if self.last_applied_state.as_ref() != Some(&state) => {
+                self.last_applied_state = Some(state.clone());
+                controller.set_mesh_media_sources(Some(state));
+            }
+            Ok(Some(_)) => {}
             Ok(None) => {}
             Err(e) => controller.ui_mut().status = Some(format!("Mesh media sources: {e}")),
         }
@@ -2102,7 +2113,13 @@ fn player_stage<E: MediaEngine>(
     // airgap-safe default) never produces one, so the placeholder paints
     // exactly as before; the real mpv engine (`--features mpv`) does, closing
     // the FakeMpv/placeholder gap BUG-VIDEO-1 records.
-    if loaded {
+    //
+    // `Player::load` replaces `media` before the engine emits `FileLoaded`, so
+    // `media.is_some()` alone is not enough here. Clear the prior title's frame
+    // while the new title is Loading; otherwise a slow/failed decode can paint
+    // stale video under the new title and OSD.
+    let frame_valid = controller.video_frame_valid();
+    if loaded && frame_valid && controller.player().state() != PlayerState::Loading {
         if let Some(frame) = controller.player_mut().engine_mut().latest_frame() {
             video.upload(ui.ctx(), &frame);
         }
@@ -2111,14 +2128,15 @@ fn player_stage<E: MediaEngine>(
     }
 
     match video.texture() {
-        Some(texture) if loaded => {
+        Some(texture) if loaded && frame_valid => {
             let tex_id = texture.id();
             egui::Image::new(egui::load::SizedTexture::new(tex_id, rect.size())).paint_at(ui, rect);
         }
         _ => {
             // The dark stage panel, then a *designed* transient state centred on it: an
-            // accent spinner while the engine buffers the pick, the title once it is
-            // loaded, or the honest "no media" prompt (§7 — never a faked frame).
+            // accent spinner while the engine buffers the pick, an unavailable note
+            // after a decoder error, the title once it is loaded, or the honest
+            // "no media" prompt (§7 — never a faked frame).
             ui.painter().rect_filled(rect, Style::RADIUS, Style::BG);
             if controller.player().state() == PlayerState::Loading {
                 // A genuine motion cue for the buffering wait (the Spinner drives its
@@ -2139,7 +2157,12 @@ fn player_stage<E: MediaEngine>(
                     Style::TEXT_DIM,
                 );
             } else {
-                let (center_text, center_color) = if loaded {
+                let (center_text, center_color) = if loaded && !frame_valid {
+                    (
+                        "Playback unavailable — see status for details".to_owned(),
+                        Style::WARN,
+                    )
+                } else if loaded {
                     (title.clone(), Style::TEXT)
                 } else {
                     (
@@ -2816,7 +2839,9 @@ fn paint_transport_triangle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mde_media_core::{FakeMpv, MediaMetadata, Player, PlaylistItem, Track};
+    use mde_media_core::{
+        EngineSignal, FakeMpv, MediaMetadata, Player, PlaylistItem, Track, VideoFrame,
+    };
 
     fn tracks() -> Vec<Track> {
         vec![
@@ -3261,6 +3286,95 @@ mod tests {
         render_with_video(&mut c, &mut video, player_view);
     }
 
+    #[test]
+    fn loading_a_new_title_clears_the_previous_video_texture() {
+        let frame = VideoFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        let mut c = MediaController::new(Player::new(
+            FakeMpv::new()
+                .with_duration(120.0)
+                .with_tracks(tracks())
+                .with_frame(frame),
+        ));
+        let mut video = VideoTextureCache::default();
+
+        c.dispatch(TransportAction::PlayPath("first.mkv".to_owned()));
+        c.pump();
+        assert_eq!(c.player().state(), PlayerState::Playing);
+        render_with_video(&mut c, &mut video, player_view);
+        assert!(
+            video.texture().is_some(),
+            "the first loaded title should populate the frame sink"
+        );
+
+        c.dispatch(TransportAction::PlayPath("second.mkv".to_owned()));
+        assert_eq!(c.player().state(), PlayerState::Loading);
+        render_with_video(&mut c, &mut video, player_view);
+        assert!(
+            video.texture().is_none(),
+            "a new title must not paint the previous title while Loading"
+        );
+    }
+
+    #[test]
+    fn playback_error_hides_the_previous_video_texture_and_shows_unavailable() {
+        let frame = VideoFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        let mut c = MediaController::new(Player::new(
+            FakeMpv::new()
+                .with_duration(120.0)
+                .with_tracks(tracks())
+                .with_frame(frame),
+        ));
+        let mut video = VideoTextureCache::default();
+
+        c.dispatch(TransportAction::PlayPath("broken.mkv".to_owned()));
+        c.pump();
+        render_with_video(&mut c, &mut video, player_view);
+        assert!(
+            video.texture().is_some(),
+            "the loaded title should have a frame"
+        );
+
+        // The engine can report an out-of-band decoder error while the Player still
+        // retains its media URL and Playing state. The old renderer re-uploaded the
+        // same cached frame in that state.
+        c.player_mut()
+            .engine_mut()
+            .push_signal(EngineSignal::Error("decoder failed".to_owned()));
+        c.pump();
+        assert!(!c.video_frame_valid());
+
+        let shapes = render_video_shapes(&mut c, &mut video, player_view);
+        assert!(
+            video.texture().is_none(),
+            "a decoder error must not leave the previous frame visible"
+        );
+        assert!(
+            painted_text(&shapes)
+                .iter()
+                .any(|text| text == "Playback unavailable — see status for details"),
+            "the failed render must name its unavailable state"
+        );
+
+        // A subsequent file-ready transition restores frame trust; an error must
+        // not permanently strand the surface in the unavailable state.
+        c.dispatch(TransportAction::PlayPath("recovered.mkv".to_owned()));
+        c.pump();
+        assert!(c.video_frame_valid());
+        render_with_video(&mut c, &mut video, player_view);
+        assert!(
+            video.texture().is_some(),
+            "a fresh file-ready transition should permit a new frame"
+        );
+    }
+
     /// PLATFORM-INTERFACES Q21 (WL-UX-006/U21): the auto-hide OSD dims the stage
     /// with the ONE shared regular scrim material — asserted off the painted
     /// shapes at full dwell (the first-frame animate lands at the endpoint) —
@@ -3675,6 +3789,77 @@ mod tests {
         );
     }
 
+    /// A retained Bus roster is decoded input, not trusted UI state.  This fixture
+    /// drives the actual full-surface render with one safe gateway plus traversal and
+    /// ambiguous-identity rows.  The projection boundary must omit the hostile rows
+    /// before their endpoint, credential, or label can reach egui; every tab still
+    /// needs to tessellate without a live network or renderer (§7).
+    #[test]
+    fn hostile_mesh_roster_is_filtered_before_full_surface_render() {
+        let mut c = controller();
+        let mut state = mesh_sources_state();
+        let safe = state.sources[0].clone();
+
+        let mut traversal = safe.clone();
+        traversal.id = "hostile-traversal".to_owned();
+        traversal.name = "UNTRUSTED-TRAVERSAL-ROW".to_owned();
+        traversal.endpoint = "https://evil.mesh/../secret".to_owned();
+        traversal.upstream_key = Some("https://evil.mesh/../upstream".to_owned());
+
+        let mut duplicate_a = safe.clone();
+        duplicate_a.id = "ambiguous".to_owned();
+        duplicate_a.name = "UNTRUSTED-DUPLICATE-A".to_owned();
+        duplicate_a.endpoint = "https://duplicate-a.mesh:8096/jellyfin/a".to_owned();
+        duplicate_a.upstream_key = Some("https://shared-upstream.mesh:8096".to_owned());
+
+        let mut duplicate_b = duplicate_a.clone();
+        duplicate_b.name = "UNTRUSTED-DUPLICATE-B".to_owned();
+        duplicate_b.endpoint = "https://duplicate-b.mesh:8096/jellyfin/b".to_owned();
+
+        state.sources = vec![safe, traversal, duplicate_a, duplicate_b];
+        c.set_mesh_media_sources(Some(state));
+
+        assert_eq!(
+            c.mesh_jellyfin_sources()
+                .iter()
+                .map(|source| source.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gateway"],
+            "only the unambiguous, dialable source may reach the rendered model"
+        );
+
+        let mut video = VideoTextureCache::default();
+        let shapes = render_video_shapes(&mut c, &mut video, media_panel);
+        let texts = painted_text(&shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Gateway Home · Default · Selected")),
+            "the safe gateway must remain visible in the rendered Sources tab: {texts:?}"
+        );
+        for rejected in [
+            "UNTRUSTED-TRAVERSAL-ROW",
+            "UNTRUSTED-DUPLICATE-A",
+            "UNTRUSTED-DUPLICATE-B",
+            "evil.mesh",
+            "duplicate-a.mesh",
+            "duplicate-b.mesh",
+        ] {
+            assert!(
+                !texts.iter().any(|text| text.contains(rejected)),
+                "rejected roster data must not be painted: {rejected:?} in {texts:?}"
+            );
+        }
+
+        // The same hostile fixture must not make another tab unrenderable.  These
+        // are CPU-only tessellation checks; no live hardware or renderer evidence is
+        // implied by the fixture.
+        for tab in [MediaTab::Library, MediaTab::Player, MediaTab::Queue] {
+            c.ui_mut().tab = tab;
+            render_video_shapes(&mut c, &mut video, media_panel);
+        }
+    }
+
     fn mesh_sources_state() -> mackes_mesh_types::media_sources::MediaSourcesState {
         mackes_mesh_types::media_sources::MediaSourcesState {
             node: "seat-15".to_string(),
@@ -3716,9 +3901,84 @@ mod tests {
                 Some(&serde_json::to_string(&state).expect("json")),
             )
             .expect("write");
+        let mut newer = state.clone();
+        newer.published_at_ms = 2;
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&newer).expect("newer json")),
+            )
+            .expect("write newer");
 
         let reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
-        assert_eq!(reader.read_latest().expect("read"), Some(state));
+        assert_eq!(reader.read_latest().expect("read"), Some(newer));
+    }
+
+    #[test]
+    fn bus_media_sources_skips_unchanged_roster_reapplication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
+        let state = mesh_sources_state();
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&state).expect("json")),
+            )
+            .expect("write initial");
+
+        let mut reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
+        let mut c = controller();
+        reader.refresh_controller(&mut c);
+        let first_endpoint = c.jellyfin().mesh_sources().expect("initial roster").sources[0]
+            .endpoint
+            .as_ptr() as usize;
+
+        // A new Bus record with identical content is still a no-op at the
+        // controller boundary: the retained allocation remains in place.
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&state).expect("json")),
+            )
+            .expect("write unchanged");
+        reader.refresh_controller(&mut c);
+        let second_endpoint = c
+            .jellyfin()
+            .mesh_sources()
+            .expect("unchanged roster")
+            .sources[0]
+            .endpoint
+            .as_ptr() as usize;
+        assert_eq!(
+            first_endpoint, second_endpoint,
+            "unchanged retained state must not be assigned again"
+        );
+
+        let mut changed = state;
+        changed.published_at_ms = 2;
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&changed).expect("json")),
+            )
+            .expect("write changed");
+        reader.refresh_controller(&mut c);
+        assert_eq!(
+            c.jellyfin()
+                .mesh_sources()
+                .expect("changed roster")
+                .published_at_ms,
+            2,
+            "a changed roster must still reach the controller"
+        );
     }
 
     #[test]
@@ -3740,7 +4000,7 @@ mod tests {
             )
             .expect("write");
 
-        let reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
+        let mut reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
         assert!(reader
             .read_latest()
             .expect_err("malformed")

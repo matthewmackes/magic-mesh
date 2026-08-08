@@ -1,3 +1,7 @@
+> HISTORICAL / SUPERSEDED — The Spotify-class Music workspace and daemon
+> authority are now governed by WL-FUNC-021 in `docs/platform/WORKLIST.md`.
+> Retained only for migration context and existing service seams.
+
 # MUSIC-DOCK + MUSIC-HOME — docked always-open Music + a server-stats Home (design)
 
 > **HISTORICAL / SUPERSEDED IN PART (2026-07-19):** describes the retired iced `mde-music` surface. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Read the iced toolkit references below as historical.

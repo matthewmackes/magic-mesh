@@ -1,6 +1,12 @@
 use super::*;
 use crate::auth::{Credential, DesktopAuth};
-use mackes_mesh_types::vdi_session::SessionRequest;
+use mackes_mesh_types::workloads::{
+    workload_state_topic, WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId,
+    WorkloadOperationAction, WorkloadOperationPhase, WorkloadOperationStatus, WorkloadPowerState,
+    WorkloadProfile, WorkloadReadiness, WorkloadRuntimeSignals, WorkloadStateSnapshot,
+    WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
+};
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist as TestPersist;
 use mde_egui::egui::{pos2, vec2, Rect};
 use mde_egui::Style;
@@ -28,22 +34,45 @@ fn run_panel(state: &mut VdiState, input: egui::RawInput) -> bool {
     !prims.is_empty()
 }
 
-fn broker_requests(root: &std::path::Path) -> Vec<SessionRequest> {
+fn write_browser_workload_status(root: &std::path::Path, node: &str) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let snapshot = WorkloadStateSnapshot {
+        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        node: node.to_owned(),
+        observed_at_ms: now_ms,
+        workloads: vec![WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: "browser-existing".to_owned(),
+            workload_id: WorkloadId::new("browser-vm").expect("browser workload id"),
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadProfile::Standard.resources(),
+            image_ref: Some("browser:1.0".to_owned()),
+            generation: 7,
+            phase: WorkloadOperationPhase::Completed,
+            power: WorkloadPowerState::Running,
+            readiness: WorkloadReadiness::Ready,
+            signals: WorkloadRuntimeSignals::default(),
+            retryable: false,
+            attempt: 0,
+            next_retry_at_ms: 0,
+            reason: None,
+            remediation: None,
+            attachment: None,
+        }],
+    };
+    let body = serde_json::to_string(&snapshot).expect("typed Workloads snapshot");
     TestPersist::open(root.to_path_buf())
-        .expect("open session Bus")
-        .list_since("action/vdi/session", None)
-        .expect("read session Bus")
-        .into_iter()
-        .map(|message| {
-            serde_json::from_str(
-                message
-                    .body
-                    .as_deref()
-                    .expect("session message carries a body"),
-            )
-            .expect("session body decodes")
-        })
-        .collect()
+        .expect("open Workloads Bus")
+        .write(
+            &workload_state_topic(node),
+            Priority::Default,
+            Some("Workloads projection"),
+            Some(&body),
+        )
+        .expect("publish Workloads snapshot");
 }
 
 #[test]
@@ -107,10 +136,17 @@ fn app_handoff_uses_the_existing_brokered_vdi_path_and_keeps_catalog_identity_ty
     let mut state = VdiState::default();
     state.request_app_connect(
         crate::session_rail::AppSessionHandoff {
-            id: "app-session-1".to_owned(),
+            request: mackes_mesh_types::vdi_session::AppVmLaunchRequest::new(
+                "org.example.Writer",
+                "catalog-7",
+                "wayland-standard",
+                vec!["audio".to_owned()],
+                "app-session-1",
+                true,
+            )
+            .expect("admitted App VM request"),
             serving_peer: "oak".to_owned(),
             vm_id: "appvm-writer".to_owned(),
-            app_id: "org.example.Writer".to_owned(),
         },
         "eagle",
         None,
@@ -141,10 +177,17 @@ fn app_surface_close_returns_to_chrome_and_clears_the_typed_request() {
     let mut state = VdiState::default();
     state.request_app_connect(
         crate::session_rail::AppSessionHandoff {
-            id: "app-session-close".to_owned(),
+            request: mackes_mesh_types::vdi_session::AppVmLaunchRequest::new(
+                "org.example.Writer",
+                "catalog-7",
+                "wayland-standard",
+                Vec::new(),
+                "app-session-close",
+                true,
+            )
+            .expect("admitted App VM request"),
             serving_peer: "oak".to_owned(),
             vm_id: "appvm-writer".to_owned(),
-            app_id: "org.example.Writer".to_owned(),
         },
         "eagle",
         None,
@@ -398,6 +441,42 @@ fn console_topic_matches_the_broker() {
     assert_eq!(CONSOLE_TOPIC, "state/vdi/console");
 }
 
+#[cfg(feature = "live-vdi")]
+#[test]
+fn console_reader_uses_a_bounded_tail_of_retained_state() {
+    let dir = tempfile::tempdir().expect("temp bus");
+    let persist = TestPersist::open(dir.path().to_path_buf()).expect("open console Bus");
+    for i in 0..=MAX_CONSOLE_MESSAGES_PER_POLL {
+        persist
+            .write(
+                CONSOLE_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&format!("{{\"session_id\":\"s{i}\"}}")),
+            )
+            .expect("write retained console record");
+    }
+
+    let bodies = read_console_bodies(Some(dir.path()));
+    assert_eq!(
+        bodies.len(),
+        MAX_CONSOLE_MESSAGES_PER_POLL,
+        "console resolution must not materialize the entire retained topic"
+    );
+    assert!(
+        !bodies
+            .iter()
+            .any(|body| body.contains("\"session_id\":\"s0\"")),
+        "the oldest retained record must fall outside the bounded tail"
+    );
+    assert!(
+        bodies
+            .last()
+            .is_some_and(|body| body.contains("\"session_id\":\"s64\"")),
+        "the newest broker record must remain available for resolution"
+    );
+}
+
 fn brokered_body(session: &str, host: &str, port: u16) -> String {
     format!(
         r#"{{"session_id":"{session}","serving_node":"peer:oak","vm_id":"win11","status":{{"state":"brokered","protocol":"spice","host":"{host}","port":{port}}}}}"#
@@ -469,35 +548,6 @@ fn resolve_preserves_requested_protocol_compatibility_for_old_records() {
         resolve_brokered_console(&[body.to_string()], "s1"),
         ConsoleResolution::Ready { protocol: None, .. }
     ));
-}
-
-#[test]
-fn browser_transport_lock_rejects_missing_or_different_broker_protocols() {
-    assert_eq!(
-        admit_broker_protocol(
-            Some(BrowserVmTransport::Sunshine),
-            Some(VdiProtocol::Moonlight)
-        ),
-        Ok(Some(VdiProtocol::Moonlight))
-    );
-    assert_eq!(
-        admit_broker_protocol(Some(BrowserVmTransport::Rdp), Some(VdiProtocol::Rdp)),
-        Ok(Some(VdiProtocol::Rdp))
-    );
-    for offered in [None, Some(VdiProtocol::Spice), Some(VdiProtocol::Vnc)] {
-        let error = admit_broker_protocol(Some(BrowserVmTransport::Rdp), offered)
-            .expect_err("a Browser transport mismatch must fail closed");
-        assert!(error.contains("no transport fallback"));
-    }
-    let error = admit_broker_protocol(Some(BrowserVmTransport::Sunshine), Some(VdiProtocol::Rdp))
-        .expect_err("Sunshine may not silently downgrade to RDP");
-    assert!(error.contains("no transport fallback"));
-
-    assert_eq!(
-        admit_broker_protocol(None, Some(VdiProtocol::Spice)),
-        Ok(Some(VdiProtocol::Spice)),
-        "generic VM consoles retain broker-authoritative native protocols"
-    );
 }
 
 #[test]
@@ -1010,267 +1060,68 @@ fn requested_summary_names_the_pending_desktop_and_protocol() {
 }
 
 #[test]
-fn browser_connect_routes_exactly_the_selected_transport() {
+fn browser_activation_publishes_only_a_native_display1_workload_attachment() {
+    let bus = tempfile::tempdir().expect("Browser Workloads Bus");
+    write_browser_workload_status(bus.path(), "dell");
     let target = crate::web::BrowserVmTarget {
         serving_peer: "dell".into(),
         workload: "browser-vm".into(),
         status: "running".into(),
         reachable: true,
     };
-    let bus = tempfile::tempdir().expect("Browser session Bus");
 
-    let mut sunshine = VdiState::default();
-    sunshine
-        .request_browser_vm_connect(
-            target.clone(),
-            BrowserVmTransport::Sunshine,
-            "surface",
-            Some(bus.path().to_path_buf()),
-            None,
-            DesktopAuth::mesh_identity("surface"),
-        )
-        .expect("Sunshine request");
-    let request = sunshine
-        .requested
-        .as_ref()
-        .expect("Sunshine pending request");
-    assert_eq!(request.protocol, VdiProtocol::Moonlight);
-    assert_eq!(
-        request.browser_transport,
-        Some(BrowserVmTransport::Sunshine)
-    );
+    let receipt = request_browser_vm_display1_attach(&target, "Dell", Some(bus.path()))
+        .expect("native Display1 attachment request");
+    assert!(!receipt.is_empty());
 
-    let mut rdp = VdiState::default();
-    rdp.request_browser_vm_connect(
-        target,
-        BrowserVmTransport::Rdp,
-        "surface",
-        Some(bus.path().to_path_buf()),
-        None,
-        DesktopAuth::mesh_identity("surface"),
+    let persist = TestPersist::open(bus.path().to_path_buf()).expect("open action Bus");
+    let messages = persist
+        .list_since(WORKLOAD_OPERATION_TOPIC, None)
+        .expect("Workload actions");
+    assert_eq!(messages.len(), 1, "one click publishes one typed action");
+    let request: mackes_mesh_types::workloads::WorkloadOperationRequest = serde_json::from_str(
+        messages[0].body.as_deref().expect("typed Workload action body"),
     )
-    .expect("explicit RDP request");
-    let request = rdp.requested.as_ref().expect("RDP pending request");
-    assert_eq!(request.protocol, VdiProtocol::Rdp);
-    assert_eq!(request.browser_transport, Some(BrowserVmTransport::Rdp));
-    assert_eq!(request.preferred_size, Some((1920, 1080)));
-}
-
-#[test]
-fn focusing_the_current_browser_session_is_an_identity_preserving_noop() {
-    let target = crate::web::BrowserVmTarget {
-        serving_peer: "dell".into(),
-        workload: "browser-vm".into(),
-        status: "running".into(),
-        reachable: true,
-    };
-    let bus = tempfile::tempdir().expect("Browser session Bus");
-    let auth = DesktopAuth::mesh_identity_with_guest(
-        "surface",
-        "desktop/dell/rdp",
-        Credential::new("browser-user", "browser-secret"),
-    );
-    let mut state = VdiState::default();
-    state
-        .request_browser_vm_connect(
-            target,
-            BrowserVmTransport::Rdp,
-            "surface",
-            Some(bus.path().to_path_buf()),
-            Some((1920, 1080)),
-            auth,
-        )
-        .expect("RDP Browser request");
-    let original = state
-        .requested
-        .clone()
-        .expect("exact Browser request retained");
-    let id = original
-        .broker_session
-        .as_ref()
-        .expect("broker identity")
-        .id
-        .clone();
-    let before = broker_requests(bus.path());
-
+    .expect("decode Workload action");
+    assert_eq!(request.action, WorkloadOperationAction::StartAndAttach);
     assert_eq!(
-        state.focus_broker_session(&id),
-        Some(SessionFocusSurface::Browser)
+        request.preferred_attachment,
+        Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf)
     );
-    assert_eq!(state.requested.as_ref(), Some(&original));
-    assert_eq!(
-        broker_requests(bus.path()),
-        before,
-        "focusing the current session must publish neither Close nor a replacement Open"
-    );
-}
-
-#[test]
-fn switching_focus_restores_the_exact_browser_request_without_terminal_close() {
-    let target = crate::web::BrowserVmTarget {
-        serving_peer: "dell".into(),
-        workload: "browser-vm".into(),
-        status: "running".into(),
-        reachable: true,
-    };
-    let bus = tempfile::tempdir().expect("Browser session Bus");
-    let mut state = VdiState::default();
-    state
-        .request_browser_vm_connect(
-            target,
-            BrowserVmTransport::Rdp,
-            "surface",
-            Some(bus.path().to_path_buf()),
-            Some((2256, 1504)),
-            DesktopAuth::mesh_identity_with_guest(
-                "surface",
-                "desktop/dell/rdp",
-                Credential::new("browser-user", "preserved-secret"),
-            ),
-        )
-        .expect("RDP Browser request");
-    let browser = state
-        .requested
-        .clone()
-        .expect("exact Browser request retained");
-    let browser_id = browser
-        .broker_session
-        .as_ref()
-        .expect("Browser broker identity")
-        .id
-        .clone();
-    #[cfg(feature = "live-vdi")]
-    {
-        let broker = browser
-            .broker_session
-            .clone()
-            .expect("Browser lifecycle handle");
-        let mut last_error = None;
-        crate::discovery::publish_active(broker.bus_root.as_deref(), &mut last_error, &browser_id);
-        assert_eq!(last_error, None);
-        state.active_broker_session = Some(broker);
-    }
-
-    state.request_connect(
-        ConnectRequest::new(
-            RequestedTarget::new("oak", "win11"),
-            VdiProtocol::Spice,
-            DisplayMode::Windowed,
-            MonitorSpan::All,
-            DesktopAuth::mesh_identity("surface"),
-        )
-        .with_broker_session(BrokerSessionLifecycle::new(
-            "desktop-session-2",
-            Some(bus.path().to_path_buf()),
-        )),
-    );
-    assert_eq!(state.requested_session_id(), Some("desktop-session-2"));
-
-    assert_eq!(
-        state.focus_broker_session(&browser_id),
-        Some(SessionFocusSurface::Browser)
-    );
-    assert_eq!(
-        state.requested.as_ref(),
-        Some(&browser),
-        "profile, transport, display geometry, and sealed credential must be restored verbatim"
-    );
+    assert_eq!(request.target_node, "dell");
+    assert_eq!(request.expected_generation, 7);
+    assert_eq!(request.resources, WorkloadProfile::Standard.resources());
+    assert_eq!(request.image_ref.as_deref(), Some("browser:1.0"));
+    assert!(request.armed_token.is_some(), "request remains capability-bound");
     assert!(
-        broker_requests(bus.path())
-            .iter()
-            .all(|request| !matches!(request, SessionRequest::Close { id } if id == &browser_id)),
-        "focus switching must keep the Browser broker record nonterminal"
-    );
-    #[cfg(feature = "live-vdi")]
-    assert!(
-        broker_requests(bus.path()).iter().any(
-            |request| matches!(request, SessionRequest::Disconnect { id } if id == &browser_id)
-        ),
-        "parking a live Browser transport must retain its broker record as disconnected"
+        persist
+            .list_since("action/vdi/session", None)
+            .expect("legacy VDI topic")
+            .is_empty(),
+        "Browser activation must not open a compatibility VDI/console session"
     );
 }
 
 #[test]
-fn explicit_rdp_once_closes_the_stale_sunshine_request_before_replacement() {
+fn browser_native_attachment_refuses_remote_placement_without_a_console_relay() {
+    let bus = tempfile::tempdir().expect("Browser Workloads Bus");
     let target = crate::web::BrowserVmTarget {
         serving_peer: "dell".into(),
         workload: "browser-vm".into(),
         status: "running".into(),
         reachable: true,
     };
-    let bus = tempfile::tempdir().expect("Browser session Bus");
-    let mut state = VdiState::default();
-    state
-        .request_browser_vm_connect(
-            target.clone(),
-            BrowserVmTransport::Sunshine,
-            "surface",
-            Some(bus.path().to_path_buf()),
-            None,
-            DesktopAuth::mesh_identity("surface"),
-        )
-        .expect("Sunshine request");
-    let sunshine_id = state
-        .requested_session_id()
-        .expect("Sunshine broker identity")
-        .to_owned();
-
-    // This is the VDI half of the UI's explicit "Use RDP once" path. The Web
-    // surface queues the new typed RDP request immediately afterward.
-    state.clear_target();
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    state
-        .request_browser_vm_connect(
-            target,
-            BrowserVmTransport::Rdp,
-            "surface",
-            Some(bus.path().to_path_buf()),
-            None,
-            DesktopAuth::mesh_identity_with_guest(
-                "surface",
-                "desktop/dell/rdp",
-                Credential::new("browser-user", "rdp-secret"),
-            ),
-        )
-        .expect("explicit RDP replacement");
-    let rdp_id = state
-        .requested_session_id()
-        .expect("RDP broker identity")
-        .to_owned();
-    assert_ne!(
-        sunshine_id, rdp_id,
-        "replacement must mint a new roster key"
+    let error = request_browser_vm_display1_attach(&target, "seat15", Some(bus.path()))
+        .expect_err("remote Display1 must fail closed");
+    assert!(error.contains("node-local"));
+    assert!(
+        TestPersist::open(bus.path().to_path_buf())
+            .expect("open action Bus")
+            .list_since(WORKLOAD_OPERATION_TOPIC, None)
+            .expect("Workload actions")
+            .is_empty(),
+        "remote placement must not publish a fallback action"
     );
-
-    let requests = broker_requests(bus.path());
-    let sunshine_open = requests
-        .iter()
-        .position(|request| {
-            matches!(
-                request,
-                SessionRequest::Open { id, .. }
-                    if id == &sunshine_id
-                        && request.browser_transport()
-                            == Ok(Some(BrowserVmTransport::Sunshine))
-            )
-        })
-        .expect("Sunshine Open recorded");
-    let sunshine_close = requests
-        .iter()
-        .position(|request| matches!(request, SessionRequest::Close { id } if id == &sunshine_id))
-        .expect("stale Sunshine Close recorded");
-    let rdp_open = requests
-        .iter()
-        .position(|request| {
-            matches!(
-                request,
-                SessionRequest::Open { id, .. }
-                    if id == &rdp_id
-                        && request.browser_transport() == Ok(Some(BrowserVmTransport::Rdp))
-            )
-        })
-        .expect("explicit RDP Open recorded");
-    assert!(sunshine_open < sunshine_close && sunshine_close < rdp_open);
 }
 
 #[test]
@@ -1666,26 +1517,88 @@ fn size_diverges_flags_a_change_beyond_tolerance_on_either_axis() {
 
 #[cfg(feature = "live-vdi")]
 fn dummy_rdp_handle() -> LiveRdpHandle {
-    let (input_tx, _in) = mpsc::channel();
+    let input = new_input_mailbox();
     let (stop_tx, _stop) = mpsc::channel();
     let (_ev, event_rx) = mpsc::channel();
     LiveRdpHandle {
-        input_tx,
+        input,
         stop_tx,
         event_rx,
+        frame_mailbox: LatestFrameMailbox::default(),
     }
 }
 
 #[cfg(feature = "live-vdi")]
 fn dummy_vnc_handle() -> LiveVncHandle {
-    let (input_tx, _in) = mpsc::channel();
+    let input = new_input_mailbox();
     let (stop_tx, _stop) = mpsc::channel();
     let (_ev, event_rx) = mpsc::channel();
     LiveVncHandle {
-        input_tx,
+        input,
         stop_tx,
         event_rx,
+        frame_mailbox: LatestFrameMailbox::default(),
     }
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn live_frame_mailbox_keeps_only_the_newest_decoded_frame() {
+    let mailbox = LatestFrameMailbox::default();
+    let frame = |color| egui::ColorImage {
+        size: [1, 1],
+        pixels: vec![color],
+    };
+    mailbox.publish(frame(egui::Color32::BLACK), FrameDamage::Full);
+    mailbox.publish(frame(egui::Color32::WHITE), FrameDamage::Full);
+
+    let (latest, _) = mailbox.take().expect("latest frame is retained");
+    assert_eq!(latest.pixels, vec![egui::Color32::WHITE]);
+    assert!(
+        mailbox.take().is_none(),
+        "the mailbox is drained, not queued"
+    );
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn live_input_mailbox_bounds_flood_and_prioritizes_key_release() {
+    let mut mailbox = BoundedInputMailbox::default();
+    let key_down = || egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    };
+    let key_up = egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    };
+    for _ in 0..LIVE_INPUT_QUEUE_CAPACITY {
+        assert!(mailbox.push(key_down()));
+    }
+    assert!(
+        mailbox.push(key_up.clone()),
+        "release evicts an older transition"
+    );
+    assert_eq!(mailbox.queue.len(), LIVE_INPUT_QUEUE_CAPACITY);
+    assert!(matches!(
+        mailbox.queue.back(),
+        Some(egui::Event::Key { pressed: false, .. })
+    ));
+
+    for _ in 0..(LIVE_INPUT_QUEUE_CAPACITY * 2) {
+        mailbox.push(egui::Event::PointerMoved(egui::Pos2::new(1.0, 2.0)));
+    }
+    assert_eq!(
+        mailbox.queue.len(),
+        LIVE_INPUT_QUEUE_CAPACITY,
+        "pointer flood cannot grow the queue"
+    );
 }
 
 #[cfg(feature = "live-vdi")]
@@ -1718,25 +1631,6 @@ fn a_material_panel_growth_arms_a_resize_redial() {
         .pending_resize
         .expect("a material resize should arm a re-dial");
     assert_eq!(pending.target, (1920, 1080));
-}
-
-#[cfg(feature = "live-vdi")]
-#[test]
-fn browser_vm_keeps_its_full_hd_guest_when_the_panel_is_smaller() {
-    let mut state = live_rdp_state();
-    state
-        .requested
-        .as_mut()
-        .expect("retained request")
-        .browser_transport = Some(BrowserVmTransport::Rdp);
-    state.negotiated_size = Some((1920, 1080));
-
-    state.note_resize_target((1600, 900), (1920, 1080));
-
-    assert!(
-        state.pending_resize.is_none(),
-        "Browser must scale its complete 1080p framebuffer, not renegotiate below Full HD"
-    );
 }
 
 #[cfg(feature = "live-vdi")]

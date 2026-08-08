@@ -21,7 +21,8 @@ use std::hash::Hash;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align2, Color32, Key, Modifiers, Rect, Response, Sense, Ui, Vec2, WidgetInfo, WidgetType,
+    Align2, Color32, CursorIcon, Key, Modifiers, Rect, Response, Sense, Ui, Vec2, WidgetInfo,
+    WidgetType,
 };
 
 use crate::{
@@ -201,7 +202,9 @@ fn icon_button(
     label: &str,
     tint: Color32,
 ) -> Response {
-    let response = ui.interact(rect, id, Sense::click());
+    let response = ui
+        .interact(rect, id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
     if ui.is_rect_visible(rect) {
         let hover = Motion::animate(ui.ctx(), id.with("hover"), response.hovered(), Motion::FAST);
@@ -357,7 +360,9 @@ impl<'a> NavigationBar<'a> {
                 Vec2::new(width, hit),
             );
             let id = ui.id().with("mde-nav-back");
-            let response = ui.interact(back_rect, id, Sense::click());
+            let response = ui
+                .interact(back_rect, id, Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
             response.widget_info(|| {
                 WidgetInfo::labeled(
                     WidgetType::Button,
@@ -639,7 +644,9 @@ impl<'a> Toolbar<'a> {
         let response = if let Some(icon) = item.icon {
             icon_button(ui, slot, id, icon, item.label, accent)
         } else {
-            let response = ui.interact(slot, id, Sense::click());
+            let response = ui
+                .interact(slot, id, Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
             response.widget_info(|| {
                 WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), item.label)
             });
@@ -837,7 +844,9 @@ impl Sidebar {
         let rid = Self::row_id(id_salt, index);
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
-        let response = ui.interact(rect, rid, Sense::click());
+        let response = ui
+            .interact(rect, rid, Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
         let is_selected = row.id == *effective;
         response.widget_info(|| {
             WidgetInfo::selected(

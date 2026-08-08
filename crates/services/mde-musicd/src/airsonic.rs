@@ -23,6 +23,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -33,6 +34,14 @@ use serde_json::Value;
 /// the server's reported version and retries (see [`Client::get`]). This makes
 /// `mde-music` work against older Airsonic/Subsonic servers, not just current ones.
 pub const API_VERSION: &str = "1.16.1";
+
+/// Maximum finite payload accepted by the daemon-owned download path. The
+/// provider response is streamed and accounted before it reaches the cache;
+/// this keeps a hostile or misconfigured endpoint from turning one Bus action
+/// into an unbounded allocation.
+pub const MAX_FINITE_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
+/// Maximum bookmark rows admitted from one provider response.
+pub const MAX_BOOKMARKS: usize = 512;
 
 /// Subsonic error code returned when the client's requested `v=` is newer than
 /// the server supports ("incompatible REST protocol version, server must upgrade").
@@ -156,6 +165,7 @@ fn metadata_cacheable_view(view: &str) -> bool {
             | "getPlaylists"
             | "getPlaylist"
             | "getStarred2"
+            | "getBookmarks"
     )
 }
 
@@ -173,6 +183,9 @@ pub const CLIENT_NAME: &str = "mde-music";
 
 /// Active-active media DNS endpoint written by `mackesd` on each node.
 pub const MUSIC_READ_HOST: &str = "music.mesh";
+
+/// Subsonic's documented upper bound for one `getAlbumList2` page.
+pub const MAX_ALBUM_LIST_PAGE_SIZE: u32 = 500;
 
 /// Deterministic single-writer media DNS endpoint for playlist mutations.
 pub const MUSIC_WRITER_HOST: &str = "music-writer.mesh";
@@ -247,17 +260,20 @@ pub struct Genre {
 
 /// A podcast channel from `getPodcasts` (AIR-21). Serialized as
 /// `{id, title}` so the GUI's `parse_items` reads it like any row.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct PodcastChannel {
     /// Subsonic channel id — used as the `id=` param for `getPodcasts` to fetch episodes.
     pub id: String,
     /// Display name of the podcast channel.
     pub title: String,
+    /// Optional provider artwork token for the feed.
+    #[serde(default, rename = "coverArt")]
+    pub artwork_ref: String,
 }
 
 /// An internet radio station from `getInternetRadioStations` (SVC-3).
 /// `stream_url` is the raw upstream URL the engine plays directly.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct RadioStation {
     /// Subsonic station id (opaque server-assigned string).
     pub id: String,
@@ -266,16 +282,45 @@ pub struct RadioStation {
     #[serde(rename = "streamUrl")]
     /// Raw upstream stream URL the playback engine connects to directly.
     pub stream_url: String,
+    /// Optional provider artwork token for the station.
+    #[serde(default, rename = "coverArt")]
+    pub artwork_ref: String,
 }
 
 /// A podcast episode from `getPodcasts?id=<channel>` (AIR-21). `id` is the
 /// episode's `streamId` — the media id the player streams + enqueues.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct PodcastEpisode {
     /// Playable media id — the episode's `streamId` (falls back to `id`) for the stream endpoint.
     pub id: String,
     /// Display title of the episode.
     pub title: String,
+    /// Optional provider artwork token for the episode.
+    #[serde(default, rename = "coverArt")]
+    pub artwork_ref: String,
+}
+
+/// A typed row from `getBookmarks`. The provider's `type` token is retained
+/// until the daemon maps it to the closed workspace [`ContentKind`] enum;
+/// unknown media types are not projected into the player shelf.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Bookmark {
+    /// Provider-owned media identity.
+    pub id: String,
+    /// Display title.
+    pub title: String,
+    /// Resume position in milliseconds.
+    pub position_ms: u64,
+    /// Provider media type token, normalized to lowercase.
+    pub kind: String,
+    /// Primary creator, when supplied.
+    pub creator: String,
+    /// Parent feed, album, or book title, when supplied.
+    pub parent_title: String,
+    /// Duration in milliseconds, when supplied by the provider.
+    pub duration_ms: Option<u64>,
+    /// Provider artwork token, when supplied.
+    pub artwork_ref: Option<String>,
 }
 
 /// An album row from `getAlbumList2` / `search3`.
@@ -300,6 +345,19 @@ pub struct Album {
     #[serde(default)]
     /// Release year, if the server has it.
     pub year: Option<u32>,
+}
+
+/// One bounded `getAlbumList2` page. The Subsonic response has no documented
+/// total/count field, so this type exposes only the effective request window;
+/// callers must treat a short page as a useful hint, not a server-proven total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumListPage {
+    /// Album rows returned by this page.
+    pub albums: Vec<Album>,
+    /// Offset sent to the provider.
+    pub offset: u32,
+    /// Effective page size sent to the provider, clamped to the API bound.
+    pub page_size: u32,
 }
 
 /// A song row from `search3` (and, later, `getAlbum`).
@@ -695,6 +753,43 @@ impl Client {
         Ok(parse_album_list2(&inner))
     }
 
+    /// Fetch one bounded `getAlbumList2` page using the provider's explicit
+    /// `offset` parameter. Existing callers should keep using
+    /// [`Self::get_album_list2`] when they do not need paging.
+    ///
+    /// Subsonic documents `size <= 500`; zero is normalized to one and larger
+    /// requests are clamped to [`MAX_ALBUM_LIST_PAGE_SIZE`]. The standard
+    /// response contains no total/count metadata, so [`AlbumListPage`] does
+    /// not invent one.
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn get_album_list2_page(
+        &self,
+        list_type: &str,
+        size: u32,
+        offset: u32,
+    ) -> Result<AlbumListPage, AirsonicError> {
+        let page_size = size.clamp(1, MAX_ALBUM_LIST_PAGE_SIZE);
+        let page_size_param = page_size.to_string();
+        let offset_param = offset.to_string();
+        let inner = self
+            .get(
+                "getAlbumList2",
+                &[
+                    ("type", list_type),
+                    ("size", &page_size_param),
+                    ("offset", &offset_param),
+                ],
+            )
+            .await?;
+        Ok(AlbumListPage {
+            albums: parse_album_list2(&inner),
+            offset,
+            page_size,
+        })
+    }
+
     /// MUSIC-HOME-3 — `getStarred2` → the user's starred albums (the Home
     /// "Starred" strip).
     ///
@@ -703,6 +798,71 @@ impl Client {
     pub async fn get_starred2(&self) -> Result<Vec<Album>, AirsonicError> {
         let inner = self.get("getStarred2", &[]).await?;
         Ok(parse_starred_albums(&inner))
+    }
+
+    /// Star one admitted song, album, or artist through the provider API.
+    ///
+    /// # Errors
+    /// Transport or provider mutation failures.
+    pub async fn star(&self, id: &str) -> Result<(), AirsonicError> {
+        self.get("star", &[("id", id)]).await.map(|_| ())
+    }
+
+    /// Remove one admitted song, album, or artist from the provider stars.
+    ///
+    /// # Errors
+    /// Transport or provider mutation failures.
+    pub async fn unstar(&self, id: &str) -> Result<(), AirsonicError> {
+        self.get("unstar", &[("id", id)]).await.map(|_| ())
+    }
+
+    /// Submit bounded playback progress through the Subsonic scrobble API.
+    /// `position_ms` is the daemon's finite playhead position; provider
+    /// mutation remains behind the admitted client and never enters the UI.
+    ///
+    /// # Errors
+    /// Transport or provider mutation failures.
+    pub async fn scrobble(&self, id: &str, position_ms: u64) -> Result<(), AirsonicError> {
+        let time = position_ms.to_string();
+        self.get(
+            "scrobble",
+            &[("id", id), ("submission", "false"), ("time", &time)],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Create one provider bookmark at a bounded finite playhead position.
+    /// The empty comment is intentional: the typed Music contract carries
+    /// identity and position, not arbitrary provider annotation text.
+    ///
+    /// # Errors
+    /// Transport or provider mutation failures.
+    pub async fn create_bookmark(&self, id: &str, position_ms: u64) -> Result<(), AirsonicError> {
+        let position = position_ms.to_string();
+        self.get(
+            "createBookmark",
+            &[("id", id), ("position", &position), ("comment", "")],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Delete the provider bookmark for one admitted media identity.
+    ///
+    /// # Errors
+    /// Transport or provider mutation failures.
+    pub async fn delete_bookmark(&self, id: &str) -> Result<(), AirsonicError> {
+        self.get("deleteBookmark", &[("id", id)]).await.map(|_| ())
+    }
+
+    /// `getBookmarks` — the provider's retained resume positions.
+    ///
+    /// # Errors
+    /// Transport / API / parse failures.
+    pub async fn get_bookmarks(&self) -> Result<Vec<Bookmark>, AirsonicError> {
+        let inner = self.get("getBookmarks", &[]).await?;
+        Ok(parse_bookmarks(&inner))
     }
 
     /// `search3` — three-section search across artists/albums/songs.
@@ -819,6 +979,100 @@ impl Client {
             }
         }
         Ok(bytes)
+    }
+
+    /// Fetch one finite song/episode stream into memory for an explicit
+    /// daemon-owned offline download. The caller bounds the requested identity
+    /// and persists the bytes atomically through the Music cache.
+    ///
+    /// # Errors
+    /// Transport / HTTP-status failures, or an upstream version envelope.
+    pub async fn get_stream_bytes(&self, song_id: &str) -> Result<Vec<u8>, AirsonicError> {
+        self.get_stream_bytes_with_progress(song_id, |_, _| {})
+            .await
+    }
+
+    /// Fetch one finite stream while reporting bounded byte progress to the
+    /// daemon-owned download ledger. The callback is invoked after each
+    /// received chunk and never receives provider payloads or credentials.
+    pub async fn get_stream_bytes_with_progress<F>(
+        &self,
+        song_id: &str,
+        mut on_progress: F,
+    ) -> Result<Vec<u8>, AirsonicError>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
+        let bytes = self
+            .fetch_stream_bytes_with_progress(song_id, &mut on_progress)
+            .await?;
+        if let Some(server_v) = error30_server_version(&bytes) {
+            let target = min_version(&server_v, API_VERSION);
+            let changed = self
+                .version
+                .lock()
+                .map(|mut cur| {
+                    if *cur != target {
+                        *cur = target.clone();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if changed {
+                write_persisted_version(&target);
+                return self
+                    .fetch_stream_bytes_with_progress(song_id, &mut on_progress)
+                    .await;
+            }
+            return Err(AirsonicError::Parse(
+                "stream returned a protocol error envelope".to_string(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Raw GET of a finite stream at the current negotiated API version.
+    async fn fetch_stream_bytes_with_progress<F>(
+        &self,
+        song_id: &str,
+        on_progress: &mut F,
+    ) -> Result<Vec<u8>, AirsonicError>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
+        let url = self.stream_url(song_id);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AirsonicError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(AirsonicError::Http(format!("HTTP {}", resp.status())));
+        }
+        let total = resp.content_length();
+        if total.is_some_and(|size| size > MAX_FINITE_DOWNLOAD_BYTES as u64) {
+            return Err(AirsonicError::Http(
+                "finite download exceeds the daemon size bound".to_string(),
+            ));
+        }
+        let mut body = Vec::with_capacity(total.map_or(0, |size| size as usize));
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| AirsonicError::Http(e.to_string()))?;
+            let next = body.len().saturating_add(chunk.len());
+            if next > MAX_FINITE_DOWNLOAD_BYTES {
+                return Err(AirsonicError::Http(
+                    "finite download exceeds the daemon size bound".to_string(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+            let received = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            on_progress(received, total);
+        }
+        Ok(body)
     }
 
     /// Raw GET of the cover-art URL at the current `v=` (no envelope handling).
@@ -1136,6 +1390,7 @@ pub fn parse_album_list2(inner: &Value) -> Vec<Album> {
             albums
                 .iter()
                 .filter_map(|a| serde_json::from_value(a.clone()).ok())
+                .take(MAX_ALBUM_LIST_PAGE_SIZE as usize)
                 .collect()
         })
         .unwrap_or_default()
@@ -1155,6 +1410,71 @@ pub fn parse_starred_albums(inner: &Value) -> Vec<Album> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Parse `getBookmarks` → `bookmarks.bookmark[]`.
+///
+/// Subsonic places the media row below `entry`, while a few compatible
+/// servers return the row fields directly. Accept both shapes, retain only
+/// bounded scalar metadata, and leave media-type admission to the daemon's
+/// closed domain mapping.
+#[must_use]
+pub fn parse_bookmarks(inner: &Value) -> Vec<Bookmark> {
+    let Some(rows) = inner
+        .get("bookmarks")
+        .and_then(|bookmarks| bookmarks.get("bookmark"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let entry = row.get("entry").unwrap_or(row);
+            let id = entry.get("id").and_then(Value::as_str)?;
+            let position_ms = row
+                .get("position")
+                .or_else(|| entry.get("position"))
+                .and_then(Value::as_u64)?;
+            let text = |keys: &[&str]| {
+                keys.iter()
+                    .find_map(|key| entry.get(*key).and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let title = {
+                let title = text(&["title"]);
+                if title.is_empty() {
+                    id.to_string()
+                } else {
+                    title
+                }
+            };
+            let kind = text(&["type", "kind", "mediaType"]).to_ascii_lowercase();
+            let duration_ms = entry.get("durationMs").and_then(Value::as_u64).or_else(|| {
+                entry
+                    .get("duration")
+                    .and_then(Value::as_u64)
+                    .and_then(|seconds| seconds.checked_mul(1_000))
+            });
+            let artwork_ref = entry
+                .get("coverArt")
+                .or_else(|| entry.get("artworkRef"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Some(Bookmark {
+                id: id.to_string(),
+                title,
+                position_ms,
+                kind,
+                creator: text(&["artist", "author", "albumArtist"]),
+                parent_title: text(&["album", "parentTitle", "seriesTitle"]),
+                duration_ms,
+                artwork_ref,
+            })
+        })
+        .take(MAX_BOOKMARKS)
+        .collect()
 }
 
 /// Parse a `getArtist` reply's `artist.album[]` into [`Album`] rows.
@@ -1343,6 +1663,11 @@ pub fn parse_radio_stations(inner: &Value) -> Vec<RadioStation> {
                         id: id.to_string(),
                         name: name.to_string(),
                         stream_url: stream_url.to_string(),
+                        artwork_ref: c
+                            .get("coverArt")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                     })
                 })
                 .collect()
@@ -1365,6 +1690,11 @@ pub fn parse_podcast_channels(inner: &Value) -> Vec<PodcastChannel> {
                     Some(PodcastChannel {
                         id: id.to_string(),
                         title: title.to_string(),
+                        artwork_ref: c
+                            .get("coverArt")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                     })
                 })
                 .collect()
@@ -1395,6 +1725,11 @@ pub fn parse_podcast_episodes(inner: &Value) -> Vec<PodcastEpisode> {
                     Some(PodcastEpisode {
                         id: id.to_string(),
                         title: title.to_string(),
+                        artwork_ref: e
+                            .get("coverArt")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                     })
                 })
                 .collect()
@@ -1481,6 +1816,56 @@ mod tests {
         format!("http://{addr}")
     }
 
+    fn one_shot_json_server_with_request(
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind capturing one-shot server");
+        let addr = listener
+            .local_addr()
+            .expect("capturing one-shot address");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap_or(0);
+            let _ = sender.send(String::from_utf8_lossy(&request[..length]).into_owned());
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        (format!("http://{addr}"), receiver)
+    }
+
+    fn one_shot_bytes_server(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind byte server");
+        let addr = listener.local_addr().expect("byte server addr");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn error30_envelope_detected_in_raw_bytes() {
         // A capped server answers a raw-byte endpoint (cover art / stream) with
@@ -1542,6 +1927,43 @@ mod tests {
         );
         assert!(parse_lyrics(&json!({"nope":1})).is_empty());
     }
+
+    #[test]
+    fn parse_bookmarks_retains_nested_resume_metadata_and_bounds_unknown_shape() {
+        let inner = json!({
+            "bookmarks": {
+                "bookmark": [
+                    {
+                        "position": 42_000,
+                        "entry": {
+                            "id": "episode-1",
+                            "title": "Episode One",
+                            "type": "podcast",
+                            "artist": "The Show",
+                            "album": "Feed One",
+                            "duration": 120,
+                            "coverArt": "art-1"
+                        }
+                    },
+                    {
+                        "position": 7,
+                        "id": "direct-1",
+                        "title": "Direct Row",
+                        "type": "music"
+                    },
+                    {"position": 9, "entry": {"title": "missing id"}}
+                ]
+            }
+        });
+        let bookmarks = parse_bookmarks(&inner);
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks[0].id, "episode-1");
+        assert_eq!(bookmarks[0].position_ms, 42_000);
+        assert_eq!(bookmarks[0].duration_ms, Some(120_000));
+        assert_eq!(bookmarks[0].kind, "podcast");
+        assert_eq!(bookmarks[1].id, "direct-1");
+        assert_eq!(bookmarks[1].kind, "music");
+    }
     use serde_json::json;
 
     #[test]
@@ -1566,6 +1988,53 @@ mod tests {
         assert_eq!(p.iter().find(|(k, _)| k == "f").unwrap().1, "json");
         // Default v= is the ceiling until a server negotiates it down.
         assert_eq!(p.iter().find(|(k, _)| k == "v").unwrap().1, API_VERSION);
+    }
+
+    #[test]
+    fn star_and_unstar_use_typed_provider_mutation_endpoints() {
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+        let star_client = Client::with_salt(one_shot_json_server(body), "alice", "pw", "star");
+        let unstar_client = Client::with_salt(one_shot_json_server(body), "alice", "pw", "unstar");
+        let bookmark_client =
+            Client::with_salt(one_shot_json_server(body), "alice", "pw", "bookmark");
+        let delete_bookmark_client =
+            Client::with_salt(one_shot_json_server(body), "alice", "pw", "bookmark-delete");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        assert!(rt.block_on(star_client.star("song-1")).is_ok());
+        assert!(rt.block_on(unstar_client.unstar("song-1")).is_ok());
+        assert!(rt
+            .block_on(bookmark_client.create_bookmark("episode-1", 42_000))
+            .is_ok());
+        assert!(rt
+            .block_on(delete_bookmark_client.delete_bookmark("episode-1"))
+            .is_ok());
+    }
+
+    #[test]
+    fn finite_stream_reports_bounded_received_progress() {
+        let client = Client::with_salt(
+            one_shot_bytes_server(b"finite-audio"),
+            "alice",
+            "pw",
+            "progress",
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut progress = Vec::new();
+        let bytes = rt
+            .block_on(
+                client.get_stream_bytes_with_progress("song-1", |received, total| {
+                    progress.push((received, total));
+                }),
+            )
+            .expect("finite stream");
+        assert_eq!(bytes, b"finite-audio");
+        assert_eq!(progress.last(), Some(&(12, Some(12))));
     }
 
     #[test]
@@ -1829,6 +2298,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_podcast_radio_and_episode_artwork_tokens() {
+        let channels = json!({"podcasts": {"channel": [
+            {"id": "feed-1", "title": "Mesh Weekly", "coverArt": "feed-art"},
+            {"id": "feed-2", "title": "No Artwork"}
+        ]}});
+        let parsed_channels = parse_podcast_channels(&channels);
+        assert_eq!(parsed_channels[0].artwork_ref, "feed-art");
+        assert!(parsed_channels[1].artwork_ref.is_empty());
+
+        let radio = json!({"internetRadioStations": {"internetRadioStation": [
+            {"id": "station-1", "name": "Mesh FM", "streamUrl": "https://radio.test/live", "coverArt": "radio-art"},
+            {"id": "station-2", "name": "No Artwork", "streamUrl": "https://radio.test/other"}
+        ]}});
+        let parsed_radio = parse_radio_stations(&radio);
+        assert_eq!(parsed_radio[0].artwork_ref, "radio-art");
+        assert!(parsed_radio[1].artwork_ref.is_empty());
+
+        let episodes = json!({"podcasts": {"channel": [{"id": "feed-1", "episode": [
+            {"id": "episode-1", "title": "Episode 1", "coverArt": "episode-art"},
+            {"id": "episode-2", "title": "Episode 2"}
+        ]}]}});
+        let parsed_episodes = parse_podcast_episodes(&episodes);
+        assert_eq!(parsed_episodes[0].artwork_ref, "episode-art");
+        assert!(parsed_episodes[1].artwork_ref.is_empty());
+    }
+
+    #[test]
     fn unwrap_envelope_ok_failed_and_malformed() {
         let ok = json!({"subsonic-response": {"status": "ok", "version": "1.16.1"}});
         assert!(unwrap_envelope(&ok).is_ok());
@@ -1878,6 +2374,46 @@ mod tests {
         assert_eq!(albums[0].name, "Moon Safari");
         assert_eq!(albums[0].year, Some(1998));
         assert_eq!(albums[0].cover_art, "al-a1");
+    }
+
+    #[test]
+    fn album_list2_page_is_bounded_and_sends_offset() {
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","albumList2":{"album":[{"id":"a1","name":"Moon Safari","artist":"Air"}]}}}"#;
+        let (base, requests) = one_shot_json_server_with_request(body);
+        let client = Client::with_salt(base, "alice", "pw", "album-page");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let page = rt
+            .block_on(client.get_album_list2_page(
+                "alphabeticalByName",
+                MAX_ALBUM_LIST_PAGE_SIZE + 1,
+                400,
+            ))
+            .expect("album page");
+        assert_eq!(page.offset, 400);
+        assert_eq!(page.page_size, MAX_ALBUM_LIST_PAGE_SIZE);
+        assert_eq!(page.albums.len(), 1);
+        assert_eq!(page.albums[0].name, "Moon Safari");
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("captured album page request");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.contains("/rest/getAlbumList2?"));
+        assert!(request_line.contains("type=alphabeticalByName"));
+        assert!(request_line.contains("size=500"));
+        assert!(request_line.contains("offset=400"));
+
+        // The standard response has no total/count contract; row admission is
+        // still capped if a compatible server ignores the requested size.
+        let rows = (0..(MAX_ALBUM_LIST_PAGE_SIZE + 7))
+            .map(|index| json!({"id": format!("a-{index}"), "name": format!("Album {index}")}))
+            .collect::<Vec<_>>();
+        let parsed = parse_album_list2(&json!({"albumList2": {"album": rows}}));
+        assert_eq!(parsed.len(), MAX_ALBUM_LIST_PAGE_SIZE as usize);
     }
 
     #[test]

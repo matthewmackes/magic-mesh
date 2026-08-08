@@ -77,7 +77,7 @@ use mde_bus::rpc::{publish_request, reply_topic};
 use crate::ipc::action_auth::{production_action_signer, ActionAuthorizer, MutationContext};
 
 use super::cert_authority::ACTION_TOPIC as CERT_SIGN_TOPIC;
-use super::compute_registry;
+use super::runtime_probe;
 use super::nebula_supervisor;
 use super::{ShutdownToken, Worker};
 
@@ -127,6 +127,9 @@ pub const CERT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cert-sign RPC poll cadence while awaiting the reply.
 pub const CERT_RPC_POLL: Duration = Duration::from_millis(250);
+
+/// Maximum number of retained create requests admitted by one worker poll.
+const MAX_CREATE_MESSAGES_PER_POLL: usize = 64;
 
 /// Capability context for the internal compute → CA signing handoff.
 pub const CERT_AUTH_VERB: &str = super::cert_authority::CERT_AUTH_VERB;
@@ -612,7 +615,7 @@ pub fn await_reply_sync(
     let topic = reply_topic(request_ulid);
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(msgs) = persist.list_since(&topic, None) {
+        if let Ok(msgs) = persist.list_since_limit(&topic, None, 1) {
             if let Some(first) = msgs.into_iter().next() {
                 return Ok(first.body.unwrap_or_default());
             }
@@ -782,7 +785,7 @@ fn provision(ctx: &ProvisionCtx, persist: &Persist, req: &CreateRequest) -> Resu
     std::fs::write(&md_path, &meta_data).map_err(|e| format!("write meta-data: {e}"))?;
 
     // 7. virt-install (lock 3 + lock 4).
-    let meshfs_mounted = compute_registry::is_meshfs_mounted(&ctx.meshfs_mount);
+    let meshfs_mounted = runtime_probe::is_meshfs_mounted(&ctx.meshfs_mount);
     let (attach_meshfs, meshfs_skipped) = meshfs_attach_decision(req.share_meshfs, meshfs_mounted);
     let disk_path = ctx
         .vm_storage
@@ -813,15 +816,6 @@ fn provision(ctx: &ProvisionCtx, persist: &Persist, req: &CreateRequest) -> Resu
     let sidecar = ctx.vm_storage.join(format!("{vm_id}.nebula-ip"));
     let _ = std::fs::write(&sidecar, &nebula_ip);
     let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    // 9. Immediate inventory publish (≤5 s budget).
-    let inv = compute_registry::snapshot_inventory(
-        &ctx.hostname,
-        &ctx.own_addr,
-        &ctx.meshfs_mount,
-        &ctx.vm_storage,
-    );
-    compute_registry::publish_inventory(&ctx.own_addr, &inv);
 
     Ok(build_create_ack_ok(&vm_id, &nebula_ip, meshfs_skipped))
 }
@@ -951,7 +945,8 @@ fn read_new_creates(
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
-    let Ok(msgs) = persist.list_since(topic, cursor.as_deref()) else {
+    let Ok(msgs) = persist.list_since_limit(topic, cursor.as_deref(), MAX_CREATE_MESSAGES_PER_POLL)
+    else {
         return vec![];
     };
     let mut out = Vec::new();
@@ -1416,6 +1411,51 @@ mod tests {
     }
 
     #[test]
+    fn create_drain_reads_a_bounded_page_and_advances_the_cursor() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let topic = format!("{CREATE_TOPIC_PREFIX}10.42.0.1");
+        let mut requests = Vec::new();
+        let mut message_ulids = Vec::new();
+        for index in 0..(MAX_CREATE_MESSAGES_PER_POLL + 1) {
+            let mut request = sample_req(false, None);
+            request.request_ulid = format!("01CREATE{index:02}");
+            request.name = format!("dev-{index}");
+            let message = persist
+                .write(
+                    &topic,
+                    Priority::Default,
+                    None,
+                    Some(&authorized_create_body(
+                        &request,
+                        &format!("create-{index}"),
+                    )),
+                )
+                .expect("write authorized create");
+            message_ulids.push(message.ulid);
+            requests.push(request);
+        }
+
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            bus.path().join("auth"),
+            AUTH_NOW_MS,
+        ));
+        let mut cursor = None;
+        let page = read_new_creates(bus.path(), &topic, &mut cursor, authorizer.as_ref());
+        assert_eq!(page.len(), MAX_CREATE_MESSAGES_PER_POLL);
+        assert_eq!(page[0], requests[0]);
+        assert_eq!(
+            page[MAX_CREATE_MESSAGES_PER_POLL - 1],
+            requests[MAX_CREATE_MESSAGES_PER_POLL - 1]
+        );
+        assert_eq!(
+            cursor.as_deref(),
+            Some(message_ulids[MAX_CREATE_MESSAGES_PER_POLL - 1].as_str())
+        );
+    }
+
+    #[test]
     fn virt_install_args_baseline_shape() {
         let req = sample_req(false, Some("/isos/f.iso"));
         let args = build_virt_install_args(
@@ -1681,6 +1721,40 @@ mod tests {
         )
         .expect("reply present");
         assert!(body.contains("cert_pem"));
+    }
+
+    #[test]
+    fn await_reply_sync_bounds_retained_reply_history_and_keeps_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let ulid = "01BOUNDEDREPLY";
+        persist
+            .write(
+                &reply_topic(ulid),
+                Priority::Default,
+                None,
+                Some("{\"cert_pem\":\"oldest\"}"),
+            )
+            .expect("write oldest reply");
+        for _ in 0..64 {
+            persist
+                .write(
+                    &reply_topic(ulid),
+                    Priority::Default,
+                    None,
+                    Some("{\"cert_pem\":\"newer\"}"),
+                )
+                .expect("write retained reply");
+        }
+
+        let body = await_reply_sync(
+            &persist,
+            ulid,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .expect("oldest reply present");
+        assert_eq!(body, "{\"cert_pem\":\"oldest\"}");
     }
 
     // ── Required scenario 1: happy-path plan compose ──

@@ -20,6 +20,10 @@ ExecStart=/usr/bin/mde-musicd serve
 # means a user-manager environment.d ordering quirk can't leave the daemon
 # answering a per-HOME bus (the "daemon not responding" library failure).
 Environment=MDE_BUS_ROOT=/run/mde-bus
+# AIR-8 handoff records are a per-node-write/read-union dataset on the
+# Syncthing file plane. Pin the same canonical root used by the platform even
+# when an old user manager has not reloaded environment.d yet.
+Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
 Restart=on-failure
 RestartSec=5
 

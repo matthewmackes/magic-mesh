@@ -4169,6 +4169,7 @@ name = "mackes-mesh-types"
 version = "12.1.6"
 dependencies = [
  "dirs",
+ "ed25519-dalek 2.2.0",
  "hmac 0.12.1",
  "serde",
  "serde_json",
@@ -4670,8 +4671,12 @@ dependencies = [
 name = "mde-music-egui"
 version = "12.1.6"
 dependencies = [
+ "image",
+ "mde-bus",
  "mde-egui",
  "mde-musicd",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -4682,12 +4687,16 @@ dependencies = [
  "base64",
  "clap",
  "cpal",
+ "ed25519-dalek 2.2.0",
+ "futures-util",
+ "mackes-mesh-types",
  "md5",
  "mde-bus",
  "opus",
  "reqwest",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "symphonia",
  "tempfile",
  "tokio",
@@ -4741,9 +4750,9 @@ version = "12.1.6"
 dependencies = [
  "base64",
  "chrono",
+ "ed25519-dalek 2.2.0",
  "image",
  "mackes-mesh-types",
- "mde-bookmarks",
  "mde-bookmarks-egui",
  "mde-bus",
  "mde-chat",
@@ -6722,12 +6731,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -9011,6 +9022,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

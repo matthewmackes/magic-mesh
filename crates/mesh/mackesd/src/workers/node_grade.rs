@@ -9,7 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::device_inventory::{self, DeviceInventory, DeviceStatus};
 use mackes_mesh_types::health::{
@@ -26,6 +27,11 @@ use serde::{Deserialize, Serialize};
 use super::{ShutdownToken, Worker};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+// Keep identical daemons from starting their first expensive health sample in
+// lockstep. The phase is stable across restarts and short enough that it cannot
+// consume a meaningful part of either the node-row or folded-snapshot freshness
+// window.
+const MAX_INITIAL_PHASE_MS: u64 = 1_500;
 // Node rows cross the mesh through Syncthing. Its normal fallback rescan is 60s
 // on seats where the shared mount cannot deliver a reliable watcher event, so
 // a validity shorter than one scan produces periodic phantom missing-publisher
@@ -39,6 +45,42 @@ const MAX_HEALTH_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MESH_STATUS_PATH: &str = "/run/mde/mesh-status.json";
 const DEVICE_INVENTORY_VALIDITY_MS: u64 = 10 * 60 * 1_000;
 const AUDIO_PROOF_PATH: &str = "/var/lib/mackesd/health/audio-proof.json";
+// Audio discovery shells out through runuser and several user-session tools.
+// Keep the health contract fresh without repeating that fork-heavy probe on
+// every 10-second node-grade sample. A failed probe is cached too, preventing
+// a broken user session from becoming a synchronized process storm.
+const AUDIO_PROBE_TTL: Duration = Duration::from_secs(60);
+
+// Keep the user-session audio evidence probe to one runuser/PAM transition.
+// The individual commands remain real providers, but launching each one
+// through runuser separately made every workstation spend a short burst of
+// CPU in the health worker on every cache refresh.
+const AUDIO_PROBE_SCRIPT: &str = r#"
+graph=0
+if systemctl --user is-active --quiet pipewire.service && pw-cli ls Node >/dev/null 2>&1; then graph=1; fi
+wireplumber=0
+if systemctl --user is-active --quiet wireplumber.service && wpctl status >/dev/null 2>&1; then wireplumber=1; fi
+pulse=0
+if systemctl --user is-active --quiet pipewire-pulse.service && pactl info 2>/dev/null | grep -qi pipewire; then pulse=1; fi
+playback=0
+if pactl list short sinks 2>/dev/null | grep -q '[^[:space:]]'; then playback=1; fi
+capture=0
+if pactl list short sources 2>/dev/null | grep -vi monitor | grep -q '[^[:space:]]'; then capture=1; fi
+printf 'graph=%s pulse=%s wireplumber=%s playback=%s capture=%s\n' "$graph" "$pulse" "$wireplumber" "$playback" "$capture"
+"#;
+
+/// Derive a stable, bounded startup phase from the node identity. A pure
+/// function keeps the scheduling contract testable without starting a worker or
+/// touching the health substrate.
+fn initial_phase_for(hostname: &str) -> Duration {
+    if hostname.is_empty() {
+        return Duration::ZERO;
+    }
+    let hash = hostname.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        hash.wrapping_mul(16_777_619) ^ u32::from(byte)
+    });
+    Duration::from_millis(u64::from(hash) % (MAX_INITIAL_PHASE_MS + 1))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ResourceObservation {
@@ -123,6 +165,7 @@ struct SystemSampler {
     host: String,
     role: String,
     workgroup_root: PathBuf,
+    audio_cache: Mutex<Option<(Instant, Option<AudioObservation>)>>,
 }
 
 impl SystemSampler {
@@ -137,6 +180,7 @@ impl SystemSampler {
                 "workstation"
             }
             .into(),
+            audio_cache: Mutex::new(None),
         }
     }
 
@@ -185,39 +229,52 @@ impl SystemSampler {
             .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    fn mm_unit_active(unit: &str) -> bool {
-        Self::run_as_mm("systemctl", &["--user", "is-active", "--quiet", unit]).is_some()
-    }
-
     fn audio() -> Option<AudioObservation> {
         Self::run("id", &["-u", "mm"])?;
-        let pipewire_nodes =
-            Self::run_as_mm("pw-cli", &["ls", "Node"]).is_some_and(|body| !body.trim().is_empty());
-        let wireplumber =
-            Self::run_as_mm("wpctl", &["status"]).is_some_and(|body| !body.trim().is_empty());
-        let pulse = Self::run_as_mm("pactl", &["info"])
-            .is_some_and(|body| body.to_ascii_lowercase().contains("pipewire"));
-        let playback_endpoint = Self::run_as_mm("pactl", &["list", "short", "sinks"])
-            .is_some_and(|body| body.lines().any(|line| !line.trim().is_empty()));
-        let capture_endpoint =
-            Self::run_as_mm("pactl", &["list", "short", "sources"]).is_some_and(|body| {
-                body.lines().any(|line| {
-                    let line = line.trim().to_ascii_lowercase();
-                    !line.is_empty() && !line.contains("monitor")
-                })
-            });
+        let probe = Self::run_as_mm("bash", &["-lc", AUDIO_PROBE_SCRIPT])?;
+        let mut observation = parse_audio_probe(&probe)?;
         let proof = read_current_audio_proof();
-        Some(AudioObservation {
-            pipewire_graph: Self::mm_unit_active("pipewire.service") && pipewire_nodes,
-            pipewire_pulse: Self::mm_unit_active("pipewire-pulse.service") && pulse,
-            wireplumber_policy: Self::mm_unit_active("wireplumber.service") && wireplumber,
-            playback: playback_endpoint && proof.as_ref().is_some_and(|proof| proof.playback),
-            capture: capture_endpoint
-                && proof
-                    .as_ref()
-                    .is_some_and(|proof| proof.capture_bytes >= 192_044),
-        })
+        observation.playback &= proof.as_ref().is_some_and(|proof| proof.playback);
+        observation.capture &= proof
+            .as_ref()
+            .is_some_and(|proof| proof.capture_bytes >= 192_044);
+        Some(observation)
     }
+
+    fn audio_cached(&self) -> Option<AudioObservation> {
+        if let Ok(cache) = self.audio_cache.lock() {
+            if let Some((observed_at, value)) = cache.as_ref() {
+                if observed_at.elapsed() < AUDIO_PROBE_TTL {
+                    return value.clone();
+                }
+            }
+        }
+
+        let value = Self::audio();
+        if let Ok(mut cache) = self.audio_cache.lock() {
+            *cache = Some((Instant::now(), value.clone()));
+        }
+        value
+    }
+}
+
+fn parse_audio_probe(body: &str) -> Option<AudioObservation> {
+    let values = body
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let admitted = |name: &str| match values.get(name).copied()? {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    };
+    Some(AudioObservation {
+        pipewire_graph: admitted("graph")?,
+        pipewire_pulse: admitted("pulse")?,
+        wireplumber_policy: admitted("wireplumber")?,
+        playback: admitted("playback")?,
+        capture: admitted("capture")?,
+    })
 }
 
 fn cpu_busy_ratio(interval: Duration) -> Option<f32> {
@@ -304,7 +361,9 @@ impl HealthSampler for SystemSampler {
                 .map(|node| node.assigned_capabilities.clone())
                 .unwrap_or_default(),
             resources: Self::resources(),
-            audio: (self.role == "workstation").then(Self::audio).flatten(),
+            audio: (self.role == "workstation")
+                .then(|| self.audio_cached())
+                .flatten(),
             mesh_snapshot_present: mesh.is_some(),
             overlay_up: local.is_some_and(|node| {
                 !matches!(node.presence.as_deref(), Some("offline" | "unreachable"))
@@ -1530,6 +1589,14 @@ impl Worker for NodeGradeWorker {
             // confirmation from an earlier boot.
             self.action_cursor = persist.latest_ulid(ACTION_TOPIC).ok().flatten();
         }
+
+        // Anchor the existing 10-second interval at a deterministic per-host
+        // phase. Shutdown remains prompt while the initial offset is pending;
+        // every later cycle retains the original freshness and action cadence.
+        tokio::select! {
+            () = tokio::time::sleep(initial_phase_for(&self.host)) => {}
+            () = shutdown.wait() => return Ok(()),
+        }
         self.cycle(persist.as_ref());
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await;
@@ -1608,6 +1675,38 @@ mod tests {
     fn publication_validity_covers_two_replica_rescan_windows() {
         const REPLICA_RESCAN_MS: u64 = 60_000;
         assert!(PUBLICATION_VALIDITY_MS >= REPLICA_RESCAN_MS * 2);
+    }
+
+    #[test]
+    fn initial_phase_is_bounded_and_stable_per_host() {
+        let phase = initial_phase_for("seat15");
+        assert_eq!(phase, initial_phase_for("seat15"));
+        assert!(phase <= Duration::from_millis(MAX_INITIAL_PHASE_MS));
+        assert_ne!(phase, initial_phase_for("dell-laptop"));
+        assert!(
+            Duration::from_millis(MAX_INITIAL_PHASE_MS)
+                < Duration::from_millis(SNAPSHOT_VALIDITY_MS)
+        );
+        assert_eq!(initial_phase_for(""), Duration::ZERO);
+    }
+
+    #[test]
+    fn audio_probe_requires_all_bounded_provider_bits() {
+        assert_eq!(
+            parse_audio_probe("graph=1 pulse=0 wireplumber=1 playback=1 capture=0\n"),
+            Some(AudioObservation {
+                pipewire_graph: true,
+                pipewire_pulse: false,
+                wireplumber_policy: true,
+                playback: true,
+                capture: false,
+            })
+        );
+        assert_eq!(parse_audio_probe("graph=1 pulse=1"), None);
+        assert_eq!(
+            parse_audio_probe("graph=1 pulse=1 wireplumber=1 playback=1 capture=2"),
+            None
+        );
     }
 
     #[test]

@@ -35,6 +35,12 @@ use mde_seat::{Backend, Connector, DdcDisplay, Probe, Seat, SeatError, SeatSnaps
 /// longer blocks the render thread.
 const REFRESH: Duration = Duration::from_secs(5);
 
+/// Keep identical seats from starting the expensive first snapshot in lockstep.
+/// The offset is deterministic per host, so a restart preserves the phase rather
+/// than introducing a new random burst, and it is short enough not to make the
+/// System surface feel stale during shell startup.
+const MAX_INITIAL_PHASE_MS: u64 = 1_500;
+
 /// The DDC/CI brightness (`getvcp`) re-read cadence — deliberately MUCH slower than
 /// [`REFRESH`] because the per-monitor I2C read is the slowest probe on the seat. A
 /// fresh detect (a re-plug) still reads brightness immediately, so a newly connected
@@ -202,12 +208,41 @@ impl Drop for SnapshotPump {
     }
 }
 
+/// Derive a stable bounded startup phase from the host identity. A pure function
+/// keeps the scheduling contract testable without spawning a thread or touching
+/// the real seat probes.
+fn initial_phase_for(hostname: &str) -> Duration {
+    if hostname.is_empty() {
+        return Duration::ZERO;
+    }
+    let hash = hostname.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        hash.wrapping_mul(16_777_619) ^ u32::from(byte)
+    });
+    Duration::from_millis(u64::from(hash) % (MAX_INITIAL_PHASE_MS + 1))
+}
+
+fn local_initial_phase() -> Duration {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
+    initial_phase_for(&hostname)
+}
+
 /// The background loop: produce a snapshot every [`REFRESH`], publish the newest,
 /// wake the UI, and stop promptly on the shutdown signal (or a dropped receiver).
 fn run(ctx: &egui::Context, snap_tx: &Sender<SeatSnapshot>, stop_rx: &Receiver<()>) {
     let seat = Seat::new();
     let mut ddc = DdcCache::default();
     let mut last_brightness: Option<Instant> = None;
+
+    // Wait only for the host-specific startup phase. Shutdown remains prompt even
+    // while the initial offset is pending; the first real snapshot then anchors
+    // the existing five-second cadence at this desynchronized point.
+    match stop_rx.recv_timeout(local_initial_phase()) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        Err(RecvTimeoutError::Timeout) => {}
+    }
 
     loop {
         // Fold the fast probes with a placeholder DDC (so the expensive `ddcutil`
@@ -271,6 +306,15 @@ mod tests {
             model: None,
             brightness: 0,
         }
+    }
+
+    #[test]
+    fn initial_phase_is_bounded_and_stable_per_host() {
+        let first = initial_phase_for("seat15");
+        assert_eq!(first, initial_phase_for("seat15"));
+        assert!(first <= Duration::from_millis(MAX_INITIAL_PHASE_MS));
+        assert_ne!(first, initial_phase_for("dell-laptop"));
+        assert_eq!(initial_phase_for(""), Duration::ZERO);
     }
 
     #[test]

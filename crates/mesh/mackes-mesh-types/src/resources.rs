@@ -9,11 +9,25 @@
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
 /// Canonical retained-latest Bus topic for the universal resource catalog.
 pub const RESOURCE_CATALOG_TOPIC: &str = "state/resources/catalog";
+/// Canonical retained-latest Bus topic for the safe resource discovery projection.
+pub const RESOURCE_DISCOVERY_TOPIC: &str = "state/resources/discovery";
+/// Prefix for the publisher-attestation topic keyed by catalog publisher.
+///
+/// Catalogs and proofs are retained separately for backward-compatible
+/// consumers, but a publisher-specific topic prevents one node's proof from
+/// being mistaken for another node's latest catalog.
+pub const RESOURCE_PUBLISHER_ATTESTATION_TOPIC_PREFIX: &str =
+    "state/resources/publisher-attestation";
+/// Secret-store key identifier used for resource-catalog HMAC publication.
+pub const RESOURCE_PUBLISHER_ATTESTATION_KEY_ID: &str = "resource-publisher-hmac-v1";
+/// Freshness window for a resource-publisher HMAC proof.
+pub const RESOURCE_PUBLISHER_ATTESTATION_TTL_MS: u64 = 5 * 60 * 1_000;
 /// The only resource-contract schema currently admitted by consumers.
 pub const RESOURCE_CONTRACT_VERSION: u16 = 1;
 /// Minimum useful freshness lifetime for a published observation.
@@ -43,9 +57,24 @@ const MAX_CONFIGURATION_CHOICES: usize = 32;
 const MAX_SERVICE_BUS_TOPICS: usize = 32;
 const MAX_SERVICE_HOSTING_NODES: usize = 64;
 const MAX_SERVICE_DEPENDENCIES: usize = 64;
+const MAX_DISCOVERY_ENTRIES: usize = MAX_CARDS;
+const MAX_DISCOVERY_SOURCES: usize = MAX_PROVENANCE;
+const MAX_DISCOVERY_SCOPES: usize = 4;
+const MAX_DISCOVERY_PROTOCOLS: usize = MAX_TRANSPORTS;
+const MAX_DISCOVERY_ACTIONS: usize = MAX_ACTIONS;
 const RESOURCE_ID_PREFIX: &str = "resource:v1:";
 const CAPABILITY_FINGERPRINT_PREFIX: &str = "capability:v1:";
 const TRANSPORT_FINGERPRINT_PREFIX: &str = "transport:v1:";
+/// Prefix for the deterministic catalog content digest.
+pub const RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX: &str = "catalog:v1:";
+/// Prefix for a detached HMAC-SHA256 publisher attestation.
+pub const RESOURCE_PUBLISHER_ATTESTATION_PREFIX: &str = "publisher-attestation:v1:";
+
+/// Return the retained publisher-attestation topic for one validated publisher.
+#[must_use]
+pub fn resource_publisher_attestation_topic(publisher: &str) -> String {
+    format!("{RESOURCE_PUBLISHER_ATTESTATION_TOPIC_PREFIX}/{publisher}")
+}
 const SECRET_SHAPE_MARKERS: &[&str] = &[
     "authorization:",
     "proxy-authorization:",
@@ -1013,6 +1042,22 @@ pub enum TransportEndpoint {
         /// Optional absolute path without query, fragment, or traversal.
         base_path: Option<String>,
     },
+    /// Explicit remote X11 display endpoint.
+    ///
+    /// The display and screen are numeric so a catalog consumer never has to
+    /// parse or execute an arbitrary `DISPLAY` string. SSH-forwarded X11
+    /// applications use [`Self::Network`] because the server allocates their
+    /// forwarded display at session creation time.
+    X11 {
+        /// DNS name or IP literal without user information.
+        host: String,
+        /// SSH or X11 transport port.
+        port: u16,
+        /// Numeric X11 display number.
+        display: u16,
+        /// Numeric X11 screen number.
+        screen: u8,
+    },
     /// Named local platform service; never a filesystem/socket path.
     LocalService {
         /// Typed service registry identity.
@@ -1041,6 +1086,27 @@ impl TransportEndpoint {
                 }
                 if let Some(path) = base_path {
                     validate_endpoint_path(path)?;
+                }
+            }
+            Self::X11 {
+                host,
+                port,
+                display,
+                screen,
+            } => {
+                validate_host(host)?;
+                if *port == 0 {
+                    return Err(ResourceValidationError::InvalidField("endpoint.port"));
+                }
+                if *display > 255 {
+                    return Err(ResourceValidationError::InvalidField(
+                        "endpoint.x11.display",
+                    ));
+                }
+                if *screen > 31 {
+                    return Err(ResourceValidationError::InvalidField(
+                        "endpoint.x11.screen",
+                    ));
                 }
             }
             Self::LocalService { service_id } => {
@@ -1072,6 +1138,18 @@ impl TransportEndpoint {
                 push_canonical(canonical, host);
                 push_canonical(canonical, &port.to_string());
                 push_optional_canonical(canonical, base_path.as_deref());
+            }
+            Self::X11 {
+                host,
+                port,
+                display,
+                screen,
+            } => {
+                push_canonical(canonical, "x11");
+                push_canonical(canonical, host);
+                push_canonical(canonical, &port.to_string());
+                push_canonical(canonical, &display.to_string());
+                push_canonical(canonical, &screen.to_string());
             }
             Self::LocalService { service_id } => {
                 push_canonical(canonical, "local_service");
@@ -1606,6 +1684,87 @@ impl ClientCapability {
             ));
         }
         self.limits.validate(&self.features)
+    }
+}
+
+/// Deterministic, bounded admission index for typed client capabilities.
+///
+/// The index is intentionally an in-memory helper rather than a wire type:
+/// callers continue to publish [`ClientCapability`] values exactly as before,
+/// while transport and action consumers can resolve a referenced capability
+/// fingerprint without accepting an arbitrary executable, path, or URL.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientCapabilityRegistry {
+    by_fingerprint: BTreeMap<String, ClientCapability>,
+}
+
+impl ClientCapabilityRegistry {
+    /// Admit a bounded set of validated, uniquely fingerprinted capabilities.
+    ///
+    /// Entries are copied into a [`BTreeMap`], so iteration and fingerprint
+    /// lookup are independent of discovery-worker arrival order. The registry
+    /// does not implement `Serialize` or `Deserialize`; the existing strict
+    /// capability contract remains the only wire representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the capability's validation error, a duplicate-fingerprint
+    /// error, or a capacity error before more than the bounded number of
+    /// entries is retained.
+    pub fn admitted<I>(capabilities: I) -> Result<Self, ResourceValidationError>
+    where
+        I: IntoIterator<Item = ClientCapability>,
+    {
+        let mut by_fingerprint = BTreeMap::new();
+        let mut count = 0;
+        for capability in capabilities {
+            count += 1;
+            validate_capacity(
+                "client_capability_registry.entries",
+                count,
+                MAX_CAPABILITIES,
+            )?;
+            capability.validate()?;
+            if by_fingerprint.contains_key(&capability.fingerprint) {
+                return Err(ResourceValidationError::Duplicate(
+                    "client_capability_registry.entries",
+                ));
+            }
+            by_fingerprint.insert(capability.fingerprint.clone(), capability);
+        }
+        Ok(Self { by_fingerprint })
+    }
+
+    /// Number of admitted capabilities.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_fingerprint.len()
+    }
+
+    /// Whether no capabilities have been admitted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_fingerprint.is_empty()
+    }
+
+    /// Resolve a capability fingerprint carried by a typed transport or action
+    /// reference. Malformed fingerprints are rejected by returning `None`.
+    #[must_use]
+    pub fn lookup(&self, fingerprint: &str) -> Option<&ClientCapability> {
+        if !valid_prefixed_fingerprint(fingerprint, CAPABILITY_FINGERPRINT_PREFIX) {
+            return None;
+        }
+        self.by_fingerprint.get(fingerprint)
+    }
+
+    /// Iterate over admitted fingerprints in canonical byte order.
+    pub fn fingerprints(&self) -> impl Iterator<Item = &str> {
+        self.by_fingerprint.keys().map(String::as_str)
+    }
+
+    /// Iterate over admitted capabilities in fingerprint order.
+    pub fn capabilities(&self) -> impl Iterator<Item = &ClientCapability> {
+        self.by_fingerprint.values()
     }
 }
 
@@ -2265,6 +2424,233 @@ impl ResourceCard {
     }
 }
 
+/// Safe, bounded browser-facing summary of one admitted resource card.
+///
+/// This projection deliberately omits endpoints, credential references,
+/// diagnostic messages, and executable details. A consumer can use it to
+/// group and filter resources before selecting the full card for a typed
+/// action. All set-like fields are emitted in their enum order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceDiscoveryEntry {
+    /// Resource-contract schema discriminator.
+    pub schema_version: u16,
+    /// Stable identity used to retrieve the full card and bind an action.
+    pub resource_id: String,
+    /// Broad resource class used for browser grouping.
+    pub class: ResourceClass,
+    /// Bounded user-facing title.
+    pub display_name: String,
+    /// Optional non-secret summary retained from the full card.
+    pub summary: Option<String>,
+    /// Current aggregate resource health.
+    pub health_status: HealthStatus,
+    /// Current resource authorization state.
+    pub auth_status: AuthStatus,
+    /// Freshness metadata for stale/offline presentation.
+    pub last_seen_at_ms: u64,
+    /// Retention deadline for the discovery entry.
+    pub expires_at_ms: u64,
+    /// Discovery lanes that contributed this identity.
+    pub discovery_sources: Vec<DiscoverySource>,
+    /// Reachability boundaries represented by provenance or transports.
+    pub reachability_scopes: Vec<ResourceScope>,
+    /// Typed protocols observed for this resource.
+    pub transport_protocols: Vec<TransportProtocol>,
+    /// Closed action verbs currently declared ready on the card.
+    pub ready_actions: Vec<ResourceActionVerb>,
+    /// Service grouping, when the resource exposes a service interface.
+    pub service_category: Option<ServiceCategory>,
+}
+
+impl ResourceDiscoveryEntry {
+    fn from_card(card: &ResourceCard) -> Self {
+        let mut discovery_sources = BTreeSet::new();
+        let mut reachability_scopes = BTreeSet::new();
+        for provenance in &card.provenance {
+            discovery_sources.insert(provenance.source);
+            reachability_scopes.insert(provenance.scope);
+        }
+
+        let mut transport_protocols = BTreeSet::new();
+        for transport in &card.transports {
+            transport_protocols.insert(transport.protocol);
+            reachability_scopes.insert(transport.scope);
+        }
+
+        let mut ready_actions = BTreeSet::new();
+        for action in &card.actions {
+            if action.availability.status == ActionAvailabilityStatus::Ready {
+                ready_actions.insert(action.verb);
+            }
+        }
+
+        Self {
+            schema_version: RESOURCE_CONTRACT_VERSION,
+            resource_id: card.resource_id().to_owned(),
+            class: card.identity.class,
+            display_name: card.display_name.clone(),
+            summary: card.summary.clone(),
+            health_status: card.health.status,
+            auth_status: card.auth.status,
+            last_seen_at_ms: card.last_seen_at_ms,
+            expires_at_ms: card.expires_at_ms,
+            discovery_sources: discovery_sources.into_iter().collect(),
+            reachability_scopes: reachability_scopes.into_iter().collect(),
+            transport_protocols: transport_protocols.into_iter().collect(),
+            ready_actions: ready_actions.into_iter().collect(),
+            service_category: card.service.as_ref().map(|service| service.category),
+        }
+    }
+
+    /// Validate a decoded discovery entry before it is rendered or acted on.
+    pub fn validate(&self) -> Result<(), ResourceValidationError> {
+        validate_version("resource_discovery_entry", self.schema_version)?;
+        validate_fingerprint_field(
+            "resource_discovery_entry.resource_id",
+            &self.resource_id,
+            RESOURCE_ID_PREFIX,
+        )?;
+        validate_text(
+            "resource_discovery_entry.display_name",
+            &self.display_name,
+            MAX_DISPLAY_NAME_BYTES,
+        )?;
+        if let Some(summary) = &self.summary {
+            validate_text(
+                "resource_discovery_entry.summary",
+                summary,
+                MAX_SUMMARY_BYTES,
+            )?;
+            if looks_like_secret(summary) {
+                return Err(ResourceValidationError::SecretShapedValue(
+                    "resource_discovery_entry.summary",
+                ));
+            }
+        }
+        if self.last_seen_at_ms == 0 || self.expires_at_ms <= self.last_seen_at_ms {
+            return Err(ResourceValidationError::InvalidTimestamp(
+                "resource_discovery_entry.freshness",
+            ));
+        }
+        validate_freshness(
+            "resource_discovery_entry",
+            self.last_seen_at_ms,
+            self.expires_at_ms,
+        )?;
+        validate_unique(
+            "resource_discovery_entry.discovery_sources",
+            &self.discovery_sources,
+            MAX_DISCOVERY_SOURCES,
+        )?;
+        validate_unique(
+            "resource_discovery_entry.reachability_scopes",
+            &self.reachability_scopes,
+            MAX_DISCOVERY_SCOPES,
+        )?;
+        validate_unique(
+            "resource_discovery_entry.transport_protocols",
+            &self.transport_protocols,
+            MAX_DISCOVERY_PROTOCOLS,
+        )?;
+        validate_unique(
+            "resource_discovery_entry.ready_actions",
+            &self.ready_actions,
+            MAX_DISCOVERY_ACTIONS,
+        )?;
+        Ok(())
+    }
+}
+
+/// Deterministically ordered, bounded projection for resource/session
+/// discovery clients.
+///
+/// The projection is derived only from an admitted [`ResourceCatalog`]. Its
+/// entries are sorted by resource class, display name, and stable resource ID;
+/// callers therefore do not depend on discovery-worker arrival order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceDiscoveryProjection {
+    /// Resource-contract schema discriminator.
+    pub schema_version: u16,
+    /// Source catalog revision represented by this projection.
+    pub revision: String,
+    /// Optional integrity reference to the source catalog's content digest.
+    ///
+    /// This is a deterministic integrity digest, not a cryptographic
+    /// signature. It detects content drift under an honest publisher; use the
+    /// catalog's detached publisher attestation for authenticated admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_content_digest: Option<String>,
+    /// Node that published the source catalog.
+    pub publisher: String,
+    /// Generation time copied from the source catalog.
+    pub generated_at_ms: u64,
+    /// Deterministically ordered browser entries.
+    pub entries: Vec<ResourceDiscoveryEntry>,
+}
+
+impl ResourceDiscoveryProjection {
+    /// Validate the projection's bounded entries and source metadata.
+    pub fn validate(&self) -> Result<(), ResourceValidationError> {
+        validate_version("resource_discovery_projection", self.schema_version)?;
+        validate_identifier("resource_discovery_projection.revision", &self.revision)?;
+        if let Some(digest) = &self.catalog_content_digest {
+            validate_fingerprint_field(
+                "resource_discovery_projection.catalog_content_digest",
+                digest,
+                RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX,
+            )?;
+        }
+        validate_identifier("resource_discovery_projection.publisher", &self.publisher)?;
+        if self.generated_at_ms == 0 {
+            return Err(ResourceValidationError::InvalidTimestamp(
+                "resource_discovery_projection.generated_at_ms",
+            ));
+        }
+        validate_capacity(
+            "resource_discovery_projection.entries",
+            self.entries.len(),
+            MAX_DISCOVERY_ENTRIES,
+        )?;
+        let mut resource_ids = BTreeSet::new();
+        let mut previous = None;
+        for entry in &self.entries {
+            entry.validate()?;
+            if entry.last_seen_at_ms > self.generated_at_ms {
+                return Err(ResourceValidationError::InvalidRelationship(
+                    "resource_discovery_projection.entry_generated_at",
+                ));
+            }
+            if !resource_ids.insert(entry.resource_id.as_str()) {
+                return Err(ResourceValidationError::Duplicate(
+                    "resource_discovery_projection.entries",
+                ));
+            }
+            if previous.is_some_and(|previous| discovery_entry_cmp(previous, entry).is_gt()) {
+                return Err(ResourceValidationError::InvalidRelationship(
+                    "resource_discovery_projection.entry_order",
+                ));
+            }
+            previous = Some(entry);
+        }
+        Ok(())
+    }
+
+    /// Consume and return only a fully validated discovery projection.
+    pub fn admitted(self) -> Result<Self, ResourceValidationError> {
+        self.validate()?;
+        Ok(self)
+    }
+}
+
+fn discovery_entry_cmp(left: &ResourceDiscoveryEntry, right: &ResourceDiscoveryEntry) -> Ordering {
+    left.class
+        .cmp(&right.class)
+        .then_with(|| left.display_name.cmp(&right.display_name))
+        .then_with(|| left.resource_id.cmp(&right.resource_id))
+}
+
 /// Versioned retained-latest body published on [`RESOURCE_CATALOG_TOPIC`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2277,6 +2663,17 @@ pub struct ResourceCatalog {
     pub publisher: String,
     /// Unix epoch milliseconds when this snapshot was generated.
     pub generated_at_ms: u64,
+    /// Optional deterministic content digest over the catalog metadata and
+    /// cards, excluding this field itself.
+    ///
+    /// The digest is an integrity reference, not a cryptographic signature or
+    /// proof of publisher identity. A detached
+    /// [`ResourcePublisherAttestation`] provides that stronger admission
+    /// boundary when a trusted key is available. It is optional only for
+    /// backward-compatible decoding of legacy retained catalog JSON; new
+    /// publication paths attach it before emitting a catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
     /// One card per stable resource ID.
     pub cards: Vec<ResourceCard>,
 }
@@ -2320,6 +2717,13 @@ impl ResourceCatalog {
             return Err(ResourceValidationError::InvalidTimestamp(
                 "resource_catalog.generated_at_ms",
             ));
+        }
+        if let Some(digest) = &self.content_digest {
+            validate_fingerprint_field(
+                "resource_catalog.content_digest",
+                digest,
+                RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX,
+            )?;
         }
         validate_capacity("resource_catalog.cards", self.cards.len(), MAX_CARDS)?;
         let mut resource_ids = BTreeSet::new();
@@ -2370,7 +2774,136 @@ impl ResourceCatalog {
                 }
             }
         }
+        if let Some(digest) = &self.content_digest {
+            if digest != &self.computed_content_digest() {
+                return Err(ResourceValidationError::FingerprintMismatch(
+                    "resource_catalog.content_digest",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Compute the deterministic integrity digest for this catalog.
+    ///
+    /// Metadata is included explicitly and cards are serialized in stable
+    /// resource-ID order, so card arrival order does not affect the result.
+    /// The catalog's own `content_digest` field is intentionally excluded.
+    /// This is not a cryptographic signature; use
+    /// [`ResourcePublisherAttestation`] when publisher authentication is
+    /// required.
+    #[must_use]
+    pub fn computed_content_digest(&self) -> String {
+        let mut cards: Vec<_> = self.cards.iter().collect();
+        cards.sort_unstable_by(|left, right| left.resource_id().cmp(right.resource_id()));
+
+        let mut canonical = String::new();
+        push_canonical(&mut canonical, "resource-catalog-content");
+        push_canonical(&mut canonical, &self.schema_version.to_string());
+        push_canonical(&mut canonical, &self.revision);
+        push_canonical(&mut canonical, &self.publisher);
+        push_canonical(&mut canonical, &self.generated_at_ms.to_string());
+        push_canonical(&mut canonical, &cards.len().to_string());
+        for card in cards {
+            let card_json =
+                serde_json::to_string(card).expect("ResourceCard's derived serializer cannot fail");
+            push_canonical(&mut canonical, &card_json);
+        }
+        format!(
+            "{RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX}{}",
+            sha256_hex(&canonical)
+        )
+    }
+
+    /// Validate this catalog and return it with a content digest attached.
+    ///
+    /// A missing digest is filled for a new publication. An existing digest is
+    /// validated before it can be retained, so this helper cannot silently
+    /// repair a forged or stale attestation.
+    pub fn with_content_digest(mut self) -> Result<Self, ResourceValidationError> {
+        self.validate()?;
+        self.content_digest = Some(self.computed_content_digest());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Build the safe, deterministically ordered browser projection used by
+    /// resource/session discovery clients.
+    ///
+    /// The source catalog is validated first, so the projection cannot carry
+    /// a forged identity, stale cross-reference, or unadmitted action summary.
+    pub fn discovery_projection(
+        &self,
+    ) -> Result<ResourceDiscoveryProjection, ResourceValidationError> {
+        self.validate()?;
+        let mut entries: Vec<_> = self
+            .cards
+            .iter()
+            .map(ResourceDiscoveryEntry::from_card)
+            .collect();
+        entries.sort_unstable_by(discovery_entry_cmp);
+        let projection = ResourceDiscoveryProjection {
+            schema_version: RESOURCE_CONTRACT_VERSION,
+            revision: self.revision.clone(),
+            catalog_content_digest: self.content_digest.clone(),
+            publisher: self.publisher.clone(),
+            generated_at_ms: self.generated_at_ms,
+            entries,
+        };
+        projection.validate()?;
+        Ok(projection)
+    }
+
+    /// Verify a detached publisher attestation before trusting this catalog.
+    ///
+    /// The attestation is HMAC-SHA256 over a canonical envelope containing the
+    /// publisher, key ID, exact catalog content digest, and bounded validity
+    /// window. The key itself is never serialized into the resource contract.
+    /// This is the verification primitive for authenticated admission;
+    /// [`Self::admit_authenticated`] produces the typed authenticated state.
+    /// [`Self::validate`] remains the compatibility path for legacy catalogs
+    /// without a detached proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog, attestation shape, publisher binding,
+    /// freshness window, digest, or HMAC does not validate.
+    pub fn validate_publisher_attestation(
+        &self,
+        attestation: &ResourcePublisherAttestation,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<(), ResourceValidationError> {
+        attestation.verify_at(self, key, now_ms)
+    }
+
+    /// Admit this catalog into authenticated resource state.
+    ///
+    /// The detached proof must use the currently trusted publisher key ID and
+    /// must verify against the supplied trusted key at `now_ms`. The ordinary
+    /// [`Self::admitted`] path remains available for backward-compatible,
+    /// explicitly untrusted consumers; it never produces this wrapper.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the proof names an unsupported key ID, is stale or
+    /// malformed, does not bind this exact catalog, or fails HMAC verification.
+    pub fn admit_authenticated(
+        self,
+        attestation: ResourcePublisherAttestation,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<AuthenticatedResourceCatalog, ResourceValidationError> {
+        if attestation.key_id != RESOURCE_PUBLISHER_ATTESTATION_KEY_ID {
+            return Err(ResourceValidationError::InvalidField(
+                "resource_publisher_attestation.key_id",
+            ));
+        }
+        self.validate_publisher_attestation(&attestation, key, now_ms)?;
+        Ok(AuthenticatedResourceCatalog {
+            catalog: self,
+            publisher_attestation: attestation,
+        })
     }
 
     /// Consume and return only a fully validated catalog.
@@ -2381,6 +2914,201 @@ impl ResourceCatalog {
     pub fn admitted(self) -> Result<Self, ResourceValidationError> {
         self.validate()?;
         Ok(self)
+    }
+}
+
+/// A resource catalog that crossed the cryptographic publisher-admission gate.
+///
+/// Keeping the proof alongside the catalog makes the stronger state explicit
+/// to consumers. A plain [`ResourceCatalog`] is still valid for the legacy
+/// untrusted path, but it cannot be mistaken for this authenticated wrapper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedResourceCatalog {
+    catalog: ResourceCatalog,
+    publisher_attestation: ResourcePublisherAttestation,
+}
+
+impl AuthenticatedResourceCatalog {
+    /// Borrow the catalog covered by the verified detached proof.
+    #[must_use]
+    pub fn catalog(&self) -> &ResourceCatalog {
+        &self.catalog
+    }
+
+    /// Borrow the detached proof that authenticated the catalog.
+    #[must_use]
+    pub fn publisher_attestation(&self) -> &ResourcePublisherAttestation {
+        &self.publisher_attestation
+    }
+
+    /// Return the catalog and discard the in-memory proof wrapper.
+    #[must_use]
+    pub fn into_catalog(self) -> ResourceCatalog {
+        self.catalog
+    }
+}
+
+/// Detached, bounded HMAC-SHA256 proof that a trusted publisher emitted a
+/// particular resource catalog.
+///
+/// The attestation is intentionally separate from [`ResourceCatalog`] so the
+/// existing retained JSON shape remains backward compatible. A producer may
+/// publish this envelope alongside the catalog, and a consumer should call
+/// [`ResourceCatalog::admit_authenticated`] before treating the catalog as
+/// authenticated. The shared key is supplied by the surrounding trusted key
+/// store and is never present in this value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourcePublisherAttestation {
+    /// Resource-contract schema discriminator.
+    pub schema_version: u16,
+    /// Publisher identity bound to the catalog.
+    pub publisher: String,
+    /// Trusted-key-store identifier, not the secret key material.
+    pub key_id: String,
+    /// Exact catalog content digest covered by the HMAC.
+    pub catalog_content_digest: String,
+    /// Unix epoch milliseconds at which this proof becomes valid.
+    pub issued_at_ms: u64,
+    /// Unix epoch milliseconds at which this proof expires.
+    pub expires_at_ms: u64,
+    /// Lowercase hexadecimal HMAC-SHA256 with the attestation prefix.
+    pub signature: String,
+}
+
+impl ResourcePublisherAttestation {
+    /// Mint an attestation for a validated catalog using a trusted shared key.
+    ///
+    /// The catalog's computed digest is covered even when the optional
+    /// `content_digest` field is absent, so this method can authenticate a
+    /// legacy-shaped catalog without weakening the proof. The caller remains
+    /// responsible for distributing the resulting envelope with the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog, key ID, key, or validity window is
+    /// malformed.
+    pub fn mint(
+        catalog: &ResourceCatalog,
+        key_id: impl Into<String>,
+        key: &[u8],
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Self, ResourceValidationError> {
+        catalog.validate()?;
+        if key.is_empty() {
+            return Err(ResourceValidationError::InvalidField(
+                "resource_publisher_attestation.key",
+            ));
+        }
+
+        let mut attestation = Self {
+            schema_version: RESOURCE_CONTRACT_VERSION,
+            publisher: catalog.publisher.clone(),
+            key_id: key_id.into(),
+            catalog_content_digest: catalog.computed_content_digest(),
+            issued_at_ms,
+            expires_at_ms,
+            signature: String::new(),
+        };
+        attestation.validate_unsigned_shape()?;
+        attestation.signature = hmac_signature(key, &attestation.signing_payload()).ok_or(
+            ResourceValidationError::InvalidField("resource_publisher_attestation.key"),
+        )?;
+        attestation.validate_shape()?;
+        Ok(attestation)
+    }
+
+    /// Return the canonical unsigned envelope covered by the HMAC.
+    #[must_use]
+    pub fn signing_payload(&self) -> String {
+        let mut payload = String::new();
+        push_canonical(&mut payload, "resource-publisher-attestation");
+        push_canonical(&mut payload, &self.schema_version.to_string());
+        push_canonical(&mut payload, &self.publisher);
+        push_canonical(&mut payload, &self.key_id);
+        push_canonical(&mut payload, &self.catalog_content_digest);
+        push_canonical(&mut payload, &self.issued_at_ms.to_string());
+        push_canonical(&mut payload, &self.expires_at_ms.to_string());
+        payload
+    }
+
+    /// Verify this proof against a catalog and a trusted key at `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or expired proofs, a publisher/digest
+    /// mismatch, or a signature that does not verify under `key`.
+    pub fn verify_at(
+        &self,
+        catalog: &ResourceCatalog,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<(), ResourceValidationError> {
+        use hmac::{Hmac, Mac};
+
+        catalog.validate()?;
+        self.validate_shape()?;
+        if key.is_empty() {
+            return Err(ResourceValidationError::InvalidField(
+                "resource_publisher_attestation.key",
+            ));
+        }
+        if self.publisher != catalog.publisher {
+            return Err(ResourceValidationError::InvalidRelationship(
+                "resource_publisher_attestation.publisher",
+            ));
+        }
+        if self.catalog_content_digest != catalog.computed_content_digest() {
+            return Err(ResourceValidationError::FingerprintMismatch(
+                "resource_publisher_attestation.catalog_content_digest",
+            ));
+        }
+        if now_ms < self.issued_at_ms || now_ms >= self.expires_at_ms {
+            return Err(ResourceValidationError::InvalidTimestamp(
+                "resource_publisher_attestation.window",
+            ));
+        }
+
+        let signature = self
+            .signature
+            .strip_prefix(RESOURCE_PUBLISHER_ATTESTATION_PREFIX)
+            .and_then(decode_hex_32)
+            .ok_or(ResourceValidationError::InvalidField(
+                "resource_publisher_attestation.signature",
+            ))?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| {
+            ResourceValidationError::InvalidField("resource_publisher_attestation.key")
+        })?;
+        mac.update(self.signing_payload().as_bytes());
+        mac.verify_slice(&signature).map_err(|_| {
+            ResourceValidationError::FingerprintMismatch("resource_publisher_attestation.signature")
+        })
+    }
+
+    fn validate_unsigned_shape(&self) -> Result<(), ResourceValidationError> {
+        validate_version("resource_publisher_attestation", self.schema_version)?;
+        validate_identifier("resource_publisher_attestation.publisher", &self.publisher)?;
+        validate_identifier("resource_publisher_attestation.key_id", &self.key_id)?;
+        validate_fingerprint_field(
+            "resource_publisher_attestation.catalog_content_digest",
+            &self.catalog_content_digest,
+            RESOURCE_CATALOG_CONTENT_DIGEST_PREFIX,
+        )?;
+        validate_freshness(
+            "resource_publisher_attestation",
+            self.issued_at_ms,
+            self.expires_at_ms,
+        )
+    }
+
+    fn validate_shape(&self) -> Result<(), ResourceValidationError> {
+        self.validate_unsigned_shape()?;
+        validate_fingerprint_field(
+            "resource_publisher_attestation.signature",
+            &self.signature,
+            RESOURCE_PUBLISHER_ATTESTATION_PREFIX,
+        )
     }
 }
 
@@ -2606,6 +3334,46 @@ fn push_optional_number<T: ToString>(output: &mut String, value: Option<T>) {
     }
 }
 
+fn hmac_signature(key: &[u8], payload: &str) -> Option<String> {
+    use hmac::{Hmac, Mac};
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    mac.update(payload.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    Some(format!(
+        "{RESOURCE_PUBLISHER_ATTESTATION_PREFIX}{}",
+        hex_encode(&signature)
+    ))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     let mut output = String::with_capacity(64);
@@ -2779,6 +3547,7 @@ mod tests {
             revision: "rev-42".into(),
             publisher: "seat-15".into(),
             generated_at_ms: NOW + 1_000,
+            content_digest: None,
             cards: vec![valid_card()],
         }
     }
@@ -2794,6 +3563,295 @@ mod tests {
         assert!(!json.contains("command"));
         assert!(!json.contains("password"));
         assert!(!json.contains("://"));
+    }
+
+    #[test]
+    fn legacy_catalog_without_content_digest_still_decodes() {
+        let catalog = valid_catalog();
+        let json = serde_json::to_string(&catalog).expect("serialize legacy catalog");
+        assert!(!json.contains("content_digest"));
+
+        let decoded = ResourceCatalog::from_json(&json).expect("legacy catalog remains valid");
+        assert_eq!(decoded.content_digest, None);
+    }
+
+    #[test]
+    fn catalog_content_digest_is_independent_of_card_arrival_order() {
+        let mut first = valid_card();
+        first.display_name = "First Browser VM".into();
+        first.identity = ResourceIdentity::new(
+            ResourceClass::Desktop,
+            IdentityAuthority::Mesh,
+            "node/first/browser-vm",
+            vec![],
+        )
+        .expect("first identity");
+        let mut second = valid_card();
+        second.display_name = "Second Browser VM".into();
+        second.identity = ResourceIdentity::new(
+            ResourceClass::Desktop,
+            IdentityAuthority::Mesh,
+            "node/second/browser-vm",
+            vec![],
+        )
+        .expect("second identity");
+
+        let mut ordered = valid_catalog();
+        ordered.cards = vec![first.clone(), second.clone()];
+        let attested = ordered
+            .with_content_digest()
+            .expect("ordered catalog attestation");
+
+        let mut reordered = attested.clone();
+        reordered.cards = vec![second, first];
+        reordered.content_digest = None;
+        assert_eq!(
+            attested.content_digest,
+            Some(reordered.computed_content_digest())
+        );
+        reordered
+            .with_content_digest()
+            .expect("reordered catalog remains admissible");
+    }
+
+    #[test]
+    fn catalog_content_digest_mismatch_is_rejected() {
+        let mut catalog = valid_catalog()
+            .with_content_digest()
+            .expect("catalog attestation");
+        catalog.cards[0].display_name = "Tampered Browser VM".into();
+        assert_eq!(
+            catalog.validate(),
+            Err(ResourceValidationError::FingerprintMismatch(
+                "resource_catalog.content_digest"
+            ))
+        );
+
+        let mut malformed = valid_catalog();
+        malformed.content_digest = Some("catalog:v1:not-a-sha256".into());
+        assert_eq!(
+            malformed.validate(),
+            Err(ResourceValidationError::InvalidField(
+                "resource_catalog.content_digest"
+            ))
+        );
+    }
+
+    #[test]
+    fn publisher_attestation_round_trips_and_binds_exact_catalog() {
+        const KEY: &[u8] = b"publisher-attestation-test-key";
+
+        let catalog = valid_catalog();
+        let attestation = ResourcePublisherAttestation::mint(
+            &catalog,
+            "mesh/seat-15/catalog",
+            KEY,
+            NOW,
+            NOW + FRESH,
+        )
+        .expect("publisher attestation");
+        assert_eq!(
+            attestation.catalog_content_digest,
+            catalog.computed_content_digest()
+        );
+        assert!(attestation
+            .signature
+            .starts_with(RESOURCE_PUBLISHER_ATTESTATION_PREFIX));
+
+        let json = serde_json::to_string(&attestation).expect("attestation JSON");
+        let decoded: ResourcePublisherAttestation =
+            serde_json::from_str(&json).expect("attestation JSON round trip");
+        assert_eq!(decoded, attestation);
+        catalog
+            .validate_publisher_attestation(&decoded, KEY, NOW + 1)
+            .expect("authenticated publisher admission");
+    }
+
+    #[test]
+    fn publisher_attestation_rejects_tamper_wrong_key_and_expiry() {
+        const KEY: &[u8] = b"publisher-attestation-test-key";
+
+        let catalog = valid_catalog();
+        let attestation = ResourcePublisherAttestation::mint(
+            &catalog,
+            "mesh/seat-15/catalog",
+            KEY,
+            NOW,
+            NOW + FRESH,
+        )
+        .expect("publisher attestation");
+
+        let mut tampered = catalog.clone();
+        tampered.cards[0].display_name = "Forged Browser VM".into();
+        assert_eq!(
+            tampered.validate_publisher_attestation(&attestation, KEY, NOW + 1),
+            Err(ResourceValidationError::FingerprintMismatch(
+                "resource_publisher_attestation.catalog_content_digest"
+            ))
+        );
+        let mut wrong_publisher = attestation.clone();
+        wrong_publisher.publisher = "attacker".into();
+        assert_eq!(
+            catalog.validate_publisher_attestation(&wrong_publisher, KEY, NOW + 1),
+            Err(ResourceValidationError::InvalidRelationship(
+                "resource_publisher_attestation.publisher"
+            ))
+        );
+        assert_eq!(
+            catalog.validate_publisher_attestation(&attestation, b"wrong-key", NOW + 1),
+            Err(ResourceValidationError::FingerprintMismatch(
+                "resource_publisher_attestation.signature"
+            ))
+        );
+        assert_eq!(
+            catalog.validate_publisher_attestation(&attestation, KEY, NOW + FRESH),
+            Err(ResourceValidationError::InvalidTimestamp(
+                "resource_publisher_attestation.window"
+            ))
+        );
+    }
+
+    #[test]
+    fn authenticated_catalog_requires_the_current_key_id() {
+        const KEY: &[u8] = b"publisher-attestation-test-key";
+
+        let catalog = valid_catalog();
+        let legacy_key_id = ResourcePublisherAttestation::mint(
+            &catalog,
+            "mesh/seat-15/catalog",
+            KEY,
+            NOW,
+            NOW + FRESH,
+        )
+        .expect("legacy proof");
+        assert_eq!(
+            catalog
+                .clone()
+                .admit_authenticated(legacy_key_id, KEY, NOW + 1),
+            Err(ResourceValidationError::InvalidField(
+                "resource_publisher_attestation.key_id"
+            ))
+        );
+
+        let current = ResourcePublisherAttestation::mint(
+            &catalog,
+            RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
+            KEY,
+            NOW,
+            NOW + FRESH,
+        )
+        .expect("current proof");
+        let authenticated = catalog
+            .clone()
+            .admit_authenticated(current.clone(), KEY, NOW + 1)
+            .expect("authenticated catalog");
+        assert_eq!(authenticated.catalog(), &catalog);
+        assert_eq!(authenticated.publisher_attestation(), &current);
+    }
+
+    #[test]
+    fn discovery_projection_is_deterministic_and_extracts_typed_facets() {
+        let mut zulu = valid_card();
+        zulu.display_name = "Zulu Browser VM".into();
+        zulu.identity = ResourceIdentity::new(
+            ResourceClass::Desktop,
+            IdentityAuthority::Mesh,
+            "node/zulu/browser-vm",
+            vec![],
+        )
+        .expect("zulu identity");
+
+        let mut alpha = valid_card();
+        alpha.display_name = "Alpha Browser VM".into();
+        alpha.identity = ResourceIdentity::new(
+            ResourceClass::Desktop,
+            IdentityAuthority::Mesh,
+            "node/alpha/browser-vm",
+            vec![],
+        )
+        .expect("alpha identity");
+
+        let mut catalog = valid_catalog();
+        catalog.cards = vec![zulu, alpha];
+        let projection = catalog
+            .discovery_projection()
+            .expect("valid discovery projection");
+        assert_eq!(
+            projection
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha Browser VM", "Zulu Browser VM"]
+        );
+
+        let mut reordered = catalog.clone();
+        reordered.cards.reverse();
+        assert_eq!(
+            reordered
+                .discovery_projection()
+                .expect("reordered projection"),
+            projection
+        );
+
+        let entry = &projection.entries[0];
+        assert_eq!(entry.class, ResourceClass::Desktop);
+        assert_eq!(entry.health_status, HealthStatus::Available);
+        assert_eq!(entry.auth_status, AuthStatus::Authorized);
+        assert_eq!(
+            entry.discovery_sources,
+            vec![DiscoverySource::MeshDirectory]
+        );
+        assert_eq!(entry.reachability_scopes, vec![ResourceScope::Mesh]);
+        assert_eq!(entry.transport_protocols, vec![TransportProtocol::Rdp]);
+        assert_eq!(
+            entry.ready_actions,
+            vec![ResourceActionVerb::Inspect, ResourceActionVerb::Connect]
+        );
+        assert!(entry.service_category.is_none());
+        assert_eq!(projection.catalog_content_digest, catalog.content_digest);
+
+        let json = serde_json::to_string(&projection).expect("projection JSON");
+        assert!(!json.contains("endpoint"));
+        let decoded: ResourceDiscoveryProjection =
+            serde_json::from_str(&json).expect("projection JSON round trip");
+        decoded.validate().expect("decoded projection validates");
+        assert_eq!(decoded, projection);
+    }
+
+    #[test]
+    fn discovery_projection_rejects_duplicate_and_unsorted_entries() {
+        let projection = valid_catalog()
+            .discovery_projection()
+            .expect("valid discovery projection");
+
+        let mut duplicate = projection.clone();
+        duplicate.entries.push(duplicate.entries[0].clone());
+        assert_eq!(
+            duplicate.validate(),
+            Err(ResourceValidationError::Duplicate(
+                "resource_discovery_projection.entries"
+            ))
+        );
+
+        let mut unsorted = projection;
+        let mut later = unsorted.entries[0].clone();
+        later.display_name = "000 Earlier Name".into();
+        later.resource_id = ResourceIdentity::new(
+            ResourceClass::Desktop,
+            IdentityAuthority::Mesh,
+            "node/earlier/browser-vm",
+            vec![],
+        )
+        .expect("earlier identity")
+        .resource_id;
+        unsorted.entries.push(later);
+        assert_eq!(
+            unsorted.validate(),
+            Err(ResourceValidationError::InvalidRelationship(
+                "resource_discovery_projection.entry_order"
+            ))
+        );
     }
 
     #[test]
@@ -2983,6 +4041,97 @@ mod tests {
                 "capability.fingerprint"
             ))
         );
+    }
+
+    #[test]
+    fn capability_registry_lookup_is_deterministic_and_typed() {
+        let first = capability();
+        let mut second = capability();
+        second.adapter_id = "construct.ironrdp.alt".into();
+        second.fingerprint = second.computed_fingerprint();
+        second.validate().expect("second capability remains valid");
+
+        let forward = ClientCapabilityRegistry::admitted(vec![first.clone(), second.clone()])
+            .expect("forward registry admission");
+        let reverse = ClientCapabilityRegistry::admitted(vec![second.clone(), first.clone()])
+            .expect("reverse registry admission");
+
+        assert_eq!(forward.len(), 2);
+        assert!(!forward.is_empty());
+        assert_eq!(
+            forward.fingerprints().collect::<Vec<_>>(),
+            reverse.fingerprints().collect::<Vec<_>>()
+        );
+        assert_eq!(forward.lookup(&first.fingerprint), Some(&first));
+        assert_eq!(forward.lookup(&second.fingerprint), Some(&second));
+        assert_eq!(
+            forward
+                .capabilities()
+                .map(|entry| entry.fingerprint.as_str())
+                .collect::<Vec<_>>(),
+            forward.fingerprints().collect::<Vec<_>>()
+        );
+        assert!(forward.lookup("not-a-capability-fingerprint").is_none());
+    }
+
+    #[test]
+    fn capability_registry_rejects_duplicate_invalid_and_oversized_input() {
+        let duplicate = ClientCapabilityRegistry::admitted(vec![capability(), capability()]);
+        assert_eq!(
+            duplicate,
+            Err(ResourceValidationError::Duplicate(
+                "client_capability_registry.entries"
+            ))
+        );
+
+        let mut invalid = capability();
+        invalid.fingerprint = format!("{CAPABILITY_FINGERPRINT_PREFIX}{}", "0".repeat(64));
+        assert_eq!(
+            ClientCapabilityRegistry::admitted(vec![invalid]),
+            Err(ResourceValidationError::FingerprintMismatch(
+                "capability.fingerprint"
+            ))
+        );
+
+        let mut oversized = Vec::new();
+        for index in 0..=MAX_CAPABILITIES {
+            let mut entry = capability();
+            entry.adapter_id = format!("construct.ironrdp.{index}");
+            entry.fingerprint = entry.computed_fingerprint();
+            oversized.push(entry);
+        }
+        assert_eq!(
+            ClientCapabilityRegistry::admitted(oversized),
+            Err(ResourceValidationError::CapacityExceeded {
+                field: "client_capability_registry.entries",
+                max: MAX_CAPABILITIES
+            })
+        );
+    }
+
+    #[test]
+    fn capability_registry_has_no_arbitrary_command_path_or_url_wire_capability() {
+        let encoded = serde_json::to_value(capability()).expect("capability JSON");
+        let object = encoded.as_object().expect("capability object");
+        assert!(!object.contains_key("command"));
+        assert!(!object.contains_key("path"));
+        assert!(!object.contains_key("url"));
+
+        for field in ["command", "path", "url"] {
+            let mut forged = encoded.clone();
+            forged
+                .as_object_mut()
+                .expect("capability object")
+                .insert(field.into(), serde_json::Value::String("arbitrary".into()));
+            assert!(
+                serde_json::from_value::<ClientCapability>(forged).is_err(),
+                "accepted arbitrary capability field {field:?}"
+            );
+        }
+
+        let registry = ClientCapabilityRegistry::admitted(vec![capability()])
+            .expect("typed capability remains admissible");
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]
@@ -3258,6 +4407,72 @@ mod tests {
             catalog.validate(),
             Err(ResourceValidationError::Duplicate("resource_catalog.cards"))
         );
+    }
+
+    #[test]
+    fn catalog_wire_boundary_rejects_identity_collisions_and_bad_provenance() {
+        let mut merged = valid_catalog();
+        let mut second_source = merged.cards[0].provenance[0].clone();
+        second_source.source = DiscoverySource::Manual;
+        second_source.source_id = "operator/seat-15".into();
+        second_source.scope = ResourceScope::Mesh;
+        second_source.trust = ProvenanceTrust::OperatorDeclared;
+        second_source.interface = None;
+        merged.cards[0].provenance.push(second_source);
+
+        let admitted = ResourceCatalog::from_json(
+            &serde_json::to_string(&merged).expect("serialize multi-source catalog"),
+        )
+        .expect("distinct source observations remain visible on one card");
+        assert_eq!(admitted.cards.len(), 1);
+        assert_eq!(admitted.cards[0].provenance.len(), 2);
+        assert_eq!(
+            admitted.cards[0]
+                .provenance
+                .iter()
+                .map(|source| source.source)
+                .collect::<Vec<_>>(),
+            vec![DiscoverySource::MeshDirectory, DiscoverySource::Manual]
+        );
+
+        let mut collision = serde_json::to_value(valid_catalog()).expect("catalog value");
+        let cards = collision
+            .get_mut("cards")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("catalog cards array");
+        let duplicate_card = cards[0].clone();
+        cards.push(duplicate_card);
+        let collision_body = serde_json::to_string(&collision).expect("collision JSON");
+        assert!(matches!(
+            ResourceCatalog::from_json(&collision_body),
+            Err(ResourceCatalogDecodeError::Validation(
+                ResourceValidationError::Duplicate("resource_catalog.cards")
+            ))
+        ));
+
+        let mut malformed_provenance = serde_json::to_value(valid_catalog())
+            .expect("catalog value");
+        malformed_provenance["cards"][0]["provenance"][0]["scope"] =
+            serde_json::Value::String("trusted_lan".into());
+        let malformed_body =
+            serde_json::to_string(&malformed_provenance).expect("malformed provenance JSON");
+        assert!(matches!(
+            ResourceCatalog::from_json(&malformed_body),
+            Err(ResourceCatalogDecodeError::Validation(
+                ResourceValidationError::InvalidRelationship(
+                    "provenance.source_scope_trust",
+                )
+            ))
+        ));
+
+        let mut unknown_kind = serde_json::to_value(valid_catalog()).expect("catalog value");
+        unknown_kind["cards"][0]["identity"]["class"] =
+            serde_json::Value::String("future_resource_kind".into());
+        let unknown_kind_body = serde_json::to_string(&unknown_kind).expect("unknown kind JSON");
+        assert!(matches!(
+            ResourceCatalog::from_json(&unknown_kind_body),
+            Err(ResourceCatalogDecodeError::Json(_))
+        ));
     }
 
     #[test]

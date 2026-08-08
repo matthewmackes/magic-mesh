@@ -1,3 +1,7 @@
+> HISTORICAL / SUPERSEDED — The Spotify-class Music workspace and daemon
+> authority are now governed by WL-FUNC-021 in `docs/platform/WORKLIST.md`.
+> Retained only for migration context and existing service seams.
+
 # MUSIC-RFX — music client/interface refactor (sonixd-inspired)
 
 > **HISTORICAL / SUPERSEDED (2026-07-19):** locks the stack to the retired **iced/`libcosmic`/cosmic-text** toolkit. The live desktop is the egui-native, DRM-native shell `mde-shell-egui` — see [`quasar-vdi-desktop.md`](quasar-vdi-desktop.md). Retained as a historical design record; the toolkit choices below are stale.

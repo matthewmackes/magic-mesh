@@ -11,7 +11,8 @@
 //! [`Client`] that builds the authenticated stream URL, and the engine's
 //! [`SourceCodec`] classifier.
 
-use mde_musicd::airsonic::{Album, Client, Song};
+use mde_musicd::airsonic::{Album, Client, SearchResult3, Song};
+use mde_musicd::domain::{ContentKind, ContentRef, MusicWorkspaceSnapshotV1};
 use mde_musicd::engine::SourceCodec;
 
 /// A music server visible to one desktop seat. Higher operator priority wins;
@@ -125,6 +126,10 @@ pub struct MusicState {
     /// so the transport shows real elapsed time instead of a value frozen at the
     /// moment playback began.
     pub position_ms: u64,
+    /// Daemon-projected output volume in thousandths. `None` means the
+    /// standalone worker has not supplied a projection, so the control starts
+    /// at its honest default rather than claiming a daemon value.
+    pub volume_milli: Option<u16>,
     /// A transient playback/engine error to surface (e.g. no audio device).
     pub error: Option<String>,
     /// The seat selected by the worker after candidate probing.
@@ -137,6 +142,19 @@ pub struct MusicState {
     pub offline: bool,
     /// Last track known to be playable, retained for offline transport state.
     pub cached_track: Option<Song>,
+    /// Starred albums from the real provider endpoint.
+    pub starred: Fetch<Vec<Album>>,
+    /// The latest debounced search result.
+    pub search: Fetch<SearchResult3>,
+    /// Generation of the latest issued search request.
+    pub search_generation: u64,
+    /// Query associated with the latest search request.
+    pub search_query: String,
+    /// Latest validated daemon workspace snapshot, when the retained Bus lane
+    /// is available. This is a read-only projection used by storage/downloads.
+    pub workspace: Option<MusicWorkspaceSnapshotV1>,
+    /// Revision of [`workspace`], used to ignore stale retained rows.
+    pub workspace_revision: u64,
 }
 
 /// A result message the worker thread sends back to the UI, folded into the
@@ -145,6 +163,17 @@ pub struct MusicState {
 pub enum Update {
     /// The album library finished loading (or failed).
     Library(Result<Vec<Album>, String>),
+    /// Starred albums finished loading.
+    Starred(Result<Vec<Album>, String>),
+    /// A progressive search result. Older generations are ignored.
+    Search {
+        /// Request generation.
+        generation: u64,
+        /// Query sent to the source.
+        query: String,
+        /// Search response.
+        result: Result<SearchResult3, String>,
+    },
     /// The worker selected a seat after probing candidates.
     ServerSelected(SeatServer),
     /// A route change is available but requires explicit approval.
@@ -196,6 +225,19 @@ pub enum Command {
     ApproveFailover,
     /// Reject and clear the currently pending failover proposal.
     RejectFailover,
+    /// Fetch the provider's starred collection.
+    LoadStarred,
+    /// Search every admitted source through the worker's fan-out seam.
+    Search {
+        /// Debounce generation.
+        generation: u64,
+        /// Query text.
+        query: String,
+    },
+    /// Seek the current finite track.
+    Seek(u64),
+    /// Set output volume from 0.0 to 1.0.
+    SetVolume(f32),
 }
 
 impl MusicState {
@@ -203,6 +245,120 @@ impl MusicState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the daemon projection only when it is valid and advances
+    /// monotonically.
+    pub fn apply_workspace_snapshot(&mut self, snapshot: MusicWorkspaceSnapshotV1) {
+        // The retained Bus payload is daemon-owned authority, but it still
+        // crosses a hostile process boundary.  Do not let malformed typed
+        // content replace the last known-good projection or become a local
+        // worker fallback.
+        if snapshot.revision <= self.workspace_revision {
+            return;
+        }
+        match snapshot.validate() {
+            Ok(()) => {
+                let now_playing = snapshot
+                    .playback
+                    .current
+                    .as_ref()
+                    .and_then(|content| Self::workspace_song(&snapshot, content));
+                if let Some(open) = self.open_album.as_mut() {
+                    if let Some(item) = snapshot
+                        .collections
+                        .iter()
+                        .flat_map(|collection| collection.items.iter())
+                        .find(|item| item.kind == ContentKind::Album && item.id == open.album.id)
+                    {
+                        open.album.cover_art = item.artwork_ref.clone().unwrap_or_default();
+                    }
+                }
+                self.workspace_revision = snapshot.revision;
+                self.playing = snapshot.playback.playing;
+                self.position_ms = snapshot.playback.position_ms;
+                self.volume_milli = Some(snapshot.playback.volume_milli);
+                self.now_playing = now_playing;
+                self.workspace = Some(snapshot);
+            }
+            Err(reason) => {
+                self.error = Some(format!("Music daemon projection rejected: {reason}"));
+            }
+        }
+    }
+
+    /// Materialize the daemon's current composite identity into the legacy
+    /// `Song` render model. The embedded shell does not run the compatibility
+    /// worker, so without this bridge a valid daemon playback projection would
+    /// leave the Music player's Now Playing strip permanently empty.
+    fn workspace_song(snapshot: &MusicWorkspaceSnapshotV1, current: &ContentRef) -> Option<Song> {
+        let catalog_item = snapshot
+            .shelves
+            .iter()
+            .flat_map(|shelf| shelf.items.iter())
+            .chain(
+                snapshot
+                    .collections
+                    .iter()
+                    .flat_map(|collection| collection.items.iter()),
+            )
+            .find(|item| {
+                item.variants
+                    .iter()
+                    .any(|variant| variant.content == *current)
+            });
+        let queue_entry = snapshot
+            .queue
+            .iter()
+            .find(|entry| entry.content == *current);
+        let bookmark = snapshot
+            .bookmarks
+            .iter()
+            .find(|entry| entry.content == *current);
+        let title = catalog_item
+            .map(|item| item.title.clone())
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                bookmark
+                    .map(|entry| entry.title.clone())
+                    .filter(|title| !title.trim().is_empty())
+            })
+            .or_else(|| {
+                queue_entry
+                    .map(|entry| entry.title.clone())
+                    .filter(|title| !title.trim().is_empty())
+            })
+            .unwrap_or_else(|| current.remote_id.clone());
+        let duration_ms = catalog_item
+            .and_then(|item| item.duration_ms)
+            .or_else(|| bookmark.and_then(|entry| entry.duration_ms))
+            .or(snapshot.playback.duration_ms)
+            .unwrap_or_default();
+        let duration = duration_ms
+            .saturating_add(999)
+            .checked_div(1000)
+            .unwrap_or_default()
+            .min(u64::from(u32::MAX)) as u32;
+
+        Some(Song {
+            id: current.remote_id.clone(),
+            title,
+            album: catalog_item
+                .map(|item| item.parent_title.clone())
+                .or_else(|| bookmark.map(|entry| entry.parent_title.clone()))
+                .unwrap_or_default(),
+            artist: catalog_item
+                .map(|item| item.creator.clone())
+                .or_else(|| bookmark.map(|entry| entry.creator.clone()))
+                .unwrap_or_default(),
+            duration,
+            track: None,
+            suffix: String::new(),
+            cover_art: catalog_item
+                .and_then(|item| item.artwork_ref.clone())
+                .or_else(|| bookmark.and_then(|entry| entry.artwork_ref.clone()))
+                .unwrap_or_default(),
+        })
     }
 
     /// Fold a worker [`Update`] into the state.
@@ -219,6 +375,27 @@ impl MusicState {
                         Fetch::Cached(albums)
                     }
                     _ => Fetch::Failed(e),
+                };
+            }
+            Update::Starred(result) => {
+                self.starred = match result {
+                    Ok(albums) => Fetch::Ready(albums),
+                    Err(error) => Fetch::Failed(error),
+                };
+            }
+            Update::Search {
+                generation,
+                query,
+                result,
+            } => {
+                if generation <= self.search_generation {
+                    return;
+                }
+                self.search_generation = generation;
+                self.search_query = query;
+                self.search = match result {
+                    Ok(page) => Fetch::Ready(page),
+                    Err(error) => Fetch::Failed(error),
                 };
             }
             Update::ServerSelected(server) => {
@@ -450,6 +627,207 @@ mod tests {
     }
 
     #[test]
+    fn daemon_snapshot_projects_transport_volume_with_playback_state() {
+        use mde_musicd::domain::{
+            MusicStorageSnapshot, MusicWorkspaceSnapshotV1, PlaybackSnapshot,
+        };
+
+        let mut state = MusicState::new();
+        state.apply_workspace_snapshot(MusicWorkspaceSnapshotV1 {
+            schema_version: 1,
+            revision: 8,
+            shelves: Vec::new(),
+            bookmarks: Vec::new(),
+            collections: Vec::new(),
+            search: None,
+            playback: PlaybackSnapshot {
+                current: None,
+                playing: true,
+                position_ms: 12_000,
+                duration_ms: Some(60_000),
+                volume_milli: 375,
+                shuffle: false,
+                repeat: "off".to_owned(),
+                queue_revision: 2,
+                seekable: true,
+            },
+            queue: Vec::new(),
+            downloads: Vec::new(),
+            storage: MusicStorageSnapshot {
+                used_bytes: 0,
+                cap_bytes: 1,
+            },
+            targets: Vec::new(),
+            sources: Vec::new(),
+            any_source_reachable: true,
+        });
+
+        assert!(state.playing);
+        assert_eq!(state.position_ms, 12_000);
+        assert_eq!(state.volume_milli, Some(375));
+    }
+
+    #[test]
+    fn daemon_snapshot_materializes_now_playing_metadata_for_embedded_shell() {
+        use mde_musicd::domain::{
+            BookmarkItem, CatalogItem, ContentKind, ContentRef, LibraryCollection,
+            MusicStorageSnapshot, MusicWorkspaceSnapshotV1, PlaybackSnapshot, SourceVariant,
+        };
+
+        let content = ContentRef::new("source-one", "song-1", ContentKind::Music).unwrap();
+        let mut state = MusicState::new();
+        state.apply_workspace_snapshot(MusicWorkspaceSnapshotV1 {
+            schema_version: 1,
+            revision: 9,
+            shelves: Vec::new(),
+            bookmarks: Vec::new(),
+            collections: vec![LibraryCollection {
+                key: "songs".to_owned(),
+                title: "Songs".to_owned(),
+                kind: ContentKind::Music,
+                items: vec![CatalogItem {
+                    id: "song-1".to_owned(),
+                    kind: ContentKind::Music,
+                    title: "A daemon song".to_owned(),
+                    creator: "An artist".to_owned(),
+                    parent_title: "An album".to_owned(),
+                    duration_ms: Some(181_000),
+                    artwork_ref: Some("art-1".to_owned()),
+                    starred: false,
+                    cached: true,
+                    variants: vec![SourceVariant {
+                        content: content.clone(),
+                        cached: true,
+                        reachable: true,
+                        operator_priority: 1,
+                        latency_ms: Some(4),
+                    }],
+                }],
+                mutable: false,
+                offset: 0,
+                page_size: 0,
+                has_more: false,
+            }],
+            search: None,
+            playback: PlaybackSnapshot {
+                current: Some(content),
+                playing: true,
+                position_ms: 12_000,
+                duration_ms: Some(181_000),
+                volume_milli: 850,
+                shuffle: false,
+                repeat: "off".to_owned(),
+                queue_revision: 1,
+                seekable: true,
+            },
+            queue: Vec::new(),
+            downloads: Vec::new(),
+            storage: MusicStorageSnapshot {
+                used_bytes: 0,
+                cap_bytes: 1,
+            },
+            targets: Vec::new(),
+            sources: Vec::new(),
+            any_source_reachable: true,
+        });
+
+        let now_playing = state.now_playing.as_ref().expect("daemon current track");
+        assert_eq!(now_playing.title, "A daemon song");
+        assert_eq!(now_playing.artist, "An artist");
+        assert_eq!(now_playing.album, "An album");
+        assert_eq!(now_playing.duration, 181);
+        assert_eq!(now_playing.cover_art, "art-1");
+        assert!(state.playing);
+
+        let mut bookmark_snapshot = state.workspace.clone().expect("retained snapshot");
+        let bookmark_content =
+            ContentRef::new("source-one", "episode-1", ContentKind::Episode).unwrap();
+        bookmark_snapshot.revision = 10;
+        bookmark_snapshot.collections.clear();
+        bookmark_snapshot.bookmarks = vec![BookmarkItem {
+            content: bookmark_content.clone(),
+            title: "A bookmarked episode".to_owned(),
+            creator: "A host".to_owned(),
+            parent_title: "A podcast".to_owned(),
+            position_ms: 42_000,
+            duration_ms: Some(300_000),
+            artwork_ref: Some("episode-art".to_owned()),
+        }];
+        bookmark_snapshot.playback.current = Some(bookmark_content);
+        bookmark_snapshot.playback.playing = false;
+        bookmark_snapshot.playback.position_ms = 42_000;
+        bookmark_snapshot.playback.duration_ms = Some(300_000);
+        state.apply_workspace_snapshot(bookmark_snapshot);
+        let now_playing = state.now_playing.as_ref().expect("bookmark current track");
+        assert_eq!(now_playing.title, "A bookmarked episode");
+        assert_eq!(now_playing.artist, "A host");
+        assert_eq!(now_playing.album, "A podcast");
+        assert_eq!(now_playing.duration, 300);
+        assert_eq!(now_playing.cover_art, "episode-art");
+    }
+
+    #[test]
+    fn daemon_snapshot_rejects_invalid_content_without_overwriting_projection() {
+        use mde_musicd::domain::{
+            MusicStorageSnapshot, MusicWorkspaceSnapshotV1, PlaybackSnapshot,
+        };
+
+        let mut state = MusicState::new();
+        state.apply_workspace_snapshot(MusicWorkspaceSnapshotV1 {
+            schema_version: 1,
+            revision: 8,
+            shelves: Vec::new(),
+            bookmarks: Vec::new(),
+            collections: Vec::new(),
+            search: None,
+            playback: PlaybackSnapshot {
+                current: None,
+                playing: true,
+                position_ms: 12_000,
+                duration_ms: Some(60_000),
+                volume_milli: 375,
+                shuffle: false,
+                repeat: "off".to_owned(),
+                queue_revision: 2,
+                seekable: true,
+            },
+            queue: Vec::new(),
+            downloads: Vec::new(),
+            storage: MusicStorageSnapshot {
+                used_bytes: 0,
+                cap_bytes: 1,
+            },
+            targets: Vec::new(),
+            sources: Vec::new(),
+            any_source_reachable: true,
+        });
+
+        let mut invalid = state.workspace.clone().expect("valid daemon projection");
+        invalid.revision = 9;
+        invalid.storage.cap_bytes = 0;
+        invalid.playback.playing = false;
+        invalid.playback.position_ms = 0;
+        state.apply_workspace_snapshot(invalid);
+
+        assert_eq!(state.workspace_revision, 8);
+        assert!(state.playing);
+        assert_eq!(state.position_ms, 12_000);
+        assert_eq!(state.volume_milli, Some(375));
+        assert_eq!(
+            state
+                .workspace
+                .as_ref()
+                .expect("retained projection")
+                .revision,
+            8
+        );
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Music daemon projection rejected: invalid_storage_cap")
+        );
+    }
+
+    #[test]
     fn a_track_ending_on_its_own_clears_the_transport() {
         let mut s = MusicState::new();
         s.apply(Update::Started(song("9", "flac", 30)));
@@ -545,5 +923,38 @@ mod tests {
             Fetch::Cached(tracks) if tracks[0].id == "track"
         ));
         assert!(state.offline);
+    }
+
+    #[test]
+    fn replayed_search_generation_cannot_replace_the_accepted_result() {
+        let mut state = MusicState::new();
+        let first = SearchResult3 {
+            albums: vec![album("first")],
+            artists: Vec::new(),
+            songs: Vec::new(),
+        };
+        let replay = SearchResult3 {
+            albums: vec![album("replay")],
+            artists: Vec::new(),
+            songs: Vec::new(),
+        };
+
+        state.apply(Update::Search {
+            generation: 1,
+            query: "first".to_owned(),
+            result: Ok(first),
+        });
+        state.apply(Update::Search {
+            generation: 1,
+            query: "replay".to_owned(),
+            result: Ok(replay),
+        });
+
+        assert_eq!(state.search_generation, 1);
+        assert_eq!(state.search_query, "first");
+        assert!(matches!(
+            &state.search,
+            Fetch::Ready(page) if page.albums[0].id == "first"
+        ));
     }
 }

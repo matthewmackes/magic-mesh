@@ -28,6 +28,7 @@ pub enum RestartPolicy {
     /// Restart after any return.
     Always,
 }
+use mackes_mesh_types::worker_runtime as runtime;
 use mde_role::{Capability, Role, RoleClass};
 
 const MIB: u64 = 1024 * 1024;
@@ -287,6 +288,36 @@ impl WorkerGroup {
             },
         }
     }
+
+    /// Parse the exact process-group token used by `mackesd serve --group`
+    /// and the six governed systemd entrypoints.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "control" => Ok(Self::Control),
+            "observation" => Ok(Self::Observation),
+            "actions" => Ok(Self::Actions),
+            "data" => Ok(Self::Data),
+            "compute" => Ok(Self::Compute),
+            "integrations" => Ok(Self::Integrations),
+            _ => Err(format!(
+                "unknown worker group {value:?}; expected control, observation, actions, data, compute, or integrations"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerGroup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for WorkerGroup {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
 }
 
 /// Operational importance used for restart-storm and degraded-mode decisions.
@@ -451,6 +482,26 @@ pub struct RuntimeOwnership {
     pub cleanup: CleanupPolicy,
 }
 
+/// How the production daemon binds a canonical worker registration to its
+/// runtime start site. This is part of the registration itself: directly
+/// supervised workers and responder threads are not an out-of-band exception
+/// to the worker census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnBinding {
+    /// Constructed through `spawn_tiered`, with role gating and policy read from
+    /// this registration.
+    Tiered,
+    /// Constructed directly under the Rust supervisor. The imperative start
+    /// site must use the restart policy declared by this registration.
+    DirectSupervisor,
+    /// Started as a named responder/maintenance thread rather than a
+    /// `Supervisor` worker.
+    ResponderThread,
+    /// Registered by a supervisor helper that returns the worker's runtime
+    /// name instead of containing a string-literal spawn call.
+    DynamicSupervisor,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GroupDefaults {
     criticality: Criticality,
@@ -517,6 +568,8 @@ pub struct WorkerSpec {
     /// The worker's stable name — the `worker_names` roster key, the `runs`
     /// gate key, and the `spawn_tiered` registration key.
     pub name: &'static str,
+    /// Exact production start-site shape used by the bidirectional drift guard.
+    pub spawn_binding: SpawnBinding,
     /// Minimum role rank that runs this worker (0 lighthouse · 1 workstation).
     pub min_rank: u8,
     /// Restart policy the supervisor applies when this worker returns/panics.
@@ -551,6 +604,7 @@ impl WorkerSpec {
         let defaults = group.defaults();
         Self {
             name,
+            spawn_binding: SpawnBinding::Tiered,
             min_rank,
             policy,
             group,
@@ -570,6 +624,36 @@ impl WorkerSpec {
                 cleanup: defaults.cleanup,
             },
         }
+    }
+
+    /// A canonical registration for a worker constructed directly under the
+    /// monolithic supervisor during the process-isolation migration.
+    #[must_use]
+    const fn direct(
+        name: &'static str,
+        policy: RestartPolicy,
+        group: WorkerGroup,
+    ) -> Self {
+        let mut spec = Self::tier(name, 0, policy, group);
+        spec.spawn_binding = SpawnBinding::DirectSupervisor;
+        spec
+    }
+
+    /// A canonical registration for an explicitly named responder or bounded
+    /// maintenance thread. `Never` records that the worker supervisor does not
+    /// own an independent restart loop for this start site.
+    #[must_use]
+    const fn responder(name: &'static str, group: WorkerGroup) -> Self {
+        let mut spec = Self::tier(name, 0, RestartPolicy::Never, group);
+        spec.spawn_binding = SpawnBinding::ResponderThread;
+        spec.cadence = CadencePolicy::Continuous;
+        spec
+    }
+
+    #[must_use]
+    const fn with_spawn_binding(mut self, binding: SpawnBinding) -> Self {
+        self.spawn_binding = binding;
+        self
     }
 
     /// Override the group's default activation predicate for an optional
@@ -699,17 +783,11 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         WorkerGroup::Observation,
     )
     .with_cadence(CadencePolicy::Continuous),
-    WorkerSpec::tier(
-        "lifecycle_exec",
-        0,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Actions,
-    ),
     // DEVMGR-8 — the device-control executor: privileged hardware ops
     // (enable/disable, reload module, rescan bus) the Device-Manager surface
-    // dispatches to a target node. UNIVERSAL (rank 0) like hardware_probe /
-    // lifecycle_exec — every node can be an action target and drains only its
-    // own replicated fleet/device-control/<self> request dir.
+    // dispatches to a target node. UNIVERSAL (rank 0); every node can be an
+    // action target and drains only its own replicated
+    // fleet/device-control/<self> request dir.
     WorkerSpec::tier(
         "device_control",
         0,
@@ -1039,17 +1117,11 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         RestartPolicy::OnFailure,
         WorkerGroup::Observation,
     ),
-    // MV — per-node libvirt VM executor, every node hosts VMs.
+    // WL-ARCH-010 — one journal-backed compute reconciler for VM and Quadlet
+    // workloads; Workstation/Server only, never Lighthouse.
     WorkerSpec::tier(
-        "vm_lifecycle",
-        0,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Compute,
-    ),
-    // MV — per-node Podman container executor, every node hosts containers.
-    WorkerSpec::tier(
-        "container",
-        0,
+        "workload_compute",
+        1,
         RestartPolicy::OnFailure,
         WorkerGroup::Compute,
     ),
@@ -1073,13 +1145,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         0,
         RestartPolicy::OnFailure,
         WorkerGroup::Data,
-    ),
-    // VDI — live-console overlay relay, serving-peer-gated, runs everywhere.
-    WorkerSpec::tier(
-        "console_broker",
-        0,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Compute,
     ),
     // VDI — per-session clipboard relay, node-local, runs everywhere.
     WorkerSpec::tier(
@@ -1113,7 +1178,8 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         0,
         RestartPolicy::OnFailure,
         WorkerGroup::Observation,
-    ),
+    )
+    .with_spawn_binding(SpawnBinding::DynamicSupervisor),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -1273,6 +1339,74 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // census entry (the BUG-STORAGE-1 lesson — a worker absent from the census
     // silently never runs).
     WorkerSpec::tier("transfers", 1, RestartPolicy::OnFailure, WorkerGroup::Data),
+    // WL-ARCH-009 — canonical registrations for the workers that the current
+    // monolith starts directly while the six process entrypoints are being
+    // extracted. These used to live in a test-only NON_TIERED_WORKERS
+    // exception list, which meant they had no runtime contract at all.
+    WorkerSpec::direct("action", RestartPolicy::Always, WorkerGroup::Actions),
+    WorkerSpec::direct("alert_relay", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::responder("apps_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("apps_installed", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct("apps_running", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("bus_retention_gc", WorkerGroup::Data),
+    WorkerSpec::direct("cert_authority", RestartPolicy::Always, WorkerGroup::Control),
+    WorkerSpec::responder("clipboard_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("compute_expose", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct("compute_migrate", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct("compute_provision", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::responder("connect_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("connect_firewall", RestartPolicy::OnFailure, WorkerGroup::Actions),
+    WorkerSpec::direct("copilot", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct("cups_sync", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct("datacenter_orchestrator", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct("dc_auditor", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::responder("dc_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("dc_health", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct("dc_jobs", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::responder("dc_power_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("dc_promote", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct("dc_snap_scheduler", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::responder("ddns_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::responder("ddns_reconcile", WorkerGroup::Integrations),
+    WorkerSpec::responder("directory_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("dr_scheduler", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct("farm_orchestrator", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::responder("files_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("firewall_monitor", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("fleet_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::responder("host_ops_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("host_state", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("jobs_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("leader_election", RestartPolicy::Always, WorkerGroup::Control),
+    WorkerSpec::direct("media_registry", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct("mesh_firewall", RestartPolicy::Always, WorkerGroup::Control),
+    WorkerSpec::direct("mirror_syncd", RestartPolicy::Always, WorkerGroup::Data),
+    WorkerSpec::direct("navidrome_supervisor", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::responder("nebula_bus_responder", WorkerGroup::Control),
+    WorkerSpec::direct("nebula_ca_backup", RestartPolicy::OnFailure, WorkerGroup::Data),
+    WorkerSpec::direct("nebula_csr_watcher", RestartPolicy::OnFailure, WorkerGroup::Control),
+    WorkerSpec::direct("nebula_enroll_listener", RestartPolicy::OnFailure, WorkerGroup::Control),
+    WorkerSpec::direct("nebula_https_listener", RestartPolicy::OnFailure, WorkerGroup::Control),
+    WorkerSpec::direct("netassess", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct("netdata_aggregator", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct("peer-cap", RestartPolicy::OnFailure, WorkerGroup::Observation),
+    WorkerSpec::direct("probe", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("route_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("router_registry", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct("selinux_monitor", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("settings_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::responder("shell_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("surface_enable", RestartPolicy::Always, WorkerGroup::Actions),
+    WorkerSpec::direct("surface_firmware", RestartPolicy::Always, WorkerGroup::Actions),
+    WorkerSpec::direct("surface_verify", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct("surrounding_hosts", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("tofu_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("upgrade_intent_watcher", RestartPolicy::Always, WorkerGroup::Actions),
+    WorkerSpec::direct("voice_provision", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::responder("voip_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("voip_rtt", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::responder("vpn_bus_responder", WorkerGroup::Actions),
+    WorkerSpec::direct("xcp_provision", RestartPolicy::Always, WorkerGroup::Compute),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -1310,14 +1444,14 @@ pub fn min_rank(worker: &str) -> u8 {
         .map_or(0, |s| s.min_rank)
 }
 
-/// WL-ARCH-004 — the registration for `worker`, if it is a role-tiered worker
-/// (i.e. present in [`WORKER_REGISTRY`]). `None` for a non-tiered worker.
+/// WL-ARCH-009 — the canonical registration for `worker`, regardless of its
+/// current monolith start-site shape.
 #[must_use]
 pub fn spec(worker: &str) -> Option<&'static WorkerSpec> {
     WORKER_REGISTRY.iter().find(|s| s.name == worker)
 }
 
-/// WL-ARCH-009 — the complete role-tiered runtime-contract registry.
+/// WL-ARCH-009 — the complete runtime-contract registry.
 ///
 /// Process entrypoints and status projections consume this view instead of
 /// maintaining group-local worker lists.
@@ -1334,12 +1468,270 @@ pub fn specs_for_group(group: WorkerGroup) -> impl Iterator<Item = &'static Work
         .filter(move |worker| worker.group == group)
 }
 
+/// Project one daemon registry row into the neutral worker-runtime contract.
+///
+/// The daemon registry remains authoritative for spawn behavior and the exact
+/// activation predicate. This projection carries only the bounded, shell-free
+/// declaration that the shared contract can represent; it never fabricates a
+/// runtime snapshot or a worker state. Any source policy without an admitted
+/// neutral equivalent is rejected instead of being silently weakened.
+pub fn worker_contract(
+    worker: &WorkerSpec,
+) -> Result<runtime::WorkerContract, runtime::WorkerRuntimeContractError> {
+    let group = runtime_group(worker.group);
+    let applicability = runtime_applicability(worker)?;
+    let cadence = runtime_cadence(worker.cadence)?;
+    let queue = runtime_queue(worker.queue)?;
+    let cache = runtime_cache(worker.cache)?;
+    let ownership = runtime_ownership(worker)?;
+
+    let mut contract = runtime::WorkerContract::new(worker.name, group, worker.name)?;
+    contract.applicability = applicability;
+    contract.criticality = match worker.criticality {
+        Criticality::Essential => runtime::WorkerCriticality::Essential,
+        Criticality::Important => runtime::WorkerCriticality::Important,
+        Criticality::Optional => runtime::WorkerCriticality::Optional,
+    };
+    contract.restart_policy = match worker.policy {
+        RestartPolicy::Never => runtime::WorkerRestartPolicy::Never,
+        RestartPolicy::OnFailure => runtime::WorkerRestartPolicy::OnFailure,
+        RestartPolicy::Always => runtime::WorkerRestartPolicy::Always,
+    };
+    contract.cadence = cadence;
+    contract.queue = queue;
+    contract.cache = cache;
+    contract.resources = runtime::WorkerResourceBudget {
+        memory_high_bytes: worker.resources.memory_high_bytes,
+        memory_max_bytes: worker.resources.memory_max_bytes,
+        cpu_millis_per_second: worker.resources.cpu_millis_per_second,
+        max_tasks: worker.resources.max_tasks,
+    };
+    contract.ownership = ownership;
+
+    // WorkerSpec does not declare typed topics, dependencies, or action
+    // descriptors. Leave those collections empty rather than manufacturing
+    // endpoints that the daemon has not actually implemented.
+    contract.admitted()
+}
+
+/// Project the complete canonical registry in stable registry order.
+///
+/// The duplicate check is intentionally performed across the whole result;
+/// validating each row alone cannot detect two registry entries publishing the
+/// same neutral worker identity.
+pub fn worker_contracts(
+) -> Result<Vec<runtime::WorkerContract>, runtime::WorkerRuntimeContractError> {
+    let mut identities = std::collections::BTreeSet::new();
+    let mut contracts = Vec::with_capacity(WORKER_REGISTRY.len());
+    for worker in worker_specs() {
+        let contract = worker_contract(worker)?;
+        if !identities.insert(contract.worker_id.clone()) {
+            return Err(runtime::WorkerRuntimeContractError::Duplicate(
+                "worker_registry.worker_id",
+            ));
+        }
+        contracts.push(contract);
+    }
+    Ok(contracts)
+}
+
+/// Project one named registry row, returning `None` only for an unknown worker.
+pub fn worker_contract_for(
+    worker: &str,
+) -> Result<Option<runtime::WorkerContract>, runtime::WorkerRuntimeContractError> {
+    spec(worker).map(worker_contract).transpose()
+}
+
+fn runtime_group(group: WorkerGroup) -> runtime::WorkerGroup {
+    match group {
+        WorkerGroup::Control => runtime::WorkerGroup::Control,
+        WorkerGroup::Observation => runtime::WorkerGroup::Observation,
+        WorkerGroup::Actions => runtime::WorkerGroup::Actions,
+        WorkerGroup::Data => runtime::WorkerGroup::Data,
+        WorkerGroup::Compute => runtime::WorkerGroup::Compute,
+        WorkerGroup::Integrations => runtime::WorkerGroup::Integrations,
+    }
+}
+
+fn runtime_applicability(
+    worker: &WorkerSpec,
+) -> Result<runtime::WorkerApplicability, runtime::WorkerRuntimeContractError> {
+    let roles = match worker.min_rank {
+        0 => vec![
+            runtime::WorkerRole::Lighthouse,
+            runtime::WorkerRole::Workstation,
+        ],
+        1 => vec![runtime::WorkerRole::Workstation],
+        _ => {
+            return Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.min_rank",
+            ));
+        }
+    };
+
+    let capabilities = match worker.activation.capability {
+        CapabilityPredicate::AnyNode => Vec::new(),
+        CapabilityPredicate::Requires(capability) => {
+            let applies_to_declared_role = match capability {
+                Capability::Media => false,
+            };
+            if !applies_to_declared_role {
+                return Err(runtime::WorkerRuntimeContractError::InvalidRelationship(
+                    "worker_spec.activation.capability",
+                ));
+            }
+            vec![capability.as_str().to_owned()]
+        }
+    };
+
+    let requires_configuration = match worker.activation.config {
+        ConfigPredicate::Always => false,
+        ConfigPredicate::EnvironmentPresent(key) | ConfigPredicate::EnvironmentUnlessFalse(key) => {
+            if !valid_environment_key(key) {
+                return Err(runtime::WorkerRuntimeContractError::InvalidField(
+                    "worker_spec.activation.environment",
+                ));
+            }
+            true
+        }
+        ConfigPredicate::RuntimeAvailable(key) => {
+            if !valid_runtime_key(key) {
+                return Err(runtime::WorkerRuntimeContractError::InvalidField(
+                    "worker_spec.activation.runtime",
+                ));
+            }
+            true
+        }
+    };
+
+    Ok(runtime::WorkerApplicability {
+        roles,
+        capabilities,
+        requires_configuration,
+    })
+}
+
+fn runtime_cadence(
+    cadence: CadencePolicy,
+) -> Result<runtime::WorkerCadence, runtime::WorkerRuntimeContractError> {
+    Ok(match cadence {
+        CadencePolicy::Continuous => runtime::WorkerCadence::Continuous,
+        CadencePolicy::EventDriven => runtime::WorkerCadence::EventDriven,
+        CadencePolicy::OnDemand => runtime::WorkerCadence::OnDemand,
+        CadencePolicy::Periodic {
+            min_interval_secs,
+            max_interval_secs,
+        } => runtime::WorkerCadence::Periodic {
+            min_interval_ms: u64::from(min_interval_secs).checked_mul(1_000).ok_or(
+                runtime::WorkerRuntimeContractError::InvalidField(
+                    "worker_spec.cadence.periodic.min_interval_secs",
+                ),
+            )?,
+            max_interval_ms: u64::from(max_interval_secs).checked_mul(1_000).ok_or(
+                runtime::WorkerRuntimeContractError::InvalidField(
+                    "worker_spec.cadence.periodic.max_interval_secs",
+                ),
+            )?,
+        },
+    })
+}
+
+fn runtime_queue(
+    queue: QueuePolicy,
+) -> Result<runtime::WorkerQueueContract, runtime::WorkerRuntimeContractError> {
+    let QueuePolicy::Bounded {
+        max_items,
+        max_bytes,
+        overflow,
+    } = queue
+    else {
+        return Err(runtime::WorkerRuntimeContractError::InvalidField(
+            "worker_spec.queue.disabled",
+        ));
+    };
+
+    let overflow = match overflow {
+        QueueOverflow::RejectNew => runtime::WorkerQueueOverflow::RejectNew,
+        QueueOverflow::LatestWins => runtime::WorkerQueueOverflow::LatestWins,
+        QueueOverflow::DropOldest => {
+            return Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.queue.overflow.drop_oldest",
+            ));
+        }
+    };
+
+    Ok(runtime::WorkerQueueContract {
+        max_items,
+        max_bytes,
+        overflow,
+    })
+}
+
+fn runtime_cache(
+    cache: CachePolicy,
+) -> Result<runtime::WorkerCachePolicy, runtime::WorkerRuntimeContractError> {
+    Ok(match cache {
+        CachePolicy::Disabled => runtime::WorkerCachePolicy::Disabled,
+        CachePolicy::Bounded {
+            max_items,
+            max_bytes,
+            ttl_secs,
+        } => runtime::WorkerCachePolicy::Bounded {
+            max_items,
+            max_bytes,
+            ttl_ms: u64::from(ttl_secs).checked_mul(1_000).ok_or(
+                runtime::WorkerRuntimeContractError::InvalidField("worker_spec.cache.ttl_secs"),
+            )?,
+        },
+    })
+}
+
+fn runtime_ownership(
+    worker: &WorkerSpec,
+) -> Result<runtime::WorkerOwnership, runtime::WorkerRuntimeContractError> {
+    if !(1..=60).contains(&worker.ownership.cleanup.grace_secs) {
+        return Err(runtime::WorkerRuntimeContractError::InvalidField(
+            "worker_spec.cleanup.grace_secs",
+        ));
+    }
+
+    Ok(runtime::WorkerOwnership {
+        state_group: runtime_group(worker.ownership.state),
+        health_group: runtime_group(worker.ownership.health),
+        action_group: runtime_group(worker.ownership.actions),
+        cleanup_owner: match worker.ownership.cleanup.owner {
+            CleanupOwner::Worker => runtime::WorkerCleanupOwner::Worker,
+            CleanupOwner::GroupSupervisor => runtime::WorkerCleanupOwner::GroupSupervisor,
+        },
+    })
+}
+
+fn valid_environment_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key.starts_with("MDE_")
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_runtime_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// WL-ARCH-004 — the restart policy declared for a role-tiered `worker`. `None`
-/// for a worker absent from [`WORKER_REGISTRY`]; `spawn_tiered` treats that as a
-/// hard error (an unregistered tiered spawn), which the drift test also catches.
+/// for an absent or directly bound worker; `spawn_tiered` treats either as a
+/// hard error, which prevents a direct registration from silently changing its
+/// start semantics.
 #[must_use]
 pub fn policy_for(worker: &str) -> Option<RestartPolicy> {
-    spec(worker).map(|s| s.policy)
+    spec(worker)
+        .filter(|spec| spec.spawn_binding == SpawnBinding::Tiered)
+        .map(|spec| spec.policy)
 }
 
 /// The rank floor for a capability-gated worker that isn't in [`WORKER_REGISTRY`]
@@ -1508,106 +1900,16 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // WL-ARCH-004 — the (now structural) drift guard.
     //
-    // Worker registration used to be split across TWO registries that drifted
-    // (BUG-STORAGE-1 / ARCH-5): a static role census vs. the ~136 imperative
-    // `sup.spawn(...)` / `worker_names.push(...)` sites in `run_serve`. WL-ARCH-004
-    // unified them: [`WORKER_REGISTRY`] is the ONE declarative table both the census
-    // (`min_rank` / `workers_for_class`) AND the spawner (`spawn_tiered`, which reads
-    // each entry's gate + restart policy) derive from — so a role-tiered worker can
-    // no longer be spawned without a census row, nor censused without a spawn.
+    // Worker registration used to be split between the role census and a
+    // test-only allowlist for directly started workers. WL-ARCH-009 makes
+    // [`WORKER_REGISTRY`] the one canonical inventory and records the exact
+    // start-site shape on every row.
     //
     // `worker_spawns_and_the_census_do_not_drift` proves that: it asserts the census
-    // is derived from the registry (not a parallel list) AND reads the crate source
-    // at test time to enforce the registry ⇔ `spawn_tiered` site identity, so any
-    // future drift fails the build with the offending worker named. Airgapped-safe:
-    // pure source parsing, no live env. The non-tiered bus responders /
-    // unconditional workers (below) still register with a literal
-    // `worker_names.push(...)` and are reconciled the same way.
-
-    /// Workers spawned in `run_serve` that are deliberately NOT role-tiered (absent
-    /// from [`WORKER_REGISTRY`]): they spawn UNCONDITIONALLY on every role (mesh/nebula
-    /// control plane, bus responders, datacenter/compute workers that self-gate on a
-    /// runtime marker), or are capability-gated under the `navidrome` key
-    /// (`media_registry` / `navidrome_supervisor`). None of them consult the registry,
-    /// so they cannot mis-tier — but listing them here keeps the full-roster reconcile
-    /// honest: every spawned worker must be classified as EITHER a registry entry OR an
-    /// explicit not-tier-gated entry, so a NEW spawn that is neither fails the guard.
-    /// A future tiering pass may promote an entry from here into [`WORKER_REGISTRY`].
-    const NON_TIERED_WORKERS: &[&str] = &[
-        "action",
-        "alert_relay",
-        "apps_bus_responder",
-        "apps_installed",
-        "apps_running",
-        "bus_retention_gc",
-        "cert_authority",
-        "clipboard_bus_responder",
-        "compute_event_toast",
-        "compute_expose",
-        "compute_migrate",
-        "compute_provision",
-        "compute_registry",
-        "connect_bus_responder",
-        "connect_firewall",
-        "copilot",
-        "cups_sync",
-        "datacenter_orchestrator",
-        "dc_auditor",
-        "dc_bus_responder",
-        "dc_health",
-        "dc_jobs",
-        "dc_power_bus_responder",
-        "dc_promote",
-        "dc_snap_scheduler",
-        "ddns_bus_responder",
-        "ddns_reconcile",
-        "directory_bus_responder",
-        "dr_scheduler",
-        "farm_orchestrator",
-        "files_bus_responder",
-        "firewall_monitor",
-        "fleet_bus_responder",
-        "host_ops_bus_responder",
-        "host_state",
-        "jobs_bus_responder",
-        "leader_election",
-        "media_registry",
-        "mesh_firewall",
-        "mirror_syncd",
-        "navidrome_supervisor",
-        "nebula_bus_responder",
-        "nebula_ca_backup",
-        "nebula_csr_watcher",
-        "nebula_enroll_listener",
-        "nebula_https_listener",
-        "netassess",
-        "netdata_aggregator",
-        "peer-cap",
-        "probe",
-        "route_bus_responder",
-        "router_registry",
-        "selinux_monitor",
-        "settings_bus_responder",
-        "shell_bus_responder",
-        "surface_enable",
-        "surface_firmware",
-        "surface_verify",
-        "surrounding_hosts",
-        "tofu_bus_responder",
-        "upgrade_intent_watcher",
-        "voice_provision",
-        "voip_bus_responder",
-        "voip_rtt",
-        "vpn_bus_responder",
-        "xcp_provision",
-    ];
-
-    /// Worker(s) whose `worker_names.push(...)` uses a runtime-computed name rather
-    /// than a string literal, so the source scan cannot see them. Currently only the
-    /// LIGHTHOUSE-8 probe, spawned via `Supervisor::spawn_lighthouse_probe()` which
-    /// returns the worker's own `name()` (`"lighthouse_probe"`). Listed so the phantom
-    /// guard does not false-flag its (deliberate) census entry.
-    const DYNAMIC_SPAWNS: &[&str] = &["lighthouse_probe"];
+    // is derived from the registry (not a parallel list) AND reads the crate
+    // source at test time to enforce the registry ⇔ production-start-site
+    // identity in both directions. Airgapped-safe: pure source parsing, no live
+    // environment and no exception list.
 
     fn crate_src_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -1701,6 +2003,57 @@ mod tests {
                 }
             }
             i = after;
+        }
+        out
+    }
+
+    /// Associate each literal `worker_names.push("name")` with the nearest
+    /// restart policy since the preceding literal registration. Direct
+    /// supervisor starts place `Spawn::new(..., RestartPolicy::X)` immediately
+    /// before the push; responder threads contain no restart policy in that
+    /// segment. Duplicate start sites must agree.
+    fn scan_literal_spawn_policies(
+        src: &str,
+    ) -> std::collections::BTreeMap<String, Option<RestartPolicy>> {
+        use std::collections::BTreeMap;
+
+        let mut out = BTreeMap::new();
+        let mut segment_start = 0usize;
+        let needle = ".push(\"";
+        while let Some(relative) = src[segment_start..].find(needle) {
+            let call = segment_start + relative;
+            let name_start = call + needle.len();
+            let Some(name_end_relative) = src[name_start..].find('"') else {
+                break;
+            };
+            let name_end = name_start + name_end_relative;
+            let name = &src[name_start..name_end];
+            if valid_worker_name(name) {
+                let segment = &src[segment_start..call];
+                let candidates = [
+                    (segment.rfind("RestartPolicy::Never"), RestartPolicy::Never),
+                    (
+                        segment.rfind("RestartPolicy::OnFailure"),
+                        RestartPolicy::OnFailure,
+                    ),
+                    (
+                        segment.rfind("RestartPolicy::Always"),
+                        RestartPolicy::Always,
+                    ),
+                ];
+                let policy = candidates
+                    .into_iter()
+                    .filter_map(|(position, policy)| position.map(|position| (position, policy)))
+                    .max_by_key(|(position, _)| *position)
+                    .map(|(_, policy)| policy);
+                if let Some(previous) = out.insert(name.to_owned(), policy) {
+                    assert_eq!(
+                        previous, policy,
+                        "WL-ARCH-009: duplicate literal start sites disagree for {name}"
+                    );
+                }
+            }
+            segment_start = name_end + 1;
         }
         out
     }
@@ -1901,16 +2254,110 @@ mod tests {
     }
 
     #[test]
+    fn neutral_worker_contract_projection_is_deterministic_and_total() {
+        let first = worker_contracts().expect("the shipped worker registry projects");
+        let second = worker_contracts().expect("the projection remains repeatable");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), worker_specs().len());
+        assert!(first.iter().all(|contract| contract.validate().is_ok()));
+
+        let cloud = worker_contract_for("cloud")
+            .expect("cloud projection")
+            .expect("cloud is registered");
+        assert_eq!(cloud.group, runtime::WorkerGroup::Compute);
+        assert_eq!(
+            cloud.applicability.roles,
+            vec![
+                runtime::WorkerRole::Lighthouse,
+                runtime::WorkerRole::Workstation
+            ]
+        );
+        assert_eq!(
+            cloud.restart_policy,
+            runtime::WorkerRestartPolicy::OnFailure
+        );
+
+        let airspace = worker_contract_for("airspace")
+            .expect("airspace projection")
+            .expect("airspace is registered");
+        assert!(airspace.applicability.requires_configuration);
+
+        let media_sources = worker_contract_for("media_sources")
+            .expect("media_sources projection")
+            .expect("media_sources is registered");
+        assert_eq!(media_sources.cadence, runtime::WorkerCadence::EventDriven);
+        assert!(worker_contract_for("not-registered")
+            .expect("unknown lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn neutral_worker_contract_projection_rejects_incomplete_or_hostile_rows() {
+        let mut invalid =
+            WorkerSpec::tier("invalid", 2, RestartPolicy::OnFailure, WorkerGroup::Control);
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.min_rank"
+            ))
+        );
+
+        invalid = WorkerSpec::tier("invalid", 0, RestartPolicy::OnFailure, WorkerGroup::Control);
+        invalid.queue = QueuePolicy::Disabled;
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.queue.disabled"
+            ))
+        );
+
+        invalid.queue = QueuePolicy::Bounded {
+            max_items: 1,
+            max_bytes: 1,
+            overflow: QueueOverflow::DropOldest,
+        };
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.queue.overflow.drop_oldest"
+            ))
+        );
+
+        invalid.queue = WorkerGroup::Control.defaults().queue;
+        invalid.name = "../worker";
+        assert!(worker_contract(&invalid).is_err());
+
+        invalid.name = "invalid";
+        invalid.activation.config = ConfigPredicate::EnvironmentPresent("MDE_BAD-NAME");
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.activation.environment"
+            ))
+        );
+
+        invalid.activation.config = ConfigPredicate::Always;
+        invalid.ownership.cleanup.grace_secs = 0;
+        assert_eq!(
+            worker_contract(&invalid),
+            Err(runtime::WorkerRuntimeContractError::InvalidField(
+                "worker_spec.cleanup.grace_secs"
+            ))
+        );
+    }
+
+    #[test]
     fn six_group_coverage_and_spawn_behavior_are_stable() {
         use std::collections::BTreeSet;
 
         let expected = [
-            (WorkerGroup::Control, 7),
-            (WorkerGroup::Observation, 20),
-            (WorkerGroup::Actions, 14),
-            (WorkerGroup::Data, 12),
-            (WorkerGroup::Compute, 6),
-            (WorkerGroup::Integrations, 20),
+            (WorkerGroup::Control, 14),
+            (WorkerGroup::Observation, 33),
+            (WorkerGroup::Actions, 35),
+            (WorkerGroup::Data, 15),
+            (WorkerGroup::Compute, 15),
+            (WorkerGroup::Integrations, 28),
         ];
         let mut services = BTreeSet::new();
         let mut covered = 0;
@@ -1948,21 +2395,41 @@ mod tests {
                 RestartPolicy::Never => never += 1,
             }
         }
-        assert_eq!((on_failure, always, never), (74, 5, 0));
+        assert_eq!((on_failure, always, never), (77, 43, 20));
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
-                .filter(|worker| worker.min_rank == 0)
+                .filter(|worker| {
+                    matches!(
+                        worker.spawn_binding,
+                        SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor
+                    ) && worker.min_rank == 0
+                })
                 .count(),
-            49
+            45
         );
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
-                .filter(|worker| worker.min_rank == 1)
+                .filter(|worker| {
+                    matches!(
+                        worker.spawn_binding,
+                        SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor
+                    ) && worker.min_rank == 1
+                })
                 .count(),
-            30
+            31
         );
+    }
+
+    #[test]
+    fn process_group_parser_is_exact_and_round_trips_service_tokens() {
+        for group in WorkerGroup::ALL {
+            assert_eq!(WorkerGroup::parse(group.as_str()), Ok(group));
+            assert_eq!(group.to_string(), group.as_str());
+        }
+        assert!(WorkerGroup::parse("all").is_err());
+        assert!(WorkerGroup::parse("control;systemctl stop mackesd").is_err());
     }
 
     #[test]
@@ -1971,8 +2438,17 @@ mod tests {
 
         let census: BTreeSet<&str> = WORKER_REGISTRY.iter().map(|s| s.name).collect();
         let caps: BTreeSet<&str> = WORKER_CAPABILITIES.iter().map(|(n, _)| *n).collect();
-        let non_tiered: BTreeSet<&str> = NON_TIERED_WORKERS.iter().copied().collect();
-        let dynamic: BTreeSet<&str> = DYNAMIC_SPAWNS.iter().copied().collect();
+        let registered = |binding| {
+            WORKER_REGISTRY
+                .iter()
+                .filter(|worker| worker.spawn_binding == binding)
+                .map(|worker| worker.name)
+                .collect::<BTreeSet<_>>()
+        };
+        let tiered_registry = registered(SpawnBinding::Tiered);
+        let direct_registry = registered(SpawnBinding::DirectSupervisor);
+        let responder_registry = registered(SpawnBinding::ResponderThread);
+        let dynamic_registry = registered(SpawnBinding::DynamicSupervisor);
 
         // WL-ARCH-004 — the registry names are unique.
         assert_eq!(
@@ -1992,7 +2468,7 @@ mod tests {
         })
         .into_iter()
         .collect();
-        let expected: BTreeSet<&str> = census.clone();
+        let expected = census.clone();
         assert_eq!(
             derived, expected,
             "WL-ARCH-004: workers_for_class no longer derives from WORKER_REGISTRY"
@@ -2002,12 +2478,13 @@ mod tests {
         //  • `tiered`  — every `spawn_tiered(…, \"X\", || …)` site (the sole way a
         //    role-tiered worker is now spawned; policy + gate come from the registry).
         //  • `pushed`  — every remaining `worker_names.push(\"X\")` literal (the
-        //    non-tiered bus responders / unconditional workers keep this shape).
+        //    directly supervised and responder-thread bindings keep this shape).
         // Both scanned across run_serve (`bin/mackesd.rs`) and its spawn helpers
         // (`bin/mackesd/spawn.rs`).
         let bin = read_source("bin/mackesd.rs") + &read_source("bin/mackesd/spawn.rs");
         let tiered: BTreeSet<String> = scan_call_names(&bin, "spawn_tiered(").into_iter().collect();
         let pushed: BTreeSet<String> = scan_names(&bin, ".push(\"").into_iter().collect();
+        let literal_policies = scan_literal_spawn_policies(&bin);
         assert!(
             tiered.len() >= 60,
             "WL-ARCH-004 drift guard: only {} `spawn_tiered(…, \"X\")` sites found — the source \
@@ -2016,33 +2493,27 @@ mod tests {
         );
         assert!(
             pushed.len() >= 45,
-            "WL-ARCH-004 drift guard: only {} `.push(\"…\")` non-tiered sites found — the source \
+            "WL-ARCH-004 drift guard: only {} `.push(\"…\")` direct/responder sites found — the source \
              scan is broken (expected ~65)",
             pushed.len()
         );
 
-        // (1) Registry ⇔ spawner identity — the structural drift guard. Every
-        //     registry entry is spawned via `spawn_tiered` (or is a known
-        //     runtime-named dynamic spawn), AND every `spawn_tiered` site names a
-        //     registry entry. So the census (derived from the registry) and the live
-        //     spawn set are the SAME set — a tiered worker cannot be spawned without
-        //     a census row, nor censused without a spawn.
-        let mut census_unspawned: Vec<&str> = census
+        // (1) Tiered registry ⇔ spawn_tiered identity.
+        let mut census_unspawned: Vec<&str> = tiered_registry
             .iter()
             .copied()
-            .filter(|n| !tiered.contains(*n) && !dynamic.contains(n))
+            .filter(|n| !tiered.contains(*n))
             .collect();
         census_unspawned.sort_unstable();
         assert!(
             census_unspawned.is_empty(),
-            "WL-ARCH-004 DRIFT: these WORKER_REGISTRY entries are never spawned via spawn_tiered \
-             (add the spawn, remove the row, or list a runtime-named spawn in DYNAMIC_SPAWNS): \
+            "WL-ARCH-009 DRIFT: these Tiered registrations are never spawned via spawn_tiered: \
              {census_unspawned:?}"
         );
         let mut tiered_unregistered: Vec<&str> = tiered
             .iter()
             .map(String::as_str)
-            .filter(|n| !census.contains(n))
+            .filter(|n| !tiered_registry.contains(n))
             .collect();
         tiered_unregistered.sort_unstable();
         assert!(
@@ -2052,13 +2523,17 @@ mod tests {
              to WORKER_REGISTRY with a deliberate tier: {tiered_unregistered:?}"
         );
 
-        // (2) A tiered worker must go through `spawn_tiered`, never a bare literal
-        //     `worker_names.push(\"X\")` — a leftover literal push is a missed
-        //     conversion that would double-register or bypass the registry policy.
+        // (2) Literal runtime names are exactly the directly supervised and
+        //     responder-thread registrations. No allowlist sits beside the
+        //     canonical registry.
+        let literal_registry: BTreeSet<&str> = direct_registry
+            .union(&responder_registry)
+            .copied()
+            .collect();
         let mut tiered_pushed_literally: Vec<&str> = pushed
             .iter()
             .map(String::as_str)
-            .filter(|n| census.contains(n))
+            .filter(|n| tiered_registry.contains(n) || dynamic_registry.contains(n))
             .collect();
         tiered_pushed_literally.sort_unstable();
         assert!(
@@ -2067,22 +2542,20 @@ mod tests {
              directly instead of via spawn_tiered — finish the conversion: {tiered_pushed_literally:?}"
         );
 
-        // (3) Non-tiered accountability — every remaining literal push must be a
-        //     classified non-tiered worker (bus responder / unconditional spawn),
-        //     and the allowlist has no stale entry + stays disjoint from the census.
+        // (3) Bidirectional direct binding: every literal production start is
+        //     registered, and every direct/responder registration has a start.
         let mut unaccounted: Vec<&str> = pushed
             .iter()
             .map(String::as_str)
-            .filter(|n| !non_tiered.contains(n))
+            .filter(|n| !literal_registry.contains(n))
             .collect();
         unaccounted.sort_unstable();
         assert!(
             unaccounted.is_empty(),
-            "WL-ARCH-004 DRIFT: these workers are pushed in run_serve but classified NOWHERE. \
-             Add each to WORKER_REGISTRY (if role-tiered, spawned via spawn_tiered) or \
-             NON_TIERED_WORKERS (if it spawns unconditionally on every role): {unaccounted:?}"
+            "WL-ARCH-009 DRIFT: these literal production starts have no canonical registration: \
+             {unaccounted:?}"
         );
-        let mut stale: Vec<&str> = non_tiered
+        let mut stale: Vec<&str> = literal_registry
             .iter()
             .copied()
             .filter(|n| !pushed.contains(*n))
@@ -2090,20 +2563,31 @@ mod tests {
         stale.sort_unstable();
         assert!(
             stale.is_empty(),
-            "WL-ARCH-004: these NON_TIERED_WORKERS entries are no longer pushed in run_serve — \
-             remove them: {stale:?}"
+            "WL-ARCH-009 DRIFT: these direct/responder registrations have no literal production \
+             start: {stale:?}"
         );
-        let mut both: Vec<&str> = non_tiered
-            .iter()
-            .copied()
-            .filter(|n| census.contains(n))
-            .collect();
-        both.sort_unstable();
         assert!(
-            both.is_empty(),
-            "WL-ARCH-004: these workers are in BOTH WORKER_REGISTRY and NON_TIERED_WORKERS — \
-             pick one: {both:?}"
+            dynamic_registry == BTreeSet::from(["lighthouse_probe"]),
+            "WL-ARCH-009: the runtime-named supervisor binding must stay explicit in the registry"
         );
+
+        for worker in WORKER_REGISTRY {
+            match worker.spawn_binding {
+                SpawnBinding::DirectSupervisor => assert_eq!(
+                    literal_policies.get(worker.name),
+                    Some(&Some(worker.policy)),
+                    "WL-ARCH-009: direct supervisor policy drift for {}",
+                    worker.name
+                ),
+                SpawnBinding::ResponderThread => assert_eq!(
+                    literal_policies.get(worker.name),
+                    Some(&None),
+                    "WL-ARCH-009: responder acquired or lost a supervisor policy for {}",
+                    worker.name
+                ),
+                SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor => {}
+            }
+        }
 
         // (4) Any REMAINING literal `runs(\"X\")` / `runs_in(\"X\")` gate in the crate
         //     (the capability gate + a few self-gating workers; the tiered gates now
@@ -2135,7 +2619,8 @@ mod tests {
         // -12 sway/desktop workers (E11 'Cosmic owns the desktop' — the
         // labwc/sway worker stack deleted). +1 ssh_pubkey_gossip (SVC-2),
         // +1 fleet_reconcile (PD-9), +1 presence_watch (PD-13),
-        // +1 lifecycle_exec (PD-11), +1 job_exec (PLANES-9),
+        // lifecycle_exec (PD-11) was retired by WL-ARCH-010; WorkloadCompute
+        // is now the sole VM/container actuator. +1 job_exec (PLANES-9),
         // +1 mesh_dns (PLANES-18), +1 netstate_apply (PLANES-15),
         // +1 validation_suite (PLANES-19), +1 metrics_exporter (EFF-9),
         // +1 hardware_probe (SUBAUDIT-D2 — the PeerProbe producer).
@@ -2213,8 +2698,8 @@ mod tests {
         // ARCH-5 (drift guard) +14 universal rank-0 workers that were riding the
         // silent "unknown worker ⇒ rank 0" default (spawned + `runs(...)`-gated but
         // uncensused → hidden from `mackesd role-workers`, the BUG-STORAGE-1 class):
-        // boot_readiness, xcp_host, kvm_health, vm_lifecycle, container, scheduler,
-        // session_broker, session_roaming, console_broker, clipboard_bridge,
+        // boot_readiness, xcp_host, kvm_health, scheduler, session_broker,
+        // session_roaming, clipboard_bridge,
         // service_onboard, spawn_lighthouse_onboard, onboard_apply, lighthouse_probe.
         // All rank 0 (behavior-preserving), so the split shifts 30/27 → 44/27,
         // len 57 → 71. The `worker_spawns_and_the_census_do_not_drift` test now keeps
@@ -2245,8 +2730,20 @@ mod tests {
         // keyless NCDOT TIMS events => 85; AirNow AQI => 86. AirSonic and
         // Jellyfin gateway proxies brought the pre-cutover census to 90; the
         // Chromium Browser VM hard cut removed all 11 host Browser workers,
-        // leaving the current 79 role-tiered workers.
-        assert_eq!(WORKER_REGISTRY.len(), 79);
+        // and retiring the duplicate VM/container tiers plus the raw console
+        // relay leaves 76 role-tiered
+        // workers in the current registry.
+        assert_eq!(WORKER_REGISTRY.len(), 140);
+        assert_eq!(
+            WORKER_REGISTRY
+                .iter()
+                .filter(|worker| matches!(
+                    worker.spawn_binding,
+                    SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor
+                ))
+                .count(),
+            76
+        );
     }
 
     #[test]
@@ -2269,17 +2766,22 @@ mod tests {
         let count = |rank: u8| {
             WORKER_REGISTRY
                 .iter()
-                .filter(|s| s.min_rank == rank)
+                .filter(|s| {
+                    matches!(
+                        s.spawn_binding,
+                        SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor
+                    ) && s.min_rank == rank
+                })
                 .count()
         };
         assert_eq!(
             count(0),
-            49,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + unit_aggregator (EXPLORER-1, universal per-node unit view) + service_aggregator (WL-FUNC-008, universal per-node unified service-provenance/health view) + notify (CHAT-FIX-2, universal local-notification producer) + federation_enforcer (WL-SEC-002, universal cross-mesh federation runtime-enforcement worker) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + collab (WL-FUNC-011 Phase 2, universal Communications-suite worker driving mde-collab-core, chat's Phase-4 successor) + cloud (WL-ARCH-001 Phase B, universal per-node OpenTofu+Ansible cloud backend — publishes state/cloud/<node>, placement-scoped capability-gated action drain, the successor to the removed openstack worker) + vehicle (Rolling Node, universal per-node MG90 vehicle-gateway mirror — publishes state/vehicle/<node>, a no-op where no gateway is attached) + device_control (DEVMGR-8, universal per-node device-control executor) + router_action (WL-RUN-006, universal per-node router firewall-edit executor) + ARCH-5 (drift guard) 14 universal rank-0 workers that were riding the silent unknown-worker default: boot_readiness/xcp_host/kvm_health/vm_lifecycle/container/scheduler/session_broker/session_roaming/console_broker/clipboard_bridge/service_onboard/spawn_lighthouse_onboard/onboard_apply/lighthouse_probe"
+            45,
+            "Lighthouse control plane plus universal storage/service/notification/control workers, with retired VM/container lifecycle and raw console relay absent"
         );
         assert_eq!(
             count(1),
-            30,
+            31,
             "Workstation = fleet/actions + desktop data + seat input + media gateways + the WL-FUNC-012 provider adapters; all retired host Browser workers are absent after the Chromium VM cutover"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
@@ -2548,9 +3050,12 @@ mod tests {
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
         // gateway proxies brought the real pre-cutover count to 90; removing all
-        // 11 host Browser workers for the Chromium VM cutover leaves ws 79.
-        assert_eq!(lh.len(), 49);
-        assert_eq!(ws.len(), 79);
+        // 11 host Browser workers for the Chromium VM cutover leaves 79
+        // role-gated registrations. WL-ARCH-009 adds the 66 directly bound
+        // supervisor/responders to the same canonical diagnostic roster:
+        // Lighthouse 49 + 66 = 115; Workstation 79 + 66 = 145.
+        assert_eq!(lh.len(), 109);
+        assert_eq!(ws.len(), 140);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -2616,14 +3121,14 @@ mod tests {
         // rank-0 workers + WL-FUNC-008 service_aggregator + WL-FUNC-011 Phase 2
         // collab + WL-ARCH-001 Phase B cloud + Rolling Node vehicle, minus the
         // removed openstack) + navidrome.
-        assert_eq!(set.len(), 49);
+        assert_eq!(set.len(), 109);
         assert!(!set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 49);
+        assert_eq!(workers_for_class(plain_lh).len(), 109);
     }
 
     #[test]

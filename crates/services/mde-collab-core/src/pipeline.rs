@@ -16,6 +16,7 @@ use mde_collab_types::ids::{EventId, SpaceId};
 use mde_collab_types::value::{AlertActionKind, CallParticipantState, MessageBody, TransferState};
 use mde_collab_types::{
     ActorClock, CollabCommand, CollabEventEnvelope, PresenceState, SpaceRole, TransferControl,
+    MAX_TRANSFER_CONTENT_BYTES,
 };
 
 use crate::domain::DomainState;
@@ -778,6 +779,56 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 },
             )])
         }
+        CollabCommand::CommitFileGeneration {
+            space,
+            file,
+            expected_generation,
+            expected_sha256_hex,
+            expected_size,
+            reference,
+        } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            let current = state
+                .files
+                .get(file)
+                .filter(|current| current.space == *space && current.present)
+                .ok_or(CollabError::FileNotFound(*file))?;
+            if current.generation != *expected_generation
+                || current.reference.sha256_hex != *expected_sha256_hex
+                || current.reference.size != *expected_size
+            {
+                return Err(CollabError::FileGenerationConflict {
+                    file: *file,
+                    expected_generation: *expected_generation,
+                    current_generation: current.generation,
+                });
+            }
+            if ctx.now_unix_ms <= current.generation {
+                return Err(CollabError::FileGenerationDidNotAdvance {
+                    file: *file,
+                    current_generation: current.generation,
+                    proposed_generation: ctx.now_unix_ms,
+                });
+            }
+            if reference.name != current.reference.name || reference.mime != current.reference.mime
+            {
+                return Err(CollabError::FileGenerationMetadataMutation(*file));
+            }
+            if reference.size > MAX_TRANSFER_CONTENT_BYTES
+                || !is_nonzero_lower_sha256(&reference.sha256_hex)
+                || reference.sha256_hex == current.reference.sha256_hex
+            {
+                return Err(CollabError::InvalidFileGeneration(*file));
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::FileLinked {
+                    file: *file,
+                    reference: reference.clone(),
+                },
+            )])
+        }
         CollabCommand::UnlinkFile { space, file } => {
             require_active_space(state, *space)?;
             require_member(state, *space, &ctx.actor)?;
@@ -963,6 +1014,14 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
     }
 }
 
+fn is_nonzero_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().any(|byte| byte != b'0')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Mirror the UI/read-model transfer control contract at the authoritative
 /// command boundary. Queued transfers may only be canceled; active transfers
 /// may be paused/canceled; paused transfers may be resumed/canceled; terminal
@@ -1117,10 +1176,10 @@ fn file_present(
     space: SpaceId,
     file: mde_collab_types::ids::FileRefId,
 ) -> bool {
-    match state.files.get(&file) {
-        Some((s, present)) => *present && *s == space,
-        None => false,
-    }
+    state
+        .files
+        .get(&file)
+        .is_some_and(|current| current.present && current.space == space)
 }
 
 /// The call must exist and still have a connected participant; returns its
@@ -1278,6 +1337,109 @@ mod tests {
             self.0 += 1;
             id
         }
+    }
+
+    #[test]
+    fn file_generation_commit_is_optimistic_and_rejects_a_stale_retry() {
+        let signer = Ed25519Signer::from_seed([9; 32]);
+        let mut ids = SeqIds(0x700);
+        let mut ctx = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "files".into(),
+            },
+            &mut ctx,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let file = FileRefId::from_uuid(Uuid::from_u128(0x701));
+        let old = FileRef {
+            name: "report.bin".into(),
+            size: 3,
+            sha256_hex: "a".repeat(64),
+            mime: Some("application/octet-stream".into()),
+        };
+        let linked = apply_command(
+            &DomainState::from_events(&created),
+            &CollabCommand::LinkFile {
+                space,
+                file,
+                reference: old.clone(),
+            },
+            &mut ctx,
+        )
+        .expect("link file");
+        let mut events = created;
+        events.extend(linked);
+        ctx.now_unix_ms = 2_000;
+        let replacement = FileRef {
+            name: old.name.clone(),
+            size: 4,
+            sha256_hex: "b".repeat(64),
+            mime: old.mime.clone(),
+        };
+        let command_for = |reference| CollabCommand::CommitFileGeneration {
+            space,
+            file,
+            expected_generation: 1_000,
+            expected_sha256_hex: old.sha256_hex.clone(),
+            expected_size: old.size,
+            reference,
+        };
+        let state = DomainState::from_events(&events);
+        for proposed_generation in [1_000, 999] {
+            ctx.now_unix_ms = proposed_generation;
+            assert!(matches!(
+                apply_command(&state, &command_for(replacement.clone()), &mut ctx),
+                Err(CollabError::FileGenerationDidNotAdvance {
+                    file: found,
+                    current_generation: 1_000,
+                    proposed_generation: found_generation,
+                }) if found == file && found_generation == proposed_generation
+            ));
+        }
+        ctx.now_unix_ms = 2_000;
+        let mut renamed = replacement.clone();
+        renamed.name = "hostile-name.bin".into();
+        assert!(matches!(
+            apply_command(&state, &command_for(renamed), &mut ctx),
+            Err(CollabError::FileGenerationMetadataMutation(found)) if found == file
+        ));
+        let mut remimed = replacement.clone();
+        remimed.mime = Some("text/plain".into());
+        assert!(matches!(
+            apply_command(&state, &command_for(remimed), &mut ctx),
+            Err(CollabError::FileGenerationMetadataMutation(found)) if found == file
+        ));
+        for hostile_hash in [
+            "aB".repeat(32),
+            "0".repeat(64),
+            "g".repeat(64),
+            "b".repeat(63),
+            old.sha256_hex.clone(),
+        ] {
+            let mut hostile = replacement.clone();
+            hostile.sha256_hex = hostile_hash;
+            assert!(matches!(
+                apply_command(&state, &command_for(hostile), &mut ctx),
+                Err(CollabError::InvalidFileGeneration(found)) if found == file
+            ));
+        }
+        let command = command_for(replacement.clone());
+        let committed =
+            apply_command(&state, &command, &mut ctx).expect("matching generation commits");
+        assert!(matches!(
+            &committed[0].kind,
+            CollabEventKind::FileLinked { file: found, reference }
+                if *found == file && *reference == replacement
+        ));
+        events.extend(committed);
+        assert!(matches!(
+            apply_command(&DomainState::from_events(&events), &command, &mut ctx),
+            Err(CollabError::FileGenerationConflict { file: found, .. }) if found == file
+        ));
     }
 
     #[test]

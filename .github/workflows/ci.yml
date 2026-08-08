@@ -20,6 +20,11 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
+# The workflow reads source and uses the run-scoped artifact service. It does
+# not write repository contents, checks, deployments, packages, or releases.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # E0.2 — the vendored Opus tree needs an explicit CMake policy floor; the
@@ -326,6 +331,103 @@ jobs:
             --expected-build-host "$EXPECTED_FARM_HOST" \
             --expected-build-slot "$EXPECTED_FARM_SLOT"
 
+      # Final files are cut only after the exact green farm gate. The dedicated
+      # run/attempt directory prevents a prior candidate from supplying bytes;
+      # xcp-build's RPM path also performs the existing payload verification.
+      - name: Build final release artifacts
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_JOB_ID: github-ci:${{ github.run_id }}:${{ github.run_attempt }}
+          EXPECTED_FARM_HOST: 172.20.0.130
+          EXPECTED_FARM_SLOT: github-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          release_root="/tmp/mcnf-github-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          upload_dir="$GITHUB_WORKSPACE/automation/.state/release-artifacts"
+          case "$release_root" in
+            /tmp/mcnf-github-release-[0-9]*-[0-9]*) ;;
+            *) echo "unsafe release artifact root" >&2; exit 1 ;;
+          esac
+          case "$upload_dir" in
+            "$GITHUB_WORKSPACE"/automation/.state/release-artifacts) ;;
+            *) echo "unsafe upload staging root" >&2; exit 1 ;;
+          esac
+          rm -rf -- "$release_root" "$upload_dir"
+          mkdir -m 0700 -p -- "$release_root/artifacts" "$upload_dir"
+          MCNF_BUILD_HOST="$EXPECTED_FARM_HOST" \
+          MCNF_BUILD_SLOT="$EXPECTED_FARM_SLOT" \
+          MCNF_BUILD_JOB_ID="$EXPECTED_JOB_ID" \
+          MCNF_BUILD_ARTIFACTS="$release_root/artifacts" \
+            ./install-helpers/xcp-build.sh rpm
+          test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
+          if find "$release_root/artifacts" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+            echo "release artifact root contains a non-regular entry" >&2
+            exit 1
+          fi
+          mapfile -d '' artifacts < <(
+            find "$release_root/artifacts" -mindepth 1 -maxdepth 1 \
+              -type f -name 'magic-mesh*.rpm' -print0 | sort -z
+          )
+          test "${#artifacts[@]}" -gt 0 || {
+            echo "RPM cut produced no final artifacts" >&2
+            exit 1
+          }
+          test "$(find "$release_root/artifacts" -mindepth 1 -maxdepth 1 -type f -printf . | wc -c)" \
+            -eq "${#artifacts[@]}" || {
+              echo "release artifact root contains an unexpected file" >&2
+              exit 1
+            }
+          for artifact in "${artifacts[@]}"; do
+            test -f "$artifact" && test ! -L "$artifact"
+            cp -- "$artifact" "$upload_dir/"
+          done
+
+      # Generate descriptors from the final bytes, bind them into this exact
+      # green farm log/status, regenerate descriptors to catch byte changes,
+      # then verify the same copies that will cross the artifact boundary.
+      - name: Bind final artifacts to farm evidence
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_JOB_ID: github-ci:${{ github.run_id }}:${{ github.run_attempt }}
+          EXPECTED_FARM_HOST: 172.20.0.130
+          EXPECTED_FARM_SLOT: github-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          release_root="/tmp/mcnf-github-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          status=automation/.state/ci-gate-status.json
+          binding=automation/.state/release-binding.json
+          recheck=automation/.state/release-binding.recheck.json
+          mapfile -d '' artifacts < <(
+            find "$release_root/artifacts" -mindepth 1 -maxdepth 1 \
+              -type f -name 'magic-mesh*.rpm' -print0 | sort -z
+          )
+          test "${#artifacts[@]}" -gt 0
+          binding_args=()
+          for artifact in "${artifacts[@]}"; do
+            binding_args+=(--artifact "$artifact")
+          done
+          rm -f -- "$binding" "$recheck"
+          ./install-helpers/release-evidence.sh write-binding \
+            --out "$binding" \
+            --source-commit "$EXPECTED_REVISION" \
+            --ci-gate-status "$status" \
+            "${binding_args[@]}"
+          ./install-helpers/ci-gate.sh bind-release "$binding" "$status"
+          ./install-helpers/release-evidence.sh write-binding \
+            --out "$recheck" \
+            --source-commit "$EXPECTED_REVISION" \
+            --ci-gate-status "$status" \
+            "${binding_args[@]}"
+          cmp -s -- "$binding" "$recheck" || {
+            echo "final artifacts changed after farm evidence binding" >&2
+            exit 1
+          }
+          rm -f -- "$recheck"
+          ./install-helpers/verify-github-release-binding.sh verify \
+            automation/.state "$release_root/artifacts" \
+            "$EXPECTED_REVISION" "$EXPECTED_JOB_ID" \
+            "$EXPECTED_FARM_HOST" "$EXPECTED_FARM_SLOT"
+
       # Keep a byte-level receipt beside the evidence. The required verifier
       # checks this receipt after artifact download, so an artifact cannot be
       # silently substituted or partially reconstructed between jobs.
@@ -339,6 +441,7 @@ jobs:
           set -euo pipefail
           status_file=automation/.state/ci-gate-status.json
           log_file=automation/.state/ci-gate.log
+          binding_file=automation/.state/release-binding.json
           manifest=automation/.state/ci-gate-manifest.txt
           {
             printf '%s\n' 'schema=1'
@@ -350,6 +453,8 @@ jobs:
             printf 'status_sha256=%s\n' "$(sha256sum "$status_file" | cut -d ' ' -f1)"
             printf 'log_bytes=%s\n' "$(stat -c '%s' "$log_file")"
             printf 'log_sha256=%s\n' "$(sha256sum "$log_file" | cut -d ' ' -f1)"
+            printf 'binding_bytes=%s\n' "$(stat -c '%s' "$binding_file")"
+            printf 'binding_sha256=%s\n' "$(sha256sum "$binding_file" | cut -d ' ' -f1)"
           } > "$manifest"
 
       - name: Upload farm evidence
@@ -361,7 +466,19 @@ jobs:
             automation/.state/ci-gate-status.json
             automation/.state/ci-gate.log
             automation/.state/ci-gate-manifest.txt
+            automation/.state/release-binding.json
+            automation/.state/release-artifacts
           if-no-files-found: error
+
+      - name: Clean run-scoped release staging
+        if: always()
+        run: |
+          set -euo pipefail
+          release_root="/tmp/mcnf-github-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "$release_root" in
+            /tmp/mcnf-github-release-[0-9]*-[0-9]*) rm -rf -- "$release_root" ;;
+            *) echo "unsafe release cleanup root" >&2; exit 1 ;;
+          esac
 
   # This is the branch-protection-facing check. It must remain a separate
   # verifier: a successful farm runner is not enough unless its evidence is
@@ -417,8 +534,27 @@ jobs:
           grep -Fqx "status_sha256=$(sha256sum farm-evidence/ci-gate-status.json | cut -d ' ' -f1)" "$manifest"
           grep -Fqx "log_bytes=$(stat -c '%s' farm-evidence/ci-gate.log)" "$manifest"
           grep -Fqx "log_sha256=$(sha256sum farm-evidence/ci-gate.log | cut -d ' ' -f1)" "$manifest"
-          ./install-helpers/ci-gate.sh verify farm-evidence/ci-gate-status.json \
-            --expected-revision "$EXPECTED_REVISION" \
-            --expected-job-id "$EXPECTED_JOB_ID" \
-            --expected-build-host "$EXPECTED_FARM_HOST" \
-            --expected-build-slot "$EXPECTED_FARM_SLOT"
+          grep -Fqx "binding_bytes=$(stat -c '%s' farm-evidence/release-binding.json)" "$manifest"
+          grep -Fqx "binding_sha256=$(sha256sum farm-evidence/release-binding.json | cut -d ' ' -f1)" "$manifest"
+          artifact_root="/tmp/mcnf-github-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/artifacts"
+          case "$artifact_root" in
+            /tmp/mcnf-github-release-[0-9]*-[0-9]*/artifacts) ;;
+            *) echo "unsafe downloaded artifact root" >&2; exit 1 ;;
+          esac
+          rm -rf -- "${artifact_root%/artifacts}"
+          mkdir -m 0700 -p -- "$artifact_root"
+          if find farm-evidence/release-artifacts -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+            echo "downloaded release artifact set contains a non-regular entry" >&2
+            exit 1
+          fi
+          mapfile -d '' artifacts < <(
+            find farm-evidence/release-artifacts -mindepth 1 -maxdepth 1 -type f -print0 | sort -z
+          )
+          test "${#artifacts[@]}" -gt 0
+          cp -- "${artifacts[@]}" "$artifact_root/"
+          ./install-helpers/verify-github-release-binding.sh verify \
+            farm-evidence \
+            "$artifact_root" \
+            "$EXPECTED_REVISION" "$EXPECTED_JOB_ID" \
+            "$EXPECTED_FARM_HOST" "$EXPECTED_FARM_SLOT"
+          rm -rf -- "${artifact_root%/artifacts}"

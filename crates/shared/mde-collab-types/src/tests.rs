@@ -15,7 +15,11 @@ use crate::value::{
     CallParticipantState, ClipItemKind, ClipboardItem, DocumentChange, FileRef, MessageBody,
     PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection, TransferMethod,
 };
-use crate::{ActorId, CollabCommand, CollabEventKind};
+use crate::{
+    ActorId, ChecksumPolicy, CollabCommand, CollabEventKind, OpaqueProfileRef, OpaqueResourceRef,
+    TransferEndpoint, TransferJobV2, TransferJobV2DecodeError, TransferKind, TransferLocation,
+    TransferOperation,
+};
 
 #[test]
 fn task_actions_normalize_titles_and_lower_to_existing_commands() {
@@ -85,6 +89,38 @@ fn task_actions_reject_blank_and_oversized_titles_before_queueing() {
         .into_command(),
         Err(TaskActionValidationError::TitleTooLong)
     );
+}
+
+#[test]
+fn media_transfer_wire_admission_rejects_ambiguous_duplicate_schema_fields() {
+    let profile = OpaqueProfileRef::new("media-library").expect("safe profile");
+    let resource = OpaqueResourceRef::new("album-42").expect("safe resource");
+    let job = TransferJobV2::new(
+        TransferId::new(),
+        TransferKind::Http,
+        TransferEndpoint::new(
+            TransferLocation::Http { profile, resource },
+            TransferLocation::Local {
+                object: FileRefId::new(),
+            },
+        ),
+        TransferOperation::Download,
+        ChecksumPolicy::off(),
+        None,
+        1,
+    )
+    .expect("valid media download transfer");
+    let wire = serde_json::to_string(&job).expect("encode transfer");
+    let ambiguous = wire.replacen(
+        "\"schema_version\":2",
+        "\"schema_version\":2,\"schema_version\":2",
+        1,
+    );
+
+    assert!(matches!(
+        TransferJobV2::from_json(&ambiguous),
+        Err(TransferJobV2DecodeError::Json(_))
+    ));
 }
 
 /// One instance of every [`CollabEventKind`] variant. Exhaustive by

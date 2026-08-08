@@ -64,7 +64,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["process", "net"] }
 
 # CHOOSER-9 — the Desktop Chooser's mesh-synced favorites/recents/manual sources
 # (`chooser/chooser_prefs.rs`) roam per mesh identity over the Syncthing-replicated
@@ -106,10 +106,6 @@ mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
 mde-maps-location-egui = { path = "../mde-maps-location-egui" }
 mde-bookmarks-egui = { path = "../mde-bookmarks-egui" }
-# BOOKMARKS-BAR — the pure `mde-bookmarks` model (consumed WITHOUT its egui GUI,
-# like mde-files below), so the Browser surface can deserialize the daemon's
-# `state/bookmarks/collection` Collection snapshot into its own bookmarks-bar row.
-mde-bookmarks = { path = "../../services/mde-bookmarks" }
 # The render-agnostic `mde-files` core (consumed WITHOUT its Cosmic-era GUI, like
 # mde-files-egui does) — the shell test harness builds against its
 # backend/fileops/model types (`FakeFileOps`, `FileRow`, `OpId`).
@@ -215,6 +211,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # one mackesd already pulls, so cargo unifies to one artifact — no new build surface.
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Workload operation request IDs are generated at the shell boundary and must
+# be unique across retries/restarts before they enter the persisted action lane.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # The Car-Mode instrument-strip tests seed a DETERMINISTIC simulated cockpit via
@@ -228,10 +227,9 @@ mde-maps-location-egui = { path = "../mde-maps-location-egui", features = ["sim-
 # round-trip test uses. Already in the workspace lock, no new lock line.
 tempfile = "3"
 
-# BOOKMARKS-BAR tests mint real `mde-bookmarks` `AddBookmark` ops (each carrying a
-# `Uuid` item id) to build a converged `Collection` fixture the bar folds/mirrors —
-# the same uuid the mde-bookmarks API returns. Already in the workspace lock.
-uuid = { version = "1", features = ["v4"] }
+# Music authorization tests verify the shell's Ed25519 body against the daemon
+# verifier. This is test-only; production signing stays in mackes-mesh-types.
+ed25519-dalek = { version = "2", default-features = false }
 
 [lints]
 workspace = true

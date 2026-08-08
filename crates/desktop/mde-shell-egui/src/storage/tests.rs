@@ -908,6 +908,9 @@ mod menubar_coverage {
     /// The ONE recorded decision per routed `Surface` (exhaustive on purpose).
     const fn coverage(surface: Surface) -> Coverage {
         match surface {
+            Surface::Workers => Coverage::Covered {
+                title: "Workers",
+            },
             // ── covered: the MENUBAR-ALL / MENUBAR-SWEEP bars ──
             Surface::FleetMesh => Coverage::Covered {
                 title: "Fleet & Mesh",
@@ -927,11 +930,6 @@ mod menubar_coverage {
                 reason: "BROWSER-CHROME C0 — Browser retired the shared MENUBAR-ALL \
                          top strip; first-party tabs, toolbar, omnibox, and menu \
                          button own this surface's chrome",
-            },
-            Surface::Bookmarks => Coverage::Exempt {
-                reason: "bare — mde-bookmarks-egui mounts with its own manager \
-                         header; folding it onto the shared bar is a MENUBAR-SWEEP \
-                         follow-on",
             },
             Surface::MapsLocation => Coverage::FirstPartyChrome {
                 reason: "MAPS-LOCATION-1 — Maps & Location owns a native tab rail, \
@@ -1013,11 +1011,18 @@ mod menubar_coverage {
         ),
     ];
 
-    /// Every routed surface: the picker set plus legacy Fleet & Mesh deep-link
+    /// Every routed surface: the picker set plus legacy Workers deep-link
     /// aliases and the clock-cell surfaces deliberately outside `Surface::ALL`.
     fn every_routed() -> Vec<Surface> {
         let mut all = Surface::ALL.to_vec();
-        all.extend([Surface::Workbench, Surface::MeshView, Surface::Explorer]);
+        all.extend([
+            Surface::FleetMesh,
+            Surface::Workbench,
+            Surface::MeshView,
+            Surface::Explorer,
+            Surface::ThisNode,
+            Surface::Phones,
+        ]);
         all.push(Surface::Timers);
         all.push(Surface::AutoHome);
         all
@@ -1056,9 +1061,9 @@ mod menubar_coverage {
         }
         assert_eq!(covered + first_party + exempt, every_routed().len());
         assert_eq!(
-            covered, 4,
-            "the shared covered set is Fleet & Mesh, Workbench, Infra as Code, \
-             and the merged This Node surface"
+            covered, 5,
+            "the shared covered set is Workers plus its legacy Fleet/Node aliases, \
+             Workbench, and Infra as Code"
         );
         assert_eq!(
             first_party, 2,
@@ -1085,9 +1090,7 @@ mod menubar_coverage {
                 Surface::Music,
                 Surface::Media,
                 Surface::Files,
-                Surface::Bookmarks,
                 Surface::Terminal,
-                Surface::Phones,
                 // WL-FUNC-011 — the Communications hub carries its own frame
                 // (rail · mode tabs · call bar), a MENUBAR-SWEEP follow-on.
                 Surface::Communications,
@@ -1095,6 +1098,7 @@ mod menubar_coverage {
                 // are folded into the unified interface before rendering.
                 Surface::MeshView,
                 Surface::Explorer,
+                Surface::Phones,
                 Surface::Timers,
                 // AUTO-HOME — the out-of-ALL Auto Mode home, appended after Timers
                 // by `every_routed`; a full-bleed Car-Mode tile launcher, bare by

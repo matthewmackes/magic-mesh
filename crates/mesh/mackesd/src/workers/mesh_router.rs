@@ -55,6 +55,14 @@ const DEFAULT_TICK: Duration = Duration::from_secs(10);
 /// turn an otherwise healthy TLS stream into unbounded daemon memory.
 const HTTPS_INBOX_CAPACITY: usize = 256;
 
+/// Idle cadence for draining the authenticated HTTPS fallback inbox into the
+/// local Nebula UDP socket. This is a fallback carrier, not the primary path;
+/// a 5 ms poll woke a Tokio worker 200 times per second on every seat even
+/// when no fallback frames existed. Fifty milliseconds bounds idle scheduler
+/// churn while keeping fallback packet delivery below the user-visible
+/// handoff/transport budget.
+const HTTPS_INBOUND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Stable loopback underlay endpoint rendered into Nebula's static host map for
 /// the configured HTTPS relay. Nebula sends encrypted UDP packets here after
 /// the public UDP endpoint is unavailable; the router moves them over TLS.
@@ -280,7 +288,7 @@ impl MeshRouterWorker {
             anyhow::bail!("HTTPS UDP bridge source must be loopback: {nebula_source}");
         }
         let mut udp_buf = vec![0_u8; mackes_nebula_https_tunnel::MAX_FRAME_SIZE];
-        let mut inbound_tick = tokio::time::interval(Duration::from_millis(5));
+        let mut inbound_tick = tokio::time::interval(HTTPS_INBOUND_POLL_INTERVAL);
         inbound_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         info!(bind = %socket.local_addr()?, source = %nebula_source, peer = %peer_id, "mesh-router: HTTPS UDP bridge active");
 

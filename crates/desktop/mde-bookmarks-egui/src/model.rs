@@ -162,7 +162,7 @@ pub struct DaemonBookmarkAction {
     pub body: String,
 }
 
-/// The whole render-agnostic state of the Bookmarks surface.
+/// The whole render-agnostic state of the Browser-owned Bookmarks panel.
 pub struct Manager {
     /// The converged bookmark tree. Every edit applies one [`Op`] to it.
     collection: Collection,
@@ -254,7 +254,7 @@ impl Manager {
     }
 
     /// Build a manager under the best-effort **local** identity — the OS user +
-    /// hostname — for the standalone surface. This is the honest local author;
+    /// hostname — for the Browser-owned panel. This is the honest local author;
     /// the authoritative mesh user/node binding is the worker's (lock Q64).
     #[must_use]
     pub fn local() -> Self {
@@ -266,7 +266,8 @@ impl Manager {
     /// Replace the visible collection with the daemon's converged snapshot.
     ///
     /// This is the read-side BOOKMARKS-2 binding: the worker owns persistence and
-    /// mesh sync, and the surface hydrates its tree from `state/bookmarks/collection`.
+    /// mesh sync, and the Browser-owned panel hydrates its tree from
+    /// `state/bookmarks/collection`.
     /// UI-only affordances survive when their ids still exist; stale focus,
     /// selection, rename, and delete confirmation ids are pruned.
     pub fn replace_collection(&mut self, collection: Collection) {
@@ -1255,7 +1256,7 @@ fn now_ms() -> u64 {
 }
 
 /// The first set, non-empty environment variable among `keys` — best-effort
-/// local identity for the standalone surface.
+/// local identity for the Browser-owned panel.
 fn env_first(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| {
         std::env::var(k)

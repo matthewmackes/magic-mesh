@@ -63,7 +63,23 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
     # etcd coordination plane: quorum health (any reachable client endpoint).
     EPS="$(tr '\n' ',' < "$ETCD_ENDPOINTS_FILE" | sed 's/,$//')"
     if command -v etcdctl >/dev/null 2>&1; then
-        if ! ETCDCTL_API=3 etcdctl --endpoints="$EPS" endpoint health >/dev/null 2>&1; then
+        # Do not ask etcdctl to check the whole comma-separated set here.  That
+        # command fails while a member is still joining (or during a transient
+        # overlay flap), even when this node can already reach a healthy member;
+        # restarting the local daemon in that window prevents the quorum from
+        # ever converging.  The watchdog only needs one coordination endpoint
+        # to be alive before it can safely leave the local etcd process alone.
+        healthy_endpoint=0
+        IFS=',' read -r -a etcd_endpoints <<<"$EPS"
+        for endpoint in "${etcd_endpoints[@]}"; do
+            endpoint="$(printf '%s' "$endpoint" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -n "$endpoint" ] || continue
+            if ETCDCTL_API=3 etcdctl --command-timeout=5s --endpoints="$endpoint" endpoint health >/dev/null 2>&1; then
+                healthy_endpoint=1
+                break
+            fi
+        done
+        if [ "$healthy_endpoint" -eq 0 ]; then
             restart etcd.service "etcd unreachable (coordination plane down)"
         fi
     fi

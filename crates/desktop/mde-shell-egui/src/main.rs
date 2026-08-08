@@ -68,6 +68,8 @@ mod provisioning;
 // WIN7-SHOT-1 — a headless CPU screenshot capture, test-only tooling (see the
 // module doc): never compiled into the production binary, so it is gated here
 // rather than declared like every real surface module above/below it.
+#[cfg(feature = "drm")]
+mod display1_client;
 #[cfg(test)]
 mod screenshot;
 mod seat_pump;
@@ -90,6 +92,7 @@ mod toast_bridge;
 mod vdi;
 mod web;
 mod workbench;
+mod workload_api;
 
 use std::time::{Duration, Instant};
 
@@ -100,18 +103,15 @@ use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 use mde_theme::brand::icons::IconId;
 
-use mde_bookmarks_egui::{
-    bookmarks_panel, real_manager, BookmarksBus, Manager as BookmarksManager,
-};
 use mde_files_egui::{files_panel, model::SurfaceTab, FileBrowser};
 use mde_maps_location_egui::{maps_location_panel, real_maps_location, MapsLocationSurface};
 use mde_media_egui::{
     media_header, media_panel, media_pump, real_media, MediaSurface, VideoTextureCache,
 };
-use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
+use mde_music_egui::{music_pump, music_workspace, MusicApp};
 use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
 
-use surfaces::Surface;
+use surfaces::{canonical_workspace_surface, Surface};
 use web::MediaTransportAction;
 // CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
 // listener source for `loginctl lock-session` (the trait's `poll`).
@@ -162,8 +162,8 @@ struct Nav {
     /// `true` while the shell body (the active surface) fills the central view.
     expanded: bool,
     /// Which surface fills the shell body (Remote Sessions by default). The
-    /// legacy Workbench/MeshView/Explorer values are normalized into Fleet &
-    /// Mesh when that interface renders.
+    /// legacy node-management values are normalized into Workers when that
+    /// interface renders.
     surface: Surface,
     /// The Workbench plane shown when the Workbench surface is active.
     plane: Plane,
@@ -190,9 +190,8 @@ const fn home_cycle_stage_after_click(stage: HomeCycleStage) -> HomeCycleStage {
     }
 }
 
-/// The three views folded into the single Fleet & Mesh interface. The legacy
-/// `Surface` variants remain internal deep-link aliases so existing alerts and
-/// workflows land on the right tab while the launcher exposes only one icon.
+/// The three mesh-control views retained as child tabs inside Workers. Their
+/// old Surface variants are migration aliases only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FleetMeshTab {
     /// Mesh-control planes: This Node, Network, Fleet, and Provisioning.
@@ -202,6 +201,43 @@ pub(crate) enum FleetMeshTab {
     MeshMap,
     /// Discovered mesh, LAN, and cloud units.
     Explorer,
+}
+
+/// The one canonical Workers workspace. The former Fleet & Mesh and This Node
+/// workspaces are now modes of this surface rather than sibling destinations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WorkersTab {
+    /// Worker control tree, graph, and provisioning actions.
+    #[default]
+    Control,
+    /// Live network topology and links.
+    Network,
+    /// Discovered mesh, LAN, and cloud units.
+    Discovery,
+    /// Local-node inventory, services, storage, and actions.
+    LocalNode,
+    /// Paired-phone management owned by the Workers workspace.
+    Phones,
+}
+
+impl WorkersTab {
+    const ALL: [Self; 5] = [
+        Self::Control,
+        Self::Network,
+        Self::Discovery,
+        Self::LocalNode,
+        Self::Phones,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Control => "Control",
+            Self::Network => "Network",
+            Self::Discovery => "Discovery",
+            Self::LocalNode => "Local Node",
+            Self::Phones => "Phones",
+        }
+    }
 }
 
 impl FleetMeshTab {
@@ -238,6 +274,7 @@ struct NavLocation {
     plane: Plane,
     fleet_mesh_tab: FleetMeshTab,
     this_node_tab: ThisNodeTab,
+    workers_tab: WorkersTab,
     this_node_section: this_node_catalog::Section,
     this_node_page: this_node_catalog::PageEntry,
 }
@@ -887,7 +924,8 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         // crash-on-navigation to Media/Files/Terminal/Music/Voice/Editor/MeshView
         // (`push_id` cannot disambiguate an explicit `Id::new`). The menubar
         // provides the control for all of these, so they return false.
-        Surface::FleetMesh
+        Surface::Workers
+        | Surface::FleetMesh
         | Surface::Workbench
         | Surface::InfraCode
         | Surface::ThisNode
@@ -903,8 +941,7 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         | Surface::Timers
         | Surface::Communications
         | Surface::Explorer
-        | Surface::Phones
-        | Surface::Bookmarks => false,
+        | Surface::Phones => false,
         // Menubar-LESS surfaces: they draw no shared MenuBar, so the shell's
         // top-right remote-sessions fallback Area is their only such control and
         // is drawn exactly once (Foreground) — no Background twin, no collision.
@@ -1066,7 +1103,8 @@ struct Shell {
     /// spawn-tab seam, §7).
     console: console::ConsoleState,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
-    /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
+    /// egui context on every update). Rendered via
+    /// `mde_music_egui::music_workspace`.
     music: MusicApp,
     /// The Media surface (MEDIA-18) — the production `MediaController` over the real
     /// `mde_media_core` backend (Player / Library / Playlist), built once by
@@ -1183,12 +1221,6 @@ struct Shell {
     /// now-playing Bus mirror as `org.mpris.MediaPlayer2.mde-browser` and routes
     /// methods back through the existing Browser media-control Bus action path.
     _browser_mpris: web::BrowserMprisHandle,
-    /// The Bookmarks manager surface (BOOKMARKS-4), mounted in-shell so Browser
-    /// users can reach folders/tags/search/dead-link workflows without leaving the
-    /// platform chrome. Persistence and mesh sync remain owned by the bookmarks
-    /// worker; this is the existing egui manager over the CRDT model.
-    bookmarks: BookmarksManager,
-    bookmarks_bus: BookmarksBus,
     /// The Maps & Location surface — native offline navigation, location-source
     /// management, simulator-backed MG90 local management, vehicle telemetry, GPIO,
     /// firmware, backups, recovery, and encrypted-at-rest-ready trip/location data.
@@ -1228,6 +1260,8 @@ struct Shell {
     fleet_mesh_tab: FleetMeshTab,
     /// The selected view inside the unified This Node interface.
     this_node_tab: ThisNodeTab,
+    /// The canonical top-level Workers workspace mode.
+    workers_tab: WorkersTab,
     /// Search-selected section in the governed This Node hierarchy.
     this_node_section: this_node_catalog::Section,
     /// Search-selected child route in the governed This Node hierarchy.
@@ -1359,7 +1393,9 @@ impl Shell {
                 }
             }
             toast_bridge::Navigate::Plane(plane) => {
-                self.nav.surface = Surface::Workbench;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
                 self.nav.plane = plane;
             }
         }
@@ -1403,7 +1439,7 @@ impl Shell {
             // shell also gets mesh-wide Custom-entry sync; see `console.rs`'s
             // `custom_sync` field doc for why the two constructors are split.
             console: console::ConsoleState::for_shell(),
-            music: MusicApp::new_with_ctx(ctx),
+            music: MusicApp::new_embedded_with_ctx(ctx),
             media: real_media(),
             media_video: VideoTextureCache::default(),
             files: mde_files_egui::real_browser(),
@@ -1425,8 +1461,6 @@ impl Shell {
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
             _browser_mpris: web::spawn_browser_mpris(),
-            bookmarks: real_manager(),
-            bookmarks_bus: BookmarksBus::default(),
             maps_location: real_maps_location(),
             car_status: mde_maps_location_egui::CarStatusSelection::load(),
             car_motion: car_motion_policy::CarMotionPolicy::default(),
@@ -1435,6 +1469,7 @@ impl Shell {
             explorer: explorer::ExplorerState::default(),
             fleet_mesh_tab: FleetMeshTab::default(),
             this_node_tab: ThisNodeTab::default(),
+            workers_tab: WorkersTab::default(),
             this_node_section: this_node_catalog::Section::default(),
             this_node_page: this_node_catalog::page_index()[0],
             this_node_search: String::new(),
@@ -1450,6 +1485,12 @@ impl Shell {
             last_workspace_rect: None,
             layout_mode: LayoutModeControl::default(),
         };
+        shell
+            .music
+            .set_workspace_action_publisher(publish_music_workspace_action);
+        shell
+            .music
+            .set_workspace_browse_publisher(publish_music_browse_request);
 
         // CURTAIN-3 boot-gate (design lock 2): when the persisted policy requires a
         // login at boot (the shipped default), start the shell **Locked** — drop the
@@ -1543,6 +1584,7 @@ impl Shell {
         };
         let saved_fleet_mesh_tab = self.fleet_mesh_tab;
         let saved_this_node_tab = self.this_node_tab;
+        let saved_workers_tab = self.workers_tab;
         let saved_this_node_section = self.this_node_section;
         let saved_this_node_page = self.this_node_page;
         let saved_this_node_search = self.this_node_search.clone();
@@ -1551,6 +1593,7 @@ impl Shell {
         self.nav.plane = location.plane;
         self.fleet_mesh_tab = location.fleet_mesh_tab;
         self.this_node_tab = location.this_node_tab;
+        self.workers_tab = location.workers_tab;
         self.this_node_section = location.this_node_section;
         self.this_node_page = location.this_node_page;
 
@@ -1566,6 +1609,7 @@ impl Shell {
         self.nav = saved_nav;
         self.fleet_mesh_tab = saved_fleet_mesh_tab;
         self.this_node_tab = saved_this_node_tab;
+        self.workers_tab = saved_workers_tab;
         self.this_node_section = saved_this_node_section;
         self.this_node_page = saved_this_node_page;
         self.this_node_search = saved_this_node_search;
@@ -1614,6 +1658,7 @@ impl Shell {
             plane: self.nav.plane,
             fleet_mesh_tab: self.fleet_mesh_tab,
             this_node_tab: self.this_node_tab,
+            workers_tab: self.workers_tab,
             this_node_section: self.this_node_section,
             this_node_page: self.this_node_page,
         };
@@ -1635,6 +1680,7 @@ impl Shell {
         self.nav.plane = location.plane;
         self.fleet_mesh_tab = location.fleet_mesh_tab;
         self.this_node_tab = location.this_node_tab;
+        self.workers_tab = location.workers_tab;
         self.this_node_section = location.this_node_section;
         self.this_node_page = location.this_node_page;
         self.last_nav_location = Some(location);
@@ -1647,6 +1693,7 @@ impl Shell {
             plane: self.nav.plane,
             fleet_mesh_tab: self.fleet_mesh_tab,
             this_node_tab: self.this_node_tab,
+            workers_tab: self.workers_tab,
             this_node_section: self.this_node_section,
             this_node_page: self.this_node_page,
         }
@@ -1694,33 +1741,66 @@ impl Shell {
         }
     }
 
-    /// Collapse legacy surface aliases into their new public interface while
-    /// preserving the selected internal tab.
+    /// Collapse every historical node-management route into Workers while
+    /// preserving the deep link's child mode. This is the single migration
+    /// seam used by persisted navigation, alerts, and workflow actions.
     fn normalize_surface_aliases(&mut self) {
         match self.nav.surface {
+            Surface::FleetMesh => {
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
+                self.nav.surface = Surface::Workers;
+            }
+            Surface::Workbench => {
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
+                self.nav.surface = Surface::Workers;
+            }
+            Surface::MeshView => {
+                self.workers_tab = WorkersTab::Network;
+                self.fleet_mesh_tab = FleetMeshTab::MeshMap;
+                self.nav.surface = Surface::Workers;
+            }
+            Surface::Explorer => {
+                self.workers_tab = WorkersTab::Discovery;
+                self.fleet_mesh_tab = FleetMeshTab::Explorer;
+                self.nav.surface = Surface::Workers;
+            }
+            Surface::Phones => {
+                self.workers_tab = WorkersTab::Phones;
+                self.nav.surface = Surface::Workers;
+            }
+            Surface::ThisNode => {
+                self.workers_tab = WorkersTab::LocalNode;
+                self.nav.surface = Surface::Workers;
+            }
             Surface::System => {
+                self.workers_tab = WorkersTab::LocalNode;
                 self.this_node_tab = ThisNodeTab::System;
                 self.this_node_section = this_node_catalog::Section::Overview;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/overview")
                     .unwrap_or(this_node_catalog::page_index()[0]);
-                self.nav.surface = Surface::ThisNode;
+                self.nav.surface = Surface::Workers;
             }
             Surface::Storage => {
+                self.workers_tab = WorkersTab::LocalNode;
                 self.this_node_tab = ThisNodeTab::Storage;
                 self.this_node_section = this_node_catalog::Section::Hardware;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/storage")
                     .unwrap_or(this_node_catalog::page_index()[0]);
-                self.nav.surface = Surface::ThisNode;
+                self.nav.surface = Surface::Workers;
             }
             Surface::About => {
+                self.workers_tab = WorkersTab::LocalNode;
                 self.this_node_tab = ThisNodeTab::About;
                 self.this_node_section = this_node_catalog::Section::Hardware;
                 self.this_node_page = this_node_catalog::page_for_route("this-node/hardware")
                     .unwrap_or(this_node_catalog::page_index()[0]);
-                self.nav.surface = Surface::ThisNode;
+                self.nav.surface = Surface::Workers;
             }
             _ => {}
         }
+        self.nav.surface = canonical_workspace_surface(self.nav.surface);
     }
 
     /// Execute one navigation-bar action. The Auto action uses the same layout
@@ -1978,17 +2058,21 @@ impl Shell {
             }
             HotkeyAction::ReturnToChrome => {
                 // Leave a fullscreen guest for the mesh-control chrome — release any
-                // VDI target and show the Workbench (a session is never a trap).
+                // VDI target and show Workers → Control (a session is never a trap).
                 if self.nav.surface == Surface::Browser {
-                    self.web.note_vdi_session_detached();
+                    self.web.note_display1_attachment_detached();
                 }
                 self.vdi.clear_target();
                 self.nav.expanded = true;
-                self.nav.surface = Surface::Workbench;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
             }
             HotkeyAction::OpenSystem => {
                 self.nav.expanded = true;
-                self.nav.surface = Surface::System;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::LocalNode;
+                self.this_node_tab = ThisNodeTab::System;
             }
             HotkeyAction::OpenOmnibox => {
                 self.open_front_door_panel();
@@ -2036,9 +2120,14 @@ impl Shell {
     fn apply_nav(&mut self, nav: toast_bridge::Navigate) {
         self.nav.expanded = true;
         match nav {
-            toast_bridge::Navigate::Surface(surface) => self.nav.surface = surface,
+            toast_bridge::Navigate::Surface(surface) => {
+                self.nav.surface = surface;
+                self.normalize_surface_aliases();
+            }
             toast_bridge::Navigate::Plane(plane) => {
-                self.nav.surface = Surface::Workbench;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
                 self.nav.plane = plane;
             }
         }
@@ -2054,25 +2143,83 @@ impl Shell {
         }
     }
 
-    /// Poll the live topology view inside Fleet & Mesh.
+    /// Poll the live topology view inside Workers → Network.
     fn poll_mesh_map(&mut self, ctx: &egui::Context) {
         self.mesh_view.poll(ctx);
     }
 
-    /// Render the unified Fleet & Mesh interface. The three formerly separate
-    /// surfaces remain real views, but share one shell surface and one compact
-    /// tab rail so the launcher has a single coherent entry point.
-    fn show_fleet_mesh(&mut self, ui: &mut egui::Ui) {
-        self.fleet_mesh_tab = match self.nav.surface {
-            Surface::Workbench => FleetMeshTab::Workbench,
-            Surface::MeshView => FleetMeshTab::MeshMap,
-            Surface::Explorer => FleetMeshTab::Explorer,
-            _ => self.fleet_mesh_tab,
-        };
-        self.nav.surface = Surface::FleetMesh;
+    /// Render the canonical Workers workspace. Fleet & Mesh and This Node are
+    /// compatibility names for the child modes below, never sibling surfaces.
+    fn show_workers(&mut self, ui: &mut egui::Ui) {
+        self.normalize_surface_aliases();
+        let mut tab = self.workers_tab;
+        ui.push_id("shell-workers", |ui| {
+            let _ = AppFrame::new("Workers").leading_title().show(ui);
+            ui.add_space(Style::SP_XS);
+            ui.colored_label(
+                Style::TEXT_DIM,
+                "One worker-owned workspace for node operations, network state, discovery, and local resources.",
+            );
+            ui.add_space(Style::SP_S);
+            ui.horizontal_wrapped(|ui| {
+                for candidate in WorkersTab::ALL {
+                    if ui
+                        .selectable_label(tab == candidate, candidate.label())
+                        .clicked()
+                    {
+                        tab = candidate;
+                    }
+                }
+            });
+            ui.separator();
+            ui.add_space(Style::SP_S);
 
+            match tab {
+                WorkersTab::Control => {
+                    self.fleet_mesh_tab = FleetMeshTab::Workbench;
+                    self.show_fleet_mesh(ui);
+                    tab = match self.fleet_mesh_tab {
+                        FleetMeshTab::Workbench => WorkersTab::Control,
+                        FleetMeshTab::MeshMap => WorkersTab::Network,
+                        FleetMeshTab::Explorer => WorkersTab::Discovery,
+                    };
+                }
+                WorkersTab::Network => {
+                    self.fleet_mesh_tab = FleetMeshTab::MeshMap;
+                    self.show_fleet_mesh(ui);
+                    tab = match self.fleet_mesh_tab {
+                        FleetMeshTab::Workbench => WorkersTab::Control,
+                        FleetMeshTab::MeshMap => WorkersTab::Network,
+                        FleetMeshTab::Explorer => WorkersTab::Discovery,
+                    };
+                }
+                WorkersTab::Discovery => {
+                    self.fleet_mesh_tab = FleetMeshTab::Explorer;
+                    self.show_fleet_mesh(ui);
+                    tab = match self.fleet_mesh_tab {
+                        FleetMeshTab::Workbench => WorkersTab::Control,
+                        FleetMeshTab::MeshMap => WorkersTab::Network,
+                        FleetMeshTab::Explorer => WorkersTab::Discovery,
+                    };
+                }
+                WorkersTab::LocalNode => self.show_this_node(ui),
+                WorkersTab::Phones => {
+                    let phones = &mut self.phones_hub;
+                    ui.push_id("shell-workers-phones", |ui| {
+                        phones.show(ui);
+                    });
+                }
+            }
+        });
+        self.workers_tab = tab;
+    }
+
+    /// Render the mesh-control child views inside Workers. The old method name
+    /// remains as a private implementation seam while the public route is now
+    /// unambiguously `Surface::Workers`.
+    fn show_fleet_mesh(&mut self, ui: &mut egui::Ui) {
         let mut tab = self.fleet_mesh_tab;
-        ui.push_id("shell-fleet-mesh", |ui| {
+        ui.push_id("shell-workers-mesh-control", |ui| {
             // Workbench owns the shared MenuBar, including its View menu. Do
             // not mount the legacy Fleet & Mesh wrapper menu above it: at
             // narrow/large-text sizes that produced a detached duplicate
@@ -2119,10 +2266,10 @@ impl Shell {
         self.fleet_mesh_tab = tab;
     }
 
-    /// Render the unified This Node interface. The formerly separate System,
-    /// Storage, and About surfaces remain real panels, but the public shell now
-    /// exposes one node-local GUI with a grouped Device Manager tree.
+    /// Render the local-node child mode inside Workers. System, Storage, and
+    /// About remain provider-owned routes but no longer own a workspace.
     fn show_this_node(&mut self, ui: &mut egui::Ui) {
+        self.normalize_surface_aliases();
         self.this_node_tab = match self.nav.surface {
             Surface::System => ThisNodeTab::System,
             Surface::Storage => ThisNodeTab::Storage,
@@ -2142,8 +2289,6 @@ impl Shell {
                     .unwrap_or(this_node_catalog::page_index()[0])
             };
         }
-        self.nav.surface = Surface::ThisNode;
-
         let mut tab = self.this_node_tab;
         let mut section = self.this_node_section;
         let mut page = self.this_node_page;
@@ -2155,11 +2300,9 @@ impl Shell {
                     // surface header, then a navigation rail beside the active
                     // workspace. This keeps the tree from pushing alerts and
                     // actions above the content they belong to.
-                    let _ = AppFrame::new("This Node").leading_title().show(ui);
-                    ui.add_space(Style::SP_XS);
                     ui.colored_label(
                         Style::TEXT_DIM,
-                        "Local operations — select a governed area to inspect its provider state.",
+                        "Local node — select a governed area to inspect its provider state.",
                     );
                     ui.add_space(Style::SP_S);
                     ui.separator();
@@ -2444,9 +2587,16 @@ impl Shell {
         self.web
             .note_surface_foreground(self.nav.surface == Surface::Browser);
         match self.nav.surface {
-            Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
-                self.show_fleet_mesh(ui);
-            }
+            Surface::Workers
+            | Surface::FleetMesh
+            | Surface::Workbench
+            | Surface::MeshView
+            | Surface::Explorer
+            | Surface::ThisNode
+            | Surface::System
+            | Surface::Storage
+            | Surface::About
+            | Surface::Phones => self.show_workers(ui),
             Surface::Desktop => {
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
@@ -2484,9 +2634,10 @@ impl Shell {
                         })
                         .inner;
                     if leave {
-                        self.web.note_vdi_session_detached();
                         self.vdi.clear_target();
-                        self.nav.surface = Surface::Workbench;
+                        self.nav.surface = Surface::Workers;
+                        self.workers_tab = WorkersTab::Control;
+                        self.fleet_mesh_tab = FleetMeshTab::Workbench;
                         self.sessions_picker_open = false;
                     }
                     // WL-PERF-002 — keep the frame loop ticking while a live VDI
@@ -2518,9 +2669,7 @@ impl Shell {
                 music_pump(&mut self.music);
                 let music = &mut self.music;
                 ui.push_id("shell-music", |ui| {
-                    music_header(ui, music);
-                    ui.separator();
-                    music_panel(ui, music);
+                    music_workspace(ui, music);
                 });
             }
             Surface::Media => {
@@ -2573,71 +2722,30 @@ impl Shell {
                     self.infra_code.request_refresh();
                 }
                 if let Some(connect) = self.web.take_browser_vm_connect() {
-                    match self.chooser.browser_vm_auth(&connect) {
-                        Ok(Some(auth)) => {
-                            if let Err(error) = self.vdi.request_browser_vm_connect(
-                                connect.target,
-                                connect.transport,
-                                &self.local_host,
-                                mde_bus::client_data_dir(),
-                                Some(vdi::body_device_px(ui.ctx())),
-                                auth,
-                            ) {
-                                self.web.browser_vm_unavailable(error);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => self.web.browser_vm_unavailable(error),
-                    }
-                }
-                if let Some((connect, auth)) = self.chooser.render_browser_vm_auth_prompt(ui) {
-                    if let Err(error) = self.vdi.request_browser_vm_connect(
-                        connect.target,
-                        connect.transport,
+                    #[cfg(feature = "drm")]
+                    if let Err(error) = vdi::request_browser_vm_display1_attach(
+                        &connect.target,
                         &self.local_host,
-                        mde_bus::client_data_dir(),
-                        Some(vdi::body_device_px(ui.ctx())),
-                        auth,
+                        mde_bus::client_data_dir().as_deref(),
                     ) {
                         self.web.browser_vm_unavailable(error);
                     }
-                }
-                if self.vdi.requested_target().is_some() {
-                    let vdi = &mut self.vdi;
-                    let leave = ui
-                        .push_id("shell-browser-vdi", |ui| {
-                            vdi::vdi_panel(ui, vdi);
-                            vdi.take_return_to_chrome()
-                        })
-                        .inner;
-                    if leave {
-                        self.web.note_vdi_session_detached();
-                        self.vdi.clear_target();
-                        self.nav.surface = Surface::Workbench;
+
+                    #[cfg(not(feature = "drm"))]
+                    {
+                        let _ = connect;
+                        self.web.browser_vm_unavailable(
+                            "This shell was built without the direct-DRM Display1 seat; no compatibility console was opened.",
+                        );
                     }
-                    #[cfg(feature = "live-vdi")]
-                    if self.vdi.has_live_transport() {
-                        ui.ctx().request_repaint();
-                    }
-                } else {
-                    let web = &mut self.web;
-                    ui.push_id("shell-web", |ui| {
-                        web::web_panel(ui, web);
-                    });
                 }
-                if self.web.take_bookmarks_manager_request() {
-                    self.nav.surface = Surface::Bookmarks;
-                }
+                let web = &mut self.web;
+                ui.push_id("shell-web", |ui| {
+                    web::web_panel(ui, web);
+                });
                 if self.web.take_open_workloads_request() {
                     self.nav.surface = Surface::InfraCode;
                 }
-            }
-            Surface::Bookmarks => {
-                let bookmarks = &mut self.bookmarks;
-                self.bookmarks_bus.pump(bookmarks);
-                ui.push_id("shell-bookmarks", |ui| {
-                    bookmarks_panel(ui, bookmarks);
-                });
             }
             Surface::MapsLocation => {
                 // Fold this seat's live `state/vehicle/<node>` mirror onto the
@@ -2667,17 +2775,6 @@ impl Shell {
                     terminal_panel(ui, terminal);
                 });
             }
-            Surface::Phones => {
-                // The Phones hub (KDC-MESH-9) — the desktop-side management surface
-                // for the mesh's paired phone(s). A thin client of the `kdc_host`
-                // worker (renders its published state + drives its Bus verbs, §6); its
-                // poll is driven in `render` while in view. Scoped under its own
-                // `push_id` like every mounted surface.
-                let phones = &mut self.phones_hub;
-                ui.push_id("shell-phones", |ui| {
-                    phones.show(ui);
-                });
-            }
             Surface::Communications => {
                 // The unified Communications hub (WL-FUNC-011) — the
                 // `mde-collab-egui` surface over a Bus-backed `CollabData` folded
@@ -2690,9 +2787,6 @@ impl Shell {
                 ui.push_id("shell-communications", |ui| {
                     communications.show(ui);
                 });
-            }
-            Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
-                self.show_this_node(ui);
             }
             Surface::Timers => {
                 // Timers & Alarms — a pure renderer over the
@@ -2905,9 +2999,8 @@ impl Shell {
         // without operator input; the polls self-gate and keep the repaint heartbeat
         // alive. The app surfaces drive their own repaints from their workers.
         if self.nav.expanded
-            && (self.nav.surface == Surface::Workbench
-                || (self.nav.surface == Surface::FleetMesh
-                    && self.fleet_mesh_tab == FleetMeshTab::Workbench))
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::Control
         {
             // perf-11: stagger the seven planes' FIRST poll by a distinct offset so
             // their shared 5 s cadences interleave instead of all firing on this
@@ -2955,11 +3048,14 @@ impl Shell {
             self.workbench_poll_epoch = None;
         }
 
-        // The unified This Node center owns the same local snapshot projection
+        // The Workers local-node mode owns the same local snapshot projection
         // as the legacy Workbench card. Keep its hierarchy badges live even
         // when Workbench is not mounted, so a global-health drilldown cannot
         // present a stale tree merely because the operator opened it directly.
-        if self.nav.expanded && self.nav.surface == Surface::ThisNode {
+        if self.nav.expanded
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::LocalNode
+        {
             self.thisnode.poll(ctx);
         }
 
@@ -2975,21 +3071,19 @@ impl Shell {
             }
         }
 
-        // The Mesh Map tab inside Fleet & Mesh refolds while in view.
+        // The Network tab inside Workers refolds while in view.
         if self.nav.expanded
-            && (self.nav.surface == Surface::MeshView
-                || (self.nav.surface == Surface::FleetMesh
-                    && self.fleet_mesh_tab == FleetMeshTab::MeshMap))
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::Network
         {
             self.poll_mesh_map(ctx);
         }
-        // The Fleet & Mesh Explorer tab (shell-ux-8) tails the SAME
+        // The Workers Discovery tab (shell-ux-8) tails the SAME
         // `state/units/*` Discovery mirrors while it is in view — the reachable
         // half of the #24 scan-active gate.
         if self.nav.expanded
-            && (self.nav.surface == Surface::Explorer
-                || (self.nav.surface == Surface::FleetMesh
-                    && self.fleet_mesh_tab == FleetMeshTab::Explorer))
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::Discovery
         {
             self.explorer.poll(ctx);
         }
@@ -3031,9 +3125,9 @@ impl Shell {
         // peer's progress lane while it's in view — a cheap local scan so a UDisks2
         // change on any peer surfaces without operator input (E12-21).
         if self.nav.expanded
-            && (self.nav.surface == Surface::Storage
-                || (self.nav.surface == Surface::ThisNode
-                    && self.this_node_tab == ThisNodeTab::Storage))
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::LocalNode
+            && self.this_node_tab == ThisNodeTab::Storage
         {
             self.storage.poll(ctx);
         }
@@ -3053,9 +3147,9 @@ impl Shell {
         // local read of the replicated `device-inventory/<host>.json`, honest
         // pre-poll dim until the `hardware_probe` worker's file lands (§7).
         if self.nav.expanded
-            && (self.nav.surface == Surface::About
-                || (self.nav.surface == Surface::ThisNode
-                    && self.this_node_tab == ThisNodeTab::About))
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::LocalNode
+            && self.this_node_tab == ThisNodeTab::About
         {
             self.device_manager.poll(ctx);
         }
@@ -3064,7 +3158,10 @@ impl Shell {
         // + the mesh service directory (the replicated `kdc-services/*.json`) while
         // in view (KDC-MESH-9) — a non-blocking Bus RPC + a cheap local scan on the
         // shared cadence; the verb replies land on a later tick (§7).
-        if self.nav.expanded && self.nav.surface == Surface::Phones {
+        if self.nav.expanded
+            && self.nav.surface == Surface::Workers
+            && self.workers_tab == WorkersTab::Phones
+        {
             self.phones_hub.poll(ctx);
         }
 
@@ -3108,21 +3205,22 @@ impl Shell {
         let lock_signals = self.lock_signal.poll();
         lock_signal::apply_lock_signals(&lock_signals, &mut self.curtain);
 
-        // E12-17 — the BlueZ pairing agent is live only while the System surface is
+        // E12-17 — the BlueZ pairing agent is live only while Workers → Local Node
+        // → System is in view:
         // in view: register on entry (once an adapter is present), drop
         // (unregister) on leave. So a pairing PIN/passkey prompt is answered by the
         // panel's modal, and no default agent lingers on the system bus otherwise.
         self.system.sync_pairing_agent(
             self.nav.expanded
-                && (self.nav.surface == Surface::System
-                    || (self.nav.surface == Surface::ThisNode
-                        && self.this_node_tab == ThisNodeTab::System)),
+                && self.nav.surface == Surface::Workers
+                && self.workers_tab == WorkersTab::LocalNode
+                && self.this_node_tab == ThisNodeTab::System,
         );
         self.system.sync_network_secret_agent(
             self.nav.expanded
-                && (self.nav.surface == Surface::System
-                    || (self.nav.surface == Surface::ThisNode
-                        && self.this_node_tab == ThisNodeTab::System)),
+                && self.nav.surface == Surface::Workers
+                && self.workers_tab == WorkersTab::LocalNode
+                && self.this_node_tab == ThisNodeTab::System,
         );
         self.system.show_network_secret_dialog(ctx);
 
@@ -3270,7 +3368,8 @@ impl Shell {
         health_modal::mount(ctx, &mut self.construct, self.chrome.health().snapshot());
         if let Some((host, key)) = self.construct.health_inventory_target.take() {
             self.nav.expanded = true;
-            self.nav.surface = Surface::ThisNode;
+            self.nav.surface = Surface::Workers;
+            self.workers_tab = WorkersTab::LocalNode;
             self.this_node_tab = ThisNodeTab::About;
             self.this_node_section = this_node_catalog::Section::Hardware;
             self.this_node_page = this_node_catalog::page_for_route("this-node/hardware")
@@ -3831,9 +3930,12 @@ impl Shell {
                 if let Some(plane) = card.workbench_plane {
                     self.nav.plane = plane;
                 }
+                self.normalize_surface_aliases();
             }
             front_door::FrontDoorTarget::ServiceLifecycle(_) => {
-                self.nav.surface = Surface::Workbench;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
                 self.nav.plane = Plane::Fleet;
             }
             front_door::FrontDoorTarget::File(target) => {
@@ -3841,7 +3943,9 @@ impl Shell {
                 self.files.open_search_omnibox_target(&target);
             }
             front_door::FrontDoorTarget::Mesh(id) => {
-                self.nav.surface = Surface::Explorer;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::Discovery;
+                self.fleet_mesh_tab = FleetMeshTab::Explorer;
                 self.explorer.open_search_omnibox_target(&id);
             }
             front_door::FrontDoorTarget::Browser(target) => {
@@ -3973,7 +4077,9 @@ impl Shell {
             }
             front_door::FrontDoorRequest::OpenWorkbenchPlane(plane) => {
                 self.nav.expanded = true;
-                self.nav.surface = Surface::Workbench;
+                self.nav.surface = Surface::Workers;
+                self.workers_tab = WorkersTab::Control;
+                self.fleet_mesh_tab = FleetMeshTab::Workbench;
                 self.nav.plane = plane;
             }
         }
@@ -4148,8 +4254,8 @@ impl Shell {
     }
 
     fn mount_remote_sessions_fallback(&self, ctx: &egui::Context) {
-        let needs_fallback = if self.nav.surface == Surface::FleetMesh {
-            self.fleet_mesh_tab == FleetMeshTab::Explorer
+        let needs_fallback = if self.nav.surface == Surface::Workers {
+            self.workers_tab == WorkersTab::Discovery
         } else {
             surface_needs_remote_sessions_fallback(self.nav.surface)
         };
@@ -4247,6 +4353,81 @@ fn publish_front_door_instance_lifecycle_to_bus(
         .map_err(|err| err.to_string())
 }
 
+/// Publish one authenticated Music workspace action from the shell's root
+/// mutation authority. The Music surface supplies only a typed unsigned body;
+/// this boundary mints the short-lived body-bound capability and writes the
+/// canonical daemon action topic.
+fn publish_music_workspace_action(body: &str) -> Result<(), String> {
+    let body = iac::authorize_music_mutation_body(body)?;
+    let bus_root = mde_bus::client_data_dir()
+        .ok_or_else(|| "Music workspace action Bus root is unavailable".to_owned())?;
+    mde_bus::persist::Persist::open(bus_root)
+        .and_then(|persist| {
+            persist.write(
+                "action/music/workspace",
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+        })
+        .map(|_| ())
+        .map_err(|error| format!("publish Music workspace action: {error}"))
+}
+
+/// Publish one read-only Music browse request from the shell's Bus boundary.
+/// Search is intentionally separate from the mutation publisher: the daemon
+/// records the bounded result in its catalog projection, while the UI consumes
+/// the refreshed retained workspace snapshot and never calls Airsonic itself.
+fn publish_music_browse_request(verb: &str, body: &str) -> Result<(), String> {
+    let topic = music_browse_topic(verb)?;
+    let bus_root = mde_bus::client_data_dir()
+        .ok_or_else(|| "Music browse request Bus root is unavailable".to_owned())?;
+    mde_bus::persist::Persist::open(bus_root)
+        .and_then(|persist| {
+            persist.write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(body),
+            )
+        })
+        .map(|_| ())
+        .map_err(|error| format!("publish Music browse request: {error}"))
+}
+
+/// Return the exact Bus action topic for a read-only Music browse verb. Keep
+/// this separate from the persistence call so the verb-to-topic routing is
+/// unit-testable; sending every valid request to `.../search` silently turns
+/// artist, album, podcast, and radio clicks into empty searches.
+fn music_browse_topic(verb: &str) -> Result<String, String> {
+    if !matches!(
+        verb,
+        "search"
+            | "list-albums"
+            | "list-artists"
+            | "get-album"
+            | "albums-by-artist"
+            | "list-podcasts"
+            | "list-radio"
+            | "podcast-episodes"
+            | "list-genres"
+            | "albums-by-genre"
+            | "get-song"
+            | "get-cover-art"
+            | "list-bookmarks"
+            | "list-recents"
+            | "list-frequent"
+            | "list-starred"
+            | "library-stats"
+            | "get-lyrics"
+            | "list-playlists"
+            | "get-playlist"
+    ) {
+        return Err(format!("unsupported Music browse request: {verb}"));
+    }
+    Ok(format!("action/music/{verb}"))
+}
+
 /// Route the Control Center transfer summary to the canonical Files view.
 fn route_file_operation_request(files: &mut FileBrowser, nav: &mut Nav) {
     files.set_surface_tab(SurfaceTab::Transfers);
@@ -4259,18 +4440,57 @@ fn publish_front_door_service_lifecycle_to_bus(
     target: &front_door::FrontDoorServiceLifecycleTarget,
     op: front_door::FrontDoorServiceLifecycleOp,
 ) -> Result<(), String> {
-    let (topic, body) = front_door::service_lifecycle_wire(target, op)?;
-    mde_bus::persist::Persist::open(bus_root.to_path_buf())
-        .and_then(|persist| {
-            persist.write(
-                &topic,
-                mde_bus::hooks::config::Priority::Default,
-                None,
-                Some(&body),
-            )
-        })
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    let target_node = if target.host.trim().starts_with("peer:") {
+        target.host.trim().to_owned()
+    } else {
+        format!("peer:{}", target.host.trim())
+    };
+    let (backend, kind_prefix) = match target.kind {
+        datacenter::FrontDoorLifecycleKind::Container => (
+            mackes_mesh_types::workloads::WorkloadBackend::QuadletSystemd,
+            "container",
+        ),
+        datacenter::FrontDoorLifecycleKind::Vm => (
+            mackes_mesh_types::workloads::WorkloadBackend::LibvirtVirtqemud,
+            "vm",
+        ),
+    };
+    let workload_id = format!("{kind_prefix}:{target_node}:{}", target.name.trim());
+    let persist = mde_bus::persist::Persist::open(bus_root.to_path_buf())
+        .map_err(|error| format!("open Workload Bus: {error}"))?;
+    let status = workload_api::read_status(&persist, &target_node, &workload_id);
+    let resources = status
+        .as_ref()
+        .map(|status| status.resources)
+        .unwrap_or_else(|| mackes_mesh_types::workloads::WorkloadProfile::Small.resources());
+    let expected_generation = status.as_ref().map_or(0, |status| status.generation);
+    let action = match op {
+        front_door::FrontDoorServiceLifecycleOp::Start => {
+            mackes_mesh_types::workloads::WorkloadOperationAction::Start
+        }
+        front_door::FrontDoorServiceLifecycleOp::Stop => {
+            mackes_mesh_types::workloads::WorkloadOperationAction::Stop
+        }
+        front_door::FrontDoorServiceLifecycleOp::Restart => {
+            mackes_mesh_types::workloads::WorkloadOperationAction::Restart
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let request = workload_api::request(
+        &workload_id,
+        &target_node,
+        backend,
+        resources,
+        action,
+        None,
+        expected_generation,
+        now_ms,
+    )?;
+    workload_api::publish(bus_root, &request).map(|_| ())
 }
 
 fn publish_front_door_peer_app_launch_to_bus(
@@ -4342,6 +4562,55 @@ fn local_hostname() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+#[cfg(feature = "drm")]
+fn display1_client_from_environment() -> display1_client::Display1Source {
+    let dynamic = || {
+        display1_client::Display1Source::dynamic(
+            local_hostname(),
+            mde_bus::client_data_dir(),
+            // Browser is the first shipped native guest surface. Do not let a
+            // lease for an unrelated workload take over the physical seat while
+            // the explicit selector plumbing is still environment-backed.
+            std::env::var("MDE_DISPLAY1_WORKLOAD_ID")
+                .ok()
+                .or_else(|| Some("browser-vm".to_owned())),
+        )
+    };
+    let Some(lease_json) = std::env::var("MDE_DISPLAY1_LEASE").ok() else {
+        return dynamic();
+    };
+    let lease: mackes_mesh_types::workloads::WorkloadAttachmentLease =
+        match serde_json::from_str(&lease_json) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(target: "shell::display1", %error, "invalid Display1 lease handoff");
+                return dynamic();
+            }
+        };
+    let socket = std::env::var_os("MDE_DISPLAY1_SOCKET")
+        .map(std::path::PathBuf::from)
+        .or_else(|| display1_client::socket_path_for_lease(&lease.lease_id));
+    let Some(socket) = socket else {
+        return dynamic();
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    match display1_client::Display1Client::connect_privileged(
+        std::path::Path::new(&socket),
+        lease,
+        now_ms,
+    ) {
+        Ok(client) => display1_client::Display1Source::Static(client),
+        Err(error) => {
+            tracing::warn!(target: "shell::display1", %error, "Display1 handoff unavailable; using GBM");
+            dynamic()
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // QBRAND-1 — `--version` prints the single baked build-identity line (version
     // · git hash · date · channel), shared verbatim with `mackesd --version` and
@@ -4387,9 +4656,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // fallback retains eframe's platform adapter; only this direct-seat
         // path must not regress to the process-local compatibility provider.
         let mut clipboard = communications::BusTextClipboard::for_shell(mde_bus::client_data_dir());
-        match mde_egui::run_drm_with_clipboard("org.magicmesh.Shell", &mut clipboard, |ctx| {
-            boot.frame(ctx)
-        }) {
+        let mut display1 = display1_client_from_environment();
+        let display1_source = &mut display1 as &mut dyn mde_egui::drm::Display1FrameSource;
+        match mde_egui::run_drm_with_clipboard_and_display1(
+            "org.magicmesh.Shell",
+            &mut clipboard,
+            Some(display1_source),
+            |ctx| boot.frame(ctx),
+        ) {
             Ok(()) => return Ok(()),
             Err(mde_egui::drm::DrmError::NoDrmMaster(why)) => {
                 tracing::warn!(
@@ -4425,10 +4699,11 @@ mod tests {
         paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
-        screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
+        music_browse_topic, screenshot, splash, status, surface_needs_remote_sessions_fallback,
+        terminal_panel,
         this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
         HomeCycleStage, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
-        VideoTextureCache, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
+        VideoTextureCache, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
         LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
         LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
     };
@@ -4452,6 +4727,23 @@ mod tests {
     };
     use mde_seat::HotkeyAction;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn music_browse_topic_preserves_each_typed_action_route() {
+        for verb in [
+            "search",
+            "albums-by-artist",
+            "get-album",
+            "podcast-episodes",
+            "list-radio",
+        ] {
+            assert_eq!(
+                music_browse_topic(verb).unwrap(),
+                format!("action/music/{verb}")
+            );
+        }
+        assert!(music_browse_topic("not-a-music-browse-verb").is_err());
+    }
 
     struct ShellFilesBackend {
         rows: Vec<FileRow>,
@@ -5378,11 +5670,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_node_surfaces_normalize_into_this_node_tabs() {
+    fn legacy_node_surfaces_normalize_into_workers_tabs() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
 
+        for (legacy, expected_workers_tab) in [
+            (Surface::FleetMesh, WorkersTab::Control),
+            (Surface::Workbench, WorkersTab::Control),
+            (Surface::MeshView, WorkersTab::Network),
+            (Surface::Explorer, WorkersTab::Discovery),
+            (Surface::ThisNode, WorkersTab::LocalNode),
+            (Surface::Phones, WorkersTab::Phones),
+            (Surface::System, WorkersTab::LocalNode),
+            (Surface::Storage, WorkersTab::LocalNode),
+            (Surface::About, WorkersTab::LocalNode),
+        ] {
+            shell.nav.surface = legacy;
+            shell.normalize_surface_aliases();
+            assert_eq!(shell.nav.surface, Surface::Workers, "{legacy:?} surface");
+            assert_eq!(shell.workers_tab, expected_workers_tab, "{legacy:?} tab");
+        }
         for (legacy, expected_tab) in [
             (Surface::System, ThisNodeTab::System),
             (Surface::Storage, ThisNodeTab::Storage),
@@ -5390,8 +5698,7 @@ mod tests {
         ] {
             shell.nav.surface = legacy;
             shell.normalize_surface_aliases();
-            assert_eq!(shell.nav.surface, Surface::ThisNode, "{legacy:?} surface");
-            assert_eq!(shell.this_node_tab, expected_tab, "{legacy:?} tab");
+            assert_eq!(shell.this_node_tab, expected_tab, "{legacy:?} local-node tab");
         }
     }
 
@@ -5759,7 +6066,8 @@ mod tests {
             let expected = !matches!(
                 surface,
                 // Own workspace chrome / handle remote-sessions themselves.
-                Surface::FleetMesh
+                Surface::Workers
+                    | Surface::FleetMesh
                     | Surface::Workbench
                     | Surface::InfraCode
                     | Surface::Desktop
@@ -5774,7 +6082,6 @@ mod tests {
                     | Surface::Media
                     | Surface::Files
                     | Surface::Terminal
-                    | Surface::Bookmarks
                     | Surface::Timers
                     | Surface::Communications
                     | Surface::Explorer
@@ -6489,7 +6796,7 @@ mod tests {
     /// scoping + the surface's own `files-top`/`files-side` panels nested in the
     /// shell's one `Context`) is runtime-reachable and actually draws. Music mounts
     /// through the identical `body` path with its own headless render test proving
-    /// `music_panel` + header tessellate.
+    /// the self-contained Music workspace tessellates.
     #[test]
     fn shell_mounts_and_renders_a_surface() {
         let ctx = egui::Context::default();
@@ -6548,7 +6855,7 @@ mod tests {
     }
 
     #[test]
-    fn this_node_shared_frame_survives_desktop_narrow_and_large_text() {
+    fn workers_local_node_child_survives_desktop_narrow_and_large_text() {
         for (width, zoom) in [(960.0, 1.0), (480.0, 1.0), (960.0, 1.5)] {
             let ctx = egui::Context::default();
             Style::install(&ctx);
@@ -6568,13 +6875,13 @@ mod tests {
             let primitives = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
             assert!(
                 !primitives.is_empty(),
-                "This Node shared frame did not paint at width={width}, zoom={zoom}"
+                "Workers local-node child did not paint at width={width}, zoom={zoom}"
             );
             assert!(
                 painted_text(&out.shapes)
                     .iter()
-                    .any(|(text, _)| text == "This Node"),
-                "This Node shared frame title is missing at width={width}, zoom={zoom}"
+                    .any(|(text, _)| text.contains("Local node")),
+                "Workers local-node child anchor is missing at width={width}, zoom={zoom}"
             );
             let text = painted_text(&out.shapes);
             for anchor in ["Find a section", "Workspace", "Overview"] {
@@ -6796,39 +7103,8 @@ mod tests {
             .take_browser_vm_connect()
             .expect("active Browser VM should issue its first attachment");
 
-        let bus = tempfile::tempdir().expect("isolated VDI lifecycle bus");
-        shell.vdi.request_connect(
-            super::vdi::ConnectRequest::new(
-                super::vdi::RequestedTarget::new(
-                    first.target.serving_peer.clone(),
-                    first.target.workload.clone(),
-                ),
-                super::vdi::VdiProtocol::Rdp,
-                super::vdi::DisplayMode::Fullscreen,
-                super::vdi::MonitorSpan::Single,
-                super::auth::DesktopAuth::mesh_identity("dell"),
-            )
-            .with_browser_transport(first.transport)
-            .with_broker_session(super::vdi::BrokerSessionLifecycle::new(
-                "browser-session",
-                Some(bus.path().to_path_buf()),
-            )),
-        );
-        shell.vdi.request_return_to_chrome();
-
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
-            ..Default::default()
-        };
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| shell.body(ui));
-        });
-
-        assert_eq!(shell.nav.surface, Surface::Workbench);
-        assert!(
-            shell.vdi.requested_target().is_none(),
-            "Escape should clear the focused Browser VDI target"
-        );
+        assert_eq!(first.target.workload, "browser-vm");
+        shell.web.note_display1_attachment_detached();
 
         shell.web.sync_browser_vm_target(Some(target));
         let reattach = shell
@@ -7342,7 +7618,7 @@ mod tests {
         shell.activate_front_door_target(front_door::FrontDoorTarget::Workflow(card));
 
         assert!(shell.nav.expanded);
-        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert_eq!(shell.nav.surface, Surface::Workers);
         assert_eq!(
             shell.nav.plane,
             Plane::Provisioning,
@@ -7369,7 +7645,7 @@ mod tests {
         ));
 
         assert!(shell.nav.expanded);
-        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert_eq!(shell.nav.surface, Surface::Workers);
         assert_eq!(shell.nav.plane, Plane::Fleet);
     }
 
@@ -7388,12 +7664,12 @@ mod tests {
         );
 
         assert!(shell.nav.expanded);
-        assert_eq!(shell.nav.surface, Surface::Workbench);
+        assert_eq!(shell.nav.surface, Surface::Workers);
         assert_eq!(shell.nav.plane, Plane::Fleet);
     }
 
     #[test]
-    fn front_door_instance_lifecycle_request_writes_cloud_bus_action() {
+    fn front_door_instance_lifecycle_request_writes_typed_workload_action() {
         let dir = tempfile::tempdir().expect("temp bus");
 
         publish_front_door_instance_lifecycle_to_bus(
@@ -7406,17 +7682,21 @@ mod tests {
 
         let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
         let msgs = persist
-            .list_since("action/cloud/instance-reboot", None)
+            .list_since(
+                mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC,
+                None,
+            )
             .expect("list lifecycle topic");
         assert_eq!(msgs.len(), 1);
         let body: serde_json::Value =
             serde_json::from_str(msgs[0].body.as_deref().expect("authorized lifecycle body"))
                 .expect("lifecycle JSON");
-        assert_eq!(body["node"], "bigboy");
-        assert_eq!(body["instance"], "i-9");
+        assert_eq!(body["target_node"], "bigboy");
+        assert_eq!(body["workload_id"], "vm:bigboy:i-9");
+        assert_eq!(body["action"], "restart");
         assert_eq!(
             body["schema_version"],
-            mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+            mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
         );
         assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
             body["armed_token"].as_str().expect("armed token")
@@ -7435,7 +7715,7 @@ mod tests {
     }
 
     #[test]
-    fn front_door_service_lifecycle_request_writes_authorized_exec_bus_action() {
+    fn front_door_service_lifecycle_request_writes_authorized_workload_operation() {
         let dir = tempfile::tempdir().expect("temp bus");
         let target = front_door::FrontDoorServiceLifecycleTarget {
             host: "oak".to_owned(),
@@ -7453,24 +7733,26 @@ mod tests {
 
         let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
         let msgs = persist
-            .list_since("action/exec/request", None)
-            .expect("list audited exec topic");
+            .list_since(mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC, None)
+            .expect("list Workload topic");
         assert_eq!(msgs.len(), 1);
         let body: serde_json::Value =
             serde_json::from_str(msgs[0].body.as_deref().unwrap_or("{}")).expect("json body");
-        assert_eq!(body["schema_version"], 1);
-        assert_eq!(body["kind"], "service_lifecycle");
-        assert_eq!(body["target_host"], "oak");
-        assert_eq!(body["service_kind"], "container");
-        assert_eq!(body["name"], "mesh-api");
-        assert_eq!(body["op"], "restart");
+        assert_eq!(
+            body["schema_version"],
+            mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(body["workload_id"], "container:peer:oak:mesh-api");
+        assert_eq!(body["target_node"], "peer:oak");
+        assert_eq!(body["backend"], "quadlet_systemd");
+        assert_eq!(body["action"], "restart");
         let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
             body["armed_token"].as_str().expect("armed capability"),
         )
         .expect("parsed capability");
-        assert_eq!(token.verb, "exec-request");
-        assert_eq!(token.node, "fleet-control");
-        assert_eq!(token.target, "service:oak:container:mesh-api:restart");
+        assert_eq!(token.verb, "workload-operation");
+        assert_eq!(token.node, "peer:oak");
+        assert_eq!(token.target, "workload:container:peer:oak:mesh-api");
     }
 
     #[test]
@@ -7493,7 +7775,7 @@ mod tests {
                 && matches!(
                     item.payload,
                     front_door::FrontDoorTarget::Workflow(card)
-                        if card.surface == Surface::Workbench
+                        if card.surface == Surface::Workers
                 )
         }));
     }
@@ -7532,7 +7814,7 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(
             apps.len(),
-            Surface::ALL.len() - super::surfaces::TOOL_TRAY_SURFACES.len()
+            Surface::ALL.len() - super::surfaces::TOOL_TRAY_SURFACES.len() - 1
         );
     }
 

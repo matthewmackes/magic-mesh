@@ -12,11 +12,16 @@
 //! `tofu` emitted no `change_summary` (a failed / aborted plan), never a fabricated
 //! all-zero "in sync" [`PlanCounts`].
 
-use mackes_mesh_types::cloud::{PlanCounts, WorkloadSpec};
+use mackes_mesh_types::cloud::{PlanCounts, StoragePool, WorkloadSpec};
 
 /// The tfvars key carrying the libvirt connection URI for the placement node's
 /// local hypervisor (E12 local-first default `qemu:///system`).
 pub(crate) const TFVARS_LIBVIRT_URI: &str = "libvirt_uri";
+
+/// The tfvars key carrying the closed-set libvirt storage pool selected in
+/// Deployment. All workloads in one node slice intentionally share one pool;
+/// mixed selections are rejected before OpenTofu is invoked.
+pub(crate) const TFVARS_POOL: &str = "pool";
 
 /// The tfvars key carrying the per-node `for_each` workload map (`var.vms`).
 pub(crate) const TFVARS_VMS: &str = "vms";
@@ -49,15 +54,27 @@ pub(crate) fn render_tfvars(
     specs: &[WorkloadSpec],
     libvirt_uri: &str,
     browser_base_image_source: &str,
-) -> String {
+) -> Result<String, String> {
     use std::collections::BTreeMap;
 
     let node = node.trim();
     let mut vms: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut selected_pool: Option<StoragePool> = None;
     for spec in specs.iter().filter(|s| s.node.trim() == node) {
         let name = spec.name.trim();
         if name.is_empty() {
             continue;
+        }
+        if let Some(existing) = selected_pool {
+            if existing != spec.storage_pool {
+                return Err(format!(
+                    "workloads on node {node} select mixed storage pools ({} and {}); choose one Deployment storage target",
+                    existing.pool_name(),
+                    spec.storage_pool.pool_name()
+                ));
+            }
+        } else {
+            selected_pool = Some(spec.storage_pool);
         }
         let app = (spec.delivery_type == mackes_mesh_types::cloud::DeliveryType::AppVm)
             .then(|| spec.app.as_ref())
@@ -86,15 +103,17 @@ pub(crate) fn render_tfvars(
             }),
         );
     }
+    let pool = selected_pool.unwrap_or(StoragePool::default()).pool_name();
     let doc = serde_json::json!({
         TFVARS_LIBVIRT_URI: libvirt_uri,
+        TFVARS_POOL: pool,
         TFVARS_VMS: vms,
         TFVARS_BROWSER_BASE_IMAGE_SOURCE: browser_base_image_source,
     });
     // Pretty so a persisted tfvars.json reads cleanly + diffs sanely; falls back to
     // a compact form only if pretty-printing somehow fails (it cannot for this
     // shape, but we never `unwrap`).
-    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string())
+    Ok(serde_json::to_string_pretty(&doc).unwrap_or_else(|_| doc.to_string()))
 }
 
 /// Parse the newline-delimited JSON stream `tofu plan -json` emits into the neutral
@@ -161,6 +180,7 @@ mod tests {
             vcpu: 2,
             memory_mb: 2048,
             disk_gb: 20,
+            storage_pool: mackes_mesh_types::cloud::StoragePool::default(),
             image: None,
             image_digest: None,
             network_isolation: false,
@@ -182,9 +202,11 @@ mod tests {
             &specs,
             "qemu:///system",
             super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
-        );
+        )
+        .expect("uniform storage target renders");
         let v: serde_json::Value = serde_json::from_str(&doc).expect("valid json");
         assert_eq!(v[TFVARS_LIBVIRT_URI], "qemu:///system");
+        assert_eq!(v[TFVARS_POOL], "mde-vms");
         assert_eq!(
             v[TFVARS_BROWSER_BASE_IMAGE_SOURCE],
             super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE
@@ -219,13 +241,15 @@ mod tests {
                 &a,
                 "qemu:///system",
                 super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
-            ),
+            )
+            .expect("first render"),
             render_tfvars(
                 "n",
                 &b,
                 "qemu:///system",
                 super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
-            ),
+            )
+            .expect("second render"),
             "the map is name-sorted so a re-render is byte-identical"
         );
     }
@@ -251,7 +275,8 @@ mod tests {
             &[spec],
             "qemu:///system",
             super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
-        ))
+        )
+        .expect("app storage target renders"))
         .expect("valid tfvars");
         let app = &value[TFVARS_VMS]["appvm-writer"]["app"];
         assert_eq!(app["app_id"], "org.example.Writer");
@@ -276,7 +301,8 @@ mod tests {
             &[spec],
             "qemu:///system",
             "/srv/browser/disk.qcow2",
-        ))
+        )
+        .expect("browser storage target renders"))
         .expect("valid tfvars");
 
         assert_eq!(

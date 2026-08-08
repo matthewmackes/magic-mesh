@@ -14,7 +14,7 @@ use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
-use mde_collab_types::value::{AlertActionKind, CallParticipantState, TransferState};
+use mde_collab_types::value::{AlertActionKind, CallParticipantState, FileRef, TransferState};
 use mde_collab_types::{ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
 
 /// The total, deterministic sort key that orders a merged multi-node log:
@@ -121,6 +121,19 @@ pub struct TransferAgg {
     pub state: TransferState,
 }
 
+/// One file reference's validation facts.
+#[derive(Debug, Clone)]
+pub struct FileAgg {
+    /// Space containing this reference.
+    pub space: SpaceId,
+    /// Whether the latest canonical event leaves the reference linked.
+    pub present: bool,
+    /// Exact current content-addressed metadata.
+    pub reference: FileRef,
+    /// Signed event creation time used as the optimistic generation token.
+    pub generation: i64,
+}
+
 /// The folded aggregate.
 #[derive(Debug, Default, Clone)]
 pub struct DomainState {
@@ -136,8 +149,8 @@ pub struct DomainState {
     pub tasks: BTreeMap<EventId, TaskAgg>,
     /// Documents → their space.
     pub documents: BTreeMap<DocumentId, SpaceId>,
-    /// File references → (space, currently-present).
-    pub files: BTreeMap<FileRefId, (SpaceId, bool)>,
+    /// File references and their exact current generation facts.
+    pub files: BTreeMap<FileRefId, FileAgg>,
     /// Transfers by id.
     pub transfers: BTreeMap<TransferId, TransferAgg>,
     /// Calls by id.
@@ -375,12 +388,20 @@ impl DomainState {
             CollabEventKind::DocumentUpdated { .. }
             | CollabEventKind::ReviewRequested { .. }
             | CollabEventKind::ReviewSubmitted { .. } => {}
-            CollabEventKind::FileLinked { file, .. } => {
-                self.files.insert(*file, (space_id, true));
+            CollabEventKind::FileLinked { file, reference } => {
+                self.files.insert(
+                    *file,
+                    FileAgg {
+                        space: space_id,
+                        present: true,
+                        reference: reference.clone(),
+                        generation: env.created_unix_ms,
+                    },
+                );
             }
             CollabEventKind::FileUnlinked { file } => {
                 if let Some(f) = self.files.get_mut(file) {
-                    f.1 = false;
+                    f.present = false;
                 }
             }
             CollabEventKind::TransferStarted { transfer, .. } => {

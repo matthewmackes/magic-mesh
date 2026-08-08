@@ -59,13 +59,13 @@ fn container_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadR
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Restart", false).clicked() {
-                state.issue_lifecycle_direct("container-restart", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("container-restart", &row.node, &row.name, row.delivery_type, &row.name);
             }
             if row_button(ui, "Logs", false).clicked() {
-                state.issue_lifecycle_direct("container-logs", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("container-logs", &row.node, &row.name, row.delivery_type, &row.name);
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_lifecycle_direct("container-destroy", &row.node, &row.name, &row.name);
+                state.issue_workload_direct("container-destroy", &row.node, &row.name, row.delivery_type, &row.name);
             }
         });
     });
@@ -153,7 +153,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, DeliveryView::ServiceContainer.icon(), Style::ICON_S);
+            carbon_icon(ui, DeliveryView::ServiceContainer.icon(), Style::ICON_M);
         });
         ui.add_space(Style::SP_XS);
         ui.label(

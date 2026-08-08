@@ -302,7 +302,7 @@ impl RouterRegistryWorker {
             let now = Instant::now();
             let prev_body = last.as_ref().map(|(b, _)| b.as_str());
             let prev_at = last.as_ref().map(|(_, at)| *at);
-            if crate::workers::compute_registry::should_publish(
+            if crate::workers::runtime_probe::should_publish(
                 prev_body,
                 &body,
                 prev_at,

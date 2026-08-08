@@ -42,6 +42,9 @@ use crate::telemetry::{health_state_from_age, heartbeat_path, HealthState, Heart
 /// cycle + one reconcile tick). Matches OV-7.a's user-story
 /// "noticed without polling" promise.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum deterministic spread before the first reconcile pass. The first
+/// pass still occurs no later than the normal five-second deadline.
+pub const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
 
 /// Worker handle. Cheap to construct; the SQLite handle is
 /// opened lazily inside `tick_once` so a transient
@@ -112,11 +115,17 @@ impl Worker for HealthReconcilerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // Keep the old no-immediate-pass behavior, but spread the first
+        // expensive SQLite/etcd/filesystem reconciliation across hosts. The
+        // subtraction keeps the first pass no later than the normal cadence,
+        // preserving the ≤15 s health-transition contract.
+        let phase = initial_phase(&self.local_node_id, self.tick);
+        let first_delay = self.tick.saturating_sub(phase);
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(first_delay) => {}
+        }
         let mut interval = tokio::time::interval(self.tick);
-        // First tick fires immediately; skip it so a freshly
-        // started worker doesn't reconcile against an empty
-        // heartbeat snapshot.
-        interval.tick().await;
         loop {
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
@@ -341,6 +350,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Return a stable bounded phase for the first expensive reconcile pass.
+/// FNV-1a is sufficient here because this is scheduling spread, not security.
+fn initial_phase(local_node_id: &str, tick: Duration) -> Duration {
+    let window_ms = tick.as_millis().min(MAX_INITIAL_PHASE.as_millis());
+    if local_node_id.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in local_node_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis((u128::from(hash) % (window_ms + 1)) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +541,17 @@ mod tests {
             TICK_INTERVAL.as_secs(),
             HEARTBEAT_INTERVAL_S,
         );
+    }
+
+    #[test]
+    fn initial_phase_is_stable_bounded_and_preserves_deadline() {
+        let phase = initial_phase("peer:seat15", TICK_INTERVAL);
+        assert_eq!(phase, initial_phase("peer:seat15", TICK_INTERVAL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert!(TICK_INTERVAL.saturating_sub(phase) >= TICK_INTERVAL - MAX_INITIAL_PHASE);
+        assert_eq!(initial_phase("", TICK_INTERVAL), Duration::ZERO);
+        let short = Duration::from_millis(100);
+        assert!(initial_phase("peer:seat15", short) <= short);
     }
 
     #[test]

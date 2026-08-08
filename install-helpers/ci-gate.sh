@@ -27,6 +27,9 @@
 #                        (expectations: --expected-revision SHA
 #                         --expected-job-id ID --expected-build-host HOST
 #                         --expected-build-slot SLOT)
+#   ci-gate.sh bind-release INPUT [STATUS]
+#                        bind caller-supplied final release descriptors into the
+#                        authenticated gate log and refresh its status digest
 #   ci-gate.sh poll      run only if origin/master advanced past the last-gated SHA
 #                        (the master-push trigger — cheap no-op when unchanged)
 #   ci-gate.sh liveness  alert if the gate hasn't produced a result within N days
@@ -52,7 +55,13 @@ STATUS_JSON="$STATE_DIR/ci-gate-status.json"
 LAST_SHA_FILE="$STATE_DIR/ci-gate-last-sha"
 MARKER="$STATE_DIR/ci-gate-last-run"      # mtime = last COMPLETED gate run
 LOG="$STATE_DIR/ci-gate.log"
+STATE_LOCK="$STATE_DIR/ci-gate.lock"
 mkdir -p "$STATE_DIR"
+
+# A release binding is intentionally small: it is a descriptor set, never an
+# artifact transport. Bounding it also makes sparse/hostile inputs cheap to
+# reject before jq parses them.
+MAX_RELEASE_BINDING_BYTES=$((1024 * 1024))
 
 # Route EVERY stage to BigBoy (memory: "BigBoy takes the heaviest builds"; it is
 # the 12-vCPU long-pole node) on a dedicated warm CI slot so the gate keeps its
@@ -86,6 +95,7 @@ POLICY_LINTS=(
   lint-brand-identity.sh
   lint-shared-substrate.sh
   lint-doc-supersession.sh
+  lint-workload-authority.sh
   lint-worklist.sh
 )
 POLICY_SELF_TESTS=(
@@ -93,6 +103,7 @@ POLICY_SELF_TESTS=(
   lint-layered-tiers.sh
   lint-brand-identity.sh
   lint-doc-supersession.sh
+  lint-workload-authority.sh
   lint-worklist.sh
 )
 POLICY_ROOT="$HERE"
@@ -117,6 +128,32 @@ derive_job_id() {
   else
     printf 'ci-gate:%s:%s:%s\n' "$SHA" "$MCNF_BUILD_HOST" "$MCNF_BUILD_SLOT"
   fi
+}
+
+# Serialize writers of the digest-bound log/status pair. A crash between the
+# two atomic renames can only leave a digest mismatch, which is fail-closed; the
+# next release must rerun the gate rather than guessing how to repair evidence.
+with_state_lock() {
+  local lock_fd rc
+  command -v flock >/dev/null 2>&1 || {
+    echo "ci-gate: state updates require flock" >&2
+    return 1
+  }
+  if [ -e "$STATE_LOCK" ] && { [ ! -f "$STATE_LOCK" ] || [ -L "$STATE_LOCK" ]; }; then
+    echo "ci-gate: state lock is not a regular, non-symlink file: $STATE_LOCK" >&2
+    return 1
+  fi
+  exec {lock_fd}>"$STATE_LOCK" || return 1
+  if ! flock -n "$lock_fd"; then
+    echo "ci-gate: another gate state writer is active" >&2
+    exec {lock_fd}>&-
+    return 1
+  fi
+  "$@"
+  rc=$?
+  flock -u "$lock_fd" || rc=1
+  exec {lock_fd}>&-
+  return "$rc"
 }
 
 # bus_publish <topic> <json-body> — best-effort, identical contract to
@@ -327,6 +364,143 @@ cmd_policy() {
   run_policy_stage
 }
 
+# cmd_bind_release INPUT [STATUS] — production publisher seam for schema-5
+# required-check evidence. INPUT is the exact canonical payload consumed by
+# release-evidence.sh: the release flow supplies the final revision and sorted
+# artifact descriptors plus the farm identity. This command never discovers,
+# rewrites, or invents artifacts.
+cmd_bind_release() {
+  local input status input_size canonical revision job_id build_host build_slot
+  local recorded_revision recorded_job recorded_host recorded_slot status_dir log
+  local binding binding_line binding_count status_before log_before staging proposed_digest
+  local rc=0
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+    echo "ci-gate: bind-release requires INPUT and accepts one optional STATUS path" >&2
+    return 1
+  }
+  input="$1"
+  status="${2:-$STATUS_JSON}"
+  [ -f "$input" ] && [ ! -L "$input" ] || {
+    echo "ci-gate: release binding input is not a regular, non-symlink file: $input" >&2
+    return 1
+  }
+  input_size="$(stat -c '%s' -- "$input" 2>/dev/null || true)"
+  [[ "$input_size" =~ ^[0-9]+$ ]] && [ "$input_size" -gt 0 ] \
+    && [ "$input_size" -le "$MAX_RELEASE_BINDING_BYTES" ] || {
+      echo "ci-gate: release binding input must be 1..$MAX_RELEASE_BINDING_BYTES bytes: $input" >&2
+      return 1
+    }
+  command -v jq >/dev/null 2>&1 || {
+    echo "ci-gate: bind-release requires jq" >&2
+    return 1
+  }
+  jq -e '
+    def identity:
+      (type == "string") and (length > 0) and (length <= 255) and
+      test("^[^[:space:][:cntrl:]]+$");
+    (type == "object") and
+    (keys == ["artifacts", "farm", "schema_version", "source_commit"]) and
+    (.schema_version == 1) and
+    (.source_commit | type == "string" and test("^([0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$")) and
+    (.artifacts | type == "array" and length > 0 and length <= 1024 and
+      all(.[];
+        (type == "object") and
+        (keys == ["path", "sha256", "size_bytes"]) and
+        (.path | type == "string" and length > 0 and length <= 4096 and
+          (test("[[:cntrl:]]") | not)) and
+        (.size_bytes | type == "number" and floor == . and . >= 0) and
+        (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+      (. == (sort_by(.path))) and
+      ((map(.path) | unique | length) == length)) and
+    (.farm | type == "object" and
+      (keys == ["build_host", "build_slot", "job_id"]) and
+      (.job_id | identity) and
+      (.build_host | identity) and
+      (.build_slot | identity))
+  ' "$input" >/dev/null 2>&1 || {
+    echo "ci-gate: malformed, incomplete, unsorted, or duplicate release binding input: $input" >&2
+    return 1
+  }
+  canonical="$(jq -cS . "$input")" || return 1
+  revision="$(jq -r '.source_commit' <<<"$canonical")"
+  job_id="$(jq -r '.farm.job_id' <<<"$canonical")"
+  build_host="$(jq -r '.farm.build_host' <<<"$canonical")"
+  build_slot="$(jq -r '.farm.build_slot' <<<"$canonical")"
+
+  verify_status "$status" >/dev/null || {
+    echo "ci-gate: bind-release requires an unchanged verified green status artifact" >&2
+    return 1
+  }
+  recorded_revision="$(jq -r '.sha' "$status")"
+  recorded_job="$(jq -r '.job_id' "$status")"
+  recorded_host="$(jq -r '.build_host' "$status")"
+  recorded_slot="$(jq -r '.build_slot' "$status")"
+  [ "$revision" = "$recorded_revision" ] \
+    && [ "$job_id" = "$recorded_job" ] \
+    && [ "$build_host" = "$recorded_host" ] \
+    && [ "$build_slot" = "$recorded_slot" ] || {
+      echo "ci-gate: release binding revision or farm job/host/slot does not match the gate status" >&2
+      return 1
+    }
+
+  status_dir="$(cd -- "$(dirname -- "$status")" && pwd -P)" || return 1
+  log="$status_dir/ci-gate.log"
+  binding_count="$(grep -Ec '^  release-evidence-binding([[:space:]]|$)' "$log" || true)"
+  [ "$binding_count" -eq 0 ] || {
+    echo "ci-gate: gate log already contains release binding input; duplicate publication rejected" >&2
+    return 1
+  }
+  binding="$(printf '%s\n' "$canonical" | sha256sum | awk '{print $1}')"
+  binding_line="  release-evidence-binding sha256=$binding"
+  status_before="$(file_sha256 "$status")" || return 1
+  log_before="$(file_sha256 "$log")" || return 1
+
+  staging="$(mktemp -d "$status_dir/.ci-gate-bind.XXXXXX")" || return 1
+  cp -- "$log" "$staging/ci-gate.log" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$binding_line" >>"$staging/ci-gate.log" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    proposed_digest="$(file_sha256 "$staging/ci-gate.log")" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    jq -S --arg digest "$proposed_digest" '.evidence.gate_log.sha256 = $digest' \
+      "$status" >"$staging/status.json" || rc=1
+    chmod --reference="$status" "$staging/status.json" 2>/dev/null || true
+  fi
+  if [ "$rc" -eq 0 ]; then
+    verify_status "$staging/status.json" >/dev/null || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    [ "$(file_sha256 "$status")" = "$status_before" ] \
+      && [ "$(file_sha256 "$log")" = "$log_before" ] || {
+        echo "ci-gate: gate evidence changed while release binding was prepared" >&2
+        rc=1
+      }
+  fi
+  if [ "$rc" -eq 0 ]; then
+    mv -f -- "$staging/ci-gate.log" "$log" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    mv -f -- "$staging/status.json" "$status" || rc=1
+  fi
+  rm -f -- "$staging/ci-gate.log" "$staging/status.json"
+  rmdir -- "$staging" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || {
+    echo "ci-gate: failed to publish release binding; evidence remains fail-closed" >&2
+    return 1
+  }
+  verify_status "$status" >/dev/null || {
+    echo "ci-gate: published release binding did not verify; evidence remains fail-closed" >&2
+    return 1
+  }
+  [ "$(grep -Fxc -- "$binding_line" "$log" || true)" -eq 1 ] || {
+    echo "ci-gate: published release binding is not unique in the authenticated log" >&2
+    return 1
+  }
+  echo "ci-gate: bound release evidence $binding for $revision on $build_host/$build_slot"
+}
+
 # verify_status — validate the promotion-facing artifact emitted by finish.
 # A status file is not authoritative merely because it is parseable: it must
 # describe a green result for every stage, include observed test output, bind to
@@ -338,6 +512,7 @@ verify_status() {
   local file expected_revision="" expected_job_id="" expected_build_host="" expected_build_slot=""
   local log expected actual sha_prefix sha file_dir log_name test_summary
   local log_passed log_failed stage recorded_short_sha recorded_job_id recorded_host recorded_slot
+  local identity_line identity_count test_summary_count binding_count binding_valid_count
   [ "$#" -ge 1 ] || {
     echo "ci-gate: verify requires a status artifact path" >&2
     return 1
@@ -387,7 +562,9 @@ verify_status() {
     (keys == ["alert", "build_host", "build_slot", "evidence", "failed_stage", "finished", "job_id", "overall", "sha", "short_sha", "source", "stages", "started", "tests_failed", "tests_passed"]) and
     (.overall == "green") and (.alert == false) and (.failed_stage == "") and
     (.source == "ci-gate") and
-    (.sha | type == "string" and test("^[0-9a-fA-F]{40,64}$")) and
+    # A promotion revision is a Git object identity, not an arbitrary-length
+    # hexadecimal token. Accept the repository SHA-1 and SHA-256 forms only.
+    (.sha | type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")) and
     (.short_sha | type == "string" and length >= 7 and startswith($sha_prefix)) and
     (.job_id | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
     (.build_host | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
@@ -443,15 +620,19 @@ verify_status() {
     echo "ci-gate: status build slot does not match expected farm slot" >&2
     return 1
   fi
-  grep -Fq "revision=$sha" "$log" || {
-    echo "ci-gate: gate log is not bound to the recorded revision" >&2
+  identity_line="  sha=$recorded_short_sha  revision=$sha  job_id=$recorded_job_id  host=$recorded_host (slot=$recorded_slot)"
+  identity_count="$(grep -Fxc -- "$identity_line" "$log" || true)"
+  [ "$identity_count" -eq 1 ] || {
+    echo "ci-gate: gate log must contain exactly one identity line bound to the recorded revision, job, host, and slot" >&2
     return 1
   }
-  grep -Fqx -- "  sha=$recorded_short_sha  revision=$sha  job_id=$recorded_job_id  host=$recorded_host (slot=$recorded_slot)" "$log" || {
-    echo "ci-gate: gate log is not bound to the recorded job, host, and slot" >&2
+  binding_count="$(grep -Ec '^  release-evidence-binding([[:space:]]|$)' "$log" || true)"
+  binding_valid_count="$(grep -Ec '^  release-evidence-binding sha256=[0-9a-f]{64}$' "$log" || true)"
+  [ "$binding_count" -eq "$binding_valid_count" ] && [ "$binding_valid_count" -le 1 ] || {
+    echo "ci-gate: gate log contains malformed or duplicate release binding input" >&2
     return 1
   }
-  [ "$(grep -Ec '^=== CI GATE SUMMARY .+ → green ===$' "$log")" -eq 1 ] || {
+  [ "$(grep -Ec '^=== CI GATE SUMMARY .+ → green ===$' "$log" || true)" -eq 1 ] || {
     echo "ci-gate: gate log has no completed green summary" >&2
     return 1
   }
@@ -460,12 +641,17 @@ verify_status() {
     return 1
   fi
   for stage in policy fmt clippy coverage; do
-    grep -Eq "^  ${stage}[[:space:]]+pass$" "$log" || {
+    [ "$(grep -Ec "^  ${stage}[[:space:]]+pass$" "$log" || true)" -eq 1 ] || {
       echo "ci-gate: gate log is missing the completed pass record for $stage" >&2
       return 1
     }
   done
-  test_summary="$(grep -E '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log" | tail -n 1)" || true
+  test_summary_count="$(grep -Ec '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log" || true)"
+  [ "$test_summary_count" -eq 1 ] || {
+    echo "ci-gate: gate log must contain exactly one completed test pass record" >&2
+    return 1
+  }
+  test_summary="$(grep -E '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log")"
   if [[ "$test_summary" =~ ^[[:space:]]+test[[:space:]]+pass[[:space:]]+\(([0-9]+)[[:space:]]+passed,[[:space:]]+([0-9]+)[[:space:]]+failed\)$ ]]; then
     log_passed="${BASH_REMATCH[1]}"
     log_failed="${BASH_REMATCH[2]}"
@@ -488,6 +674,15 @@ verify_status() {
 # constituent check fails and success only when all checks pass. Coreutils
 # true/false make this deterministic without modifying the checkout.
 cmd_self_test() {
+  local work status log log_digest rc
+  local binding_input expected_binding before_status before_log
+  local missing_input malformed_input symlink_input oversized_input duplicate_input
+  local unsorted_input incomplete_input malformed_descriptor_input hostile
+  local mismatch_revision mismatch_job mismatch_host mismatch_slot
+  local -a hostile_inputs=()
+  work="$(mktemp -d "${TMPDIR:-/tmp}/ci-gate-self-test.XXXXXX")"
+  trap 'rm -rf -- "$work"' RETURN
+  LOG="$work/policy.log"
   : > "$LOG"
   POLICY_ROOT=/bin
   POLICY_SELF_TESTS=()
@@ -502,9 +697,6 @@ cmd_self_test() {
     return 1
   fi
 
-  local work status log log_digest rc
-  work="$(mktemp -d "${TMPDIR:-/tmp}/ci-gate-self-test.XXXXXX")"
-  trap 'rm -rf -- "$work"' RETURN
   status="$work/status.json"
   log="$work/ci-gate.log"
 cat >"$log" <<'EOF'
@@ -642,6 +834,116 @@ EOF
     echo "ci-gate.sh: SELF-TEST FAILED — mismatched farm slot was accepted" >&2
     return 1
   }
+  local duplicate_identity duplicate_identity_digest
+  duplicate_identity="$work/duplicate-identity"
+  mkdir -p -- "$duplicate_identity"
+  cp -- "$log" "$duplicate_identity/ci-gate.log"
+  sed -n '2p' "$log" >>"$duplicate_identity/ci-gate.log"
+  duplicate_identity_digest="$(file_sha256 "$duplicate_identity/ci-gate.log")"
+  jq --arg digest "$duplicate_identity_digest" \
+    '.evidence.gate_log.sha256 = $digest' "$status" >"$duplicate_identity/status.json"
+  set +e
+  verify_status "$duplicate_identity/status.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — duplicated producer identity was accepted" >&2
+    return 1
+  }
+
+  binding_input="$work/release-binding.json"
+  jq -nS \
+    --arg revision 0123456789abcdef0123456789abcdef01234567 \
+    '{schema_version:1,source_commit:$revision,
+      artifacts:[
+        {path:"artifacts/a.rpm",size_bytes:17,sha256:("a" * 64)},
+        {path:"artifacts/b.raw",size_bytes:31,sha256:("b" * 64)}],
+      farm:{job_id:"self-test-job",build_host:"172.20.0.130",build_slot:"self-test-slot"}}' \
+    >"$binding_input"
+  missing_input="$work/missing-binding.json"
+  malformed_input="$work/malformed-binding.json"
+  printf '{not-json\n' >"$malformed_input"
+  symlink_input="$work/symlink-binding.json"
+  ln -s -- "$binding_input" "$symlink_input"
+  oversized_input="$work/oversized-binding.json"
+  truncate -s $((MAX_RELEASE_BINDING_BYTES + 1)) "$oversized_input"
+  duplicate_input="$work/duplicate-binding.json"
+  jq '.artifacts += [.artifacts[0]] | .artifacts |= sort_by(.path)' \
+    "$binding_input" >"$duplicate_input"
+  unsorted_input="$work/unsorted-binding.json"
+  jq '.artifacts |= reverse' "$binding_input" >"$unsorted_input"
+  incomplete_input="$work/incomplete-binding.json"
+  jq 'del(.farm)' "$binding_input" >"$incomplete_input"
+  malformed_descriptor_input="$work/malformed-descriptor-binding.json"
+  jq '.artifacts[0].sha256 = "not-a-digest"' \
+    "$binding_input" >"$malformed_descriptor_input"
+  mismatch_revision="$work/mismatch-revision-binding.json"
+  jq '.source_commit = "ffffffffffffffffffffffffffffffffffffffff"' \
+    "$binding_input" >"$mismatch_revision"
+  mismatch_job="$work/mismatch-job-binding.json"
+  jq '.farm.job_id = "wrong-job"' "$binding_input" >"$mismatch_job"
+  mismatch_host="$work/mismatch-host-binding.json"
+  jq '.farm.build_host = "wrong-host"' "$binding_input" >"$mismatch_host"
+  mismatch_slot="$work/mismatch-slot-binding.json"
+  jq '.farm.build_slot = "wrong-slot"' "$binding_input" >"$mismatch_slot"
+  hostile_inputs=(
+    "$missing_input" "$malformed_input" "$symlink_input" "$oversized_input"
+    "$duplicate_input" "$unsorted_input" "$incomplete_input"
+    "$malformed_descriptor_input" "$mismatch_revision" "$mismatch_job"
+    "$mismatch_host" "$mismatch_slot"
+  )
+  before_status="$(file_sha256 "$status")"
+  before_log="$(file_sha256 "$log")"
+  for hostile in "${hostile_inputs[@]}"; do
+    set +e
+    cmd_bind_release "$hostile" "$status" >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || {
+      echo "ci-gate.sh: SELF-TEST FAILED — hostile release binding input was accepted: $hostile" >&2
+      return 1
+    }
+    [ "$(file_sha256 "$status")" = "$before_status" ] \
+      && [ "$(file_sha256 "$log")" = "$before_log" ] || {
+        echo "ci-gate.sh: SELF-TEST FAILED — rejected release binding changed gate evidence: $hostile" >&2
+        return 1
+      }
+  done
+  set +e
+  cmd_bind_release >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — missing release binding argument was accepted" >&2
+    return 1
+  }
+
+  expected_binding="$(jq -cS . "$binding_input" | sha256sum | awk '{print $1}')"
+  cmd_bind_release "$binding_input" "$status" >/dev/null || {
+    echo "ci-gate.sh: SELF-TEST FAILED — valid final release binding was rejected" >&2
+    return 1
+  }
+  [ "$(grep -Fxc -- "  release-evidence-binding sha256=$expected_binding" "$log" || true)" -eq 1 ] \
+    && [ "$(grep -Ec '^  release-evidence-binding sha256=[0-9a-f]{64}$' "$log" || true)" -eq 1 ] || {
+      echo "ci-gate.sh: SELF-TEST FAILED — final release binding was not emitted exactly once" >&2
+      return 1
+    }
+  verify_status "$status" >/dev/null || {
+    echo "ci-gate.sh: SELF-TEST FAILED — bound gate status did not authenticate its updated log" >&2
+    return 1
+  }
+  before_status="$(file_sha256 "$status")"
+  before_log="$(file_sha256 "$log")"
+  set +e
+  cmd_bind_release "$binding_input" "$status" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] \
+    && [ "$(file_sha256 "$status")" = "$before_status" ] \
+    && [ "$(file_sha256 "$log")" = "$before_log" ] || {
+      echo "ci-gate.sh: SELF-TEST FAILED — duplicate release binding was accepted or changed evidence" >&2
+      return 1
+    }
   printf 'tampered\n' >>"$log"
   set +e
   verify_status "$status" >/dev/null 2>&1
@@ -651,7 +953,7 @@ EOF
     echo "ci-gate.sh: SELF-TEST FAILED — tampered gate log was accepted" >&2
     return 1
   }
-  echo "ci-gate.sh: self-test passed — policy failures and evidence tampering propagate"
+  echo "ci-gate.sh: self-test passed — policy failures, authenticated status, and fail-closed release binding propagate"
 }
 
 # cmd_poll — the master-push trigger. Run the gate only when origin/master has
@@ -706,13 +1008,16 @@ cmd_liveness() {
 usage() { sed -n '/^# Usage:/,/^# Env overrides:/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-run}" in
-  run)      cmd_run ;;
-  policy)   cmd_policy ;;
+  run)      with_state_lock cmd_run ;;
+  policy)   with_state_lock cmd_policy ;;
   --self-test) cmd_self_test ;;
   verify)
     verify_status "${@:2}"
     ;;
-  poll)     cmd_poll ;;
+  bind-release)
+    with_state_lock cmd_bind_release "${@:2}"
+    ;;
+  poll)     with_state_lock cmd_poll ;;
   liveness) cmd_liveness ;;
   -h | --help | help) usage ;;
   *) usage; exit 1 ;;

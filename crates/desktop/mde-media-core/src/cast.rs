@@ -24,7 +24,7 @@
 //!   `LiveServiceApply`/`IntegrationGated` posture.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,18 @@ pub const MESH_MEDIA_DEFAULT_PORT: u16 = 4533;
 /// The per-connection timeout for a live cast probe / push — kept short so an absent
 /// renderer fails fast to the honest gate rather than hanging the surface.
 pub const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Maximum number of renderer records one discovery fold may retain.
+pub const MAX_CAST_TARGETS: usize = 64;
+/// Maximum SSDP response bytes collected from one probe.
+pub const MAX_SSDP_RESPONSE_BYTES: usize = 64 * 1024;
+/// Maximum bytes retained for one discovery field.
+const MAX_DISCOVERY_FIELD_BYTES: usize = 1024;
+/// Maximum input parsed by a pure discovery fold.
+const MAX_DISCOVERY_INPUT_BYTES: usize = MAX_SSDP_RESPONSE_BYTES;
+/// Maximum seek position accepted by a network cast request.
+const MAX_CAST_POSITION_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+/// Maximum bytes accepted for media metadata forwarded to a renderer.
+const MAX_CAST_REQUEST_TEXT_BYTES: usize = 8 * 1024;
 
 // ── the discovered target ──────────────────────────────────────────────────────
 
@@ -153,11 +165,17 @@ pub trait RendererDiscovery {
 pub fn mesh_render_targets(peers: &[PeerRecord]) -> Vec<CastTarget> {
     let mut out = Vec::new();
     for peer in peers {
+        if out.len() == MAX_CAST_TARGETS {
+            break;
+        }
+        if !valid_discovery_field(&peer.hostname) {
+            continue;
+        }
         let Some(ip) = peer
             .overlay_ip
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| s.parse::<IpAddr>().is_ok())
         else {
             continue;
         };
@@ -165,12 +183,21 @@ pub fn mesh_render_targets(peers: &[PeerRecord]) -> Vec<CastTarget> {
         if !peer.media && media_service.is_none() {
             continue; // not a media-capable node
         }
-        let port = media_service.map_or(MESH_MEDIA_DEFAULT_PORT, |s| s.port);
+        let port = match media_service {
+            Some(service) if service.port != 0 => service.port,
+            Some(_) => continue,
+            None => MESH_MEDIA_DEFAULT_PORT,
+        };
+        let location = if ip.contains(':') {
+            format!("[{ip}]:{port}")
+        } else {
+            format!("{ip}:{port}")
+        };
         out.push(CastTarget {
             kind: CastKind::MeshNode,
             id: peer.hostname.clone(),
             name: peer.hostname.clone(),
-            location: format!("{ip}:{port}"),
+            location,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -187,7 +214,16 @@ pub fn mesh_render_targets(peers: &[PeerRecord]) -> Vec<CastTarget> {
 #[must_use]
 pub fn parse_ssdp_responses(raw: &str) -> Vec<CastTarget> {
     let mut out = Vec::new();
-    for block in raw.split("\r\n\r\n").flat_map(|b| b.split("\n\n")) {
+    for block in bounded_discovery_input(raw)
+        .split("\r\n\r\n")
+        .flat_map(|b| b.split("\n\n"))
+    {
+        if out.len() == MAX_CAST_TARGETS {
+            break;
+        }
+        if parse_http_status(block) != Some(200) {
+            continue;
+        }
         let mut location = None;
         let mut usn = None;
         let mut server = None;
@@ -198,12 +234,18 @@ pub fn parse_ssdp_responses(raw: &str) -> Vec<CastTarget> {
             };
             let key = key.trim().to_ascii_uppercase();
             let value = value.trim();
+            if value.len() > MAX_DISCOVERY_FIELD_BYTES {
+                continue;
+            }
             match key.as_str() {
                 "LOCATION" => location = Some(value.to_owned()),
                 "USN" => usn = Some(value.to_owned()),
                 "SERVER" => server = Some(value.to_owned()),
                 "ST" | "NT" => {
-                    if value.contains("MediaRenderer") {
+                    if value
+                        .split(':')
+                        .any(|part| part.eq_ignore_ascii_case("MediaRenderer"))
+                    {
                         is_renderer = true;
                     }
                 }
@@ -213,12 +255,23 @@ pub fn parse_ssdp_responses(raw: &str) -> Vec<CastTarget> {
         if !is_renderer {
             continue;
         }
-        if let Some(location) = location {
+        if let Some(location) =
+            location.filter(|value| value.starts_with("http://") && parse_endpoint(value).is_some())
+        {
             let id = usn.unwrap_or_else(|| location.clone());
+            if !valid_discovery_field(&id) {
+                continue;
+            }
+            let name = server
+                .filter(|value| valid_discovery_field(value))
+                .unwrap_or_else(|| id.clone());
+            if out.iter().any(|target: &CastTarget| target.id == id) {
+                continue;
+            }
             out.push(CastTarget {
                 kind: CastKind::DlnaUpnp,
                 id: id.clone(),
-                name: server.unwrap_or(id),
+                name,
                 location,
             });
         }
@@ -234,34 +287,58 @@ pub fn parse_ssdp_responses(raw: &str) -> Vec<CastTarget> {
 #[must_use]
 pub fn parse_chromecast_records(raw: &str) -> Vec<CastTarget> {
     let mut out = Vec::new();
-    for block in raw.split("\r\n\r\n").flat_map(|b| b.split("\n\n")) {
+    for block in bounded_discovery_input(raw)
+        .split("\r\n\r\n")
+        .flat_map(|b| b.split("\n\n"))
+    {
+        if out.len() == MAX_CAST_TARGETS {
+            break;
+        }
         let mut id = None;
         let mut name = None;
         let mut host = None;
         let mut port = None;
+        let mut invalid_port = false;
         for line in block.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             let key = key.trim().to_ascii_lowercase();
             let value = value.trim().to_owned();
+            if value.len() > MAX_DISCOVERY_FIELD_BYTES {
+                continue;
+            }
             match key.as_str() {
                 "id" => id = Some(value),
                 "fn" => name = Some(value),
                 "host" | "address" => host = Some(value),
-                "port" => port = value.parse::<u16>().ok(),
+                "port" => {
+                    port = value.parse::<u16>().ok().filter(|port| *port != 0);
+                    invalid_port = port.is_none();
+                }
                 _ => {}
             }
         }
         let (Some(id), Some(host)) = (id, host) else {
             continue;
         };
+        if invalid_port || !valid_discovery_field(&id) || !valid_discovery_field(&host) {
+            continue;
+        }
         let port = port.unwrap_or(8009); // the Chromecast control port
+        let location = format!("{host}:{port}");
+        if parse_endpoint(&location).is_none()
+            || out.iter().any(|target: &CastTarget| target.id == id)
+        {
+            continue;
+        }
         out.push(CastTarget {
             kind: CastKind::Chromecast,
             id: id.clone(),
-            name: name.unwrap_or(id),
-            location: format!("{host}:{port}"),
+            name: name
+                .filter(|value| valid_discovery_field(value))
+                .unwrap_or_else(|| id.clone()),
+            location,
         });
     }
     out
@@ -327,11 +404,40 @@ impl SsdpProbe {
         let mut buf = [0_u8; 2048];
         // Read replies until the socket read times out (the honest end of discovery).
         while let Ok((n, _addr)) = socket.recv_from(&mut buf) {
-            gathered.push_str(&String::from_utf8_lossy(&buf[..n]));
+            let remaining = MAX_SSDP_RESPONSE_BYTES
+                .saturating_sub(gathered.len())
+                .saturating_sub(4);
+            if remaining == 0 {
+                break;
+            }
+            let accepted = n.min(remaining);
+            gathered.push_str(&String::from_utf8_lossy(&buf[..accepted]));
             gathered.push_str("\r\n\r\n");
+            if accepted < n {
+                break;
+            }
         }
         Ok(parse_ssdp_responses(&gathered))
     }
+}
+
+/// Keep pure discovery folds bounded even when called directly with hostile input.
+fn bounded_discovery_input(value: &str) -> &str {
+    if value.len() <= MAX_DISCOVERY_INPUT_BYTES {
+        return value;
+    }
+    let mut end = MAX_DISCOVERY_INPUT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// Validate a discovery identity/name before retaining it in the target list.
+fn valid_discovery_field(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_DISCOVERY_FIELD_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 /// Fold several discovery sources into one de-duplicated target list (by `id`).
@@ -340,6 +446,9 @@ pub fn discover_all(sources: &[&dyn RendererDiscovery]) -> Vec<CastTarget> {
     let mut out: Vec<CastTarget> = Vec::new();
     for source in sources {
         for target in source.discover() {
+            if out.len() == MAX_CAST_TARGETS {
+                return out;
+            }
             if !out.iter().any(|t| t.id == target.id) {
                 out.push(target);
             }
@@ -391,6 +500,25 @@ impl Caster for NetworkCaster {
         if req.media_url.trim().is_empty() {
             return Err(CastError::Invalid("no media is loaded to cast".to_owned()));
         }
+        if !valid_cast_text(&req.media_url)
+            || req
+                .title
+                .as_deref()
+                .is_some_and(|title| !valid_cast_text(title))
+        {
+            return Err(CastError::Invalid(
+                "cast media metadata contains control characters or exceeds the bounded limit"
+                    .to_owned(),
+            ));
+        }
+        if !req.position_secs.is_finite()
+            || req.position_secs.is_sign_negative()
+            || req.position_secs > MAX_CAST_POSITION_SECS
+        {
+            return Err(CastError::Invalid(
+                "cast resume position is outside the bounded finite range".to_owned(),
+            ));
+        }
         match target.kind {
             CastKind::DlnaUpnp => self.cast_dlna(target, req),
             CastKind::Chromecast => Err(CastError::Gated {
@@ -415,6 +543,7 @@ impl NetworkCaster {
         let description = self
             .http_roundtrip(&device, &http_request("GET", &device, &[], ""))
             .map_err(|e| CastError::Unreachable(e.to_string()))?;
+        expect_2xx(&description, "device description")?;
         let body = http_body(&description);
         let control = dlna_control_url(body, &device).ok_or(CastError::Gated {
             kind: "a DLNA/UPnP renderer",
@@ -440,6 +569,30 @@ impl NetworkCaster {
             .http_roundtrip(&control_ep, &play)
             .map_err(|e| CastError::Unreachable(e.to_string()))?;
         expect_2xx(&play_reply, "Play")?;
+
+        if req.position_secs > 0.0 {
+            let seek = http_request(
+                "POST",
+                &control_ep,
+                &soap_headers("Seek"),
+                &soap_seek(req.position_secs),
+            );
+            let seek_result = self
+                .http_roundtrip(&control_ep, &seek)
+                .map_err(|e| CastError::Unreachable(e.to_string()))
+                .and_then(|reply| expect_2xx(&reply, "Seek"));
+            if let Err(error) = seek_result {
+                // Play already started the renderer.  A rejected or lost Seek must
+                // not leave an unintended stream running after we report failure;
+                // Stop is best-effort because the original seek error is the useful
+                // result and the renderer may have gone away with it.
+                let stop = http_request("POST", &control_ep, &soap_headers("Stop"), &soap_stop());
+                if let Ok(stop_reply) = self.http_roundtrip(&control_ep, &stop) {
+                    let _ = expect_2xx(&stop_reply, "Stop");
+                }
+                return Err(error);
+            }
+        }
 
         Ok(CastOutcome {
             target: target.clone(),
@@ -478,11 +631,48 @@ impl NetworkCaster {
 
 /// A non-2xx SOAP reply is an honest [`CastError::Rejected`] naming the action.
 fn expect_2xx(reply: &str, action: &str) -> Result<(), CastError> {
+    if !http_response_complete(reply) {
+        return Err(CastError::Rejected(format!(
+            "{action} → incomplete HTTP response"
+        )));
+    }
     match parse_http_status(reply) {
         Some(code) if (200..300).contains(&code) => Ok(()),
         Some(code) => Err(CastError::Rejected(format!("{action} → HTTP {code}"))),
         None => Err(CastError::Rejected(format!("{action} → no HTTP status"))),
     }
+}
+
+/// Validate the response framing before treating a successful status as an accepted
+/// renderer action. A renderer that closes after a partial `Content-Length` must not
+/// look like a successful cast; this intentionally supports only the close-delimited
+/// or explicit-length responses produced by the raw TCP client.
+fn http_response_complete(response: &str) -> bool {
+    let Some((headers, body)) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+    else {
+        return false;
+    };
+
+    let mut content_length = None;
+    for line in headers.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let Ok(length) = value.trim().parse::<usize>() else {
+            return false;
+        };
+        if content_length.is_some_and(|previous| previous != length) {
+            return false;
+        }
+        content_length = Some(length);
+    }
+
+    content_length.map_or(true, |expected| body.len() == expected)
 }
 
 // ── the pure HTTP / SOAP builders + parsers (fixture-tested) ─────────────────────
@@ -504,7 +694,10 @@ pub struct Endpoint {
 /// raw-TCP path speaks plain HTTP, the DLNA control-channel norm).
 #[must_use]
 pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
-    let rest = url.trim();
+    if !valid_http_field(url) {
+        return None;
+    }
+    let rest = url;
     let rest = if let Some(r) = rest.strip_prefix("http://") {
         r
     } else if rest.starts_with("https://") {
@@ -518,11 +711,29 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
     if authority.is_empty() {
         return None;
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().ok()?),
-        None => (authority, 80),
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']')?;
+        let host = &bracketed[..close];
+        if host.parse::<IpAddr>().is_err() {
+            return None;
+        }
+        let suffix = &bracketed[close + 1..];
+        let port = if suffix.is_empty() {
+            80
+        } else {
+            suffix.strip_prefix(':')?.parse::<u16>().ok()?
+        };
+        (host, port)
+    } else if authority.matches(':').count() > 1 {
+        // An unbracketed IPv6 authority would be ambiguous with its port.
+        return None;
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()?),
+            None => (authority, 80),
+        }
     };
-    if host.is_empty() {
+    if host.is_empty() || port == 0 || !valid_http_field(host) || !valid_http_field(path) {
         return None;
     }
     Some(Endpoint {
@@ -536,6 +747,24 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
     })
 }
 
+/// Whether a media field can safely be transported in a bounded SOAP request.
+///
+/// The SOAP builder escapes XML metacharacters, but control characters are not valid
+/// XML 1.0 text and should never reach a renderer. Keeping the cap here also prevents
+/// a remote control caller from making an unbounded in-memory request.
+fn valid_cast_text(value: &str) -> bool {
+    value.len() <= MAX_CAST_REQUEST_TEXT_BYTES && !value.chars().any(char::is_control)
+}
+
+/// Raw HTTP fields must never contain controls or whitespace, which would otherwise
+/// let malformed discovery/control input alter the request line or headers.
+fn valid_http_field(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
 /// Resolve the `AVTransport` `controlURL` from a device-description XML, made absolute
 /// against `base`.
 ///
@@ -545,23 +774,47 @@ pub fn parse_endpoint(url: &str) -> Option<Endpoint> {
 /// `AVTransport` control URL.
 #[must_use]
 pub fn dlna_control_url(xml: &str, base: &Endpoint) -> Option<String> {
-    let anchor = xml.find("AVTransport")?;
-    // The <controlURL> for AVTransport is the first one at or after the service anchor.
-    let tail = &xml[anchor..];
-    let raw = between(tail, "<controlURL>", "</controlURL>")?;
+    if xml.len() > MAX_DISCOVERY_INPUT_BYTES {
+        return None;
+    }
+    let mut search = xml;
+    let raw = loop {
+        let anchor = search.find("AVTransport")?;
+        // Stay within this service block so a friendly name or another service cannot
+        // lend its controlURL to AVTransport.
+        let tail = &search[anchor..];
+        let service = tail
+            .split_once("</service>")
+            .map_or(tail, |(block, _)| block);
+        if let Some(raw) = between(service, "<controlURL>", "</controlURL>") {
+            break raw;
+        }
+        let advance = anchor + "AVTransport".len();
+        search = &search[advance..];
+    };
     let control = raw.trim();
     if control.is_empty() {
         return None;
     }
-    if control.starts_with("http://") || control.starts_with("https://") {
-        return Some(control.to_owned());
-    }
-    let path = if control.starts_with('/') {
+    let resolved = if control.starts_with("http://") || control.starts_with("https://") {
         control.to_owned()
     } else {
-        format!("/{control}")
+        let path = if control.starts_with('/') {
+            control.to_owned()
+        } else {
+            format!("/{control}")
+        };
+        let host = if base.host.contains(':') {
+            format!("[{}]", base.host)
+        } else {
+            base.host.clone()
+        };
+        format!("http://{host}:{}{path}", base.port)
     };
-    Some(format!("http://{}:{}{path}", base.host, base.port))
+    if parse_endpoint(&resolved).is_none() {
+        return None;
+    };
+    Some(resolved)
 }
 
 /// The substring between `open` and the next `close`, if both are present.
@@ -588,7 +841,13 @@ pub fn http_request(
     req.push(' ');
     req.push_str(&endpoint.path);
     req.push_str(" HTTP/1.1\r\nHost: ");
-    req.push_str(&endpoint.host);
+    if endpoint.host.contains(':') {
+        req.push('[');
+        req.push_str(&endpoint.host);
+        req.push(']');
+    } else {
+        req.push_str(&endpoint.host);
+    }
     req.push(':');
     req.push_str(&endpoint.port.to_string());
     req.push_str("\r\n");
@@ -652,6 +911,40 @@ s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
 </u:Play>\
 </s:Body></s:Envelope>"
         .to_owned()
+}
+
+/// The `Stop` SOAP envelope used to roll back a cast whose resume seek failed.
+#[must_use]
+pub fn soap_stop() -> String {
+    "<?xml version=\"1.0\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body>\
+<u:Stop xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<InstanceID>0</InstanceID>\
+</u:Stop>\
+</s:Body></s:Envelope>"
+        .to_owned()
+}
+
+/// Build the DLNA `Seek` envelope for a finite resume position.
+#[must_use]
+pub fn soap_seek(position_secs: f64) -> String {
+    let total = position_secs.floor() as u64;
+    let hours = total / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    let target = format!("{hours:02}:{minutes:02}:{seconds:02}");
+    format!(
+        "<?xml version=\"1.0\"?>\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+<s:Body>\
+<u:Seek xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>\
+</u:Seek>\
+</s:Body></s:Envelope>"
+    )
 }
 
 /// Minimal XML-attribute/text escaping for the SOAP payload.
@@ -731,6 +1024,26 @@ mod tests {
         assert!(mesh_render_targets(&[]).is_empty());
     }
 
+    #[test]
+    fn mesh_discovery_refuses_invalid_identity_ip_and_port() {
+        let mut invalid_identity = peer("bad\nnode", Some("10.0.0.1"), true);
+        let mut invalid_ip = peer("bad-ip", Some("not-an-ip"), true);
+        let mut invalid_port = peer("bad-port", Some("10.0.0.2"), true);
+        invalid_port.descriptors = Some(ServiceDescriptors {
+            media: vec![MediaService {
+                name: "renderer".to_owned(),
+                port: 0,
+            }],
+            ..ServiceDescriptors::default()
+        });
+        invalid_identity.hostname = "bad\nnode".to_owned();
+        invalid_ip.hostname = "bad-ip".to_owned();
+        assert!(mesh_render_targets(&[invalid_identity, invalid_ip, invalid_port]).is_empty());
+
+        let ipv6 = mesh_render_targets(&[peer("v6", Some("fd00::7"), true)]);
+        assert_eq!(ipv6[0].location, "[fd00::7]:4533");
+    }
+
     // ── SSDP + Chromecast parsers ───────────────────────────────────────────────
 
     #[test]
@@ -757,6 +1070,43 @@ USN: uuid:nas-1::MediaServer\r\n\r\n";
     }
 
     #[test]
+    fn hostile_ssdp_backlog_is_bounded_and_oversized_fields_are_ignored() {
+        let mut raw = String::new();
+        for index in 0..(MAX_CAST_TARGETS + 8) {
+            raw.push_str(&format!(
+                "HTTP/1.1 200 OK\r\nLOCATION: http://192.0.2.{index}:8200/desc.xml\r\n\
+ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSN: uuid:{index}\r\n\
+SERVER: renderer\r\n\r\n"
+            ));
+        }
+        let targets = parse_ssdp_responses(&raw);
+        assert_eq!(targets.len(), MAX_CAST_TARGETS);
+
+        let oversized = "x".repeat(MAX_DISCOVERY_FIELD_BYTES + 1);
+        let one = format!(
+            "HTTP/1.1 200 OK\r\nLOCATION: http://192.0.2.200:8200/desc.xml\r\n\
+ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\nUSN: uuid:oversized\r\n\
+SERVER: {oversized}\r\n\r\n"
+        );
+        let target = &parse_ssdp_responses(&one)[0];
+        assert_eq!(target.name, "uuid:oversized");
+    }
+
+    #[test]
+    fn ssdp_discovery_refuses_non_success_and_malformed_renderer_records() {
+        let raw = "HTTP/1.1 404 Not Found\r\n\
+LOCATION: http://192.0.2.10:8200/desc.xml\r\n\
+ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n\
+HTTP/1.1 200 OK\r\n\
+LOCATION: not-http\r\n\
+ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n\
+HTTP/1.1 200 OK\r\n\
+LOCATION: http://192.0.2.11:8200/desc.xml\r\n\
+ST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n";
+        assert!(parse_ssdp_responses(raw).is_empty());
+    }
+
+    #[test]
     fn parses_chromecast_mdns_records() {
         let raw = "id=abc123\nfn=Living Room TV\nhost=192.168.1.70\nport=8009\n\n\
 id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
@@ -767,6 +1117,16 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
         assert_eq!(targets[0].location, "192.168.1.70:8009");
         // The second omits an explicit port → the default control port.
         assert_eq!(targets[1].location, "192.168.1.71:8009");
+    }
+
+    #[test]
+    fn chromecast_discovery_refuses_bad_ports_and_duplicate_ids() {
+        let raw = "id=tv\nhost=192.0.2.20\nport=0\n\n\
+id=tv\nhost=192.0.2.21\nport=8009\n\n\
+id=bad\nhost=192.0.2.22\nport=not-a-port\n";
+        let targets = parse_chromecast_records(raw);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].location, "192.0.2.21:8009");
     }
 
     #[test]
@@ -824,7 +1184,27 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
             })
         );
         assert_eq!(parse_endpoint("https://secure/desc"), None);
+        assert_eq!(
+            parse_endpoint("[fd00::7]:8200/desc").map(|ep| ep.host),
+            Some("fd00::7".to_owned())
+        );
+        assert_eq!(
+            parse_endpoint("http://[fd00::7]:8200/desc").map(|ep| ep.host),
+            Some("fd00::7".to_owned())
+        );
         assert_eq!(parse_endpoint(""), None);
+    }
+
+    #[test]
+    fn endpoint_parser_rejects_control_and_whitespace_in_raw_http_fields() {
+        for malformed in [
+            "http://tv\r\nX-Injected: yes/desc.xml",
+            "http://tv/desc.xml\nX-Injected: yes",
+            "http://living room/desc.xml",
+            " http://tv/desc.xml",
+        ] {
+            assert_eq!(parse_endpoint(malformed), None, "must reject {malformed:?}");
+        }
     }
 
     #[test]
@@ -861,6 +1241,14 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
     }
 
     #[test]
+    fn seek_envelope_preserves_a_bounded_resume_position() {
+        let body = soap_seek(3_725.9);
+        assert!(body.contains("<Unit>REL_TIME</Unit>"));
+        assert!(body.contains("<Target>01:02:05</Target>"));
+        assert!(body.contains("urn:schemas-upnp-org:service:AVTransport:1"));
+    }
+
+    #[test]
     fn http_request_sets_host_content_length_and_soap_action() {
         let ep = parse_endpoint("http://tv:8200/AVTransport/ctrl").expect("endpoint");
         let body = soap_play();
@@ -889,6 +1277,15 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
         assert!(matches!(
             expect_2xx("HTTP/1.1 500 err\r\n\r\n", "Play"),
             Err(CastError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn expect_2xx_rejects_a_truncated_success_response() {
+        let reply = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nshort";
+        assert!(matches!(
+            expect_2xx(reply, "SetAVTransportURI"),
+            Err(CastError::Rejected(message)) if message.contains("incomplete HTTP response")
         ));
     }
 
@@ -947,6 +1344,265 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
     }
 
     #[test]
+    fn invalid_resume_positions_fail_before_network_access() {
+        let caster = NetworkCaster {
+            timeout: Duration::from_millis(1),
+        };
+        let target = CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "tv".to_owned(),
+            name: "TV".to_owned(),
+            location: "http://203.0.113.1:8200/desc.xml".to_owned(),
+        };
+        for position_secs in [f64::NAN, f64::INFINITY, -1.0, MAX_CAST_POSITION_SECS + 1.0] {
+            let request = CastRequest {
+                media_url: "http://mesh/clip.mkv".to_owned(),
+                position_secs,
+                ..CastRequest::default()
+            };
+            assert!(matches!(
+                caster.cast(&target, &request),
+                Err(CastError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_or_oversized_media_metadata_fails_before_any_cast_gate() {
+        let caster = NetworkCaster::default();
+        let target = CastTarget {
+            kind: CastKind::Chromecast,
+            id: "cc".to_owned(),
+            name: "TV".to_owned(),
+            location: "192.0.2.2:8009".to_owned(),
+        };
+        for request in [
+            CastRequest {
+                media_url: "http://mesh/clip\r\nmalformed".to_owned(),
+                ..CastRequest::default()
+            },
+            CastRequest {
+                media_url: "http://mesh/clip.mkv".to_owned(),
+                title: Some("bad\u{0000}title".to_owned()),
+                ..CastRequest::default()
+            },
+            CastRequest {
+                media_url: "x".repeat(MAX_CAST_REQUEST_TEXT_BYTES + 1),
+                ..CastRequest::default()
+            },
+        ] {
+            assert!(matches!(
+                caster.cast(&target, &request),
+                Err(CastError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn dlna_cast_fixture_requires_description_and_ordered_soap_acceptance() {
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).expect("fixture request read");
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                let Some(headers_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    assert!(
+                        bytes.len() < 64 * 1024,
+                        "fixture request headers are bounded"
+                    );
+                    continue;
+                };
+                let header_len = headers_end + 4;
+                let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_len + content_length {
+                    break;
+                }
+            }
+            String::from_utf8(bytes).expect("fixture request is UTF-8")
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind renderer fixture");
+        let address = listener.local_addr().expect("renderer fixture address");
+        let server = thread::spawn(move || {
+            let description = "<root><serviceList><service>\
+<serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\
+<controlURL>/upnp/control</controlURL></service></serviceList></root>";
+            let mut requests = Vec::new();
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept renderer request");
+                let request = read_request(&mut stream);
+                let expected_path = if index == 0 {
+                    "/desc.xml"
+                } else {
+                    "/upnp/control"
+                };
+                assert!(request.starts_with(if index == 0 {
+                    "GET /desc.xml HTTP/1.1"
+                } else {
+                    "POST /upnp/control HTTP/1.1"
+                }));
+                assert!(request.contains(&format!("Host: 127.0.0.1:{}", address.port())));
+                assert!(request.contains(expected_path));
+                requests.push(request);
+                let body = if index == 0 { description } else { "" };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(reply.as_bytes())
+                    .expect("write renderer response");
+            }
+            requests
+        });
+
+        let target = CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "fixture-tv".to_owned(),
+            name: "Fixture TV".to_owned(),
+            location: format!("http://127.0.0.1:{}/desc.xml", address.port()),
+        };
+        let request = CastRequest {
+            media_url: "http://mesh/media?a=1&b=2".to_owned(),
+            title: Some("Fixture & Track".to_owned()),
+            position_secs: 3_725.9,
+        };
+        let outcome = NetworkCaster {
+            timeout: Duration::from_secs(2),
+        }
+        .cast(&target, &request)
+        .expect("fixture renderer accepts the complete cast");
+        assert_eq!(outcome.target, target);
+
+        let requests = server.join().expect("renderer fixture completed");
+        assert!(requests[1].contains(
+            "SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI\""
+        ));
+        assert!(requests[1].contains("<CurrentURI>http://mesh/media?a=1&amp;b=2</CurrentURI>"));
+        assert!(
+            requests[1].contains("<CurrentURIMetaData>Fixture &amp; Track</CurrentURIMetaData>")
+        );
+        assert!(
+            requests[2].contains("SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#Play\"")
+        );
+        assert!(
+            requests[3].contains("SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#Seek\"")
+        );
+        assert!(requests[3].contains("<Target>01:02:05</Target>"));
+    }
+
+    #[test]
+    fn failed_dlna_seek_stops_renderer_before_reporting_rejection() {
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).expect("fixture request read");
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                let Some(headers_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    assert!(
+                        bytes.len() < 64 * 1024,
+                        "fixture request headers are bounded"
+                    );
+                    continue;
+                };
+                let header_len = headers_end + 4;
+                let header_text = String::from_utf8_lossy(&bytes[..headers_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_len + content_length {
+                    break;
+                }
+            }
+            String::from_utf8(bytes).expect("fixture request is UTF-8")
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind renderer fixture");
+        let address = listener.local_addr().expect("renderer fixture address");
+        let server = thread::spawn(move || {
+            let description = "<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/control</controlURL></service>";
+            let mut requests = Vec::new();
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().expect("accept renderer request");
+                let request = read_request(&mut stream);
+                requests.push(request);
+                let (status, body) = match index {
+                    0 => ("200 OK", description),
+                    3 => ("500 Seek Not Supported", ""),
+                    _ => ("200 OK", ""),
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(reply.as_bytes())
+                    .expect("write renderer response");
+            }
+            requests
+        });
+
+        let target = CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "fixture-tv".to_owned(),
+            name: "Fixture TV".to_owned(),
+            location: format!("http://{}/desc.xml", address),
+        };
+        let request = CastRequest {
+            media_url: "http://mesh/media.mkv".to_owned(),
+            position_secs: 12.0,
+            ..CastRequest::default()
+        };
+        assert!(matches!(
+            NetworkCaster::default().cast(&target, &request),
+            Err(CastError::Rejected(message)) if message.contains("Seek")
+        ));
+
+        let requests = server.join().expect("renderer fixture completed");
+        assert_eq!(
+            requests.len(),
+            5,
+            "description, set, play, seek, rollback stop"
+        );
+        assert!(
+            requests[3].contains("SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#Seek\"")
+        );
+        assert!(
+            requests[4].contains("SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#Stop\"")
+        );
+    }
+
+    #[test]
     fn dlna_cast_to_an_absent_renderer_is_unreachable_never_faked() {
         // 203.0.113.0/24 is TEST-NET-3 (RFC 5737) — guaranteed no renderer answers, so
         // the live leg fails to the honest Unreachable gate, never a fabricated success.
@@ -968,5 +1624,88 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
             caster.cast(&target, &req),
             Err(CastError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn dlna_description_error_is_rejected_before_control_requests() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind renderer fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("description request");
+            let body = "<serviceType>AVTransport</serviceType><controlURL>/control</controlURL>";
+            let reply = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(reply.as_bytes())
+                .expect("write description refusal");
+        });
+
+        let target = CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "fixture-tv".to_owned(),
+            name: "Fixture TV".to_owned(),
+            location: format!("http://{}/desc.xml", address),
+        };
+        let request = CastRequest {
+            media_url: "http://mesh/media.mkv".to_owned(),
+            ..CastRequest::default()
+        };
+        assert!(matches!(
+            NetworkCaster::default().cast(&target, &request),
+            Err(CastError::Rejected(message)) if message.contains("device description")
+        ));
+        server.join().expect("renderer fixture completed");
+    }
+
+    #[test]
+    fn dlna_truncated_success_response_never_claims_cast_success() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind renderer fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = thread::spawn(move || {
+            let description = "<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>/control</controlURL></service>";
+            let description_reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                description.len(),
+                description
+            );
+            let (mut stream, _) = listener.accept().expect("description request");
+            stream
+                .write_all(description_reply.as_bytes())
+                .expect("write description response");
+
+            let (mut stream, _) = listener.accept().expect("set request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nshort",
+                )
+                .expect("write truncated response");
+        });
+
+        let target = CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "fixture-tv".to_owned(),
+            name: "Fixture TV".to_owned(),
+            location: format!("http://{address}/desc.xml"),
+        };
+        let request = CastRequest {
+            media_url: "http://mesh/media.mkv".to_owned(),
+            ..CastRequest::default()
+        };
+        assert!(matches!(
+            NetworkCaster::default().cast(&target, &request),
+            Err(CastError::Rejected(message))
+                if message.contains("SetAVTransportURI")
+                    && message.contains("incomplete HTTP response")
+        ));
+        server.join().expect("renderer fixture completed");
     }
 }

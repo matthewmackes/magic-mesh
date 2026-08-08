@@ -3,8 +3,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::health::{
-    HealthAction, HealthActionRequest, HealthComponent, HealthCondition, HealthScope,
-    HealthSeverity, NodeGrade, SystemMeshHealthSnapshot, ACTION_TOPIC, HEALTH_SCHEMA_VERSION,
+    format_health_duration_ms, HealthAction, HealthActionRequest, HealthComponent,
+    HealthCondition, HealthScope, HealthSeverity, NodeGrade, SystemMeshHealthSnapshot,
+    ACTION_TOPIC, HEALTH_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -356,6 +357,7 @@ fn detail(
                 && matches!(&condition.scope, HealthScope::Node { node: target } if target == &node)
         })
         .collect();
+    ui.strong("Active Issues");
     if conditions.is_empty() {
         ui.colored_label(Style::SUPPORT_SUCCESS, "0 active issues");
         ui.label("All required providers are current and within policy.");
@@ -387,19 +389,19 @@ fn detail(
     }
 
     if let Some(snapshot) = snapshot {
-        let resolved: Vec<_> = snapshot.resolved_conditions.iter().filter(|condition| {
-            matches!(&condition.scope, HealthScope::Node { node: target } if target == &node)
-        }).take(8).collect();
+        let resolved = sorted_history(&snapshot.resolved_conditions, &node);
         if !resolved.is_empty() {
             ui.separator();
-            ui.strong("Recent history");
+            ui.strong("Recent History");
             for condition in resolved {
                 ui.label(format!(
-                    "{} · resolved {}",
+                    "{} · resolved {} · duration {}",
                     condition.evidence.summary,
                     condition
                         .resolved_at_ms
-                        .map_or_else(|| "—".into(), format_timestamp)
+                        .map_or_else(|| "—".into(), format_timestamp),
+                    resolution_duration_ms(condition)
+                        .map_or_else(|| "unknown".to_string(), format_health_duration_ms),
                 ));
             }
         }
@@ -565,6 +567,33 @@ fn now_ms() -> u64 {
 
 fn format_timestamp(timestamp_ms: u64) -> String {
     format!("{} s", timestamp_ms / 1_000)
+}
+
+fn resolution_duration_ms(condition: &HealthCondition) -> Option<u64> {
+    condition
+        .resolved_at_ms
+        .map(|resolved| resolved.saturating_sub(condition.active_since_ms))
+}
+
+fn sorted_history<'a>(
+    conditions: &'a [HealthCondition],
+    node: &str,
+) -> Vec<&'a HealthCondition> {
+    let mut resolved: Vec<_> = conditions
+        .iter()
+        .filter(|condition| {
+            matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
+        })
+        .collect();
+    resolved.sort_by(|left, right| {
+        right
+            .severity
+            .cmp(&left.severity)
+            .then_with(|| resolution_duration_ms(right).cmp(&resolution_duration_ms(left)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    resolved.truncate(8);
+    resolved
 }
 
 #[cfg(test)]
@@ -981,6 +1010,50 @@ mod tests {
         assert!(
             chrome.health_modal_open,
             "a resolved and recurring critical opens once again"
+        );
+    }
+
+    #[test]
+    fn resolution_durations_use_elapsed_boundaries_not_wall_clock_time() {
+        assert_eq!(format_health_duration_ms(0), "0s");
+        assert_eq!(format_health_duration_ms(59_999), "59s");
+        assert_eq!(format_health_duration_ms(3_599_000), "59m 59s");
+        assert_eq!(format_health_duration_ms(3_600_000), "01:00:00");
+        assert_eq!(format_health_duration_ms(86_400_000), "24:00:00");
+        assert_eq!(format_health_duration_ms(172_801_000), "2d 00:00:01");
+    }
+
+    #[test]
+    fn history_sorts_critical_before_warning_then_longest_duration() {
+        let mut short_critical = condition(
+            "critical-short",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        short_critical.resolved_at_ms = Some(2_000);
+        let mut long_critical = condition(
+            "critical-long",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        long_critical.active_since_ms = 0;
+        long_critical.resolved_at_ms = Some(10_000);
+        let mut long_warning = condition(
+            "warning-long",
+            "node",
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        long_warning.active_since_ms = 0;
+        long_warning.resolved_at_ms = Some(20_000);
+        let conditions = vec![long_warning, short_critical, long_critical];
+
+        let ordered = sorted_history(&conditions, "node");
+        assert_eq!(
+            ordered.iter().map(|condition| condition.id.as_str()).collect::<Vec<_>>(),
+            ["critical-long", "critical-short", "warning-long"]
         );
     }
 

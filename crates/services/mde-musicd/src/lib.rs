@@ -15,6 +15,7 @@ pub mod airsonic;
 pub mod bus_responder;
 pub mod cache;
 pub mod creds;
+pub mod domain;
 pub mod engine;
 pub mod mpris;
 pub mod queue;

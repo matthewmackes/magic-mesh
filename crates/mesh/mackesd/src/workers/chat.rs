@@ -139,12 +139,9 @@ pub const ALERT_LANE_PREFIXES: &[&str] = &[
     "event/security/",
     "fleet/sec",
     "event/firewall",
-    "compute/event/",
     "event/compute/",
     "event/kvm/",
     "event/dc/",
-    "event/vm/",
-    "event/podman/",
     "fdo/",
     // CHAT-FIX-2 — the local-notification producer (`workers::notify`) publishes
     // typed local system events (peer join/leave, updates, failed service,

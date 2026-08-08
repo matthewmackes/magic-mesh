@@ -44,6 +44,15 @@ use crate::mesh_media::{self, MediaRegistration, MediaServerRecord, SharedAccoun
 /// flip still propagates on the very next tick.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Maximum retry delay after a failed local Navidrome health probe.
+pub const FAILURE_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Advance a failed-probe retry delay without allowing a tight reconnect loop.
+#[must_use]
+pub fn next_failure_retry(current: Duration) -> Duration {
+    current.saturating_mul(2).min(FAILURE_RETRY_MAX)
+}
+
 /// Slow heartbeat for the on-change Bus publish — republish an unchanged
 /// registration at most this often so a freshly-pruned topic / late subscriber
 /// still finds a recent doc. Matches `compute_registry::PUBLISH_HEARTBEAT`'s
@@ -90,12 +99,12 @@ fn credential_free_registration(reg: &MediaRegistration) -> MediaRegistration {
     safe
 }
 
-/// Mirror a node's media registration to the replicated QNM-Shared registry
-/// plane at `<mount>/<hostname>/media-registry.json` — the SAME plane the
-/// other published services replicate through. Atomic (tmp + rename) so a
-/// reader never sees a half-written file. Best-effort: a missing mount / write
-/// error is logged, never fatal.
-pub fn write_shared_registration(mount: &Path, hostname: &str, reg: &MediaRegistration) {
+/// Write a replicated registry body only when its bytes changed. The registry
+/// timer is intentionally frequent enough to notice health changes, but an
+/// unchanged atomic rename still creates Syncthing work and wakes every peer.
+/// Missing, unreadable, or materially different files retain the existing
+/// best-effort atomic-write behavior.
+fn write_shared_body(mount: &Path, hostname: &str, body: &str) {
     if hostname.is_empty() {
         return;
     }
@@ -104,12 +113,11 @@ pub fn write_shared_registration(mount: &Path, hostname: &str, reg: &MediaRegist
         tracing::warn!("media_registry: mkdir {} failed: {e}", dir.display());
         return;
     }
-    let safe = credential_free_registration(reg);
-    let Ok(body) = serde_json::to_string(&safe) else {
-        return;
-    };
-    let tmp = dir.join("media-registry.json.tmp");
     let final_path = dir.join(mesh_media::MEDIA_REGISTRY_FILE);
+    if std::fs::read(&final_path).is_ok_and(|existing| existing.as_slice() == body.as_bytes()) {
+        return;
+    }
+    let tmp = dir.join("media-registry.json.tmp");
     if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
         tracing::warn!("media_registry: write {} failed: {e}", tmp.display());
         return;
@@ -117,6 +125,19 @@ pub fn write_shared_registration(mount: &Path, hostname: &str, reg: &MediaRegist
     if let Err(e) = std::fs::rename(&tmp, &final_path) {
         tracing::warn!("media_registry: rename registration failed: {e}");
     }
+}
+
+/// Mirror a node's media registration to the replicated QNM-Shared registry
+/// plane at `<mount>/<hostname>/media-registry.json` — the SAME plane the
+/// other published services replicate through. Atomic (tmp + rename) so a
+/// reader never sees a half-written file. Best-effort: a missing mount / write
+/// error is logged, never fatal.
+pub fn write_shared_registration(mount: &Path, hostname: &str, reg: &MediaRegistration) {
+    let safe = credential_free_registration(reg);
+    let Ok(body) = serde_json::to_string(&safe) else {
+        return;
+    };
+    write_shared_body(mount, hostname, &body);
 }
 
 /// Publish a versioned, credential-free endpoint record.
@@ -140,26 +161,10 @@ pub fn write_shared_server_record(mount: &Path, hostname: &str, reg: &MediaServe
 
 /// Atomically mirror the complete endpoint roster to the shared registry.
 pub fn write_shared_server_records(mount: &Path, hostname: &str, records: &[MediaServerRecord]) {
-    if hostname.is_empty() {
-        return;
-    }
-    let dir = mount.join(hostname);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("media_registry: mkdir {} failed: {e}", dir.display());
-        return;
-    }
     let Ok(body) = serde_json::to_string(records) else {
         return;
     };
-    let tmp = dir.join("media-registry.json.tmp");
-    let final_path = dir.join(mesh_media::MEDIA_REGISTRY_FILE);
-    if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
-        tracing::warn!("media_registry: write {} failed: {e}", tmp.display());
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &final_path) {
-        tracing::warn!("media_registry: rename registration failed: {e}");
-    }
+    write_shared_body(mount, hostname, &body);
 }
 
 /// MEDIA-8 — resolve the read-only shared account to publish from the
@@ -295,7 +300,7 @@ impl MediaRegistryWorker {
         mesh_media::registration_with_account(&self.node_id, self.port, &health, account)
     }
 
-    fn tick_once(&self) {
+    fn tick_once(&self) -> bool {
         if !self.operator_records.is_empty() {
             if let Ok(body) = serde_json::to_string(&self.operator_records) {
                 let mut last = self
@@ -305,7 +310,7 @@ impl MediaRegistryWorker {
                 let now = Instant::now();
                 let prev_body = last.as_ref().map(|(b, _)| b.as_str());
                 let prev_at = last.as_ref().map(|(_, at)| *at);
-                if crate::workers::compute_registry::should_publish(
+                if crate::workers::runtime_probe::should_publish(
                     prev_body,
                     &body,
                     prev_at,
@@ -317,9 +322,10 @@ impl MediaRegistryWorker {
                 }
             }
             write_shared_server_records(&self.mount, &self.hostname, &self.operator_records);
-            return;
+            return true;
         }
         let reg = self.build_registration();
+        let healthy = reg.is_up();
         // Bus publish: on-change + slow heartbeat (BUS-RUN-FULL-1). Serialize
         // once and compare against the last published body.
         if let Ok(body) = serde_json::to_string(&reg) {
@@ -330,7 +336,7 @@ impl MediaRegistryWorker {
             let now = Instant::now();
             let prev_body = last.as_ref().map(|(b, _)| b.as_str());
             let prev_at = last.as_ref().map(|(_, at)| *at);
-            if crate::workers::compute_registry::should_publish(
+            if crate::workers::runtime_probe::should_publish(
                 prev_body,
                 &body,
                 prev_at,
@@ -345,6 +351,7 @@ impl MediaRegistryWorker {
         // Written every tick (the reader always wants the latest); the helper
         // is a no-op when the mount/host is absent.
         write_shared_registration(&self.mount, &self.hostname, &reg);
+        healthy
     }
 }
 
@@ -355,10 +362,15 @@ impl Worker for MediaRegistryWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        let mut delay = self.tick;
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(self.tick) => {
-                    self.tick_once();
+                _ = tokio::time::sleep(delay) => {
+                    delay = if self.tick_once() {
+                        self.tick
+                    } else {
+                        next_failure_retry(delay)
+                    };
                 }
                 _ = shutdown.wait() => break,
             }
@@ -439,6 +451,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_health_probes_use_a_bounded_retry_ladder() {
+        assert_eq!(
+            [
+                DEFAULT_TICK_INTERVAL,
+                next_failure_retry(DEFAULT_TICK_INTERVAL),
+                next_failure_retry(next_failure_retry(DEFAULT_TICK_INTERVAL)),
+                next_failure_retry(next_failure_retry(next_failure_retry(
+                    DEFAULT_TICK_INTERVAL,
+                ))),
+                next_failure_retry(next_failure_retry(next_failure_retry(
+                    next_failure_retry(DEFAULT_TICK_INTERVAL),
+                ))),
+            ],
+            [
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(240),
+                Duration::from_secs(300),
+            ]
+        );
+        assert_eq!(
+            next_failure_retry(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
     fn shared_mirror_writes_atomic_registry_file() {
         let tmp = std::env::temp_dir().join(format!("mde-mediareg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -451,6 +491,28 @@ mod tests {
         assert_eq!(back, reg);
         // No leftover tmp file (atomic rename consumed it).
         assert!(!tmp.join("eagle").join("media-registry.json.tmp").exists());
+    }
+
+    #[test]
+    fn shared_mirror_skips_identical_registry_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = mesh_media::registration("peer:eagle", mesh_media::NAVIDROME_PORT, "up");
+        write_shared_registration(tmp.path(), "eagle", &reg);
+        let path = tmp
+            .path()
+            .join("eagle")
+            .join(mesh_media::MEDIA_REGISTRY_FILE);
+        let before = std::fs::metadata(&path).unwrap();
+        write_shared_registration(tmp.path(), "eagle", &reg);
+        let after = std::fs::metadata(&path).unwrap();
+
+        assert_eq!(before.ino(), after.ino(), "identical body must not rename");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec(&reg).unwrap()
+        );
     }
 
     #[test]

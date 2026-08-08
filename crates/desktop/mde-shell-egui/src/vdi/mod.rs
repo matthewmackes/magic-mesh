@@ -19,7 +19,10 @@
 //! wire transport is the gated E12-4 layer) the panel shows an honest "no desktop"
 //! EmptyState, never a placeholder render of a fake desktop (§7).
 
-use mackes_mesh_types::vdi_session::BrowserVmTransport;
+use mackes_mesh_types::workloads::{
+    WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction,
+};
+use mde_bus::persist::Persist;
 use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
 
 use mde_vdi_core::{sub_color_image, FrameDamage};
@@ -29,19 +32,25 @@ use mde_vdi_vnc::VncSession;
 
 use crate::auth::DesktopAuth;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[cfg(feature = "live-vdi")]
 use {
     mde_bus::hooks::config::Priority,
-    mde_bus::persist::Persist,
     mde_collab_types::{ClipboardClipBody, MAX_CLIPBOARD_TEXT_BYTES},
     mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
     mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
     mde_vdi_vnc::{PumpOutcome as VncPumpOutcome, VncConfig, VncConnection},
-    std::sync::mpsc,
     std::thread,
     std::time::Duration,
+    std::{
+        collections::VecDeque,
+        sync::mpsc,
+        sync::{Arc, Mutex},
+    },
 };
 
 /// A live VDI desktop the shell drives — RDP-primary, VNC the console fallback,
@@ -127,6 +136,13 @@ impl DesktopEndpoint {
 #[cfg(any(test, feature = "live-vdi"))]
 pub(crate) const CONSOLE_TOPIC: &str = "state/vdi/console";
 
+/// Keep the broker resolution read bounded even when retained console state has
+/// accumulated across many sessions. The newest page is sufficient because
+/// the broker republishes each live record on refresh and the resolver keeps the
+/// newest matching record for the requested session.
+#[cfg(feature = "live-vdi")]
+const MAX_CONSOLE_MESSAGES_PER_POLL: usize = 64;
+
 /// The shell's read mirror of `console_broker`'s brokered-console status — only the
 /// fields the transport needs. The broker's protocol is authoritative when it is
 /// present: a libvirt VM may expose SPICE even when the initial Browser request
@@ -191,36 +207,6 @@ fn broker_protocol(value: Option<&str>) -> Option<VdiProtocol> {
     }
 }
 
-/// Admit a serving-broker protocol without weakening a Browser transport lock.
-/// Generic desktops retain the broker-authoritative behavior; Browser sessions
-/// require an exact match and fail closed on missing, stale, or alternate
-/// records.
-#[cfg(any(test, feature = "live-vdi"))]
-fn admit_broker_protocol(
-    selected: Option<BrowserVmTransport>,
-    offered: Option<VdiProtocol>,
-) -> Result<Option<VdiProtocol>, String> {
-    let Some(selected) = selected else {
-        return Ok(offered);
-    };
-    let expected = match selected {
-        BrowserVmTransport::Sunshine => VdiProtocol::Moonlight,
-        BrowserVmTransport::Rdp => VdiProtocol::Rdp,
-    };
-    match offered {
-        Some(protocol) if protocol == expected => Ok(Some(protocol)),
-        Some(protocol) => Err(format!(
-            "selected {} but the broker offered {}; no transport fallback was attached",
-            selected.label(),
-            protocol.label()
-        )),
-        None => Err(format!(
-            "selected {} but the broker omitted its protocol; no transport fallback was attached",
-            selected.label()
-        )),
-    }
-}
-
 /// Resolve the brokered console endpoint for `session_id` from the raw
 /// [`CONSOLE_TOPIC`] record bodies (the latest matching record wins — the broker
 /// republishes when a session's console state changes). Pure + headless-testable;
@@ -259,9 +245,10 @@ pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> C
     out
 }
 
-/// Read the raw brokered-console record bodies off [`CONSOLE_TOPIC`] — a
-/// non-blocking local spool scan (empty when there's no Bus dir / nothing
-/// published), mirroring the Chooser's `BusDesktopSources::latest` read idiom.
+/// Read a bounded tail of raw brokered-console record bodies off
+/// [`CONSOLE_TOPIC`] — a non-blocking local spool scan (empty when there's no
+/// Bus dir / nothing published), mirroring the Chooser's latest-value read
+/// idiom without materializing the retained topic history.
 #[cfg(feature = "live-vdi")]
 fn read_console_bodies(bus_root: Option<&std::path::Path>) -> Vec<String> {
     // arch-11: open through the shared BusReader seam (full path — this fn is
@@ -272,7 +259,7 @@ fn read_console_bodies(bus_root: Option<&std::path::Path>) -> Vec<String> {
         return Vec::new();
     };
     persist
-        .list_since(CONSOLE_TOPIC, None)
+        .read_tail(CONSOLE_TOPIC, MAX_CONSOLE_MESSAGES_PER_POLL)
         .map(|msgs| msgs.into_iter().filter_map(|m| m.body).collect())
         .unwrap_or_default()
 }
@@ -469,10 +456,6 @@ pub(crate) struct ConnectRequest {
     /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
     /// off-mesh endpoints leave this empty.
     pub broker_session: Option<BrokerSessionLifecycle>,
-    /// Exact Browser VM transport lock. Generic desktops leave this unset and
-    /// may follow their native console protocol. Browser sessions reject any
-    /// broker response that differs from this selection.
-    pub browser_transport: Option<BrowserVmTransport>,
     /// vdi-vm-8 — the guest desktop size hint in **device pixels** (the shell's real
     /// output size at connect time, [`body_device_px`]), so an RDP/SPICE guest renders
     /// at near-native resolution instead of a hardcoded 1024×768 that egui upscales
@@ -495,12 +478,6 @@ pub(crate) struct ConnectRequest {
     pub preferred_size: Option<(u16, u16)>,
 }
 
-/// The Browser VM is a fixed high-quality application surface, not an adaptive
-/// administrative console. Keep its guest desktop at Full HD and scale that
-/// complete framebuffer into the Construct panel. This prevents the panel's
-/// chrome height from silently renegotiating the guest below 1080p.
-const BROWSER_VM_DESKTOP_PX: (u16, u16) = (1920, 1080);
-
 impl ConnectRequest {
     /// Assemble a request from the picked target + the three display choices + the
     /// resolved auth (CHOOSER-6).
@@ -519,7 +496,6 @@ impl ConnectRequest {
             auth,
             app_id: None,
             broker_session: None,
-            browser_transport: None,
             preferred_size: None,
         }
     }
@@ -527,13 +503,6 @@ impl ConnectRequest {
     /// Attach the broker session lifecycle id minted by discovery.
     pub(crate) fn with_broker_session(mut self, broker: BrokerSessionLifecycle) -> Self {
         self.broker_session = Some(broker);
-        self
-    }
-
-    /// Lock a Browser VM request to the exact operator/default selection.
-    #[must_use]
-    pub(crate) const fn with_browser_transport(mut self, transport: BrowserVmTransport) -> Self {
-        self.browser_transport = Some(transport);
         self
     }
 
@@ -554,18 +523,13 @@ impl ConnectRequest {
     }
 }
 
-const fn request_focus_surface(request: &ConnectRequest) -> SessionFocusSurface {
-    if request.browser_transport.is_some() {
-        SessionFocusSurface::Browser
-    } else {
-        SessionFocusSurface::Desktop
-    }
+const fn request_focus_surface(_request: &ConnectRequest) -> SessionFocusSurface {
+    SessionFocusSurface::Desktop
 }
 
 #[cfg(feature = "live-vdi")]
 enum LiveRdpEvent {
     Connected(String),
-    Frame(egui::ColorImage, FrameDamage),
     /// The host's TLS certificate changed since it was pinned (vdi-vm-6) — a
     /// non-fatal MITM warning; the session stays live (the Nebula link is the
     /// trust floor). Strict mode instead surfaces as [`LiveRdpEvent::Error`].
@@ -576,15 +540,15 @@ enum LiveRdpEvent {
 
 #[cfg(feature = "live-vdi")]
 struct LiveRdpHandle {
-    input_tx: mpsc::Sender<egui::Event>,
+    input: SharedInputMailbox,
     stop_tx: mpsc::Sender<()>,
     event_rx: mpsc::Receiver<LiveRdpEvent>,
+    frame_mailbox: LatestFrameMailbox,
 }
 
 #[cfg(feature = "live-vdi")]
 enum LiveVncEvent {
     Connected(String),
-    Frame(egui::ColorImage, FrameDamage),
     Clipboard(ClipboardClipBody),
     Error(String),
     Ended(String),
@@ -592,24 +556,168 @@ enum LiveVncEvent {
 
 #[cfg(feature = "live-vdi")]
 struct LiveVncHandle {
-    input_tx: mpsc::Sender<egui::Event>,
+    input: SharedInputMailbox,
     stop_tx: mpsc::Sender<()>,
     event_rx: mpsc::Receiver<LiveVncEvent>,
+    frame_mailbox: LatestFrameMailbox,
 }
 
 #[cfg(feature = "live-vdi")]
 enum LiveSpiceEvent {
     Connected(String),
-    Frame(egui::ColorImage, FrameDamage),
     Error(String),
     Ended(String),
 }
 
 #[cfg(feature = "live-vdi")]
 struct LiveSpiceHandle {
-    input_tx: mpsc::Sender<egui::Event>,
+    input: SharedInputMailbox,
     stop_tx: mpsc::Sender<()>,
     event_rx: mpsc::Receiver<LiveSpiceEvent>,
+    frame_mailbox: LatestFrameMailbox,
+}
+
+/// The live decoder may outpace the egui seat. Keep only the newest decoded
+/// frame so a stalled consumer cannot turn the transport handoff into an
+/// unbounded framebuffer queue.
+#[cfg(feature = "live-vdi")]
+#[derive(Clone, Default)]
+struct LatestFrameMailbox(Arc<Mutex<Option<(egui::ColorImage, FrameDamage)>>>);
+
+#[cfg(feature = "live-vdi")]
+impl LatestFrameMailbox {
+    fn publish(&self, frame: egui::ColorImage, damage: FrameDamage) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some((frame, damage));
+    }
+
+    fn take(&self) -> Option<(egui::ColorImage, FrameDamage)> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// Bounded input admission for a live transport. Pointer motion and wheel
+/// events are coalescible; key/button transitions are retained ahead of those
+/// low-value events, with releases receiving priority when the queue is full.
+#[cfg(feature = "live-vdi")]
+const LIVE_INPUT_QUEUE_CAPACITY: usize = 256;
+
+#[cfg(feature = "live-vdi")]
+const LIVE_INPUT_TEXT_MAX_BYTES: usize = 64 * 1024;
+
+#[cfg(feature = "live-vdi")]
+#[derive(Default)]
+struct BoundedInputMailbox {
+    queue: VecDeque<egui::Event>,
+    dropped: u64,
+}
+
+#[cfg(feature = "live-vdi")]
+type SharedInputMailbox = Arc<Mutex<BoundedInputMailbox>>;
+
+#[cfg(feature = "live-vdi")]
+fn new_input_mailbox() -> SharedInputMailbox {
+    Arc::new(Mutex::new(BoundedInputMailbox::default()))
+}
+
+#[cfg(feature = "live-vdi")]
+impl BoundedInputMailbox {
+    fn push(&mut self, event: egui::Event) -> bool {
+        let Some(event) = bound_live_input(event) else {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        };
+        if self.queue.len() < LIVE_INPUT_QUEUE_CAPACITY {
+            self.queue.push_back(event);
+            return true;
+        }
+
+        if is_coalescible_input(&event) {
+            if let Some(existing) = self
+                .queue
+                .iter_mut()
+                .rev()
+                .find(|existing| is_same_coalescible_kind(existing, &event))
+            {
+                *existing = event;
+                return true;
+            }
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+
+        // Make room for a transition before admitting another critical event.
+        // Releases are allowed to evict an older non-release transition so a
+        // stuck key/button cannot be hidden behind motion or wheel flood.
+        let evict = if is_release_input(&event) {
+            self.queue
+                .iter()
+                .position(|queued| is_coalescible_input(queued))
+                .or_else(|| {
+                    self.queue
+                        .iter()
+                        .position(|queued| !is_release_input(queued))
+                })
+        } else {
+            self.queue
+                .iter()
+                .position(|queued| is_coalescible_input(queued))
+        };
+        if let Some(index) = evict {
+            self.queue.remove(index);
+            self.queue.push_back(event);
+            return true;
+        }
+
+        self.dropped = self.dropped.saturating_add(1);
+        false
+    }
+
+    fn drain(&mut self) -> Vec<egui::Event> {
+        self.queue.drain(..).collect()
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+fn bound_live_input(event: egui::Event) -> Option<egui::Event> {
+    match &event {
+        egui::Event::Text(text) if text.len() > LIVE_INPUT_TEXT_MAX_BYTES => None,
+        _ => Some(event),
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+fn is_coalescible_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::PointerMoved(_) | egui::Event::MouseWheel { .. }
+    )
+}
+
+#[cfg(feature = "live-vdi")]
+fn is_same_coalescible_kind(left: &egui::Event, right: &egui::Event) -> bool {
+    matches!(
+        (left, right),
+        (egui::Event::PointerMoved(_), egui::Event::PointerMoved(_))
+            | (
+                egui::Event::MouseWheel { .. },
+                egui::Event::MouseWheel { .. }
+            )
+    )
+}
+
+#[cfg(feature = "live-vdi")]
+fn is_release_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { pressed: false, .. } | egui::Event::PointerButton { pressed: false, .. }
+    )
 }
 
 #[cfg(feature = "live-vdi")]
@@ -631,24 +739,37 @@ impl LiveRdpHandle {
         )
         .with_port(endpoint.port)
         .with_resolution(width, height);
-        let (input_tx, input_rx) = mpsc::channel();
+        let input = new_input_mailbox();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let frame_mailbox = LatestFrameMailbox::default();
 
         thread::Builder::new()
             .name(format!("mde-live-rdp-{}", request.target.name))
-            .spawn(move || run_live_rdp(config, input_rx, stop_rx, event_tx))
+            .spawn({
+                let input = input.clone();
+                let frame_mailbox = frame_mailbox.clone();
+                move || run_live_rdp(config, input, stop_rx, event_tx, frame_mailbox)
+            })
             .map_err(|e| format!("failed to spawn live RDP worker: {e}"))?;
 
         Ok(Self {
-            input_tx,
+            input,
             stop_tx,
             event_rx,
+            frame_mailbox,
         })
     }
 
     fn send_input(&self, event: egui::Event) {
-        let _ = self.input_tx.send(event);
+        let accepted = self
+            .input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+        if !accepted {
+            tracing::debug!("dropping excess live RDP input after bounded admission");
+        }
     }
 
     fn stop(&self) {
@@ -666,33 +787,45 @@ impl LiveVncHandle {
             .and_then(|broker| broker.bus_root.clone())
             .or_else(mde_bus::client_data_dir);
         let clipboard_source = vnc_clipboard_source(request);
-        let (input_tx, input_rx) = mpsc::channel();
+        let input = new_input_mailbox();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let frame_mailbox = LatestFrameMailbox::default();
 
+        let worker_input = input.clone();
+        let worker_frame_mailbox = frame_mailbox.clone();
         thread::Builder::new()
             .name(format!("mde-live-vnc-{}", request.target.name))
             .spawn(move || {
                 run_live_vnc(
                     config,
-                    input_rx,
+                    worker_input,
                     stop_rx,
                     event_tx,
                     clipboard_root,
                     clipboard_source,
+                    worker_frame_mailbox,
                 )
             })
             .map_err(|e| format!("failed to spawn live VNC worker: {e}"))?;
 
         Ok(Self {
-            input_tx,
+            input,
             stop_tx,
             event_rx,
+            frame_mailbox,
         })
     }
 
     fn send_input(&self, event: egui::Event) {
-        let _ = self.input_tx.send(event);
+        let accepted = self
+            .input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+        if !accepted {
+            tracing::debug!("dropping excess live VNC input after bounded admission");
+        }
     }
 
     fn stop(&self) {
@@ -704,24 +837,37 @@ impl LiveVncHandle {
 impl LiveSpiceHandle {
     fn spawn(request: &ConnectRequest) -> Result<Self, String> {
         let config = live_spice_config(request)?;
-        let (input_tx, input_rx) = mpsc::channel();
+        let input = new_input_mailbox();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let frame_mailbox = LatestFrameMailbox::default();
 
         thread::Builder::new()
             .name(format!("mde-live-spice-{}", request.target.name))
-            .spawn(move || run_live_spice(config, input_rx, stop_rx, event_tx))
+            .spawn({
+                let input = input.clone();
+                let frame_mailbox = frame_mailbox.clone();
+                move || run_live_spice(config, input, stop_rx, event_tx, frame_mailbox)
+            })
             .map_err(|e| format!("failed to spawn live SPICE worker: {e}"))?;
 
         Ok(Self {
-            input_tx,
+            input,
             stop_tx,
             event_rx,
+            frame_mailbox,
         })
     }
 
     fn send_input(&self, event: egui::Event) {
-        let _ = self.input_tx.send(event);
+        let accepted = self
+            .input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+        if !accepted {
+            tracing::debug!("dropping excess live SPICE input after bounded admission");
+        }
     }
 
     fn stop(&self) {
@@ -925,9 +1071,10 @@ impl Drop for LiveSpiceHandle {
 #[cfg(feature = "live-vdi")]
 fn run_live_rdp(
     config: RdpConfig,
-    input_rx: mpsc::Receiver<egui::Event>,
+    input: SharedInputMailbox,
     stop_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<LiveRdpEvent>,
+    frame_mailbox: LatestFrameMailbox,
 ) {
     let target = format!("{}:{}", config.host, config.port);
     let mut session = match RdpSession::new(config) {
@@ -951,7 +1098,7 @@ fn run_live_rdp(
         let _ = event_tx.send(LiveRdpEvent::CertWarning(change.operator_message()));
     }
     if let Some((frame, damage)) = session.frame_with_damage() {
-        let _ = event_tx.send(LiveRdpEvent::Frame(frame, damage));
+        frame_mailbox.publish(frame, damage);
     }
 
     loop {
@@ -961,7 +1108,11 @@ fn run_live_rdp(
         }
 
         let mut had_input = false;
-        while let Ok(event) = input_rx.try_recv() {
+        let events = input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain();
+        for event in events {
             session.send_input(&event);
             had_input = true;
         }
@@ -976,7 +1127,7 @@ fn run_live_rdp(
             Ok(PumpOutcome::Processed { painted_rects }) => {
                 if painted_rects > 0 {
                     if let Some((frame, damage)) = session.frame_with_damage() {
-                        let _ = event_tx.send(LiveRdpEvent::Frame(frame, damage));
+                        frame_mailbox.publish(frame, damage);
                     }
                 }
             }
@@ -996,11 +1147,12 @@ fn run_live_rdp(
 #[cfg(feature = "live-vdi")]
 fn run_live_vnc(
     config: VncConfig,
-    input_rx: mpsc::Receiver<egui::Event>,
+    input: SharedInputMailbox,
     stop_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<LiveVncEvent>,
     clipboard_root: Option<PathBuf>,
     clipboard_source: String,
+    frame_mailbox: LatestFrameMailbox,
 ) {
     let target = format!("{}:{}", config.host, config.port);
     let mut session = match VncSession::new(config) {
@@ -1023,7 +1175,7 @@ fn run_live_vnc(
         negotiated.major, negotiated.minor, negotiated.width, negotiated.height, negotiated.name
     )));
     if let Some((frame, damage)) = session.frame_with_damage() {
-        let _ = event_tx.send(LiveVncEvent::Frame(frame, damage));
+        frame_mailbox.publish(frame, damage);
     }
 
     // The canonical event lane is latest-value-wins. Keep the Bus ULID only
@@ -1063,7 +1215,11 @@ fn run_live_vnc(
         }
 
         let mut had_input = false;
-        while let Ok(event) = input_rx.try_recv() {
+        let events = input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain();
+        for event in events {
             session.send_input(&event);
             had_input = true;
         }
@@ -1081,7 +1237,7 @@ fn run_live_vnc(
             Ok(VncPumpOutcome::Processed { rects, .. }) => {
                 if rects > 0 {
                     if let Some((frame, damage)) = session.frame_with_damage() {
-                        let _ = event_tx.send(LiveVncEvent::Frame(frame, damage));
+                        frame_mailbox.publish(frame, damage);
                     }
                 }
             }
@@ -1122,9 +1278,10 @@ fn run_live_vnc(
 #[cfg(feature = "live-vdi")]
 fn run_live_spice(
     config: SpiceConfig,
-    input_rx: mpsc::Receiver<egui::Event>,
+    input: SharedInputMailbox,
     stop_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<LiveSpiceEvent>,
+    frame_mailbox: LatestFrameMailbox,
 ) {
     let target = format!("{}:{}", config.host, config.port);
     let mut session = match SpiceSession::new(config.clone()) {
@@ -1143,7 +1300,7 @@ fn run_live_spice(
     };
     let _ = event_tx.send(LiveSpiceEvent::Connected(target));
     if let Some((frame, damage)) = session.frame_with_damage() {
-        let _ = event_tx.send(LiveSpiceEvent::Frame(frame, damage));
+        frame_mailbox.publish(frame, damage);
     }
 
     loop {
@@ -1155,7 +1312,11 @@ fn run_live_spice(
         }
 
         let mut had_input = false;
-        while let Ok(event) = input_rx.try_recv() {
+        let events = input
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain();
+        for event in events {
             session.send_input(&event);
             had_input = true;
         }
@@ -1169,7 +1330,7 @@ fn run_live_spice(
         match conn.pump_frame(&mut session) {
             Ok(true) => {
                 if let Some((frame, damage)) = session.frame_with_damage() {
-                    let _ = event_tx.send(LiveSpiceEvent::Frame(frame, damage));
+                    frame_mailbox.publish(frame, damage);
                 }
             }
             Ok(false) => {}
@@ -1523,6 +1684,60 @@ fn session_overlay(phase: &SessionPhase, max: u32) -> Option<SessionOverlay> {
     }
 }
 
+/// Request the Browser VM's native, node-local Display1 attachment.
+///
+/// This is deliberately not a VNC, SPICE, RDP, or Moonlight connection. The
+/// caller obtains fresh typed Workload status, then publishes the one
+/// capability-bound `StartAndAttach(QemuDisplay1Dmabuf)` operation. `mackesd`
+/// owns the domain and creates the one-use lease; the direct-DRM shell consumes
+/// that lease through its authenticated local Display1 client.
+///
+/// A Display1 DMA-BUF and its Unix socket cannot cross a mesh link. Refuse a
+/// remote placement instead of accidentally reviving a console relay.
+pub(crate) fn request_browser_vm_display1_attach(
+    target: &crate::web::BrowserVmTarget,
+    local_node: &str,
+    bus_root: Option<&Path>,
+) -> Result<String, String> {
+    if target.workload != "browser-vm" {
+        return Err("Browser activation refused a non-browser workload identity.".to_owned());
+    }
+    if !target.serving_peer.eq_ignore_ascii_case(local_node.trim()) {
+        return Err(format!(
+            "Browser VM is placed on `{}` but this Display1 seat is `{}`. Native Display1 is node-local; no console relay was opened.",
+            target.serving_peer, local_node
+        ));
+    }
+    let root = bus_root.ok_or_else(|| "the local mesh Bus directory is unavailable".to_owned())?;
+    let persist = Persist::open(root.to_path_buf())
+        .map_err(|error| format!("the local mesh Bus could not be opened: {error}"))?;
+    let status = crate::workload_api::read_status(&persist, &target.serving_peer, &target.workload)
+        .ok_or_else(|| {
+            "Browser VM has no fresh authoritative Workloads status; no attachment was requested."
+                .to_owned()
+        })?;
+    if status.backend != WorkloadBackend::LibvirtVirtqemud {
+        return Err("Browser VM status names a non-VM backend; no attachment was requested.".to_owned());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let request = crate::workload_api::request_with_image(
+        &target.workload,
+        &target.serving_peer,
+        status.backend,
+        status.resources,
+        WorkloadOperationAction::StartAndAttach,
+        Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+        status.generation,
+        status.image_ref.as_deref(),
+        now_ms,
+    )?;
+    crate::workload_api::publish(root, &request)
+}
+
 /// The Desktop surface's state: the active session (if any), the desktop texture
 /// the framebuffer is uploaded into, the decode → upload hand-off slot, and the
 /// picked target the discovery picker requested before a live session attaches.
@@ -1795,49 +2010,6 @@ impl VdiState {
         }
     }
 
-    /// Attach the stable Browser VM workload to the existing brokered VDI
-    /// transport. Browser uses the same session lifecycle as every other
-    /// Desktop VM; the guest identity is the workload name and no host Browser
-    /// process is constructed here.
-    pub(crate) fn request_browser_vm_connect(
-        &mut self,
-        target: crate::web::BrowserVmTarget,
-        transport: BrowserVmTransport,
-        client_peer: &str,
-        bus_root: Option<PathBuf>,
-        _preferred_size: Option<(u16, u16)>,
-        auth: DesktopAuth,
-    ) -> Result<(), String> {
-        let mut last_error = None;
-        let publication = crate::discovery::publish_browser_vm_open_record_with_transport(
-            bus_root.as_deref(),
-            &mut last_error,
-            &target.serving_peer,
-            &target.workload,
-            client_peer,
-            transport,
-        );
-        if let Some(error) = last_error {
-            return Err(format!("could not request browser-vm VDI session: {error}"));
-        }
-        let protocol = match transport {
-            BrowserVmTransport::Sunshine => VdiProtocol::Moonlight,
-            BrowserVmTransport::Rdp => VdiProtocol::Rdp,
-        };
-        let request = ConnectRequest::new(
-            RequestedTarget::new(target.serving_peer, target.workload),
-            protocol,
-            DisplayMode::Fullscreen,
-            MonitorSpan::Single,
-            auth,
-        )
-        .with_browser_transport(transport)
-        .with_broker_session(BrokerSessionLifecycle::new(publication.id, bus_root))
-        .with_preferred_size(Some(BROWSER_VM_DESKTOP_PX));
-        self.request_connect(request);
-        Ok(())
-    }
-
     /// Attach a focused App VM rail session to the existing brokered VDI path.
     /// App sessions use VNC as the universal console fallback while the serving
     /// console broker resolves the actual endpoint; this does not expose the
@@ -1849,6 +2021,11 @@ impl VdiState {
         bus_root: Option<PathBuf>,
         preferred_size: Option<(u16, u16)>,
     ) {
+        // `SessionRailState` admits the complete request before producing this
+        // handoff. Retain that declaration's identities here rather than
+        // rebuilding a session id or app identity from presentation text.
+        let app_id = handoff.request.app_id.clone();
+        let session_id = handoff.request.session_id.clone();
         let request = ConnectRequest::new(
             RequestedTarget::new(handoff.serving_peer, handoff.vm_id),
             VdiProtocol::Vnc,
@@ -1856,8 +2033,8 @@ impl VdiState {
             MonitorSpan::Single,
             DesktopAuth::mesh_identity(client_peer),
         )
-        .with_app_id(handoff.app_id)
-        .with_broker_session(BrokerSessionLifecycle::new(handoff.id, bus_root))
+        .with_app_id(app_id)
+        .with_broker_session(BrokerSessionLifecycle::new(session_id, bus_root))
         .with_preferred_size(preferred_size);
         self.request_connect(request);
     }
@@ -1946,18 +2123,6 @@ impl VdiState {
         let bodies = read_console_bodies(broker.bus_root.as_deref());
         match resolve_brokered_console(&bodies, &broker.id) {
             ConsoleResolution::Ready { endpoint, protocol } => {
-                let selected = self
-                    .requested
-                    .as_ref()
-                    .and_then(|request| request.browser_transport);
-                let protocol = match admit_broker_protocol(selected, protocol) {
-                    Ok(protocol) => protocol,
-                    Err(reason) => {
-                        self.live_status = Some(reason);
-                        self.broker_resolution_gated = true;
-                        return;
-                    }
-                };
                 if let Some(request) = self.requested.as_mut() {
                     request.target.endpoint = Some(endpoint);
                     if let Some(protocol) = protocol {
@@ -2112,17 +2277,6 @@ impl VdiState {
     /// stay on the LINEAR upscale (imperceptible, no disruptive re-dial).
     #[cfg(feature = "live-vdi")]
     fn note_resize_target(&mut self, panel_px: (u16, u16), guest_px: (u16, u16)) {
-        // Browser is deliberately a fixed 1080p source. Construct scales the
-        // complete framebuffer to its panel; panel chrome must never trigger a
-        // lower-resolution guest re-dial.
-        if self
-            .requested
-            .as_ref()
-            .is_some_and(|request| request.browser_transport.is_some())
-        {
-            self.pending_resize = None;
-            return;
-        }
         // Only an RDP/SPICE session re-negotiates by re-dialing; VNC excludes itself.
         let renegotiable = self.live_rdp.is_some() || self.live_spice.is_some();
         if !renegotiable || self.session_phase != SessionPhase::Live {
@@ -2270,12 +2424,6 @@ impl VdiState {
                     self.live_status = Some(format!("Live RDP connected to {target}"));
                     publish_active = true;
                 }
-                LiveRdpEvent::Frame(frame, damage) => {
-                    self.incoming = Some(frame);
-                    self.incoming_damage = Some(damage);
-                    self.metrics.note_frame();
-                    got_frame = true;
-                }
                 LiveRdpEvent::CertWarning(message) => {
                     // Non-fatal: keep the session live, just raise the banner.
                     self.live_status = Some(message);
@@ -2289,6 +2437,12 @@ impl VdiState {
                     drop_reason = Some(reason);
                 }
             }
+        }
+        if let Some((frame, damage)) = live.frame_mailbox.take() {
+            self.incoming = Some(frame);
+            self.incoming_damage = Some(damage);
+            self.metrics.note_frame();
+            got_frame = true;
         }
         // A fresh frame means the desktop is live again (recovering a reconnect).
         if got_frame {
@@ -2321,12 +2475,6 @@ impl VdiState {
                     self.live_status = Some(format!("Live VNC connected to {target}"));
                     publish_active = true;
                 }
-                LiveVncEvent::Frame(frame, damage) => {
-                    self.incoming = Some(frame);
-                    self.incoming_damage = Some(damage);
-                    self.metrics.note_frame();
-                    got_frame = true;
-                }
                 LiveVncEvent::Clipboard(clip) => clipboard_events.push(clip),
                 LiveVncEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
@@ -2337,6 +2485,12 @@ impl VdiState {
                     drop_reason = Some(reason);
                 }
             }
+        }
+        if let Some((frame, damage)) = live.frame_mailbox.take() {
+            self.incoming = Some(frame);
+            self.incoming_damage = Some(damage);
+            self.metrics.note_frame();
+            got_frame = true;
         }
         if !clipboard_events.is_empty() {
             let root = self
@@ -2376,12 +2530,6 @@ impl VdiState {
                     self.live_status = Some(format!("Live SPICE connected to {target}"));
                     publish_active = true;
                 }
-                LiveSpiceEvent::Frame(frame, damage) => {
-                    self.incoming = Some(frame);
-                    self.incoming_damage = Some(damage);
-                    self.metrics.note_frame();
-                    got_frame = true;
-                }
                 LiveSpiceEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
                     drop_reason = Some(reason);
@@ -2391,6 +2539,12 @@ impl VdiState {
                     drop_reason = Some(reason);
                 }
             }
+        }
+        if let Some((frame, damage)) = live.frame_mailbox.take() {
+            self.incoming = Some(frame);
+            self.incoming_damage = Some(damage);
+            self.metrics.note_frame();
+            got_frame = true;
         }
         if got_frame {
             self.note_live_frame();

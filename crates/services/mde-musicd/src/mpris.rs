@@ -27,9 +27,8 @@
 //! the queue cursor and advances it at each boundary — see
 //! [`advance_queue_cursor`](crate::bus_responder)), so this surface's `Metadata`
 //! + `Position` track the song you actually hear without any MPRIS-side
-//! callback. `CanSeek` is reported `false` here even though the AIR-5 engine
-//! gained seek (MUSIC-RFX-2) — wiring MPRIS `Seek`/`SetPosition` to it is a
-//! small follow-on (the GUI scrub bar already drives `action/music/seek`).
+//! callback. MPRIS `Seek`/`SetPosition` use the same finite-source gate and
+//! engine seek request as the GUI's `action/music/seek` path.
 
 // MPRIS plumbing trips a few pedantic/nursery lints that are noise here:
 // the f32↔f64 volume + u64→i64 position conversions are intentional and
@@ -46,6 +45,7 @@
     clippy::module_name_repetitions,
     clippy::missing_const_for_fn,
     clippy::implicit_hasher,
+    missing_docs,
     // The MPRIS contract forces `&self` on the no-op methods (Seek /
     // SetPosition / OpenUri) + on `client()`, and forces ignored params
     // that zbus still deserializes off the wire — so the `_`-prefix is
@@ -59,7 +59,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use zbus::interface;
@@ -177,11 +176,41 @@ fn read_mode(dir: &Path) -> PlaybackMode {
 }
 
 /// Write the playback mode (best-effort; creates the parent dir).
-fn write_mode(dir: &Path, mode: &PlaybackMode) {
-    if let Ok(json) = serde_json::to_string_pretty(mode) {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(mode_path(dir), json);
-    }
+fn write_mode(dir: &Path, mode: &PlaybackMode) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(mode)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(mode_path(dir), json)
+}
+
+/// Apply the durable shuffle preference from the typed Bus workspace lane.
+pub(crate) fn set_workspace_shuffle(dir: &Path, shuffle: bool) -> Result<(), &'static str> {
+    let mut mode = read_mode(dir);
+    mode.shuffle = shuffle;
+    write_mode(dir, &mode).map_err(|_| "mode_persist_failed")
+}
+
+/// Apply the durable repeat preference from the typed Bus workspace lane.
+pub(crate) fn set_workspace_repeat(dir: &Path, repeat: &str) -> Result<(), &'static str> {
+    let mut mode = read_mode(dir);
+    mode.loop_status = match repeat {
+        "off" => LoopStatus::None,
+        "track" => LoopStatus::Track,
+        "context" => LoopStatus::Playlist,
+        _ => return Err("invalid_repeat"),
+    };
+    write_mode(dir, &mode).map_err(|_| "mode_persist_failed")
+}
+
+/// Read the shared playback policy for the retained Music workspace snapshot.
+pub(crate) fn workspace_playback_policy(dir: &Path) -> (bool, &'static str) {
+    let mode = read_mode(dir);
+    let repeat = match mode.loop_status {
+        LoopStatus::None => "off",
+        LoopStatus::Track => "track",
+        LoopStatus::Playlist => "context",
+    };
+    (mode.shuffle, repeat)
 }
 
 /// A 64-bit seed mixing the per-call ULID randomness with the wall clock —
@@ -294,6 +323,25 @@ fn metadata_map(now: &NowPlaying) -> HashMap<String, OwnedValue> {
     m
 }
 
+/// Convert an MPRIS signed microsecond offset into a bounded millisecond target.
+/// Negative offsets saturate at the start instead of wrapping through `u64`.
+#[must_use]
+fn seek_target_ms(current_ms: u64, offset_us: i64) -> u64 {
+    let delta_ms = offset_us.unsigned_abs() / 1_000;
+    if offset_us.is_negative() {
+        current_ms.saturating_sub(delta_ms)
+    } else {
+        current_ms.saturating_add(delta_ms)
+    }
+}
+
+/// Convert an MPRIS absolute microsecond position to the engine's millisecond
+/// unit, rejecting the protocol's negative sentinel values.
+#[must_use]
+fn position_target_ms(position_us: i64) -> Option<u64> {
+    (!position_us.is_negative()).then_some(position_us as u64 / 1_000)
+}
+
 // ───────────────────────── root interface ─────────────────────────
 
 /// `org.mpris.MediaPlayer2` — the root media-player object.
@@ -360,16 +408,23 @@ struct Player {
     engine: EngineHandle,
     queue_path: PathBuf,
     data_dir: PathBuf,
+    coordination_dir: PathBuf,
     now: Arc<Mutex<NowPlaying>>,
 }
 
 impl Player {
     /// Build a player bound to the shared engine + the on-disk queue/state.
-    fn new(engine: EngineHandle, queue_path: PathBuf, data_dir: PathBuf) -> Self {
+    fn new(
+        engine: EngineHandle,
+        queue_path: PathBuf,
+        data_dir: PathBuf,
+        coordination_dir: PathBuf,
+    ) -> Self {
         Self {
             engine,
             queue_path,
             data_dir,
+            coordination_dir,
             now: Arc::new(Mutex::new(NowPlaying::default())),
         }
     }
@@ -391,7 +446,7 @@ impl Player {
             position_ms,
             updated_ms: state::now_ms(),
         };
-        let _ = state::write_state(&self.data_dir, &st);
+        let _ = state::write_state(&self.coordination_dir, &st);
     }
 
     /// Resolve + cache the metadata for `song_id` via `getSong`, falling
@@ -520,6 +575,7 @@ impl Player {
     }
 }
 
+#[allow(missing_docs)]
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
     /// MPRIS `Play`: resume a paused buffer, or start the queue when
@@ -584,12 +640,50 @@ impl Player {
         self.notify(&emitter).await;
     }
 
-    /// MPRIS `Seek`. The AIR-5 engine has no seek yet (`CanSeek` is
-    /// `false`), so per the MPRIS contract this has no effect.
-    async fn seek(&self, _offset: i64) {}
+    /// MPRIS `Seek`: apply a signed microsecond offset to the finite current
+    /// track. Live/radio streams are rejected by the shared engine gate.
+    async fn seek(&self, offset: i64, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
+        if self.engine.is_seekable() {
+            let target_ms = seek_target_ms(self.engine.position_ms(), offset);
+            if self.engine.seek(target_ms) {
+                let position_us =
+                    i64::try_from(target_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
+                let _ = Self::seeked(emitter, position_us).await;
+            }
+        }
+    }
 
-    /// MPRIS `SetPosition`. No effect while `CanSeek` is `false`.
-    async fn set_position(&self, _track_id: ObjectPath<'_>, _position: i64) {}
+    /// MPRIS `SetPosition`: accept only the currently loaded track path and a
+    /// non-negative absolute position, then use the same finite-source gate.
+    async fn set_position(
+        &self,
+        track_id: ObjectPath<'_>,
+        position: i64,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
+        let Some(position_ms) = position_target_ms(position) else {
+            return;
+        };
+        let current = queue::read_from(&self.queue_path)
+            .current()
+            .map(ToOwned::to_owned)
+            .unwrap_or_default();
+        if current.is_empty() || track_id.as_str() != track_path(&current) {
+            return;
+        }
+        if self.engine.is_seekable() {
+            if self.engine.seek(position_ms) {
+                let position_us =
+                    i64::try_from(position_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
+                let _ = Self::seeked(emitter, position_us).await;
+            }
+        }
+    }
+
+    /// MPRIS `Seeked` signal emitted after the shared engine accepts a seek.
+    #[allow(missing_docs)]
+    #[zbus(signal)]
+    async fn seeked(emitter: SignalEmitter<'_>, position: i64) -> zbus::Result<()>;
 
     /// MPRIS `OpenUri`. Playback is queue-driven (Airsonic ids), so an
     /// arbitrary URI open is unsupported.
@@ -610,7 +704,7 @@ impl Player {
         if let Some(ls) = LoopStatus::from_mpris(&value) {
             let mut mode = read_mode(&self.data_dir);
             mode.loop_status = ls;
-            write_mode(&self.data_dir, &mode);
+            let _ = write_mode(&self.data_dir, &mode);
         }
     }
 
@@ -623,7 +717,7 @@ impl Player {
     async fn set_shuffle(&self, value: bool) {
         let mut mode = read_mode(&self.data_dir);
         mode.shuffle = value;
-        write_mode(&self.data_dir, &mode);
+        let _ = write_mode(&self.data_dir, &mode);
     }
 
     #[zbus(property)]
@@ -710,7 +804,7 @@ impl Player {
 
     #[zbus(property)]
     async fn can_seek(&self) -> bool {
-        false
+        self.engine.is_seekable()
     }
 
     #[zbus(property)]
@@ -725,6 +819,7 @@ impl Player {
 /// or on drop.
 pub struct MprisHandle {
     stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -732,6 +827,10 @@ impl MprisHandle {
     /// Signal the MPRIS thread to stop, then join it.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Wake the event-driven wait immediately. `notify_one` retains a
+        // permit when the runtime has not reached the wait yet, closing the
+        // stop-vs-wait race without a periodic polling timer.
+        self.wake.notify_one();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -752,9 +851,16 @@ impl Drop for MprisHandle {
 /// is no reachable session bus — a headless peer keeps Bus + queue working
 /// without MPRIS.
 #[must_use]
-pub fn spawn(engine: EngineHandle, queue_path: PathBuf, data_dir: PathBuf) -> MprisHandle {
+pub fn spawn(
+    engine: EngineHandle,
+    queue_path: PathBuf,
+    data_dir: PathBuf,
+    coordination_dir: PathBuf,
+) -> MprisHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let wake_thread = wake.clone();
     let join = std::thread::Builder::new()
         .name("mde-musicd-mpris".to_string())
         .spawn(move || {
@@ -769,7 +875,7 @@ pub fn spawn(engine: EngineHandle, queue_path: PathBuf, data_dir: PathBuf) -> Mp
                 }
             };
             rt.block_on(async move {
-                let player = Player::new(engine, queue_path, data_dir);
+                let player = Player::new(engine, queue_path, data_dir, coordination_dir);
                 let built = zbus::connection::Builder::session()
                     .and_then(|b| b.name(BUS_NAME))
                     .and_then(|b| b.serve_at(OBJECT_PATH, MediaPlayer2))
@@ -790,20 +896,23 @@ pub fn spawn(engine: EngineHandle, queue_path: PathBuf, data_dir: PathBuf) -> Mp
                         return;
                     }
                 };
-                // Keep the connection alive until asked to stop.
+                // Keep the connection alive until asked to stop. There is no
+                // MPRIS-side periodic work, so a timer here would create
+                // synchronized idle wakeups across seats for no benefit.
                 while !stop_thread.load(Ordering::Relaxed) {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    wake_thread.notified().await;
                 }
             });
         })
         .ok();
-    MprisHandle { stop, join }
+    MprisHandle { stop, wake, join }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use std::time::Duration;
 
     #[test]
     fn playback_status_maps_engine_flags() {
@@ -850,7 +959,7 @@ mod tests {
             shuffle: true,
             loop_status: LoopStatus::Playlist,
         };
-        write_mode(dir.path(), &mode);
+        let _ = write_mode(dir.path(), &mode);
         assert_eq!(read_mode(dir.path()), mode);
     }
 
@@ -877,6 +986,37 @@ mod tests {
         assert!(empty.contains_key("mpris:trackid"));
         assert!(!empty.contains_key("xesam:title"));
         assert!(!empty.contains_key("mpris:length"));
+    }
+
+    #[test]
+    fn mpris_seek_offsets_saturate_and_use_microseconds() {
+        assert_eq!(seek_target_ms(10_000, -2_500_000), 7_500);
+        assert_eq!(seek_target_ms(1_000, -2_500_000), 0);
+        assert_eq!(seek_target_ms(u64::MAX - 1, i64::MAX), u64::MAX);
+        assert_eq!(position_target_ms(42_500), Some(42));
+        assert_eq!(position_target_ms(-1), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mpris_stop_wakeup_is_prompt_without_polling_timer() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let stop_wait = stop.clone();
+        let wake_wait = wake.clone();
+        let waiter = async move {
+            while !stop_wait.load(Ordering::Relaxed) {
+                wake_wait.notified().await;
+            }
+        };
+
+        stop.store(true, Ordering::Relaxed);
+        wake.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waiter)
+                .await
+                .is_ok(),
+            "stop notification should wake the MPRIS lifecycle without a timer"
+        );
     }
 
     #[test]

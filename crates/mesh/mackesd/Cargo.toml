@@ -212,7 +212,7 @@ fs2 = "0.4"
 # NF-2.4 seal — safe running-uid lookup (rustix avoids the
 # `unsafe { libc::getuid() }` path that the workspace's
 # `unsafe_code = "forbid"` lint rejects).
-rustix = { version = "0.38", features = ["fs", "process"] }
+rustix = { version = "0.38", features = ["fs", "process", "net"] }
 
 # NF-2 CA module — error-derive macro used across the
 # ca::{mint,sign,seal,bundle} modules. tokio-rustls already
@@ -263,7 +263,7 @@ task-supervisor = { version = "0.4", optional = true }
 # cooperates with the worker pool; default-features disabled to skip
 # the async-io thread launches. blocking-api stays off — the library
 # never blocks.
-zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"], optional = true }
 
 # v2.0.0 Phase A — async-trait for object-safe `Worker` boxing in the
 # in-process supervisor (`crate::workers::Worker`). Native async-fn-
@@ -399,7 +399,26 @@ payload_compress = "xz"
 # `dnf upgrade` survives on a node like Eagle. A minor VERSION bump
 # (11.2.0 → 11.3.0: onboard verbs OW-8/11, CTRLSURF 1-8, NOTIFY-REDESIGN A-C)
 # resets release to 1.
-release = "1"
+# -4 (2026-08-05): WL-ARCH-010 managed Workload reconciler, authenticated
+# Display1 handoff, and bounded storage-pool deployment path. This release is
+# intentionally above the Dell seat's installed review -3 package.
+# -5 (2026-08-06): Music/Media daemon projection validation, media-core
+# roaming/cast hardening, and the current installed-seat proof boundary.
+# -6 (2026-08-07): first-class daemon-owned artwork across Music catalog,
+# detail, queue, now-playing, bookmarks, and embedded discovery surfaces.
+# -7 (2026-08-07): fail-closed typed Internet-radio playback plus a
+# user-service-writable replay ledger for root-signed Music actions.
+# -8 (2026-08-08): decode verified Music authorization envelopes at the typed
+# workspace boundary and fail over across configured secret-store endpoints.
+# -9 (2026-08-08): preserve identity-bound loading state while Artist, Album,
+# and Podcast detail responses replace the retained Music workspace snapshot.
+# -10 (2026-08-08): activate replaced shell/daemon executables after upgrade
+# and enforce exactly one seat-owned mde-musicd user authority.
+# -11 (2026-08-08): repair a same-cause NWS degraded projection when Bus
+# startup replaces the worker's early retained write.
+# -12 (2026-08-08): put Music ownership/handoff records on the Syncthing mesh
+# plane and preserve alternate admitted providers behind the selected source.
+release = "12"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -461,6 +480,13 @@ assets = [
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    # WL-CRIT-007 — authenticated post-overlay claim snapshot prerequisite.
+    # These units remain deliberately disabled/inert until the typed pre-Nebula
+    # authority-transport blocker is closed.
+    { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
+    { source = "install-helpers/mcnf-overlay-identity-collision-guard.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py", mode = "755" },
+    { source = "packaging/systemd/mcnf-overlay-identity-claims-materializer.service", dest = "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service", mode = "644" },
+    { source = "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf", dest = "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf", mode = "644" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
@@ -485,6 +511,17 @@ assets = [
     { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
+    # WL-FUNC-021 — Music mutations use a dedicated asymmetric credential:
+    # only the root DRM shell receives the encrypted seed; mde-musicd reads the
+    # derived public key. Keep this helper/drop-in separate from cloud-arm.
+    { source = "install-helpers/provision-music-action-credential.sh", dest = "/usr/libexec/mackesd/provision-music-action-credential", mode = "755" },
+    { source = "packaging/systemd/music-action-credential.conf", dest = "/usr/libexec/mackesd/music-action-credential.conf", mode = "644" },
+    { source = "packaging/systemd/mcnf-music-action-credential.service", dest = "/usr/lib/systemd/system/mcnf-music-action-credential.service", mode = "644" },
+    # WL-FUNC-019 — the shell's authenticated resource consumer reads this
+    # host-bound credential. The helper obtains the exact key through the
+    # approved mackesd SecretStore CLI; without it the chooser stays read-only.
+    { source = "install-helpers/provision-resource-publisher-credential.sh", dest = "/usr/libexec/mackesd/provision-resource-publisher-credential", mode = "755" },
+    { source = "packaging/systemd/resource-publisher-hmac.conf", dest = "/usr/libexec/mackesd/resource-publisher-hmac.conf", mode = "644" },
     # Browser VM RDP login is rotated per serving seat and sealed by systemd.
     # The warning helper is the mandatory five-second pre-update operator notice.
     { source = "install-helpers/seat-update-warning.sh", dest = "/usr/libexec/mackesd/seat-update-warning", mode = "755" },
@@ -689,6 +726,19 @@ assets = [
     { source = "infra/tofu/control-vm/cloud-init/*", dest = "/opt/mcnf/infra/tofu/control-vm/cloud-init/", mode = "644" },
     { source = "infra/tofu/control-vm/env.sh.example", dest = "/opt/mcnf/infra/tofu/control-vm/env.sh.example", mode = "644" },
     { source = "infra/tofu/control-vm/README.md", dest = "/opt/mcnf/infra/tofu/control-vm/README.md", mode = "644" },
+    # Workloads U4/U5 — the cloud worker executes these committed IaC roots from
+    # its default /usr/share/mde/iac path. Runtime tfvars/backend/state files are
+    # generated on the host and intentionally remain outside the package.
+    { source = "infra/tofu/cloud/*.tf",                dest = "/usr/share/mde/iac/infra/tofu/cloud/",                mode = "644" },
+    { source = "infra/tofu/cloud/.terraform.lock.hcl", dest = "/usr/share/mde/iac/infra/tofu/cloud/.terraform.lock.hcl", mode = "644" },
+    { source = "infra/tofu/cloud/cloud-init/*",        dest = "/usr/share/mde/iac/infra/tofu/cloud/cloud-init/",        mode = "644" },
+    { source = "infra/tofu/cloud/modules/**/*",        dest = "/usr/share/mde/iac/infra/tofu/cloud/modules/",        mode = "644" },
+    { source = "infra/tofu/cloud/scripts/*",           dest = "/usr/share/mde/iac/infra/tofu/cloud/scripts/",           mode = "755" },
+    { source = "automation/ansible/ansible.cfg",       dest = "/usr/share/mde/iac/automation/ansible/ansible.cfg",       mode = "644" },
+    { source = "automation/ansible/inventory/*",       dest = "/usr/share/mde/iac/automation/ansible/inventory/",       mode = "755" },
+    { source = "automation/ansible/playbooks/*",       dest = "/usr/share/mde/iac/automation/ansible/playbooks/",       mode = "644" },
+    { source = "automation/ansible/plugins/**/*",      dest = "/usr/share/mde/iac/automation/ansible/plugins/",      mode = "644" },
+    { source = "automation/ansible/roles/**/*",        dest = "/usr/share/mde/iac/automation/ansible/roles/",        mode = "644" },
     # The backoffice systemd units (mcnf-*). The boot-time convergence oneshot
     # (mcnf-backoffice-up.service, DAR-46/47) runs backoffice-up.sh from-intent
     # --adopt; the reconciler/DR/status units are installed live by the *-up.sh
@@ -742,7 +792,7 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
 # the mackesd supervisor. (mackesd self-gates on a pinned role, so enabling
 # it pre-enrollment is safe — it idles until `found`/`join` pins a role.)
-systemctl enable mackesd.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mackesd.service mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 # MESHSHELL — the mesh-status snapshot timer feeds the bash prompt + greeting
 # on every role.
 systemctl enable --now mesh-status.timer >/dev/null 2>&1 || :
@@ -787,12 +837,39 @@ systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
 # oneshots can still race the open RPM transaction. Enable only; policy loading
 # is deferred to boot or an explicit post-install retry outside dnf.
 systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
-# MUSIC-DAEMON-AUTOSTART — enable the mde-musicd USER service for every user so
-# the music library has its action/music/* responder in the desktop session
-# (the GUI talks to it over the bus). It self-gates on Workstation rank
-# (ExecCondition) + only starts where a user session exists, so enabling it
-# globally is safe: a headless Server/Lighthouse has no session to start it in.
-systemctl --global enable mde-musicd.service >/dev/null 2>&1 || :
+# MUSIC-DAEMON-AUTOSTART — exactly one seat account owns the daemon authority.
+# A global user-unit enable starts another responder for root and every login;
+# Surface exposed that duplicate live. Remove the global edge and select the
+# first production seat identity. Direct user-bus calls avoid systemctl's
+# broken `--machine=user@` transient-unit bridge on current Fedora seats.
+systemctl --global disable mde-musicd.service >/dev/null 2>&1 || :
+mcnf_user_systemctl() {
+  mcnf_user="$1"
+  shift
+  mcnf_uid="$(id -u "$mcnf_user" 2>/dev/null || :)"
+  [ -n "$mcnf_uid" ] && [ -S "/run/user/$mcnf_uid/bus" ] || return 0
+  runuser -u "$mcnf_user" -- env \
+    XDG_RUNTIME_DIR="/run/user/$mcnf_uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$mcnf_uid/bus" \
+    systemctl --user "$@" >/dev/null 2>&1 || :
+}
+mcnf_music_seat_user=
+for candidate in mm mde; do
+  if id "$candidate" >/dev/null 2>&1; then
+    mcnf_music_seat_user="$candidate"
+    break
+  fi
+done
+for candidate in root mm mde; do
+  id "$candidate" >/dev/null 2>&1 || continue
+  if [ "$candidate" = "$mcnf_music_seat_user" ]; then
+    mcnf_user_systemctl "$candidate" daemon-reload
+    mcnf_user_systemctl "$candidate" enable mde-musicd.service
+    mcnf_user_systemctl "$candidate" restart mde-musicd.service
+  else
+    mcnf_user_systemctl "$candidate" disable --now mde-musicd.service
+  fi
+done
 # AUDIO-SEAT — compositor-less DRM Workstations do not have a desktop login
 # manager handing out uaccess ACLs to the long-running mm/mde user audio
 # services. Grant the known seat users the local audio group when present so
@@ -822,8 +899,8 @@ if getent group audio >/dev/null 2>&1; then
     fi
   done
   if [ -n "$mcnf_audio_seat_user" ]; then
-    systemctl --user --machine="$mcnf_audio_seat_user@" daemon-reload >/dev/null 2>&1 || :
-    systemctl --user --machine="$mcnf_audio_seat_user@" enable --now mcnf-qemu-pulse-endpoint.service >/dev/null 2>&1 || :
+    mcnf_user_systemctl "$mcnf_audio_seat_user" daemon-reload
+    mcnf_user_systemctl "$mcnf_audio_seat_user" enable --now mcnf-qemu-pulse-endpoint.service
   fi
 fi
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
@@ -848,6 +925,11 @@ set_gtk_icon_theme() {
 set_gtk_icon_theme /etc/gtk-3.0/settings.ini
 set_gtk_icon_theme /etc/gtk-4.0/settings.ini
 timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
+# RPM-UPGRADE-ACTIVATION — replacing an executable does not replace a running
+# process. Restart only already-active system authorities after package setup so
+# upgrades cannot leave the old shell or daemon mapped through a deleted inode;
+# fresh installs remain governed by the normal role/start gates.
+systemctl try-restart mackesd.service mde-shell-egui.service >/dev/null 2>&1 || :
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
@@ -881,6 +963,12 @@ nmap = "*"
 # headless lighthouse without alsa-lib failed the v10.0.9 install until it was
 # added by hand. alsa-lib is small + in the base Fedora repos.
 alsa-lib = "*"
+# MUSIC-AUTH-1 — the base workstation ships the root-only Music capability
+# provisioner. It invokes OpenSSL for Ed25519 public-key derivation and the
+# packaged mcnf-secret helper uses curl for the existing secret-store API;
+# declare both so the enabled provisioning service cannot fail on a fresh seat.
+openssl = "*"
+curl = "*"
 # RCLICK-4 (2026-06-19) — the Win+X right-click power menu launches these: btop
 # (its "Task Manager", run in cosmic-term) + Midnight Commander (`mc`). Both are
 # small + in the base Fedora repos, and the menu entries dead-end without them,
@@ -1130,7 +1218,9 @@ magic-mesh-server = "*"
 name = "magic-mesh-lighthouse"
 summary = "MCNF thin DigitalOcean lighthouse — Nebula relay, etcd quorum, and mackesd control plane"
 payload_compress = "xz"
-release = "1"
+# Keep the role variants monotonic with the base package for corrected-forward
+# fleet deployment.
+release = "5"
 license = "GPL-3.0-or-later AND MPL-2.0"
 # The thin variant must replace (not co-install with) any role package that
 # owns the same daemon/unit paths.  An operator can use `dnf swap` for an
@@ -1140,6 +1230,12 @@ assets = [
     { source = "target/release/mackesd", dest = "/usr/bin/mackesd", mode = "755" },
     { source = "target/release/meshctl", dest = "/usr/bin/meshctl", mode = "755" },
     { source = "packaging/systemd/mackesd.service", dest = "/usr/lib/systemd/system/mackesd.service", mode = "644" },
+    # WL-CRIT-007 — ship the disabled producer and inert guard prerequisite on
+    # the thin control-plane role without adding an activation edge.
+    { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
+    { source = "install-helpers/mcnf-overlay-identity-collision-guard.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py", mode = "755" },
+    { source = "packaging/systemd/mcnf-overlay-identity-claims-materializer.service", dest = "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service", mode = "644" },
+    { source = "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf", dest = "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf", mode = "644" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
@@ -1235,6 +1331,12 @@ assets = [
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     # PKG-3 — the self-gating daemon unit + the health/alert watchdog.
     { source = "packaging/systemd/mackesd.service",   dest = "/usr/lib/systemd/system/mackesd.service",   mode = "644" },
+    # WL-CRIT-007 — the same disabled/inert authenticated snapshot
+    # prerequisite shipped by every role package.
+    { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
+    { source = "install-helpers/mcnf-overlay-identity-collision-guard.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py", mode = "755" },
+    { source = "packaging/systemd/mcnf-overlay-identity-claims-materializer.service", dest = "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service", mode = "644" },
+    { source = "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf", dest = "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf", mode = "644" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
@@ -1333,6 +1435,18 @@ assets = [
     { source = "infra/tofu/control-vm/cloud-init/*", dest = "/opt/mcnf/infra/tofu/control-vm/cloud-init/", mode = "644" },
     { source = "infra/tofu/control-vm/env.sh.example", dest = "/opt/mcnf/infra/tofu/control-vm/env.sh.example", mode = "644" },
     { source = "infra/tofu/control-vm/README.md", dest = "/opt/mcnf/infra/tofu/control-vm/README.md", mode = "644" },
+    # Workloads U4/U5 — same committed cloud IaC + Ansible roots for the
+    # headless compute/server variant; generated runtime state is excluded.
+    { source = "infra/tofu/cloud/*.tf",                dest = "/usr/share/mde/iac/infra/tofu/cloud/",                mode = "644" },
+    { source = "infra/tofu/cloud/.terraform.lock.hcl", dest = "/usr/share/mde/iac/infra/tofu/cloud/.terraform.lock.hcl", mode = "644" },
+    { source = "infra/tofu/cloud/cloud-init/*",        dest = "/usr/share/mde/iac/infra/tofu/cloud/cloud-init/",        mode = "644" },
+    { source = "infra/tofu/cloud/modules/**/*",        dest = "/usr/share/mde/iac/infra/tofu/cloud/modules/",        mode = "644" },
+    { source = "infra/tofu/cloud/scripts/*",           dest = "/usr/share/mde/iac/infra/tofu/cloud/scripts/",           mode = "755" },
+    { source = "automation/ansible/ansible.cfg",       dest = "/usr/share/mde/iac/automation/ansible/ansible.cfg",       mode = "644" },
+    { source = "automation/ansible/inventory/*",       dest = "/usr/share/mde/iac/automation/ansible/inventory/",       mode = "755" },
+    { source = "automation/ansible/playbooks/*",       dest = "/usr/share/mde/iac/automation/ansible/playbooks/",       mode = "644" },
+    { source = "automation/ansible/plugins/**/*",      dest = "/usr/share/mde/iac/automation/ansible/plugins/",      mode = "644" },
+    { source = "automation/ansible/roles/**/*",        dest = "/usr/share/mde/iac/automation/ansible/roles/",        mode = "644" },
     { source = "packaging/systemd/mcnf-backoffice-up.service",  dest = "/usr/lib/systemd/system/mcnf-backoffice-up.service",  mode = "644" },
     { source = "packaging/systemd/mcnf-backoffice-status.service", dest = "/usr/lib/systemd/system/mcnf-backoffice-status.service", mode = "644" },
     { source = "packaging/systemd/mcnf-backoffice-status.timer",   dest = "/usr/lib/systemd/system/mcnf-backoffice-status.timer",   mode = "644" },

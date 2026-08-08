@@ -21,9 +21,11 @@ path = "src/lib.rs"
 # Airsonic is reached over the Nebula overlay, which is the encryption
 # boundary; HTTPS-server support is the AIR-4.b follow-on). `blocking`
 # powers the AIR-5 decode thread's stream fetch.
-reqwest    = { version = "0.12", default-features = false, features = ["json", "blocking"] }
+reqwest    = { version = "0.12", default-features = false, features = ["json", "blocking", "stream"] }
+futures-util = "0.3"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+ed25519-dalek = { version = "2", default-features = false }
 # Subsonic API auth token = md5(password + salt), hex-encoded (Q—).
 md5        = "0.7"
 # Random per-session salt source (already a workspace dep).
@@ -38,6 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # AIR-2 daemon control surface: Bus-native (action/music/* + reply/<ulid>)
 # per the Q96 Bus-canonical lock (no new D-Bus interface).
 mde-bus    = { path = "../../platform/mde-bus" }
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # AIR-5 playback engine: pure-Rust decode (Symphonia — FLAC/MP3/Vorbis/
 # AAC/WAV) + native output (cpal → ALSA/PipeWire). Opus decode is AIR-5.b
 # (Symphonia 0.5 ships no opus codec; routed through libopus there).
@@ -60,6 +63,7 @@ base64     = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+socket2 = "0.5"
 
 [lints]
 workspace = true

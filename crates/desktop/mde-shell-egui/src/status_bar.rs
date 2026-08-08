@@ -63,63 +63,22 @@ pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.8;
 
 /// Construct-owned workspaces promoted into the persistent notification/tool
 /// tray. The navigation rail remains intact in both placement modes.
-pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 6] = TOOL_TRAY_SURFACES;
+pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 4] = TOOL_TRAY_SURFACES;
 const WORKSPACE_TRAY_ICON_W: f32 = STATUS_BAR_H;
 const WORKSPACE_TRAY_GAP: f32 = Style::SP_XS;
 
-/// Compact right-rail controls. These are intentionally action-only: the
-/// existing Control Center remains the source of truth for their live values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatusControl {
-    /// Open the Control Center's volume controls.
-    Volume,
-    /// Open the Control Center's network controls.
-    Network,
-    /// Open the Control Center's display/brightness controls.
-    Brightness,
-    /// Open the Control Center's live power and battery controls.
-    Power,
-}
+/// One menu trigger replaces the old four-icon shortcut cluster. The existing
+/// Control Center remains the source of truth for all live status values.
+const STATUS_MENU_ICON: IconId = IconId::Menu;
+const STATUS_MENU_LABEL: &str = "Open status menu — Control Center";
 
-impl StatusControl {
-    /// The fixed, deterministic order used by the top rail.
-    pub(crate) const ALL: [Self; 4] = [Self::Volume, Self::Network, Self::Brightness, Self::Power];
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Volume => 0,
-            Self::Network => 1,
-            Self::Brightness => 2,
-            Self::Power => 3,
-        }
-    }
-
-    /// Existing YAMIS glyph selected for this status/control-center affordance.
-    pub(crate) const fn icon(self) -> IconId {
-        match self {
-            Self::Volume => IconId::Volume,
-            Self::Network => IconId::Signal,
-            Self::Brightness => IconId::DisplaySettings,
-            Self::Power => IconId::PowerBattery,
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Volume => "Volume",
-            Self::Network => "Network",
-            Self::Brightness => "Screen brightness",
-            Self::Power => "Power & Battery",
-        }
-    }
-}
-
-/// Each icon gets one full rail-height hit target, matching the compact macOS
-/// menu-bar rhythm while keeping the pointer target larger than the glyph.
+/// The status-menu icon gets one full rail-height hit target, matching the
+/// compact macOS menu-bar rhythm while keeping the pointer target larger than
+/// the glyph.
 const STATUS_CONTROL_W: f32 = STATUS_BAR_H;
 const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
 const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
-const BOTTOM_TRAY_PIN_W: f32 = 40.0;
+const BOTTOM_TRAY_STATUS_MENU_W: f32 = 40.0;
 /// Keep a usable clock lane when a window is narrower than the normal menu
 /// bar. The lane may shrink below this value on an extremely small surface,
 /// but the controls must never consume the centered clock's hit target.
@@ -183,15 +142,14 @@ fn finite_non_negative(value: f32) -> f32 {
 }
 
 fn status_controls_width() -> f32 {
-    STATUS_CONTROL_W * StatusControl::ALL.len() as f32
-        + STATUS_CONTROL_GAP * (StatusControl::ALL.len().saturating_sub(1) as f32)
+    STATUS_CONTROL_W
 }
 
-/// Fit the right-control cluster to the available rail without changing its
+/// Fit the status-menu trigger to the available rail without changing its
 /// normal macOS-sized geometry on a real workstation. Tiny headless/windowed
-/// surfaces still get bounded hit targets instead of controls extending past
-/// the top-bar edge.
-fn status_controls_metrics(bar: egui::Rect) -> (f32, f32) {
+/// surfaces still get a bounded hit target instead of extending past the
+/// top-bar edge.
+fn status_menu_width(bar: egui::Rect) -> f32 {
     // Scale the side inset down with the viewport. For a bar narrower than
     // both insets there is no honest room for a positive hit target; return
     // zero-sized targets at the center rather than placing them outside the
@@ -203,38 +161,19 @@ fn status_controls_metrics(bar: egui::Rect) -> (f32, f32) {
     // clock; since those interactions are registered later, they stole clock
     // clicks even though the clock remained visibly centered.
     let available = (width - inset * 2.0 - STATUS_CONTROL_GAP - STATUS_CLOCK_MIN_W).max(0.0);
-    let count = StatusControl::ALL.len() as f32;
-    let normal_width = STATUS_CONTROL_W;
-    let normal_gap = STATUS_CONTROL_GAP;
-    let min_gap = normal_gap.min(available / (count * 4.0));
-    let control_width = normal_width.min(((available - min_gap * (count - 1.0)).max(0.0)) / count);
-    (control_width, min_gap)
+    STATUS_CONTROL_W.min(available)
 }
 
-fn status_controls_rect(bar: egui::Rect) -> egui::Rect {
+fn status_menu_rect(bar: egui::Rect) -> egui::Rect {
     let width = finite_non_negative(bar.width());
     let inset = Style::SP_S.min(width / 2.0);
     let left = bar.left() + inset;
     let right = bar.right() - inset;
-    let (control_width, gap) = status_controls_metrics(bar);
-    let total = control_width * StatusControl::ALL.len() as f32
-        + gap * (StatusControl::ALL.len().saturating_sub(1) as f32);
+    let total = status_menu_width(bar);
     let controls_left = (right - total).max(left).min(right);
     egui::Rect::from_min_max(
         egui::pos2(controls_left, bar.top()),
         egui::pos2((controls_left + total).min(right), bar.bottom()),
-    )
-}
-
-fn status_control_rect(bar: egui::Rect, control: StatusControl) -> egui::Rect {
-    let controls = status_controls_rect(bar);
-    let (control_width, gap) = status_controls_metrics(bar);
-    let x = (controls.left() + control.index() as f32 * (control_width + gap))
-        .clamp(controls.left(), controls.right());
-    let right = (x + control_width).min(controls.right()).max(x);
-    egui::Rect::from_min_max(
-        egui::pos2(x, controls.top()),
-        egui::pos2(right, controls.bottom()),
     )
 }
 
@@ -244,8 +183,8 @@ fn workspace_tray_width() -> f32 {
 }
 
 fn workspace_tray_rect(bar: egui::Rect, clock: egui::Rect) -> egui::Rect {
-    let controls = status_controls_rect(bar);
-    let right = (controls.left() - WORKSPACE_TRAY_GAP).max(bar.left());
+    let menu = status_menu_rect(bar);
+    let right = (menu.left() - WORKSPACE_TRAY_GAP).max(bar.left());
     let left = (right - workspace_tray_width())
         .max((clock.right() + WORKSPACE_TRAY_GAP).min(right))
         .max(bar.left());
@@ -257,10 +196,10 @@ fn workspace_tray_rect(bar: egui::Rect, clock: egui::Rect) -> egui::Rect {
 
 const fn workspace_tray_shortcut(surface: Surface) -> &'static str {
     match surface {
+        Surface::Workers => "Super+1",
         Surface::FleetMesh => "Super+1",
         Surface::Music => "Super+4",
         Surface::Media => "Super+5",
-        Surface::Phones => "Super+Shift+1",
         Surface::ThisNode => "Super+Shift+2",
         _ => "Front Door search",
     }
@@ -283,16 +222,8 @@ fn workspace_tray_tooltip(surface: Surface, active: Option<Surface>) -> String {
     )
 }
 
-fn status_control_id(control: StatusControl) -> egui::Id {
-    egui::Id::new((
-        "construct-status-bar",
-        match control {
-            StatusControl::Volume => "volume",
-            StatusControl::Network => "network",
-            StatusControl::Brightness => "brightness",
-            StatusControl::Power => "power",
-        },
-    ))
+fn status_menu_id() -> egui::Id {
+    egui::Id::new(("construct-status-bar", "menu"))
 }
 
 fn centered_clock_rect(bar: egui::Rect, time_width: f32) -> egui::Rect {
@@ -650,7 +581,7 @@ fn bottom_tray(
     let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
     let date = format!("{month:02}/{day:02}/{year:04}");
     let clock_width = 85.8_f32.min((panel.width() * 0.30).max(39.6));
-    let pin_left = panel.right() - BOTTOM_TRAY_PIN_W;
+    let pin_left = panel.right() - BOTTOM_TRAY_STATUS_MENU_W;
     let clock = egui::Rect::from_min_max(
         egui::pos2(
             (pin_left - Style::SP_XS - clock_width).max(panel.left()),
@@ -731,57 +662,23 @@ fn bottom_tray(
     );
     paint_health_status(ui, health_rect, construct, opacity, "bottom");
 
-    let icon_right = clock.left() - Style::SP_XS;
-    let icon_left = health_rect.right() + Style::SP_XS;
-    let icon_space = icon_right - icon_left - Style::SP_XS * 2.2;
-    if icon_space > 0.0 {
-        let icon_width = (icon_space / 3.0).max(1.0);
-        for control in StatusControl::ALL {
-            let left = icon_left + control.index() as f32 * (icon_width + Style::SP_XS * 1.1);
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(left, panel.top()),
-                egui::pos2(
-                    (left + icon_width).min(icon_right).max(left),
-                    panel.bottom(),
-                ),
-            );
-            let response = ui.interact(
-                rect,
-                egui::Id::new(("construct-bottom-system-tray", control.index())),
-                egui::Sense::click(),
-            );
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    ui.is_enabled(),
-                    format!("{} — Control Center", control.label()),
-                )
-            });
-            if response.hovered() {
-                painter.rect_filled(
-                    rect.shrink(2.0),
-                    Style::RADIUS_S,
-                    surface_hi.gamma_multiply(opacity),
-                );
-            }
-            if let Some(texture) = icon_texture(ui.ctx(), control.icon(), STATUS_CONTROL_ICON, text)
-            {
-                let draw = egui::Rect::from_center_size(
-                    rect.center(),
-                    egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
-                );
-                painter.image(
-                    texture.id(),
-                    draw,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE.gamma_multiply(opacity),
-                );
-            }
-            if response.clicked() {
-                construct.control_center_open = !construct.control_center_open;
-            }
-        }
-    }
+    let menu_right = clock.left() - Style::SP_XS;
+    let menu_left = (menu_right - BOTTOM_TRAY_STATUS_MENU_W)
+        .max(health_rect.right() + Style::SP_XS)
+        .min(menu_right);
+    let menu = egui::Rect::from_min_max(
+        egui::pos2(menu_left, panel.top()),
+        egui::pos2(menu_right, panel.bottom()),
+    );
+    paint_status_menu(
+        ui,
+        menu,
+        construct,
+        egui::Id::new(("construct-bottom-system-tray", "menu")),
+        text.gamma_multiply(opacity),
+        surface_hi.gamma_multiply(opacity),
+        opacity,
+    );
 
     ui.ctx().request_repaint_after(Duration::from_secs(
         crate::timers::secs_to_next_minute(now).max(1),
@@ -863,6 +760,51 @@ fn health_status_label(fresh: bool, count: usize) -> String {
     }
 }
 
+/// Paint the one status-menu trigger shared by both taskbar placements.
+/// Its Control Center owns the live status details and actions.
+fn paint_status_menu(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    construct: &mut ConstructChrome,
+    id: egui::Id,
+    foreground: egui::Color32,
+    hover: egui::Color32,
+    opacity: f32,
+) {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), STATUS_MENU_LABEL)
+    });
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
+    }
+    if let Some(texture) = icon_texture(ui.ctx(), STATUS_MENU_ICON, STATUS_CONTROL_ICON, foreground)
+    {
+        let draw = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
+        );
+        painter.image(
+            texture.id(),
+            draw,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            foreground,
+        );
+    } else {
+        // The bundled glyph loader fails soft; retain a visible, honest
+        // interaction target rather than manufacturing a status value.
+        painter.circle_filled(
+            rect.center(),
+            Style::SP_XS,
+            Style::TEXT_DIM.gamma_multiply(opacity),
+        );
+    }
+    if response.clicked() {
+        construct.control_center_open = !construct.control_center_open;
+    }
+}
+
 /// Paint + interact the strip body. Absolute screen-space rects throughout
 /// (the dock's WIN7-DESKTOP-1 lesson: an Area's `fixed_pos` only seeds the Ui,
 /// `ui.painter()`/`ui.interact` stay absolute).
@@ -885,7 +827,7 @@ fn strip(
     );
     let cy = bar.center().y;
     // ── Center cluster: the one authoritative clock ────────────────────────
-    let controls_rect = status_controls_rect(bar);
+    let controls_rect = status_menu_rect(bar);
     let now = crate::timers::display_unix();
     let time = crate::timers::hhmm(now);
     let time_galley = painter.layout_job(status_text_job(
@@ -948,43 +890,15 @@ fn strip(
         Style::resolve_color(ui.ctx(), Style::TEXT),
     );
 
-    for control in StatusControl::ALL {
-        let rect = status_control_rect(bar, control);
-        let response = ui.interact(rect, status_control_id(control), egui::Sense::click());
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
-                ui.is_enabled(),
-                format!("{} — Control Center", control.label()),
-            )
-        });
-        if response.hovered() {
-            painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
-        }
-        if let Some(texture) =
-            icon_texture(ui.ctx(), control.icon(), STATUS_CONTROL_ICON, Style::TEXT)
-        {
-            let draw = egui::Rect::from_center_size(
-                rect.center(),
-                egui::vec2(STATUS_CONTROL_ICON * 1.1, STATUS_CONTROL_ICON * 1.1),
-            );
-            painter.image(
-                texture.id(),
-                draw,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        } else {
-            // The bundled glyph loader fails soft; retain a visible, honest
-            // interaction target rather than manufacturing a status value.
-            painter.circle_filled(rect.center(), Style::SP_XS, Style::TEXT_DIM);
-        }
-        if response.clicked() {
-            // The three glyphs are shortcuts into the existing Control Center;
-            // the panel remains the sole source of truth for live values.
-            construct.control_center_open = !construct.control_center_open;
-        }
-    }
+    paint_status_menu(
+        ui,
+        status_menu_rect(bar),
+        construct,
+        status_menu_id(),
+        Style::TEXT,
+        Style::SURFACE_HI,
+        1.0,
+    );
 
     // Wake at the next minute rollover so the painted minute is never stale
     // (the dock tray clock's idiom).
@@ -1228,13 +1142,10 @@ mod tests {
                 .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
                 .expect("narrow tray keeps a clock target");
             assert!(clock.rect.width() >= 0.0 && clock.rect.height() >= 0.0);
-            for control in StatusControl::ALL {
-                if let Some(response) = ctx.read_response(egui::Id::new((
-                    "construct-bottom-system-tray",
-                    control.index(),
-                ))) {
-                    assert!(response.rect.width() >= 0.0 && response.rect.height() >= 0.0);
-                }
+            if let Some(response) =
+                ctx.read_response(egui::Id::new(("construct-bottom-system-tray", "menu")))
+            {
+                assert!(response.rect.width() >= 0.0 && response.rect.height() >= 0.0);
             }
         }
 
@@ -1442,55 +1353,38 @@ mod tests {
     }
 
     #[test]
-    fn centered_clock_and_right_controls_have_deterministic_geometry() {
+    fn centered_clock_and_status_menu_have_deterministic_geometry() {
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, STATUS_BAR_H));
         let clock = centered_clock_rect(bar, 48.0);
         assert!((clock.center().x - bar.center().x).abs() < f32::EPSILON);
         assert!((clock.center().y - bar.center().y).abs() < f32::EPSILON);
 
-        let controls = status_controls_rect(bar);
+        let controls = status_menu_rect(bar);
         assert!((controls.right() - (bar.right() - Style::SP_S)).abs() < f32::EPSILON);
-        assert!(
-            (status_controls_width()
-                - (STATUS_CONTROL_W * StatusControl::ALL.len() as f32
-                    + STATUS_CONTROL_GAP * (StatusControl::ALL.len() - 1) as f32))
-                .abs()
-                < f32::EPSILON
-        );
-        for (index, control) in StatusControl::ALL.into_iter().enumerate() {
-            let rect = status_control_rect(bar, control);
-            assert_eq!(rect.top(), bar.top());
-            assert_eq!(rect.bottom(), bar.bottom());
-            assert!(
-                (rect.left()
-                    - (controls.left() + index as f32 * (STATUS_CONTROL_W + STATUS_CONTROL_GAP)))
-                    .abs()
-                    < f32::EPSILON
-            );
-            assert!(rect.right() <= controls.right());
-        }
-        let last = status_control_rect(bar, StatusControl::Power);
-        assert!((last.right() - controls.right()).abs() < f32::EPSILON);
+        assert!((status_controls_width() - STATUS_CONTROL_W).abs() < f32::EPSILON);
+        let menu = status_menu_rect(bar);
+        assert_eq!(menu, controls);
+        assert_eq!(menu.top(), bar.top());
+        assert_eq!(menu.bottom(), bar.bottom());
+        assert!((menu.right() - controls.right()).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn narrow_clock_target_does_not_overlap_later_control_targets() {
+    fn narrow_clock_target_does_not_overlap_the_status_menu_target() {
         for width in [72.0, 128.0, 240.0] {
             let bar =
                 egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(width, STATUS_BAR_H));
-            let controls = status_controls_rect(bar);
+            let controls = status_menu_rect(bar);
             let clock = clock_target_rect(bar, 48.0, controls);
             assert!(
                 bar.contains_rect(clock),
                 "clock escaped {width}px bar: {clock:?} vs {bar:?}"
             );
-            for control in StatusControl::ALL {
-                let rect = status_control_rect(bar, control);
-                assert!(
-                    !clock.intersects(rect),
-                    "clock target {clock:?} overlaps {control:?} target {rect:?}"
-                );
-            }
+            let menu = status_menu_rect(bar);
+            assert!(
+                !clock.intersects(menu),
+                "clock target {clock:?} overlaps status menu target {menu:?}"
+            );
         }
     }
 
@@ -1518,18 +1412,16 @@ mod tests {
         for width in [0.0, 1.0, 7.0, 15.0, 31.0] {
             let bar =
                 egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(width, STATUS_BAR_H));
-            let controls = status_controls_rect(bar);
+            let controls = status_menu_rect(bar);
             assert!(
                 bar.contains_rect(controls),
                 "control cluster escaped {width}px bar: {controls:?}"
             );
-            for control in StatusControl::ALL {
-                let rect = status_control_rect(bar, control);
-                assert!(
-                    bar.contains_rect(rect),
-                    "{control:?} escaped {width}px bar: {rect:?}"
-                );
-            }
+            let menu = status_menu_rect(bar);
+            assert!(
+                bar.contains_rect(menu),
+                "status menu escaped {width}px bar: {menu:?}"
+            );
 
             let clock = centered_clock_rect(bar, f32::INFINITY);
             let cluster = bounded_cluster_rect(bar, clock, controls, f32::MAX);
@@ -1540,21 +1432,14 @@ mod tests {
     }
 
     #[test]
-    fn right_controls_remain_inside_a_narrow_top_bar() {
+    fn status_menu_remains_inside_a_narrow_top_bar() {
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(72.0, STATUS_BAR_H));
-        let controls = status_controls_rect(bar);
+        let controls = status_menu_rect(bar);
         assert!(
             bar.contains_rect(controls),
             "cluster escaped narrow bar: {controls:?}"
         );
-        let rects: Vec<_> = StatusControl::ALL
-            .into_iter()
-            .map(|control| status_control_rect(bar, control))
-            .collect();
-        assert!(rects.iter().all(|rect| bar.contains_rect(*rect)));
-        assert!(rects
-            .windows(2)
-            .all(|pair| pair[0].right() <= pair[1].left()));
+        assert!(bar.contains_rect(status_menu_rect(bar)));
     }
 
     #[test]
@@ -1597,20 +1482,18 @@ mod tests {
             .read_response(status_bar_clock_id())
             .expect("clock target registered")
             .rect;
-        for control in StatusControl::ALL {
-            let response = ctx
-                .read_response(status_control_id(control))
-                .unwrap_or_else(|| panic!("{control:?} target was not registered"));
-            assert!(
-                bar.contains_rect(response.rect),
-                "{control:?} target escaped the narrow status bar: {:?} vs {bar:?}",
-                response.rect
-            );
-            assert!(
-                !clock.intersects(response.rect),
-                "clock target must not steal {control:?} on a narrow bar"
-            );
-        }
+        let menu = ctx
+            .read_response(status_menu_id())
+            .expect("status menu target was not registered");
+        assert!(
+            bar.contains_rect(menu.rect),
+            "status menu target escaped the narrow status bar: {:?} vs {bar:?}",
+            menu.rect
+        );
+        assert!(
+            !clock.intersects(menu.rect),
+            "clock target must not steal the status menu on a narrow bar"
+        );
 
         click_at(
             &ctx,
@@ -1622,23 +1505,25 @@ mod tests {
         );
         assert!(
             construct.notification_center_open,
-            "the centered clock remains clickable beside narrow controls"
+            "the centered clock remains clickable beside the narrow status menu"
         );
 
-        let brightness = ctx
-            .read_response(status_control_id(StatusControl::Brightness))
-            .expect("brightness control registered")
-            .rect
-            .center();
-        click_at(&ctx, &mut construct, &segments, &grades, screen, brightness);
+        click_at(
+            &ctx,
+            &mut construct,
+            &segments,
+            &grades,
+            screen,
+            menu.rect.center(),
+        );
         assert!(
             construct.control_center_open,
-            "a non-zero-origin control target must remain clickable"
+            "a non-zero-origin status menu target must remain clickable"
         );
     }
 
     #[test]
-    fn clicking_a_status_control_toggles_the_existing_control_center() {
+    fn clicking_the_status_menu_toggles_the_existing_control_center() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
@@ -1655,23 +1540,19 @@ mod tests {
             );
         }
         let pos = ctx
-            .read_response(status_control_id(StatusControl::Volume))
-            .expect("volume control registered")
+            .read_response(status_menu_id())
+            .expect("status menu registered")
             .rect
             .center();
         click(&ctx, &mut construct, &segments, &grades, pos);
-        assert!(construct.control_center_open, "volume control opens CC");
+        assert!(construct.control_center_open, "status menu opens CC");
         click(&ctx, &mut construct, &segments, &grades, pos);
         assert!(!construct.control_center_open, "second click closes CC");
     }
 
     #[test]
-    fn status_controls_use_the_requested_existing_icon_identities() {
-        assert_eq!(StatusControl::Volume.icon(), IconId::Volume);
-        assert_eq!(StatusControl::Network.icon(), IconId::Signal);
-        assert_eq!(StatusControl::Brightness.icon(), IconId::DisplaySettings);
-        assert_eq!(StatusControl::Power.icon(), IconId::PowerBattery);
-        assert_eq!(StatusControl::ALL.len(), 4);
+    fn status_menu_uses_the_existing_menu_icon() {
+        assert_eq!(STATUS_MENU_ICON, IconId::Menu);
     }
 
     #[test]

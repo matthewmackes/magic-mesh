@@ -46,6 +46,11 @@ use super::{ShutdownToken, Worker};
 /// outage fires.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Bound the startup phase so alert freshness remains within the existing
+/// first-poll cadence. The phase is derived from the node identity rather than
+/// process randomness, so a restart does not create a new common-mode pattern.
+const MAX_INITIAL_PHASE: Duration = Duration::from_secs(1);
+
 /// Subset of the MON-3 `AlertEvent` schema the relay needs
 /// to render an FDO notification. The full schema lives in
 /// `crates/mde-alert-emit/src/main.rs::AlertEvent`; the
@@ -75,6 +80,8 @@ pub struct AlertRelayWorker {
     alerts_dir: PathBuf,
     /// Sweep cadence.
     tick: Duration,
+    /// Stable local identity used to spread the first directory sweep.
+    node_id: String,
     /// `notify-send` binary path. Default `notify-send` (looked
     /// up on PATH). Tests inject `/bin/true` to neutralize the
     /// shell-out without a session bus. Used only as the headless
@@ -106,6 +113,7 @@ impl AlertRelayWorker {
         Self {
             alerts_dir,
             tick: DEFAULT_TICK_INTERVAL,
+            node_id: local_node_identity(),
             notify_send: "notify-send".to_owned(),
             bus_binary: "mde-bus".to_owned(),
             seen_alert_ids: std::sync::Mutex::new(BTreeSet::new()),
@@ -123,6 +131,13 @@ impl AlertRelayWorker {
     #[must_use]
     pub fn with_tick(mut self, t: Duration) -> Self {
         self.tick = t;
+        self
+    }
+
+    /// Override the scheduling identity for deterministic tests and fixtures.
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = node_id.into();
         self
     }
 
@@ -381,6 +396,45 @@ pub fn default_alerts_dir() -> Option<PathBuf> {
     )
 }
 
+/// Resolve the identity used for startup scheduling without spawning a
+/// process. An empty identity deliberately disables phasing: nodes that do
+/// not expose an identity retain the existing timing rather than receiving a
+/// misleading identical phase.
+fn local_node_identity() -> String {
+    for key in ["MACKESD_NODE_ID", "HOSTNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+/// Return a stable, bounded phase for the first alert-directory sweep.
+///
+/// The phase is at most half of a configured cadence, so the first sweep is
+/// always due no later than the old cadence. FNV-1a is sufficient here because
+/// this is scheduling spread, not a security primitive.
+fn initial_phase_for(node_id: &str, tick: Duration) -> Duration {
+    let window_ms = (tick.as_millis() / 2).min(MAX_INITIAL_PHASE.as_millis());
+    if node_id.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in node_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let window_ms = window_ms as u64;
+    Duration::from_millis(hash % (window_ms + 1))
+}
+
 #[async_trait::async_trait]
 impl Worker for AlertRelayWorker {
     fn name(&self) -> &'static str {
@@ -388,6 +442,16 @@ impl Worker for AlertRelayWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // Keep the first poll no later than the old cadence while spreading
+        // identical daemon startups across the interval. Selecting shutdown
+        // during this delay preserves prompt cancellation during boot.
+        let first_delay = self
+            .tick
+            .saturating_sub(initial_phase_for(&self.node_id, self.tick));
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(first_delay) => {}
+        }
         loop {
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
@@ -487,6 +551,24 @@ mod tests {
     }
 
     #[test]
+    fn initial_phase_is_stable_bounded_and_preserves_first_poll_deadline() {
+        let interval = DEFAULT_TICK_INTERVAL;
+        let phase = initial_phase_for("peer:seat15", interval);
+        assert_eq!(phase, initial_phase_for("peer:seat15", interval));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert!(interval.saturating_sub(phase) <= interval);
+        assert!(
+            initial_phase_for("peer:seat15", interval)
+                != initial_phase_for("peer:seat16", interval)
+        );
+        assert_eq!(initial_phase_for("", interval), Duration::ZERO);
+        assert_eq!(
+            initial_phase_for("peer:seat15", Duration::from_millis(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn bus_publish_argv_targets_the_fdo_topic_with_priority() {
         let mk = |sev: &str, url: &str| AlertEventPartial {
             id: "x".into(),
@@ -501,21 +583,24 @@ mod tests {
         assert_eq!(crit[0], "mde-bus");
         assert_eq!(crit[1], "publish");
         assert_eq!(crit[2], "fdo/MCNF Alerts");
-        assert!(crit
-            .windows(2)
-            .any(|w| w[0] == "--priority" && w[1] == "urgent"));
+        assert!(
+            crit.windows(2)
+                .any(|w| w[0] == "--priority" && w[1] == "urgent")
+        );
         assert!(crit.iter().any(|s| s == "[anvil] disk_full"));
         assert!(crit.iter().any(|s| s == "--no-broker"));
         // Severity → priority mapping + the chart-url hint.
         let warn = bus_publish_argv("mde-bus", &mk("WARNING", "http://c/1"));
-        assert!(warn
-            .windows(2)
-            .any(|w| w[0] == "--priority" && w[1] == "default"));
+        assert!(
+            warn.windows(2)
+                .any(|w| w[0] == "--priority" && w[1] == "default")
+        );
         assert!(warn.iter().any(|s| s == "string:chart-url:http://c/1"));
         let info = bus_publish_argv("mde-bus", &mk("INFO", ""));
-        assert!(info
-            .windows(2)
-            .any(|w| w[0] == "--priority" && w[1] == "min"));
+        assert!(
+            info.windows(2)
+                .any(|w| w[0] == "--priority" && w[1] == "min")
+        );
         assert!(!info.iter().any(|s| s.starts_with("string:chart-url")));
     }
 
@@ -548,9 +633,10 @@ mod tests {
             chart_url: "https://peer:alice:19999/#menu_nebula".into(),
         };
         let argv = notify_send_argv("notify-send", &event);
-        assert!(argv
-            .iter()
-            .any(|s| s == "--hint=string:chart-url:https://peer:alice:19999/#menu_nebula"));
+        assert!(
+            argv.iter()
+                .any(|s| s == "--hint=string:chart-url:https://peer:alice:19999/#menu_nebula")
+        );
     }
 
     #[test]
@@ -564,9 +650,11 @@ mod tests {
             chart_url: String::new(),
         };
         let argv = notify_send_argv("notify-send", &event);
-        assert!(!argv
-            .iter()
-            .any(|s| s.starts_with("--hint=string:chart-url:")));
+        assert!(
+            !argv
+                .iter()
+                .any(|s| s.starts_with("--hint=string:chart-url:"))
+        );
     }
 
     #[test]
@@ -602,6 +690,7 @@ mod tests {
         let mut w = AlertRelayWorker::new()
             .with_notify_send_binary("/bin/true")
             .with_bus_binary("/bin/true")
+            .with_node_id("peer:shutdown-test")
             .with_tick(Duration::from_millis(50));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);

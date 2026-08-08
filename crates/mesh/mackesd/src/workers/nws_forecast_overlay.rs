@@ -30,6 +30,7 @@ pub const ENABLED_ENV: &str = "MDE_OVERLAY_NWS_FORECAST";
 pub const POLL: Duration = Duration::from_secs(10 * 60);
 const FIX_RETRY: Duration = Duration::from_secs(20);
 const RETRY_MAX: Duration = Duration::from_secs(10 * 60);
+const RETRY_PHASE_MAX: Duration = Duration::from_secs(20);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_POINTS_BODY_BYTES: usize = 128 * 1024;
 const MAX_FORECAST_BODY_BYTES: usize = 256 * 1024;
@@ -618,6 +619,60 @@ fn push_gap(gaps: &mut Vec<String>, gap: String) {
     }
 }
 
+fn retry_ceiling(poll: Duration) -> Duration {
+    poll.min(RETRY_MAX)
+}
+
+fn retry_delay(current: Duration, poll: Duration) -> Duration {
+    current.max(FIX_RETRY).min(retry_ceiling(poll))
+}
+
+fn backoff_retry(current: Duration, poll: Duration) -> Duration {
+    current.saturating_mul(2).min(retry_ceiling(poll))
+}
+
+/// Derive a stable phase from the node identity instead of wall-clock
+/// randomness. Restarts therefore keep a seat off the common retry phase,
+/// while different hosts normally choose different offsets without adding a
+/// new source of entropy or making retry behavior untestable.
+fn retry_phase(host: &str) -> Duration {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in host.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3_u64);
+    }
+    Duration::from_millis(hash % RETRY_PHASE_MAX.as_millis() as u64)
+}
+
+fn phase_desynchronized_retry_delay(
+    current: Duration,
+    poll: Duration,
+    phase: Duration,
+) -> Duration {
+    retry_delay(current, poll)
+        .saturating_add(phase.min(RETRY_PHASE_MAX))
+        .min(retry_ceiling(poll))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedCause {
+    NoFix,
+    RefreshFailure,
+}
+
+/// Publish one degraded projection per outage cause, while still publishing
+/// when the worker crosses from a missing vehicle fix to a failed NWS refresh
+/// (or back). Repeating the same cause is otherwise a needless Bus write and
+/// warning on every retry interval across every seat.
+fn degraded_cause_transition(published: &mut Option<DegradedCause>, next: DegradedCause) -> bool {
+    if *published == Some(next) {
+        false
+    } else {
+        *published = Some(next);
+        true
+    }
+}
+
 /// Workstation-side NWS hourly forecast adapter.
 pub struct NwsForecastOverlayWorker {
     host: String,
@@ -689,6 +744,33 @@ impl NwsForecastOverlayWorker {
         }
     }
 
+    /// A same-cause degraded publish may be suppressed only while its retained
+    /// projection still exists. During seat startup the overlay workers can run
+    /// before the Bus supervisor finishes replacing/initializing its store; a
+    /// successful early write can therefore disappear. Re-checking the latest
+    /// row on each bounded retry lets that seat repair the projection without
+    /// returning to noisy unconditional publishes.
+    fn retained_projection_exists(&self) -> bool {
+        self.bus_root
+            .clone()
+            .and_then(|root| mde_bus::persist::Persist::open(root).ok())
+            .and_then(|persist| {
+                persist
+                    .read_latest(&nws_forecast_state_topic(&self.host))
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    }
+
+    fn degraded_publish_needed(
+        &self,
+        published: &mut Option<DegradedCause>,
+        next: DegradedCause,
+    ) -> bool {
+        degraded_cause_transition(published, next) || !self.retained_projection_exists()
+    }
+
     fn degraded_snapshot(
         &self,
         last_good: Option<&NwsForecastSnapshot>,
@@ -741,15 +823,19 @@ impl NwsForecastOverlayWorker {
         &self,
         result: io::Result<NwsForecastSnapshot>,
         last_good: &mut Option<NwsForecastSnapshot>,
+        degraded_cause: &mut Option<DegradedCause>,
     ) -> bool {
         match result {
             Ok(snapshot) => {
                 self.publish(&snapshot);
                 *last_good = Some(snapshot);
+                *degraded_cause = None;
                 true
             }
             Err(error) => {
-                self.publish_unavailable(last_good, &format!("refresh failed: {error}"));
+                if self.degraded_publish_needed(degraded_cause, DegradedCause::RefreshFailure) {
+                    self.publish_unavailable(last_good, &format!("refresh failed: {error}"));
+                }
                 false
             }
         }
@@ -822,21 +908,26 @@ impl Worker for NwsForecastOverlayWorker {
         };
         let mut last_good = None;
         let mut retry = FIX_RETRY;
-        let mut no_fix_published = false;
+        let mut degraded_cause = None;
+        let phase = retry_phase(&self.host);
+        let mut phase_pending = true;
         loop {
             let context = match self.current_context() {
-                Ok(context) => {
-                    no_fix_published = false;
-                    context
-                }
+                Ok(context) => context,
                 Err(reason) => {
-                    if !no_fix_published {
+                    if self.degraded_publish_needed(&mut degraded_cause, DegradedCause::NoFix) {
                         self.publish_unavailable(&mut last_good, &reason);
-                        no_fix_published = true;
                     }
+                    let delay = if phase_pending {
+                        phase_pending = false;
+                        phase_desynchronized_retry_delay(retry, self.poll, phase)
+                    } else {
+                        retry_delay(retry, self.poll)
+                    };
+                    retry = backoff_retry(retry, self.poll);
                     tokio::select! {
                         () = shutdown.wait() => break,
-                        () = tokio::time::sleep(FIX_RETRY) => {}
+                        () = tokio::time::sleep(delay) => {}
                     }
                     continue;
                 }
@@ -847,12 +938,20 @@ impl Worker for NwsForecastOverlayWorker {
             else {
                 break;
             };
-            let success = self.apply_result(result, &mut last_good);
-            let delay = if success { self.poll } else { retry };
+            let success = self.apply_result(result, &mut last_good, &mut degraded_cause);
+            let delay = if success {
+                phase_pending = true;
+                self.poll
+            } else if phase_pending {
+                phase_pending = false;
+                phase_desynchronized_retry_delay(retry, self.poll, phase)
+            } else {
+                retry_delay(retry, self.poll)
+            };
             retry = if success {
                 FIX_RETRY
             } else {
-                retry.saturating_mul(2).min(RETRY_MAX)
+                backoff_retry(retry, self.poll)
             };
             tokio::select! {
                 () = shutdown.wait() => break,
@@ -1144,6 +1243,69 @@ mod tests {
     }
 
     #[test]
+    fn no_fix_retry_is_bounded_and_phase_desynchronized() {
+        let long_poll = Duration::from_secs(20 * 60);
+        assert_eq!(retry_ceiling(long_poll), RETRY_MAX);
+        assert_eq!(retry_delay(Duration::from_secs(2), long_poll), FIX_RETRY);
+        assert_eq!(backoff_retry(FIX_RETRY, long_poll), Duration::from_secs(40));
+        assert_eq!(
+            backoff_retry(Duration::from_secs(5 * 60), long_poll),
+            RETRY_MAX
+        );
+        assert_eq!(backoff_retry(RETRY_MAX, long_poll), RETRY_MAX);
+
+        let first_phase = retry_phase("seat-a");
+        let second_phase = retry_phase("seat-b");
+        assert_eq!(first_phase, retry_phase("seat-a"));
+        assert_ne!(first_phase, second_phase);
+        assert!(first_phase < RETRY_PHASE_MAX);
+        assert!(second_phase < RETRY_PHASE_MAX);
+
+        let first_delay = phase_desynchronized_retry_delay(FIX_RETRY, RETRY_MAX, first_phase);
+        assert!(first_delay >= FIX_RETRY);
+        assert!(first_delay <= RETRY_MAX);
+        assert_eq!(
+            phase_desynchronized_retry_delay(RETRY_MAX, RETRY_MAX, first_phase),
+            RETRY_MAX
+        );
+        assert_eq!(
+            phase_desynchronized_retry_delay(FIX_RETRY, RETRY_MAX, Duration::ZERO),
+            FIX_RETRY
+        );
+
+        let short_poll = Duration::from_millis(50);
+        assert_eq!(
+            phase_desynchronized_retry_delay(FIX_RETRY, short_poll, first_phase),
+            short_poll
+        );
+    }
+
+    #[test]
+    fn degraded_publication_coalesces_repeated_causes_but_marks_transitions() {
+        let mut published = None;
+        assert!(degraded_cause_transition(
+            &mut published,
+            DegradedCause::NoFix
+        ));
+        assert!(!degraded_cause_transition(
+            &mut published,
+            DegradedCause::NoFix
+        ));
+        assert!(degraded_cause_transition(
+            &mut published,
+            DegradedCause::RefreshFailure
+        ));
+        assert!(!degraded_cause_transition(
+            &mut published,
+            DegradedCause::RefreshFailure
+        ));
+        assert!(degraded_cause_transition(
+            &mut published,
+            DegradedCause::NoFix
+        ));
+    }
+
+    #[test]
     fn http_client_refuses_redirects() {
         let target = TcpListener::bind("127.0.0.1:0").expect("target");
         target.set_nonblocking(true).expect("nonblocking");
@@ -1199,9 +1361,23 @@ mod tests {
         let original =
             build_snapshot(&FakeProbe::captured(), "rig-1", context(), NOW_MS).expect("snapshot");
         let mut last = None;
-        assert!(worker.apply_result(Ok(original), &mut last));
-        assert!(!worker.apply_result(Err(io::Error::other("timeout")), &mut last));
+        let mut degraded_cause = None;
+        assert!(worker.apply_result(Ok(original), &mut last, &mut degraded_cause));
+        assert!(!worker.apply_result(
+            Err(io::Error::other("timeout")),
+            &mut last,
+            &mut degraded_cause
+        ));
+        assert!(!worker.apply_result(
+            Err(io::Error::other("same timeout")),
+            &mut last,
+            &mut degraded_cause
+        ));
         assert!(last.is_none());
+        assert!(degraded_cause_transition(
+            &mut degraded_cause,
+            DegradedCause::NoFix
+        ));
         worker.publish_unavailable(&mut last, "fresh same-host MG90 fix unavailable");
         assert!(last.is_none());
         let persist = Persist::open(root).expect("bus");
@@ -1254,12 +1430,14 @@ mod tests {
         let seed_worker = NwsForecastOverlayWorker::new("rig-1".to_string())
             .with_bus_root(Some(restart_root.path().to_path_buf()));
         let mut seed_cache = None;
+        let mut seed_degraded_cause = None;
         seed_worker.apply_result(
             Ok(
                 build_snapshot(&FakeProbe::captured(), "rig-1", context(), NOW_MS)
                     .expect("restart seed"),
             ),
             &mut seed_cache,
+            &mut seed_degraded_cause,
         );
         let restarted = NwsForecastOverlayWorker::new("rig-1".to_string())
             .with_bus_root(Some(restart_root.path().to_path_buf()));
@@ -1319,6 +1497,26 @@ mod tests {
             .any(|gap| gap.contains("fresh same-host")));
         assert_eq!(snapshot.license_tier, "us-government-public-domain");
         assert!(snapshot.attribution.contains("National Weather Service"));
+    }
+
+    #[test]
+    fn same_cause_retry_repairs_a_projection_lost_during_bus_startup() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        let worker =
+            NwsForecastOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let mut published = None;
+        let mut last = None;
+
+        assert!(worker.degraded_publish_needed(&mut published, DegradedCause::NoFix));
+        worker.publish_unavailable(&mut last, "fresh same-host MG90 fix unavailable");
+        assert!(!worker.degraded_publish_needed(&mut published, DegradedCause::NoFix));
+
+        std::fs::remove_dir_all(&root).expect("simulate Bus startup replacement");
+        std::fs::create_dir_all(&root).expect("replacement Bus root");
+        assert!(worker.degraded_publish_needed(&mut published, DegradedCause::NoFix));
+        worker.publish_unavailable(&mut last, "fresh same-host MG90 fix unavailable");
+        assert!(worker.retained_projection_exists());
     }
 
     struct SlowProbe;

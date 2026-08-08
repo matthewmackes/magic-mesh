@@ -4,7 +4,7 @@
 //! One shared, mesh-wide bookmark tree (lock Q8) that every enrolled node edits
 //! offline and converges without conflicts. This crate is the headless model
 //! both the mackesd bookmarks worker (BOOKMARKS-2, persistence + Syncthing) and
-//! the `Surface::Bookmarks` UI import — no Servo, no credentials, no I/O.
+//! the Browser-owned bookmark panel — no Servo, no credentials, no I/O.
 //!
 //! The pieces:
 //!

@@ -841,6 +841,11 @@ mod tests {
     #[test]
     fn packaging_delivers_the_credential_only_through_systemd_private_directories() {
         let dropin = include_str!("../../../../../../packaging/systemd/cloud-arm-credential.conf");
+        let credential_service =
+            include_str!("../../../../../../packaging/systemd/mcnf-cloud-arm-credential.service");
+        let recipient_service = include_str!(
+            "../../../../../../packaging/systemd/mcnf-mesh-secret-recipient.service"
+        );
         let daemon = include_str!("../../../../../../packaging/systemd/mackesd.service");
         let shell = include_str!("../../../../../../packaging/bootc/units/mde-shell-egui.service");
         let helper =
@@ -864,5 +869,45 @@ mod tests {
         assert!(helper.contains("mackesd.service mde-shell-egui.service"));
         assert!(helper.contains("/etc/systemd/system/$unit.d/50-cloud-arm-credential.conf"));
         assert!(!helper.contains("MDE_CLOUD_ARM_KEY"));
+        assert!(helper.contains("--restart)"));
+
+        let credential_after = credential_service
+            .lines()
+            .find(|line| line.trim_start().starts_with("After="))
+            .expect("credential service must declare ordering");
+        assert!(credential_after
+            .split_whitespace()
+            .any(|dependency| dependency == "mackesd.service"));
+        assert!(credential_service
+            .lines()
+            .all(|line| !line.trim_start().starts_with("Before=mackesd.service")));
+        assert!(credential_service.contains(
+            "/usr/libexec/mackesd/provision-cloud-arm-credential --refresh"
+        ));
+        assert!(credential_service.contains("After=network-online.target mackesd.service"));
+
+        let daemon_after = daemon
+            .lines()
+            .find(|line| line.trim_start().starts_with("After="))
+            .expect("mackesd must declare ordering");
+        assert!(!daemon_after
+            .split_whitespace()
+            .any(|dependency| dependency == "mcnf-cloud-arm-credential.service"));
+        assert!(!daemon_after
+            .split_whitespace()
+            .any(|dependency| dependency == "mcnf-mesh-secret-recipient.service"));
+        let daemon_wants = daemon
+            .lines()
+            .find(|line| line.trim_start().starts_with("Wants="))
+            .expect("mackesd must retain the best-effort credential pull-in");
+        assert!(daemon_wants
+            .split_whitespace()
+            .any(|dependency| dependency == "mcnf-cloud-arm-credential.service"));
+        assert!(helper.contains("cmp -s \"$plain\" \"$decrypted\""));
+        assert!(helper.contains("systemctl try-restart mackesd.service"));
+        assert!(helper.contains("systemctl try-restart mde-shell-egui.service"));
+        assert!(recipient_service
+            .lines()
+            .all(|line| !line.trim_start().starts_with("Before=mackesd.service")));
     }
 }

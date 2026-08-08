@@ -322,6 +322,7 @@ pub fn open_app_session(
         id.clone(),
         resume,
     )?;
+    app.validate_admitted()?;
     Ok(VdiSession {
         id,
         serving_peer,
@@ -2140,6 +2141,41 @@ mod tests {
         );
         assert!(matches!(result, Err(SessionError::InvalidAppVm(_))));
         assert!(roster.is_empty());
+    }
+
+    #[test]
+    fn apply_request_rejects_unadmitted_app_identity_and_capability() {
+        for (app_id, requested_capabilities, expected) in [
+            (
+                "host-command",
+                Vec::new(),
+                mackes_mesh_types::vdi_session::AppVmLaunchRequestError::InvalidField("app_id"),
+            ),
+            (
+                "org.example.Editor",
+                vec!["host_socket".to_owned()],
+                mackes_mesh_types::vdi_session::AppVmLaunchRequestError::InvalidCapability,
+            ),
+        ] {
+            let mut roster = BTreeMap::new();
+            let result = apply_request(
+                &mut roster,
+                SessionRequest::OpenApp {
+                    id: "app-s".into(),
+                    serving_peer: "peer:host".into(),
+                    vm_id: "app-vm".into(),
+                    client_peer: "peer:seat".into(),
+                    app_id: app_id.into(),
+                    catalog_revision: "catalog-1".into(),
+                    guest_profile: "wayland-standard".into(),
+                    requested_capabilities,
+                    resume: false,
+                },
+                42,
+            );
+            assert_eq!(result, Err(SessionError::InvalidAppVm(expected)));
+            assert!(roster.is_empty(), "rejected handoff must not enter roster");
+        }
     }
 
     #[test]

@@ -17,6 +17,10 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::desktop_sources::{DesktopSourcesState, resource_card_from_desktop_source};
+use super::ssh_x11_sources::{SshX11SourcesState, append_ssh_x11_cards};
+use super::upnp_sources::{UpnpSourcesState, append_upnp_cards};
+
 const FRESH_MS: u64 = 60_000;
 const CARD_MS: u64 = 120_000;
 const SERVICE_CONFIG_VERSION: u16 = 1;
@@ -157,7 +161,7 @@ const REGISTERED: &[RegisteredService] = &[
 pub fn catalog_from_services(
     state: &ServicesState,
 ) -> Result<ResourceCatalog, ResourceValidationError> {
-    catalog_from_services_and_root(state, None)
+    catalog_from_services_and_root(state, None, None, None, None)
 }
 
 /// Project the catalog with persisted first-class service lifecycle state.
@@ -165,12 +169,61 @@ pub fn catalog_from_services_with_root(
     state: &ServicesState,
     workgroup_root: &Path,
 ) -> Result<ResourceCatalog, ResourceValidationError> {
-    catalog_from_services_and_root(state, Some(workgroup_root))
+    catalog_from_services_and_root(state, Some(workgroup_root), None, None, None)
+}
+
+/// Project the catalog with persisted first-class service lifecycle state and
+/// the latest retained desktop-source roster, when one is available.
+pub fn catalog_from_services_with_root_and_desktops(
+    state: &ServicesState,
+    workgroup_root: &Path,
+    desktop_state: Option<&DesktopSourcesState>,
+) -> Result<ResourceCatalog, ResourceValidationError> {
+    catalog_from_services_and_root(state, Some(workgroup_root), desktop_state, None, None)
+}
+
+/// Project the catalog with retained desktop and typed SSH/X11 source rosters.
+/// The SSH/X11 roster is optional so older producers remain compatible while a
+/// typed source worker is rolled out.
+pub fn catalog_from_services_with_root_and_desktops_and_ssh_x11(
+    state: &ServicesState,
+    workgroup_root: &Path,
+    desktop_state: Option<&DesktopSourcesState>,
+    ssh_x11_state: Option<&SshX11SourcesState>,
+) -> Result<ResourceCatalog, ResourceValidationError> {
+    catalog_from_services_and_root(
+        state,
+        Some(workgroup_root),
+        desktop_state,
+        ssh_x11_state,
+        None,
+    )
+}
+
+/// Project the catalog with every retained typed source roster currently
+/// owned by the universal aggregator.
+pub fn catalog_from_services_with_root_and_desktops_and_ssh_x11_and_upnp(
+    state: &ServicesState,
+    workgroup_root: &Path,
+    desktop_state: Option<&DesktopSourcesState>,
+    ssh_x11_state: Option<&SshX11SourcesState>,
+    upnp_state: Option<&UpnpSourcesState>,
+) -> Result<ResourceCatalog, ResourceValidationError> {
+    catalog_from_services_and_root(
+        state,
+        Some(workgroup_root),
+        desktop_state,
+        ssh_x11_state,
+        upnp_state,
+    )
 }
 
 fn catalog_from_services_and_root(
     state: &ServicesState,
     workgroup_root: Option<&Path>,
+    desktop_state: Option<&DesktopSourcesState>,
+    ssh_x11_state: Option<&SshX11SourcesState>,
+    upnp_state: Option<&UpnpSourcesState>,
 ) -> Result<ResourceCatalog, ResourceValidationError> {
     let now = u64::try_from(state.published_at_ms).unwrap_or(1).max(1);
     let configured: BTreeMap<_, _> = workgroup_root
@@ -179,8 +232,14 @@ fn catalog_from_services_and_root(
         .into_iter()
         .map(|config| (config.service_kind.clone(), config))
         .collect();
-    let mut cards =
-        Vec::with_capacity(REGISTERED.len() + AospStarterApp::ALL.len() + state.records.len());
+    let mut cards = Vec::with_capacity(
+        REGISTERED.len()
+            + AospStarterApp::ALL.len()
+            + state.records.len()
+            + desktop_state.map_or(0, |desktop| desktop.sources.len())
+            + ssh_x11_state.map_or(0, |ssh_x11| ssh_x11.sources.len())
+            + upnp_state.map_or(0, |upnp| upnp.sources.len()),
+    );
     for app in AospStarterApp::ALL {
         cards.push(application_card(app, &state.host, now)?);
     }
@@ -195,15 +254,65 @@ fn catalog_from_services_and_root(
     for record in &state.records {
         cards.push(observed_card(record, &state.host, now)?);
     }
+    if let Some(desktop_state) = desktop_state {
+        append_desktop_cards(&mut cards, desktop_state)?;
+    }
+    if let Some(ssh_x11_state) = ssh_x11_state {
+        append_ssh_x11_cards(&mut cards, ssh_x11_state)?;
+    }
+    if let Some(upnp_state) = upnp_state {
+        append_upnp_cards(&mut cards, upnp_state)?;
+    }
     let catalog = ResourceCatalog {
         schema_version: RESOURCE_CONTRACT_VERSION,
         revision: format!("{}-{now}", safe_id(&state.host)),
         publisher: safe_id(&state.host),
         generated_at_ms: now,
+        content_digest: None,
         cards,
     };
-    catalog.validate()?;
-    Ok(catalog)
+    catalog.with_content_digest()
+}
+
+/// Append desktop-source cards in stable resource-ID order, collapsing exact
+/// duplicate observations while rejecting conflicting rows for the same ID.
+/// The final catalog validation remains authoritative for all cross-card
+/// relationships and capacity limits.
+fn append_desktop_cards(
+    cards: &mut Vec<ResourceCard>,
+    desktop_state: &DesktopSourcesState,
+) -> Result<(), ResourceValidationError> {
+    let mut desktop_cards = BTreeMap::<String, ResourceCard>::new();
+    for source in &desktop_state.sources {
+        let card = resource_card_from_desktop_source(source, desktop_state.published_at_ms)?;
+        let resource_id = card.resource_id().to_owned();
+        match desktop_cards.entry(resource_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(card);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != &card {
+                    return Err(ResourceValidationError::InvalidRelationship(
+                        "desktop_source.conflicting_duplicate",
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut existing_ids: BTreeSet<String> = cards
+        .iter()
+        .map(|card| card.resource_id().to_owned())
+        .collect();
+    for (resource_id, card) in desktop_cards {
+        if !existing_ids.insert(resource_id) {
+            return Err(ResourceValidationError::InvalidRelationship(
+                "desktop_source.catalog_identity_collision",
+            ));
+        }
+        cards.push(card);
+    }
+    Ok(())
 }
 
 fn application_card(
@@ -1046,6 +1155,7 @@ fn remove_media_registration(workgroup_root: &Path, kind: &str) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
+    use super::super::desktop_sources::DesktopSource;
     use super::*;
 
     fn local_secret_store(root: &Path) -> crate::ipc::secret_store::SecretStore {
@@ -1086,6 +1196,8 @@ mod tests {
             .cards
             .iter()
             .all(|card| !card.operating_roles.is_empty()));
+        assert!(catalog.content_digest.is_some());
+        catalog.validate().expect("attested catalog");
     }
 
     #[test]
@@ -1117,6 +1229,141 @@ mod tests {
             ssh.service.as_ref().expect("service").stack.hosting_nodes,
             ["dell"]
         );
+    }
+
+    #[test]
+    fn optional_desktop_state_adds_stable_deduplicated_cards() {
+        let root = tempfile::tempdir().unwrap();
+        let services = ServicesState {
+            host: "seat-15".into(),
+            records: vec![],
+            published_at_ms: 1_700_000_000_000,
+        };
+        let source = DesktopSource {
+            id: "peer:oak".into(),
+            name: "Oak Seat".into(),
+            node: "oak".into(),
+            host: "10.42.0.7".into(),
+            protocols: vec![super::super::desktop_sources::ProtocolOffer::new(
+                super::super::desktop_sources::DesktopProtocol::Rdp,
+                Some(3389),
+            )],
+            origin: super::super::desktop_sources::SourceOrigin::MeshPeer,
+            reachability: super::super::desktop_sources::Reachability::Reachable,
+            reason: None,
+            os_hint: None,
+            power_state: None,
+            thumbnail_ref: None,
+        };
+        let desktop = DesktopSourcesState {
+            node: "desktop-discovery".into(),
+            sources: vec![source.clone(), source],
+            lanes: vec![],
+            published_at_ms: 1_700_000_000_000,
+        };
+
+        let catalog =
+            catalog_from_services_with_root_and_desktops(&services, root.path(), Some(&desktop))
+                .expect("valid desktop state");
+        assert_eq!(
+            catalog
+                .cards
+                .iter()
+                .filter(|card| card.identity.canonical_key == "peer:oak")
+                .count(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .cards
+                .iter()
+                .filter(|card| card.display_name == "Oak Seat")
+                .count(),
+            1
+        );
+        catalog.validate().expect("validated catalog");
+        assert!(catalog.content_digest.is_some());
+    }
+
+    #[test]
+    fn optional_upnp_state_adds_trusted_media_cards_to_the_universal_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let subnet = super::super::upnp_sources::TrustedLanSubnet::new(
+            "172.20.146.0".parse().unwrap(),
+            24,
+        )
+        .unwrap();
+        let policy = super::super::upnp_sources::UpnpDiscoveryPolicy::default_for(vec![
+            super::super::upnp_sources::TrustedLanInterface::new(
+                "enp0s31f6",
+                vec![subnet],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let adapter = super::super::upnp_sources::UpnpDiscoveryAdapter::new(policy);
+        let packet = b"HTTP/1.1 200 OK\r\n\
+CACHE-CONTROL: max-age=120\r\n\
+LOCATION: http://172.20.146.20:8200/rootDesc.xml\r\n\
+ST: urn:schemas-upnp-org:device:MediaServer:1\r\n\
+USN: uuid:2f402f80-da50-11e1-9b23-00025b00a001::urn:schemas-upnp-org:device:MediaServer:1\r\n\
+SERVER: MCNF/1.0\r\n\r\n";
+        let source = adapter
+            .admit_packet(
+                packet,
+                &super::super::upnp_sources::SsdpPacketContext {
+                    interface: "enp0s31f6".into(),
+                    source: "172.20.146.20:1900".parse().unwrap(),
+                    observed_at_ms: 1_700_000_000_000,
+                },
+            )
+            .unwrap();
+        let upnp = super::super::upnp_sources::UpnpSourcesState {
+            node: "seat-15".into(),
+            sources: vec![source],
+            published_at_ms: 1_700_000_000_000,
+        };
+        let services = ServicesState {
+            host: "seat-15".into(),
+            records: vec![],
+            published_at_ms: 1_700_000_000_000,
+        };
+
+        let catalog = catalog_from_services_with_root_and_desktops_and_ssh_x11_and_upnp(
+            &services,
+            root.path(),
+            None,
+            None,
+            Some(&upnp),
+        )
+        .expect("valid UPnP source state");
+        let card = catalog
+            .cards
+            .iter()
+            .find(|card| card.display_name == "UPnP media server at 172.20.146.20")
+            .expect("UPnP media-server card");
+        assert_eq!(card.identity.class, ResourceClass::MediaServer);
+        assert_eq!(card.provenance[0].source, DiscoverySource::SsdpUpnp);
+        catalog.validate().expect("validated UPnP catalog");
+    }
+
+    #[test]
+    fn every_catalog_constructor_attaches_a_deterministic_content_digest() {
+        let state = ServicesState {
+            host: "seat-15".into(),
+            records: vec![],
+            published_at_ms: 1_700_000_000_000,
+        };
+        let catalog = catalog_from_services(&state).expect("valid catalog");
+        assert_eq!(
+            catalog.content_digest.as_deref(),
+            Some(catalog.computed_content_digest().as_str())
+        );
+        assert!(catalog
+            .discovery_projection()
+            .unwrap()
+            .catalog_content_digest
+            .is_some());
     }
 
     #[test]

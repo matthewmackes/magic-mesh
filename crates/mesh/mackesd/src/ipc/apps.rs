@@ -7,14 +7,14 @@
 //!   * **local apps** — XDG `.desktop` (all dirs) + Flatpak exports (Q5);
 //!   * **mesh apps** — one remote-desktop launch target per joined peer, plus any
 //!     apps a peer advertises in its PD-2 directory descriptor (Q17);
-//!   * **workloads** — local podman containers + libvirt VMs from the compute
-//!     inventory (Q19);
+//!   * **workloads** — node-local VM and container rows from the authoritative
+//!     typed Workload projection (Q19);
 //!   * **services** — published mesh services from the PD-2 descriptors (Q20).
 //!
 //! Every entry is tagged `kind` / `source` / `node` / `health` so the applet can
 //! file it under the right tab without a per-tab query. The pure builders
 //! (`parse_desktop_entry`, `scan_local_apps`, `mesh_entries_from_directory`,
-//! `workload_entries_from_inventory`, `build_list`) are unit-tested; the responder
+//! `workload_entries_from_state`, `build_list`) are unit-tested; the responder
 //! is the thin Bus shell around them.
 
 #![cfg(feature = "async-services")]
@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use mackes_mesh_types::app_catalog::FlatpakAppCatalog;
+use mackes_mesh_types::workloads::{
+    workload_state_topic, WorkloadBackend, WorkloadPowerState, WorkloadStateSnapshot,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
@@ -94,7 +97,7 @@ pub struct AppEntry {
     pub name: String,
     /// `app` | `mesh-app` | `workload` | `service` — selects the applet tab.
     pub kind: String,
-    /// `xdg` | `flatpak` | `peer` | `podman` | `libvirt` | `service`.
+    /// `xdg` | `flatpak` | `peer` | `quadlet` | `libvirt` | `service`.
     pub source: String,
     /// Owning node hostname — empty for the local box.
     #[serde(default)]
@@ -313,102 +316,69 @@ pub fn mesh_entries_from_directory(dir: &serde_json::Value, this_node: &str) -> 
     out
 }
 
-// ───────────────────────── workloads (compute inventory) ─────────────────────────
+// ───────────────────────── workloads (authoritative state) ─────────────────────────
 
-/// Map a compute inventory document (`{"vms":[…],"containers":[…]}`) into
-/// `workload` entries (Q19). Tolerant of missing arrays.
-#[must_use]
-pub fn workload_entries_from_inventory(inv: &serde_json::Value, node: &str) -> Vec<AppEntry> {
-    let mut out = Vec::new();
-    let mk = |v: &serde_json::Value, source: &str, icon: &str| -> Option<AppEntry> {
-        let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
-        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
-        if name.is_empty() {
-            return None;
-        }
-        Some(AppEntry {
-            id: format!("workload:{source}:{id}"),
-            name: name.to_string(),
-            kind: "workload".into(),
-            source: source.to_string(),
-            node: node.to_string(),
-            exec: String::new(),
-            endpoint: String::new(),
-            icon: icon.to_string(),
-            health: String::new(),
-            state: v
-                .get("state")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-        })
-    };
-    if let Some(vms) = inv.get("vms").and_then(|v| v.as_array()) {
-        out.extend(vms.iter().filter_map(|v| mk(v, "libvirt", "computer")));
-    }
-    if let Some(cts) = inv.get("containers").and_then(|v| v.as_array()) {
-        out.extend(
-            cts.iter()
-                .filter_map(|v| mk(v, "podman", "application-x-executable")),
-        );
-    }
-    out
-}
-
-/// WORKLOAD-FLEET-2 — fold EVERY peer's compute inventory off the replicated
-/// QNM-Shared plane (`<root>/<host>/compute-inventory.json`, written by each
-/// node's `compute_registry`) into workload entries attributed to that host, so
-/// the Start-menu Workloads tab shows fleet-wide VMs/containers, not just local.
-/// Empty when the share isn't mounted (caller falls back to the local doc).
-#[must_use]
-pub fn fleet_workload_entries(this_node: &str) -> Vec<AppEntry> {
-    fleet_workload_entries_in(&crate::default_qnm_shared_root(), this_node)
-}
-
-/// Pure variant (unit-tested): read every `<root>/<host>/compute-inventory.json`.
+/// Map one node's authoritative Workload projection into Start-menu entries.
 ///
-/// Ports the proven `fold_bus_inventories` discipline (the Workbench compute
-/// panel): every node — including this one — publishes its own
-/// `compute-inventory.json` onto the share, so without a self-skip the local
-/// box's own VMs/containers would surface here AND again from the responder's
-/// local-bus fallback / live probe. Skip the doc whose `hostname` is
-/// `this_node`, and dedup any row already folded (node + source + name), so a
-/// stale duplicate doc can't double-list a workload.
+/// The launcher intentionally consumes the typed projection only. It neither
+/// probes an implementation backend nor reads a compatibility inventory, so a
+/// row's power state always has the same authority as Workloads and Datacenter.
 #[must_use]
-pub fn fleet_workload_entries_in(root: &std::path::Path, this_node: &str) -> Vec<AppEntry> {
-    let Ok(entries) = std::fs::read_dir(root) else {
+pub fn workload_entries_from_state(snapshot: &WorkloadStateSnapshot) -> Vec<AppEntry> {
+    snapshot
+        .workloads
+        .iter()
+        .map(|status| {
+            let (source, icon) = match status.backend {
+                WorkloadBackend::LibvirtVirtqemud => ("libvirt", "computer"),
+                WorkloadBackend::QuadletSystemd => ("quadlet", "application-x-executable"),
+            };
+            let state = match status.power {
+                WorkloadPowerState::Defined => "defined",
+                WorkloadPowerState::Starting => "starting",
+                WorkloadPowerState::Running => "running",
+                WorkloadPowerState::Paused => "paused",
+                WorkloadPowerState::Stopping => "stopping",
+                WorkloadPowerState::Stopped => "stopped",
+                WorkloadPowerState::Failed => "failed",
+            };
+            AppEntry {
+                id: format!("workload:{source}:{}", status.workload_id.as_str()),
+                name: status
+                    .workload_id
+                    .as_str()
+                    .rsplit(':')
+                    .next()
+                    .unwrap_or(status.workload_id.as_str())
+                    .to_string(),
+                kind: "workload".into(),
+                source: source.into(),
+                node: snapshot.node.clone(),
+                exec: String::new(),
+                endpoint: String::new(),
+                icon: icon.into(),
+                health: String::new(),
+                state: state.into(),
+            }
+        })
+        .collect()
+}
+
+/// Decode one untrusted Bus document at the typed Workload boundary. Malformed
+/// or invalid records are omitted rather than being rendered as a guessed
+/// workload.
+#[must_use]
+pub fn workload_entries_from_state_document(doc: &serde_json::Value) -> Vec<AppEntry> {
+    let Ok(snapshot) = serde_json::from_value::<WorkloadStateSnapshot>(doc.clone()) else {
         return Vec::new();
     };
-    let mut out: Vec<AppEntry> = Vec::new();
-    for ent in entries.flatten() {
-        let path = ent.path().join("compute-inventory.json");
-        let Some(body) = read_bounded_app_record(&path) else {
-            continue;
-        };
-        let Ok(inv) = serde_json::from_str::<serde_json::Value>(&body) else {
-            continue;
-        };
-        let node = inv
-            .get("hostname")
-            .and_then(|h| h.as_str())
-            .unwrap_or("")
-            .to_string();
-        // This node publishes its own inventory too — skip the whole doc when
-        // it's us (the local workloads come from the responder's own bus doc).
-        if !this_node.is_empty() && node == this_node {
-            continue;
-        }
-        for entry in workload_entries_from_inventory(&inv, &node) {
-            let dup = out
-                .iter()
-                .any(|e| e.node == entry.node && e.source == entry.source && e.name == entry.name);
-            if dup {
-                continue;
-            }
-            out.push(entry);
-        }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+    if snapshot.validate(now_ms).is_err() {
+        return Vec::new();
     }
-    out
+    workload_entries_from_state(&snapshot)
 }
 
 // ───────────────────────── running apps (APPS-LIVE-1) ─────────────────────────
@@ -778,7 +748,7 @@ pub fn action_topic(verb: &str) -> String {
 }
 
 /// Build the reply for one `action/apps/<verb>` request. Aggregates fresh on each
-/// `list` (refresh-on-open). The directory + inventory documents are read via the
+/// `list` (refresh-on-open). The directory + Workload-state documents are read via the
 /// provided closures so the heavy mackesd context isn't a hard dependency of the
 /// pure aggregation (and tests inject fixtures).
 #[must_use]
@@ -787,7 +757,7 @@ pub fn build_reply<D, I>(
     verb: &str,
     body: Option<&str>,
     dir_doc: D,
-    inv_doc: I,
+    workload_doc: I,
 ) -> String
 where
     D: FnOnce() -> serde_json::Value,
@@ -803,14 +773,7 @@ where
                 &fleet_running_hosts_in(&svc.workgroup_root),
             );
             let mesh = mesh_entries_from_directory(&dir_doc(), &svc.node_id);
-            // WORKLOAD-FLEET-2 — fleet-wide workloads from the replicated plane
-            // (this node's own doc is self-skipped — its workloads come from the
-            // local bus inventory below); fall back to that bus inventory wholly
-            // when the share is absent.
-            let mut workloads = fleet_workload_entries(&svc.node_id);
-            if workloads.is_empty() {
-                workloads = workload_entries_from_inventory(&inv_doc(), &svc.node_id);
-            }
+            let workloads = workload_entries_from_state_document(&workload_doc());
             build_list(local, mesh, workloads)
         }
         // APPS-4 — per-user favorites on QNM-Shared (Q10).
@@ -987,13 +950,13 @@ pub fn resolve_launch(dir: &serde_json::Value, node: &str) -> Option<(String, St
     Some(("rdp".to_string(), overlay.to_string()))
 }
 
-/// Read this node's latest published compute inventory (`compute/inventory/<node>`)
-/// from the bus, for the Workloads source (Q19). Opens its own short-lived Persist
-/// handle (the responder owns the serve-loop handle); an absent inventory is an
-/// honest empty doc, never an error.
+/// Read this node's latest authoritative Workload projection
+/// (`state/workloads/<node>`) from the Bus for the Workloads source (Q19).
+/// Opens its own short-lived Persist handle (the responder owns the serve-loop
+/// handle); an absent projection is an honest empty document, never an error.
 #[must_use]
-pub fn read_local_inventory(node_id: &str) -> serde_json::Value {
-    let topic = format!("compute/inventory/{node_id}");
+pub fn read_local_workload_state(node_id: &str) -> serde_json::Value {
+    let topic = workload_state_topic(node_id);
     let Some(root) = mde_bus::default_data_dir() else {
         return json!({});
     };
@@ -1005,13 +968,20 @@ pub fn read_local_inventory(node_id: &str) -> serde_json::Value {
     };
     // Re-read the newest message's body (latest_ulid gives the cursor; one
     // bounded list_since from the prior ulid returns it).
-    persist
+    let value = persist
         .list_since(&topic, None)
         .ok()
         .and_then(|msgs| msgs.into_iter().rev().find(|m| m.ulid == latest))
         .and_then(|m| m.body)
         .and_then(|b| serde_json::from_str(&b).ok())
-        .unwrap_or_else(|| json!({}))
+        .unwrap_or_else(|| json!({}));
+    let Ok(snapshot) = serde_json::from_value::<WorkloadStateSnapshot>(value) else {
+        return json!({});
+    };
+    if snapshot.node != node_id {
+        return json!({});
+    }
+    serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}))
 }
 
 /// Seed each verb cursor at the topic's current tail so a restart doesn't
@@ -1030,13 +1000,13 @@ pub fn seed_cursors_at_tail(persist: &Persist) -> HashMap<String, String> {
 }
 
 /// One poll sweep: answer every new `action/apps/<verb>` request on `reply/<ulid>`.
-/// `dir_doc`/`inv_doc` are re-invoked per request so each `list` is fresh.
+/// `dir_doc`/`workload_doc` are re-invoked per request so each `list` is fresh.
 pub fn poll_once<D, I>(
     persist: &Persist,
     svc: &AppsService,
     cursors: &mut HashMap<String, String>,
     dir_doc: &D,
-    inv_doc: &I,
+    workload_doc: &I,
 ) where
     D: Fn() -> serde_json::Value,
     I: Fn() -> serde_json::Value,
@@ -1057,7 +1027,7 @@ pub fn poll_once<D, I>(
                 crate::ipc::body_too_large_reply(verb)
             } else if matches!(verb, "set-favorite" | "set-groups") {
                 match svc.authorize_mutation(verb, msg.body.as_deref()) {
-                    Ok(()) => build_reply(svc, verb, msg.body.as_deref(), dir_doc, inv_doc),
+                    Ok(()) => build_reply(svc, verb, msg.body.as_deref(), dir_doc, workload_doc),
                     Err(error) => json!({
                         "ok": false,
                         "error": format!("{verb}: authorization refused: {error}"),
@@ -1065,7 +1035,7 @@ pub fn poll_once<D, I>(
                     .to_string(),
                 }
             } else {
-                build_reply(svc, verb, msg.body.as_deref(), dir_doc, inv_doc)
+                build_reply(svc, verb, msg.body.as_deref(), dir_doc, workload_doc)
             };
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
@@ -1079,13 +1049,14 @@ pub fn poll_once<D, I>(
     }
 }
 
-/// Run the `action/apps/*` responder loop until `should_stop`. `dir_doc`/`inv_doc`
-/// supply the live directory + compute-inventory documents (refresh-on-open).
+/// Run the `action/apps/*` responder loop until `should_stop`. `dir_doc`/
+/// `workload_doc` supply the live directory + authoritative Workload-state
+/// documents (refresh-on-open).
 pub fn serve_bus<F, D, I>(
     persist: &Persist,
     svc: &AppsService,
     dir_doc: D,
-    inv_doc: I,
+    workload_doc: I,
     should_stop: F,
 ) where
     F: Fn() -> bool,
@@ -1094,7 +1065,7 @@ pub fn serve_bus<F, D, I>(
 {
     let mut cursors = seed_cursors_at_tail(persist);
     while !should_stop() {
-        poll_once(persist, svc, &mut cursors, &dir_doc, &inv_doc);
+        poll_once(persist, svc, &mut cursors, &dir_doc, &workload_doc);
         std::thread::sleep(POLL_INTERVAL);
     }
 }
@@ -1225,106 +1196,59 @@ mod tests {
     }
 
     #[test]
-    fn workload_entries_map_vms_and_containers() {
-        let inv = json!({
-            "vms": [{"id": "uuid1", "name": "win10", "state": "running"}],
-            "containers": [{"id": "c1", "name": "nginx", "state": "exited"}]
+    fn workload_entries_use_the_typed_state_projection_only() {
+        let state = json!({
+            "schema_version": 1,
+            "node": "node1",
+            "observed_at_ms": 1,
+            "workloads": [
+                {
+                    "schema_version": 1,
+                    "request_id": "request-vm",
+                    "workload_id": "vm:node1:win10",
+                    "backend": "libvirt_virtqemud",
+                    "resources": {"vcpu": 1, "memory_mb": 512, "disk_gb": 1},
+                    "generation": 1,
+                    "phase": "completed",
+                    "power": "running",
+                    "readiness": "ready",
+                    "retryable": false,
+                    "reason": null,
+                    "remediation": null,
+                    "attachment": null
+                },
+                {
+                    "schema_version": 1,
+                    "request_id": "request-container",
+                    "workload_id": "container:node1:nginx",
+                    "backend": "quadlet_systemd",
+                    "resources": {"vcpu": 1, "memory_mb": 512, "disk_gb": 1},
+                    "generation": 1,
+                    "phase": "completed",
+                    "power": "stopped",
+                    "readiness": "unknown",
+                    "retryable": false,
+                    "reason": null,
+                    "remediation": null,
+                    "attachment": null
+                }
+            ]
         });
-        let e = workload_entries_from_inventory(&inv, "node1");
+        let e = workload_entries_from_state_document(&state);
         assert_eq!(e.len(), 2);
         let vm = e.iter().find(|x| x.source == "libvirt").unwrap();
         assert_eq!(vm.name, "win10");
         assert_eq!(vm.state, "running");
         assert_eq!(vm.kind, "workload");
-        let ct = e.iter().find(|x| x.source == "podman").unwrap();
+        let ct = e.iter().find(|x| x.source == "quadlet").unwrap();
         assert_eq!(ct.name, "nginx");
-    }
-
-    #[test]
-    fn fleet_workload_entries_unions_every_peer_attributed_by_host() {
-        let tmp = tempfile::tempdir().unwrap();
-        for (host, vm) in [("fedora", "MDE-KVM-1"), ("node-13", "web1")] {
-            let d = tmp.path().join(host);
-            std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(
-                d.join("compute-inventory.json"),
-                json!({"hostname": host, "vms": [{"id": format!("{host}-uuid"), "name": vm, "state": "running"}], "containers": []}).to_string(),
-            )
-            .unwrap();
-        }
-        // A non-inventory dir + file must be tolerated.
-        std::fs::create_dir_all(tmp.path().join("peers")).unwrap();
-        // this_node is some other host so both peer docs are folded.
-        let e = fleet_workload_entries_in(tmp.path(), "self-host");
-        assert_eq!(e.len(), 2, "one workload per peer file");
-        let f = e.iter().find(|x| x.name == "MDE-KVM-1").unwrap();
-        assert_eq!(f.node, "fedora");
-        assert_eq!(f.kind, "workload");
-        assert!(e.iter().any(|x| x.name == "web1" && x.node == "node-13"));
-    }
-
-    #[test]
-    fn fleet_workload_entries_empty_when_no_root() {
         assert!(
-            fleet_workload_entries_in(std::path::Path::new("/nonexistent-xyz"), "self").is_empty()
+            workload_entries_from_state_document(&json!({
+                "vms": [{"id": "uuid1", "name": "legacy", "state": "running"}]
+            }))
+            .is_empty(),
+            "the retired inventory shape must never become a Workloads fallback"
         );
-    }
-
-    #[test]
-    fn fleet_workload_entries_self_skips_own_doc_and_dedups() {
-        // Ports the fold_bus_inventories discipline (compute panel): the local
-        // node's own published doc must NOT be folded here (it duplicates the
-        // responder's local-bus inventory), and a stale duplicate peer doc must
-        // not double-list a workload.
-        let tmp = tempfile::tempdir().unwrap();
-        // This node's own doc — must be skipped wholesale.
-        let me = tmp.path().join("fedora");
-        std::fs::create_dir_all(&me).unwrap();
-        std::fs::write(
-            me.join("compute-inventory.json"),
-            json!({"hostname": "fedora",
-                   "vms": [{"id": "u-local", "name": "MDE-KVM-1", "state": "running"}],
-                   "containers": []})
-            .to_string(),
-        )
-        .unwrap();
-        // A genuine peer doc.
-        let peer = tmp.path().join("node-13");
-        std::fs::create_dir_all(&peer).unwrap();
-        std::fs::write(
-            peer.join("compute-inventory.json"),
-            json!({"hostname": "node-13",
-                   "vms": [{"id": "u-web", "name": "web1", "state": "running"}],
-                   "containers": [{"id": "c-db", "name": "db", "state": "exited"}]})
-            .to_string(),
-        )
-        .unwrap();
-        // A stale second copy of the SAME peer (different dir, same hostname +
-        // same workloads) — the dedup must collapse it to one row each.
-        let stale = tmp.path().join("node-13-stale");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(
-            stale.join("compute-inventory.json"),
-            json!({"hostname": "node-13",
-                   "vms": [{"id": "u-web2", "name": "web1", "state": "running"}],
-                   "containers": []})
-            .to_string(),
-        )
-        .unwrap();
-
-        let e = fleet_workload_entries_in(tmp.path(), "fedora");
-        // self ("fedora") doc skipped → no MDE-KVM-1; node-13's web1 + db, each once.
-        assert!(
-            !e.iter().any(|x| x.node == "fedora"),
-            "this node's own doc must be self-skipped"
-        );
-        assert_eq!(
-            e.iter().filter(|x| x.name == "web1").count(),
-            1,
-            "duplicate peer doc must be deduped to one web1"
-        );
-        assert!(e.iter().any(|x| x.name == "db" && x.node == "node-13"));
-        assert_eq!(e.len(), 2, "web1 + db, no self rows, no dupes");
     }
 
     #[test]

@@ -1,33 +1,31 @@
 //! Fleet · Datacenter — live per-node KVM reality (MV-6).
 //!
-//! Wires the Workbench Fleet plane to the two Bus topics the `mackesd` virt
-//! workers publish, and drives VM lifecycle back onto the Bus:
+//! Wires the Workbench Fleet plane to the authoritative Workload projection
+//! published by `mackesd`, and routes VM power intent through the typed
+//! Workload API:
 //!
 //! * `event/kvm/services` (MV-2 `kvm_health`) — each node's KVM service-health
 //!   summary (libvirtd / podman / … up or down).
-//! * `event/vm/instances` (MV-3 `vm_lifecycle`) — each node's VM roster.
-//! * `event/podman/containers` (MV-4 `container`) — each node's Podman container
-//!   roster (MV-6b).
-//! * `action/vm/lifecycle` (MV-3) — create / start / stop, **host-targeted** so a
-//!   request can only ever act on the one node it names (the worker drops any
-//!   request that doesn't `targets()` its own id; an empty host never matches).
+//! * `state/workloads/<node>` (WL-ARCH-010) — each node's typed VM/container
+//!   roster, power, readiness, health, pressure, progress, and failure state.
+//! * `action/workload/operation` — start / stop intent, **host-targeted** so a
+//!   request can only ever act on the one node it names.
 //!
-//! The payloads are a JSON boundary: we mirror them with **local** serde structs
-//! (field shapes read from `mackesd`'s `kvm_health.rs` / `vm_lifecycle.rs` /
-//! `container.rs`) rather than depending on the daemon crate — the shell stays in
-//! the desktop-shell tier and only leans inward on `mde-bus` (§6).
+//! The Workload snapshot is a versioned JSON boundary shared by the mesh-types
+//! crate. The shell remains a client: it reads the retained projection and
+//! never probes libvirt, Podman, or a legacy inventory topic.
 //!
 //! The container roster is rendered **read-only** (name / image / state) beside the
 //! VM roster: it completes MV-6's "VMs *and* containers" surface. Container
-//! run/stop lifecycle-drive (publishing `action/container/lifecycle`) is a
+//! run/stop lifecycle-drive is a
 //! deliberate follow-up — the container worker has no "start an existing container"
 //! verb to mirror the VM Start/Stop toggle, so the read-only roster lands cleanly
 //! first rather than half-wiring a drive.
 //!
 //! `project` is pure (no Bus, no GPU) and unit-tested directly; the only IO is
-//! `poll` (a cheap local `Persist` read) and `publish` (a `Persist` write — the
-//! same persist-first path `mde-bus publish` takes, so the request is recorded
-//! locally and replicated to the target node by the Bus).
+//! `poll` (a cheap local `Persist` read) and the typed Workload publisher (a
+//! `Persist` write recorded locally and replicated to the target node by the
+//! Bus).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,23 +33,21 @@ use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::Style;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use mackes_mesh_types::workloads::{
+    WorkloadBackend, WorkloadOperationAction, WorkloadOperationStatus,
+    WorkloadPowerState, WorkloadProfile, WorkloadStateSnapshot, WORKLOAD_OPERATION_TOPIC,
+};
 
 use crate::bus_reader::BusReader;
 
 /// Per-node KVM service-health summary topic (MV-2 `kvm_health`).
 const SERVICES_TOPIC: &str = "event/kvm/services";
-/// Per-node VM roster topic (MV-3 `vm_lifecycle`).
-const INSTANCES_TOPIC: &str = "event/vm/instances";
-/// Per-node Podman container roster topic (MV-4 `container`, read by MV-6b).
-const CONTAINERS_TOPIC: &str = "event/podman/containers";
-/// VM lifecycle request topic (MV-3). Flat — per-node targeting is the request's
-/// `host` field, never the topic.
-const ACTION_TOPIC: &str = "action/vm/lifecycle";
-
+/// Per-node authoritative VM/container Workload projection.
+const WORKLOAD_STATE_PREFIX: &str = "state/workloads/";
 /// BOOKMARKS-7 — the per-node ad-block stats topic prefix (`state/adfilter/<node>`,
 /// published by the `adfilter` worker). The Fleet view folds these into per-host
 /// ad-block rows (enabled lists / rules / allowlist / staleness).
@@ -65,10 +61,19 @@ const DATACENTER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 const CLOUD_MANAGED_TOOLTIP: &str =
     "Managed by the Workloads surface - start/stop this instance there, not from the Fleet roster.";
 
-/// Poll cadence for the two live topics — a node's health flip or a new VM
+/// Poll cadence for the health and Workload projections — a node's health flip
+/// or a new VM/container
 /// surfaces within this window. Matches the panel shell's 5 s refresh; the read
 /// is a cheap local `SQLite` scan so the cadence can stay tight.
 const REFRESH: Duration = Duration::from_secs(5);
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 // ───────────────────────── JSON boundary (read side) ─────────────────────────
 // Local mirrors of the `mackesd` worker payloads. serde ignores any wire fields
@@ -102,48 +107,24 @@ struct KvmHealth {
     published_at_ms: u64,
 }
 
-/// One VM row — mirrors `vm_lifecycle::Instance` (the libvirt numeric `id` on the
-/// wire is not rendered, so it's omitted; serde drops it).
+/// One VM row derived from an authoritative Workload status.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct Instance {
-    /// Domain name — the lifecycle key.
+    /// Domain/workload name — the stable lifecycle key.
     name: String,
-    /// Raw libvirt state string (`running`, `shut off`, `paused`, …).
+    /// Display state derived from the typed Workload power dimension.
     state: String,
 }
 
-/// Whole-node VM roster — mirrors `vm_lifecycle::InstanceReport`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct InstanceReport {
-    /// Publishing node id.
-    host: String,
-    /// The node's VMs in `virsh list --all` order.
-    instances: Vec<Instance>,
-    /// Publish time (ms since the Unix epoch) — the latest-wins fold key.
-    published_at_ms: u64,
-}
-
-/// One container row — mirrors `container::Container` (the podman `id` on the wire
-/// is not rendered, so it's omitted; serde drops it).
+/// One container row derived from an authoritative Workload status.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct Container {
-    /// Container name (first of podman's `Names`) — the roster key.
+    /// Container/workload name — the stable lifecycle key.
     name: String,
-    /// Image reference (`docker.io/library/nginx:latest`, `postgres:16`, …).
+    /// Approved catalog image reference, if one was carried into the status.
     image: String,
-    /// Raw podman state string (`running`, `exited`, `created`, `paused`, …).
+    /// Display state derived from the typed Workload power dimension.
     state: String,
-}
-
-/// Whole-node container roster — mirrors `container::ContainerReport`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct ContainerReport {
-    /// Publishing node id.
-    host: String,
-    /// The node's containers in `podman ps --all` order.
-    containers: Vec<Container>,
-    /// Publish time (ms since the Unix epoch) — the latest-wins fold key.
-    published_at_ms: u64,
 }
 
 // ─────────────── JSON boundary: browser + ad-block fleet state ───────────────
@@ -304,26 +285,27 @@ fn staleness_label(s: &Staleness) -> (Color32, String) {
 
 // ──────────────────────────── projected view ────────────────────────────
 
-/// One node's live datacenter reality, folded from the latest health + roster
-/// messages seen for that host.
+/// One node's live datacenter reality, folded from the latest health and
+/// authoritative Workload snapshot seen for that host.
 #[derive(Debug, Clone)]
 struct NodeView {
     /// Node id (the Bus `host`).
     host: String,
     /// Latest KVM health summary, once any has arrived.
     health: Option<KvmHealth>,
-    /// Latest VM roster (also empty for a genuinely empty node — see `roster_seen`).
+    /// Latest VM rows (also empty for a genuinely empty Workload snapshot — see
+    /// `roster_seen`).
     instances: Vec<Instance>,
-    /// `true` once an `event/vm/instances` report has been seen for this host —
-    /// distinguishes "no VMs defined" from "roster not yet reported".
+    /// `true` once a Workload snapshot has been seen for this host — distinguishes
+    /// "no VMs defined" from "Workload state not yet reported".
     roster_seen: bool,
     /// Publish time of the roster currently held (latest-wins fold key).
     roster_at_ms: u64,
-    /// Latest container roster (also empty for a genuinely empty node — see
-    /// `containers_seen`).
+    /// Latest container rows (also empty for a genuinely empty Workload snapshot
+    /// — see `containers_seen`).
     containers: Vec<Container>,
-    /// `true` once an `event/podman/containers` report has been seen for this host
-    /// — distinguishes "no containers" from "container roster not yet reported".
+    /// `true` once a Workload snapshot has been seen for this host — distinguishes
+    /// "no containers" from "Workload state not yet reported".
     containers_seen: bool,
     /// Publish time of the container roster currently held (latest-wins fold key).
     containers_at_ms: u64,
@@ -347,9 +329,9 @@ impl NodeView {
 /// The Datacenter roster kind Front Door may expose as a service lifecycle row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrontDoorLifecycleKind {
-    /// A Podman container reported by `event/podman/containers`.
+    /// A Quadlet/systemd container reported by the Workload projection.
     Container,
-    /// A libvirt/KVM guest reported by `event/vm/instances`.
+    /// A libvirt/KVM guest reported by the Workload projection.
     Vm,
 }
 
@@ -374,15 +356,63 @@ pub(crate) struct FrontDoorLifecycleCandidate {
     pub(crate) detail: String,
 }
 
+fn workload_name(snapshot_node: &str, status: &WorkloadOperationStatus) -> Option<String> {
+    let prefix = match status.backend {
+        WorkloadBackend::LibvirtVirtqemud => "vm:",
+        WorkloadBackend::QuadletSystemd => "container:",
+    };
+    let expected = format!("{prefix}{snapshot_node}:");
+    status
+        .workload_id
+        .as_str()
+        .strip_prefix(&expected)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn power_label(power: WorkloadPowerState) -> &'static str {
+    match power {
+        WorkloadPowerState::Defined => "defined",
+        WorkloadPowerState::Starting => "starting",
+        WorkloadPowerState::Running => "running",
+        WorkloadPowerState::Paused => "paused",
+        WorkloadPowerState::Stopping => "stopping",
+        WorkloadPowerState::Stopped => "shut off",
+        WorkloadPowerState::Failed => "failed",
+    }
+}
+
+fn workload_rows(
+    snapshot: &WorkloadStateSnapshot,
+) -> (Vec<Instance>, Vec<Container>) {
+    let mut instances = Vec::new();
+    let mut containers = Vec::new();
+    for status in &snapshot.workloads {
+        let Some(name) = workload_name(&snapshot.node, status) else {
+            continue;
+        };
+        let state = power_label(status.power).to_owned();
+        match status.backend {
+            WorkloadBackend::LibvirtVirtqemud => instances.push(Instance { name, state }),
+            WorkloadBackend::QuadletSystemd => containers.push(Container {
+                name,
+                image: status
+                    .image_ref
+                    .clone()
+                    .unwrap_or_else(|| "managed by Workloads".to_owned()),
+                state,
+            }),
+        }
+    }
+    instances.sort_by(|left, right| left.name.cmp(&right.name));
+    containers.sort_by(|left, right| left.name.cmp(&right.name));
+    (instances, containers)
+}
+
 /// Fold raw topic bodies into a sorted-by-host per-node view. Latest message wins
-/// per host (health, VM roster + container roster each tracked independently by
-/// their own `published_at_ms`), so a growing topic collapses to one row per node.
-/// Pure — no Bus, no GPU.
-fn project(
-    health_bodies: &[String],
-    instance_bodies: &[String],
-    container_bodies: &[String],
-) -> Vec<NodeView> {
+/// per host (health and Workload snapshot each tracked by their own timestamp),
+/// so a growing topic collapses to one row per node. Pure — no Bus, no GPU.
+fn project(health_bodies: &[String], workload_bodies: &[String]) -> Vec<NodeView> {
     let mut nodes: BTreeMap<String, NodeView> = BTreeMap::new();
 
     for body in health_bodies {
@@ -402,30 +432,23 @@ fn project(
         }
     }
 
-    for body in instance_bodies {
-        let Ok(r) = serde_json::from_str::<InstanceReport>(body) else {
+    for body in workload_bodies {
+        let Ok(snapshot) = serde_json::from_str::<WorkloadStateSnapshot>(body) else {
             continue;
         };
-        let entry = nodes
-            .entry(r.host.clone())
-            .or_insert_with(|| NodeView::new(&r.host));
-        if !entry.roster_seen || r.published_at_ms >= entry.roster_at_ms {
-            entry.roster_at_ms = r.published_at_ms;
-            entry.instances = r.instances;
-            entry.roster_seen = true;
+        if snapshot.validate(unix_millis()).is_err() {
+            continue;
         }
-    }
-
-    for body in container_bodies {
-        let Ok(r) = serde_json::from_str::<ContainerReport>(body) else {
-            continue;
-        };
+        let (instances, containers) = workload_rows(&snapshot);
         let entry = nodes
-            .entry(r.host.clone())
-            .or_insert_with(|| NodeView::new(&r.host));
-        if !entry.containers_seen || r.published_at_ms >= entry.containers_at_ms {
-            entry.containers_at_ms = r.published_at_ms;
-            entry.containers = r.containers;
+            .entry(snapshot.node.clone())
+            .or_insert_with(|| NodeView::new(&snapshot.node));
+        if !entry.roster_seen || snapshot.observed_at_ms >= entry.roster_at_ms {
+            entry.roster_at_ms = snapshot.observed_at_ms;
+            entry.instances = instances;
+            entry.roster_seen = true;
+            entry.containers_at_ms = snapshot.observed_at_ms;
+            entry.containers = containers;
             entry.containers_seen = true;
         }
     }
@@ -449,10 +472,9 @@ fn health_summary(h: &KvmHealth) -> (Color32, String) {
 
 // ─────────────────────── JSON boundary (write / action) ───────────────────────
 
-/// A VM spec for a create request — the `vm_lifecycle::VmSpec` fields the
-/// worker's `parse_action` reads. The worker defaults the optional `image_path`
-/// / `network`, so a blank-disk VM only needs these four.
-#[derive(Debug, Serialize)]
+/// The Fleet form's legacy create fields. Creation is intentionally not
+/// serialized here; the Workloads stepper owns definition and image approval.
+#[derive(Debug)]
 struct VmSpec {
     name: String,
     vcpus: u32,
@@ -460,15 +482,14 @@ struct VmSpec {
     disk_gb: u64,
 }
 
-/// A lifecycle request published to `action/vm/lifecycle` — internally tagged by
-/// `op` exactly like the worker's `LifecycleAction`
-/// (`#[serde(tag = "op", rename_all = "snake_case")]`), so the worker's
-/// `parse_action` accepts it verbatim. `host` is always a concrete node id.
-#[derive(Debug, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+/// A pending Fleet power intent. The Fleet roster remains an observation view;
+/// `publish` below translates Start/Stop into the sole typed Workload operation
+/// lane. Create is retained only as a visible migration affordance and is
+/// rejected with an actionable Workloads redirect.
+#[derive(Debug)]
 enum Lifecycle {
     /// Define a new VM (leaves it shut off).
-    Create { host: String, spec: VmSpec },
+    Create,
     /// Boot a defined VM.
     Start { host: String, name: String },
     /// Stop a running VM (graceful unless `force`).
@@ -479,58 +500,45 @@ enum Lifecycle {
     },
 }
 
-impl Lifecycle {
-    /// Serialize to the request body. A fixed, derive-backed shape → serialization
-    /// cannot realistically fail; an empty body (never produced here) would simply
-    /// be rejected by the worker's parser rather than acted on.
-    fn to_body(&self) -> String {
-        let mut body = serde_json::to_value(self).unwrap_or_default();
-        if let Some(object) = body.as_object_mut() {
-            object.insert(
-                "schema_version".to_string(),
-                serde_json::Value::from(mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION),
-            );
-        }
-        body.to_string()
-    }
-
-    /// Capability binding shared with `vm_lifecycle`: exact operation, host,
-    /// and domain. The complete serialized body is bound separately by its
-    /// canonical SHA-256 digest.
-    fn authorization_context(&self) -> (&'static str, &str, &str) {
-        match self {
-            Self::Create { host, spec } => ("vm-create", host, &spec.name),
-            Self::Start { host, name } => ("vm-start", host, name),
-            Self::Stop { host, name, .. } => ("vm-stop", host, name),
-        }
-    }
-}
-
-/// Publish a lifecycle request to `action/vm/lifecycle` via the persist-first
-/// path (`mde-bus publish`'s own path): the write is recorded locally and the Bus
-/// replicates it to the target node. Records any failure in `last_error` — never
-/// panics.
+/// Publish one Fleet power intent through the sole typed Workload lane. No
+/// retired lifecycle topic or direct backend publisher remains reachable from
+/// the shell; VM creation belongs to the Workloads stepper.
 fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, action: &Lifecycle) {
     let Some(root) = bus_root else {
         *last_error = Some("No mesh Bus directory — VM actions unavailable.".to_string());
         return;
     };
-    let unsigned = action.to_body();
-    let (verb, node, target) = action.authorization_context();
-    let body = match crate::iac::authorize_root_mutation_body(&unsigned, verb, node, target) {
-        Ok(body) => body,
-        Err(error) => {
-            *last_error = Some(format!("VM action authorization unavailable: {error}"));
+    let (host, name, operation) = match action {
+        Lifecycle::Start { host, name } => (host, name, WorkloadOperationAction::Start),
+        Lifecycle::Stop { host, name, .. } => (host, name, WorkloadOperationAction::Stop),
+            Lifecycle::Create => {
+            *last_error = Some(
+                "VM creation is managed by Workloads — open Workloads → New workload to continue."
+                    .into(),
+            );
             return;
         }
     };
-    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
-    // Persist::open because it needs the write Result to set `last_error`.
-    match Persist::open(root.to_path_buf())
-        .and_then(|p| p.write(ACTION_TOPIC, Priority::Default, None, Some(&body)))
-    {
+    let workload_id = format!("vm:{host}:{name}");
+    let request = match crate::workload_api::request(
+        &workload_id,
+        host,
+        WorkloadBackend::LibvirtVirtqemud,
+        WorkloadProfile::Small.resources(),
+        operation,
+        None,
+        0,
+        unix_millis(),
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            *last_error = Some(format!("VM Workload authorization unavailable: {error}"));
+            return;
+        }
+    };
+    match crate::workload_api::publish(root, &request) {
         Ok(_) => *last_error = None,
-        Err(e) => *last_error = Some(format!("Couldn't publish VM action: {e}")),
+        Err(error) => *last_error = Some(error),
     }
 }
 
@@ -587,7 +595,7 @@ impl CreateForm {
     }
 }
 
-/// The Fleet plane's live datacenter state: the projected per-node view plus the
+    /// The Fleet plane's live datacenter state: the projected per-node view plus the
 /// small IO/form context to refresh it and drive lifecycle.
 pub(crate) struct DatacenterState {
     /// Desktop-client Bus spool (resolved once). `None` on a box with no Bus dir
@@ -679,7 +687,8 @@ impl DatacenterState {
         out
     }
 
-    /// Read both topics and re-project. Split from the cadence gate so the pure
+    /// Read the health stream and authoritative Workload projections and
+    /// re-project. Split from the cadence gate so the pure
     /// projection stays testable; a missing dir / unreadable topic yields an empty
     /// or last-known projection, never a panic.
     fn refresh(&mut self) {
@@ -694,19 +703,18 @@ impl DatacenterState {
             return;
         };
         let health = read_bodies(&persist, SERVICES_TOPIC);
-        let instances = read_bodies(&persist, INSTANCES_TOPIC);
-        let containers = read_bodies(&persist, CONTAINERS_TOPIC);
-        self.nodes = project(&health, &instances, &containers);
+        let topics = persist.list_topics().unwrap_or_default();
+        let workloads = read_bodies_by_prefix(&persist, &topics, WORKLOAD_STATE_PREFIX);
+        self.nodes = project(&health, &workloads);
         // BOOKMARKS-8 — the per-node fan-out state topics (one topic per node) are
         // enumerated by prefix, not a fixed name.
-        let topics = persist.list_topics().unwrap_or_default();
         let adfilter = read_bodies_by_prefix(&persist, &topics, ADFILTER_STATE_PREFIX);
         let policy = read_bodies_by_prefix(&persist, &topics, BROWSER_POLICY_STATE_PREFIX);
         self.browser = project_browser(&adfilter, &policy);
     }
 
     /// Render the Fleet plane's live datacenter content: per-node KVM
-    /// service-health rows + VM roster, with host-targeted create/start/stop
+    /// service-health rows + Workload roster, with host-targeted create/start/stop
     /// controls. Shows an honest loading state before the first Bus message.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         // Disjoint field borrows so the render closures can hold `&nodes`
@@ -753,8 +761,8 @@ impl DatacenterState {
             ui.add_space(Style::SP_XS);
             ui.label(
                 RichText::new(
-                    "Each mesh node publishes its libvirt/Podman stack health, VM roster, \
-                     container roster, and browser/ad-block policy state to the Bus.",
+                    "Each mesh node publishes its libvirt/Podman stack health, typed Workload \
+                     roster, and browser/ad-block policy state to the Bus.",
                 )
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL),
@@ -815,19 +823,23 @@ impl DatacenterState {
     }
 }
 
-/// Read the JSON bodies of every retained message on `topic`, oldest first.
+/// Read the newest JSON body on a retained latest-value `topic`.
+///
+/// Health and per-node Workload/browser projections publish complete snapshots,
+/// so replaying their entire history only creates stale allocations for the
+/// render fold. The latest-row probe keeps the Fleet reader bounded.
 fn read_bodies(persist: &Persist, topic: &str) -> Vec<String> {
     persist
-        .list_since(topic, None)
-        .unwrap_or_default()
+        .read_latest(topic)
+        .ok()
+        .and_then(|message| message.and_then(|message| message.body))
         .into_iter()
-        .filter_map(|m| m.body)
         .collect()
 }
 
-/// Read the JSON bodies of every retained message on every topic under `prefix`
-/// (the per-node `state/<service>/<node>` fan-out), oldest first. `topics` is the
-/// already-enumerated topic list so a single `list_topics` serves several prefixes.
+/// Read the newest JSON body on every topic under `prefix` (the per-node
+/// `state/<service>/<node>` fan-out). `topics` is the already-enumerated topic
+/// list so a single `list_topics` serves several prefixes.
 fn read_bodies_by_prefix(persist: &Persist, topics: &[String], prefix: &str) -> Vec<String> {
     topics
         .iter()
@@ -975,9 +987,9 @@ fn show_node(
     });
 }
 
-/// One container roster row (read-only): a state pip + name + image + raw state.
-/// Mirrors [`show_instance_row`] without the lifecycle buttons — container run/stop
-/// drive is a deliberate follow-up (see the module doc).
+/// One container roster row (read-only): a state pip + name + approved image +
+/// typed power state. Mirrors [`show_instance_row`] without lifecycle buttons —
+/// container run/stop drive remains in the Workloads surface.
 fn show_container_row(ui: &mut egui::Ui, c: &Container) {
     let running = c.state.trim() == "running";
     let dot = if running { Style::OK } else { Style::TEXT_DIM };
@@ -1361,10 +1373,8 @@ fn show_create(
         {
             match form.to_spec() {
                 Ok(spec) => {
-                    *pending = Some(Lifecycle::Create {
-                        host: host.to_string(),
-                        spec,
-                    });
+                    let _ = spec;
+                    *pending = Some(Lifecycle::Create);
                     *create_for = None;
                 }
                 Err(e) => form.error = Some(e),
@@ -1394,6 +1404,7 @@ fn form_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mde_bus::hooks::config::Priority;
 
     fn health_body(host: &str, all_healthy: bool, at: u64) -> String {
         // A minimal but faithful `event/kvm/services` body.
@@ -1405,29 +1416,96 @@ mod tests {
     }
 
     fn roster_body(host: &str, names_states: &[(&str, &str)], at: u64) -> String {
-        let insts: Vec<String> = names_states
-            .iter()
-            .map(|(n, s)| format!(r#"{{"id":"-","name":"{n}","state":"{s}"}}"#))
-            .collect();
-        format!(
-            r#"{{"host":"{host}","instances":[{}],"published_at_ms":{at}}}"#,
-            insts.join(",")
-        )
+        workload_body(host, names_states, &[], at)
     }
 
     fn container_body(host: &str, rows: &[(&str, &str, &str)], at: u64) -> String {
-        // A minimal but faithful `event/podman/containers` body — each row is
-        // (name, image, state). `id` is on the wire but not rendered (serde drops it).
-        let cs: Vec<String> = rows
+        // A minimal authoritative Workload snapshot — each row is
+        // (name, approved image, power state).
+        workload_body(host, &[], rows, at)
+    }
+
+    fn workload_body(
+        host: &str,
+        vms: &[(&str, &str)],
+        containers: &[(&str, &str, &str)],
+        at: u64,
+    ) -> String {
+        let mut workloads: Vec<_> = vms
             .iter()
-            .map(|(n, img, s)| {
-                format!(r#"{{"id":"-","name":"{n}","image":"{img}","state":"{s}"}}"#)
-            })
+            .map(|(name, state)| workload_status(host, "vm", name, state, None))
             .collect();
-        format!(
-            r#"{{"host":"{host}","containers":[{}],"published_at_ms":{at}}}"#,
-            cs.join(",")
-        )
+        workloads.extend(containers.iter().map(|(name, image, state)| {
+            workload_status(host, "container", name, state, Some(image))
+        }));
+        workload_snapshot(host, at, workloads)
+    }
+
+    fn workload_status(
+        host: &str,
+        kind: &str,
+        name: &str,
+        state: &str,
+        image: Option<&str>,
+    ) -> serde_json::Value {
+        let backend = if kind == "vm" {
+            "libvirt_virtqemud"
+        } else {
+            "quadlet_systemd"
+        };
+        let power = if state == "running" {
+            "running"
+        } else if matches!(state, "paused") {
+            "paused"
+        } else {
+            "stopped"
+        };
+        let phase = if state == "running" { "ready" } else { "completed" };
+        let readiness = if state == "running" { "ready" } else { "unknown" };
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "request_id": format!("test-{kind}-{name}"),
+            "workload_id": format!("{kind}:{host}:{name}"),
+            "backend": backend,
+            "resources": {"vcpu": 2, "memory_mb": 4096, "disk_gb": 32},
+            "generation": 1,
+            "phase": phase,
+            "power": power,
+            "readiness": readiness,
+            "retryable": false,
+            "attempt": 0,
+            "next_retry_at_ms": 0,
+            "reason": serde_json::Value::Null,
+            "remediation": serde_json::Value::Null,
+            "attachment": serde_json::Value::Null,
+        });
+        if let Some(image) = image {
+            value["image_ref"] = serde_json::Value::String((*image).to_owned());
+        }
+        value
+    }
+
+    fn workload_snapshot(host: &str, at: u64, workloads: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "node": host,
+            "observed_at_ms": at,
+            "workloads": workloads,
+        })
+        .to_string()
+    }
+
+    /// Keep the older test call shape while every body now represents the same
+    /// authoritative Workload topic. Production has only the two-argument
+    /// `super::project` path.
+    fn project(
+        health_bodies: &[String],
+        workload_bodies: &[String],
+        additional_workload_bodies: &[String],
+    ) -> Vec<NodeView> {
+        let mut bodies = workload_bodies.to_vec();
+        bodies.extend(additional_workload_bodies.iter().cloned());
+        super::project(health_bodies, &bodies)
     }
 
     #[test]
@@ -1435,12 +1513,13 @@ mod tests {
         let mut state = DatacenterState {
             nodes: project(
                 &[],
-                &[roster_body("oak", &[("dispatch-vm", "running")], 10)],
-                &[container_body(
+                &[workload_body(
                     "oak",
-                    &[("mesh-api", "construct/mesh-api:latest", "exited")],
+                    &[("dispatch-vm", "running")],
+                    &[("mesh-api", "construct.mesh-api:latest", "exited")],
                     11,
                 )],
+                &[],
             ),
             ..DatacenterState::default()
         };
@@ -1457,7 +1536,7 @@ mod tests {
             row.host == "oak"
                 && row.kind == FrontDoorLifecycleKind::Container
                 && row.name == "mesh-api"
-                && row.detail == "construct/mesh-api:latest"
+                && row.detail == "construct.mesh-api:latest"
         }));
 
         state.nodes.clear();
@@ -1774,13 +1853,13 @@ mod tests {
             health_body("node-b", true, 1),
             health_body("node-a", false, 1),
         ];
-        let instances = vec![roster_body("node-a", &[("web1", "running")], 1)];
-        let containers = vec![container_body(
+        let workloads = vec![workload_body(
             "node-a",
+            &[("web1", "running")],
             &[("cache", "redis:7", "running")],
             1,
         )];
-        let nodes = project(&health, &instances, &containers);
+        let nodes = project(&health, &workloads, &[]);
         assert_eq!(nodes.len(), 2, "one row per host");
         // BTreeMap key order → sorted by host.
         assert_eq!(nodes[0].host, "node-a");
@@ -1951,6 +2030,29 @@ mod tests {
     }
 
     #[test]
+    fn latest_value_reader_does_not_materialize_retained_projection_history() {
+        let dir = tempfile::tempdir().expect("temp Bus");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open Bus");
+        for at in 0..=64 {
+            persist
+                .write(
+                    SERVICES_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&health_body("node-a", true, at)),
+                )
+                .expect("write retained health snapshot");
+        }
+
+        let bodies = read_bodies(&persist, SERVICES_TOPIC);
+        assert_eq!(bodies.len(), 1, "latest-value topics admit one row");
+        assert!(
+            bodies[0].contains("\"published_at_ms\":64"),
+            "the newest complete projection remains visible"
+        );
+    }
+
+    #[test]
     fn project_folds_containers_per_host_sorted() {
         let containers = vec![
             container_body("node-b", &[("web", "nginx:latest", "running")], 1),
@@ -1965,7 +2067,7 @@ mod tests {
         assert_eq!(nodes[0].containers.len(), 1);
         assert_eq!(nodes[0].containers[0].name, "db");
         assert_eq!(nodes[0].containers[0].image, "postgres:16");
-        assert_eq!(nodes[0].containers[0].state, "exited");
+        assert_eq!(nodes[0].containers[0].state, "shut off");
     }
 
     #[test]
@@ -2035,52 +2137,47 @@ mod tests {
     }
 
     #[test]
-    fn create_action_serializes_to_the_worker_shape() {
-        let body = Lifecycle::Create {
-            host: "node-a".to_string(),
-            spec: VmSpec {
-                name: "web1".to_string(),
-                vcpus: 2,
-                ram_mb: 2048,
-                disk_gb: 20,
-            },
-        }
-        .to_body();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["op"], "create");
-        assert_eq!(v["host"], "node-a");
-        assert_eq!(v["spec"]["name"], "web1");
-        assert_eq!(v["spec"]["vcpus"], 2);
-        assert_eq!(v["spec"]["ram_mb"], 2048);
-        assert_eq!(v["spec"]["disk_gb"], 20);
+    fn create_action_is_rejected_in_fleet_and_redirects_to_workloads() {
+        let mut error = None;
+        publish(
+            Some(Path::new("/missing-bus")),
+            &mut error,
+            &Lifecycle::Create,
+        );
+        assert!(error.is_some_and(|message| message.contains("Workloads")));
     }
 
     #[test]
-    fn start_and_stop_actions_are_host_targeted() {
-        let start = Lifecycle::Start {
-            host: "node-a".to_string(),
-            name: "web1".to_string(),
-        }
-        .to_body();
-        let v: serde_json::Value = serde_json::from_str(&start).unwrap_or_default();
-        assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["op"], "start");
-        assert_eq!(v["host"], "node-a");
-        assert_eq!(v["name"], "web1");
+    fn start_and_stop_actions_are_host_targeted_typed_operations() {
+        let start = crate::workload_api::request(
+            "vm:node-a:web1",
+            "node-a",
+            WorkloadBackend::LibvirtVirtqemud,
+            WorkloadProfile::Small.resources(),
+            WorkloadOperationAction::Start,
+            None,
+            0,
+            unix_millis(),
+        )
+        .expect("start request");
+        assert_eq!(start.target_node, "node-a");
+        assert_eq!(start.workload_id.as_str(), "vm:node-a:web1");
+        assert_eq!(start.action, WorkloadOperationAction::Start);
 
-        let stop = Lifecycle::Stop {
-            host: "node-b".to_string(),
-            name: "db1".to_string(),
-            force: false,
-        }
-        .to_body();
-        let v: serde_json::Value = serde_json::from_str(&stop).unwrap_or_default();
-        assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["op"], "stop");
-        assert_eq!(v["host"], "node-b");
-        assert_eq!(v["name"], "db1");
-        assert_eq!(v["force"], false);
+        let stop = crate::workload_api::request(
+            "vm:node-b:db1",
+            "node-b",
+            WorkloadBackend::LibvirtVirtqemud,
+            WorkloadProfile::Small.resources(),
+            WorkloadOperationAction::Stop,
+            None,
+            0,
+            unix_millis(),
+        )
+        .expect("stop request");
+        assert_eq!(stop.target_node, "node-b");
+        assert_eq!(stop.workload_id.as_str(), "vm:node-b:db1");
+        assert_eq!(stop.action, WorkloadOperationAction::Stop);
     }
 
     #[test]
@@ -2116,14 +2213,10 @@ mod tests {
     #[test]
     fn publish_without_a_bus_root_records_an_error() {
         let mut err = None;
-        publish(
-            None,
-            &mut err,
-            &Lifecycle::Start {
-                host: "n".to_string(),
-                name: "v".to_string(),
-            },
-        );
+        publish(None, &mut err, &Lifecycle::Start {
+            host: "n".to_string(),
+            name: "v".to_string(),
+        });
         assert!(err.is_some(), "a missing bus dir is surfaced, not panicked");
     }
 
@@ -2142,20 +2235,16 @@ mod tests {
         );
         assert!(error.is_none(), "{error:?}");
         let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
-        let messages = persist.list_since(ACTION_TOPIC, None).unwrap();
+        let messages = persist.list_since(WORKLOAD_OPERATION_TOPIC, None).unwrap();
         assert_eq!(messages.len(), 1);
         let body = messages[0].body.as_deref().unwrap();
-        let value: serde_json::Value = serde_json::from_str(body).unwrap();
-        let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
-            value["armed_token"].as_str().unwrap(),
+        let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
+            body,
+            unix_millis(),
         )
-        .unwrap();
-        assert_eq!(token.verb, "vm-stop");
-        assert_eq!(token.node, "node-a");
-        assert_eq!(token.target, "web1");
-        assert_eq!(
-            token.request_sha256,
-            mackes_mesh_types::cloud::cloud_request_digest(body).unwrap()
-        );
+        .expect("typed request");
+        assert_eq!(request.target_node, "node-a");
+        assert_eq!(request.workload_id.as_str(), "vm:node-a:web1");
+        assert_eq!(request.action, WorkloadOperationAction::Stop);
     }
 }

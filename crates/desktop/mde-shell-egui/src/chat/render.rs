@@ -67,7 +67,8 @@ pub(super) fn fmt_hh_mm(ts_unix_ms: i64) -> String {
     if ts_unix_ms <= 0 {
         return String::new();
     }
-    let secs = (ts_unix_ms / 1000).saturating_add(crate::timers::display_offset_seconds());
+    let unix_secs = ts_unix_ms / 1000;
+    let secs = unix_secs.saturating_add(crate::timers::display_offset_seconds_at(unix_secs));
     let tod = secs.rem_euclid(86_400);
     format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60)
 }
@@ -77,7 +78,8 @@ pub(super) fn fmt_full_datetime(ts_unix_ms: i64) -> String {
     if ts_unix_ms <= 0 {
         return "unknown time".to_string();
     }
-    let secs = (ts_unix_ms / 1000).saturating_add(crate::timers::display_offset_seconds());
+    let unix_secs = ts_unix_ms / 1000;
+    let secs = unix_secs.saturating_add(crate::timers::display_offset_seconds_at(unix_secs));
     let tod = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     format!(
@@ -93,7 +95,8 @@ pub(super) fn fmt_date(ts_unix_ms: i64) -> String {
     if ts_unix_ms <= 0 {
         return "unknown date".to_string();
     }
-    let secs = (ts_unix_ms / 1000).saturating_add(crate::timers::display_offset_seconds());
+    let unix_secs = ts_unix_ms / 1000;
+    let secs = unix_secs.saturating_add(crate::timers::display_offset_seconds_at(unix_secs));
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     format!("{year:04}-{month:02}-{day:02}")
 }

@@ -45,14 +45,23 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mackes_mesh_types::vdi_clipboard::{
-    ClipboardMaterialization, VdiClipboardText, CLIPBOARD_MATERIALIZATION_TOPIC,
+    ClipboardEnvelopeV2, ClipboardEnvelopeV2ValidationError, ClipboardMaterialization,
+    ClipboardSessionConsentV1, ClipboardSessionConsentValidationError, VdiClipboardText,
+    CLIPBOARD_MATERIALIZATION_TOPIC,
 };
 use mde_bus::persist::Persist;
+use mde_collab_types::{
+    ClipboardEnvelopeV2 as CollabClipboardEnvelopeV2,
+    ClipboardEnvelopeV2ValidationError as CollabClipboardEnvelopeV2ValidationError,
+    ClipboardMimeKind as CollabClipboardMimeKind, ClipboardPayloadV2 as CollabClipboardPayloadV2,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -61,7 +70,12 @@ pub mod session;
 use super::clipboard_bridge::{ClipDirection, ClipPayload, ClipboardEvent};
 use super::session_broker::{EtcdSessionStore, MeshSessionStore, SessionState, SessionStore};
 use super::{ShutdownToken, Worker};
-use crate::ipc::action_auth::{production_action_signer, ACTION_SCHEMA_VERSION, MAX_AUTH_TTL_MS};
+use crate::ipc::action_auth::{
+    production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
+    MAX_AUTH_TTL_MS,
+};
+
+pub use mackes_mesh_types::vdi_clipboard::CLIPBOARD_SESSION_CONSENT_TOPIC;
 
 /// The daemon-owned VNC-to-seat handoff is deliberately narrower than the
 /// general clipboard action lane: only the shell's truthful VNC source form is
@@ -83,10 +97,57 @@ pub const HISTORY_CAP: usize = 50;
 /// the history file.
 pub const CLIP_TOPIC: &str = "event/clipboard/clip";
 
+/// Bus topic for the versioned rich clipboard contract. This lane is kept
+/// separate from [`CLIP_TOPIC`] so legacy text consumers cannot deserialize a
+/// rich envelope as an old `{ id, text, source, time }` body.
+pub const CLIPBOARD_ENVELOPE_V2_TOPIC: &str = "event/clipboard/envelope-v2";
+
+/// Bus topic for the signed `mde-collab-types` rich clipboard contract.
+///
+/// This must remain distinct from [`CLIPBOARD_ENVELOPE_V2_TOPIC`]: that lane
+/// carries the existing `mackes_mesh_types` VDI envelope and has a different
+/// wire shape. Keeping both explicit preserves deployed VDI producers while
+/// allowing the collaboration contract to reach this worker's real intake.
+pub const COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC: &str = "event/clipboard/collab-envelope-v2";
+
+/// Capability verb for the explicit clipboard publishing consent control.
+pub const CLIPBOARD_SESSION_CONSENT_AUTH_VERB: &str = "clipboard-session-consent";
+
+/// Maximum encoded consent command size, including its short-lived capability.
+/// This is deliberately smaller than the generic action cap because the
+/// command carries only identity, timestamps, state, and authentication.
+const MAX_CLIPBOARD_SESSION_CONSENT_COMMAND_BYTES: usize = 16 * 1024;
+
+/// Maximum encoded capability field accepted by the typed consent envelope.
+/// Cloud armed tokens are substantially shorter; this bound prevents a forged
+/// command from turning the parser into an allocation sink before authorization.
+const MAX_CLIPBOARD_SESSION_CONSENT_TOKEN_BYTES: usize = 1024;
+
 /// Per-daemon cursor file kept beside the local Bus log. It is deliberately
 /// not stored under the replicated workgroup root: each daemon must acknowledge
 /// the canonical lane independently, while the history itself is mesh-global.
 const CURSOR_FILE_NAME: &str = "clipboard-sync.cursor.json";
+
+/// The V2 cursor is separate from the legacy text cursor because the two lanes
+/// have independent schemas and acknowledgement rules.
+const V2_CURSOR_FILE_NAME: &str = "clipboard-sync.v2.cursor.json";
+
+/// Durable cursor for the distinct `mde-collab-types` envelope lane.
+const COLLAB_V2_CURSOR_FILE_NAME: &str = "clipboard-sync.collab-v2.cursor.json";
+
+/// Durable cursor for the authenticated consent-control lane.
+const CONSENT_CURSOR_FILE_NAME: &str = "clipboard-sync.consent.cursor.json";
+
+/// Keep the source-session replay ledger bounded. The ledger stores only
+/// identity + sequence markers, never inline payload bytes.
+const MAX_V2_SOURCE_LANES: usize = 256;
+
+/// Keep collaboration-envelope replay state bounded and payload-free.
+const MAX_COLLAB_V2_SOURCE_LANES: usize = 256;
+
+/// Keep consent state bounded independently from replay markers. The ledger
+/// stores only safe source identity and timestamps; it never stores payloads.
+const MAX_V2_CONSENT_SESSIONS: usize = 256;
 
 /// Bus-drain cadence for the canonical clipboard event lane.
 pub const CLIP_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -137,6 +198,456 @@ impl ClipEventBody {
             time: time.to_string(),
         }
     }
+}
+
+/// Authenticated Bus envelope for one clipboard session-consent update.
+///
+/// The outer schema is the existing privileged-action schema consumed by
+/// [`ActionAuthorizer`]. The nested value is the only typed semantic payload;
+/// in particular, there is no clipboard text, MIME value, Files reference, or
+/// arbitrary byte field in this control envelope. Unknown fields fail closed
+/// before the capability is even considered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardSessionConsentCommandV1 {
+    /// Existing exact-body action schema.
+    pub schema_version: u16,
+    /// Explicit bounded consent state for one source node/seat/session.
+    pub consent: ClipboardSessionConsentV1,
+    /// Exact-body capability minted by the root/systemd signer.
+    pub armed_token: String,
+}
+
+impl ClipboardSessionConsentCommandV1 {
+    /// Decode the bounded, strict Bus body. The nested consent type performs
+    /// its own intrinsic schema/identity/timestamp/expiry validation during
+    /// deserialization; freshness and update ordering are checked by the
+    /// daemon ledger after authentication.
+    fn from_json(body: &str) -> Result<Self, String> {
+        if body.len() > MAX_CLIPBOARD_SESSION_CONSENT_COMMAND_BYTES {
+            return Err(format!(
+                "clipboard consent command body exceeds {MAX_CLIPBOARD_SESSION_CONSENT_COMMAND_BYTES} bytes"
+            ));
+        }
+        let command = serde_json::from_str::<Self>(body)
+            .map_err(|error| format!("malformed clipboard consent command: {error}"))?;
+        if command.schema_version != ACTION_SCHEMA_VERSION as u16 {
+            return Err(format!(
+                "clipboard consent command requires schema_version {ACTION_SCHEMA_VERSION}"
+            ));
+        }
+        if command.armed_token.is_empty()
+            || command.armed_token.len() > MAX_CLIPBOARD_SESSION_CONSENT_TOKEN_BYTES
+            || command.armed_token.trim() != command.armed_token
+        {
+            return Err("clipboard consent command has an invalid armed_token field".to_string());
+        }
+        Ok(command)
+    }
+}
+
+/// Canonical capability target for one consented source session. Keeping all
+/// three source identity components in the target makes a token minted for one
+/// seat/session unusable for another even when a caller accidentally reuses a
+/// local node scope.
+#[must_use]
+pub fn clipboard_session_consent_auth_target(consent: &ClipboardSessionConsentV1) -> String {
+    format!(
+        "source:{}:seat:{}:session:{}",
+        consent.source_node, consent.source_seat, consent.source_session
+    )
+}
+
+/// Payload forms that the current daemon materialization path cannot preserve
+/// without an additional Files or rich-MIME adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardEnvelopeV2UnsupportedPayload {
+    /// The bytes live in the Files executor and must not be treated as text.
+    FilesReference,
+    /// More than the exact text/plain representation was offered.
+    RichMime,
+}
+
+/// A bounded V2 admission or materialization failure. Shared contract errors
+/// remain typed so replay, identity, expiry, and intrinsic payload failures are
+/// distinguishable from the daemon's currently unsupported representations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardEnvelopeV2BoundaryError {
+    /// The serialized body was too large or malformed.
+    Decode(String),
+    /// The shared V2 contract rejected the decoded envelope.
+    Admission(ClipboardEnvelopeV2ValidationError),
+    /// The envelope is valid but this text-only materialization path cannot
+    /// preserve its representation.
+    UnsupportedPayload(ClipboardEnvelopeV2UnsupportedPayload),
+    /// The bounded source-session high-water table has no free lane.
+    LedgerCapacityExceeded {
+        /// Maximum number of source-session replay lanes.
+        max: usize,
+    },
+    /// The source session has not passed the separate typed consent boundary.
+    Consent(ClipboardSessionConsentBoundaryError),
+    /// A valid source timestamp cannot be represented as an RFC3339 chrono
+    /// timestamp for the existing materialization record.
+    TimestampOutOfRange {
+        /// Source timestamp in Unix epoch milliseconds.
+        timestamp_ms: u64,
+    },
+}
+
+impl std::fmt::Display for ClipboardEnvelopeV2BoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode(error) => write!(formatter, "clipboard V2 body decode failed: {error}"),
+            Self::Admission(error) => write!(formatter, "clipboard V2 admission failed: {error}"),
+            Self::UnsupportedPayload(ClipboardEnvelopeV2UnsupportedPayload::FilesReference) => {
+                formatter.write_str(
+                    "clipboard V2 Files payload is not materializable by the text-only daemon path",
+                )
+            }
+            Self::UnsupportedPayload(ClipboardEnvelopeV2UnsupportedPayload::RichMime) => formatter
+                .write_str(
+                "clipboard V2 rich MIME offers are not materializable by the text-only daemon path",
+            ),
+            Self::LedgerCapacityExceeded { max } => write!(
+                formatter,
+                "clipboard V2 source-session ledger is full (maximum {max})"
+            ),
+            Self::Consent(error) => {
+                write!(formatter, "clipboard V2 consent admission failed: {error}")
+            }
+            Self::TimestampOutOfRange { timestamp_ms } => write!(
+                formatter,
+                "clipboard V2 timestamp {timestamp_ms} is outside the RFC3339 range"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardEnvelopeV2BoundaryError {}
+
+/// A typed failure from the daemon-local clipboard consent seam. The Bus
+/// command is authenticated and decoded before it reaches this ledger; the
+/// ledger itself remains bounded and payload-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardSessionConsentBoundaryError {
+    /// No consent has been admitted for this exact source identity.
+    Missing,
+    /// A consent record exists, but it is explicitly disabled.
+    Disabled,
+    /// The shared consent contract rejected the record or its freshness.
+    Admission(ClipboardSessionConsentValidationError),
+    /// The bounded in-memory consent table has no free identity lane.
+    LedgerCapacityExceeded {
+        /// Maximum number of consented source identities.
+        max: usize,
+    },
+}
+
+impl std::fmt::Display for ClipboardSessionConsentBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("no consent is admitted for the source session"),
+            Self::Disabled => formatter.write_str("source-session clipboard consent is disabled"),
+            Self::Admission(error) => write!(formatter, "{error}"),
+            Self::LedgerCapacityExceeded { max } => write!(
+                formatter,
+                "clipboard consent ledger is full (maximum {max})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardSessionConsentBoundaryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Missing | Self::Disabled | Self::LedgerCapacityExceeded { .. } => None,
+        }
+    }
+}
+
+/// The explicit typed fold produced for the only V2 representation the
+/// existing daemon handoff can preserve. The original envelope remains attached
+/// so the worker can advance its source-session high-water marker without
+/// rebuilding or guessing any payload representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardEnvelopeV2TextFold {
+    /// The admitted rich envelope, including its source ordering metadata.
+    pub envelope: ClipboardEnvelopeV2,
+    /// The bounded text payload copied without truncation or re-encoding.
+    pub text: VdiClipboardText,
+    /// Stable source attribution for [`ClipboardMaterialization`].
+    pub source: String,
+    /// Source timestamp converted to the legacy materialization's RFC3339 form.
+    pub time: String,
+}
+
+/// Admit one serialized V2 body against the prior source-session high-water
+/// marker. The first body establishes the lane's claimed identity; subsequent
+/// bodies must match that identity and strictly increase its sequence. A
+/// caller with a stronger authenticated source context should pass that context
+/// directly to [`ClipboardEnvelopeV2::admit`] before calling the fold seam.
+pub fn admit_serialized_clipboard_envelope_v2(
+    body: &[u8],
+    previous: Option<&ClipboardEnvelopeV2>,
+    now_ms: u64,
+) -> Result<ClipboardEnvelopeV2, ClipboardEnvelopeV2BoundaryError> {
+    let envelope = ClipboardEnvelopeV2::from_json_bytes(body)
+        .map_err(|error| ClipboardEnvelopeV2BoundaryError::Decode(error.to_string()))?;
+    if let Some(previous) = previous {
+        envelope
+            .admit(
+                &previous.source_node,
+                &previous.source_seat,
+                &previous.source_session,
+                None,
+                now_ms,
+            )
+            .map_err(ClipboardEnvelopeV2BoundaryError::Admission)?;
+        if envelope.sequence <= previous.sequence {
+            return Err(ClipboardEnvelopeV2BoundaryError::Admission(
+                ClipboardEnvelopeV2ValidationError::Replay {
+                    previous: previous.sequence,
+                    received: envelope.sequence,
+                },
+            ));
+        }
+    } else {
+        // There is no publisher identity field in mde-bus::StoredMessage. The
+        // first message can therefore only establish a source-session lane;
+        // later messages are bound to this marker. Authenticated adapters must
+        // use ClipboardEnvelopeV2::admit with their trusted identity context.
+        envelope
+            .admit(
+                &envelope.source_node,
+                &envelope.source_seat,
+                &envelope.source_session,
+                None,
+                now_ms,
+            )
+            .map_err(ClipboardEnvelopeV2BoundaryError::Admission)?;
+    }
+    Ok(envelope)
+}
+
+/// Fold an admitted V2 envelope into the existing text-only materialization
+/// shape. Files references and rich MIME offers fail explicitly; neither is
+/// represented as a `String` or inserted into the legacy text lane.
+pub fn fold_clipboard_envelope_v2(
+    envelope: ClipboardEnvelopeV2,
+) -> Result<ClipboardEnvelopeV2TextFold, ClipboardEnvelopeV2BoundaryError> {
+    envelope
+        .validate()
+        .map_err(ClipboardEnvelopeV2BoundaryError::Admission)?;
+    let Some(text) = envelope.inline_text.clone() else {
+        return Err(ClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+            ClipboardEnvelopeV2UnsupportedPayload::FilesReference,
+        ));
+    };
+    if envelope.mime_offers.len() != 1
+        || !envelope.mime_offers[0].eq_ignore_ascii_case("text/plain")
+    {
+        return Err(ClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+            ClipboardEnvelopeV2UnsupportedPayload::RichMime,
+        ));
+    }
+    let timestamp = i64::try_from(envelope.timestamp_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .ok_or(ClipboardEnvelopeV2BoundaryError::TimestampOutOfRange {
+            timestamp_ms: envelope.timestamp_ms,
+        })?
+        .to_rfc3339();
+    let source = format!(
+        "v2:{}:{}:{}",
+        envelope.source_node, envelope.source_seat, envelope.source_session
+    );
+    Ok(ClipboardEnvelopeV2TextFold {
+        envelope,
+        text,
+        source,
+        time: timestamp,
+    })
+}
+
+/// Payload forms the current daemon handoff must refuse for the collaboration
+/// contract. Refusal is explicit: no representation is truncated, guessed, or
+/// copied into the legacy text history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollabClipboardEnvelopeV2UnsupportedPayload {
+    /// Bytes remain owned by Files; this worker has no Files materializer.
+    FilesReference,
+    /// More than the sole exact `text/plain` representation was offered.
+    RichMime,
+    /// The producer explicitly marked the representation unsupported.
+    UnsupportedState,
+    /// The producer explicitly marked the representation unavailable.
+    UnavailableState,
+}
+
+/// Admission and materialization failures for the `mde-collab-types` lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollabClipboardEnvelopeV2BoundaryError {
+    /// The bounded signed envelope could not be decoded.
+    Decode(String),
+    /// Intrinsic signature, expiry, replay, or echo admission failed.
+    Admission(CollabClipboardEnvelopeV2ValidationError),
+    /// The current text handoff cannot truthfully preserve the offered payload.
+    UnsupportedPayload(CollabClipboardEnvelopeV2UnsupportedPayload),
+    /// The envelope is addressed to a different node or seat.
+    WrongTarget,
+    /// The source session lacks fresh explicit publishing consent.
+    Consent(ClipboardSessionConsentBoundaryError),
+    /// The bounded source/session replay table has no free lane.
+    LedgerCapacityExceeded {
+        /// Maximum retained source/session identities.
+        max: usize,
+    },
+    /// The inline text exceeded the existing VDI materialization contract.
+    TextMaterialization(String),
+    /// The contract timestamp cannot be represented by the handoff schema.
+    TimestampOutOfRange {
+        /// Creation timestamp in Unix milliseconds.
+        timestamp_ms: u64,
+    },
+}
+
+impl std::fmt::Display for CollabClipboardEnvelopeV2BoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode(error) => {
+                write!(
+                    formatter,
+                    "collaboration clipboard V2 decode failed: {error}"
+                )
+            }
+            Self::Admission(error) => {
+                write!(
+                    formatter,
+                    "collaboration clipboard V2 admission failed: {error}"
+                )
+            }
+            Self::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::FilesReference,
+            ) => formatter
+                .write_str("collaboration clipboard Files payload requires the Files materializer"),
+            Self::UnsupportedPayload(CollabClipboardEnvelopeV2UnsupportedPayload::RichMime) => {
+                formatter.write_str(
+                    "collaboration clipboard rich MIME cannot be downgraded to plain text",
+                )
+            }
+            Self::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::UnsupportedState,
+            ) => formatter
+                .write_str("collaboration clipboard representation is explicitly unsupported"),
+            Self::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::UnavailableState,
+            ) => formatter
+                .write_str("collaboration clipboard representation is explicitly unavailable"),
+            Self::WrongTarget => {
+                formatter.write_str("collaboration clipboard envelope targets another seat")
+            }
+            Self::Consent(error) => {
+                write!(formatter, "collaboration clipboard consent failed: {error}")
+            }
+            Self::LedgerCapacityExceeded { max } => write!(
+                formatter,
+                "collaboration clipboard replay ledger is full (maximum {max})"
+            ),
+            Self::TextMaterialization(error) => write!(
+                formatter,
+                "collaboration clipboard text materialization failed: {error}"
+            ),
+            Self::TimestampOutOfRange { timestamp_ms } => write!(
+                formatter,
+                "collaboration clipboard timestamp {timestamp_ms} is outside the RFC3339 range"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CollabClipboardEnvelopeV2BoundaryError {}
+
+/// The sole collaboration-envelope representation this worker can currently
+/// hand to the compositor-less seat provider. The original signed envelope is
+/// retained only for the duration of the drain call; replay state records only
+/// its bounded identity and sequence metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollabClipboardEnvelopeV2TextFold {
+    /// Admitted signed contract.
+    pub envelope: CollabClipboardEnvelopeV2,
+    /// Exact bounded UTF-8 text.
+    pub text: VdiClipboardText,
+    /// Safe source attribution for the existing seat handoff.
+    pub source: String,
+    /// Source creation time in the handoff's existing RFC3339 form.
+    pub time: String,
+}
+
+/// Fold only a sole inline `text/plain` collaboration offer. Files references,
+/// rich MIME, and explicit unsupported/unavailable states fail closed and are
+/// never converted into legacy history or raw-byte storage.
+pub fn fold_collab_clipboard_envelope_v2(
+    envelope: CollabClipboardEnvelopeV2,
+) -> Result<CollabClipboardEnvelopeV2TextFold, CollabClipboardEnvelopeV2BoundaryError> {
+    envelope
+        .validate()
+        .map_err(CollabClipboardEnvelopeV2BoundaryError::Admission)?;
+    if envelope.offers.len() != 1 {
+        return Err(CollabClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+            CollabClipboardEnvelopeV2UnsupportedPayload::RichMime,
+        ));
+    }
+    let offer = &envelope.offers[0];
+    let text = match &offer.payload {
+        CollabClipboardPayloadV2::InlineText { text }
+            if offer.mime == CollabClipboardMimeKind::TextPlain =>
+        {
+            VdiClipboardText::new(text.clone()).map_err(|error| {
+                CollabClipboardEnvelopeV2BoundaryError::TextMaterialization(error.to_string())
+            })?
+        }
+        CollabClipboardPayloadV2::InlineText { .. } => {
+            return Err(CollabClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::RichMime,
+            ));
+        }
+        CollabClipboardPayloadV2::FilesReference { .. } => {
+            return Err(CollabClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::FilesReference,
+            ));
+        }
+        CollabClipboardPayloadV2::Unsupported { .. } => {
+            return Err(CollabClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::UnsupportedState,
+            ));
+        }
+        CollabClipboardPayloadV2::Unavailable { .. } => {
+            return Err(CollabClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+                CollabClipboardEnvelopeV2UnsupportedPayload::UnavailableState,
+            ));
+        }
+    };
+    let time = i64::try_from(envelope.created_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .ok_or(
+            CollabClipboardEnvelopeV2BoundaryError::TimestampOutOfRange {
+                timestamp_ms: envelope.created_unix_ms,
+            },
+        )?
+        .to_rfc3339();
+    let source = format!(
+        "collab-v2:{}:{}:{}",
+        envelope.source.node, envelope.source.seat, envelope.session
+    );
+    Ok(CollabClipboardEnvelopeV2TextFold {
+        envelope,
+        text,
+        source,
+        time,
+    })
 }
 
 /// The mesh-global clipboard history (newest first). Serialized as the
@@ -383,6 +894,394 @@ fn write_cursor(path: &Path, ulid: &str) -> Result<(), String> {
         .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
 }
 
+/// Locate the local V2 cursor beside the legacy clipboard cursor.
+#[must_use]
+fn v2_cursor_path(bus_root: &Path) -> PathBuf {
+    bus_root.join(V2_CURSOR_FILE_NAME)
+}
+
+/// Read a cursor for the explicit V2 lane. A malformed or foreign record is
+/// treated as absent, matching the legacy cursor's fail-open replay behavior.
+#[must_use]
+fn read_v2_cursor(path: &Path) -> Option<String> {
+    let record: CursorRecord = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (record.topic == CLIPBOARD_ENVELOPE_V2_TOPIC && !record.ulid.trim().is_empty())
+        .then_some(record.ulid)
+}
+
+/// Atomically persist the V2 lane acknowledgement.
+fn write_v2_cursor(path: &Path, ulid: &str) -> Result<(), String> {
+    let record = CursorRecord {
+        topic: CLIPBOARD_ENVELOPE_V2_TOPIC.to_string(),
+        ulid: ulid.to_string(),
+    };
+    let body = serde_json::to_vec(&record).map_err(|e| format!("encode V2 cursor: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
+}
+
+/// Locate the collaboration-envelope cursor beside the other clipboard lanes.
+#[must_use]
+fn collab_v2_cursor_path(bus_root: &Path) -> PathBuf {
+    bus_root.join(COLLAB_V2_CURSOR_FILE_NAME)
+}
+
+/// Read only a cursor for the exact collaboration-envelope topic.
+#[must_use]
+fn read_collab_v2_cursor(path: &Path) -> Option<String> {
+    let record: CursorRecord = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (record.topic == COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC && !record.ulid.trim().is_empty())
+        .then_some(record.ulid)
+}
+
+/// Atomically persist a collaboration-envelope acknowledgement. The cursor
+/// contains only a topic and ULID; no clipboard payload reaches this file.
+fn write_collab_v2_cursor(path: &Path, ulid: &str) -> Result<(), String> {
+    let record = CursorRecord {
+        topic: COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC.to_string(),
+        ulid: ulid.to_string(),
+    };
+    let body = serde_json::to_vec(&record).map_err(|e| format!("encode collab V2 cursor: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
+}
+
+/// Locate the local authenticated consent cursor beside the clipboard lane
+/// cursors. Consent state itself is intentionally in-memory and therefore
+/// resets to disabled on every daemon start; this cursor only acknowledges
+/// already-consumed Bus rows.
+#[must_use]
+fn consent_cursor_path(bus_root: &Path) -> PathBuf {
+    bus_root.join(CONSENT_CURSOR_FILE_NAME)
+}
+
+/// Read a cursor only when it names the consent-control lane.
+#[must_use]
+fn read_consent_cursor(path: &Path) -> Option<String> {
+    let record: CursorRecord = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (record.topic == CLIPBOARD_SESSION_CONSENT_TOPIC && !record.ulid.trim().is_empty())
+        .then_some(record.ulid)
+}
+
+/// Atomically acknowledge one terminal consent-control row.
+fn write_consent_cursor(path: &Path, ulid: &str) -> Result<(), String> {
+    let record = CursorRecord {
+        topic: CLIPBOARD_SESSION_CONSENT_TOPIC.to_string(),
+        ulid: ulid.to_string(),
+    };
+    let body = serde_json::to_vec(&record).map_err(|e| format!("encode consent cursor: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
+}
+
+/// Compact source-session high-water marker. Retaining only this metadata keeps
+/// the replay guard bounded even when an admitted inline payload is large.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClipboardEnvelopeV2ReplayMarker {
+    source_node: String,
+    source_seat: String,
+    source_session: String,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct ClipboardEnvelopeV2Ledger {
+    latest_by_session: BTreeMap<String, ClipboardEnvelopeV2ReplayMarker>,
+}
+
+impl ClipboardEnvelopeV2Ledger {
+    /// Seed only bounded retained metadata at daemon startup. This prevents a
+    /// replay published after a restart from being accepted merely because the
+    /// worker's in-memory ledger was reset; retained payloads are never folded.
+    fn seed_from_retained(&mut self, persist: &Persist) {
+        let Ok(messages) = persist.read_tail(CLIPBOARD_ENVELOPE_V2_TOPIC, MAX_V2_SOURCE_LANES)
+        else {
+            return;
+        };
+        for message in messages {
+            let Some(body) = message.body.as_deref() else {
+                continue;
+            };
+            let Ok(envelope) = ClipboardEnvelopeV2::from_json(body) else {
+                continue;
+            };
+            self.record(&envelope);
+        }
+    }
+
+    fn admit(
+        &self,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<ClipboardEnvelopeV2, ClipboardEnvelopeV2BoundaryError> {
+        let decoded = ClipboardEnvelopeV2::from_json_bytes(body)
+            .map_err(|error| ClipboardEnvelopeV2BoundaryError::Decode(error.to_string()))?;
+        let previous = self.latest_by_session.get(&decoded.source_session);
+        if let Some(previous) = previous {
+            decoded
+                .admit(
+                    &previous.source_node,
+                    &previous.source_seat,
+                    &previous.source_session,
+                    None,
+                    now_ms,
+                )
+                .map_err(ClipboardEnvelopeV2BoundaryError::Admission)?;
+            if decoded.sequence <= previous.sequence {
+                return Err(ClipboardEnvelopeV2BoundaryError::Admission(
+                    ClipboardEnvelopeV2ValidationError::Replay {
+                        previous: previous.sequence,
+                        received: decoded.sequence,
+                    },
+                ));
+            }
+        } else {
+            if self.latest_by_session.len() >= MAX_V2_SOURCE_LANES {
+                return Err(ClipboardEnvelopeV2BoundaryError::LedgerCapacityExceeded {
+                    max: MAX_V2_SOURCE_LANES,
+                });
+            }
+            decoded
+                .admit(
+                    &decoded.source_node,
+                    &decoded.source_seat,
+                    &decoded.source_session,
+                    None,
+                    now_ms,
+                )
+                .map_err(ClipboardEnvelopeV2BoundaryError::Admission)?;
+        }
+        Ok(decoded)
+    }
+
+    fn record(&mut self, envelope: &ClipboardEnvelopeV2) {
+        let marker = ClipboardEnvelopeV2ReplayMarker {
+            source_node: envelope.source_node.clone(),
+            source_seat: envelope.source_seat.clone(),
+            source_session: envelope.source_session.clone(),
+            sequence: envelope.sequence,
+        };
+        let replace = self
+            .latest_by_session
+            .get(&envelope.source_session)
+            .is_none_or(|previous| marker.sequence > previous.sequence);
+        if replace {
+            self.latest_by_session
+                .insert(envelope.source_session.clone(), marker);
+        }
+    }
+}
+
+/// Safe identity key for one source clipboard session. Keeping all three
+/// identity components in the key prevents a session id reused by another
+/// node or seat from inheriting consent.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClipboardSessionIdentityKey {
+    source_node: String,
+    source_seat: String,
+    source_session: String,
+}
+
+impl ClipboardSessionIdentityKey {
+    fn from_consent(consent: &ClipboardSessionConsentV1) -> Self {
+        Self {
+            source_node: consent.source_node.clone(),
+            source_seat: consent.source_seat.clone(),
+            source_session: consent.source_session.clone(),
+        }
+    }
+
+    fn from_envelope(envelope: &ClipboardEnvelopeV2) -> Self {
+        Self {
+            source_node: envelope.source_node.clone(),
+            source_seat: envelope.source_seat.clone(),
+            source_session: envelope.source_session.clone(),
+        }
+    }
+
+    fn from_collab_envelope(envelope: &CollabClipboardEnvelopeV2) -> Self {
+        Self {
+            source_node: envelope.source.node.to_string(),
+            source_seat: envelope.source.seat.to_string(),
+            source_session: envelope.session.to_string(),
+        }
+    }
+}
+
+/// Bounded, payload-free replay ledger for the collaboration envelope lane.
+/// The complete signed body remains in Bus retention owned by the producer;
+/// this worker keeps only full source identity and its sequence high-water.
+#[derive(Debug, Default)]
+struct CollabClipboardEnvelopeV2Ledger {
+    latest_by_identity: BTreeMap<ClipboardSessionIdentityKey, u64>,
+}
+
+impl CollabClipboardEnvelopeV2Ledger {
+    /// Seed replay metadata from retained envelopes without materializing them.
+    fn seed_from_retained(&mut self, persist: &Persist) {
+        let Ok(messages) = persist.read_tail(
+            COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+            MAX_COLLAB_V2_SOURCE_LANES,
+        ) else {
+            return;
+        };
+        for message in messages {
+            let Some(body) = message.body.as_deref() else {
+                continue;
+            };
+            let Ok(envelope) = CollabClipboardEnvelopeV2::from_json(body) else {
+                continue;
+            };
+            self.record(&envelope);
+        }
+    }
+
+    fn admit(
+        &self,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<CollabClipboardEnvelopeV2, CollabClipboardEnvelopeV2BoundaryError> {
+        let envelope = CollabClipboardEnvelopeV2::from_json_bytes(body)
+            .map_err(|error| CollabClipboardEnvelopeV2BoundaryError::Decode(error.to_string()))?;
+        let key = ClipboardSessionIdentityKey::from_collab_envelope(&envelope);
+        let previous = self.latest_by_identity.get(&key).copied();
+        if previous.is_none() && self.latest_by_identity.len() >= MAX_COLLAB_V2_SOURCE_LANES {
+            return Err(
+                CollabClipboardEnvelopeV2BoundaryError::LedgerCapacityExceeded {
+                    max: MAX_COLLAB_V2_SOURCE_LANES,
+                },
+            );
+        }
+        envelope
+            .validate_at(now_ms, previous)
+            .map_err(CollabClipboardEnvelopeV2BoundaryError::Admission)?;
+        Ok(envelope)
+    }
+
+    fn record(&mut self, envelope: &CollabClipboardEnvelopeV2) {
+        let key = ClipboardSessionIdentityKey::from_collab_envelope(envelope);
+        let sequence = envelope.sequence;
+        if self
+            .latest_by_identity
+            .get(&key)
+            .is_none_or(|previous| sequence > *previous)
+        {
+            self.latest_by_identity.insert(key, sequence);
+        }
+    }
+}
+
+/// Daemon-local, bounded consent state for the V2 clipboard lane.
+///
+/// This is intentionally an in-memory typed ledger behind the authenticated
+/// consent topic. Production constructs it empty on every daemon start, so no
+/// V2 envelope can be materialized until a fresh signed control is admitted.
+#[derive(Debug, Default)]
+pub struct ClipboardSessionConsentLedger {
+    latest_by_identity: BTreeMap<ClipboardSessionIdentityKey, ClipboardSessionConsentV1>,
+}
+
+impl ClipboardSessionConsentLedger {
+    /// Admit one consent update after validating its identity, freshness,
+    /// explicit state, and strict monotonic update ordering.
+    pub fn admit(
+        &mut self,
+        consent: ClipboardSessionConsentV1,
+        now_ms: u64,
+    ) -> Result<(), ClipboardSessionConsentBoundaryError> {
+        let key = ClipboardSessionIdentityKey::from_consent(&consent);
+        let previous = self.latest_by_identity.get(&key);
+        consent
+            .admit(
+                &consent.source_node,
+                &consent.source_seat,
+                &consent.source_session,
+                previous,
+                now_ms,
+            )
+            .map_err(ClipboardSessionConsentBoundaryError::Admission)?;
+        if previous.is_none() && self.latest_by_identity.len() >= MAX_V2_CONSENT_SESSIONS {
+            return Err(
+                ClipboardSessionConsentBoundaryError::LedgerCapacityExceeded {
+                    max: MAX_V2_CONSENT_SESSIONS,
+                },
+            );
+        }
+        self.latest_by_identity.insert(key, consent);
+        Ok(())
+    }
+
+    /// Require an explicitly enabled, fresh consent for this exact envelope
+    /// identity before any payload fold or materialization is attempted.
+    fn authorize_envelope(
+        &self,
+        envelope: &ClipboardEnvelopeV2,
+        now_ms: u64,
+    ) -> Result<(), ClipboardSessionConsentBoundaryError> {
+        self.authorize_identity(
+            ClipboardSessionIdentityKey::from_envelope(envelope),
+            &envelope.source_node,
+            &envelope.source_seat,
+            &envelope.source_session,
+            now_ms,
+        )
+    }
+
+    /// Apply the same authenticated, session-scoped consent boundary to the
+    /// collaboration contract without weakening either wire format.
+    fn authorize_collab_envelope(
+        &self,
+        envelope: &CollabClipboardEnvelopeV2,
+        now_ms: u64,
+    ) -> Result<(), ClipboardSessionConsentBoundaryError> {
+        let source_node = envelope.source.node.to_string();
+        let source_seat = envelope.source.seat.to_string();
+        let source_session = envelope.session.to_string();
+        self.authorize_identity(
+            ClipboardSessionIdentityKey::from_collab_envelope(envelope),
+            &source_node,
+            &source_seat,
+            &source_session,
+            now_ms,
+        )
+    }
+
+    fn authorize_identity(
+        &self,
+        key: ClipboardSessionIdentityKey,
+        source_node: &str,
+        source_seat: &str,
+        source_session: &str,
+        now_ms: u64,
+    ) -> Result<(), ClipboardSessionConsentBoundaryError> {
+        let Some(consent) = self.latest_by_identity.get(&key) else {
+            return Err(ClipboardSessionConsentBoundaryError::Missing);
+        };
+        let enabled = consent
+            .allows_clipboard_at(source_node, source_seat, source_session, None, now_ms)
+            .map_err(ClipboardSessionConsentBoundaryError::Admission)?;
+        if !enabled {
+            return Err(ClipboardSessionConsentBoundaryError::Disabled);
+        }
+        Ok(())
+    }
+}
+
 /// Writability for the shared clipboard history.
 ///
 /// Pure core — `root_is_dir` is injected so it unit-tests without touching the
@@ -410,6 +1309,9 @@ pub fn clip_share_writable(workgroup_root: &Path) -> bool {
 /// `event/clipboard/clip` Bus bodies through [`apply_clip_event`].
 pub struct ClipboardSyncWorker {
     workgroup_root: PathBuf,
+    /// Local node identity used to reject collaboration envelopes addressed to
+    /// another daemon before consent or materialization.
+    target_node: String,
     /// Exact direct-seat identity that may consume a replicated history
     /// materialization on this node.
     target_seat: String,
@@ -421,6 +1323,9 @@ pub struct ClipboardSyncWorker {
     /// missing credential disables this handoff honestly; it never publishes
     /// an unsigned action body.
     vnc_action_signer: Option<CloudArmSigner>,
+    /// Verifier for the root-authenticated clipboard session-consent control
+    /// lane. Missing production credentials fail closed.
+    consent_authorizer: Arc<ActionAuthorizer>,
 }
 
 impl ClipboardSyncWorker {
@@ -429,10 +1334,12 @@ impl ClipboardSyncWorker {
     pub fn new(workgroup_root: PathBuf) -> Self {
         Self {
             workgroup_root,
+            target_node: local_node_id(),
             target_seat: local_target_seat(),
             bus_root_override: None,
             poll: CLIP_EVENT_POLL_INTERVAL,
             vnc_action_signer: production_action_signer().ok(),
+            consent_authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -452,10 +1359,31 @@ impl ClipboardSyncWorker {
         self
     }
 
+    /// Override the local node identity for collaboration-envelope tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_target_node(mut self, target_node: impl Into<String>) -> Self {
+        self.target_node = target_node.into();
+        self
+    }
+
     fn bus_root(&self) -> Option<PathBuf> {
         self.bus_root_override
             .clone()
             .or_else(crate::bus_publish::default_bus_root)
+    }
+
+    /// Require the collaboration envelope's typed destination to identify this
+    /// exact daemon node and seat. The existing materialization topic uses the
+    /// historical `seat:<hostname>` spelling, while the strict collaboration
+    /// identity alphabet intentionally excludes `:`; compare its suffix only.
+    fn collab_target_matches(&self, envelope: &CollabClipboardEnvelopeV2) -> bool {
+        let target_seat = self
+            .target_seat
+            .strip_prefix("seat:")
+            .unwrap_or(&self.target_seat);
+        envelope.target.node.as_str() == self.target_node
+            && envelope.target.seat.as_str() == target_seat
     }
 
     /// Inject the daemon action signer in unit tests. Production obtains it
@@ -464,6 +1392,14 @@ impl ClipboardSyncWorker {
     #[must_use]
     fn with_vnc_action_signer(mut self, signer: CloudArmSigner) -> Self {
         self.vnc_action_signer = Some(signer);
+        self
+    }
+
+    /// Inject the consent capability verifier in deterministic tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_consent_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.consent_authorizer = authorizer;
         self
     }
 
@@ -702,6 +1638,421 @@ impl ClipboardSyncWorker {
         Ok(true)
     }
 
+    /// Emit the typed V2 text fold through the existing target-seat handoff.
+    /// This method deliberately has no `ClipEventBody` conversion: the V2
+    /// boundary has already proved that the sole offered representation is
+    /// exactly `text/plain`.
+    fn materialize_v2_text(
+        &self,
+        persist: &mut Persist,
+        fold: &ClipboardEnvelopeV2TextFold,
+    ) -> Result<(), String> {
+        let handoff = ClipboardMaterialization::new(
+            self.target_seat.clone(),
+            fold.text.clone(),
+            fold.source.clone(),
+            fold.time.clone(),
+        );
+        handoff
+            .validate()
+            .map_err(|error| format!("V2 clipboard materialization rejected: {error}"))?;
+        let body = serde_json::to_string(&handoff)
+            .map_err(|error| format!("encode V2 clipboard materialization: {error}"))?;
+        persist
+            .write(
+                CLIPBOARD_MATERIALIZATION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("publish V2 clipboard materialization: {error}"))
+    }
+
+    /// Emit an admitted collaboration `text/plain` offer through the existing
+    /// direct-seat handoff. This does not touch `clipboard/history.json`; raw
+    /// binary, Files references, rich representations, and explicit refusal
+    /// states never reach this method.
+    fn materialize_collab_v2_text(
+        &self,
+        persist: &mut Persist,
+        fold: &CollabClipboardEnvelopeV2TextFold,
+    ) -> Result<(), String> {
+        let handoff = ClipboardMaterialization::new(
+            self.target_seat.clone(),
+            fold.text.clone(),
+            fold.source.clone(),
+            fold.time.clone(),
+        );
+        handoff.validate().map_err(|error| {
+            format!("collaboration clipboard materialization rejected: {error}")
+        })?;
+        let body = serde_json::to_string(&handoff)
+            .map_err(|error| format!("encode collaboration clipboard materialization: {error}"))?;
+        persist
+            .write(
+                CLIPBOARD_MATERIALIZATION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("publish collaboration clipboard materialization: {error}"))
+    }
+
+    /// Acknowledge one terminal consent-control row. A failed checkpoint stops
+    /// the current drain so a later row cannot leap over an unacknowledged row;
+    /// the in-memory cursor remains unchanged and the Bus row is retryable.
+    fn acknowledge_consent(
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ulid: &str,
+    ) -> bool {
+        if let Some(path) = checkpoint {
+            if let Err(error) = write_consent_cursor(path, ulid) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid,
+                    error = %error,
+                    "clipboard consent cursor checkpoint failed"
+                );
+                return false;
+            }
+        }
+        *cursor = Some(ulid.to_owned());
+        true
+    }
+
+    /// Drain authenticated typed consent controls before V2 envelopes. Every
+    /// malformed, unsigned, unauthorized, expired, or stale row is terminal
+    /// for this cursor and cannot change the ledger. Only a body that passes
+    /// strict typed decoding, exact capability binding, and the existing
+    /// full-identity monotonic consent ledger can enable V2 materialization.
+    fn drain_clipboard_consents(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ledger: &mut ClipboardSessionConsentLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let messages = match persist.list_since(CLIPBOARD_SESSION_CONSENT_TOPIC, cursor.as_deref())
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                debug!(
+                    target: "clipboard_sync",
+                    error = %error,
+                    "clipboard consent drain failed"
+                );
+                return 0;
+            }
+        };
+        let mut admitted = 0;
+        for message in messages {
+            let body = message.body.as_deref().unwrap_or("");
+            let command = match ClipboardSessionConsentCommandV1::from_json(body) {
+                Ok(command) => command,
+                Err(error) => {
+                    warn!(
+                        target: "clipboard_sync",
+                        ulid = %message.ulid,
+                        error = %error,
+                        "clipboard consent control rejected before authorization"
+                    );
+                    if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let target = clipboard_session_consent_auth_target(&command.consent);
+            if let Err(error) = self.consent_authorizer.authorize(
+                body,
+                MutationContext {
+                    verb: CLIPBOARD_SESSION_CONSENT_AUTH_VERB,
+                    node: &command.consent.source_node,
+                    target: &target,
+                },
+            ) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    source_node = %command.consent.source_node,
+                    source_seat = %command.consent.source_seat,
+                    source_session = %command.consent.source_session,
+                    error = %error,
+                    "clipboard consent control unauthorized"
+                );
+                if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                    break;
+                }
+                continue;
+            }
+            if let Err(error) = ledger.admit(command.consent, now_ms) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    error = %error,
+                    "clipboard consent control failed ledger admission"
+                );
+                if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                    break;
+                }
+                continue;
+            }
+            if !Self::acknowledge_consent(cursor, checkpoint, &message.ulid) {
+                break;
+            }
+            admitted += 1;
+        }
+        admitted
+    }
+
+    /// Acknowledge one terminal V2 result. Malformed, expired, replayed, and
+    /// currently unsupported envelopes are not retried forever; transient
+    /// materialization failures return before this helper is called.
+    fn acknowledge_v2(cursor: &mut Option<String>, checkpoint: Option<&Path>, ulid: &str) -> bool {
+        if let Some(path) = checkpoint {
+            if let Err(error) = write_v2_cursor(path, ulid) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid,
+                    error = %error,
+                    "clipboard V2 cursor checkpoint failed"
+                );
+                return false;
+            }
+        }
+        *cursor = Some(ulid.to_owned());
+        true
+    }
+
+    /// Drain serialized V2 envelopes through bounded admission, source-session
+    /// replay tracking, and the existing text-only materialization lane.
+    fn drain_clipboard_envelopes(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ledger: &mut ClipboardEnvelopeV2Ledger,
+        consent_ledger: &ClipboardSessionConsentLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let messages = match persist.list_since(CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref()) {
+            Ok(messages) => messages,
+            Err(error) => {
+                debug!(
+                    target: "clipboard_sync",
+                    error = %error,
+                    "clipboard V2 envelope drain failed"
+                );
+                return 0;
+            }
+        };
+        let mut materialized = 0;
+        for message in messages {
+            let body = message.body.as_deref().unwrap_or("");
+            let envelope = match ledger.admit(body.as_bytes(), now_ms) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    warn!(
+                        target: "clipboard_sync",
+                        ulid = %message.ulid,
+                        error = %error,
+                        "clipboard V2 envelope rejected"
+                    );
+                    let _ = Self::acknowledge_v2(cursor, checkpoint, &message.ulid);
+                    continue;
+                }
+            };
+            if let Err(error) = consent_ledger.authorize_envelope(&envelope, now_ms) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    source_node = %envelope.source_node,
+                    source_seat = %envelope.source_seat,
+                    source_session = %envelope.source_session,
+                    error = %error,
+                    "clipboard V2 envelope withheld pending explicit fresh consent"
+                );
+                // Consent is an authenticated control lane. Leave this
+                // envelope unacknowledged and do not advance replay state so a
+                // later admitted update can authorize the same envelope.
+                continue;
+            }
+            let fold = match fold_clipboard_envelope_v2(envelope.clone()) {
+                Ok(fold) => fold,
+                Err(error) => {
+                    warn!(
+                        target: "clipboard_sync",
+                        ulid = %message.ulid,
+                        source_session = %envelope.source_session,
+                        error = %error,
+                        "clipboard V2 envelope has no supported materialization"
+                    );
+                    // The envelope passed intrinsic/identity/expiry/replay
+                    // admission. Record its sequence even though this worker
+                    // cannot currently preserve its representation.
+                    ledger.record(&envelope);
+                    let _ = Self::acknowledge_v2(cursor, checkpoint, &message.ulid);
+                    continue;
+                }
+            };
+            if let Err(error) = self.materialize_v2_text(persist, &fold) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    source_session = %envelope.source_session,
+                    error = %error,
+                    "clipboard V2 materialization deferred"
+                );
+                continue;
+            }
+            ledger.record(&envelope);
+            if Self::acknowledge_v2(cursor, checkpoint, &message.ulid) {
+                materialized += 1;
+            }
+        }
+        materialized
+    }
+
+    /// Acknowledge one terminal collaboration-envelope result without storing
+    /// any clipboard body in the cursor file.
+    fn acknowledge_collab_v2(
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ulid: &str,
+    ) -> bool {
+        if let Some(path) = checkpoint {
+            if let Err(error) = write_collab_v2_cursor(path, ulid) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid,
+                    error = %error,
+                    "collaboration clipboard V2 cursor checkpoint failed"
+                );
+                return false;
+            }
+        }
+        *cursor = Some(ulid.to_owned());
+        true
+    }
+
+    /// Drain signed collaboration clipboard envelopes through bounded decode,
+    /// exact-target, fresh-consent, replay, expiry, and echo admission. Only a
+    /// sole inline `text/plain` offer can reach the existing seat handoff.
+    fn drain_collab_clipboard_envelopes(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ledger: &mut CollabClipboardEnvelopeV2Ledger,
+        consent_ledger: &ClipboardSessionConsentLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let messages =
+            match persist.list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref()) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    debug!(
+                        target: "clipboard_sync",
+                        error = %error,
+                        "collaboration clipboard V2 drain failed"
+                    );
+                    return 0;
+                }
+            };
+        let mut materialized = 0;
+        for message in messages {
+            let body = message.body.as_deref().unwrap_or("");
+            let envelope = match ledger.admit(body.as_bytes(), now_ms) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    warn!(
+                        target: "clipboard_sync",
+                        ulid = %message.ulid,
+                        error = %error,
+                        "collaboration clipboard V2 envelope rejected"
+                    );
+                    if !Self::acknowledge_collab_v2(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if !self.collab_target_matches(&envelope) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    target_node = %envelope.target.node,
+                    target_seat = %envelope.target.seat,
+                    "collaboration clipboard V2 envelope targets another seat"
+                );
+                if !Self::acknowledge_collab_v2(cursor, checkpoint, &message.ulid) {
+                    break;
+                }
+                continue;
+            }
+            if let Err(error) = consent_ledger.authorize_collab_envelope(&envelope, now_ms) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    source_node = %envelope.source.node,
+                    source_seat = %envelope.source.seat,
+                    source_session = %envelope.session,
+                    error = %error,
+                    "collaboration clipboard V2 withheld pending explicit fresh consent"
+                );
+                // Preserve ordering and retry eligibility: no later row may
+                // advance the cursor past a consent-withheld envelope.
+                break;
+            }
+            let fold = match fold_collab_clipboard_envelope_v2(envelope.clone()) {
+                Ok(fold) => fold,
+                Err(error) => {
+                    warn!(
+                        target: "clipboard_sync",
+                        ulid = %message.ulid,
+                        source_session = %envelope.session,
+                        error = %error,
+                        "collaboration clipboard V2 has no supported materialization"
+                    );
+                    // Files references, rich MIME, and explicit unavailable or
+                    // unsupported states are terminal for this text-only
+                    // adapter. Record only the sequence to prevent replay.
+                    ledger.record(&envelope);
+                    if !Self::acknowledge_collab_v2(cursor, checkpoint, &message.ulid) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if let Err(error) = self.materialize_collab_v2_text(persist, &fold) {
+                warn!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    source_session = %envelope.session,
+                    error = %error,
+                    "collaboration clipboard V2 materialization deferred"
+                );
+                // A transient handoff failure must not let a later row leap
+                // over this envelope or advance its replay high-water.
+                break;
+            }
+            ledger.record(&envelope);
+            if Self::acknowledge_collab_v2(cursor, checkpoint, &message.ulid) {
+                materialized += 1;
+            } else {
+                break;
+            }
+        }
+        materialized
+    }
+
     /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
     fn drain_clip_events(
         &self,
@@ -821,6 +2172,61 @@ impl Worker for ClipboardSyncWorker {
                 }
             }
         }
+        let consent_checkpoint = consent_cursor_path(&bus_root);
+        let mut consent_cursor = read_consent_cursor(&consent_checkpoint);
+        if consent_cursor.is_none() {
+            // Consent is session-scoped and must not resurrect across a daemon
+            // start. Seed the cursor past retained controls; only a control
+            // published after this worker starts can establish fresh in-memory
+            // consent for this process.
+            consent_cursor = persist
+                .latest_ulid(CLIPBOARD_SESSION_CONSENT_TOPIC)
+                .ok()
+                .flatten();
+            if let Some(ulid) = consent_cursor.as_deref() {
+                if let Err(error) = write_consent_cursor(&consent_checkpoint, ulid) {
+                    warn!(target: "clipboard_sync", error = %error, "initial clipboard consent cursor checkpoint failed");
+                }
+            }
+        }
+        let v2_checkpoint = v2_cursor_path(&bus_root);
+        let mut v2_cursor = read_v2_cursor(&v2_checkpoint);
+        if v2_cursor.is_none() {
+            // V2 follows the same forward-only first-boot rule as the legacy
+            // lane. Retained V2 metadata still seeds replay protection, but it
+            // is never materialized merely because this worker started.
+            v2_cursor = persist
+                .latest_ulid(CLIPBOARD_ENVELOPE_V2_TOPIC)
+                .ok()
+                .flatten();
+            if let Some(ulid) = v2_cursor.as_deref() {
+                if let Err(error) = write_v2_cursor(&v2_checkpoint, ulid) {
+                    warn!(target: "clipboard_sync", error = %error, "initial clipboard V2 cursor checkpoint failed");
+                }
+            }
+        }
+        let mut v2_ledger = ClipboardEnvelopeV2Ledger::default();
+        v2_ledger.seed_from_retained(&persist);
+        let collab_v2_checkpoint = collab_v2_cursor_path(&bus_root);
+        let mut collab_v2_cursor = read_collab_v2_cursor(&collab_v2_checkpoint);
+        if collab_v2_cursor.is_none() {
+            // First boot is forward-only, matching both existing clipboard
+            // lanes. Retained metadata still seeds replay protection below.
+            collab_v2_cursor = persist
+                .latest_ulid(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC)
+                .ok()
+                .flatten();
+            if let Some(ulid) = collab_v2_cursor.as_deref() {
+                if let Err(error) = write_collab_v2_cursor(&collab_v2_checkpoint, ulid) {
+                    warn!(target: "clipboard_sync", error = %error, "initial collaboration clipboard V2 cursor checkpoint failed");
+                }
+            }
+        }
+        let mut collab_v2_ledger = CollabClipboardEnvelopeV2Ledger::default();
+        collab_v2_ledger.seed_from_retained(&persist);
+        // Consent starts disabled on every daemon/session start. Fresh signed
+        // controls are drained before either V2 envelope lane on each tick.
+        let mut v2_consent_ledger = ClipboardSessionConsentLedger::default();
         // Do not resurrect a retained clipboard at daemon start. Only a head
         // that changes while this worker is alive is a fresh mesh delivery.
         let mut observed_history_head = read_history(&history_path(&self.workgroup_root))
@@ -838,6 +2244,34 @@ impl Worker for ClipboardSyncWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis());
+                    if let Ok(now_ms) = now_ms {
+                        self.drain_clipboard_consents(
+                            &mut persist,
+                            &mut consent_cursor,
+                            Some(&consent_checkpoint),
+                            &mut v2_consent_ledger,
+                            now_ms,
+                        );
+                        self.drain_clipboard_envelopes(
+                            &mut persist,
+                            &mut v2_cursor,
+                            Some(&v2_checkpoint),
+                            &mut v2_ledger,
+                            &v2_consent_ledger,
+                            now_ms,
+                        );
+                        self.drain_collab_clipboard_envelopes(
+                            &mut persist,
+                            &mut collab_v2_cursor,
+                            Some(&collab_v2_checkpoint),
+                            &mut collab_v2_ledger,
+                            &v2_consent_ledger,
+                            now_ms,
+                        );
+                    } else {
+                        warn!(target: "clipboard_sync", "system clock is before the Unix epoch; clipboard V2 admission deferred");
+                    }
                     self.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint));
                     if let Err(error) = self.materialize_replicated_head(
                         &mut persist,
@@ -852,12 +2286,16 @@ impl Worker for ClipboardSyncWorker {
     }
 }
 
-fn local_target_seat() -> String {
+fn local_node_id() -> String {
     let hostname = std::fs::read_to_string("/etc/hostname")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "unknown".to_owned());
-    format!("seat:{}", hostname.trim())
+    hostname.trim().to_owned()
+}
+
+fn local_target_seat() -> String {
+    format!("seat:{}", local_node_id())
 }
 
 /// Build the supervisor-ready worker (call site in `run_serve`).
@@ -869,9 +2307,22 @@ pub fn build(workgroup_root: PathBuf) -> ClipboardSyncWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
+    use ed25519_dalek::SigningKey;
     use mackes_mesh_types::cloud::CloudArmSigner;
     use mde_bus::hooks::config::Priority;
+    use mde_collab_types::{
+        ClipboardClipId as CollabClipboardClipId,
+        ClipboardMimeOfferV2 as CollabClipboardMimeOfferV2,
+        ClipboardNodeId as CollabClipboardNodeId, ClipboardSeatId as CollabClipboardSeatId,
+        ClipboardSessionId as CollabClipboardSessionId,
+        ClipboardSourceV2 as CollabClipboardSourceV2, ClipboardTargetV2 as CollabClipboardTargetV2,
+        ClipboardUnavailableReason as CollabClipboardUnavailableReason,
+        ClipboardUnsupportedReason as CollabClipboardUnsupportedReason, FileRefId,
+    };
+
+    const CONSENT_AUTH_KEY: &[u8] = b"clipboard-consent-command-test-key";
+    const CONSENT_AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn entry(text: &str, pinned: bool) -> ClipEntry {
         ClipEntry {
@@ -883,10 +2334,855 @@ mod tests {
         }
     }
 
+    fn v2_inline(sequence: u64, offers: &[&str]) -> ClipboardEnvelopeV2 {
+        ClipboardEnvelopeV2::new_inline_text(
+            "node-a",
+            "seat-a",
+            "session-a",
+            sequence,
+            1_700_000_000_000,
+            offers.iter().map(|offer| (*offer).to_owned()).collect(),
+            "preview",
+            VdiClipboardText::new("hello").expect("bounded V2 fixture text"),
+            1_700_000_060_000,
+        )
+        .expect("valid V2 inline fixture")
+    }
+
+    fn collab_v2_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn collab_v2_with_offers(
+        sequence: u64,
+        offers: Vec<CollabClipboardMimeOfferV2>,
+    ) -> CollabClipboardEnvelopeV2 {
+        CollabClipboardEnvelopeV2::new(
+            CollabClipboardClipId::from_uuid(uuid::Uuid::from_u128(0x1000 + sequence as u128)),
+            CollabClipboardSourceV2::new(
+                CollabClipboardNodeId::new("node-a").expect("source node"),
+                CollabClipboardSeatId::new("seat-a").expect("source seat"),
+            ),
+            CollabClipboardTargetV2::new(
+                CollabClipboardNodeId::new("eagle").expect("target node"),
+                CollabClipboardSeatId::new("eagle").expect("target seat"),
+            ),
+            CollabClipboardSessionId::from_uuid(uuid::Uuid::from_u128(0x2000)),
+            sequence,
+            CONSENT_AUTH_NOW as u64,
+            CONSENT_AUTH_NOW as u64 + 60_000,
+            offers,
+        )
+        .expect("valid collaboration V2 fixture")
+        .signed(&collab_v2_signing_key())
+    }
+
+    fn collab_v2_inline(sequence: u64, text: &str) -> CollabClipboardEnvelopeV2 {
+        collab_v2_with_offers(
+            sequence,
+            vec![
+                CollabClipboardMimeOfferV2::inline_text(CollabClipboardMimeKind::TextPlain, text)
+                    .expect("valid collaboration inline text"),
+            ],
+        )
+    }
+
+    fn v2_consent(
+        source_node: &str,
+        source_seat: &str,
+        source_session: &str,
+        enabled: bool,
+        updated_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> ClipboardSessionConsentV1 {
+        ClipboardSessionConsentV1::new(
+            source_node,
+            source_seat,
+            source_session,
+            enabled,
+            updated_at_ms,
+            expires_at_ms,
+        )
+        .expect("valid V2 consent fixture")
+    }
+
+    fn consent_unsigned_body(consent: &ClipboardSessionConsentV1) -> String {
+        serde_json::json!({
+            "schema_version": ACTION_SCHEMA_VERSION,
+            "consent": consent,
+        })
+        .to_string()
+    }
+
+    fn signed_consent_body(
+        consent: &ClipboardSessionConsentV1,
+        nonce: &str,
+        node: &str,
+        target: &str,
+    ) -> String {
+        authorize_test_body(
+            CONSENT_AUTH_KEY,
+            &consent_unsigned_body(consent),
+            MutationContext {
+                verb: CLIPBOARD_SESSION_CONSENT_AUTH_VERB,
+                node,
+                target,
+            },
+            nonce,
+            CONSENT_AUTH_NOW + 30_000,
+        )
+    }
+
+    fn signed_consent(consent: &ClipboardSessionConsentV1, nonce: &str) -> String {
+        let target = clipboard_session_consent_auth_target(consent);
+        signed_consent_body(consent, nonce, &consent.source_node, &target)
+    }
+
+    fn consent_authorizer(root: &Path) -> Arc<ActionAuthorizer> {
+        Arc::new(ActionAuthorizer::for_test(
+            CONSENT_AUTH_KEY,
+            root.join("auth"),
+            CONSENT_AUTH_NOW,
+        ))
+    }
+
     #[test]
     fn worker_name_is_stable() {
         let w = ClipboardSyncWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "clipboard_sync");
+    }
+
+    #[test]
+    fn v2_boundary_admits_plain_text_and_preserves_source_metadata() {
+        let envelope = v2_inline(1, &["text/plain"]);
+        let body = serde_json::to_vec(&envelope).expect("encode V2 envelope");
+        let admitted = admit_serialized_clipboard_envelope_v2(&body, None, 1_700_000_000_001)
+            .expect("admit V2 envelope");
+        let fold = fold_clipboard_envelope_v2(admitted).expect("fold plain text");
+
+        assert_eq!(fold.text.as_str(), "hello");
+        assert_eq!(fold.source, "v2:node-a:seat-a:session-a");
+        assert_eq!(fold.time, "2023-11-14T22:13:20+00:00");
+        assert_eq!(fold.envelope.sequence, 1);
+    }
+
+    #[test]
+    fn v2_boundary_rejects_replay_identity_and_expiry() {
+        let previous = v2_inline(4, &["text/plain"]);
+        let previous_body = serde_json::to_vec(&previous).expect("encode previous V2");
+
+        assert!(matches!(
+            admit_serialized_clipboard_envelope_v2(
+                &previous_body,
+                Some(&previous),
+                1_700_000_000_001,
+            ),
+            Err(ClipboardEnvelopeV2BoundaryError::Admission(
+                ClipboardEnvelopeV2ValidationError::Replay {
+                    previous: 4,
+                    received: 4
+                }
+            ))
+        ));
+
+        let mut cross_source = v2_inline(5, &["text/plain"]);
+        cross_source.source_seat = "seat-b".to_owned();
+        let cross_source_body =
+            serde_json::to_vec(&cross_source).expect("encode identity mismatch");
+        assert!(matches!(
+            admit_serialized_clipboard_envelope_v2(
+                &cross_source_body,
+                Some(&previous),
+                1_700_000_000_001,
+            ),
+            Err(ClipboardEnvelopeV2BoundaryError::Admission(
+                ClipboardEnvelopeV2ValidationError::IdentityMismatch {
+                    field: "source_seat"
+                }
+            ))
+        ));
+
+        let expired_body =
+            serde_json::to_vec(&v2_inline(5, &["text/plain"])).expect("encode expired V2");
+        assert!(matches!(
+            admit_serialized_clipboard_envelope_v2(&expired_body, None, 1_700_000_060_000,),
+            Err(ClipboardEnvelopeV2BoundaryError::Admission(
+                ClipboardEnvelopeV2ValidationError::Expired { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn v2_boundary_never_downgrades_files_or_rich_mime_to_text() {
+        let files = ClipboardEnvelopeV2::new_files(
+            "node-a",
+            "seat-a",
+            "session-files",
+            1,
+            1_700_000_000_000,
+            vec![
+                "image/png".to_owned(),
+                "application/octet-stream".to_owned(),
+            ],
+            "image",
+            ClipboardEnvelopeV2::content_hash_for(b"png bytes"),
+            9,
+            "files:v2:payload-1",
+            1_700_000_060_000,
+        )
+        .expect("valid Files envelope");
+        let admitted_files = admit_serialized_clipboard_envelope_v2(
+            &serde_json::to_vec(&files).expect("encode Files envelope"),
+            None,
+            1_700_000_000_001,
+        )
+        .expect("admit Files metadata");
+        assert!(matches!(
+            fold_clipboard_envelope_v2(admitted_files),
+            Err(ClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+                ClipboardEnvelopeV2UnsupportedPayload::FilesReference
+            ))
+        ));
+
+        let rich = v2_inline(1, &["text/html", "text/plain"]);
+        assert!(matches!(
+            fold_clipboard_envelope_v2(rich),
+            Err(ClipboardEnvelopeV2BoundaryError::UnsupportedPayload(
+                ClipboardEnvelopeV2UnsupportedPayload::RichMime
+            ))
+        ));
+    }
+
+    #[test]
+    fn v2_consent_ledger_is_default_disabled_and_binds_full_identity() {
+        let envelope = v2_inline(1, &["text/plain"]);
+        let mut ledger = ClipboardSessionConsentLedger::default();
+        assert!(matches!(
+            ledger.authorize_envelope(&envelope, 1_700_000_000_001),
+            Err(ClipboardSessionConsentBoundaryError::Missing)
+        ));
+
+        let initial = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-a",
+            true,
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        ledger
+            .admit(initial.clone(), 1_700_000_000_001)
+            .expect("admit enabled consent");
+        assert!(ledger
+            .authorize_envelope(&envelope, 1_700_000_000_001)
+            .is_ok());
+
+        let mut wrong_identity = envelope.clone();
+        wrong_identity.source_seat = "seat-other".to_owned();
+        assert!(matches!(
+            ledger.authorize_envelope(&wrong_identity, 1_700_000_000_001),
+            Err(ClipboardSessionConsentBoundaryError::Missing)
+        ));
+
+        let disabled = initial
+            .update(false, 1_700_000_000_010, 1_700_000_060_010)
+            .expect("construct disabling update");
+        ledger
+            .admit(disabled.clone(), 1_700_000_000_011)
+            .expect("admit disabling update");
+        assert!(matches!(
+            ledger.authorize_envelope(&envelope, 1_700_000_000_011),
+            Err(ClipboardSessionConsentBoundaryError::Disabled)
+        ));
+        assert!(matches!(
+            ledger.admit(initial, 1_700_000_000_011),
+            Err(ClipboardSessionConsentBoundaryError::Admission(
+                ClipboardSessionConsentValidationError::StaleUpdate { .. }
+            ))
+        ));
+
+        let expired = disabled
+            .update(true, 1_700_000_000_020, 1_700_000_000_030)
+            .expect("construct short-lived update");
+        assert!(matches!(
+            ledger.admit(expired, 1_700_000_000_030),
+            Err(ClipboardSessionConsentBoundaryError::Admission(
+                ClipboardSessionConsentValidationError::Expired { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn signed_consent_transport_enables_and_disables_exact_session() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let auth_dir = tempfile::tempdir().expect("auth root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_consent_authorizer(consent_authorizer(auth_dir.path()));
+        let mut cursor = None;
+        let checkpoint = bus_dir.path().join("consent.cursor");
+        let mut ledger = ClipboardSessionConsentLedger::default();
+        let enabled = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-a",
+            true,
+            CONSENT_AUTH_NOW as u64,
+            CONSENT_AUTH_NOW as u64 + 60_000,
+        );
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_consent(
+                    &enabled,
+                    "consent-enable-000000000000000000000000",
+                )),
+            )
+            .expect("publish signed enable");
+
+        assert_eq!(
+            worker.drain_clipboard_consents(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            1
+        );
+        assert!(ledger
+            .authorize_envelope(&v2_inline(1, &["text/plain"]), CONSENT_AUTH_NOW as u64 + 1)
+            .is_ok());
+        assert_eq!(read_consent_cursor(&checkpoint), cursor);
+
+        let disabled = enabled
+            .update(
+                false,
+                CONSENT_AUTH_NOW as u64 + 10,
+                CONSENT_AUTH_NOW as u64 + 60_010,
+            )
+            .expect("newer disable");
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_consent(
+                    &disabled,
+                    "consent-disable-000000000000000000000000",
+                )),
+            )
+            .expect("publish signed disable");
+        assert_eq!(
+            worker.drain_clipboard_consents(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                CONSENT_AUTH_NOW as u64 + 11,
+            ),
+            1
+        );
+        assert!(matches!(
+            ledger.authorize_envelope(&v2_inline(2, &["text/plain"]), CONSENT_AUTH_NOW as u64 + 11),
+            Err(ClipboardSessionConsentBoundaryError::Disabled)
+        ));
+    }
+
+    #[test]
+    fn consent_transport_rejects_wrong_target_without_enabling() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let auth_dir = tempfile::tempdir().expect("auth root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_consent_authorizer(consent_authorizer(auth_dir.path()));
+        let consent = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-a",
+            true,
+            CONSENT_AUTH_NOW as u64,
+            CONSENT_AUTH_NOW as u64 + 60_000,
+        );
+        let wrong_target = format!(
+            "source:{}:seat:{}:session:other",
+            consent.source_node, consent.source_seat
+        );
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_consent_body(
+                    &consent,
+                    "consent-wrong-target-000000000000000",
+                    &consent.source_node,
+                    &wrong_target,
+                )),
+            )
+            .expect("publish wrong-target control");
+        let mut cursor = None;
+        let mut ledger = ClipboardSessionConsentLedger::default();
+        assert_eq!(
+            worker.drain_clipboard_consents(
+                &mut persist,
+                &mut cursor,
+                None,
+                &mut ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            0
+        );
+        assert!(matches!(
+            ledger.authorize_envelope(&v2_inline(1, &["text/plain"]), CONSENT_AUTH_NOW as u64 + 1),
+            Err(ClipboardSessionConsentBoundaryError::Missing)
+        ));
+    }
+
+    #[test]
+    fn consent_transport_rejects_malformed_unsigned_replay_and_expired_controls() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let auth_dir = tempfile::tempdir().expect("auth root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_consent_authorizer(consent_authorizer(auth_dir.path()));
+        let consent = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-a",
+            true,
+            CONSENT_AUTH_NOW as u64,
+            CONSENT_AUTH_NOW as u64 + 60_000,
+        );
+        let malformed = serde_json::json!({
+            "schema_version": ACTION_SCHEMA_VERSION,
+            "consent": consent,
+            "payload": "clipboard bytes must not be accepted",
+        })
+        .to_string();
+        assert!(ClipboardSessionConsentCommandV1::from_json(&malformed).is_err());
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&malformed),
+            )
+            .expect("publish malformed control");
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&consent_unsigned_body(&consent)),
+            )
+            .expect("publish unsigned control");
+
+        let valid = signed_consent(&consent, "consent-replay-000000000000000000000000");
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&valid),
+            )
+            .expect("publish signed control");
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&valid),
+            )
+            .expect("publish replayed signed control");
+
+        let expired = v2_consent(
+            "node-a",
+            "seat-a",
+            "session-expired",
+            true,
+            CONSENT_AUTH_NOW as u64,
+            CONSENT_AUTH_NOW as u64 + 1,
+        );
+        persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_consent(
+                    &expired,
+                    "consent-expired-000000000000000000000",
+                )),
+            )
+            .expect("publish expired control");
+
+        let mut cursor = None;
+        let mut ledger = ClipboardSessionConsentLedger::default();
+        assert_eq!(
+            worker.drain_clipboard_consents(
+                &mut persist,
+                &mut cursor,
+                None,
+                &mut ledger,
+                CONSENT_AUTH_NOW as u64 + 2,
+            ),
+            1,
+            "only the first signed, fresh control may enter the ledger"
+        );
+        assert!(cursor.is_some());
+        assert!(persist
+            .list_since(CLIPBOARD_SESSION_CONSENT_TOPIC, cursor.as_deref())
+            .expect("consent cursor read")
+            .is_empty());
+        assert!(ledger
+            .authorize_envelope(&v2_inline(1, &["text/plain"]), CONSENT_AUTH_NOW as u64 + 2)
+            .is_ok());
+    }
+
+    #[test]
+    fn v2_worker_requires_fresh_enabled_consent_and_preserves_replay_cursor() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let envelope = v2_inline(1, &["text/plain"]);
+        let body = serde_json::to_string(&envelope).expect("encode V2 envelope");
+        persist
+            .write(
+                CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish V2 envelope");
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_target_seat("seat:eagle");
+        let mut cursor = None;
+        let mut ledger = ClipboardEnvelopeV2Ledger::default();
+        let consent_ledger = ClipboardSessionConsentLedger::default();
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                None,
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_001,
+            ),
+            0,
+            "default-disabled consent must prevent materialization"
+        );
+        assert!(cursor.is_none(), "withheld envelope must remain retryable");
+        assert!(persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read withheld handoff")
+            .is_none());
+
+        let mut consent_ledger = consent_ledger;
+        consent_ledger
+            .admit(
+                v2_consent(
+                    "node-a",
+                    "seat-a",
+                    "session-a",
+                    true,
+                    1_700_000_000_000,
+                    1_700_000_060_000,
+                ),
+                1_700_000_000_001,
+            )
+            .expect("admit explicit fresh consent");
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                None,
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_001,
+            ),
+            1
+        );
+        let handoff = persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read V2 handoff")
+            .expect("V2 handoff exists");
+        let handoff: ClipboardMaterialization =
+            serde_json::from_str(handoff.body.as_deref().expect("V2 handoff body"))
+                .expect("decode V2 handoff");
+        assert_eq!(handoff.target_seat, "seat:eagle");
+        assert_eq!(handoff.text.as_str(), "hello");
+        assert_eq!(handoff.source, "v2:node-a:seat-a:session-a");
+        assert!(
+            read_history(&history_path(history_dir.path()))
+                .entries
+                .is_empty(),
+            "V2 handoff must not be downgraded into the legacy text history"
+        );
+
+        persist
+            .write(
+                CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish replay V2 envelope");
+        assert_eq!(
+            worker.drain_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                None,
+                &mut ledger,
+                &consent_ledger,
+                1_700_000_000_002,
+            ),
+            0,
+            "replayed source sequence is rejected before materialization"
+        );
+        assert_eq!(
+            persist
+                .list_since(CLIPBOARD_MATERIALIZATION_TOPIC, None)
+                .expect("list V2 handoffs")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn collab_v2_bus_intake_requires_consent_and_never_writes_legacy_history() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let envelope = collab_v2_inline(1, "collaboration hello");
+        let body = serde_json::to_string(&envelope).expect("encode collaboration envelope");
+        persist
+            .write(
+                COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish collaboration envelope");
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf())
+            .with_target_node("eagle")
+            .with_target_seat("seat:eagle");
+        let checkpoint = bus_dir.path().join("collab-v2.cursor");
+        let mut cursor = None;
+        let mut ledger = CollabClipboardEnvelopeV2Ledger::default();
+        let consent_ledger = ClipboardSessionConsentLedger::default();
+        assert_eq!(
+            worker.drain_collab_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            0
+        );
+        assert!(cursor.is_none(), "consent-withheld input stays retryable");
+        assert!(persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read withheld handoff")
+            .is_none());
+
+        let mut consent_ledger = consent_ledger;
+        consent_ledger
+            .admit(
+                v2_consent(
+                    envelope.source.node.as_str(),
+                    envelope.source.seat.as_str(),
+                    &envelope.session.to_string(),
+                    true,
+                    CONSENT_AUTH_NOW as u64,
+                    CONSENT_AUTH_NOW as u64 + 60_000,
+                ),
+                CONSENT_AUTH_NOW as u64 + 1,
+            )
+            .expect("admit collaboration source consent");
+        assert_eq!(
+            worker.drain_collab_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            1
+        );
+        let handoff = persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .expect("read collaboration handoff")
+            .expect("collaboration handoff exists");
+        let handoff: ClipboardMaterialization =
+            serde_json::from_str(handoff.body.as_deref().expect("handoff body"))
+                .expect("decode collaboration handoff");
+        assert_eq!(handoff.target_seat, "seat:eagle");
+        assert_eq!(handoff.text.as_str(), "collaboration hello");
+        assert_eq!(
+            handoff.source,
+            format!("collab-v2:node-a:seat-a:{}", envelope.session)
+        );
+        assert!(
+            read_history(&history_path(history_dir.path()))
+                .entries
+                .is_empty(),
+            "collaboration payloads never enter legacy durable history"
+        );
+        let cursor_body = std::fs::read_to_string(&checkpoint).expect("read payload-free cursor");
+        assert!(!cursor_body.contains("collaboration hello"));
+        assert_eq!(read_collab_v2_cursor(&checkpoint), cursor);
+
+        persist
+            .write(
+                COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish collaboration replay");
+        assert_eq!(
+            worker.drain_collab_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                Some(&checkpoint),
+                &mut ledger,
+                &consent_ledger,
+                CONSENT_AUTH_NOW as u64 + 2,
+            ),
+            0,
+            "source/session replay must not materialize twice"
+        );
+        assert_eq!(
+            persist
+                .list_since(CLIPBOARD_MATERIALIZATION_TOPIC, None)
+                .expect("list collaboration handoffs")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn collab_v2_bus_intake_fails_closed_for_files_rich_states_and_echoes() {
+        let history_dir = tempfile::tempdir().expect("history root");
+        let bus_dir = tempfile::tempdir().expect("bus root");
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).expect("open bus");
+        let files = collab_v2_with_offers(
+            1,
+            vec![CollabClipboardMimeOfferV2::files_reference(
+                CollabClipboardMimeKind::ImagePng,
+                FileRefId::from_uuid(uuid::Uuid::from_u128(0x3000)),
+                9,
+                "a".repeat(64),
+            )
+            .expect("valid Files reference")],
+        );
+        let unsupported = collab_v2_with_offers(
+            2,
+            vec![CollabClipboardMimeOfferV2::unsupported(
+                CollabClipboardMimeKind::TextPlain,
+                CollabClipboardUnsupportedReason::TransportUnsupported,
+            )],
+        );
+        let unavailable = collab_v2_with_offers(
+            3,
+            vec![CollabClipboardMimeOfferV2::unavailable(
+                CollabClipboardMimeKind::TextPlain,
+                CollabClipboardUnavailableReason::ProviderOffline,
+            )],
+        );
+        let rich = collab_v2_with_offers(
+            4,
+            vec![CollabClipboardMimeOfferV2::inline_text(
+                CollabClipboardMimeKind::TextHtml,
+                "<b>rich</b>",
+            )
+            .expect("valid rich inline offer")],
+        );
+        let mut echo = collab_v2_inline(5, "must not echo");
+        echo.echo_guard.visited_nodes.push(echo.target.node.clone());
+        echo.sign(&collab_v2_signing_key());
+
+        for envelope in [&files, &unsupported, &unavailable, &rich, &echo] {
+            persist
+                .write(
+                    COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(envelope).expect("encode rejected envelope")),
+                )
+                .expect("publish rejected envelope");
+        }
+
+        let worker = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_target_node("eagle")
+            .with_target_seat("seat:eagle");
+        let mut consent_ledger = ClipboardSessionConsentLedger::default();
+        consent_ledger
+            .admit(
+                v2_consent(
+                    files.source.node.as_str(),
+                    files.source.seat.as_str(),
+                    &files.session.to_string(),
+                    true,
+                    CONSENT_AUTH_NOW as u64,
+                    CONSENT_AUTH_NOW as u64 + 60_000,
+                ),
+                CONSENT_AUTH_NOW as u64 + 1,
+            )
+            .expect("admit collaboration source consent");
+        let mut cursor = None;
+        let mut ledger = CollabClipboardEnvelopeV2Ledger::default();
+        assert_eq!(
+            worker.drain_collab_clipboard_envelopes(
+                &mut persist,
+                &mut cursor,
+                None,
+                &mut ledger,
+                &consent_ledger,
+                CONSENT_AUTH_NOW as u64 + 1,
+            ),
+            0
+        );
+        assert!(cursor.is_some(), "all terminal refusals are acknowledged");
+        assert!(persist
+            .list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref())
+            .expect("read collaboration tail")
+            .is_empty());
+        assert!(
+            persist
+                .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+                .expect("read refused handoff")
+                .is_none(),
+            "Files, rich, explicit states, and echoes have no materialization effect"
+        );
+        assert!(
+            read_history(&history_path(history_dir.path()))
+                .entries
+                .is_empty(),
+            "no refused representation reaches legacy persistence"
+        );
+        assert_eq!(
+            ledger
+                .latest_by_identity
+                .get(&ClipboardSessionIdentityKey::from_collab_envelope(&files)),
+            Some(&4),
+            "only valid admitted metadata advances replay state; echo is rejected intrinsically"
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ require_unit_line "TimeoutStartSec=20s"
 require_unit_line "WatchdogSec=20s"
 require_unit_line "Restart=on-failure"
 require_unit_line "NoNewPrivileges=yes"
-require_unit_line "RestrictAddressFamilies=AF_UNIX AF_NETLINK"
+require_unit_line "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6"
 require_unit_line "WantedBy=default.target"
 
 if grep -Eq '^(User|Group|DynamicUser)=' "$unit"; then

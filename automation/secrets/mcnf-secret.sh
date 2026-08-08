@@ -53,6 +53,7 @@
 #   mcnf-secret.sh list                 list stored secret names
 #   mcnf-secret.sh selftest             run the offline self-test (mocked etcd; touches NO live store)
 #   mcnf-secret.sh selftest-scope       WL-SEC-003 offline self-test of role/scope-targeted sealing (mocked etcd)
+#   mcnf-secret.sh selftest-endpoints   offline endpoint-failover regression test
 #
 # Env:
 #   MCNF_ETCD       etcd v3 HTTP endpoint (no default — resolved by the caller / DAR-1b).
@@ -68,26 +69,82 @@
 set -euo pipefail
 
 KEY="${MCNF_AGE_KEY:-/root/.mcnf-age-key}"
+ETCD_ENDPOINTS=()
 
 # ── etcd endpoint resolution (fail-loud; NO dead .192:2379 default) ──
 # Order: explicit MCNF_ETCD → /etc/mackesd/etcd-endpoints (comma-joined) → FAIL.
+# Select the first healthy member so an offline HA peer does not turn a valid
+# request into an empty response and a misleading JSON/Python exception.
 # Skipped entirely in selftest mode (the mock backs etcd with a local dir).
 _resolve_etcd() {
-  if [ -n "${MCNF_SECRET_SELFTEST:-}" ]; then ETCD="mock://selftest"; return 0; fi
-  if [ -n "${MCNF_ETCD:-}" ]; then ETCD="$MCNF_ETCD"; return 0; fi
+  if [ -n "${MCNF_SECRET_SELFTEST:-}" ]; then ETCD="mock://selftest"; ETCD_ENDPOINTS=("$ETCD"); return 0; fi
+  local configured="${MCNF_ETCD:-}" candidate selected=""
   local f="/etc/mackesd/etcd-endpoints"
-  if [ -r "$f" ]; then
-    # File holds one or more http://<ip>:2379 lines/commas; use the first.
-    ETCD="$(tr ',\n' ' ' <"$f" | awk '{print $1}')"
-    [ -n "$ETCD" ] && return 0
-  fi
-  echo "mcnf-secret: no etcd endpoint — set MCNF_ETCD or write /etc/mackesd/etcd-endpoints (run setup-etcd.sh)" >&2
-  exit 1
+  if [ -z "$configured" ] && [ -r "$f" ]; then configured="$(<"$f")"; fi
+  [ -n "$configured" ] || {
+    echo "mcnf-secret: no etcd endpoint — set MCNF_ETCD or write /etc/mackesd/etcd-endpoints (run setup-etcd.sh)" >&2
+    exit 1
+  }
+  while IFS= read -r candidate || [ -n "$candidate" ]; do
+    [ -n "$candidate" ] || continue
+    candidate="${candidate%/}"
+    case "$candidate" in http://*|https://*) ;; *) continue ;; esac
+    ETCD_ENDPOINTS+=("$candidate")
+    # /version proves the member is accepting etcd HTTP requests without the
+    # quorum-sensitive latency of /health (which can itself block for seconds
+    # during leader churn). The actual KV request remains fail-loud below.
+    if curl --silent --fail --connect-timeout 1 --max-time 2 "$candidate/version" >/dev/null 2>&1; then
+      [ -n "$selected" ] || selected="$candidate"
+    fi
+  done < <(printf '%s' "$configured" | tr ',[:space:]' '\n' | sed '/^$/d')
+  [ -n "$selected" ] || {
+    echo "mcnf-secret: no configured etcd endpoint passed its bounded availability check" >&2
+    exit 1
+  }
+  ETCD="$selected"
 }
 
 b64()  { base64 -w0; }
 
 # ── etcd v3 HTTP KV layer (mockable for selftest) ──
+# Every live etcd request is deliberately bounded.  This helper runs on the
+# daemon's readiness path (mesh-ssh-key), so a control-plane startup race must
+# yield a truthful retryable failure rather than hold the desktop behind
+# systemd's two-minute start timeout.  The overlay-local API should connect in
+# well under a second; three seconds still leaves room for transient startup.
+_etcd_curl() {
+  local endpoint argument rewritten rc=1
+  local -a attempt
+  local output errors
+  output="$(mktemp)"; errors="$(mktemp)"
+  for endpoint in "$ETCD" "${ETCD_ENDPOINTS[@]}"; do
+    # The selected endpoint is also present in ETCD_ENDPOINTS; skip that one
+    # duplicate while retaining every configured fallback.
+    if [ "$endpoint" != "$ETCD" ] || [ ! -s "$output.seen-selected" ]; then
+      [ "$endpoint" != "$ETCD" ] || : >"$output.seen-selected"
+    else
+      continue
+    fi
+    attempt=()
+    for argument in "$@"; do
+      rewritten="$argument"
+      case "$argument" in "$ETCD"/*) rewritten="$endpoint${argument#"$ETCD"}" ;; esac
+      attempt+=("$rewritten")
+    done
+    if curl --silent --show-error --fail-with-body --connect-timeout 2 --max-time 5 \
+      "${attempt[@]}" >"$output" 2>"$errors"; then
+      cat "$output"
+      rm -f -- "$output" "$output.seen-selected" "$errors"
+      return 0
+    else
+      rc=$?
+    fi
+  done
+  cat "$errors" >&2
+  rm -f -- "$output" "$output.seen-selected" "$errors"
+  return "$rc"
+}
+
 # In selftest mode every KV op is backed by files under $MOCK_DIR, so the crypto
 # + reseal logic is exercised honestly WITHOUT touching any live etcd.
 _mock_path() { printf '%s/%s' "$MOCK_DIR" "$(printf %s "$1" | b64)"; }
@@ -97,7 +154,7 @@ _put() { # <key> <value-b64-string>
     mkdir -p "$MOCK_DIR"; printf %s "$2" >"$(_mock_path "$1")"; return 0
   fi
   local k; k=$(printf %s "$1" | b64)
-  curl -s -X POST "$ETCD/v3/kv/put" -d "{\"key\":\"$k\",\"value\":\"$2\"}" >/dev/null
+  _etcd_curl -X POST "$ETCD/v3/kv/put" -d "{\"key\":\"$k\",\"value\":\"$2\"}" >/dev/null
 }
 
 _get() { # <key> -> raw value bytes on stdout (exit 3 if absent)
@@ -107,9 +164,11 @@ _get() { # <key> -> raw value bytes on stdout (exit 3 if absent)
     base64 -d <"$p"; return 0
   fi
   local k; k=$(printf %s "$1" | b64)
-  curl -s -X POST "$ETCD/v3/kv/range" -d "{\"key\":\"$k\"}" | python3 -c '
+  _etcd_curl -X POST "$ETCD/v3/kv/range" -d "{\"key\":\"$k\"}" | python3 -c '
 import sys,json,base64
-d=json.load(sys.stdin); kvs=d.get("kvs")
+try: d=json.load(sys.stdin)
+except (json.JSONDecodeError, OSError): sys.exit(1)
+kvs=d.get("kvs")
 if not kvs: sys.exit(3)
 sys.stdout.buffer.write(base64.b64decode(kvs[0]["value"]))'
 }
@@ -117,7 +176,7 @@ sys.stdout.buffer.write(base64.b64decode(kvs[0]["value"]))'
 _del() { # <key>
   if [ "$ETCD" = "mock://selftest" ]; then rm -f "$(_mock_path "$1")"; return 0; fi
   local k; k=$(printf %s "$1" | b64)
-  curl -s -X POST "$ETCD/v3/kv/deleterange" -d "{\"key\":\"$k\"}" >/dev/null
+  _etcd_curl -X POST "$ETCD/v3/kv/deleterange" -d "{\"key\":\"$k\"}" >/dev/null
 }
 
 # List keys under a prefix (decoded), one per line.
@@ -134,9 +193,11 @@ _range_keys() { # <prefix>
   fi
   local s e; s=$(printf %s "$1" | b64)
   e=$(python3 -c "import sys,base64;b=sys.argv[1].encode();print(base64.b64encode(b[:-1]+bytes([b[-1]+1])).decode())" "$1")
-  curl -s -X POST "$ETCD/v3/kv/range" -d "{\"key\":\"$s\",\"range_end\":\"$e\",\"keys_only\":true}" | python3 -c '
+  _etcd_curl -X POST "$ETCD/v3/kv/range" -d "{\"key\":\"$s\",\"range_end\":\"$e\",\"keys_only\":true}" | python3 -c '
 import sys,json,base64
-for kv in (json.load(sys.stdin).get("kvs") or []):
+try: d=json.load(sys.stdin)
+except (json.JSONDecodeError, OSError): sys.exit(1)
+for kv in (d.get("kvs") or []):
     print(base64.b64decode(kv["key"]).decode())'
 }
 
@@ -147,7 +208,7 @@ RESEAL_LOCK="/mcnf/reseal/lock"
 RESEAL_MARKER="/mcnf/reseal/marker"
 _lease() { # <ttl> -> leaseID (selftest: a fixed sentinel)
   if [ "$ETCD" = "mock://selftest" ]; then echo "0"; return 0; fi
-  curl -s -X POST "$ETCD/v3/lease/grant" -d "{\"TTL\":\"${1:-300}\",\"ID\":0}" \
+  _etcd_curl -X POST "$ETCD/v3/lease/grant" -d "{\"TTL\":\"${1:-300}\",\"ID\":0}" \
     | python3 -c "import json,sys;print(json.load(sys.stdin).get('ID',''))" 2>/dev/null
 }
 _claim_lock() { # <owner> <leaseID> -> 0 if WE won
@@ -162,7 +223,7 @@ _claim_lock() { # <owner> <leaseID> -> 0 if WE won
 import json,sys
 print(json.dumps({'compare':[{'key':sys.argv[1],'result':'EQUAL','target':'CREATE','create_revision':'0'}],
  'success':[{'requestPut':{'key':sys.argv[1],'value':sys.argv[2],'lease':sys.argv[3]}}],'failure':[]}))" "$lk" "$val" "$2")
-  resp=$(curl -s -X POST "$ETCD/v3/kv/txn" -d "$body")
+  resp=$(_etcd_curl -X POST "$ETCD/v3/kv/txn" -d "$body")
   printf '%s' "$resp" | python3 -c "import json,sys;sys.exit(0 if json.load(sys.stdin).get('succeeded') else 1)" 2>/dev/null
 }
 _release_lock() { _del "$RESEAL_LOCK"; }
@@ -723,8 +784,47 @@ case "$cmd" in
     exit "$fail"
     ;;
 
+  selftest-endpoints)
+    # Offline regression for HA endpoint selection. The fake curl rejects the
+    # first controller, accepts the second, and returns an empty etcd range.
+    work="$(mktemp -d)"
+    trap 'rm -rf -- "$work"' EXIT
+    mkdir -p "$work/bin"
+    cat >"$work/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url=""
+for argument in "$@"; do
+  case "$argument" in http://*|https://*) url="$argument" ;; esac
+done
+printf '%s\n' "$url" >>"$MCNF_SECRET_CURL_LOG"
+case "$url" in
+  http://down.test:2379/version) exit 22 ;;
+  http://healthy.test:2379/version) printf '{"etcdserver":"3.6.0"}' ;;
+  http://healthy.test:2379/v3/kv/range) printf '{}' ;;
+  *) exit 22 ;;
+esac
+EOF
+    chmod 0755 "$work/bin/curl"
+    if env PATH="$work/bin:$PATH" \
+      MCNF_SECRET_CURL_LOG="$work/curl.log" \
+      MCNF_ETCD="http://down.test:2379,http://healthy.test:2379" \
+      bash "$0" list >"$work/out" 2>"$work/err" \
+      && grep -Fxq 'http://down.test:2379/version' "$work/curl.log" \
+      && grep -Fxq 'http://healthy.test:2379/version' "$work/curl.log" \
+      && grep -Fxq 'http://healthy.test:2379/v3/kv/range' "$work/curl.log" \
+      && ! grep -Fxq 'http://down.test:2379/v3/kv/range' "$work/curl.log"; then
+      echo "selftest-endpoints: PASS (unhealthy first controller skipped)"
+    else
+      echo "selftest-endpoints: FAIL" >&2
+      sed 's/^/  /' "$work/err" >&2 || true
+      sed 's/^/  request: /' "$work/curl.log" >&2 || true
+      exit 1
+    fi
+    ;;
+
   *)
-    echo "usage: $0 {init|init-self|put <name> [--scope role:<r>|scope:<s>]|get <name>|rotate <name> [--scope ...]|reseal-to <recipient>|reseal-all|recipients [--scope ...]|list|selftest|selftest-scope}" >&2
+    echo "usage: $0 {init|init-self|put <name> [--scope role:<r>|scope:<s>]|get <name>|rotate <name> [--scope ...]|reseal-to <recipient>|reseal-all|recipients [--scope ...]|list|selftest|selftest-scope|selftest-endpoints}" >&2
     exit 2
     ;;
 esac

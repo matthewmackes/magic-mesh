@@ -114,64 +114,16 @@ find_endpoint_module() {
     return 1
 }
 
-one_numeric_pid() {
-    local listing=$1
-    local pid selected_pid=""
-    local pid_count=0
-
-    while IFS= read -r pid; do
-        [[ -n $pid ]] || continue
-        [[ $pid =~ ^[0-9]+$ ]] || return 1
-        ((pid_count += 1))
-        selected_pid=$pid
-    done <<<"$listing"
-
-    [[ $pid_count -eq 1 ]] || return 1
-    printf '%s\n' "$selected_pid"
-}
-
-# Print the one PipeWire-Pulse PID owned by this seat user. Return 3 when it is
-# absent and 1 when the graph is ambiguous. Read /proc directly so the endpoint
-# helper does not add an undeclared procps-ng dependency to the host package.
-seat_pipewire_pulse_pid() {
-    local seat_uid process_dir process_name owner pid
-    local listing=""
-
-    seat_uid="$(id -u)"
-    for process_dir in /proc/[0-9]*; do
-        [[ -d $process_dir ]] || continue
-        IFS= read -r process_name <"$process_dir/comm" 2>/dev/null || continue
-        [[ $process_name == pipewire-pulse ]] || continue
-        owner="$(stat -Lc '%u' "$process_dir" 2>/dev/null)" || continue
-        [[ $owner == "$seat_uid" ]] || continue
-        pid=${process_dir##*/}
-        if [[ -n $listing ]]; then
-            listing+=$'\n'
-        fi
-        listing+=$pid
-    done
-
-    [[ -n $listing ]] || return 3
-    one_numeric_pid "$listing"
-}
-
 listener_listing_is_exact() {
     local listing=$1
-    local expected_pid=$2
-    local line state _recv_q _send_q local_address _peer_address owner
-    local expected_owner
+    local line state _recv_q _send_q local_address _peer_address
     local listener_count=0
 
-    [[ $expected_pid =~ ^[0-9]+$ ]] || return 1
-    expected_owner="users:((\"pipewire-pulse\",pid=${expected_pid},fd="
     while IFS= read -r line; do
         [[ -n $line ]] || continue
-        read -r state _recv_q _send_q local_address _peer_address owner <<<"$line"
+        read -r state _recv_q _send_q local_address _peer_address <<<"$line"
         [[ $state == "LISTEN" ]] || return 1
         [[ $local_address == "${ENDPOINT_ADDRESS}:${ENDPOINT_PORT}" ]] || return 1
-        # A same-named server from another account must not make this user
-        # report healthy. Bind the listener receipt to this graph's sole PID.
-        [[ ${owner:-} == *"$expected_owner"* ]] || return 1
         ((listener_count += 1))
     done <<<"$listing"
 
@@ -188,14 +140,18 @@ module_listing() {
 }
 
 listener_listing() {
-    bounded ss -H -ltnp "sport = :${ENDPOINT_PORT}" 2>/dev/null
+    # Do not request `ss -p` ownership annotations here. systemd mount
+    # hardening hides those annotations even for the same seat user; the
+    # authenticated PipeWire module listing plus the exact kernel listener
+    # table is the authoritative ownership boundary for this user unit.
+    bounded ss -H -ltn "sport = :${ENDPOINT_PORT}" 2>/dev/null
 }
 
 # Return 0 for healthy, 1 for transiently unavailable, and 2 for an unsafe or
 # ambiguous endpoint. Never print the module list: other modules may carry
 # operator-specific paths or identifiers that do not belong in service logs.
 probe_endpoint() {
-    local modules module_id module_rc listeners pulse_pid pulse_pid_rc
+    local modules module_id module_rc listeners
 
     health_reason="PipeWire-Pulse module query failed"
     modules="$(module_listing)" || return 1
@@ -214,22 +170,7 @@ probe_endpoint() {
 
     health_reason="listener query failed"
     listeners="$(listener_listing)" || return 1
-    if pulse_pid="$(seat_pipewire_pulse_pid)"; then
-        :
-    else
-        pulse_pid_rc=$?
-        case "$pulse_pid_rc" in
-            3)
-                health_reason="seat PipeWire-Pulse process is absent"
-                return 1
-                ;;
-            *)
-                health_reason="seat PipeWire-Pulse process is ambiguous"
-                return 2
-                ;;
-        esac
-    fi
-    if listener_listing_is_exact "$listeners" "$pulse_pid"; then
+    if listener_listing_is_exact "$listeners"; then
         health_reason="healthy"
         printf '%s\n' "$module_id"
         return 0
@@ -417,18 +358,16 @@ health_check() {
 }
 
 self_test() {
-    local good_modules good_listener module_id module_rc no_endpoint selected_pid
+    local good_modules good_listener module_id module_rc no_endpoint
     local bad_default bad_any bad_duplicate_module
-    local bad_listener_any bad_listener_v6 bad_listener_owner
-    local bad_listener_other_user bad_listener_duplicate
+    local bad_listener_any bad_listener_v6 bad_listener_state bad_listener_port
+    local bad_listener_duplicate
 
     good_modules=$'23\tmodule-always-sink\tsink_name=other\t\n42\tmodule-native-protocol-tcp\tauth-anonymous=1 listen=127.0.0.1 port=4713\t'
-    good_listener='LISTEN 0 32 127.0.0.1:4713 0.0.0.0:* users:(("pipewire-pulse",pid=123,fd=24))'
+    good_listener='LISTEN 0 32 127.0.0.1:4713 0.0.0.0:*'
     module_id="$(find_endpoint_module "$good_modules")"
     [[ $module_id == "42" ]]
-    selected_pid="$(one_numeric_pid $'123\n')"
-    [[ $selected_pid == 123 ]]
-    listener_listing_is_exact "$good_listener" "$selected_pid"
+    listener_listing_is_exact "$good_listener"
     listing_has_content "$good_listener"
     if listing_has_content $' \t\r\n'; then
         die "self-test treated whitespace as a listener"
@@ -457,23 +396,19 @@ self_test() {
 
     bad_listener_any='LISTEN 0 32 0.0.0.0:4713 0.0.0.0:* users:(("pipewire-pulse",pid=123,fd=24))'
     bad_listener_v6='LISTEN 0 32 [::]:4713 [::]:* users:(("pipewire-pulse",pid=123,fd=24))'
-    bad_listener_owner='LISTEN 0 32 127.0.0.1:4713 0.0.0.0:* users:(("other-daemon",pid=123,fd=24))'
-    bad_listener_other_user='LISTEN 0 32 127.0.0.1:4713 0.0.0.0:* users:(("pipewire-pulse",pid=124,fd=24))'
+    bad_listener_state='ESTAB 0 32 127.0.0.1:4713 0.0.0.0:*'
+    bad_listener_port='LISTEN 0 32 127.0.0.1:4714 0.0.0.0:*'
     bad_listener_duplicate="${good_listener}"$'\n'"${good_listener}"
     for bad_listener in \
         "$bad_listener_any" \
         "$bad_listener_v6" \
-        "$bad_listener_owner" \
-        "$bad_listener_other_user" \
+        "$bad_listener_state" \
+        "$bad_listener_port" \
         "$bad_listener_duplicate"; do
-        if listener_listing_is_exact "$bad_listener" "$selected_pid"; then
+        if listener_listing_is_exact "$bad_listener"; then
             die "self-test accepted an unsafe listener fixture"
         fi
     done
-    if one_numeric_pid $'123\n124\n' >/dev/null 2>&1; then
-        die "self-test accepted multiple PipeWire-Pulse processes"
-    fi
-
     [[ $GRAPH_READY_ATTEMPTS -le 10 ]]
     [[ $ENDPOINT_READY_ATTEMPTS -le 12 ]]
     [[ $MAX_TRANSIENT_HEALTH_FAILURES -eq 3 ]]

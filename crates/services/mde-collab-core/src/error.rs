@@ -44,6 +44,35 @@ pub enum CollabError {
     /// The referenced file reference does not exist (or was unlinked).
     #[error("file reference {0} does not exist")]
     FileNotFound(FileRefId),
+    /// An optimistic file-generation commit raced a newer canonical update.
+    #[error("file reference {file} generation changed (expected {expected_generation}, current {current_generation})")]
+    FileGenerationConflict {
+        /// Destination reference whose current facts changed.
+        file: FileRefId,
+        /// Generation bound by the transfer before staging.
+        expected_generation: i64,
+        /// Current canonical generation.
+        current_generation: i64,
+    },
+    /// The wall-clock generation proposed for a file commit would not advance
+    /// the canonical generation token.
+    #[error("file reference {file} generation did not advance (current {current_generation}, proposed {proposed_generation})")]
+    FileGenerationDidNotAdvance {
+        /// Destination reference whose generation must advance.
+        file: FileRefId,
+        /// Current canonical generation.
+        current_generation: i64,
+        /// Event creation time the command would publish as its generation.
+        proposed_generation: i64,
+    },
+    /// A generation commit attempted to alter destination-owned descriptive
+    /// metadata rather than only its verified content generation.
+    #[error("file reference {0} generation commit attempted a name or MIME mutation")]
+    FileGenerationMetadataMutation(FileRefId),
+    /// A generation commit supplied an invalid, oversized, or unchanged
+    /// content-addressed generation.
+    #[error("file reference {0} generation commit supplied invalid content metadata")]
+    InvalidFileGeneration(FileRefId),
     /// The referenced transfer does not exist.
     #[error("transfer {0} does not exist")]
     TransferNotFound(TransferId),

@@ -18,6 +18,240 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// Version of the collision-detectable overlay claimant contract.
+pub const OVERLAY_IDENTITY_CLAIM_SCHEMA_VERSION: u16 = 1;
+/// Maximum encoded size of one overlay identity claim.
+pub const MAX_OVERLAY_IDENTITY_CLAIM_BYTES: usize = 1_024;
+/// Maximum suffix length after the required `peer:` node-id prefix.
+pub const MAX_OVERLAY_NODE_SUFFIX_BYTES: usize = 128;
+/// Maximum Nebula certificate-name length.
+pub const MAX_NEBULA_NAME_BYTES: usize = 253;
+
+/// A strict, credential-free assertion that one physical machine and boot are
+/// actively using one public Nebula identity.
+///
+/// The claimant fields are already-derived, domain-separated SHA-256 digests.
+/// Raw machine-id, boot-id, certificate bytes, paths, credentials, and secrets
+/// are deliberately absent from this wire contract. Callers must obtain every
+/// field from validated local public identity facts; this type never invents a
+/// certificate fingerprint or treats a hostname as identity authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayIdentityClaim {
+    /// Closed wire-schema discriminator.
+    pub schema_version: u16,
+    /// Stable enrolled platform node id (`peer:<safe-name>`).
+    pub nebula_node_id: String,
+    /// Exact public name printed from the active Nebula certificate.
+    pub nebula_name: String,
+    /// Canonical IPv4 address printed from the active Nebula certificate.
+    pub nebula_address: String,
+    /// Lowercase, bare SHA-256 fingerprint of the public Nebula certificate.
+    pub certificate_fingerprint: String,
+    /// Lowercase, bare certificate-scoped, domain-separated SHA-256
+    /// physical-machine claimant.
+    pub machine_claimant_digest: String,
+    /// Lowercase, bare certificate-scoped, domain-separated SHA-256
+    /// current-boot claimant.
+    pub boot_claimant_digest: String,
+}
+
+/// Validation failure at the overlay identity claimant boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayIdentityClaimError {
+    /// The encoded claim exceeds its allocation bound.
+    PayloadTooLarge,
+    /// The body is not the exact closed JSON shape.
+    MalformedWire,
+    /// The schema version is not supported.
+    UnsupportedSchema(u16),
+    /// A named identity field is malformed or inconsistent.
+    InvalidField(&'static str),
+    /// A named digest is not exactly 64 lowercase hexadecimal characters.
+    InvalidDigest(&'static str),
+    /// Machine and boot dimensions reused the same digest.
+    DuplicateClaimantDigest,
+}
+
+impl std::fmt::Display for OverlayIdentityClaimError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PayloadTooLarge => formatter.write_str("overlay identity claim is too large"),
+            Self::MalformedWire => formatter.write_str("malformed overlay identity claim"),
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "unsupported overlay identity claim schema {version}"
+                )
+            }
+            Self::InvalidField(field) => {
+                write!(formatter, "invalid overlay identity claim field {field}")
+            }
+            Self::InvalidDigest(field) => {
+                write!(formatter, "invalid overlay identity claim digest {field}")
+            }
+            Self::DuplicateClaimantDigest => {
+                formatter.write_str("machine and boot claimant digests must be domain-distinct")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OverlayIdentityClaimError {}
+
+impl OverlayIdentityClaim {
+    /// Construct and validate a claim exclusively from caller-supplied public
+    /// identity facts and privacy-bounded claimant digests.
+    ///
+    /// # Errors
+    /// Returns [`OverlayIdentityClaimError`] when any field is malformed,
+    /// inconsistent, or outside the closed v1 bounds.
+    pub fn new(
+        nebula_node_id: impl Into<String>,
+        nebula_name: impl Into<String>,
+        nebula_address: impl Into<String>,
+        certificate_fingerprint: impl Into<String>,
+        machine_claimant_digest: impl Into<String>,
+        boot_claimant_digest: impl Into<String>,
+    ) -> Result<Self, OverlayIdentityClaimError> {
+        let claim = Self {
+            schema_version: OVERLAY_IDENTITY_CLAIM_SCHEMA_VERSION,
+            nebula_node_id: nebula_node_id.into(),
+            nebula_name: nebula_name.into(),
+            nebula_address: nebula_address.into(),
+            certificate_fingerprint: certificate_fingerprint.into(),
+            machine_claimant_digest: machine_claimant_digest.into(),
+            boot_claimant_digest: boot_claimant_digest.into(),
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    /// Validate the exact v1 identity grammar and claimant dimensions.
+    ///
+    /// # Errors
+    /// Returns [`OverlayIdentityClaimError`] for unsupported versions,
+    /// malformed public identity facts, placeholder digests, or reused
+    /// machine/boot claimant dimensions.
+    pub fn validate(&self) -> Result<(), OverlayIdentityClaimError> {
+        if self.schema_version != OVERLAY_IDENTITY_CLAIM_SCHEMA_VERSION {
+            return Err(OverlayIdentityClaimError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        validate_overlay_node_id(&self.nebula_node_id)?;
+        validate_nebula_name(&self.nebula_name)?;
+        if self.nebula_node_id != self.nebula_name {
+            return Err(OverlayIdentityClaimError::InvalidField("nebula_name"));
+        }
+        validate_nebula_address(&self.nebula_address)?;
+        validate_claim_digest("certificate_fingerprint", &self.certificate_fingerprint)?;
+        validate_claim_digest("machine_claimant_digest", &self.machine_claimant_digest)?;
+        validate_claim_digest("boot_claimant_digest", &self.boot_claimant_digest)?;
+        if self.machine_claimant_digest == self.boot_claimant_digest {
+            return Err(OverlayIdentityClaimError::DuplicateClaimantDigest);
+        }
+        if self.to_json_unchecked()?.len() > MAX_OVERLAY_IDENTITY_CLAIM_BYTES {
+            return Err(OverlayIdentityClaimError::PayloadTooLarge);
+        }
+        Ok(())
+    }
+
+    /// Decode and validate one bounded, closed-shape JSON claim.
+    ///
+    /// Serde rejects duplicate and unknown fields before semantic admission.
+    ///
+    /// # Errors
+    /// Returns [`OverlayIdentityClaimError`] when the body is oversized,
+    /// malformed, duplicated, unknown-field-bearing, or semantically invalid.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, OverlayIdentityClaimError> {
+        if bytes.len() > MAX_OVERLAY_IDENTITY_CLAIM_BYTES {
+            return Err(OverlayIdentityClaimError::PayloadTooLarge);
+        }
+        let claim: Self =
+            serde_json::from_slice(bytes).map_err(|_| OverlayIdentityClaimError::MalformedWire)?;
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    /// Encode the validated claim into its deterministic bounded JSON value.
+    ///
+    /// # Errors
+    /// Returns [`OverlayIdentityClaimError`] when the claim is invalid or its
+    /// encoded representation exceeds the wire bound.
+    pub fn to_json(&self) -> Result<String, OverlayIdentityClaimError> {
+        self.validate()?;
+        self.to_json_unchecked()
+    }
+
+    fn to_json_unchecked(&self) -> Result<String, OverlayIdentityClaimError> {
+        serde_json::to_string(self).map_err(|_| OverlayIdentityClaimError::MalformedWire)
+    }
+}
+
+fn validate_overlay_node_id(value: &str) -> Result<(), OverlayIdentityClaimError> {
+    let Some(suffix) = value.strip_prefix("peer:") else {
+        return Err(OverlayIdentityClaimError::InvalidField("nebula_node_id"));
+    };
+    if suffix.is_empty()
+        || suffix.len() > MAX_OVERLAY_NODE_SUFFIX_BYTES
+        || !suffix.bytes().enumerate().all(|(index, byte)| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' => index > 0,
+            _ => false,
+        })
+    {
+        return Err(OverlayIdentityClaimError::InvalidField("nebula_node_id"));
+    }
+    Ok(())
+}
+
+fn validate_nebula_name(value: &str) -> Result<(), OverlayIdentityClaimError> {
+    if value.is_empty()
+        || value.len() > MAX_NEBULA_NAME_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_control())
+        || value.contains(['/', '\\'])
+    {
+        return Err(OverlayIdentityClaimError::InvalidField("nebula_name"));
+    }
+    Ok(())
+}
+
+fn validate_nebula_address(value: &str) -> Result<(), OverlayIdentityClaimError> {
+    let address = value
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| OverlayIdentityClaimError::InvalidField("nebula_address"))?;
+    let octets = address.octets();
+    if address.to_string() != value
+        || octets[0] != 10
+        || octets[1] != 42
+        || octets[2] > 127
+        || address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address == std::net::Ipv4Addr::new(10, 42, 0, 0)
+        || address == std::net::Ipv4Addr::new(10, 42, 127, 255)
+    {
+        return Err(OverlayIdentityClaimError::InvalidField("nebula_address"));
+    }
+    Ok(())
+}
+
+fn validate_claim_digest(
+    field: &'static str,
+    value: &str,
+) -> Result<(), OverlayIdentityClaimError> {
+    if value.len() != 64
+        || value.bytes().all(|byte| byte == b'0')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(OverlayIdentityClaimError::InvalidDigest(field));
+    }
+    Ok(())
+}
+
 /// One peer's self-reported state. The file `<hostname>.json` IS the
 /// row; the peer that owns `hostname` is its sole writer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +571,91 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const CERT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const MACHINE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const BOOT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn overlay_claim() -> OverlayIdentityClaim {
+        OverlayIdentityClaim::new(
+            "peer:SURFACE",
+            "peer:SURFACE",
+            "10.42.0.7",
+            CERT,
+            MACHINE,
+            BOOT,
+        )
+        .expect("valid overlay claim")
+    }
+
+    #[test]
+    fn overlay_claim_roundtrips_exact_bounded_public_shape() {
+        let claim = overlay_claim();
+        let json = claim.to_json().expect("encode");
+
+        assert!(json.len() <= MAX_OVERLAY_IDENTITY_CLAIM_BYTES);
+        assert!(!json.contains("machine-id"));
+        assert!(!json.contains("boot-id"));
+        assert!(!json.contains('/'));
+        assert_eq!(
+            OverlayIdentityClaim::from_json(json.as_bytes()).expect("decode"),
+            claim
+        );
+    }
+
+    #[test]
+    fn overlay_claim_rejects_duplicate_and_unknown_wire_fields() {
+        let claim = overlay_claim();
+        let json = claim.to_json().expect("encode");
+        let duplicate = json.replacen("{", "{\"schema_version\":1,", 1);
+        assert_eq!(
+            OverlayIdentityClaim::from_json(duplicate.as_bytes()),
+            Err(OverlayIdentityClaimError::MalformedWire)
+        );
+
+        let unknown = json.replacen("{", "{\"raw_machine_id\":\"forbidden\",", 1);
+        assert_eq!(
+            OverlayIdentityClaim::from_json(unknown.as_bytes()),
+            Err(OverlayIdentityClaimError::MalformedWire)
+        );
+    }
+
+    #[test]
+    fn overlay_claim_rejects_malformed_identity_and_reused_digest() {
+        assert_eq!(
+            OverlayIdentityClaim::new(
+                "peer:SURFACE",
+                "peer:OTHER",
+                "10.42.0.7",
+                CERT,
+                MACHINE,
+                BOOT,
+            ),
+            Err(OverlayIdentityClaimError::InvalidField("nebula_name"))
+        );
+        assert_eq!(
+            OverlayIdentityClaim::new(
+                "peer:SURFACE",
+                "peer:SURFACE",
+                "10.42.128.7",
+                CERT,
+                MACHINE,
+                BOOT,
+            ),
+            Err(OverlayIdentityClaimError::InvalidField("nebula_address"))
+        );
+        assert_eq!(
+            OverlayIdentityClaim::new(
+                "peer:SURFACE",
+                "peer:SURFACE",
+                "10.42.0.7",
+                CERT,
+                MACHINE,
+                MACHINE,
+            ),
+            Err(OverlayIdentityClaimError::DuplicateClaimantDigest)
+        );
+    }
 
     #[test]
     fn write_then_read_roundtrips() {

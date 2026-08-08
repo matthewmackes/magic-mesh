@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::airspace::{
-    airspace_state_topic, AirspaceContact, AirspaceContactKind, AirspaceSnapshot, AirspaceSurvey,
-    MAX_GAPS, MAX_SNAPSHOT_BYTES,
+    airspace_state_topic, AirspaceAvailability, AirspaceContact, AirspaceContactKind,
+    AirspaceSnapshot, AirspaceSurvey, MAX_GAPS, MAX_SNAPSHOT_BYTES,
 };
 
 use super::{vehicle, ShutdownToken, Worker};
@@ -25,6 +25,24 @@ use vehicle::VehicleProbe;
 
 /// Mirror cadence and heartbeat interval.
 pub const POLL: Duration = Duration::from_secs(5);
+const FAILURE_RETRY_MAX: Duration = Duration::from_secs(60);
+const MAX_INITIAL_PHASE: Duration = Duration::from_millis(250);
+
+/// Spread the first expensive MG90 survey across a small deterministic window.
+/// Failed surveys already back off, but without this phase every configured
+/// seat still launches its first root-SSH/`iw` probe together after a restart.
+#[must_use]
+fn initial_phase_for(host: &str, cap: Duration) -> Duration {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in host.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis(
+        (hash % (MAX_INITIAL_PHASE.as_millis() as u64 + 1))
+            .min(cap.as_millis() as u64),
+    )
+}
 
 /// Allow a small MG90/host clock skew, but do not publish a source timestamp
 /// that is implausibly newer than the local publication. A future-dated
@@ -665,14 +683,32 @@ impl Worker for AirspaceWorker {
             return Ok(());
         };
 
+        let phase = initial_phase_for(&self.host, self.poll);
+        tokio::select! {
+            () = shutdown.wait() => return Ok(()),
+            () = tokio::time::sleep(phase) => {}
+        }
+        let mut retry = self.poll;
         loop {
             let Some(snapshot) = self.poll_once(probe.clone(), &mut shutdown).await else {
                 return Ok(());
             };
             self.publish(&snapshot);
+            let delay = match snapshot.availability {
+                AirspaceAvailability::Ready => {
+                    retry = self.poll;
+                    self.poll
+                }
+                AirspaceAvailability::Offline => {
+                    let delay = retry;
+                    retry = retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+                    delay
+                }
+                AirspaceAvailability::NoSource => self.poll,
+            };
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
-                () = tokio::time::sleep(self.poll) => {}
+                () = tokio::time::sleep(delay) => {}
             }
         }
     }
@@ -910,6 +946,15 @@ END_BT_INQUIRY RC=0
         assert_eq!(snapshot.availability, AirspaceAvailability::Offline);
         assert!(snapshot.contacts.is_empty());
         assert!(snapshot.gaps.iter().any(|gap| gap.contains("timeout")));
+    }
+
+    #[test]
+    fn initial_survey_phase_is_stable_bounded_and_capped_for_tests() {
+        let phase = initial_phase_for("seat-15", POLL);
+        assert_eq!(phase, initial_phase_for("seat-15", POLL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert!(initial_phase_for("seat-15", Duration::from_millis(10)) <= Duration::from_millis(10));
+        assert_ne!(phase, initial_phase_for("dell-laptop", POLL));
     }
 
     #[test]

@@ -107,6 +107,13 @@ pub type MediaSurface = MediaController<Engine>;
 #[must_use]
 pub fn real_media() -> MediaSurface {
     let mut controller = MediaController::new(mde_media_core::Player::new(build_engine()));
+    match mde_jellyfin::ServerStore::load() {
+        Ok(store) => controller.set_jellyfin_store(store),
+        Err(mde_jellyfin::StoreError::Missing(_)) => {}
+        Err(error) => {
+            controller.ui_mut().status = Some(format!("Jellyfin server store: {error}"));
+        }
+    }
     controller.enable_roaming_default();
     controller
 }

@@ -115,7 +115,8 @@ pub use widgets::{
 #[cfg(feature = "drm")]
 pub use drm::{
     probe_primary_video_plane, probe_prime_import_liveness, probe_video_plane, run_drm,
-    run_drm_with_clipboard, DrmVideoScanout, PrimeImportLiveness,
+    run_drm_with_clipboard, run_drm_with_clipboard_and_display1, Display1FramePoll,
+    Display1FrameSource, DrmVideoScanout, PrimeImportLiveness,
 };
 
 // Re-export the toolkit so surfaces depend on `mde-egui` alone and share one

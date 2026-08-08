@@ -220,10 +220,16 @@ def validate_document(data: Any) -> dict[str, Any]:
     capture = require_bounded_uint(data, "audio_capture_endpoints")
     validate_timestamp(data["recorded_at"])
 
-    if audio_status == "wired" and (playback == 0 or capture == 0):
-        fail("audio_status=wired requires at least one playback and capture endpoint")
-    if audio_status == "unavailable" and playback > 0 and capture > 0:
-        fail("audio_status=unavailable contradicts non-empty playback and capture endpoints")
+    if audio_status == "wired":
+        if transport_health != "connected":
+            fail(
+                "audio_status=wired requires transport_health=connected for the "
+                "current VDI session"
+            )
+        if playback == 0 or capture == 0:
+            fail("audio_status=wired requires at least one playback and capture endpoint")
+    elif playback != 0 or capture != 0:
+        fail("audio_status=unavailable requires zero playback and capture endpoints")
 
     # The accepted record has no sample, Chromium, mute, capture, or recovery
     # fields. Keep this classification explicit so callers cannot mistake
@@ -288,10 +294,24 @@ def self_test() -> None:
     assert result["endpoint_wiring"] == "observed"
     assert result["live_proof"] == "unavailable"
 
-    unavailable = dict(valid, audio_status="unavailable", audio_capture_endpoints=0)
+    unavailable = dict(
+        valid,
+        audio_status="unavailable",
+        audio_playback_endpoints=0,
+        audio_capture_endpoints=0,
+    )
     unavailable_result = validate_document(unavailable)
     assert unavailable_result["status"] == "unavailable"
     assert unavailable_result["endpoint_wiring"] == "unavailable"
+    for health in ("reconnecting", "failed", "unavailable"):
+        assert_rejected(
+            dict(valid, transport_health=health),
+            "requires transport_health=connected",
+        )
+    assert_rejected(
+        dict(valid, audio_status="unavailable", audio_capture_endpoints=0),
+        "requires zero playback and capture endpoints",
+    )
     assert_rejected(dict(valid, extra="no"), "unexpected evidence fields")
     assert_rejected(dict(valid, live_proof="passed"), "unexpected evidence fields")
     assert_rejected(dict(valid, password="not-a-secret"), "credential-shaped field")

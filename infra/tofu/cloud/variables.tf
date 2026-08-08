@@ -10,9 +10,14 @@ variable "libvirt_uri" {
 }
 
 variable "pool" {
-  description = "The libvirt storage pool VM volumes + cloud-init disks land in."
+  description = "The closed-set libvirt storage pool selected by Deployment for VM volumes + cloud-init disks."
   type        = string
-  default     = "default"
+  default     = "mde-vms"
+
+  validation {
+    condition     = contains(["mde-vms", "default"], var.pool)
+    error_message = "pool must be the managed mde-vms pool or the explicit libvirt default pool."
+  }
 }
 
 variable "base_image_source" {

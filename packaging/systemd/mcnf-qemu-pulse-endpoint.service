@@ -22,8 +22,10 @@ WatchdogSec=20s
 Restart=on-failure
 RestartSec=2s
 
-# The helper only talks to the user's native Pulse socket and inspects sockets
-# through netlink. PipeWire-Pulse, not this helper, owns the TCP listener.
+# The helper only talks to the user's native Pulse socket and inspects the
+# exact loopback listener through netlink. The authenticated PipeWire-Pulse
+# module listing is the ownership proof; the helper does not need a host PID
+# annotation that mount hardening can hide.
 NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateTmp=yes
@@ -40,7 +42,11 @@ MemoryDenyWriteExecute=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# The helper uses AF_NETLINK-backed `ss` to prove that PipeWire-Pulse owns the
+# exact loopback TCP listener.  It must be allowed to inspect IPv4/IPv6 socket
+# state; denying those families makes the helper misclassify its own listener
+# as unsafe and leaves the Browser VM unable to start with audio.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=

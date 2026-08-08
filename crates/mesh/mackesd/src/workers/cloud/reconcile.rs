@@ -537,12 +537,12 @@ pub(crate) fn rendered_tfvars_for_node(
 ) -> Result<String, String> {
     path_key::segment("node", node)?;
     let specs = read_desired_slice_strict(state_root, node)?;
-    Ok(render::render_tfvars(
+    render::render_tfvars(
         node,
         &specs,
         libvirt_uri,
         browser_base_image_source,
-    ))
+    )
 }
 
 /// Render node `node`'s desired slice into tfvars and shell `tofu plan -json`
@@ -684,6 +684,7 @@ mod tests {
             vcpu: 2,
             memory_mb: 2048,
             disk_gb: 20,
+            storage_pool: mackes_mesh_types::cloud::StoragePool::default(),
             image: None,
             image_digest: None,
             network_isolation: false,

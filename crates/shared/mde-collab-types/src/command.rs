@@ -486,6 +486,25 @@ pub enum CollabCommand {
         /// The file metadata.
         reference: FileRef,
     },
+    /// Commit a verified new content-addressed generation for an existing file
+    /// reference. The collaboration core applies this only when every expected
+    /// generation fact still matches its folded authority.
+    CommitFileGeneration {
+        /// The space containing the exact destination reference.
+        space: SpaceId,
+        /// The stable destination file-reference id.
+        file: FileRefId,
+        /// Generation observed before staging, expressed as the prior signed
+        /// event's creation time in milliseconds.
+        expected_generation: i64,
+        /// Prior content hash observed before staging.
+        expected_sha256_hex: String,
+        /// Prior byte count observed before staging.
+        expected_size: u64,
+        /// Verified replacement metadata. The Files authority preserves the
+        /// destination name/MIME while replacing hash and size.
+        reference: FileRef,
+    },
     /// Remove a file reference from a space.
     UnlinkFile {
         /// The space.
@@ -631,6 +650,7 @@ impl CollabCommand {
             Self::RequestReview { .. } => "request_review",
             Self::SubmitReview { .. } => "submit_review",
             Self::LinkFile { .. } => "link_file",
+            Self::CommitFileGeneration { .. } => "commit_file_generation",
             Self::UnlinkFile { .. } => "unlink_file",
             Self::StartTransfer { .. } => "start_transfer",
             Self::ControlTransfer { .. } => "control_transfer",

@@ -1,7 +1,7 @@
 use super::*;
 use mackes_mesh_types::cloud::{
-    CloudProviderAdapter, DriftFlag, DriftSummary, EndpointInterface, HealthState, ImageRow,
-    NodeCapacity, ServiceHealth,
+    CloudProviderAdapter, DeploymentRole, DriftFlag, DriftSummary, EndpointInterface, HealthState,
+    ImageRow, NodeCapacity, ServiceHealth,
 };
 use mde_egui::egui::{pos2, vec2, Rect};
 
@@ -31,6 +31,53 @@ fn cloud_arm_credential_reader_is_bounded_and_non_following() {
         read_cloud_arm_credential(&path).is_err(),
         "oversized credentials must fail closed"
     );
+}
+
+#[test]
+fn music_auth_hostname_prefers_the_daemon_compatible_command_source() {
+    assert_eq!(
+        select_music_hostname(
+            Some("daemon-name\n".to_string()),
+            Some("file-name".to_string()),
+            Some("environment-name".to_string()),
+        ),
+        "daemon-name"
+    );
+    assert_eq!(
+        select_music_hostname(
+            None,
+            Some("file-name\n".to_string()),
+            Some("environment-name".to_string()),
+        ),
+        "file-name"
+    );
+    assert_eq!(
+        select_music_hostname(None, None, Some("environment-name".to_string())),
+        "environment-name"
+    );
+    assert_eq!(select_music_hostname(None, None, None), "unknown-node");
+}
+
+#[test]
+fn music_auth_body_verifies_against_the_daemon_contract() {
+    let unsigned =
+        r#"{"schema_version":1,"action":"set_volume","request_id":"auth-test","volume_milli":1000}"#;
+    let signed = authorize_music_mutation_body(unsigned).expect("Music body signs");
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+    let node = music_local_hostname();
+    let token = mackes_mesh_types::music_auth::verify_request(
+        &signed,
+        mackes_mesh_types::music_auth::MusicAuthContext {
+            verb: "music-workspace",
+            node: &node,
+            target: "workspace",
+        },
+        &signing_key.verifying_key(),
+    )
+    .expect("mde-musicd must accept the shell's signed body");
+    assert_eq!(token.verb, "music-workspace");
+    assert_eq!(token.node, node);
+    assert_eq!(token.target, "workspace");
 }
 
 #[cfg(target_os = "linux")]
@@ -91,6 +138,7 @@ fn workload(name: &str, delivery_type: DeliveryType, status: &str) -> WorkloadRo
 fn fixture_state() -> CloudState {
     CloudState {
         host: "eagle".to_string(),
+        role: DeploymentRole::Workstation,
         adapter: CloudProviderAdapter::ConstructCloud,
         health: vec![
             health("opentofu", HealthState::Up),
@@ -111,6 +159,7 @@ fn fixture_state() -> CloudState {
             mem_total_mb: 32768,
             mem_used_mb: 4096,
         },
+        android_inventories: Vec::new(),
     }
 }
 
@@ -138,6 +187,48 @@ fn run_panel(state: &mut WorkloadsState) -> bool {
     });
     let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
     !prims.is_empty()
+}
+
+#[test]
+fn sidebar_rows_accept_clicks_across_the_full_row_not_only_the_icon() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let frame = |events: Vec<egui::Event>| {
+        let mut result = (Rect::NOTHING, false);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 240.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(260.0);
+                let response = sidebar_row(ui, false, "overlay", "Android VM", Style::ACCENT);
+                result = (response.rect, response.clicked());
+            });
+        });
+        result
+    };
+
+    let (rect, _) = frame(Vec::new());
+    let target = pos2(rect.right() - 4.0, rect.center().y);
+    let (_, pressed) = frame(vec![
+        egui::Event::PointerMoved(target),
+        egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        },
+    ]);
+    assert!(!pressed, "egui clicks complete on release");
+    let (_, clicked) = frame(vec![egui::Event::PointerButton {
+        pos: target,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    }]);
+    assert!(clicked, "the blank right side of the row must be clickable");
 }
 
 /// A Workloads state backed by an isolated fixture Bus, with one explicit
@@ -223,6 +314,57 @@ fn confirm_pending(state: &mut WorkloadsState) {
 }
 
 #[test]
+fn android_starter_launch_uses_the_audited_typed_exec_lane() {
+    let (_tmp, mut state) = placed_bus_state();
+    state.arm_android_app_launch(
+        "eagle",
+        "android-eagle",
+        mackes_mesh_types::android_apps::AospStarterApp::Browser,
+    );
+    assert!(state.has_arming(), "launch must open its explicit review gate");
+    confirm_pending(&mut state);
+
+    let persist = Persist::open(state.bus_root.clone().expect("fixture bus root"))
+        .expect("open fixture bus");
+    let messages = persist
+        .list_since("action/exec/request", None)
+        .expect("read typed exec request topic");
+    assert_eq!(messages.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(
+        messages[0]
+            .body
+            .as_deref()
+            .expect("typed Android request body"),
+    )
+    .expect("typed Android request is JSON");
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["kind"], "android_app_launch");
+    assert_eq!(body["target_host"], "eagle");
+    assert_eq!(body["workload_id"], "android-eagle");
+    assert_eq!(body["app"], "browser");
+    assert!(body.get("command").is_none());
+    assert!(body.get("intent").is_none());
+
+    let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+        body["armed_token"]
+            .as_str()
+            .expect("typed Android capability"),
+    )
+    .expect("parse typed Android capability");
+    assert_eq!(token.verb, "exec-request");
+    assert_eq!(token.node, "fleet-control");
+    assert_eq!(
+        token.target,
+        "android-app:eagle:android-eagle:com.android.browser"
+    );
+    assert_eq!(
+        token.request_sha256,
+        mackes_mesh_types::cloud::cloud_request_digest(&body.to_string())
+            .expect("typed Android request digest")
+    );
+}
+
+#[test]
 fn the_surface_is_reachable_in_the_dock() {
     // §7 reachability: the surface stays in Surface::ALL and wears the server /
     // infrastructure brand glyph (the dock mount is unchanged by the reshape).
@@ -271,7 +413,7 @@ fn every_lifecycle_route_renders_headless() {
 }
 
 #[test]
-fn provision_route_renders_grouped_sections_and_sticky_actions() {
+fn provision_route_renders_ordered_guided_flow_with_one_next_action() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.bus_root = Some(tmp.path().join("bus"));
@@ -291,19 +433,27 @@ fn provision_route_renders_grouped_sections_and_sticky_actions() {
         "Armed by current mirror",
         "Identity",
         "Sizing",
-        "Image & network",
-        "HCL override",
-        "Validation",
-        "Sticky actions",
-        "Set desired",
-        "Plan",
-        "Provision",
+        "Guided provisioning",
+        "Workload details",
+        "Desired state",
+        "Dry-run plan",
+        "Live provision",
+        "Next step",
+        "Save desired state",
     ] {
         assert!(
             text.contains(expected),
-            "Provision route must render grouped/sticky section {expected:?}: {text}"
+            "Provision route must render guided section {expected:?}: {text}"
         );
     }
+    assert!(
+        !text.contains("Sticky actions") && !text.contains("Run dry-run plan"),
+        "the draft step must show one unambiguous next action: {text}"
+    );
+    assert!(
+        text.find("Next step") < text.find("Identity"),
+        "the required action must remain visible before optional details in a no-scroll viewport: {text}"
+    );
     assert_eq!(
         emitted_request_count(&state, mackes_mesh_types::cloud::VERB_SET_DESIRED),
         0,
@@ -322,6 +472,52 @@ fn provision_route_renders_grouped_sections_and_sticky_actions() {
 }
 
 #[test]
+fn guided_flow_reveals_only_the_backend_acknowledged_next_step() {
+    let mut state = state_on(DeliveryView::AndroidVm, WorkloadsRoute::Provision);
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = true;
+    state.form.set_test_draft("android-basic", "", "");
+    state.provision_draft_key = Some(state.form.workflow_key(DeliveryView::AndroidVm, "eagle"));
+
+    state.provision_progress = ProvisionProgress::DesiredSaved;
+    let planned = rendered_text(|ui| route_body(ui, &mut state));
+    assert!(planned.contains("Run dry-run plan"), "{planned}");
+    assert!(!planned.contains("Provision live"), "{planned}");
+
+    state.provision_progress = ProvisionProgress::Planned;
+    let apply = rendered_text(|ui| route_body(ui, &mut state));
+    assert!(apply.contains("Provision live"), "{apply}");
+    assert!(!apply.contains("Run dry-run plan"), "{apply}");
+
+    state.provision_progress = ProvisionProgress::Applied;
+    let complete = rendered_text(|ui| route_body(ui, &mut state));
+    assert!(complete.contains("Provisioning complete"), "{complete}");
+}
+
+#[test]
+fn confirmation_focus_hides_the_underlying_provision_form() {
+    let (_tmp, mut state) = placed_bus_state();
+    state.set_view(DeliveryView::AndroidVm);
+    state.form.set_test_draft("android-basic", "", "");
+    state.arm_android_provision("android-basic");
+
+    let text = rendered_text(|ui| infra_code_panel(ui, &mut state));
+    assert!(text.contains("Choose Yes"), "{text}");
+    assert!(
+        !text.contains("Placement & delivery") && !text.contains("Sticky actions"),
+        "the review must replace, not compete with, the form: {text}"
+    );
+}
+
+#[test]
+fn cloud_request_timeout_allows_real_infrastructure_work() {
+    assert!(
+        REQUEST_TIMEOUT >= std::time::Duration::from_secs(5 * 60),
+        "OpenTofu/image work must not be discarded by a UI-scale timeout"
+    );
+}
+
+#[test]
 fn provision_route_validation_distinguishes_plan_only_nodes() {
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.selected_node = Some("eagle".to_string());
@@ -333,11 +529,13 @@ fn provision_route_validation_distinguishes_plan_only_nodes() {
     assert!(text.contains("Plan-only / not armed"), "{text}");
     assert!(text.contains("Live apply"), "{text}");
     assert!(
-        text.contains("Plan remains available; live Provision stays disabled"),
+        text.contains(
+            "Plan-only node: desired state and dry-run are available; live provision will remain disabled"
+        ),
         "{text}"
     );
     assert!(
-        text.contains("Provision is disabled because the selected node is plan-only"),
+        text.contains("Save desired state") && !text.contains("Provision live"),
         "{text}"
     );
 }
@@ -487,7 +685,9 @@ fn android_apps_catalog_renders_in_active_plan_and_run_routes() {
         let text = rendered_text_at_height(1_400.0, |ui| route_body(ui, &mut state));
         assert!(text.contains("AOSP starter apps"), "{route:?}: {text}");
         assert!(
-            text.contains("Scoped to Android VM android-1 on eagle"),
+            text.contains(
+                "No guest inventory is connected for Android VM android-1 on eagle; its catalog remains pending."
+            ),
             "{route:?}: {text}"
         );
         for package_id in [
@@ -881,6 +1081,7 @@ fn set_desired_emits_the_worker_envelope_instead_of_a_bare_spec() {
         vcpu: 4,
         memory_mb: 8192,
         disk_gb: 60,
+        storage_pool: mackes_mesh_types::cloud::StoragePool::LocalXfs,
         image: Some("construct-desktop".to_string()),
         image_digest: None,
         network_isolation: true,
@@ -912,10 +1113,20 @@ fn android_cuttlefish_action_emits_the_dedicated_cloud_contract() {
     let (_tmp, mut state) = placed_bus_state();
 
     state.arm_android_provision("  droid-1  ");
+    let review = rendered_text(|ui| render_review_sheet(ui, &mut state));
+    assert!(
+        review.contains("Choose Yes") && review.contains("Yes") && review.contains("No"),
+        "Android preparation should be a simple Yes/No decision: {review}"
+    );
+    assert!(
+        !review.contains("type \u{201C}droid-1\u{201D} exactly"),
+        "Android preparation must not require retyping its image/workload name: {review}"
+    );
     let arming = state
         .arming
         .take()
         .expect("Android action opens confirmation");
+    assert!(arming.action.uses_yes_no_review());
     assert_eq!(arming.action.echo(), "droid-1");
     assert_eq!(arming.action.verb(), VERB_ANDROID_PROVISION);
     state.perform(arming.action, "droid-1");
@@ -972,6 +1183,9 @@ fn ui_mutation_requests_carry_their_explicit_placement_node() {
     assert_eq!(configure["group"], "cloud_vm");
     assert!(CloudArmedToken::parse(configure["armed_token"].as_str().unwrap()).is_some());
 
+    // The fixture has one pending-reply slot; clear the unrelated configure
+    // request before proving the retired lifecycle shape cannot publish.
+    state.mutation_pending = None;
     state.perform(
         ArmAction::Lifecycle {
             verb: "instance-start",
@@ -981,19 +1195,13 @@ fn ui_mutation_requests_carry_their_explicit_placement_node() {
         },
         "seat-1",
     );
-    let start = emitted_request(&state, "instance-start");
-    assert_eq!(start["node"], "otter");
-    assert_eq!(start["instance"], "seat-1");
-    let start_token = CloudArmedToken::parse(start["armed_token"].as_str().unwrap()).unwrap();
-    assert_eq!(start_token.target, "seat-1");
+    assert!(state.mutation_pending.is_none());
+    assert!(state.note_text().is_some_and(
+        |note| note.contains("Legacy lifecycle action") && note.contains("Nothing was sent")
+    ));
 
     state.issue_console_attach("otter", "seat-1", "seat-1");
-    assert!(
-        state.mutation_pending.is_some(),
-        "prior start remains pending"
-    );
-    // Resolve the fixture's single-pending limitation before confirming console.
-    state.mutation_pending = None;
+    assert!(state.mutation_pending.is_none());
     confirm_pending(&mut state);
     let console = emitted_request(&state, "console-attach");
     assert_eq!(console["schema_version"], 1);
@@ -1189,11 +1397,19 @@ fn prepared_review_sheet_renders_frozen_mutation_facts_before_confirm() {
             && text.contains("placement node eagle"),
         "{text}"
     );
+    assert!(
+        text.contains("Choose Yes") && text.contains("Yes") && text.contains("No"),
+        "prepared service changes must use the simple Yes/No review: {text}"
+    );
+    assert!(
+        !text.contains("type \u{201C}web\u{201D} exactly"),
+        "prepared service changes must not ask for the long target echo: {text}"
+    );
     assert!(state.mutation_pending.is_none());
     assert_eq!(
         emitted_request_count(&state, mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY),
         0,
-        "review render must not publish before the exact echo confirms"
+        "review render must not publish before the operator confirms"
     );
 }
 
@@ -1221,6 +1437,10 @@ fn lifecycle_review_sheet_renders_frozen_mutation_facts_before_confirm() {
     assert!(
         text.contains("Placement node") && text.contains("eagle"),
         "{text}"
+    );
+    assert!(
+        text.contains("type \u{201C}seat-1\u{201D} exactly"),
+        "destructive lifecycle actions must retain typed confirmation: {text}"
     );
     assert!(
         text.contains("Body digest") && text.contains(&format!("sha256:{digest}")),
@@ -1277,12 +1497,10 @@ fn lifecycle_reboot_and_delete_are_typed_confirm_gated() {
         },
         "seat-1",
     );
-    let delete = emitted_request(&state, "instance-delete");
-    assert_eq!(delete["schema_version"], 1);
-    assert_eq!(delete["node"], "eagle");
-    assert_eq!(delete["instance"], "seat-1");
-    assert_eq!(delete["typed_name"], "seat-1");
-    assert!(CloudArmedToken::parse(delete["armed_token"].as_str().unwrap()).is_some());
+    assert!(state.mutation_pending.is_none());
+    assert!(state.note_text().is_some_and(
+        |note| note.contains("Legacy lifecycle action") && note.contains("Nothing was sent")
+    ));
 }
 
 #[test]
@@ -1347,6 +1565,16 @@ fn fold_mutation_maps_the_reply_tri_state_honestly() {
     let (note, entry) = fold_mutation(&ok);
     assert!(note.contains("applied"), "{note}");
     assert_eq!(entry.outcome, AuditOutcome::Applied);
+
+    // A successful plan remains explicit that it was only a dry-run.
+    let plan: CloudReply = serde_json::from_str(r#"{"ok":true,"verb":"plan","audited":true}"#)
+        .expect("plan reply parses");
+    let (note, entry) = fold_mutation(&plan);
+    assert!(
+        note.contains("Dry-run plan completed") && note.contains("nothing was applied"),
+        "{note}"
+    );
+    assert_eq!(entry.outcome, AuditOutcome::Staged);
 
     // A `gated` mutation reply reads STAGED (a dry-run — nothing applied) and
     // carries the staged plan summary honestly.
@@ -1510,6 +1738,52 @@ fn console_attach_decodes_the_endpoint_and_renders_it_honestly() {
 }
 
 #[test]
+fn workload_reply_reader_keeps_oldest_reply_without_scanning_history() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bus_root = tmp.path().join("bus");
+    let mut state = WorkloadsState::default();
+    state.bus_root = Some(bus_root.clone());
+    let persist = Persist::open(bus_root).expect("open the fixture bus");
+    let ulid = "01JREPLYBOUNDEDSLICE000000";
+    let reply = |uri: &str| {
+        serde_json::json!({
+            "ok": true,
+            "verb": "console-attach",
+            "audited": false,
+            "console": {"proto": "spice", "uri": uri}
+        })
+        .to_string()
+    };
+
+    persist
+        .write(
+            &reply_topic(ulid),
+            Priority::Default,
+            None,
+            Some(&reply("spice://10.42.0.7:5900")),
+        )
+        .expect("write oldest reply");
+    for _ in 0..64 {
+        persist
+            .write(
+                &reply_topic(ulid),
+                Priority::Default,
+                None,
+                Some(&reply("spice://10.42.0.7:5901")),
+            )
+            .expect("write retained duplicate reply");
+    }
+
+    let decoded = state
+        .read_wire_reply(ulid)
+        .expect("oldest reply remains readable");
+    assert_eq!(
+        decoded.console.expect("console endpoint").uri,
+        "spice://10.42.0.7:5900"
+    );
+}
+
+#[test]
 fn labels_carry_no_legacy_backend_terminology() {
     // The lifecycle app is provider-neutral: zero OpenStack-family terms in its
     // user-facing copy (grep-clean, §6).
@@ -1538,4 +1812,27 @@ fn labels_carry_no_legacy_backend_terminology() {
             );
         }
     }
+}
+
+#[test]
+fn app_vm_open_is_limited_to_run_rows_with_a_valid_typed_declaration() {
+    let mut app_row = workload("app-vm-1", DeliveryType::AppVm, "running");
+    assert!(!app_vm_launch_allowed(&app_row, ResourceTableMode::Run));
+
+    app_row.app = Some(
+        mackes_mesh_types::vdi_session::AppVmLaunchRequest::new(
+            "org.example.Editor",
+            "catalog-7",
+            "wayland-standard",
+            vec!["audio".to_owned()],
+            "session-7",
+            true,
+        )
+        .expect("typed App VM declaration"),
+    );
+    assert!(!app_vm_launch_allowed(&app_row, ResourceTableMode::Plan));
+    assert!(app_vm_launch_allowed(&app_row, ResourceTableMode::Run));
+
+    app_row.app.as_mut().expect("declaration").app_id = "host-command".into();
+    assert!(!app_vm_launch_allowed(&app_row, ResourceTableMode::Run));
 }

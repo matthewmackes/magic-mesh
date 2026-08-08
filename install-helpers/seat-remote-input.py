@@ -429,6 +429,52 @@ def absolute_tap_ops(event: dict) -> list[Op]:
     ]
 
 
+def absolute_drag_ops(event: dict) -> list[Op]:
+    # Proof-only companion to absolute_tap: keep one touchscreen device and one
+    # contact alive for the whole gesture so libinput/egui can recognize a real
+    # drag (needed for deterministic ScrollArea proofing on bare DRM seats).
+    width = positive_extent(event.get("width"), "width")
+    height = positive_extent(event.get("height"), "height")
+    duration_ms = hold_millis(event.get("duration_ms"), "duration_ms", 400)
+    start_x = absolute_coord(event.get("x"), "x", width)
+    start_y = absolute_coord(event.get("y"), "y", height)
+    end_x = absolute_coord(event.get("to_x"), "to_x", width)
+    end_y = absolute_coord(event.get("to_y"), "to_y", height)
+    if start_x == end_x and start_y == end_y:
+        unsupported("absolute_drag start and end must differ")
+
+    steps = 8
+    step_delay_ms = max(25, duration_ms // steps)
+    ops = [
+        Op(EV_ABS, ABS_MT_SLOT, 0),
+        Op(EV_ABS, ABS_MT_TRACKING_ID, 1),
+        Op(EV_ABS, ABS_MT_POSITION_X, start_x),
+        Op(EV_ABS, ABS_MT_POSITION_Y, start_y),
+        Op(EV_KEY, BTN_TOOL_FINGER, 1),
+        Op(EV_KEY, BTN_TOUCH, 1),
+        Op(EV_SYN, SYN_REPORT, 0),
+    ]
+    for step in range(1, steps + 1):
+        ops.extend(
+            [
+                hold_delay(step_delay_ms),
+                Op(EV_ABS, ABS_MT_POSITION_X, start_x + (end_x - start_x) * step // steps),
+                Op(EV_ABS, ABS_MT_POSITION_Y, start_y + (end_y - start_y) * step // steps),
+                Op(EV_SYN, SYN_REPORT, 0),
+            ]
+        )
+    ops.extend(
+        [
+            Op(EV_ABS, ABS_MT_SLOT, 0),
+            Op(EV_ABS, ABS_MT_TRACKING_ID, -1),
+            Op(EV_KEY, BTN_TOUCH, 0),
+            Op(EV_KEY, BTN_TOOL_FINGER, 0),
+            Op(EV_SYN, SYN_REPORT, 0),
+        ]
+    )
+    return ops
+
+
 def event_to_ops(event: dict) -> list[Op]:
     if not isinstance(event, dict):
         unsupported("event must be a JSON object")
@@ -461,6 +507,8 @@ def event_to_ops(event: dict) -> list[Op]:
         return ops
     if kind == "absolute_tap":
         return absolute_tap_ops(event)
+    if kind == "absolute_drag":
+        return absolute_drag_ops(event)
     if kind == "special_key":
         code = event.get("special_key")
         if not isinstance(code, int):
@@ -619,6 +667,7 @@ def self_test() -> None:
         ({"kind": "scroll", "delta": -3}, [(EV_REL, REL_WHEEL, -3)]),
         ({"kind": "button", "button": "secondary", "clicks": 2}, [(EV_KEY, BTN_RIGHT, 1), (OP_DELAY, 0, DEFAULT_BUTTON_HOLD_MS), (EV_KEY, BTN_RIGHT, 0)]),
         ({"kind": "absolute_tap", "x": 120, "y": 640, "width": 1920, "height": 1080}, [(EV_ABS, ABS_MT_TRACKING_ID, 1), (EV_ABS, ABS_MT_POSITION_X, 4098), (EV_KEY, BTN_TOUCH, 1), (OP_DELAY, 0, DEFAULT_ABSOLUTE_TAP_HOLD_MS), (EV_ABS, ABS_MT_TRACKING_ID, -1)]),
+        ({"kind": "absolute_drag", "x": 500, "y": 600, "to_x": 500, "to_y": 200, "width": 1366, "height": 768}, [(EV_ABS, ABS_MT_TRACKING_ID, 1), (EV_ABS, ABS_MT_POSITION_Y, 51266), (EV_ABS, ABS_MT_POSITION_Y, 17089), (EV_ABS, ABS_MT_TRACKING_ID, -1)]),
         ({"kind": "text", "text": "Az!"}, [(EV_KEY, KEY_LEFTSHIFT, 1), (EV_KEY, KEY_A, 1), (EV_KEY, KEY_Z, 1), (EV_KEY, KEY_1, 1)]),
         ({"kind": "special_key", "special_key": 12, "modifiers": {"ctrl": True}}, [(EV_KEY, KEY_LEFTCTRL, 1), (EV_KEY, KEY_ENTER, 1)]),
     ]

@@ -24,10 +24,11 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mackes_mesh_types::peers::{default_mesh_home, peers_dir, read_peers};
 use tracing::{debug, warn};
@@ -44,6 +45,14 @@ const MACKES_GROUP: &str = "Mesh Peers";
 const MACKES_TAG: &str = "X-Mackes-Managed";
 /// Per-connection TCP probe timeout.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Failed peers are retried less often, but never disabled permanently.
+const FAILED_PROBE_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(TICK_INTERVAL_S),
+    Duration::from_secs(TICK_INTERVAL_S * 2),
+    Duration::from_secs(TICK_INTERVAL_S * 4),
+    Duration::from_secs(TICK_INTERVAL_S * 8),
+    Duration::from_secs(TICK_INTERVAL_S * 15),
+];
 
 /// `(proto-key, port, Remmina protocol string)`.
 const PROTOCOLS: &[(&str, u16, &str)] = &[
@@ -65,6 +74,18 @@ pub struct PeerProbe {
     pub rdp: bool,
     /// Port 5900 accepted a connection.
     pub vnc: bool,
+}
+
+/// Cached probe result and the next time it is eligible for network I/O.
+///
+/// A peer with no open protocol is an honest negative result, not a reason to
+/// run three synchronous connects on every cadence forever. The retry ladder
+/// is bounded so a peer that returns later is still discovered.
+#[derive(Debug, Clone)]
+struct CachedPeerProbe {
+    result: PeerProbe,
+    failure_streak: usize,
+    next_probe: Instant,
 }
 
 impl PeerProbe {
@@ -211,31 +232,84 @@ fn probe_peer(host: &str) -> (bool, bool, bool) {
     )
 }
 
-/// The live mesh peers (excluding self), each TCP-probed. Empty when the mesh
-/// home / peers dir is absent (no mesh → no entries, never an error).
-fn current_peers() -> Vec<PeerProbe> {
+/// Select the next retry delay. Any open protocol is a successful peer probe
+/// and returns to the normal cadence; an all-closed result advances the
+/// bounded failure ladder.
+fn probe_schedule(has_open_protocol: bool, failure_streak: usize) -> (Duration, usize) {
+    if has_open_protocol {
+        return (Duration::from_secs(TICK_INTERVAL_S), 0);
+    }
+
+    let next_streak = failure_streak
+        .saturating_add(1)
+        .min(FAILED_PROBE_BACKOFF.len());
+    (FAILED_PROBE_BACKOFF[next_streak - 1], next_streak)
+}
+
+/// Return a cached peer result when its retry is not due, otherwise perform
+/// the three synchronous probes and schedule the next attempt.
+fn probe_or_cached(
+    host: &str,
+    name: String,
+    cache: &mut HashMap<String, CachedPeerProbe>,
+    now: Instant,
+) -> PeerProbe {
+    if let Some(cached) = cache.get(host) {
+        if now < cached.next_probe {
+            let mut result = cached.result.clone();
+            result.name = name;
+            return result;
+        }
+    }
+
+    let (ssh, rdp, vnc) = probe_peer(host);
+    let result = PeerProbe {
+        name,
+        host: host.to_string(),
+        ssh,
+        rdp,
+        vnc,
+    };
+    let previous_streak = cache
+        .get(host)
+        .map(|cached| cached.failure_streak)
+        .unwrap_or_default();
+    let (delay, failure_streak) =
+        probe_schedule(result.ssh || result.rdp || result.vnc, previous_streak);
+    cache.insert(
+        host.to_string(),
+        CachedPeerProbe {
+            result: result.clone(),
+            failure_streak,
+            next_probe: now + delay,
+        },
+    );
+    result
+}
+
+/// The live mesh peers (excluding self), using cached results until a retry is
+/// due. Empty when the mesh home / peers dir is absent (no mesh → no entries,
+/// never an error).
+fn current_peers(cache: &mut HashMap<String, CachedPeerProbe>) -> Vec<PeerProbe> {
     let me = local_hostname();
     let dir = peers_dir(&default_mesh_home());
     let mut out = Vec::new();
+    let now = Instant::now();
+    let mut active_hosts = HashSet::new();
     for rec in read_peers(&dir) {
         if rec.hostname.is_empty() || rec.hostname == me {
             continue;
         }
+        active_hosts.insert(rec.hostname.clone());
         let name = rec
             .hostname
             .split('.')
             .next()
             .unwrap_or(&rec.hostname)
             .to_string();
-        let (ssh, rdp, vnc) = probe_peer(&rec.hostname);
-        out.push(PeerProbe {
-            name,
-            host: rec.hostname,
-            ssh,
-            rdp,
-            vnc,
-        });
+        out.push(probe_or_cached(&rec.hostname, name, cache, now));
     }
+    cache.retain(|host, _| active_hosts.contains(host));
     out
 }
 
@@ -341,9 +415,16 @@ fn reconcile(
 
 /// One full sync pass: read live peers, reconcile the local Remmina group.
 /// Blocking (TCP probes + file I/O) — call from `spawn_blocking`.
-fn sync_once() -> std::io::Result<SyncReport> {
+fn sync_once(
+    mut probe_cache: HashMap<String, CachedPeerProbe>,
+) -> (
+    std::io::Result<SyncReport>,
+    HashMap<String, CachedPeerProbe>,
+) {
     let user = std::env::var("USER").unwrap_or_default();
-    reconcile(&remmina_dir(), &current_peers(), &home(), &user)
+    let peers = current_peers(&mut probe_cache);
+    let result = reconcile(&remmina_dir(), &peers, &home(), &user);
+    (result, probe_cache)
 }
 
 /// Async worker: run `sync_once` on a 60 s tick until shutdown. Native Rust —
@@ -376,14 +457,26 @@ impl Worker for RemminaSyncWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let mut tick = tokio::time::interval(self.interval);
+        // A slow batch must not make missed ticks replay immediately. The
+        // blocking boundary below remains important, but Delay also prevents
+        // the worker from turning one slow pass into a burst of new passes.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut probe_cache = HashMap::new();
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.wait() => return Ok(()),
                 _ = tick.tick() => {
-                    match tokio::task::spawn_blocking(sync_once).await {
-                        Ok(Ok(report)) => debug!(target: "remmina_sync", "{report}"),
-                        Ok(Err(e)) => warn!(target: "remmina_sync", "sync failed: {e}"),
+                    let cache_for_sync = std::mem::take(&mut probe_cache);
+                    match tokio::task::spawn_blocking(move || sync_once(cache_for_sync)).await {
+                        Ok((Ok(report), cache)) => {
+                            probe_cache = cache;
+                            debug!(target: "remmina_sync", "{report}");
+                        }
+                        Ok((Err(e), cache)) => {
+                            probe_cache = cache;
+                            warn!(target: "remmina_sync", "sync failed: {e}");
+                        }
                         Err(e) => warn!(target: "remmina_sync", "sync task panicked: {e}"),
                     }
                 }
@@ -423,6 +516,31 @@ mod tests {
     fn worker_name_matches_phase_b_lock() {
         assert_eq!(build().name(), "remmina-sync");
         assert_eq!(TICK_INTERVAL_S, 60);
+    }
+
+    #[test]
+    fn failed_probe_retry_ladder_is_bounded_and_success_resets_it() {
+        let mut streak = 0;
+        let mut delays = Vec::new();
+        for _ in 0..FAILED_PROBE_BACKOFF.len() + 2 {
+            let (delay, next_streak) = probe_schedule(false, streak);
+            delays.push(delay);
+            streak = next_streak;
+        }
+
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+                Duration::from_secs(240),
+                Duration::from_secs(480),
+                Duration::from_secs(900),
+                Duration::from_secs(900),
+                Duration::from_secs(900),
+            ]
+        );
+        assert_eq!(probe_schedule(true, streak), (Duration::from_secs(60), 0));
     }
 
     #[test]

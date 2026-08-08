@@ -84,25 +84,26 @@ fn focused(s: &ExplorerState) -> Unit {
     s.units[idx].clone()
 }
 
-fn assert_armed_cloud_call(
+fn assert_armed_workload_call(
     call: &(String, String),
-    topic: &str,
     node: &str,
     instance: &str,
-    typed_name: Option<&str>,
+    action: &str,
 ) {
-    assert_eq!(call.0, topic);
-    let body: serde_json::Value = serde_json::from_str(&call.1).expect("authorized cloud body");
+    assert_eq!(
+        call.0,
+        mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&call.1).expect("authorized Workload operation body");
     assert_eq!(
         body["schema_version"],
-        mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+        mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
     );
-    assert_eq!(body["node"], node);
-    assert_eq!(body["instance"], instance);
-    match typed_name {
-        Some(name) => assert_eq!(body["typed_name"], name),
-        None => assert!(body.get("typed_name").is_none()),
-    }
+    assert_eq!(body["target_node"], node);
+    assert_eq!(body["workload_id"], format!("vm:{node}:{instance}"));
+    assert_eq!(body["action"], action);
+    assert_eq!(body["backend"], "libvirt_virtqemud");
     assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
         body["armed_token"].as_str().expect("armed token")
     )
@@ -788,30 +789,28 @@ fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
 
     // Start is non-destructive → fires immediately.
     s.fire(Verb::Start, &u);
-    assert_armed_cloud_call(
+    assert_armed_workload_call(
         &fake.calls.borrow()[0],
-        "action/cloud/instance-start",
         "node-a",
         "i-9",
-        None,
+        "start",
     );
 
     // The three destructive verbs each publish their own topic once armed.
-    for (verb, topic) in [
-        (Verb::Stop, "action/cloud/instance-stop"),
-        (Verb::Reboot, "action/cloud/instance-reboot"),
-        (Verb::Delete, "action/cloud/instance-delete"),
+    for (verb, action) in [
+        (Verb::Stop, "stop"),
+        (Verb::Reboot, "restart"),
+        (Verb::Delete, "destroy"),
     ] {
         fake.calls.borrow_mut().clear();
         s.arm_verb(verb, &u.id);
         s.arm.as_mut().expect("armed").echo = "web".to_string();
         assert!(s.confirm_armed(&u), "the typed-name confirm fires the verb");
-        assert_armed_cloud_call(
+        assert_armed_workload_call(
             &fake.calls.borrow()[0],
-            topic,
             "node-a",
             "i-9",
-            (verb == Verb::Delete).then_some("i-9"),
+            action,
         );
         assert!(s.arm.is_none(), "arming clears after the confirm");
     }
@@ -2544,19 +2543,17 @@ fn bulk_destructive_is_gated_on_the_typed_count_phrase() {
     assert!(s.confirm_bulk());
     let calls = fake.calls.borrow();
     assert_eq!(calls.len(), 2, "one QC-11 request per marked instance");
-    assert_armed_cloud_call(
+    assert_armed_workload_call(
         &calls[0],
-        "action/cloud/instance-delete",
         "node-a",
         "i2",
-        Some("i2"),
+        "destroy",
     );
-    assert_armed_cloud_call(
+    assert_armed_workload_call(
         &calls[1],
-        "action/cloud/instance-delete",
         "node-a",
         "i1",
-        Some("i1"),
+        "destroy",
     );
     drop(calls);
     assert!(s.bulk_arm.is_none(), "the arm clears after the run");

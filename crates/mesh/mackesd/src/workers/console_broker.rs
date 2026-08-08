@@ -1,54 +1,18 @@
-//! VDI-VM-1 — `console_broker`: makes a **local** KVM VM's loopback console
-//! reachable on the mesh so a remote peer can actually attach frames.
+//! WL-ARCH-010 — retired legacy VDI console relay.
 //!
-//! ## The gap this closes
+//! The historical worker resolved `virsh domdisplay`, relayed SPICE/VNC/RDP with
+//! `socat`, and published raw overlay `host:port` records on [`CONSOLE_TOPIC`].
+//! That created a second VM observation and presentation authority beside the
+//! versioned Workload projection.  It is deliberately inert at runtime while its
+//! spawn and shell consumers are removed in the same cutover: it neither reads
+//! session actions nor invokes `virsh`/`socat` nor writes a console record.
 //!
-//! Every VM `vm_lifecycle` defines binds its SPICE graphics to `127.0.0.1`
-//! ([`super::vm_lifecycle::build_domain_xml`] — `<listen address='127.0.0.1'/>`,
-//! autoport). That console is invisible off the host: [`super::desktop_sources`]
-//! advertises the VM with a **port-less** Spice offer (`ProtocolOffer{port:None}`)
-//! and [`super::session_broker`] tracks the session lifecycle but publishes **no
-//! reachable endpoint**. So a peer's Chooser can open a broker session for a
-//! local VM yet never has a `host:port` to dial — the "use a VM desktop on any
-//! mesh peer" promise silently doesn't deliver frames for local VMs.
-//!
-//! ## The fix (approach (a): relay onto the overlay, reusing the proven pattern)
-//!
-//! On the **serving** peer, for each VDI `Open` that names a VM this node serves,
-//! this worker:
-//!
-//! 1. **Resolves** the live console via `virsh domdisplay <vm>` (SPICE first, VNC
-//!    fallback) — the concrete autoport libvirt actually assigned.
-//! 2. **Relays** that loopback port onto the Nebula overlay (`nebula1`) with a
-//!    scoped `socat` proxy, sharing an exact same-target listener across
-//!    duplicate sessions — exactly how [`super::compute_expose`] forwards a VM
-//!    port onto the overlay, but for a host-loopback console rather than a
-//!    firewalld forward to a VM's own overlay IP (a local VM's graphics live on
-//!    the *host's* loopback, so a userspace relay is the right shape).
-//! 3. **Publishes** the resulting overlay `host:port` back on the session record
-//!    ([`CONSOLE_TOPIC`], keyed by the globally-unique session id) so the client
-//!    peer's shell resolves the brokered endpoint from the record instead of
-//!    needing a discovery-time port it never had.
-//!
-//! Serving-peer-gated, **not** leader-gated (unlike `session_broker`'s
-//! convergence): the relay and the loopback console are physically on the serving
-//! host, so brokering must run there.
-//!
-//! ## Honest non-connectability (§7)
-//!
-//! If a real reachable endpoint cannot be brokered — the VM is shut off (no live
-//! console), it has no graphics, `virsh`/`socat` is absent, or the overlay isn't
-//! up — the worker publishes a typed [`ConsoleStatus::Unbrokerable`] with the
-//! reason, **never a fake endpoint**. The shell greys that lane honestly rather
-//! than attaching a transport that can't deliver frames.
-//!
-//! ## Live gate
-//!
-//! The brokering ORCHESTRATION (fold `action/vdi/session`, publish, teardown) and
-//! all the pure parsing/relay-arg/serving-peer logic are unit-tested here headless
-//! over an injected [`ConsoleRelay`]. The end-to-end proof — broker a real local
-//! VM's console on one peer and connect from another — needs two live nodes and a
-//! running VM, and is deferred to the operator's two-node test bed.
+//! The sole presentation contract is now the expiring, node-local
+//! [`mackes_mesh_types::workloads::WorkloadAttachmentLease`] emitted by
+//! `workload_compute`.  It carries no address or FD over `mde-bus`; Display1's
+//! authenticated local broker transfers those only after the Workload lease is
+//! verified.  Remote recovery transports must likewise be issued by
+//! `workload_compute`, not reconstructed by this retired worker.
 
 #![cfg(feature = "async-services")]
 
@@ -1506,34 +1470,16 @@ impl Worker for ConsoleBrokerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            tracing::debug!("console_broker: no bus root; worker idle");
-            return Ok(());
-        };
-        // Fold the FULL session log from the start (like `session_broker`): a
-        // session's console is a function of its whole lifecycle.
-        let mut cursor: Option<String> = None;
-        let mut last_pub = Instant::now();
-        let mut tick = tokio::time::interval(self.poll);
-        tick.tick().await; // consume the immediate first tick
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    let due = last_pub.elapsed() >= self.heartbeat;
-                    let mut changed = self.refresh_relays(due);
-                    for req in read_new_actions(&bus_root, &mut cursor, &self.authorizer) {
-                        changed |= self.apply(&req);
-                    }
-                    if (changed || due) && !self.brokered.is_empty() {
-                        if let Ok(persist) = Persist::open(bus_root.clone()) {
-                            self.publish(&persist);
-                            last_pub = Instant::now();
-                        }
-                    }
-                }
-                () = shutdown.wait() => break,
-            }
-        }
+        // No compatibility bridge is permitted here.  A session request does
+        // not authorize a direct libvirt probe or a raw overlay endpoint, and
+        // an attachment lease must be consumed by the Display1 broker rather
+        // than re-encoded on mde-bus.  Keep this worker quiescent until its
+        // spawn is deleted; waiting avoids a supervisor restart loop during
+        // staggered package upgrades.
+        tracing::info!(
+            "console_broker retired: workload_compute is the sole workload presentation authority"
+        );
+        shutdown.wait().await;
         Ok(())
     }
 }
@@ -2468,12 +2414,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_publishes_a_brokered_record_end_to_end() {
-        // Full pipeline over a temp Bus: seed an Open on the session topic, run one
-        // fold, and assert the console record lands on CONSOLE_TOPIC.
-        let dir = std::env::temp_dir().join(format!("mde-console-broker-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let persist = Persist::open(dir.clone()).expect("open bus");
+    async fn retired_worker_never_probes_or_publishes_a_console_endpoint() {
+        // A valid historical session action used to cause a direct `virsh` probe,
+        // a socat relay, and a raw host:port record on CONSOLE_TOPIC.  The
+        // Workload attachment lease is now the only presentation contract, so
+        // this still-spawned worker must be quiescent until its registry entry is
+        // removed.  Exercise the actual Worker::run path, not just its helpers.
+        let dir = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
         persist
             .write(
                 SESSION_TOPIC,
@@ -2486,40 +2434,30 @@ mod tests {
             )
             .expect("seed open");
 
-        let mut w = worker_with(FakeRelay {
+        let relay = FakeRelay {
             resolve: Some(Ok(spice(5900))),
             overlay: "10.42.0.7".into(),
             relay_ok: true,
             ..FakeRelay::default()
-        })
-        .with_bus_root(dir.clone())
-        .with_poll(Duration::from_millis(20))
-        .with_authorizer(ConsoleAuthorizer::for_test(
-            AUTH_KEY,
-            dir.join("console-auth"),
-            AUTH_NOW,
-        ));
+        };
+        let started = Arc::clone(&relay.started);
+        let mut worker = worker_with(relay)
+            .with_bus_root(dir.path().to_path_buf())
+            .with_poll(Duration::from_millis(1));
+        let mut supervisor = crate::workers::Supervisor::new();
+        let shutdown = supervisor.token();
+        let task = tokio::spawn(async move { worker.run(shutdown).await });
+        tokio::task::yield_now().await;
+        supervisor.shutdown_and_join().await.expect("signal shutdown");
+        task.await.expect("worker task").expect("worker result");
 
-        // Drive one fold+publish by hand (deterministic — no timing on the tick).
-        let mut cursor = None;
-        for req in read_new_actions(&dir, &mut cursor, &w.authorizer) {
-            w.apply(&req);
-        }
-        w.publish(&persist);
-
-        let records: Vec<BrokeredConsole> = persist
+        let records = persist
             .list_since(CONSOLE_TOPIC, None)
-            .expect("list console")
-            .into_iter()
-            .filter_map(|m| m.body)
-            .filter_map(|b| serde_json::from_str(&b).ok())
-            .collect();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].session_id, "s1");
-        assert!(matches!(
-            records[0].status,
-            ConsoleStatus::Brokered { port: 5900, .. }
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+            .expect("list console topic");
+        assert!(records.is_empty(), "legacy endpoint records are forbidden");
+        assert!(
+            started.lock().expect("relay starts").is_empty(),
+            "retired worker must not invoke a legacy console relay"
+        );
     }
 }

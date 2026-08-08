@@ -1,2014 +1,1278 @@
 # Platform Worklist
 
-This is the only active platform worklist. Design notes, parity ledgers,
-operational runbooks, review notes, and `docs/NEEDS-OPERATOR.md` are evidence
-sources, not parallel trackers.
+This is the only active platform worklist. Design notes, evidence ledgers,
+runbooks, and operator notes are inputs, not parallel trackers. Historical
+implementation diaries remain in docs/worklist-archive/ and are not executable
+tasks.
 
-The complete pre-rework worklist, including all progress records and historical
-reconciliation text, is preserved at
-`docs/worklist-archive/2026-07-28-platform-worklist-pre-rework.md`. The exact
-pre-lint-compaction state and implementation diaries removed on 2026-08-03 are
-preserved in
-`docs/worklist-archive/2026-08-03-platform-worklist-pre-lint-compaction.md`.
+## Current Snapshot - 2026-08-06 executable story rewrite
 
-## Current Snapshot - 2026-08-03 Workloads and five-seat fleet integration
+- **17 active epics:** 17 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **Execution order:** complete ARCH-010 stories in order; then consume its
+  contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
+  vertical slices FUNC-011/FUNC-016, FUNC-017, and FUNC-021 next. Integrate
+  UX-009, UX-011, UX-012, and UX-013/014 at their named story gates. Close
+  every slice through CRIT-006 and CRIT-007.
+- **Single-authority lock:** typed Workload operations are the only VM/container
+  lifecycle API; mackesd is the only daemon authority; mde-bus is the only
+  platform bus; the shell renders typed bounded projections and sends typed
+  intent. Do not add a compatibility shim, parallel tracker, direct backend
+  call, raw command, or GUI-owned service state.
+- **Product lock:** Construct is one egui DRM thin-client shell. Native apps run
+  in governed VMs or approved native collaboration/media surfaces. There is no
+  Wayland compositor, host Browser engine, OpenStack control plane, or retired
+  LizardFS/cloud-hypervisor path.
+- **Evidence lock:** a story is incomplete until its deliverable, focused hostile
+  tests, farm command and result, and required live/package evidence are recorded
+  in docs/platform/evidence/. Missing hardware or provider access is a named
+  blocker, not a passing substitute.
+- **Farm lock:** heavy verification is farm-only; route the longest job to
+  BigBoy at 172.20.0.130, use explicit MCNF_BUILD_HOST and MCNF_BUILD_SLOT, and
+  never run filler tests.
+- **Rollout lock:** prove the release seat first, then Dell, Eagle, seat 15,
+  T480, Surface, and three lighthouses. Publish the red AI-GENERATED-ALERT and
+  wait five seconds before each seat mutation. Recover failures by re-enrollment
+  and corrected-forward deployment, never rollback.
+- **Story format:** execute stories top-to-bottom. Do not start a story until
+  every dependency is green. If a dependency or external resource is absent,
+  set the epic to Blocked with the exact missing item; do not invent evidence.
 
-- **13 active epics:** 13 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
-- **P0:** WL-ARCH-008 (standalone old Browser repo plus VM Browser cutover),
-  WL-ARCH-009 (process-isolated mackesd and unified Workers interface),
-  WL-FUNC-011 (native Mesh Collaboration Suite and hard cut), WL-FUNC-016
-  (native rich clipboard across seat/mesh/VDI), WL-FUNC-017 (complete Maps,
-  navigation, and MG90 radio health), WL-UX-011 (node hardware providers and
-  safe controls), WL-CRIT-006 (production evidence, six-node acceptance, and
-  corrected-forward recovery), WL-CRIT-007 (boot/sleep recovery and fleet
-  peer return), and WL-FUNC-019 (universal resource/session discovery and
-  client browser).
-- **P1:** WL-UX-009 (shared Quazar theme and design-language completion),
-  WL-UX-012 (full-width Construct taskbar and search-first Home), and
-  WL-FUNC-018 (seamless Flatpak Front Door backed by App VMs), and WL-FUNC-020
-  (governed Android applications backed by Cuttlefish Android VMs).
-- **Delivery policy:** produce service-oriented releases in the queue below.
-  Farm lanes may fan out implementation and verification for the current
-  service, but a later service does not displace its release proof. An
-  engineering preview may ship with named evidence gaps; production promotion
-  still requires every selected live gate to pass.
-- **Rollout policy:** prove the current service on its named release seat first,
-  then deploy that same revision to Dell, Eagle, seat 15, T480, and Surface.
-  Every seat update publishes the centered red `AI-GENERATED-ALERT` and waits
-  five seconds before mutation. Require all three lighthouses and the complete
-  eight-node substrate before production promotion. Failed nodes recover by
-  re-enrollment and corrected-forward deployment, not rollback.
-- **Repository policy:** the local GitHub checkout is authoritative for commits
-  and pushes. Farm lanes fetch the pushed revision; BigBoy runs the longest
-  build/test gate. Heavy build and release validation remains farm-only.
-- **Evidence policy:** implementation metrics and deterministic tests remain
-  required for acceptance, but no new post-release monitoring surface is added.
-  Human GUI review is the required visual signoff. Missing live hardware,
-  external providers, or stale installed packages are recorded honestly for the
-  preview and remain hard gates for production promotion.
-- **Audit record:** the 2026-07-30 fit-for-purpose finding and all 25 selected
-  actions are recorded in
-  [`docs/platform/FIT-FOR-PURPOSE-AUDIT-2026-07-30.md`](FIT-FOR-PURPOSE-AUDIT-2026-07-30.md).
-  `AUD-*` labels there are evidence references, not a parallel tracker; action
-  ownership is this file's active epics.
+## Active Drain Goal
 
-## Service Release Queue - 2026-08-03
+Finish the Music and Media Player vertical slice (daemon catalog/playback,
+mpv frame/audio, library/Jellyfin, cache/offline, discovery, casting, handoff,
+visual proof) while preserving the single Workload, Bus, and typed executor
+authorities. Archive old MEDIA and FUNC-007 IDs; they are evidence only.
 
-This is an ordering view over the active epics below, not a second worklist.
-The operator's service-oriented direction on 2026-08-03 supersedes the earlier
-single integrated-preview sequencing in the Survey Decision Register. Only one
-release milestone is current; independent farm lanes fan out inside that
-milestone, then rejoin at its live exit evidence.
+## Service Release Queue
 
-1. **R1 - Chromium Workspace (WL-ARCH-008) - Current.** On Dell, Browser
-   selects the admitted `browser-vm` automatically; Chromium produces a live
-   frame, keyboard/pointer input works, reconnect resumes the same workload,
-   and audible media reaches the Dell sink. Record the immutable image identity,
-   encrypted guest credential, five-second seat alert, and deployed revision.
-2. **R2 - Remote Sessions and Resources (WL-FUNC-019) - Queued.** One resource
-   browser discovers desktops, services, and external providers and launches
-   each through a typed, health-proven adapter.
-3. **R3 - Flatpak Applications (WL-FUNC-018) - Queued.** A governed starter
-   catalog appears in Front Door and each selected Flatpak launches and
-   reconnects through an App VM.
-4. **R4 - Android Applications (WL-FUNC-020) - Queued.** Workloads lists the
-   governed AOSP starter set and launches and reconnects each application
-   through an Android VM.
-5. **R5 - Native Rich Clipboard (WL-FUNC-016) - Queued.** Session-opt-in rich
-   clipboard content crosses the direct seat and every enrolled node; released
-   VDI paths negotiate MIME support and hand binary payloads to Files.
-6. **R6 - Mesh Collaboration Suite (WL-FUNC-011) - Queued.** One native suite
-   exposes Alerts, Chat, Calls, Files, Editor, and Clipboard, with real media,
-   shared SIP gateways, a full IDE, and LibreOfficeKit-backed office editing.
-7. **R7 - Maps and Vehicle (WL-FUNC-017) - Queued.** Offline maps, routing,
-   location, and MG90 radio health work with freshness and safe-action proof.
-8. **R8 - Workers and Node Administration (WL-ARCH-009, WL-UX-011) - Queued.**
-   One Workers interface replaces State of the Mesh and This Node, backed by
-   process-isolated workers, complete node providers, and typed staged actions.
-9. **R9 - Construct Experience (WL-UX-009, WL-UX-012) - Queued.** Quazar
-   Dark/Light, the full-width taskbar, search-first Home, and responsive
-   seat/tablet interaction pass visual signoff.
+1. Workloads runtime and native attachment.
+2. Browser VM cutover and standalone legacy repository.
+3. Process-isolated mackesd and Workers.
+4. Collaboration Suite and rich clipboard.
+5. Maps/MG90 and universal resource browser.
+6. Flatpak App VMs and Android Workloads.
+7. Music/Media Player.
+8. Quazar visual integration, health modal/Kiron, and release/recovery proof.
 
-WL-CRIT-006 and WL-CRIT-007 are cross-release proof obligations. They collect
-production evidence and recovery results without becoming competing product
-milestones.
+## Story execution contract
 
-## Survey Decision Register - 2026-07-29
-
-The following decisions are normative modifications to the active epics below.
-The latest survey answer wins when it conflicts with an older planning note;
-the current code, governance, and archive remain evidence sources. These are
-implementation instructions, not a second worklist.
-
-### Integrated release actions
-
-1. Keep the seven active epics separate for ownership and acceptance, but build
-   one integrated engineering-preview release. Do not mark an epic complete or
-   promote the platform to production until its stated production gates pass.
-2. Use the local checkout as the source of truth. Commit and push the selected
-   revision directly to `master`; farm jobs fetch that exact GitHub revision.
-   No additional review guard is required by this operator decision, but farm
-   gates remain mandatory.
-3. Keep Fedora 43 thin-lighthouse packages separate from Fedora 44 workstation
-   packages. Auto-upgrade role-package drift during deployment and verify the
-   resulting role contract before declaring a node healthy.
-4. Deploy the preview to Dell, Eagle, and seat 15 simultaneously; use seat 15
-   as the observation seat rather than a pre-rollout canary. Require all three
-   lighthouses, canonical substrate completeness, hard resource budgets, and a
-   hard free-space floor for production promotion.
-5. If an upgrade fails, stop promotion, preserve diagnostics, re-enroll the
-   failed node, and deploy a corrected revision forward. Do not make rollback a
-   required recovery path. Preserve prior signed artifacts for provenance only.
-6. Record the operator decisions in this file and keep dated archive snapshots
-   immutable. Completed implementation with missing live proof is archived with
-   the evidence gap for the preview, while production promotion remains gated.
-
-### Cross-epic contract actions
-
-1. Make the public `magic-mesh-browser-stack` repository history-bearing and
-   independently buildable before deleting the host Browser. Browser VM sizing
-   is hardware-adaptive with safe operator bounds; RDP and Sunshine/Moonlight
-   are equal first-class display paths with explicit health and selection.
-2. Make the Mesh Collaboration Suite the single collaboration destination with
-   exactly six sections: Alerts, Chat, Calls, Files, Editor, and Clipboard.
-   Chat uses node direct messages and simple saved groups; remove Teams/channels,
-   tasks, Discord, AI, and separate Transfers/Activity/Settings destinations.
-3. Make the suite the owner of session-only Clipboard history/actions while
-   WL-FUNC-016 owns seat, mesh, KDC/mobile, and VDI transport. Rich MIME events
-   broadcast to every enrolled node after explicit session opt-in; inline text
-   is bounded to 1 MiB and Files transports larger or binary payloads.
-4. Make Maps offline-capable with a native local routing engine and open or
-   zero-cost feeds. Show source age and disable unsafe actions for stale data.
-   Use the retained MG90 mirror with direct polling as a stale-data fallback,
-   enable GPS when Maps opens, retain no additional motion policy, and support
-   Quazar Dark/Light in Car. Live MG90 proof is a production gate, not a preview
-   blocker.
-5. Make Workers the only durable mesh and node-administration interface. Old
-   State of the Mesh, Fleet & Mesh, This Node, System, Storage, and About names
-   may normalize to Workers as routing aliases but may not retain renderers or
-   state. Keep Control Center transient. Use typed, staged, admin-authorized
-   actions, visibly expose unsupported capabilities, auto-recover unsafe
-   profiles, warn before network disruption, and require the named OEM adapters
-   for production.
-6. Make Quazar the only platform visual language with Dark and Light modes,
-   balanced information density, licensed shared icons, expressive Apple-like
-   shared motion as the default, the Terminal-pattern top bar with the
-   previously approved exemptions, and a 25%-thinner two-row zebra side tab bar.
-   Preserve the governed Maps content-color and focused-VDI exceptions; guest
-   Browser chrome remains outside Construct styling.
-7. Make the taskbar full-width with 40px targets, Front Door search as Start,
-   user-selected first-boot pins, pin/unpin personalization without reordering,
-   one focus underline, icon-only overflow, physical-screen centering, shared
-   Bottom/Left order, deleted App Grid, and focused-VDI auto-hide.
-
-### Operator decisions - 2026-07-31
-
-1. Remove OpenStack/Nova references and implementation code completely. The
-   provider-neutral replacement path is the required destination; do not retain
-   OpenStack compatibility or user-facing terminology.
-2. Fleet-wide search/index access is authorized with a seven-day retention
-   window. Expired data must be removed and access remains subject to the
-   existing mesh trust and authorization model.
-3. A real screen-reader/TTS consumer is not required for the current scope.
-   Retain accessible touch interaction as a requirement for tablet surfaces.
-4. Resolve the Browser chrome visual ruling using platform best practice:
-   conform it to the Quazar dark/light design tokens, with touch-sized tablet
-   controls where applicable.
-5. Integrate Fedora's system-packaged LibreOfficeKit as a sandboxed headless
-   platform engine behind an entirely egui-visible Editor. Writer, Calc, and
-   Impress are Editor workspace kinds, not App VMs or host application windows;
-   Files owns their associations and open/save/version operations.
-6. Printing is a Construct-owned, world-class Editor workflow over the native
-   LibreOfficeKit integration:
-   printer discovery and health, local/mesh printer selection, live
-   page-faithful preview, paper/tray/orientation/margins, duplex/binding,
-   color, copies, collation, ranges, scaling, N-up/booklet, PDF output,
-   presets, progress, cancel, retry, and tablet-sized touch controls.
-7. Audio is a first-class production requirement across seats, App VMs,
-   Browser VMs, VDI, the Mesh Collaboration Suite, and node-to-node streaming.
-   PulseAudio compatibility must be present through PipeWire's Pulse server;
-   ALSA,
-   PipeWire, WirePlumber, UCM, codecs, permissions, services, device
-   discovery, microphones, speakers, HDMI/Bluetooth, VM audio, and remote
-   audio transport must all be installed, routed, observable, recoverable,
-   and proven live. Audio may not be marked optional or unavailable for
-   production promotion.
-
-### Mesh Collaboration Suite survey - 2026-08-03
-
-The operator replaced the earlier Mesh Teams direction after a 20-question
-product survey and a three-question native-office follow-up. These decisions
-are the normative intent for WL-FUNC-011 and WL-FUNC-016 and supersede older
-Teams/channel, App-VM LibreOffice, text-only clipboard, durable Alerts-inbox,
-Discord, task, and assistive-AI requirements where they conflict.
-
-1. The product is named `Mesh Collaboration Suite` and has exactly six primary
-   sections: Alerts, Chat, Calls, Files, Editor, and Clipboard.
-2. Files is a universal file workspace: browse local, mesh, and SFTP sources and
-   create, monitor, pause, resume, retry, inspect, and verify every transfer.
-3. Remove Teams/channels, Tasks, Discord, and AI. Chat retains only node direct
-   messages and simple saved groups.
-4. Alerts aggregates events from every platform node and service through one
-   canonical envelope, with node, service, and severity filters.
-5. Relevant alerts also appear as transient system rows inside Chat while
-   Alerts remains the aggregate view.
-6. Alerts is an ephemeral bounded stream, not a durable triage queue. Durable
-   health issues and recovery remain owned by System and Mesh Health.
-7. Calls supports both direct and group voice/video sessions.
-8. Direct calls prefer peer-to-peer WebRTC; group calls and failed direct paths
-   use a self-hosted relay/SFU.
-9. Calls includes screen sharing and explicit-consent remote control.
-10. SIP uses a provider-neutral shared gateway pool, with Vitelity as the first
-    live adapter rather than the permanent provider model.
-11. Every node receives an internal SIP URI and may have optional inbound DID
-    mappings.
-12. The caller selects the outbound SIP gateway for each call; the suite may
-    remember the last choice and must show gateway health and failure state.
-13. Clipboard publishing starts disabled and requires opt-in every session.
-14. Clipboard supports rich content: text, formatted content, images, and file
-    payloads, with large/binary bytes transported by Files.
-15. An opted-in clipboard update broadcasts to every enrolled node, with source
-    attribution and echo prevention; only capable seats materialize it.
-16. SSH means SFTP browsing plus SFTP/rsync-over-SSH transfer jobs, not SSHFS or
-    an arbitrary remote shell.
-17. Scrape/download and multipart upload are first-class Files job adapters with
-    common progress, retry, credentials, result, and history behavior.
-18. Editor is a full IDE with projects, language intelligence, diagnostics,
-    terminals, tasks, tests, version control, and debugging.
-19. Editor opens local workspaces or managed development workspaces on a chosen
-    node; remote execution never becomes an unrestricted host-control shell.
-20. Cutover migrates useful state and settings, proves the new vertical slices,
-    then removes legacy routes, workers, writers, and packages in one hard cut.
-21. Writer, Calc, and Impress reuse LibreOfficeKit's document engine and tiled
-    editing while every visible control, dialog, and workflow remains egui.
-22. LibreOfficeKit is a Fedora system dependency. The repository carries the
-    safe adapter, native UI, packaging contract, and exact release provenance,
-    not a vendored LibreOffice source tree.
-23. Editor is one first-class section with Text/Code, Document, Spreadsheet,
-    and Presentation workspace kinds; there is no separate Office destination.
-
-### Unified This Node survey completion - 2026-07-31
-
-The operator requested completion at the 50-question cap. Questions 45-50
-were closed with the recommended defaults below so the resulting decisions are
-recorded before implementation. These choices extend WL-UX-011 and do not
-close it or imply production readiness.
-
-45. A critical health state opens an urgent alert with affected components,
-    current impact, and guided recovery actions.
-46. System and Mesh Health owns durable issue state and guided recovery. The
-    Mesh Collaboration Suite receives an ephemeral, severity-filterable alert
-    event linked to that issue and mirrors it transiently into relevant Chat;
-    acknowledgement, snooze, and escalation are not Alerts-stream state.
-47. Health views provide safe, guided recovery actions with explicit impact
-    and confirmation before mutation.
-48. All operators may view health; only privileged roles may configure health
-    policy or override a reported state, with every change audited.
-49. Health refresh is live or on demand according to the view, and every
-    stale or unavailable interval is explicit rather than silently inferred.
-50. Health and This Node history can be exported as operator-readable,
-    audit-backed evidence without exporting credentials or secret material.
-
-### This Node interface rethink survey - 2026-08-01
-
-The operator selected a bold workspace redesign while retaining every existing
-capability and action. WL-UX-011 is the owning epic; this record is normative
-design direction, not a second workstream:
-
-1. Use a technical Device Manager as the primary mental model.
-2. Navigate through a hierarchy-first tree, with selected areas opening as
-   focused full-page detail views.
-3. Make the landing view inventory-first; keep health, alerts, and recovery
-   states attached to the relevant inventory items and clearly visible.
-4. Use a dense operator-console information layout with progressive disclosure.
-5. Put mutations and recovery in a dedicated Actions tab with impact,
-   confirmation, audit, and recovery details.
-6. Use a high-contrast technical visual language with strong state encoding.
-7. **Superseded 2026-08-03:** the centered System and Mesh Health modal owns the
-   sole condition-backed A–F authority. No persistent global score, local issue
-   badges, or second health presentation remains in This Node or Workers.
-8. Make the tree the primary discovery mechanism, supported by aliases,
-   related-item links, and search rather than search-first navigation.
-9. Treat desktop and tablet interaction as equal primary targets, including
-   touch-sized controls and responsive dense layouts.
-10. Permit a bold new workspace structure while preserving all functionality,
-    typed contracts, safe actions, and clear continuity to existing routes.
-
-### Workers interface merge survey - 2026-08-03
-
-The operator completed a 25-question decision pass to merge State of the Mesh,
-all of its children and services, and every This Node capability into one
-reenvisioned interface named `Workers`. These latest decisions supersede the
-older This Node interface decisions where they conflict. WL-ARCH-009 owns the
-single product/runtime cutover; WL-UX-011 supplies node providers and safe
-hardware actions and must not create a second interface.
-
-1. The primary model is an entity graph paired with a synchronized hierarchy
-   tree; the initial view is the whole mesh, not the local node.
-2. The top level is worker-first and uses the actual runtime groups `control`,
-   `observation`, `actions`, `data`, `compute`, and `integrations`.
-3. Show canonical worker IDs exactly as registered. Start with all six group
-   hubs collapsed and expand children only by explicit operator action.
-4. Selecting a worker opens a fleet comparison with one row per applicable
-   node, not a local detail page or node-first branch.
-5. Relationships are typed and filterable. Ownership, dependency, publication,
-   subscription, state/event flow, and action targeting remain distinguishable.
-6. System and Mesh Health remains a separate centered modal and the only issue
-   authority. Workers contains no grades, issue counts, health badges, health
-   links, or duplicate diagnostics dashboard.
-7. The taskbar is the only manual health entry. Existing critical auto-open may
-   remain, and the modal may deep-link one way to a Workers entity.
-8. Workers is observational. Every mutation is staged in one global Action
-   Console; worker inspectors do not execute changes directly.
-9. Action Console changes are previewed as a change set before commit, bind the
-   target and expected generation, expose impact and recovery, and report honest
-   per-item partial success rather than claiming cross-node atomic rollback.
-10. Search filters the hierarchy in place; it is not a launcher or a second
-    navigation surface.
-11. One synchronized filter state controls tree and graph. Filters cover group,
-    node, runtime state, and relationship type.
-12. Runtime data updates live and always shows freshness; manual refresh remains
-    available. Unknown or stale data never appears current.
-13. Use one bounded, redacted timeline across worker/runtime activity. Raw logs,
-    credentials, secrets, and unbounded diagnostics are forbidden.
-14. Every former This Node capability receives canonical worker ownership.
-    There is no permanent local-shell, legacy-provider, or uncategorized branch.
-15. Use deterministic registry-order layout. Do not save or accept manual graph
-    coordinates.
-16. Wide layout is tree, graph, and inspector. Narrow layout shows one pane at a
-    time with an explicit Tree/Graph/Inspector selector and predictable back
-    navigation.
-17. The visual direction is cinematic mission control using stable group hues
-    plus semantic runtime colors with icon/text redundancy.
-18. Group hues are control blue, observation cyan, actions pink, data indigo,
-    compute purple, and integrations teal. Runtime running/degraded/failed/
-    unavailable states are green/amber/red/gray.
-19. Use Kdam Thmor Pro for interface text and IBM Plex Mono for worker IDs,
-    topics, generations, timestamps, and other technical identifiers.
-20. Motion is event-driven only: selection, topology changes, new state/events,
-    and action transitions. No ambient animation or continuous decorative pulse.
-21. The cutover is atomic. There is one canonical `Surface::Workers`; legacy
-    renderers, tabs, polls, catalog entries, and duplicated state are removed.
-22. State/Workbench aliases open the Workers overview; Mesh Map/Network aliases
-    apply network filters; Fleet/Explorer aliases focus observation/compute;
-    Provisioning focuses onboarding/reconcile workers.
-23. This Node/System/Storage/About aliases open Workers with This Node selected
-    and the owning workers focused. Licenses and credits move to Workers Help/
-    About. Aliases normalize routes only and are not visible product surfaces.
-24. Workloads and other application surfaces remain separate; this merge covers
-    mesh/node administration and its worker-owned providers only.
-25. Completion requires contract, hostile-input, registry/spawn drift,
-    process-isolation, change-set security, deterministic UI, responsive render,
-    full-fleet, forced-partial-failure, and legacy-removal proof.
-
-### MG90 ownership, sharing, and cache contract
-
-1. Treat an MG90 as a network device attached to a workstation, not as a mesh
-   node or lighthouse. MG90-local state includes its radios, GNSS, IMU, WAN,
-   Ethernet, power, vehicle I/O, firmware, capabilities, and diagnostics.
-   Workstation-local state includes management credentials, the typed vehicle
-   worker, Bus publication, authorization, and audit. `management_node_id` is
-   the assignment; a workstation may manage multiple MG90 devices.
-2. Give every MG90 an independent snapshot and stable identity using ESN plus
-   operator alias. Permit multiple active workstation managers after discovery
-   and explicit approval. One approval covers all enrolled workstations; any
-   enrolled node may revoke immediately, revocation removes every assignment,
-   and re-sharing requires fresh approval. Only workstation roles may manage.
-3. Publish snapshots at
-   `state/vehicle/<management-node>/<mg90-id>`. Deduplicate competing manager
-   publications to the freshest valid complete snapshot, retain only the latest
-   stale manager snapshot for diagnostics, and show MG90 identity, management
-   node, source, age, and sharing state in normal Maps, Car, Workers, and
-   other relevant views. Remote views render the same reported domains as
-   read-only remote data; they never invent local hardware state.
-4. Use direct Ethernet first, then an authorized mesh path. Lighthouses are
-   transparent Nebula relays only: they never manage or store MG90 snapshots.
-   Fall back automatically to the healthy lowest-latency lighthouse, migrate
-   streams to a better relay, pause for a full snapshot resync, render the last
-   values with an explicit resyncing state, queue actions during resync, expire
-   queued actions with a visible failure, and reject duplicate queued writes for
-   the same setting while one is pending.
-5. Allow any active authorized manager to issue idempotent MG90 actions. Order
-   concurrent actions by mesh arrival time using last-accepted-action-wins;
-   actions already in flight may finish after revocation. A failed manager
-   triggers automatic takeover by another manager, the returning original
-   manager resumes automatically, queued actions are discarded during takeover,
-   and all nodes receive ephemeral takeover notifications. MG90 availability
-   is optional for workstation mesh readiness; all nodes retain the last shared
-   telemetry as stale when managers are offline.
-6. Keep stale data in a viewer-local, OS-protected cache for 24 hours. Cache
-   telemetry, redacted raw diagnostics, and action outcomes but never
-   credentials. Any local user may view or purge one MG90 or the whole cache;
-   revocation clears it immediately. Show alias/ESN, management node, last-seen
-   time, stale age, and relay path. Stale views are read-only. Under disk
-   pressure disable caching while live telemetry/actions continue with an
-   affected-view warning; automatic expiry and manual purge restore normal
-   behavior when space is available.
-
-### Fit-for-purpose audit actions - 2026-07-30
-
-The operator selected the following cross-cutting decisions. They are owned by
-`WL-CRIT-006` unless an existing feature epic is named; do not create duplicate
-epics for these rows. The complete rationale and interface requirements are in
-[`docs/platform/FIT-FOR-PURPOSE-AUDIT-2026-07-30.md`](FIT-FOR-PURPOSE-AUDIT-2026-07-30.md).
-
-1. GitHub required checks are authoritative; the build farm is the heavy
-   self-hosted execution backend and publishes signed evidence.
-2. Production requires three lighthouses and three workstations.
-3. Failed nodes recover through corrected-forward re-enrollment; rollback is
-   not a required recovery path.
-4. Flat trust gains capability quarantine, default-deny workload exposure, and
-   explicit blast-radius diagnostics.
-5. Enrollment becomes one-time, scope-bound, guided, approved, and auditable.
-6. Readiness becomes capability-based rather than one all-or-nothing verdict.
-7. Every replicated domain declares its deterministic merge and provenance rule.
-8. The host Browser is removed in favor of the dedicated Browser VM.
-9. VDI sessions receive stable workload identity and resume/reconnect behavior.
-10. Clipboard uses one versioned rich-MIME contract. UTF-8 text up to 1 MiB may
-    travel inline; Files owns binary and larger payload transport.
-11. The six-section Mesh Collaboration Suite is the sole collaboration
-    destination.
-12. Workers is the durable mesh/node settings and administration authority;
-    Control Center remains transient.
-13. Hardware mutations use typed, allowlisted, audited adapters with safe
-    fallback and watchdog recovery.
-14. Maps is offline-first and MG90 state is typed, fresh, sourced, and honest.
-15. Quazar owns shared Dark/Light tokens, typography, icons, motion, and states.
-16. The taskbar is full-width and Start opens focused Front Door search.
-17. Releases publish an explicit Fedora compatibility matrix using the oldest
-    supported ABI.
-18. Signed provenance binds source, artifacts, SBOM, static gates, and live
-    evidence.
-19. Incident bundles correlate health, audit, worker, transport, workload, and
-    operator events.
-20. Replicated live state is the target recovery model; current encrypted
-    backups remain mandatory until peer-recovery proof passes.
-21. Lighthouse failover is automatic and visibly degraded while recovering.
-22. Workloads require capability and resource-budget admission.
-23. Data uses minimal retention with explicit replication, TTL, redaction, and
-    purge rules.
-24. The immutable image exposes bounded capability profiles rather than one
-    unqualified all-in-one contract.
-25. A permanent six-node integration and chaos testbed is a production gate.
-
-## Status Vocabulary
-
-- `Remaining` - unfinished implementation that can proceed.
-- `Blocked` - unfinished implementation that requires a named external action,
-  account, secret, hardware resource, or release authority.
-- `Needs clarification` - implementation cannot be specified safely from
-  repository evidence and current operator decisions.
-
-Completed and retired work is moved to `docs/worklist-archive/`; it never
-remains here under a completed status.
+Every story below is a self-contained unit. The implementing agent must:
+read the named inputs; change only the owned files; produce the named deliverable;
+add the stated hostile or regression test; run the stated validation; record the
+revision, command, result, and evidence path; and mark the story complete only
+when the Done when condition is true. A passing compile without the named
+behavioral evidence is not completion.
 
 ## Core Architecture
+
+
+### WL-ARCH-010 - Make Workloads the sole VM/container runtime, readiness, and presentation authority
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: VM, container, session, console, and shell paths still publish or interpret overlapping lifecycle state; local attachment and capacity admission are not fully
+  proven.
+- Required outcome: One versioned, persisted, idempotent Workload operation API controls VM/container lifecycle. The reconciler is the only actuator, libvirt/virtqemud is
+  the VM adapter, Quadlet/systemd is the container adapter, and the shell uses bounded typed projections. Local Display1/KMS attachment and RDP/SPICE/VNC recovery are
+  tested.
+- Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, and several hostile farm tests exist. Workload cleanup now treats
+  an already-stopped libvirt domain as an idempotent destroy/undefine boundary, and an independent live-proof helper validates the typed projection and refuses
+  missing runtime evidence. Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
+- Remaining work:
+- **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator
+  accepts absent/stopped-domain diagnostics during ordered cleanup while still
+  refusing unrelated virtqemud failures. Workload `workload_compute` passed
+  23/23 on `.90` in `workload-cleanup-idempotence-20260806-r1`.
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
+- **Admission/recovery proof checkpoint (2026-08-06):**
+  `verify-workloads-live-proof.py` validates bounded typed state, placement,
+  resources, retry state, and lease safety; its strict live command honestly
+  refused because mackesd, role pin, and Bus were absent. Live HostCapacity,
+  restart/crash, native attachment, and Dell/seat proof remain open.
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`.
+- **Typed live-proof checkpoint (2026-08-06):** the read-only verifier now
+  consumes only `action/workload/operation` and typed Workload projections;
+  self-test passed. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-live-proof-typed-operation-r1.md`.
+- **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON
+  admission rejects duplicate top-level and nested keys; `.50` passed 9/9.
+  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
+- **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness,
+  relay state, and stale sockets; BigBoy passed 7/7. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
+- **Storage path-boundary checkpoint (2026-08-06):** apply-time virtual-storage
+  validation rejects symlinks and outside-root image paths before executor use;
+  `.90` passed 1/1. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
+- **Durable journal checkpoint (2026-08-06):** persisted Workload journals reject
+  recursive duplicate JSON keys before replay; BigBoy passed 8/8 reconciler tests.
+  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-ledger-duplicate-keys-r1.md`.
+- **Shell projection checkpoint (2026-08-06):** duplicate-key node projections
+  fail closed; `.50` was ENOSPC during compile, so no pass is claimed. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-shell-projection-duplicate-keys-r1.md`.
+- **VDI reconnect checkpoint (2026-08-06):** generation-zero reconnect evidence
+  is refused; BigBoy passed 1/1. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-vdi-reconnect-generation-r1.md`.
+- **Journal rollback checkpoint (2026-08-06):** failed atomic phase flushes roll
+  back in-memory status; BigBoy passed 9/9. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-ledger-flush-rollback-r1.md`.
+- **Attachment generation checkpoint (2026-08-06):** stale lease generations
+  are rejected; BigBoy passed 1/1. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-status-attachment-generation-r1.md`.
+- **Quadlet catalog checkpoint (2026-08-06):** Start/StartAndAttach validate a
+  promoted non-empty OCI artifact before systemd or Display1; `.90` passed 2/2.
+  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-quadlet-catalog-r1.md`.
+- **Cloud lifecycle retirement checkpoint (2026-08-06):** the cloud worker no
+  longer classifies or dispatches legacy VM `instance-*` or container
+  `container-*` lifecycle topics; the stale rootless systemd/journal adapter
+  was removed. Front Door and Explorer publish typed Workload operations only;
+  mackesd refusal coverage passed 6/6 plus 2/2 on BigBoy, and the shell
+  lifecycle suite passed 27/27 on `.50` after `.90` ENOSPC rerouting.
+  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-cloud-lifecycle-retire-r1.md`.
+- **Quadlet materialization and backend admission checkpoint (2026-08-06):**
+  the sole typed container actuator now loads a missing approved OCI archive
+  into local Podman storage, atomically installs a hashed-identity rootful
+  Quadlet unit, reloads systemd, and removes the unit on destroy; runtime names
+  cannot contain Workload `:` separators or collide by simple sanitization.
+  BigBoy passed the focused materialization test 1/1. The typed contract now
+  exposes separate VM/container storage pools and matching reservation
+  admission; `.50` passed 2/2 backend-pool tests. The old cloud deploy handler
+  refuses before staging/runner activity, and the shell container lens is
+  preview-only; `.50` passed 4/4 IAC tests. The follow-up admission wiring
+  below now connects the live reconciler to the backend-specific contract;
+  live capacity and storage proof remain open. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-quadlet-admission-r1.md`.
+- **Backend admission and managed storage wiring checkpoint (2026-08-06):**
+  `workload_compute` now partitions active reservations by VM versus Quadlet
+  backend, probes separate live pools, and calls typed backend-specific
+  admission. The rootful Quadlet image path and generated unit use the storage
+  worker's managed `/var/lib/mde-vms/containers` subtree. Storage layout
+  creation rejects symlink, escape, and non-directory substitutions. Browser
+  Workload caller and activation/package contracts passed their typed-action
+  checks. BigBoy passed the focused reconciler admission test 1/1 and `.90`
+  passed the hostile storage-link test 1/1; the focused backend contract gate
+  passed 12/12 on `.50`. This checkpoint does not
+  claim live Dell/seat-15, native KMS/EGL, packaging-install, or restart proof.
+  Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-wiring-r1.md`.
+  1. S1 Inventory authorities and remove reachability.
+     - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
+     - Inputs: repository search, CI authority scan, current evidence.
+     - Deliverable: checked-in inventory and negative tests for each retired topic/symbol.
+     - Depends on: none.
+     - Acceptance: every owner is unique and every retired path is absent or proven unreachable.
+     - Validation: run lint-workload-authority, authority scan, and focused farm tests.
+     - Done when: inventory, tests, hashes, and evidence file exist.
+  2. S2 Freeze bounded Workload contracts.
+     - Objective: finish versioned IDs, desired/observed states, operation status, generation, deadline, capacity, and attachment lease types.
+     - Inputs: mackes-mesh-types cloud/workload modules and S1 inventory.
+     - Deliverable: serde-bounded contracts plus hostile round-trip/schema-skew tests.
+     - Depends on: S1.
+     - Acceptance: unknown, oversized, stale, replayed, and unauthenticated inputs fail closed.
+     - Validation: run focused mackes-mesh-types cargo tests on .50.
+     - Done when: all contract tests pass and source hashes are recorded.
+  3. S3 Make reconciliation restart-safe.
+     - Objective: journal accepted requests before side effects and reconcile with CAS, idempotency, deadlines, cancellation, backoff, and bounded projections.
+     - Inputs: S2 contracts and existing journal/reconciler.
+     - Deliverable: one reconciler with crash/replay/capacity/cancellation state-machine tests.
+     - Depends on: S2.
+     - Acceptance: restart never duplicates a domain, container, lease, or side effect.
+     - Validation: run workload_compute/reconciler tests on BigBoy.
+     - Done when: hostile matrix passes and live recovery evidence is recorded.
+  4. S4 Migrate real adapters and callers.
+     - Objective: route VM effects only through libvirt/virtqemud and containers only through Quadlet/systemd; migrate Browser, App, Android, Service, and Workloads
+       callers.
+     - Inputs: S1 inventory, S2 contracts, ARCH-008/019 caller maps.
+     - Deliverable: adapter implementations, migrated callers, and no competing worker/topic.
+     - Depends on: S2 and S3.
+     - Acceptance: one typed StartAndAttach path reaches ready or actionable failure.
+     - Validation: run adapter fixtures, caller negative tests, and package checks on BigBoy.
+     - Done when: old publishers/readers are deleted and migration evidence is signed.
+  5. S5 Enforce admission and storage safety.
+     - Objective: reserve bounded CPU/RAM/tasks/I/O and offer only fitting profiles; preview contiguous-space XFS creation without destructive partition changes.
+     - Inputs: host capabilities, storage workers, Workload policy.
+     - Deliverable: admission policy, UDisks2/parted preview, XFS/SELinux setup, refusal tests.
+     - Depends on: S2.
+     - Acceptance: unknown capacity, Lighthouse placement, oversubscription, shrink/move/format requests all fail closed.
+     - Validation: run admission/storage hostile tests and Tofu/Quadlet/SELinux checks on .90.
+     - Done when: safe preview and refusal evidence are present.
+  6. S6 Implement authenticated native attachment.
+     - Objective: transfer one-use Display1 DMA-BUF leases with peer credentials, nonce, generation, expiry, and SCM_RIGHTS into the existing KMS/EGL owner.
+     - Inputs: Display1 broker, mde-egui DRM path, S2 lease contract.
+     - Deliverable: FD broker, scanout/damage/input/audio/clipboard bridge, cleanup tests.
+     - Depends on: S3 and S4.
+     - Acceptance: unsupported formats, expired leases, device loss, resize, crash, and duplicate use clean every resource and never expose an FD on the Bus.
+     - Validation: run Display1/DRM/VDI tests and native fixture on BigBoy.
+     - Done when: zero-copy metrics and recovery evidence are recorded.
+  7. S7 Replace provisioning UX and package policy.
+     - Objective: make Workloads UI one typed Open/StartAndAttach stepper and package all adapter, slice, storage, SELinux, and socket policy.
+     - Inputs: S4-S6, UX-009 primitives.
+     - Deliverable: render-only UI, package units, upgrade cleanup, and GUI regression fixtures.
+     - Depends on: S4, S5, S6.
+     - Acceptance: UI performs no backend I/O and install/upgrade leaves no deleted process or stale lease.
+     - Validation: run shell render, RPM payload, and systemd/package gates on .50.
+     - Done when: clean install/upgrade evidence and fixture captures exist.
+  8. S8 Prove live lifecycle and recovery.
+     - Objective: exercise cold/warm start, native frame/input/audio/clipboard, remote recovery, container health, stop/restart, suspend/rejoin, reboot, and
+       corrected-forward upgrade.
+     - Inputs: completed S1-S7 and release revision.
+     - Deliverable: five-seat and three-lighthouse evidence bundle.
+     - Depends on: S7, CRIT-006, CRIT-007.
+     - Acceptance: Dell and seat 15 pass first; every required seat and lighthouse rejects unsafe placement and recovers.
+     - Validation: farm release gates plus named live-seat commands.
+     - Done when: all required artifacts and limitations are recorded; unresolved hardware keeps Status Remaining.
+- Scope: Owns Workload contracts, reconciler, adapters, readiness, admission, storage, attachment, presentation, provisioning UX, packaging, and integrated proof. Browser
+  guest internals, generic worker runtime, health modal, and release authority are owned elsewhere.
+- Relevant files/components: crates/mesh/mackes-mesh-types, crates/mesh/mackesd workers/cloud, mde-shell-egui/iac and vdi, mde-egui/drm, libvirt/OpenTofu,
+  Quadlet/systemd, storage and SELinux packaging.
+- Dependencies: ARCH-008, ARCH-009, FUNC-019, UX-009, CRIT-006, and CRIT-007 consume this API; none may add a lifecycle or console authority.
+- Acceptance criteria:
+  1. Duplicate/replayed/stale/deadline/cancelled operations are deterministic and side-effect safe.
+  2. Capacity and Lighthouse placement fail closed; no four-thread host receives four guest vCPUs.
+  3. Native and recovery transports pass frame, input, audio, clipboard, reconnect, resize, and cleanup tests.
+  4. The shell only sends typed intent and renders bounded state.
+- Verification method: run lint-workload-authority first; use @farm:{cargo test -p mackes-mesh-types}
+  @farm:{cargo test -p mackesd workload_compute}
+  @farm:{cargo test -p mde-shell-egui --features live-vdi}
+  and BigBoy release/package gates with explicit host and slot; capture live evidence on required seats.
+- Origin or merged source IDs: Job One 2026-08-05; archived ARCH-006/007, CRIT-001; VDI zero-copy design; current Dell/seat-15 incidents.
 
 ### WL-ARCH-008 - Extract the host Browser stack and replace it with a VM Browser
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Construct still ships a host Browser built around CEF/Servo
-  offscreen helpers, shared-memory frame copies, CPU conversion, and shell
-  texture uploads. Video refresh is visibly unreliable, Browser activity can
-  compete with the shell repaint loop, and native host page execution violates
-  the governed thin-client model in which applications run inside VM guests.
-  Browser-owned code is spread across shell, daemon, packaging, worker, and
-  mixed-purpose files, so deleting only the helper crates would leave reachable
-  runtime and package seams.
-- Required outcome: The complete old host Browser stack is preserved in an
-  public, history-bearing, clean-clone-buildable repository at
-  `matthewmackes/magic-mesh-browser-stack`. Construct ships no CEF/Servo host
-  engine, helper, Browser worker family, Browser RPM, or Browser runtime
-  installer. `Surface::Browser` remains, but it only starts or resumes a
-  dedicated `browser-vm`, attaches through VDI, renders the guest framebuffer,
-  and forwards focused input. Chromium, browser chrome, tabs, page execution,
-  media decode, and page failures remain inside the guest.
-- Current state: The standalone repository preserves the old CEF/Servo stack.
-  Browser uses a typed Workloads start/resume controller; RDP is preferred and
-  Sunshine/Moonlight explicit. Dell runs immutable Fedora 44 source `1f8bd845…`,
-  digest `sha256:17e38205…b0556`, accepted r5/r6 identity, encrypted login, and
-  five-second alerts. Pushed RDP client `9660cbd9…` passed three strict runs:
-  1920x1080 Chromium, reversible pointer/Escape input, 79.6% reconnect repaint,
-  and 99.9% identity. Farm validators passed playback/capture endpoint wiring
-  and fixed-fixture A/V decode; VA decode failed a rolled-back GL probe. Exact
-  release `6f28404b…` auto-selected Workloads, brokered RDP, published active,
-  and rendered Chromium in a native Dell readback. Public repository/host
-  removal, sample-backed audio, five-tab performance, and fleet rollout remain;
-  see the dated WL-ARCH-008 evidence.
+- Problem: CEF/Servo host Browser code, frame copies, helpers, and package seams still compete with the DRM shell and violate the VM-only application boundary.
+- Required outcome: Preserve the old stack with history in matthewmackes/magic-mesh-browser-stack, remove it from magic-mesh, and make Surface::Browser start/resume a
+  browser-vm that renders guest Chromium over VDI with focused input and guest-owned chrome.
+- Current state: The standalone repository and typed Browser workload path exist; source/package removal, portable data migration, guest image quality, audio, and
+  five-seat performance proof remain.
+- **Portable data checkpoint (2026-08-06):** deterministic migration helper and redacted self-test cover allowlisted profile data, downloads, policies, and extensions;
+  BigBoy probe passed. Evidence: `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`. Live legacy-profile import remains open.
+- **Portable-boundary checkpoint (2026-08-06):** the disposable-fixture validator
+  checks allowlists, deterministic manifests, idempotent reruns, symlink rejection,
+  and secret non-export; local and `.50` probes passed. Evidence:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-boundary-validator-r1.md`.
 - Remaining work:
-
-  1. Re-run and review the source commit, workspace/package/process inventory,
-     persistent Browser data locations, focused test baseline, and
-     source-to-destination path map before each extraction batch.
-  2. Create a disposable history-filtered clone and publish
-     `matthewmackes/magic-mesh-browser-stack` before deleting source from
-     `magic-mesh`. Preserve attribution, relevant history, `LICENSE`, `NOTICE`,
-     and an `UPSTREAM-SOURCE.md` provenance record. Never rewrite history in the
-     live `magic-mesh` worktree.
-  3. Move the old shell Browser UI, every `mde-web-*` crate,
-     `mde-browser-workers`, Browser-only mixed-file logic, package assets,
-     installers, policies, units, verification helpers, and implementation docs
-     into the standalone repository.
-  4. Make the new repository independently buildable. Add its own workspace,
-     toolchain, lockfiles, CI, package instructions, and minimal local
-     compatibility contracts. No path, submodule, or Git dependency may point
-     back to `magic-mesh`. Keep CEF and Servo in separate/nested workspaces where
-     their native runtime and SQLite constraints require separate lockfiles.
-  5. Inventory and back up legacy profiles, bookmarks, history, sessions,
-     downloads metadata, policies, passkeys, cache, extension state, and model
-     assets. Add an idempotent import/export path for portable Chromium data.
-     Never silently export cookies, passwords, private passkeys, or sealed
-     credentials into the guest.
-  6. Remove the host Browser from `magic-mesh`: workspace members/excludes,
-     lockfile edges, shell engine/spawn/frame code, Browser worker registrations,
-     Browser-only transfer/MPRIS/KDC/policy consumers, package variant, weak
-     dependencies, binaries, runtime/model installers, policies, units, hooks,
-     payload expectations, tests, and active host-Browser documentation.
-  7. Add a reusable `browser-vm` profile using the existing
-     `DeliveryType::DesktopVm` contract. Size it from host capabilities within
-     safe operator bounds, retaining 4 vCPU, 8 GiB RAM, and 64 GiB disk as the
-     baseline profile. The new repository-owned profile contract fixes the
-     guest identity, Chromium/Sway ownership, RDP preferred transport,
-     Sunshine alternate, and `host_browser=false`; the image still must contain
-     Chromium, supported GPU/video acceleration, PipeWire integration, and
-     guest agents.
-  8. Replace shell `web` state with a small VM controller. Browser activation
-     resolves and starts/resumes the stable workload, waits for its advertised
-     desktop source, and exposes RDP plus Sunshine/Moonlight as explicit display
-     paths with transport health and user-visible selection. RDP is preferred
-     for the R1 Chromium service release; an unavailable selected transport
-     offers the alternate and a preference change rather than silently
-     switching. Store the mesh-wide preference in replicated settings, expose
-     it in Browser settings and Workers, and apply changes on the next Browser
-     launch.
-  9. Preserve damage rectangles through VDI decode/apply/upload and add metrics
-     for frame cadence, full/partial uploads, decode/apply/upload time,
-     reconnects, shell repaint, and host CPU/GPU load. Enable RDP audio into
-     PipeWire or add an equally typed guest-audio stream.
-  10. Keep Construct navigation, status, emergency controls, session switching,
-      and global shortcuts host-owned. Forward pointer/key/text/scroll and the
-      WL-FUNC-016 VDI clipboard channel only while the viewport owns focus.
-      Switching surfaces stops unnecessary host uploads without destroying the
-      VM; failure shows bounded retry and actionable unavailable diagnostics.
-  11. Remove the stale host Browser visual exception from current authority.
-      Guest Chromium owns its UI; only Construct-owned VM connection,
-      unavailable, and diagnostic states use the shared Quazar language.
-  12. Cut over packages and upgrades only after the public repository and clean
-      clone are proven. Remove obsolete services without deleting user data.
-      Preserve prior signed artifacts for provenance, but recover failed
-      upgrades by re-enrollment and corrected forward deployment rather than a
-      required rollback path.
-- Scope: This epic owns old-stack preservation, standalone buildability,
-  user-state migration, complete Construct host-stack removal, Browser VM image
-  and workload wiring, shell VDI behavior, guest audio/video quality,
-  install/upgrade cleanup, docs, and forward recovery. It does not mirror guest tabs,
-  omnibox, extensions, or browser chrome into Construct v1, and it does not add
-  a Browser-specific Workloads delivery type.
-- Relevant files/components: root workspace and packaging manifests;
-  `crates/desktop/mde-shell-egui/src/web/` plus the `mde-web-*` and
-  `mde-browser-workers` crates; existing Workloads, VDI, image-build, package,
-  and Browser runtime assets; planned sibling checkout
-  `/root/magic-mesh-browser-stack`.
-- Dependencies: Use the existing typed Workloads placement, authorization,
-  lifecycle, and console contracts as a completed, non-blocking foundation.
-  Use WL-FUNC-016 for VM clipboard and WL-UX-009 for Construct-owned connection
-  and failure states. Repository extraction can proceed in parallel with both.
+  1. S1 Preserve history and build the standalone repository.
+     - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
+     - Inputs: current repo commit, Browser inventory, licenses.
+     - Deliverable: repository, provenance record, workspace/lockfiles, CI, and clean-clone build log.
+     - Depends on: ARCH-010 S2.
+     - Acceptance: no path/submodule/Git dependency points back to magic-mesh.
+     - Validation: clean clone cargo build/test on BigBoy.
+     - Done when: immutable revision and evidence hash are recorded.
+  2. S2 Migrate portable Browser data safely.
+     - Objective: inventory and idempotently import/export profiles, bookmarks, history, sessions, downloads, policies, and extensions without exposing secrets.
+     - Inputs: legacy profile locations and guest image contract.
+     - Deliverable: migration tool with imported/skipped/failed counts and redacted fixtures.
+     - Depends on: S1.
+     - Acceptance: downloads survive; cookies, passwords, passkeys, and sealed credentials never export silently.
+     - Validation: migration unit/property tests and secret scan.
+     - Done when: two consecutive migrations produce the same result.
+  3. S3 Remove host Browser production seams.
+     - Objective: delete host crates, workers, engines, package variants, installers, policies, units, and active docs.
+     - Inputs: S1 inventory and S2 migration.
+     - Deliverable: source/package deletion plus negative reachability scan.
+     - Depends on: S1, S2.
+     - Acceptance: no mde-web, CEF/Servo host engine, Browser helper, or Browser RPM is reachable.
+     - Validation: workspace/package/architecture/supersession gates.
+     - Done when: scan is clean in a fresh checkout.
+  4. S4 Build and integrate browser-vm.
+     - Objective: create the 4-vCPU/8-GiB/64-GiB baseline image and typed Workload profile with Chromium, GPU/video, PipeWire, guest agents, RDP preferred, Sunshine
+       alternate, and host_browser=false.
+     - Inputs: ARCH-010 adapter/readiness contracts and image builder.
+     - Deliverable: reproducible image/profile and readiness fixture.
+     - Depends on: S3 and ARCH-010 S4.
+     - Acceptance: start/resume exposes the advertised desktop source or an actionable failure.
+     - Validation: image/package and Workload tests on BigBoy.
+     - Done when: profile hash and readiness evidence exist.
+  5. S5 Replace shell Browser with VDI controller.
+     - Objective: preserve Construct navigation, focused input, clipboard, source selection, reconnect, and preference without guest chrome mirroring.
+     - Inputs: S4, VDI contract, UX-009.
+     - Deliverable: controller and render/input/audio regression fixtures.
+     - Depends on: S4.
+     - Acceptance: switching transport preserves the VM and never silently changes preference.
+     - Validation: shell live-vdi cargo tests and rendered captures.
+     - Done when: no host helper process exists during the proof.
+  6. S6 Prove quality and upgrade behavior.
+     - Objective: verify five-tab cadence, damage uploads, navigation latency, guest audio, install/upgrade cleanup, and corrected-forward recovery.
+     - Inputs: S1-S5 and release artifacts.
+     - Deliverable: timestamped 15-minute metrics, audio proof, RPM proof, and five-seat captures.
+     - Depends on: S5, CRIT-006, CRIT-007.
+     - Acceptance: >=30 FPS visible target, no unexplained >500ms stall, navigation p95 <=100ms, and no secret/data loss.
+     - Validation: farm standalone/magic-mesh gates and live seat commands.
+     - Done when: all measurements and unavailable hardware are honestly recorded.
+- Scope: Owns old-stack preservation, migration, host removal, Browser VM image/workload, shell VDI behavior, packaging, and proof. Guest Chromium UI and generic Workload
+  lifecycle are out of scope.
+- Relevant files/components: root manifests, mde-shell-egui web/vdi, old mde-web crates/workers, Browser packaging, image-build, VDI, and sibling browser repository.
+- Dependencies: ARCH-010 is blocking; FUNC-016 owns VDI clipboard; UX-009 owns Construct connection/error styling.
 - Acceptance criteria:
-
-  1. The remote standalone repository records immutable provenance, contains
-     every Browser-owned source/asset/doc, preserves relevant history, and
-     builds/tests from a clean clone with no sibling checkout.
-  2. Its top-level workspace and separate CEF/Servo manifests build the old
-     Browser application, helpers, renderer, verifier, workers, and package
-     artifacts without production stubs.
-  3. `magic-mesh` has no `mde-web-*`, `mde-browser-workers`, host Browser
-     engine/spawn/frame path, Browser helper/runtime package, setup unit,
-     SELinux policy, Widevine/model installer, or `magic-mesh-browser`
-     dependency/payload.
-  4. Legacy user data is inventoried and backed up; portable migration is
-     idempotent and reports imported/skipped/failed rows; downloads survive;
-     secret material is never silently exposed.
-  5. Opening Browser starts or resumes `browser-vm` through typed Workloads,
-     displays live Chromium over RDP or Sunshine/Moonlight, forwards focused
-     input, and leaves shell navigation usable. Missing sources and VM/transport
-     crashes degrade only the viewport. Switching transport preserves the same
-     VM session and never silently changes the global preference.
-  6. Switching away stops unnecessary host texture work without killing the
-     guest; returning resumes the same session; no old Browser helper process is
-     present on the host.
-  7. Guest `vainfo` succeeds and Chromium media diagnostics report GPU video
-     decode for the acceptance stream.
-  8. Five concurrent 1080p video tabs run for 15 minutes. The visible tab
-     sustains at least 90 percent of source cadence up to the supported target,
-     with a minimum target of 30 fps, no unexplained VDI frame stall over
-     500 ms, and continuous updates for five stationary-pointer minutes.
-  9. Under that load, Construct navigation/session switching is at or below
-     100 ms p95 with no measured response over 250 ms; RDP damage produces
-     partial uploads; hidden Browser state does not continuously repaint.
-  10. Guest audio appears in the host PipeWire VM/application mixer path and
-      follows mute/volume policy. PulseAudio compatibility, PipeWire,
-      WirePlumber, ALSA/UCM, device permissions, VM audio, and the selected
-      VDI transport must all be live. A silent fallback or unavailable audio
-      evidence fails production acceptance; the engineering preview may not
-      promote until `.15` and the six-node testbed pass playback, capture,
-      reconnect, and recovery.
-  11. Clean install and upgrade remove obsolete runtime/package state without
-      deleting user data. Current docs describe only the VM Browser; historical
-      host Browser evidence remains archived.
-- Verification method: Build/test the standalone workspace and separate
-  CEF/Servo manifests from a clean clone, with the longest native builds on
-  BigBoy. In `magic-mesh`, run
-  `@farm:{cargo test -p mde-shell-egui --features live-vdi}`,
-  `@farm:{cargo test -p mde-vdi-rdp --features live-connect}`,
-  `@farm:{cargo test -p mackesd}`, `@farm:{cargo test --workspace}`, and
-  `@farm:{cargo clippy --workspace --all-targets --all-features -- -D warnings}`;
-  run package/payload, migration, architecture, secret, and supersession gates.
-  Complete the video/audio/latency/process/RPM/reconnect acceptance on a
-  GPU-capable Workstation with timestamped metrics and rendered-output capture.
-  Missing hardware must be recorded without claiming those live criteria pass.
-- Origin or merged source IDs: 2026-07-28 operator Option 3 decision to remove
-  the current Browser stack from `magic-mesh`, preserve everything Browser in a
-  buildable standalone repository, and make the production Browser VM-backed.
-  Corrective successor to archived WL-PERF-003, WL-FUNC-001, WL-FUNC-002,
-  WL-FUNC-003, WL-FUNC-004, and WL-ARCH-005. Primary evidence source:
-  `docs/design/browser-perf-native.md`.
-
-## Functional Completeness
+  1. Old Browser stack builds from its clean standalone clone and is absent from production magic-mesh.
+  2. Browser opens the same guest session over RDP/Sunshine with focused input, audio, clipboard, reconnect, and no host engine.
+  3. Five-tab performance, package cleanup, and data migration meet the stated thresholds.
+- Verification method: standalone and root cargo gates, architecture/secret/package gates, and live video/audio/latency captures on named seats; put the longest build on
+  BigBoy.
+- Origin or merged source IDs: 2026-07-28 Option 3; archived WL-PERF-003, FUNC-001..004, ARCH-005; browser-perf-native design.
 
 ### WL-ARCH-009 - Process-isolated mackesd and unified Workers interface
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: `mackesd` remains a large single-process worker runtime with weak
-  failure and resource isolation. Its registry does not yet prove that every
-  spawned worker has complete ownership, applicability, relationship, state,
-  and action metadata. Operators also face duplicate State of the Mesh, Fleet &
-  Mesh, and This Node interfaces whose navigation and local-node abstractions do
-  not match the actual worker architecture. Runtime truth, node providers, and
-  mutations cannot be understood or administered from one canonical model.
-- Required outcome: Replace the monolith with independently supervised
-  `mackesd-control`, `mackesd-observation`, `mackesd-actions`, `mackesd-data`,
-  `mackesd-compute`, and `mackesd-integrations` services and introduce one
-  canonical `Surface::Workers`. Workers presents the whole mesh as synchronized
-  worker-first tree, deterministic graph, and fleet inspector; every former
-  This Node capability belongs to a real canonical worker. A global staged
-  Action Console owns all mutations. State of the Mesh, Fleet & Mesh, This
-  Node, System, Storage, About, and their child renderers are removed in one
-  hard cut after route aliases normalize into Workers. System and Mesh Health
-  remains a separate centered modal and never becomes Workers content.
-- Current state: The 79-worker registry exposes a typed `WorkerSpec` with group,
-  criticality, capability activation, cadence, bounded queues/caches, restart,
-  resource budget, namespace, and cleanup metadata. Focused farm tests cover
-  registry entries and group distribution. `spawn.rs` still constructs one
-  daemon process, runtime budgets are not enforced by split units, relationship
-  and complete ownership metadata are missing, and the shell still carries the
-  superseded mesh/node surfaces. In-progress centralized-health changes remain
-  valid and must be preserved as the separate modal authority.
+- Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
+- Required outcome: six independently supervised mackesd groups publish bounded typed runtime snapshots; one Surface::Workers owns worker tree, graph, inspector, Network
+  Operations, and staged Action Console; old surfaces and health duplication are removed.
+- Current state: all 145 production starts are registered and sampled with bounded generations; the shared runtime contract rejects unknown schema versions at
+  every versioned boundary. Process split, complete ownership, providers, UI
+  cutover, and fleet evidence remain.
+- **Process-boundary checkpoint (2026-08-06):** source validator and complete-fixture self-test pass; checkout validation correctly reports missing six group units/target and the
+  monolith. Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-06-process-boundary-r1.md`.
+- **Process-group admission checkpoint (2026-08-06):** exact six-token group
+  parsing and canonical-registry worker admission pass 3/3 on BigBoy; `serve
+  --group` is exposed. The six-unit cutover, responder partitioning, and
+  single-writer/resource/live proofs remain open. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-06-process-group-admission-r1.md`.
 - Remaining work:
-
-  1. Inventory every actually spawned worker and service dependency from code
-     and live nodes. Record exact canonical ID, group, role applicability,
-     cadence, queue/cache limits, resource budget, restart and cleanup owner,
-     entity/output kinds, dependencies, publications, subscriptions, and typed
-     actions. Remove every unregistered-worker exception and add bidirectional
-     registry/spawn drift tests.
-  2. Establish a neutral shared, strict-versioned `worker_runtime` contract so
-     the shell does not depend on `mackesd`. Define `WorkerGroup`,
-     `WorkerContract`, `WorkerRuntimeSnapshot`, `WorkerRuntimeState`,
-     `WorkerRelation`, `WorkerTimelineEvent`, and change-set request/result
-     types with explicit size, count, nesting, string, and schema bounds.
-  3. Represent runtime states distinctly as `not_applicable`, `unconfigured`,
-     `starting`, `running`, `backoff`, `paused`, `stopped`, `failed`, `stale`,
-     and `unavailable`. Define freshness, unknown-version behavior, redaction,
-     stable IDs, generation ordering, and a 512-event maximum timeline.
-  4. Complete canonical ownership for former This Node data. `host_state` owns
-     bounded identity, OS, seat, connectivity, display, audio, input, power,
-     privacy, account, and locale observations. Add governance-required
-     `desktop_state` for appearance, wallpaper, layout, clock, workspace, and
-     accessibility preferences.
-  5. Assign hardware, storage, printers, services, applications, lifecycle,
-     recovery, backup, and virtualization to real workers such as
-     `hardware_probe`, `device_inventory`, `storage`, `cups_sync`,
-     `service_aggregator`, `fleet_reconcile`, `lifecycle_exec`,
-     `nebula_ca_backup`, and `vm_lifecycle`. Add missing workers rather than a
-     generic local shell branch. WL-UX-011 supplies provider/action behavior.
-  6. Implement the six process entrypoints and `mackesd.target`. Assign each
-     worker exactly once; keep Control as the sole SQLite migration/write owner
-     and expose only bounded typed read models to other groups. Remove the
-     monolithic unit and executable path from the hard-cut package.
-  7. Add structured shutdown and resource discipline: cancel tasks, release
-     sockets/leases, drain or reject bounded queues by message class, skip
-     unconfigured optional workers, cap caches and concurrency, jitter retries,
-     break circuits, suppress restart storms, and publish cleanup outcomes.
-  8. Install per-group systemd and RPM policy for memory, CPU, tasks, I/O,
-     watchdog, restart limits, filesystem, address families, devices, writable
-     paths, and dedicated identities. Retain privilege only for allowlisted
-     Actions operations and package optional groups/providers by role.
-  9. Publish bounded credential-free `state/mackesd/<node>` snapshots and
-     `/run/mde/mackesd-status.json`. Include group resources, worker runtime,
-     capabilities, relations, queues, retries, effective configuration,
-     generations, freshness, outputs, and audit pointers; exclude raw logs,
-     credentials, secrets, and unbounded diagnostics.
-  10. Build the Workers read model. Open on the whole mesh with six collapsed
-      group hubs and the full canonical roster, highlighting This Node without
-      changing the worker-first hierarchy. The tree is group → worker →
-      applicable node → entity/output and expands only by operator action.
-  11. Render a deterministic registry-order graph synchronized with the tree.
-      Use solid ownership, dashed dependencies, directed transient state/event
-      flow, and dotted action targeting. Filtered hidden dependencies become
-      dim boundary stubs; never persist manual coordinates.
-  12. Implement one shared filter state for group, node, runtime state, and
-      relation type. Tree search filters in place. Selection, expansion,
-      filtering, live snapshot updates, and manual refresh must preserve stable
-      focus and never produce divergent tree/graph truth.
-  13. Selecting a worker opens contract metadata and one fleet row per
-      applicable node with Runtime, Outputs, Relationships, and Timeline views.
-      Keep stale/unavailable nodes visible. A `Stage action` affordance may
-      populate the global console but cannot mutate from the inspector.
-  14. Implement the global Action Console around exact lanes
-      `action/mackesd/changeset/preview`, `/commit`, and `/cancel`. Preview
-      binds normalized typed items, target, expected generation, impact,
-      recovery, arming requirements, digest, and expiry. Commit rejects stale
-      previews before work starts and reports honest per-item partial outcomes.
-  15. Keep Action Console drafts session-local and discard uncommitted drafts
-      on close. Persist committed results through bounded audit records. Forbid
-      raw shell, arbitrary paths/properties, secret-bearing bodies, invented
-      rollback, or claims of cross-node transaction atomicity.
-  16. Implement the surveyed presentation: wide tree/graph/inspector layout;
-      narrow single-pane Tree/Graph/Inspector navigation with back stack; Kdam
-      Thmor Pro interface text; IBM Plex Mono technical IDs; stable group hues;
-      semantic state colors with icon/text redundancy; event-driven motion only.
-  17. Perform the atomic shell cutover. Add one Workers taskbar, Front Door,
-      title, and help identity. Normalize legacy aliases to the surveyed Workers
-      filters/selection, move credits/licenses to Workers Help/About, and delete
-      old tabs, catalogs, polls, renderer state, navigation, and dead tests.
-  18. Preserve the health boundary. Workers has no grade, issue count, badge,
-      health link, alert list, diagnostics dashboard, or automatic health entry.
-      The taskbar and critical auto-open own the modal; modal inventory links may
-      select a Workers entity without creating a return link.
-  19. Update governance, architecture, navigation, operator, and test documents
-      so Workers replaces the old five-plane/This Node information architecture.
-      Mark historical designs superseded and ensure no document presents
-      WL-UX-011 or a design note as a second interface workstream.
-  20. Cut one farm-built release across all five workstations and three
-      lighthouses. Exercise group crashes, provider loss, saturation, restart
-      storms, stale/unknown snapshots, a safe staged action, forced partial
-      failure, and corrected-forward recovery with no compatibility monolith.
-- Scope: In scope are worker registry/contracts, six-process runtime, resource
-  governance, typed snapshots/relations/timeline/actions, Workers shell/read
-  model/UI, Action Console, legacy route normalization and deletion, packaging,
-  docs, and full-fleet proof. WL-UX-011 provider implementations are inputs.
-  Workloads, application-specific surfaces, raw shell/SQL/filesystem controls,
-  arbitrary systemd properties, and System and Mesh Health modal internals are
-  out of scope.
-- Relevant files/components: `crates/mesh/mackesd/src/worker_role.rs`,
-  `crates/mesh/mackesd/src/bin/mackesd/spawn.rs`,
-  `crates/mesh/mackesd/src/ipc/action_auth.rs`, mackesd package/systemd units,
-  `crates/desktop/mde-shell-egui/src/main.rs`, `this_node_catalog.rs`, State of
-  the Mesh/Fleet renderers, Front Door, taskbar, routing, and shell GUI tests.
-- Dependencies: WL-UX-011 supplies complete node provider truth and bounded
-  hardware actions but owns no presentation route. WL-UX-009 supplies shared
-  visual primitives and responsive profiles. Coordinate release/live evidence
-  with WL-CRIT-006 and recovery with WL-CRIT-007. Use the governed build farm
-  for all heavy build, package, GUI, and live-fleet work.
+- **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
+  is now the canonical node-management route; Fleet & Mesh, This Node,
+  System, Storage, About, and Phones deep links normalize into it. Phones is a
+  Workers → Phones subtab and is absent from the launcher and pin catalog.
+  Eastern current and retained timestamps now apply the daylight-saving offset.
+  Focused farm route gates passed; the full shell suite passed 1,453 tests with
+  five unrelated pre-existing pixel/IaC failures. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-07-workers-phones-clock-r1.md`.
+- **Current release-5 clock binding (2026-08-07):** the fresh artifact hash
+  `8219d399ae7abf498f4916c9c43240628bbef02e9ef71971d235db3ada450be3` is
+  installed and clean on Dell and seat 15; the Eastern DST regression passed
+  1/1 on `.90`. Evidence: `evidence/WL-ARCH-009-2026-08-07-current-clock-r1.md`.
+- **Runtime schema checkpoint (2026-08-06):** worker contract, relation,
+  timeline, snapshot, change-set request, and change-set result tests reject
+  unknown schema versions before admission; `.90` passed 8/8. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-06-runtime-schema-r1.md`.
+  1. S1 Complete the worker registry.
+     - Objective: give every spawned worker one canonical ID, group, role, owner, relation, cadence, budget, output, and cleanup policy.
+     - Inputs: spawn.rs, worker_role.rs, live unit inventory.
+     - Deliverable: bidirectional registry/spawn drift guard and generated inventory.
+     - Depends on: none.
+     - Acceptance: no exception, duplicate, or unowned worker remains.
+     - Validation: registry and drift cargo tests on .50.
+     - Done when: inventory hash and negative test evidence are recorded.
+  2. S2 Freeze runtime contracts and bounded snapshots.
+     - Objective: version WorkerContract, runtime state, relations, timeline, change-set, redaction, freshness, and generation rules.
+     - Inputs: S1 and mesh types.
+     - Deliverable: bounded credential-free contracts and hostile schema tests.
+     - Depends on: S1.
+     - Acceptance: unknown versions, stale data, oversized events, and secrets fail closed.
+     - Validation: shared-contract cargo tests on .90.
+     - Done when: contract evidence is signed.
+  3. S3 Assign all node/provider ownership.
+     - Objective: map host, desktop, hardware, storage, services, lifecycle, recovery, backup, and virtualization facts/actions to real workers.
+     - Inputs: UX-011 provider inventory and current This Node routes.
+     - Deliverable: one owner per entity, observation, action, and publication.
+     - Depends on: S1, S2.
+     - Acceptance: no generic shell branch or duplicate state writer remains.
+     - Validation: ownership scan and provider tests.
+     - Done when: every capability has a worker and evidence.
+  4. S4 Split and isolate the runtime.
+     - Objective: ship mackesd-control, observation, actions, data, compute, integrations, and mackesd.target with one SQLite writer.
+     - Inputs: S1-S3, ARCH-010 process/resource contracts.
+     - Deliverable: units, RPM policy, shutdown, queue, retry, watchdog, and cgroup tests.
+     - Depends on: S3.
+     - Acceptance: group crash is isolated; optional unconfigured workers quiesce; no monolith ships.
+     - Validation: process/chaos/resource cargo tests and package gate on BigBoy.
+     - Done when: all six groups start/stop/recover under declared budgets.
+  5. S5 Implement Workers and Action Console.
+     - Objective: provide synchronized tree/graph/inspector, filters, device inventory, staged preview/commit/cancel, audit, and partial-failure reporting.
+     - Inputs: S2-S4 and UX-009.
+     - Deliverable: one responsive Surface::Workers and typed action model.
+     - Depends on: S4.
+     - Acceptance: no page, raw command, arbitrary path, or worker bypasses the console.
+     - Validation: shell model/render and action-auth tests.
+     - Done when: wide/narrow/largest-text captures and hostile action evidence exist.
+  6. S6 Add Network Operations and cut over routes.
+     - Objective: implement typed geo/fabric/flow/history projections and remove old This Node/Fleet/State surfaces while keeping Health modal separate.
+     - Inputs: FUNC-017 providers, UX-011, health boundary.
+     - Deliverable: deterministic graph/time lens, alias map, deleted old routes/docs/tests.
+     - Depends on: S3-S5.
+     - Acceptance: one Workers destination owns each legacy alias; no health grade/badge lives in Workers.
+     - Validation: route/geo/history cargo tests and supersession scan.
+     - Done when: source, package, runtime, navigation, and help scans are clean.
+  7. S7 Prove fleet isolation and convergence.
+     - Objective: run crashes, provider loss, saturation, stale snapshots, staged change, forced partial failure, and corrected-forward recovery.
+     - Inputs: S4-S6 and CRIT-006/007.
+     - Deliverable: five-workstation/three-lighthouse evidence bundle.
+     - Depends on: S6.
+     - Acceptance: bounded redacted snapshots converge without secrets or legacy fallback.
+     - Validation: farm chaos/package gates and live captures.
+     - Done when: every required failure matrix row has evidence.
+- Scope: Owns registry/contracts, six services, budgets, snapshots, Workers UI, Network Operations, Action Console, route deletion, packaging, and fleet proof. Workload
+  lifecycle, health modal, and provider implementation remain owned elsewhere.
+- Relevant files/components: mackesd spawn/worker_role, mesh types, process units/RPM, mde-shell-egui Workers/routes, provider workers, and Network Operations design.
+- Dependencies: ARCH-010, UX-009, UX-011, FUNC-017, CRIT-006, and CRIT-007.
 - Acceptance criteria:
-
-  1. Every spawned worker has exactly one complete canonical registration and
-     group; no exception list, duplicate owner, or unowned This Node capability
-     remains, and registry/spawn drift tests fail both directions.
-  2. Six independently supervised services run under `mackesd.target`; Control
-     is the only persistent-state writer, group crashes remain isolated, and no
-     monolithic runtime runs or ships.
-  3. Snapshots, relations, timeline events, and change sets are versioned,
-     bounded, redacted, credential-free, generation-aware, and safe under
-     hostile input, schema mismatch, stale data, and unavailable providers.
-  4. Dell settles below 1 GiB for the complete stack and stays below 2 GiB at
-     boot; queues, caches, tasks, retry rates, and concurrency remain within
-     declared limits across the fleet failure matrix.
-  5. Exactly one Workers product renders the worker-first tree, deterministic
-     graph, and fleet inspector with synchronized selection/filtering, manual
-     expansion, live freshness, manual refresh, and honest runtime states.
-  6. Wide, narrow, largest-text, Dark, Light, stale, unavailable, and large-
-     topology renders remain legible and operable with the surveyed typography,
-     group/state language, responsive panes, and event-only motion.
-  7. The Action Console previews and binds every mutation, rejects stale or
-     expired commits, audits results, and renders partial success honestly. No
-     worker page, legacy surface, raw command, or arbitrary path bypasses it.
-  8. Legacy names normalize to the specified Workers context, while their
-     renderers, tabs, polling, catalog/state branches, and visible destinations
-     are absent from source, package, runtime, navigation, and help.
-  9. Workers contains no health grades, scores, issue counts, badges, health
-     links, or duplicate diagnostics. The separate modal still opens from the
-     taskbar/critical condition and can deep-link to the exact Workers entity.
-  10. The exact release passes farm contract/process/security/GUI/package gates
-      and live proof on five workstations plus three lighthouses, including a
-      safe change set and forced partial failure with no legacy fallback.
-- Verification method: First run the worklist self-test and lint. On the farm,
-  run shared-contract hostile fixtures, registry/spawn drift, mackesd unit and
-  integration suites, six-group lifecycle/chaos tests, action-auth/change-set
-  security tests, shell route/model/render tests, fmt, clippy, package/payload,
-  architecture, secret, and supersession gates; put the longest job on BigBoy.
-  Capture deterministic baseline/after frames in Dark/Light desktop, narrow,
-  largest text, stale/unavailable, and large-topology states through DRM or
-  Sunshine. On all five workstations and three lighthouses, verify exact worker
-  IDs, unit/cgroup isolation, fresh projections, alias normalization, one safe
-  staged change, forced partial failure, no old surface, and the separate health
-  modal. Record unavailable hardware honestly without claiming that gate passed.
-- Origin or merged source IDs: 2026-08-01 operator evaluation of mackesd
-  growth, Dell boot memory regression, process isolation, performance,
-  resilience, Fedora best practice, and fleet-wide administration, including
-  the under-1-GiB idle and under-2-GiB boot targets. Expanded by the 2026-08-03
-  25-question Workers merge survey, which supersedes the Advanced/This Node
-  interface and makes this epic the sole owner of the State of the Mesh plus
-  This Node product/runtime hard cut.
+  1. Registry/spawn drift tests prove exactly one owner for every worker and capability.
+  2. Six groups run under budgets with bounded credential-free snapshots and one SQLite writer.
+  3. Workers and Action Console are the only node-management surfaces; Health remains a separate modal.
+  4. Fleet chaos and five-seat/three-lighthouse evidence passes.
+- Verification method: registry, contract, process/chaos, action-auth, route/render, package, format, and live fleet cargo gates; longest job on BigBoy.
+- Origin or merged source IDs: 2026-08-01 process isolation evaluation; 2026-08-03 Workers merge survey; 2026-08-04 Network Operations directive.
 
 ### WL-FUNC-011 - Build the native Mesh Collaboration Suite and hard-cut legacy collaboration
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: The current Mesh Teams UI organizes collaboration around nested app,
-  team, channel, Activity, Details, Transfers, and Settings rails instead of the
-  six capabilities users need. Calls author signed state but production has no
-  media providers; legacy Chat still runs; SIP provisioning is gated; Files and
-  collaboration maintain competing transfer models; Clipboard is text-only;
-  and the capable native Editor is buried inside Documents. The worklist also
-  assigns LibreOffice to an App VM even though the approved product is a wholly
-  native collaboration and creation suite.
-- Required outcome: One egui-native `Mesh Collaboration Suite` replaces every
-  legacy Chat, Voice, Files/Transfers, Editor, Notifications, Clipboard, and
-  Mesh Teams destination. Its only primary sections are Alerts, Chat, Calls,
-  Files, Editor, and Clipboard. Files is the universal browser and transfer hub;
-  Editor owns Text/Code, Document, Spreadsheet, and Presentation workspaces;
-  Calls provides real direct/group media, shared provider-neutral SIP gateways,
-  screen sharing, and consented control. Fedora LibreOfficeKit supplies the
-  sandboxed Writer/Calc/Impress engine without a visible VCL UI, App VM, host
-  window, or compositor. One epic owns contracts, workers, UI, migration,
-  package removal, and final acceptance.
-- Current state: Signed offline-first collaboration envelopes, projections,
-  egui UI, shell/daemon mounting, and migration helpers are substantial. The
-  native Editor already has rope buffers, tree-sitter, LSP, panes, search, a
-  terminal, and Yrs collaboration. Files has POSIX operations and durable
-  transfer workers; the legacy voice stack has reusable SIP/RTP pieces. Calls
-  still use an empty production media registry, Vitelity live calls are gated,
-  the transfer worker exposes fewer lanes than the suite projection, and legacy
-  Chat remains spawned. LibreOfficeKit integration, rich Clipboard transport,
-  canonical Alerts, state migration, and the hard cut have not landed.
+- Problem: Collaboration is split across legacy Chat, Teams rails, text-only clipboard, duplicate Files/transfers, incomplete Calls media, and an App-VM office path.
+- Required outcome: one egui-native Collaboration surface has exactly Alerts, Chat, Calls, Files, Editor, and Clipboard; durable signed transport, real media, native
+  office editing, and one executor replace all retired paths.
+- Current state: signed envelopes, projections, native Editor foundation, POSIX/CAS Files transfer, and shell mounting exist; Calls providers, cross-node executors,
+  office transport, canonical Alerts, migration, and hard cut remain.
+- **Transfer wire checkpoint (2026-08-06):** duplicate `schema_version` fields are rejected at media transfer admission; `.50` passed 1/1.
+  Evidence: `docs/platform/evidence/WL-FUNC-011-2026-08-06-transfer-wire-boundary-r1.md`.
 - Remaining work:
-
-  1. Reconcile the parity ledger and current runtime into the approved product.
-     Every legacy command, route, hotkey, state writer, migration source,
-     package, and workflow must map to one of the six sections or an explicit
-     retirement. Remove the conflicting keep-Files-separate, Teams/channel,
-     task, Discord, AI, text-only clipboard, and App-VM LibreOffice decisions.
-  2. Introduce strict-versioned shared contracts for `SuiteSection`,
-     `AlertEnvelopeV2`, `ConversationTarget`, `CallEndpoint`, `MediaRoute`,
-     `SipGateway`, `ControlGrant`, `FileEndpoint`, `FileOperation`,
-     `TransferJobV2`, `ClipboardEnvelopeV2`, `EditorWorkspace`, `EditorKind`,
-     and `OfficeSessionRecord`. Bound strings, arrays, MIME metadata, payloads,
-     retries, nesting, and unknown-version behavior; retain signed attribution.
-  3. Replace `Surface::Communications` and the current eight-app/nested-channel
-     frame with `Surface::Collaboration`. Render exactly six full-name sections
-     plus a stable context header showing selected node/group, connectivity,
-     call/share state, and cross-section actions. Settings belongs in contextual
-     preferences or Control Center; Transfers is Files content, not navigation.
-  4. Consolidate Chat on the collaboration event core. Support signed durable
-     node direct messages and simple saved groups, threads, attachments, offline
-     replay, local find, delivery state, and source identity. Import useful
-     legacy Chat history, then remove the old Chat worker, state tree, shell
-     renderer, package edges, and duplicate notification folding.
-  5. Replace the fixed alert-lane prefix fold with `AlertEnvelopeV2` emitted by
-     every platform service. Alerts keeps a session-only virtualized 500-row
-     ring with node/service/severity filters and deep links. Relevant events
-     also appear as transient Chat system rows. Durable health issue lifecycle
-     stays in System and Mesh Health; Alerts has no acknowledge, assign, snooze,
-     mute, escalation, or second persistent store.
-  6. Make Files the universal browser and file-operation authority. Expose local
-     paths, enrolled-node paths, SFTP profiles, shares, staging areas, and job
-     results in one source tree. Route list/stat/read/write, new file/folder,
-     rename, duplicate, move/copy, archive/extract, link, trash/delete, and
-     open-with operations through typed local or addressed node executors.
-  7. Replace the collaboration transfer projection and the old five-method GUI
-     mirrors with one `TransferJobV2` contract. Separate endpoint from operation
-     and support local/mesh copy, rsync sync, SFTP, HTTP download, browser scrape,
-     multipart upload, recurring mirror, and Clipboard payload jobs. Executors
-     keep durable node-local ledgers; signed summaries form the global Files
-     view. Preserve cancelled history, real bytes/rate/phase/attempt/error,
-     pause/resume/retry, bandwidth limits, checksum verification, and CLI parity.
-  8. Use direct resumable rsync-over-Nebula for node transfers and Syncthing
-     staging as the durable fallback. Browser supplies a typed scrape session
-     adapter while Files owns job state. Multipart/SFTP credentials are sealed
-     profile references, never job fields. Migrate existing ledger and sync-pair
-     JSON without resetting active jobs or losing history.
-  9. Keep shared Clipboard transport in WL-FUNC-016 and make the suite its one
-     session-history UI. Publishing starts disabled every session and broadcasts
-     rich MIME events to all enrolled nodes after opt-in. Inline text remains at
-     most 1 MiB; formatted, image, and file payloads use ephemeral priority Files
-     jobs, arrive first as attributed placeholders, and persist only through an
-     explicit `Save to Files` action.
-  10. Restore Editor as a first-class section and retain the current rope,
-      tree-sitter, LSP, panes, search, terminal, and Yrs foundations. Complete a
-      full IDE with Git status/diff/commit, DAP debugging, tasks, test discovery,
-      terminal management, conflict/diff views, and local or selected-node
-      projects. Remote tools run inside an admitted development workload on the
-      selected node, never as an unrestricted host-control shell.
-  11. Do not import Code-OSS or an extension marketplace. Reuse only audited open
-      protocols and independently licensed LSP/DAP adapters. Add Text/Code,
-      Document, Spreadsheet, and Presentation `EditorKind` workspaces to the
-      same tab/pane/session model and route all open/save/version operations
-      through Files with expected-content hashes and atomic conflict handling.
-  12. Add a process-isolated `mde-office-core` adapter over Fedora's system
-      `libreofficekit`, `libreoffice-core`, Writer, Calc, and Impress packages.
-      Run one sandboxed headless process per active document with the `svp` VCL
-      backend, no display/compositor access, separate temporary profile, default-
-      denied network, and macros/Java/extensions/external links disabled unless
-      a later typed policy explicitly admits them. Never load the engine into the
-      DRM shell or display LibreOffice VCL widgets.
-  13. Add an egui office renderer for LibreOfficeKit BGRA tiles, invalidation,
-      selections, cursors, touch/pointer/key input, parts/sheets/slides, command
-      state, and errors. Implement native menus, toolbars, dialogs, and status
-      for Writer formatting/styles/tables/images/comments/track-changes/layout;
-      Calc formulas/sheets/format/sort/filter/charts/freeze panes; and Impress
-      slide/layout/text/media/shape/notes/transition/presentation workflows.
-      Support ODF, Microsoft Office formats, PDF export, and fidelity warnings.
-  14. Implement native office collaboration with one leased, capable session
-      host per document, LibreOfficeKit multi-view state, signed Bus control,
-      direct Nebula tile/input transport, participant presence, cursors,
-      comments, and reconnect. Autosave atomic versioned snapshots through Files;
-      host loss elects another capable node and reopens the latest snapshot.
-      Text/code retains Yrs CRDT; conflicting offline office edits create an
-      explicit conflict version rather than an unsafe synthetic merge.
-  15. Move the LibreOffice printing requirement from WL-FUNC-018 into Editor.
-      LibreOfficeKit PDF/page output drives one page-faithful native preview and
-      CUPS workflow with printer discovery/health, local/mesh selection, paper,
-      tray, orientation, margins, duplex/binding, color, copies, collation,
-      ranges, scale, N-up/booklet, PDF output, presets, progress, cancel, retry,
-      offline/error states, and tablet-sized controls.
-  16. Populate the production media registry. Use direct WebRTC P2P for one-to-
-      one calls and self-hosted LiveKit for group calls or direct-path fallback.
-      Bind real PipeWire/WirePlumber microphones/speakers and camera/screen
-      capture; expose actual device selection, mute/volume, camera, screen,
-      quality, jitter/loss, reconnect, and failure state. Recording and
-      transcription remain absent.
-  17. Deploy LiveKit SFU and SIP as managed workloads on capable Workstations
-      with health-based room placement and no fixed central node. Define a
-      sealed provider-neutral shared SIP gateway pool, implement Vitelity as the
-      first live adapter, give each node an internal SIP URI, and support optional
-      DID mappings. The caller chooses a healthy outbound gateway for each call;
-      retain the last choice without silently overriding an explicit selection.
-  18. Support direct and group voice/video, inbound/outbound SIP participants,
-      DTMF, hold, transfer, device changes, route failover, and honest carrier
-      errors. Screen sharing and remote control require an explicit per-call
-      request/grant, persistent sharing indicator, immediate revoke, automatic
-      expiry on hangup, and no unattended-control mode.
-  19. Build an idempotent preflight/importer for collaboration, Chat, Alerts,
-      Clipboard history, editor state, file references, transfer jobs/sync pairs,
-      voice/SIP configuration, launcher pins, and routes. Quiesce legacy writers,
-      import once, compare counts/hashes/active state, activate the new surface,
-      and remove old routes, workers, writers, crates, packages, and current docs
-      in the same release. Retain no long dual-run or permanent compatibility
-      shim.
-  20. Amend durable governance and current interface authority before runtime
-      implementation: permit only sandboxed headless platform document engines,
-      retain the ban on host app windows/compositors, require every visible
-      office control to be egui, and replace the ICQ-only notification lock with
-      the six-section suite. Finish desktop, narrow/tablet, Car-safe, Dark/Light,
-      unavailable-state, performance, and no-overlap acceptance with WL-UX-009.
-- Scope: One collaboration domain and one native Mesh Collaboration Suite;
-  canonical Alerts and Chat; universal Files and transfers; rich Clipboard UI;
-  a full local/managed-remote IDE; LibreOfficeKit Writer/Calc/Impress editing and
-  printing; direct/group WebRTC, LiveKit, SIP, sharing/control; migration; and
-  legacy removal. Out of scope are Teams/channels, tasks, Discord, AI, Code-OSS,
-  an extension marketplace, recording/transcription, unattended control,
-  macros/Java/office extensions, a visible LibreOffice UI, an Office App VM,
-  arbitrary remote host shells, and a permanent old/new switch.
-- Relevant files/components: `mde-collab-types`, `mde-collab-core`,
-  `mde-collab-egui`, shell/daemon integration, and the parity ledger.
-- Dependencies: WL-FUNC-016 owns rich Clipboard seat/mesh/VDI transport;
-  WL-UX-009 owns shared visual/state primitives; WL-ARCH-009 supplies isolated
-  worker/service ownership; Files is the only binary-payload authority. Update
-  `AI_GOVERNANCE.md` and `docs/design/platform-interfaces.md` before landing the
-  native office runtime. Missing live SIP, media, or office hardware remains an
-  evidence gate and never permits a fake provider.
+  1. S1 Reconcile parity and contracts.
+     - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
+     - Inputs: current parity ledger, collab types/core, archived IDs.
+     - Deliverable: versioned bounded contracts for alerts, chat, calls, files, clipboard, editor, office, and transfer.
+     - Depends on: none.
+     - Acceptance: no conflicting Teams/channel/task/Discord/AI/App-VM office decision remains active.
+     - Validation: schema/property/signature cargo tests on .90.
+     - Done when: parity map and contract evidence exist.
+  2. S2 Ship the six-section shell.
+     - Objective: replace Communications and nested rails with one responsive Collaboration surface and contextual settings.
+     - Inputs: S1 and UX-009.
+     - Deliverable: six-section render/model with stable context header and route tests.
+     - Depends on: S1.
+     - Acceptance: Transfers is Files content; no legacy route or duplicate notification surface is reachable.
+     - Validation: shell render/navigation cargo tests.
+     - Done when: Dark/Light/narrow/largest-text captures pass.
+  3. S3 Complete signed Chat and Alerts.
+     - Objective: deliver durable direct/group chat, threads, attachments, offline replay, local find, delivery state, and canonical alert projection.
+     - Inputs: collab event core and signed envelopes.
+     - Deliverable: daemon authority, migration importer, and redacted alert/chat fixtures.
+     - Depends on: S1, S2.
+     - Acceptance: replay, attribution, ordering, and deduplication remain deterministic offline.
+     - Validation: collab-core hostile and migration tests on .50.
+     - Done when: legacy Chat worker/state/renderer is unreachable.
+  4. S4 Complete Calls media and control.
+     - Objective: provide direct/group media, provider-neutral SIP gateways, screen share, consented control, reconnect, and mute policy.
+     - Inputs: media registry, SIP/RTP pieces, signed control grants.
+     - Deliverable: real provider adapters and session lifecycle tests.
+     - Depends on: S1, S2.
+     - Acceptance: no empty provider or fake connected state; consent and revocation are auditable.
+     - Validation: media/provider cargo tests and live call fixture.
+     - Done when: provider availability and failure are visible.
+  5. S5 Complete Files and transfer execution.
+     - Objective: make Files the browser and CAS-backed transfer hub with seven typed executors, safe conflict policy, progress, cancel, retry, and cross-node
+       acknowledgement.
+     - Inputs: FUNC-016 and existing TransferJobV2/CAS.
+     - Deliverable: executor registry, destination-generation commit, and end-to-end transfer evidence.
+     - Depends on: S1, S2, FUNC-016 S1-S3.
+     - Acceptance: bytes are immutable, destination commits are authenticated, and partial failure is honest.
+     - Validation: transfer/CAS cargo tests on BigBoy and cross-node fixture.
+     - Done when: all executor rows pass or are explicitly blocked by a named provider.
+  6. S6 Complete native Editor and office sessions.
+     - Objective: ship Text/Code, Document, Spreadsheet, and Presentation with sandboxed LibreOfficeKit, no VCL/App VM/compositor.
+     - Inputs: existing Editor, office session contract, package policy.
+     - Deliverable: native session adapter, autosave/recovery, and format fixtures.
+     - Depends on: S1, S2.
+     - Acceptance: open/edit/save/recover works with bounded files and no host process escape.
+     - Validation: editor/office cargo and package tests on BigBoy.
+     - Done when: all four kinds have render and persistence evidence.
+  7. S7 Integrate Clipboard and hard-cut legacy products.
+     - Objective: mount FUNC-016 rich clipboard, migrate useful data, and delete retired Chat/Teams/Files/Editor/Notification paths.
+     - Inputs: S2-S6, FUNC-016.
+     - Deliverable: migration report, negative scans, and one release surface.
+     - Depends on: S3-S6.
+     - Acceptance: six sections are the only primary collaboration navigation and no duplicate authority remains.
+     - Validation: architecture, secret, supersession, package, and shell gates.
+     - Done when: fresh checkout has no retired production route/worker/package.
+  8. S8 Prove collaboration release.
+     - Objective: run offline/online, permission, media, transfer, editor, clipboard, migration, recovery, and five-seat live acceptance.
+     - Inputs: S1-S7, CRIT-006.
+     - Deliverable: signed evidence bundle and visual captures.
+     - Depends on: S7.
+     - Acceptance: missing external media or hardware is recorded as a blocker, never a pass.
+     - Validation: farm workspace gates and named live-seat proofs.
+     - Done when: release evidence lists every section and failure path.
+- Scope: Owns the one Collaboration surface, signed contracts, Chat, Calls, Files executors, Editor/office, Alerts, migration, packaging, and hard cut. Clipboard
+  transport details belong to FUNC-016.
+- Relevant files/components: mde-collab-types, mde-collab-core, mackesd collaboration/files workers, mde-shell-egui collaboration/editor, LibreOfficeKit packaging, and
+  transfer/CAS modules.
+- Dependencies: FUNC-016, ARCH-009, ARCH-010, UX-009, CRIT-006, and CRIT-007.
 - Acceptance criteria:
-
-  1. One Mesh Collaboration Suite entry with exactly six full-name sections
-     replaces every superseded collaboration destination and state writer; no
-     competing surface, Teams/channel rail, separate Transfers app, or dead
-     control remains.
-  2. Signed two/three-node partition, replay, membership, tombstone, blob,
-     backfill, and migration fixtures converge without loss, duplication,
-     invalid authority, or resurrection.
-  3. Chat direct messages/groups converge offline with durable signed history;
-     all platform Alerts enter the bounded ephemeral aggregate and relevant
-     transient Chat contexts without creating durable alert-inbox state or
-     monopolizing rendering.
-  4. Files browses and mutates local, mesh, and SFTP paths and owns one global
-     view over durable executor ledgers. Local/mesh/SFTP/rsync/HTTP/scrape/
-     multipart/recurring/Clipboard jobs report real progress, pause/resume,
-     retry, verify, survive restart, and never expose credentials.
-  5. Editor provides the accepted full IDE locally and in a managed development
-     workload, with language intelligence, Git, tasks/tests, terminal, debugger,
-     Yrs co-editing, safe external-write review, and version history.
-  6. Writer, Calc, and Impress open inside Editor with no VCL/VM window; native
-     chrome drives real LibreOfficeKit editing, office-format round trips,
-     collaborative presence, atomic versioned save/conflict handling, PDF, and
-     page-faithful printing. Engine crash and session-host loss recover honestly.
-  7. Direct and SFU-relayed calls carry advancing audio/video/screen frames;
-     direct/group sessions, SIP URI/DID ingress, caller-selected gateway egress,
-     DTMF/hold/transfer, devices, failover, and consented control work. No
-     recording, transcription, or unattended-control artifact exists.
-  8. Session-opt-in rich Clipboard events reach every enrolled node with source
-     attribution and echo prevention; capable seats materialize supported MIME,
-     Files transports binary payloads, and session-end cleanup preserves only
-     content explicitly saved to Files.
-  9. Migration is repeatable and failure-safe, the parity ledger has no open or
-     contradictory row, and old runtime/package/doc surfaces are removed after
-     cutover with no dual-run compatibility mode.
-  10. Desktop, narrow/tablet, and Car render and interaction tests show no
-     overlap, unbounded feeds, hidden commands, placeholders, or fabricated
-     provider state.
-- Verification method: Run focused contract, signature, projection, permission,
-  replay, CRDT, file/transfer, Clipboard, LibreOfficeKit sandbox/round-trip,
-  media/SIP, and migration tests. Run deterministic multi-node fixtures plus
-  `@farm:{cargo test --workspace --all-targets}` and
-  `@farm:{cargo clippy --workspace --all-targets -- -D warnings}`, with BigBoy
-  carrying the long job. Prove live Files adapters, Clipboard, office editing,
-  collaboration/printing/recovery, direct/relayed media, SIP, migration, and DRM;
-  record unavailable external resources without claiming success.
-- Origin or merged source IDs: `NOTIFY-CHAT`, `EDITOR-*`, `FILEMGR-*`,
-  `TRANSFERS-*`, `E12-11`, `VOIP-GW-*`, clipboard/alert-relay workstreams,
-  editor/Communications surveys, retired WL-UX-010, and the 2026-08-03 suite and
-  native-office surveys. Old interface evidence is historical baseline only.
+  1. Exactly six primary sections exist and all retired collaboration surfaces are unreachable.
+  2. Signed offline replay, real media, CAS transfer, native office, and rich clipboard pass focused hostile tests.
+  3. Five-seat release proof records real providers, partial failures, and corrected-forward recovery.
+- Verification method: collab/file/editor/media cargo suites, architecture/secret/package gates, visual captures, and live provider tests; route long jobs to BigBoy.
+- Origin or merged source IDs: NOTIFY-CHAT, EDITOR-*, FILEMGR-*, TEAMS-*, CLIPBOARD-*, VOICE-*; 2026-08-03 Mesh Collaboration survey.
 
 ### WL-FUNC-016 - Native rich clipboard across the DRM seat, mesh, and VDI
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: The existing clipboard path is limited to UTF-8 text and does not
-  consistently connect direct-DRM applications, KDC/mobile clients, every
-  enrolled node, the collaboration UI, and VDI guests. Binary content has no
-  canonical Files handoff, rich MIME capability negotiation is absent, and
-  some host synchronization still assumes Wayland tools even though Construct
-  has no compositor.
-- Required outcome: One versioned rich-MIME clipboard contract carries text,
-  HTML/RTF, images, and file references among native egui applications,
-  authorized mesh/KDC producers, and capable VDI guests. Publishing is disabled
-  at each session start and, after explicit opt-in, broadcasts to every enrolled
-  node with attribution, ordering, deduplication, and echo prevention. Text up
-  to 1 MiB may remain inline; Files owns all large or binary bytes. The Mesh
-  Collaboration Suite owns session history/actions while this epic owns the
-  seat, mesh, KDC/mobile, and VDI transport.
-- Current state: Canonical text events/actions, direct DRM copy/cut/paste,
-  bounded shell/daemon/KDC/mobile materialization, signed seat targeting,
-  retry/deduplication/attribution, session UI, and VNC text round-trip have
-  focused farm coverage. Guest-to-client Bus handoff is wired; client-to-guest
-  remains gated by live protocol ownership. RDP CLIPRDR and SPICE vdagent are
-  explicitly unsupported. Rich MIME envelopes, Files payload jobs, all-node
-  broadcast, the production signed-target adapter, and live VDI proof remain
-  open. Exact prior evidence is preserved in the dated pre-lint snapshot.
+- Problem: Clipboard is text-only and cannot safely negotiate rich MIME payloads across local seat, mesh peers, and guest VDI.
+- Required outcome: one versioned bounded clipboard contract supports text, HTML, images, files, and typed metadata through direct DRM, authenticated mesh, and VDI paths
+  with explicit permission, limits, and cleanup.
+- Current state: text shortcuts, direct DRM copy/cut/paste, bounded envelopes, and transfer scaffolding exist; rich MIME negotiation, guest bridges, and live proof
+  remain.
+- **JSON-admission checkpoint (2026-08-06):** nested duplicate object keys are
+  rejected before rich clipboard admission; the signed-envelope hostile test
+  passed 1/1 on `.50`. Evidence:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-06-clipboard-json-admission-r1.md`.
 - Remaining work:
-
-  1. Introduce `ClipboardEnvelopeV2` with source node/seat/session, monotonic
-     sequence, timestamp, ordered MIME offers, bounded preview, content hash,
-     byte count, inline text, optional Files payload reference, and expiry.
-     Bound and sanitize every field; reject malformed, unauthorized, replayed,
-     oversized, unsupported, and unknown-version envelopes.
-  2. Complete the production direct-DRM adapter. Capture native copy/cut output,
-     materialize the richest supported representation, preserve explicit
-     unavailable state, and remove remaining `wl-copy`/`wl-paste` polling.
-  3. Add session-scoped publishing consent. Default it off on every login,
-     broadcast accepted updates to all enrolled nodes, retain source attribution,
-     prevent local/mesh/VDI echo loops, and let incapable targets expose an
-     unsupported representation without corrupting or downgrading the source.
-  4. Integrate the WL-FUNC-011 Files executor. Create short-lived priority jobs
-     for images, formatted payloads, and file bundles; publish placeholders
-     immediately, verify content before materialization, clean expired staging,
-     and preserve bytes only after an explicit `Save to Files` action.
-  5. Route the suite Clipboard section and KDC/mobile clients through the same
-     envelope, capability, consent, and authorization model. Migrate useful
-     text-session state, then delete duplicate clipboard histories and lanes.
-  6. Implement VNC, RDP CLIPRDR, and SPICE vdagent capability negotiation and
-     bidirectional transfer for their honestly supported MIME subsets. Browser
-     participates only through its `browser-vm` VDI protocol; no host Browser
-     or direct guest-memory exception is permitted.
-- Scope: Rich MIME negotiation and transport; direct DRM seat integration;
-  opted-in all-node broadcast; suite session history/actions; KDC/mobile
-  ingress/materialization; VDI host/guest channels; and Files-backed binary
-  payloads. Secret classification/DLP, arbitrary object deserialization, direct
-  guest access to host memory, and permanent clipboard publishing are out of
-  scope.
-- Relevant files/components: direct DRM handling in `mde-egui` and the shell;
-  daemon clipboard sync/IPC/bridge workers; collaboration Clipboard UI;
-  `mde-vdi-rdp`, `mde-vdi-vnc`, and `mde-vdi-spice`.
-- Dependencies: WL-FUNC-011 owns the Files payload executor and suite UI;
-  WL-ARCH-008 owns Browser VM transport. Preserve signed authorization and echo
-  guards while versioning the text-only bodies through an explicit migration.
+  1. S1 Define the rich contract.
+     - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
+     - Inputs: collab types and existing clipboard v2.
+     - Deliverable: serde-bounded contract and hostile payload tests.
+     - Depends on: none.
+     - Acceptance: oversized, unknown, stale, secret-bearing, and unsupported payloads fail closed.
+     - Validation: shared-contract cargo tests on .50.
+     - Done when: contract hash and fixtures are recorded.
+  2. S2 Implement local DRM ownership.
+     - Objective: connect egui/DRM selection and shortcuts to one clipboard authority without blocking render.
+     - Inputs: mde-egui DRM/input and shell clipboard bridge.
+     - Deliverable: local provider, paste/copy tests, bounded selection cache.
+     - Depends on: S1.
+     - Acceptance: focus, cut/copy/paste, ownership loss, and app switch preserve correct MIME.
+     - Validation: mde-egui and shell clipboard cargo tests.
+     - Done when: local render and shortcut evidence passes.
+  3. S3 Implement authenticated mesh transport.
+     - Objective: replicate permitted rich payloads over mde-bus with peer identity, expiry, size caps, and no raw paths.
+     - Inputs: mde-bus, peer auth, transfer CAS.
+     - Deliverable: sender/receiver adapter with deduplication and cleanup.
+     - Depends on: S1.
+     - Acceptance: unauthorized peers, replay, flood, and unavailable peers are bounded and honest.
+     - Validation: bus/property/security cargo tests on .90.
+     - Done when: cross-node fixture records exact bytes and denial reasons.
+  4. S4 Implement VDI guest transport.
+     - Objective: bridge negotiated clipboard to Browser/App/Workload guests through typed VDI messages.
+     - Inputs: Workload attachment, VDI session, S1 contract.
+     - Deliverable: guest adapter with reconnect and lease-expiry behavior.
+     - Depends on: S1, ARCH-010 S6.
+     - Acceptance: guest cannot access host secrets or unapproved MIME; reconnect never duplicates payload.
+     - Validation: VDI cargo tests and live guest fixture on BigBoy.
+     - Done when: all supported MIME types have evidence.
+  5. S5 Integrate UI permissions and release proof.
+     - Objective: expose user-visible source/target, approval, progress, and failure without a second clipboard store.
+     - Inputs: FUNC-011 suite and UX-009.
+     - Deliverable: UI model, redacted audit rows, package policy, five-seat proof.
+     - Depends on: S2-S4.
+     - Acceptance: only approved transfers occur and all limits remain enforced.
+     - Validation: shell render, package, and live-seat gates.
+     - Done when: evidence bundle covers local/mesh/VDI and cleanup.
+- Scope: Rich MIME negotiation and transport across DRM, mesh, VDI, permissions, limits, package policy, and proof. Files application UX and general collaboration
+  navigation remain FUNC-011.
+- Relevant files/components: mde-egui DRM/input, mde-shell-egui clipboard/VDI, mde-collab-types, mde-bus, transfer/CAS workers, and Workload VDI adapters.
+- Dependencies: FUNC-011 consumes the contract and UI; ARCH-010 supplies attachment; UX-009 supplies styling.
 - Acceptance criteria:
-
-  1. Copy/cut/paste works among native egui surfaces on the direct DRM seat
-     without Wayland tools for text, formatted text, images, and file payloads.
-  2. Publishing defaults off every session. One opt-in update reaches every
-     enrolled node with stable ordering, attribution, deduplication, and no
-     echo loop; opt-out stops publishing immediately without deleting history.
-  3. KDC/mobile ingress rejects malformed, oversized, unauthorized, duplicate,
-     replayed, unknown-version, and echo payloads while preserving attribution.
-  4. Binary payloads use verified Files jobs and expire unless explicitly saved;
-     no binary bytes enter the bounded Bus envelope or clipboard history store.
-  5. VNC, RDP, and SPICE negotiate their real capabilities bidirectionally or
-     expose explicit unsupported state. `browser-vm` has no host-side exception.
-  6. The suite is the sole Clipboard UI and old text-only histories, workers,
-     and protocol lanes are removed after repeatable migration.
-- Verification method: Run focused farm tests for DRM shortcut/output handling,
-  MIME bounds/sanitization, consent, all-node fanout, ordering/echo prevention,
-  Files payload lifecycle, KDC/mobile authorization, and VNC/RDP/SPICE wire
-  behavior. Complete live direct-seat and multi-node round trips among Editor,
-  Terminal, the suite, a VDI desktop, and `browser-vm`; unsupported MIME or
-  protocol channels must remain explicit.
-- Origin or merged source IDs: 2026-07-26 operator report that platform cut and
-  paste is unusable; 2026-07-28 host Browser retirement; and the 2026-08-03
-  Mesh Collaboration Suite survey requiring rich, opted-in all-node Clipboard.
+  1. Text, HTML, image, file, and typed metadata round-trip or fail with a typed reason.
+  2. Secret, replay, flood, stale lease, and unauthorized-peer tests pass.
+  3. Five-seat local/mesh/VDI evidence shows bounded memory and cleanup.
+- Verification method: shared, bus, shell, VDI, package, and live cargo gates with explicit farm routing; record exact payload hashes.
+- Origin or merged source IDs: 2026-07-26 operator platform cut; archived clipboard workstreams.
 
 ### WL-FUNC-017 - Complete Maps, navigation, and MG90 radio health
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Maps and Car look finished but still contain an unstable MG90
-  freshness contract, incomplete radio/GNSS accounting, dead controls, empty
-  instruments, inert map rotation/pitch, hard-coded route geometry, fabricated
-  lane/speed guidance, and no live Valhalla route session. The MG90 worker
-  commonly publishes every 10-13 seconds while the consumer expires data after
-  5 seconds. The wire model collapses Wi-Fi A/B, omits Bluetooth health, and
-  cannot distinguish missing, failed, disabled, stale, or standby radios.
-- Required outcome: Maps is a production offline mapping and turn-by-turn
-  product in Construct and Car. MG90 remains a Workstation-attached vehicle
-  gateway, never a node role. Each MG90 has an independent, versioned snapshot
-  with ESN/alias identity, `management_node_id`, source/provenance, approval and
-  sharing state, and complete radio/GNSS/vehicle domains. Multiple workstation
-  managers may publish and issue authorized idempotent actions; remote nodes
-  render the freshest valid snapshot read-only, with stale/resync/cache state.
-  A persistent accessible health rail and gateway console expose honest
-  per-radio state/freshness. Real route, maneuver, map, trip, and vehicle data
-  replace placeholders. Carbon requirements retire while egui, shared `Style`,
-  Construct, Car, and direct DRM remain governed.
-- Current state: Versioned multi-manager MG90 identity/radio/freshness
-  contracts, bounded Maps/Car projections, roster/cache/resync behavior, OBD
-  outcome typing, offline-region admission, and route-start guards are
-  farm-tested. Seat 15 has published sanitized MG90 LTE/GNSS/power/ignition
-  observations; OBD remains explicitly untyped until its schema is verified.
-  Full live-adapter cadence, all-radio discovery, multi-manager action rollout,
-  Valhalla navigation, real map/route/vehicle rendering, and end-to-end live
-  acceptance remain open. Exact credential-free evidence is preserved in the
-  dated pre-lint-compaction snapshot.
+- Problem: Maps, weather, Car navigation, GNSS, and MG90 radio data have incomplete provider truth, offline behavior, taskbar entry, and recovery.
+- Required outcome: Maps provides production offline maps, turn-by-turn navigation, and a map-first current/1-day/3-day/5-day weather experience. A live weather icon
+  and temperature beside the clock deep-link into Maps. Car exposes typed route/vehicle/radio health; MG90 is bounded, reconnectable, multi-manager, and never presents
+  fabricated position, weather, forecast, or link state.
+- Current state: versioned vehicle contracts and bounded projections exist. Maps already has NWS alert polygons, NWS hourly drive-ahead forecasts, and animated
+  IEM/NEXRAD radar seams, but the forecast is vehicle-fix scoped and capped at 24 hours. A general current/manual location authority, current observations, five-day
+  summaries, nowCOAST temperature/wind/cloud layers, clock-adjacent launcher, offline map cache, route execution, radio recovery, and complete live proof remain.
+- **Geocoder boundary checkpoint (2026-08-06):** hostile rows with invalid coordinates/control-bearing or oversized labels are rejected before navigation; BigBoy passed 1/1.
+  Evidence: `docs/platform/evidence/WL-FUNC-017-2026-08-06-geocoder-boundary-r1.md`.
 - Remaining work:
-  1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
-     the Maps/Car-specific authority while retaining egui, shared `Style`,
-     Construct/Car, HIG principles, and Car Dark/Light modes. Inspect governance
-     history first, leave `AGENTS.md` untouched, and do not create a repo-root
-     `CLAUDE.md`.
-  2. Extend the landed versioned `VehicleState` v2 baseline to multiple MG90s,
-     multiple managers, and the full rolling-upgrade removal plan.
-  3. Extend the landed bounded `RadioId`/health inventory with live SKU
-     discovery and multiple-manager routing. Consumer-side stale/resync/cache
-  behavior is now covered for the Maps roster fold; live adapter evidence and
-  cross-surface rollout remain.
-  The vehicle worker now rejects unsupported v2 schemas before acceptance and
-  exposes a typed manager route that skips revoked or unenrolled suppliers while
-  preserving an honest no-source/rejected result; its focused farm gate passes
-  79 tests with 4,238 filtered on `.90` slot `func017-vehicle-review-239`.
-  4. Extend the landed typed radio metrics with proven device discovery and
-     live adapter coverage; never infer absent hardware or zero-fill telemetry.
-  5. Refactor the vehicle worker into independent schedulers for multiple MG90s
-     and multiple managers: fast status, slow enrichers, direct-Ethernet-first
-     transport, authorized mesh fallback, and a publisher that emits on change
-     plus a heartbeat at most every 2 seconds. Deduplicate to the freshest
-     complete snapshot. Slow probes may time out without delaying heartbeats or
-     erasing fresher fields; consumers mark domains stale after three intervals.
-     Lighthouses relay transparently without storing snapshots; relay migration
-     pauses for full resync and renders last values with a resyncing state.
-  6. Complete proven MG90 adapters for identity, radio state, GNSS, power,
-     GPIO, WAN policy, VPN, and device temperature. Decode OBD/HDOBD only from
-     captured, sanitized, versioned fixtures that prove the payload schema and
-     units. Discovery requires explicit approval; report `Unsupported`,
-     `NotInstalled`, or a specific probe failure instead of zero-filled
-     telemetry, and never place credentials in snapshots, logs, or cache.
-  7. Add a persistent Radio Health Rail to Free Drive and Active Route. Keep
-     stable positions for the six native interfaces so every radio is
-     accounted for. Use color plus shape/text: green check active, blue ring
-     standby, amber triangle acquiring/degraded, red crossed link fault, gray
-     pause disabled, gray slash not installed, and clock outline stale/unknown.
-     Keep signal strength and active-uplink selection separate. Car and
-     Construct expose metrics, age, handoffs, failures, diagnostics, management
-     node, source, relay, stale, and resync state without a motion-based policy.
-  8. Replace MG90 administration with Overview, Radios & GNSS, Vehicle I/O, and
-     Maintenance, all driven by v2. Any active approved workstation manager may
-     issue an idempotent allowlisted typed `action/vehicle/*` request. Order
-     concurrent actions by mesh arrival time with last-accepted-action-wins;
-     queue during resync, expire failed queues, reject duplicate pending writes,
-     discard queues during takeover, and keep typed reply, timeout, audit, and
-     revocation behavior visible. Delete unsupported controls.
-  9. Add typed route/session/maneuver/lane/limit/voice/reroute/cancel contracts
-     and supervise local Valhalla over Bus request/reply. Disable Start until a
-     route and compatible region are ready. Render only provider-returned
-     polylines/guidance; delete `ROUTE_UV`, `ALT_UV`, `mock_lanes`,
-     `mock_speed_limit`, and production fixtures. Add map matching, bounded
-     reroute, maneuver/ETA advancement, cancellation, and restart recovery.
-  10. Wrap MapLibre Native as a rendering dependency, not a UI toolkit. Render
-      an offscreen RGBA frame into an egui texture on both the production
-      `egui_glow` DRM path and windowed wgpu path. Support vector labels,
-      collision handling, real route geometry, smooth zoom/bearing/pitch, and
-      independent day/night map styles. Do not implement a new vector-map
-      engine in Rust; remove rotation/pitch controls until their rendered effect
-      and input behavior pass.
-  11. Define a signed `OfflineRegionManifest` binding vector tiles, style/font
-      assets, gazetteer, Valhalla graph, bounds, versions, byte sizes, and
-      digests. Extend the existing region installer for verified staging,
-      atomic activation, rollback, storage accounting, update, and removal.
-      Never mix graph, gazetteer, and map revisions from incompatible bundles.
-  12. Rebuild navigation around Free Drive, Active Route, and Explore. Car uses
-      a full-canvas map, one maneuver/ETA card, the health rail, and at most four
-      map actions; secondary controls live in sheets rather than a scrolling
-      page. Construct adds search, saved places, recents, region management, and
-      diagnostics. Replace empty instruments with three to five
-      capability-backed readings; collapse missing feeds into one health row
-      and repair invalid persisted choices.
-  13. Complete trip recording, recent destinations, favorites, route history,
-      breadcrumb replay, and export with bounded durable storage and explicit
-      start/stop/delete actions. Record only fresh defensible fixes and mark
-      gaps; never interpolate missing travel as observed history.
-  14. Redesign Airspace around source truth. Identify the radio and scan age for
-      each survey, use ranked spectrum/contact presentation when bearing is
-      absent, and enable directional radar only for a proven bearing source.
-      Prevent scans from disrupting an active Wi-Fi WAN/AP and report that gate
-      explicitly. Geolocate contacts only from defensible coordinates.
-  15. Replace Maps/Car Carbon-named glyphs and category mappings with
-      license-audited repo-native navigation, radio, satellite, vehicle, and
-      maneuver SVGs. Use Inter Variable for UI text and tabular instrument
-      numerals; reserve display typography for branding. Coordinate reusable
-      primitives with WL-UX-009 rather than creating a second platform theme.
-  16. Cut over atomically: migrate persisted map/route/tile selections, deploy
-      v2 producer before consumer enforcement, remove v1 after the documented
-      window, delete simulator/runtime reachability and dead controls, update
-      current help/design/governance, and archive superseded Maps plans with an
-      explicit disposition.
-- Scope: This epic owns MG90 vehicle/radio/GNSS contracts and workers; gateway
-  health and safe management; Maps/Car navigation UX; Valhalla routing;
-  MapLibre offscreen rendering; offline-region lifecycle; route/trip storage;
-  Airspace source truth; Maps/Car icon and typography migration; rollout,
-  cleanup, and proof. It does not create an MG90 node role, infer unreported
-  antenna faults, configure carrier service, add paid map/feed providers,
-  expose credentials, build a general fleet-management product, or restyle
-  unrelated Construct surfaces. Typed authorized actions are not blocked by a
-  motion policy; stale, unavailable, and unapproved actions remain disabled.
-- Relevant files/components:
-  `crates/mesh/mackes-mesh-types/src/{vehicle,airspace}.rs`,
-  `crates/mesh/mackesd/src/workers/{vehicle,airspace}.rs`,
-  `crates/desktop/mde-maps-location-egui/`, shell Car integration,
-  `install-helpers/install-offline-map-region.sh`, packaging/service manifests,
-  shared `mde-egui`/theme assets, and the current platform-interface authority.
-- Dependencies: Use WL-UX-009 for shared frame/state/icon primitives without
-  blocking data, routing, or renderer work. Preserve existing Bus, sealed
-  credential, audit, direct-DRM, offline gazetteer, and overlay contracts.
-  MapLibre Native, Valhalla, and their packaged data must remain local/offline
-  at runtime. Installed MG90 hardware supplies live evidence; unavailable
-  optional modules require explicit notes, not fabricated success.
+  1. S1 Freeze provider, location, and weather contracts.
+     - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
+       source, producer time, fetch time, attribution, freshness, and explicit gaps.
+     - Inputs: mesh types, existing MG90 managers, `nws_alert`, `nws_forecast`, `iem_radar`, vehicle fixes, and offline gazetteer results.
+     - Deliverable: bounded versioned contracts, topic helpers, normalization rules, and hostile schema tests. Add `action/weather/set-location` plus latest-wins
+       `state/weather/location/<host>`, `state/weather/current/<host>`, `state/weather/forecast/<host>`, and `state/weather/map/<host>` projections.
+     - Weather bounds: `WeatherLocationMode::{Auto, Manual}`; at most 120 hourly periods and five daily summaries; unit-tagged optional measurements; bounded labels,
+       source identifiers, alert references, gaps, and attribution; local date/time-zone identity for aggregation; no zero-filled missing values.
+     - Depends on: none.
+     - Acceptance: unknown versions/managers, invalid or non-finite coordinates, hostile labels, oversized collections, future/stale timestamps, impossible units, and
+       unsupported map fields fail closed without replacing the last known-good snapshot.
+     - Validation: mesh-type cargo tests on .90.
+     - Done when: round-trip and hostile fixtures pass and the evidence records the exact topics, schema revision, caps, and source hash.
+  2. S2 Implement one effective-location authority.
+     - Objective: resolve a truthful weather/map point without coupling workstation weather to a vehicle fix.
+     - Inputs: S1, fresh same-host GNSS/device/vehicle fixes, persisted settings, and the existing offline geocoder.
+     - Deliverable: daemon-owned Auto/Manual resolver, atomic preference persistence, location-change generation, and typed action admission. Auto uses a fresh local fix,
+       falls back to the last saved verified place, and reports unavailable when neither exists. Selecting a verified search result enters Manual; `Use Current Location`
+       restores Auto. A location change clears mismatched projections immediately and triggers refresh.
+     - Depends on: S1.
+     - Acceptance: restart preserves mode and verified manual place; stale/wrong-host fixes, replayed actions, invalid search rows, and unsupported coverage never silently
+       select a location or retain data for the prior point.
+     - Validation: resolver/property tests on .50 with injected clocks, fixes, persistence failures, restarts, and location movement.
+     - Done when: Auto, Manual, fallback, unavailable, restart, and location-change traces are recorded.
+  3. S3 Produce current conditions and 1/3/5-day forecasts.
+     - Objective: make the daemon the only network and forecast aggregation authority for the selected location.
+     - Inputs: S1/S2, official NWS `/points`, nearest-station observations, `forecastHourly`, and existing NWS parser/probe seams.
+     - Deliverable: default-on Workstation weather worker with strict official-host allowlists, redirects disabled, bounded bodies, timeouts, backoff, last-good caching,
+       condition normalization, current observations, 120 retained hourly periods, and five local-day summaries. Preserve the existing vehicle drive-ahead forecast topic
+       for Car rather than changing its semantics.
+     - Forecast behavior: 1D exposes the next 24 hourly periods; 3D and 5D expose producer-derived local-day high/low, dominant condition, precipitation, and wind
+       summaries. Normalize provider text into clear day/night, cloud, rain, wintry, storm, fog, wind, and unavailable; retain original bounded provider text.
+     - Cadence: fetch current conditions every five minutes and forecasts every ten minutes; refresh immediately after effective-location generation changes or material
+       live-fix movement. Current data older than 90 minutes is stale; older than six hours is unavailable. Never infer freshness from local fetch success alone.
+     - Depends on: S2.
+     - Acceptance: partial observation/forecast failure is explicit; missing measurements remain absent; daily aggregation respects provider time zone and DST; provider
+       loss retains only age-bounded last-good data and never publishes another location's conditions.
+     - Validation: injected-probe parser/worker tests on .50 and broad async tests on BigBoy.
+     - Done when: live or recorded NWS fixtures prove current, 120-hour, 1D/3D/5D, partial-outage, stale, expiry, retry, restart, and point-change behavior.
+  4. S4 Produce bounded live weather map layers.
+     - Objective: combine independently controllable radar, alerts, temperature, wind, and clouds without UI-owned network I/O.
+     - Inputs: S1/S2, existing IEM/NEXRAD and NWS-alert workers, and official nowCOAST WMS capabilities.
+     - Deliverable: reuse animated radar and alert polygon contracts; add validated Web-Mercator PNG snapshots for `ndfd_temperature:air_temperature`,
+       `ndfd_wind:wind_velocity`, and `ndfd_sky:total_sky_cover`. Bound frame count, zoom, viewport, pixel dimensions, bytes, producer times, legends, cache keys, and disk
+       retention; reject non-PNG/error documents and redirects.
+     - Layer policy: Radar and Alerts are independent toggles and default on. Temperature/Wind/Clouds are one exclusive atmospheric selector and Temperature defaults on,
+       so unreadable rasters are not stacked. Animate only valid time-ordered frames and expose pause, age, attribution, degradation, and unavailable state.
+     - Cadence: retain the existing 60-second radar/alert refresh; fetch atmospheric fields every ten minutes and on location/viewport generation changes with bounded
+       cancellation and backoff.
+     - Depends on: S2.
+     - Acceptance: strict HTTPS allowlists, bounded responses, PNG signature/dimension checks, future/stale frame rejection, cache corruption, provider loss, and viewport
+       churn cannot block rendering, leak old-location imagery, or fabricate a successful layer.
+     - Validation: overlay contract/parser/cache tests on .90; animation and field render fixtures on BigBoy.
+     - Done when: each layer has fresh, stale, unavailable, malformed-payload, and attribution evidence, including explicit unsupported-territory behavior.
+  5. S5 Ship offline map catalog and cache.
+     - Objective: download, verify, index, expire, and query approved map regions without unbounded disk or network work.
+     - Inputs: map provider policy and storage bounds.
+     - Deliverable: cache/index worker, offline fixtures, quota/eviction evidence.
+     - Depends on: S1.
+     - Acceptance: offline query returns only verified tiles or a clear unavailable result.
+     - Validation: map/cache property tests and package checks.
+     - Done when: quota and corruption recovery pass.
+  6. S6 Implement route and navigation authority.
+     - Objective: calculate and present turn-by-turn routes with reroute, progress, cancellation, and source attribution.
+     - Inputs: S1/S5, typed location and route services.
+     - Deliverable: daemon-owned navigation worker and deterministic route fixtures.
+     - Depends on: S5.
+     - Acceptance: no UI-thread I/O, false position, stale route, or silent reroute.
+     - Validation: route simulation cargo tests on BigBoy.
+     - Done when: online/offline/reconnect traces are captured.
+  7. S7 Implement MG90 radio and manager recovery.
+     - Objective: connect multiple approved managers, correlate GNSS/radio health, select a source deterministically, and recover link loss.
+     - Inputs: S1, provider credentials/configuration, MG90 hardware.
+     - Deliverable: provider adapters, selection policy, audit, and replay tests.
+     - Depends on: S1.
+     - Acceptance: source loss is visible and no provider claims success without a live response.
+     - Validation: provider/fault-injection tests and hardware fixture.
+     - Done when: each manager state has evidence or a named blocker.
+  8. S8 Build the map-first weather interface in Maps.
+     - Objective: make Maps the sole weather destination with fast current/1D/3D/5D understanding and full live-map control.
+     - Inputs: S2-S4, existing Maps Map tab/surface, offline geocoder, and UX-009 Style/Visuals.
+     - Deliverable: a weather-focused Map mode centered on the selected location, responsive forecast sheet/inspector, Current plus 1D/3D/5D tabs, location search,
+       `Use Current Location`, layer controls, legends, timestamps, attribution, keyboard/touch navigation, and explicit loading/stale/unavailable/unsupported states.
+     - Layout behavior: preserve map context while the forecast sheet opens; do not invent a vehicle marker for a manual place. Wide views may use a side inspector;
+       narrow/largest-text views use a bounded bottom sheet. Forecast tabs retain scroll/focus state and remain usable in Dark/Light and Bottom/Left taskbar layouts.
+     - Display units: show Fahrenheit and mph initially while wire values remain unit-tagged. Never substitute zero, hide provider gaps, or imply coverage outside the
+       United States and supported NOAA territories.
+     - Depends on: S3, S4, UX-009 S1-S3.
+     - Acceptance: tab switching, location mode, layer choices, attribution, stale/expiry behavior, responsive layout, and provider recovery are deterministic; render
+       performs no Bus, network, clock, persistence, or backend I/O.
+     - Validation: headless Maps model/render/input tests on BigBoy for Dark/Light, wide/narrow, largest text, keyboard, touch, fresh/stale/unavailable, and all layers.
+     - Done when: deterministic captures and direct-DRM review prove every state with no clipping, hidden meaning, unreadable raster stack, or false location.
+  9. S9 Add the clock-adjacent live weather launcher.
+     - Objective: expose live weather beside the clock without creating a second launcher, Home widget, tray flyout, or new top-level surface.
+     - Inputs: S3, Maps weather deep link, shell Bottom/Left taskbar geometry, UX-012 S1-S3, and the shared icon registry.
+     - Deliverable: a full-hit-target monochrome condition icon plus rounded temperature immediately left of the clock in Bottom and Left layouts. Constrained layouts
+       collapse to icon-only. Activation selects the existing Maps & Location surface, activates Map, and opens weather mode; the clock continues to open Notification
+       Center and all hit regions remain disjoint.
+     - Icon policy: add closed registry variants for clear day/night, clouds, rain, wintry weather, storms, fog, wind, and unavailable using existing licensed assets or
+       repository-approved replacements. Stale data dims the icon and exposes age; expired/unavailable data shows no temperature and never reuses a prior condition.
+     - Depends on: S3, S8, UX-012 S1-S3.
+     - Acceptance: correct condition/temperature/freshness survives restart and location changes; responsive icon-only fallback, keyboard activation, accessible label,
+       focus, deep link, and weather/clock/tray target separation pass in both placements.
+     - Validation: shell projection/navigation/render tests on BigBoy plus direct-DRM Bottom/Left captures.
+     - Done when: action traces and reviewed captures prove one click opens weather mode and the clock/tray retain their governed behavior.
+  10. S10 Integrate Maps/Car, package, document, and prove release behavior.
+      - Objective: close the complete Maps/weather/navigation/vehicle/radio slice with reproducible farm and live evidence.
+      - Inputs: S1-S9, ARCH-009/010 authority, UX-009/012, CRIT-006/007, package policy, and required hardware/providers.
+      - Deliverable: production wiring and default-on Workstation weather worker; responsive Maps/Car captures; package/service policy; five-seat/MG90/weather evidence;
+        updated `docs/design/platform-interfaces.md` and refreshed `docs/design/maps-live-overlays.md` that describes shipped rather than planned providers.
+      - Farm routing: rerun `farm-topology.sh table`; use distinct free slots with mesh contracts on `.90`, focused async workers on `.50`, and the longest
+        Maps/shell/full gate on BigBoy `.130`. Run worklist self-test before lint, then doc-supersession and style-leak gates.
+      - Live matrix: on release seat `.15`, exercise fresh fix, manual override, return to Auto, provider loss/reconnect, restart persistence, Bottom/Left, Dark/Light,
+        icon-only fallback, offline maps/routes, sleep/rejoin, radio source loss, and MG90 recovery. Publish the required five-second AI alert before seat mutation.
+      - Depends on: S5-S9, ARCH-009, ARCH-010, UX-009, UX-012, CRIT-006, CRIT-007.
+      - Acceptance: no GUI-owned provider, network I/O, duplicate destination, fabricated data, secret, unbounded cache, stale installed payload, or undocumented live gap;
+        missing hardware/provider access is recorded honestly and cannot become a production pass by inference.
+      - Validation: focused cargo gates, full CI gate, package/RPM ownership checks, doc/worklist/style lints, direct-DRM captures, provider traces, and five-seat fleet proof.
+      - Done when: one evidence bundle records revision, exact commands/slots/results, source timestamps/attribution, captures, package identity, all live outcomes, and any
+        explicit production blocker.
+- Scope: Owns maps, current/forecast weather, live weather layers, weather location preference, taskbar weather projection/deep link, navigation,
+  vehicle/radio/GNSS contracts and workers, Car/Maps surfaces, offline cache, casting/location health, documentation, and proof. Taskbar geometry remains UX-012;
+  shared visual primitives remain UX-009; Network Operations presentation belongs to ARCH-009. Do not add a Weather app, launcher catalog entry, Home widget, tray
+  flyout, compositor surface, paid/geocoding provider, or GUI-side provider client.
+- Relevant files/components: `crates/mesh/mackes-mesh-types/src/{vehicle,nws_alert,nws_forecast,iem_radar}.rs`, new weather contract module,
+  `crates/mesh/mackesd/src/workers/{vehicle,nws_alert_overlay,nws_forecast_overlay,iem_radar_overlay}.rs`, new weather worker, `crates/desktop/mde-maps-location-egui/src/`,
+  `crates/desktop/mde-shell-egui/src/{nav_bar,status_bar,surfaces}.rs`, `crates/shared/mde-theme/src/brand/icons.rs`, map cache/storage, GNSS/radio providers,
+  package policy, `docs/design/{maps-live-overlays,platform-interfaces}.md`, and evidence helpers.
+- Dependencies: ARCH-009 worker ownership, ARCH-010 Workload/Bus authority, UX-009 visual primitives, UX-012 taskbar geometry/actions, CRIT-006, and CRIT-007.
 - Acceptance criteria:
-  1. A 30-minute MG90 bench run publishes at the declared cadence with no false
-     live/stale flicker, no heartbeat gap over 3 expected intervals, and no
-     slow enrichment probe blocking current radio, power, ignition, or GNSS
-     state.
-  2. Cellular A/B, Wi-Fi A/B, Bluetooth, and GNSS always have one stable
-     inventory row. Single-radio variants show Cellular B as not installed only
-     when proven; unknown hardware never appears failed or absent.
-  3. Every radio passes active, standby, acquiring, degraded, fault, disabled,
-     stale, unknown, and not-installed fixture transitions with the specified
-     non-color cue. The active uplink is independently identifiable.
-  4. Cellular, Wi-Fi, Bluetooth, and GNSS details display only reported metrics,
-     correct units, source, and observation age. GNSS no-fix shows satellites
-     and freshness without claiming an antenna fault or usable position.
-  5. Car shows the complete health rail on Free Drive and Active Route without
-     covering maneuver/ETA content. Car and Construct expose the same bounded
-     matrix, including manager/source/stale/resync state, without a motion-based
-     policy.
-  6. MG90 Overview, Radios & GNSS, Vehicle I/O, and Maintenance consume the
-     same snapshot. Multiple approved workstation managers, takeover,
-     revocation, idempotency, mesh-arrival ordering, resync queue expiry, and
-     read-only stale-cache behavior are covered. Every enabled control produces
-     a real typed, authorized, audited reply; no UI-only toggle, dead button, or
-     unbounded command input remains.
-  7. OBD values appear only for a verified supported payload. Absent,
-     unsupported, malformed, and stale OBD sources remain distinct and never
-     produce zero-filled RPM, speed, fuel, temperature, or odometer readings.
-  8. Search returns offline results; preview/start use live Valhalla; guidance
-     advances and recovers from off-route, restart, cancel, and missing-region
-     conditions. No hard-coded geometry, fabricated lane/limit, reachable
-     simulator data, or enabled Start action remains when routing is unavailable.
-  9. MapLibre renders installed vector tiles, labels, route, bearing, pitch,
-      zoom, and day/night style through egui on windowed wgpu and the direct
-      DRM/GLES seat. Stationary pointer input does not stop advancing frames.
-  10. Region install/update/remove verifies signatures and digests, enforces
-      bounds/storage, atomically activates compatible tile/style/gazetteer/graph
-      data, rolls back on interruption, and never exposes a mixed bundle.
-  11. Free Drive, Active Route, and Explore work at supported Car and Construct
-      resolutions with no nested map scrolling, clipped sheets, unreachable
-      controls, empty dashboard expanses, or more than four Car map actions.
-  12. Instrument defaults choose available high-value data, persist valid user
-      choices, repair invalid selections, and collapse unavailable feeds into a
-      concise health explanation.
-  13. Trips record only fresh fixes, preserve explicit gaps, replay on the real
-      map, export through a working action, and honor bounded retention and
-      confirmed deletion.
-  14. Bearing-less Airspace contacts never appear directional; scan source,
-      radio health, age, and disruptive-scan gates are visible and tested.
-- Verification method: Add bounded contract/property tests for vehicle v2,
-  radio inventory/states, parser fixtures, cadence, time skew, and v1 rollout;
-  deterministic worker tests with delayed/failed probes; route/maneuver,
-  map-render, region-integrity, trip, Airspace, dead-control, and
-  screenshot tests. Run independent focused farm jobs for mesh types, `mackesd`,
-  Maps, shell/Car, and packaging; put
-  `@farm:{cargo test --workspace --all-targets}` and
-  `@farm:{cargo clippy --workspace --all-targets --all-features -- -D warnings}`
-  on BigBoy. Run worklist/doc/style/architecture/secret/package gates and
-  `cargo fmt --all -- --check`. Finish with a sanitized MG90 replay, 30-minute
-  hardware bench proof, direct-DRM Car/Construct captures, route drive/replay,
-  offline install/rollback, and explicit evidence for every installed radio.
-- Origin or merged source IDs: 2026-07-29 operator review of broken/incomplete
-  mapping, navigation, and MG90 data; follow-up requiring visible health for
-  every MG90 radio and GPS and permitting removal of all Carbon requirements.
-  Corrective successor to archived WL-FUNC-010, WL-FUNC-012, WL-FUNC-013, and
-  WL-UX-007. Evidence sources include `docs/design/maps-worldclass-plan.md`,
-  `docs/design/maps-live-overlays.md`, the official MG90 hardware/setup
-  inventory, and Apple/Google in-vehicle navigation guidance.
+  1. Offline map and route flows are deterministic and bounded.
+  2. MG90 source selection, GNSS freshness, reconnect, and failure are truthful.
+  3. Current weather and 1D/3D/5D forecasts are location-correct, bounded, attributed, fresh-or-explicitly-stale, and honest under partial provider loss.
+  4. Radar, alerts, temperature, wind, and cloud cover render from daemon-owned validated data with independent truthful layer state.
+  5. The weather icon and temperature sit immediately left of the clock, deep-link to Maps weather mode, degrade responsively, and never alter clock/tray semantics.
+  6. Five-seat and MG90/weather-provider proof covers live/manual/offline/provider-loss/restart/sleep/rejoin and package upgrade.
+- Verification method: contract/property, location/persistence, NWS/nowCOAST/IEM parser and worker, route/cache, provider/fault, Maps/shell model/render/navigation,
+  accessibility, package, documentation, and live hardware/provider gates with explicit farm slots; BigBoy runs the longest Maps/shell and route suites.
+- Origin or merged source IDs: 2026-07-29 Maps/MG90 review and vehicle/navigation source workstreams; 2026-08-08 operator map-first weather, 1D/3D/5D,
+  full live-layer, current/manual-location, and clock-adjacent launcher decisions.
 
 ### WL-FUNC-018 - Seamless Flatpak Front Door backed by App VMs
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Construct has no supported way to discover or launch Wayland
-  Flatpak applications. The host deliberately owns the DRM seat directly,
-  ships no compositor, and does not run native host applications, so adding a
-  normal Flatpak launcher would silently violate the thin-client boundary.
-  Flatpak applications also need a real Wayland session, portal services,
-  runtimes, GPU/audio policy, and durable application identity; none of those
-  contracts currently connect the Front Door catalog to App VM provisioning.
-- Required outcome: A user searches Front Door, selects a Flatpak app, and
-  sees it launch as a Construct application without managing or seeing the
-  underlying VM. Construct owns catalog, favorites, permissions explanation,
-  launch state, stop/resume, reconnect, and honest failure presentation.
-  `mackesd` places or resumes a Wayland-enabled App VM through the existing
-  Workloads/session-broker/VDI planes; the guest owns Flatpak, its compositor,
-  portals, app files, and app execution. No host compositor, host Flatpak
-  sandbox, arbitrary host D-Bus access, or native-app fallback is introduced.
-- Current state: Signed catalog projection, typed App VM/OpenApp/session/VDI
-  contracts, a bounded immutable Wayland/Flatpak image profile, lifecycle and
-  generation/replay/identity admission, favorites/permission states, and
-  guest-owned launch/evidence policies have focused farm or static-image proof.
-  Host-launch fallback remains rejected. Full provision/install/guest-process/
-  portal/VDI app-mode convergence, remote signing, data/update/removal policy,
-  live GPU/audio/input/reconnect proof remain open. Exact implementation and
-  image evidence is preserved in the dated pre-lint-compaction snapshot.
+- Problem: Construct lacks a governed way to discover and run Flatpak applications without installing native host apps.
+- Required outcome: Front Door searches a signed catalog, starts an isolated App VM through Workloads, displays its Wayland app over VDI, and stops/cleans the session
+  predictably.
+- Current state: signed catalog and typed App VM/OpenApp/session contracts exist; catalog freshness, image supply, launch readiness, UX, security, and live proof remain.
 - Remaining work:
-
-  1. Complete the Front Door catalog experience around the validated projection:
-     finish permission explanation and launch-state/reconnect presentation.
-     Preserve unavailable, stale, unsigned, and not-installed states instead of
-     presenting a launchable card for missing guest content.
-  2. Finish integration of the typed App VM launch/session contract across the
-     Workloads and `action/vdi/session` seams, including app identity, catalog
-     revision, guest profile, placement constraints, session identity, requested
-     capabilities, and resume/reconnect intent without raw command, mount,
-     environment, or socket input.
-  3. Complete `mackesd` reconciliation for App VM images and app declarations:
-     the typed desired-state and dedicated image-selection/build lane now land;
-     signed-image admission now distinguishes unavailable, unsigned, stale,
-     and fresh matching evidence before declaration; still required are
-     idempotent provision/resume now requires fresh matching guest-runtime evidence;
-     full guest install/update execution through the admitted
-     `curated` remote, and complete daemon-published readiness. The guest unit
-     now reports bounded install/start/failure evidence and the broker consumes
-     it; the guest image validates every identity before admission. The image
-     now has a fixed compositor/app supervisor; full process convergence remains
-     required. Repeated launches must converge
-     on one app session, not duplicate VMs or processes.
-  4. Finish the hardened App VM profile: the image definition now pins the
-     supported Wayland compositor, portal frontend/backends, Flatpak, PipeWire,
-     input, and deny-by-default profile, while the new static built-image
-     verifier now checks those contents and requires immutable image provenance;
-     remote signing and bounded writable app-data policy remain to be
-     implemented and inspected in a built image.
-     The image-owned launcher binds app process lifetime to the
-     guest compositor and emits terminal failure evidence. Portal prompts and
-     file access remain guest-scoped; the host does not proxy arbitrary portal
-     requests or grant unrestricted host paths.
-  5. Complete VDI app-mode presentation so the shell renders the application
-     surface with Construct chrome, forwards keyboard/pointer/touch/text input,
-     preserves focus, and handles resize, close, suspend, reconnect, and
-     compositor/app crash separately. A full guest desktop may be a diagnostic
-     recovery view only; it is not the normal Flatpak UX. The Workloads-side
-     launch action and typed session handoff are now landed; Construct-owned
-     app identity chrome, close, input routing, and bounded reconnect/failure
-     presentation are covered by focused tests. Focusing the resulting
-     broker-visible App VM rail entry now routes the typed session into the
-     existing VDI console resolver once; live guest-backed rendering, resize,
-     reconnect, and compositor/app crash proof remain required.
-  7. Add explicit user-facing permission and lifecycle states: installing,
-     waiting for placement, starting guest, starting app, connected, paused,
-     reconnecting, unavailable, denied, stale catalog, and failed with retry
-     guidance. Destructive actions (remove app/data, stop guest, reset guest)
-     require typed confirmation and explain their scope. The shared lifecycle
-     enum now enforces legal forward/retry edges and idempotent repeated states
-     in the daemon broker. The serving daemon also emits a signed
-     `starting_guest` handoff while the session is still waiting, without
-     rewinding later evidence; guest runtime probes, publication of later
-     transitions, and shell consumption of connected/reconnecting states remain
-     required.
-  8. Integrate app data, updates, favorites, recents, and removal with the
-     existing replicated-state and retention rules. Keep app data in the guest
-     profile, distinguish app reset from VM reset, and make purge behavior
-     explicit; never replicate secrets or silently expose guest home data to
-     the Construct host.
-  9. Add admission and security policy: default-deny network/host exposure,
-     capability and resource-budget checks, signed image/catalog provenance,
-     audit records for install/launch/permission/reset, and blast-radius
-     diagnostics. Reuse WL-CRIT-006 Workloads admission and provenance rather
-     than creating a second authorization plane. The typed App VM profile now
-     enforces bounded vCPU (1..=8), memory (1..=32768 MiB), disk (16..=256
-     GiB), mandatory network isolation, an eight-capability maximum, and an
-     explicit allow-list before image admission or desired-state persistence;
-     the pure mesh-type contract and nine daemon provisioning regressions pass
-     on farm `.90` slot `func018-app-daemon-191`. Individual catalog rows also
-     fail closed when `is_launchable()` is called before catalog projection;
-     five catalog policy tests pass on farm `.50` slot
-     `func018-catalog-launchable-194`.
-  10. Provide a staged migration and rollout: catalog-only records first,
-      one curated Flatpak in one App VM profile second, then updates,
-      favorites, roaming, remote placement, and broader catalog coverage.
-      Existing Construct surfaces and the Browser VM route remain unchanged;
-      an unavailable provider produces an honest disabled state.
-- Scope: Flatpak catalog/discovery, Front Door UX, App VM lifecycle and
-  placement, guest Wayland/portal/runtime image, VDI app-mode display/input,
-  permissions, app data, updates, roaming, resource admission, audit, recovery,
-  and the governed Flatpak catalog. Native host Wayland mode, a host compositor,
-  arbitrary user-built Flatpak manifests, unrestricted host filesystem/D-Bus
-  access, a general host desktop/window manager, and LibreOffice/printing are
-  out of scope. WL-FUNC-011 owns native LibreOfficeKit Editor workspaces and
-  their printing workflow; no LibreOffice App VM is created.
-- Relevant files/components:
-  `crates/desktop/mde-shell-egui/src/front_door.rs`,
-  `crates/desktop/mde-shell-egui/src/front_door_peer_apps.rs`,
-  `crates/desktop/mde-shell-egui/src/iac/views/app_vm.rs`,
-  `crates/desktop/mde-shell-egui/src/{discovery,session_rail,vdi}/`,
-  `crates/mesh/mackesd/src/workers/{session_broker,vm_lifecycle,desktop_sources}.rs`,
-  `crates/mesh/mackes-mesh-types/src/cloud.rs`, and App VM/bootc packaging.
-- Dependencies: Coordinate guest ownership and app-mode behavior with
-  WL-ARCH-008; use WL-FUNC-016 for negotiated rich Clipboard over VDI and
-  Files-backed binary payloads where the guest protocol supports them; use
-  WL-CRIT-006 for resource admission, provenance, retention, and production
-  evidence. Reuse existing Workloads Bus contracts and session identity; do not
-  create a Flatpak-specific control plane or a second active worklist.
+  1. S1 Freeze catalog and identity.
+     - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
+     - Inputs: catalog projection and trust policy.
+     - Deliverable: bounded catalog contract, importer, and ranking tests.
+     - Depends on: ARCH-010 S2.
+     - Acceptance: unsigned, stale, duplicate, or secret-bearing entries are rejected.
+     - Validation: catalog/property cargo tests on .50.
+     - Done when: catalog evidence and signature hashes exist.
+  2. S2 Build App VM image/profile.
+     - Objective: create reproducible image with Flatpak runtime, Wayland guest, agent, GPU/audio policy, and safe resource bounds.
+     - Inputs: Workload adapter and image builder.
+     - Deliverable: image/profile manifest and readiness probe.
+     - Depends on: ARCH-010 S4, S5.
+     - Acceptance: image contains only approved runtimes and reports ready/unavailable truthfully.
+     - Validation: image/package cargo and shell checks on BigBoy.
+     - Done when: image hash and probe trace exist.
+  3. S3 Implement typed open/resume/stop.
+     - Objective: start one App VM, wait for readiness, attach VDI, and stop it on session close or policy.
+     - Inputs: S1/S2 and Workload operation API.
+     - Deliverable: controller, idempotency, cancellation, and cleanup tests.
+     - Depends on: S2.
+     - Acceptance: duplicate opens reuse one session; timeout and crash clean all resources.
+     - Validation: Workload/App VM cargo tests.
+     - Done when: lifecycle trace proves one operation path.
+  4. S4 Integrate Front Door UX.
+     - Objective: search, select, approve permissions, show progress, focus input, and report failure in the shared Construct style.
+     - Inputs: S1-S3, UX-009/012.
+     - Deliverable: render/model fixtures and no-backend-I/O UI.
+     - Depends on: S3.
+     - Acceptance: no shell process or arbitrary command is launched.
+     - Validation: shell render/navigation tests.
+     - Done when: Dark/Light/narrow/largest-text captures pass.
+  5. S5 Prove security and release behavior.
+     - Objective: verify sandbox, resource limits, package upgrade, app data persistence, reconnect, and five-seat acceptance.
+     - Inputs: S1-S4 and CRIT-006/007.
+     - Deliverable: signed security/package/live evidence.
+     - Depends on: S4.
+     - Acceptance: host files/secrets are inaccessible and corrected-forward recovery succeeds.
+     - Validation: package, SELinux, architecture, and live VDI gates.
+     - Done when: every supported provider limitation is named.
+- Scope: Owns Flatpak catalog, Front Door, App VM image/lifecycle, VDI UX, policy, package, migration, and proof. Generic Workload and Android lifecycle are out of scope.
+- Relevant files/components: app catalog types/workers, mde-shell-egui Front Door/IAC, image-builder, browser/VDI, Quadlet/libvirt packaging.
+- Dependencies: ARCH-010, ARCH-009, UX-009, UX-012, CRIT-006, CRIT-007.
 - Acceptance criteria:
-
-  1. A signed curated Flatpak catalog appears in Front Door with stable app
-     IDs, icons, metadata, source/revision, install state, and accessible
-     search results. Malformed, duplicate, stale, and unsigned records are
-     non-launchable and explain why.
-  2. Selecting an installed app creates or resumes exactly one admitted App VM
-     session through typed Workloads plus `action/vdi/session`; no shell code
-     executes a catalog-provided command or opens an arbitrary host path.
-  3. The guest boots a supported Wayland session and portal stack; the selected
-     Flatpak renders through VDI app-mode, receives focused input, and supports
-     close, pause/resume, reconnect, resize, and app-crash recovery states.
-  4. The normal user experience shows an app surface with Construct chrome,
-     not a host window and not an unmanaged guest desktop. No host compositor
-     or native host Flatpak path is required.
-  5. Guest portal requests are bounded and auditable. File chooser, OpenURI,
-     settings, notifications, audio, clipboard, and screen/input capabilities
-     work through the declared guest policy; audio is mandatory and must reach
-     the host/VDI mixer with working capture and playback. No unrestricted host
-     access is granted.
-  6. Install, update, launch, stop, resume, remove, reset, and purge behavior
-     is idempotent, authorized, auditable, and tested across local placement,
-     remote placement, node loss, VM restart, app crash, and reconnect.
-  7. App data and credentials remain guest-scoped with explicit retention and
-     purge semantics; favorites/recents replicate only approved metadata.
-  8. Resource admission rejects unsafe CPU, memory, storage, GPU, network, or
-     capability requests before provisioning and exposes the rejection reason.
-  9. A curated end-to-end proof passes on the build farm plus a reachable
-     VDI/guest seat; missing live Wayland, portal, GPU, audio, or hardware
-     evidence is recorded as unavailable rather than implied by unit tests.
-- Verification method: Add pure catalog, identity, ranking, permission,
-  lifecycle, migration, and malformed-input tests; Bus contract tests for
-  typed App VM launch/session records; deterministic `mackesd` reconciliation
-  and idempotency tests; VDI frame/input/reconnect tests; guest-image and
-  portal-policy inspection; package/signature/provenance/resource-admission
-  gates. Run focused shell, mesh-types, `mackesd`, VDI, and packaging tests on
-  independent farm slots, with the longest App VM/guest build on BigBoy, plus
-  workspace clippy/fmt and worklist/doc/architecture/secret gates. Finish with
-  a live curated-app launch, portal file-selection, audio/input, app-crash,
-  suspend/resume, reconnect, and corrected-forward recovery capture when the
-  seat and guest provider are available.
-- Origin or merged source IDs: 2026-07-31 operator brainstorm: “Flatpak Front
-  Door backed by App VMs” — combines the Flatpak catalog/control-plane path
-  with the existing App VM/VDI runtime path. Evidence sources are the current
-  Construct no-host-app/no-compositor governance, App VM view, Front Door
-  provider, Workloads contracts, session broker, VDI transport, and Flatpak /
-  Wayland / xdg-desktop-portal upstream contracts.
+  1. Signed catalog search opens one isolated App VM through typed Workloads.
+  2. Readiness, input, audio, persistence, stop, crash, reconnect, and cleanup are truthful.
+  3. Five-seat security and package proof passes without host app installation.
+- Verification method: catalog, image, Workload, shell, package, SELinux, and live VDI cargo gates; BigBoy runs image/build jobs.
+- Origin or merged source IDs: 2026-07-31 Flatpak Front Door decision and archived app-launch workstreams.
 
 ### WL-FUNC-019 - Make Remote Sessions the universal resource browser
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Construct's Remote Sessions view is currently a narrow desktop
-  chooser. It does not provide one durable identity for local, mesh, LAN,
-  gateway, media, file, VM, container, cloud, or network resources, and its
-  supported client transports are not admitted from a typed capability
-  registry. Sunshine/Moonlight, SSH, SSH X11 applications, full remote X11
-  desktops, Jellyfin, and Subsonic/OpenSubsonic therefore cannot reliably be
-  discovered, authenticated, browsed, and opened from the Thin Client's main
-  interface. A resource that is visible through one worker but unsupported by
-  the shell is misleading; a control that launches arbitrary commands would
-  violate the bounded client boundary.
-- Required outcome: Remote Sessions is always Construct's primary onboarding
-  and resource-browsing surface. It shows one deduplicated card per resource,
-  with source, protocol/client capabilities, health, last-seen state, auth
-  state, and safe actions. Every resource for which Construct has a native
-  client or an explicitly approved typed adapter is exposed here, including
-  resources discovered locally, over mesh, on the trusted LAN, through
-  configured gateways, or from typed manual sources. Selecting a card hands
-  off to the existing native session/client surface while preserving card and
-  session state; no arbitrary shell command, plaintext credential, public
-  exposure, or UI-only fake capability is introduced.
-- Current state: `resources.rs` now provides a strict versioned
-  `ResourceIdentity`, card, transport/capability, auth/health, provenance, and
-  bounded-action contract with deterministic fingerprints and hostile-input
-  tests. Existing desktop and media publishers remain separate projections;
-  the shell chooser still knows only RDP/VNC/SPICE. The canonical resource
-  topic, capability registry, deduplicating discovery fold, SSDP/UPnP, SSH/X11,
-  Moonlight, Subsonic, universal landing surface, and all-seat Sunshine proof
-  remain open.
+- Problem: Remote Sessions is a narrow desktop chooser and does not admit all governed resources, typed capabilities, provenance, or safe actions.
+- Required outcome: one universal resource browser discovers peers, VMs, containers, Apps, Android apps, media, files, and services; deduplicates them by stable identity;
+  exposes typed Open/Start/Resume/Transfer actions; and never launches an untrusted or ambiguous resource.
+- Current state: universal identities, cards, capabilities, provenance, and typed execution scaffolding exist; hostile catalog coverage now rejects duplicate identity,
+  malformed provenance, unknown kinds, and admits multiple provenance sources. Adapters, freshness, deduplication, action authority, and full UI proof remain.
 - Remaining work:
-
-  1. Publish the landed versioned `ResourceIdentity`, `ResourceCard`,
-     `TransportCandidate`, `ClientCapability`, `AuthState`, `HealthState`,
-     `SourceProvenance`, and bounded action model on a canonical resource topic
-     (for example `state/resources/catalog`) with
-     stable IDs, aliases, last-seen timestamps, failure reasons, and
-     capability fingerprints. Keep desktop/media topics as compatibility
-     projections during migration, not competing identities.
-  2. Build an automatic typed client-capability registry. Admission must be
-     based on a registered native client or approved platform adapter, with
-     protocol version, OS/guest boundary, auth requirements, feature limits,
-     and safe action policy. Adding a supported client must automatically make
-     matching discovered resources visible without a new hard-coded chooser
-     branch; unsupported or malformed advertisements remain visible as
-     unavailable evidence only when useful, never as launchable controls.
-  3. Normalize all discovery lanes into that catalog: replicated mesh peer
-     descriptors; existing mDNS/DNS-SD; local service/session enumeration;
-     trusted-LAN SSDP/UPnP; configured gateway registries; and typed manual
-     sources. Use resource identity plus endpoint/capability fingerprints to
-     deduplicate one service found by multiple lanes. Bound TTLs, retries,
-     interface scope, packet sizes, and concurrency; do not turn discovery
-     into an unbounded port scan.
-  4. Use the existing Rust `mdns-sd` lane for mDNS/DNS-SD. Add `rupnp` for
-     async SSDP/UPnP discovery and control, with explicit interface/trust
-     policy. Do not switch to `mdns-sd-discovery` unless an OS-native resolver
-     gap is demonstrated. Keep the adapter boundary protocol-agnostic so
-     future clients can register without rewriting workers or the shell.
-  5. Add native in-shell Sunshine/Moonlight transport support. Use the
-     official `moonlight-common-c` core through a narrowly owned Rust FFI
-     adapter, bundling and testing its exact ENet dependency; use
-     `moonlight-embedded` as a protocol/reference oracle, not as an
-     unbounded application embedding. Record the GPL-3-compatible packaging,
-     ABI, cross-build, hardware decode, audio, input, pairing, suspend,
-     reconnect, and frame-pacing obligations before enabling the client.
-  6. Complete the all-seat Sunshine server rollout for T480, Eagle/T470S,
-     Basement seat 15, and Dell. Make typed remote-proofing settings the
-     source of truth: enabled, LAN plus Nebula/mesh exposure, KMS capture,
-     automatic encoder, pairing and local approval, visible shadowing/input
-     indicator, remote input, VNC fallback, and 30 FPS. Add the missing
-     combined LAN+mesh policy to settings, generated lifecycle/firewall
-     policy, status descriptors, and UI. Allow TCP 47984, 47989, 48010 and
-     local-only web management on 47990 plus the required UDP 47998-48010
-     transport range on LAN and mesh; deny public exposure, disable Sunshine
-     UPnP port mapping, and verify listeners/firewall/pairing on every seat
-     without rebooting encrypted seats.
-  7. Add SSH and X11 adapters. Use `russh` plus `russh-config` for typed SSH
-     discovery/session/auth and its X11 forwarding primitives. Use `x11rb`
-     only for a local X11 protocol client/display integration. Model both SSH
-     X11 application sessions and full existing remote X11 desktop sessions;
-     require an explicit display/session endpoint for the latter and never
-     infer one by blind scanning. State clearly when a DRM seat lacks a local
-     X server and cannot render an X11-forwarded application.
-  8. Unify media admission without losing domain-specific clients. Expose
-     Jellyfin resources through the existing client and its server OpenAPI
-     contract; use a hand-written auth/policy facade and optionally
-     `progenitor` for bounded generated OpenAPI transport code. Add an
-     `mde-subsonic` adapter for the OpenSubsonic REST JSON/XML contract using
-     the `opensubsonic` crate where suitable, covering Navidrome, Airsonic,
-     and compatible Subsonic servers. Retain distinct typed adapters for
-     DLNA/UPnP, MPD, file shares, and mesh media rather than falsely labeling
-     music-only services as Jellyfin.
-  9. Replace the chooser-only landing with a browse-first Remote Sessions
-     catalog. Cards must show resource class, origin (local/mesh/LAN/gateway),
-     available native clients, transport health, trust/auth state, and
-     actions such as inspect, pair, connect, retry, forget, or request
-     approval. Keep offline cards with last-seen and failed transports; make
-     LAN resources visible immediately but action-gated until trust/auth is
-     approved. Embed native Construct clients and preserve reconnect/session
-     context; typed platform adapters may delegate rendering but may not
-     accept arbitrary command or URL execution.
-  10. Store credentials/tokens/keys only in the approved secret store and
-      pass opaque references to adapters. Add pairing/approval expiry,
-      revocation, audit events, per-resource trust, mesh-vs-LAN policy, and
-      redaction tests. Expose capability and health reasons without leaking
-      secrets. Add migration/versioning for existing desktop/media records,
-      operator diagnostics, onboarding copy, and a deterministic unavailable
-      state for absent hardware, provider, display, codec, or credentials.
-- Scope: In scope are the shared catalog contract, identity/deduplication,
-  mesh/LAN/local/gateway/manual discovery, typed client registry, primary
-  Remote Sessions UI, Sunshine server rollout and native Moonlight client,
-  SSH/X11 modes, Jellyfin, Subsonic/OpenSubsonic, DLNA/UPnP, MPD, file-share,
-  auth/trust/secrets, offline retention, and migration of existing desktop and
-  media projections. Out of scope are a general-purpose arbitrary protocol
-  launcher, public Internet exposure, automatic router port mapping, blind
-  network scanning, replacing the existing Jellyfin/media/VDI clients, or
-  making every advertised protocol launchable without an approved adapter.
-- Relevant files/components: `crates/mesh/mackes-mesh-types/src/peers.rs`,
-  `crates/mesh/mackesd/src/workers/desktop_sources.rs`,
-  `crates/mesh/mackesd/src/workers/media_sources.rs`,
-  `crates/mesh/mackesd/src/descriptors.rs`,
-  `crates/desktop/mde-shell-egui/src/chooser/` and `vdi/`,
-  `crates/desktop/mde-shell-egui/src/system/mesh.rs`,
-  `install-helpers/mde-remote-proofing-apply.py`,
-  `packaging/systemd/mde-remote-proofing-plan.*`, `mde-jellyfin`, and the
-  existing `docs/design/desktop-chooser.md` / media-source contracts.
-- Dependencies: WL-ARCH-008 owns the Browser VM cutover and remains a
-  transport consumer; this epic owns the universal resource/session surface
-  and its adapter admission. Coordinate with the existing Remote Proofing,
-  VDI, media, peer-descriptor, secret-store, systemd, and firewalld contracts;
-  do not create separate backend or UI worklist epics for those lanes.
+- **Resource catalog hostile-boundary checkpoint (2026-08-06):** resource
+  contract tests cover multi-source cards, duplicate identities, malformed
+  provenance, and unknown kinds; the focused farm lane passed 1/1 on `.90`.
+  Source/schema, adapter, action, and live recovery proof remain open. Evidence:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-06-resource-catalog-hostile-r1.md`.
+  1. S1 Freeze resource schema and identity.
+     - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
+     - Inputs: mesh peers, Workload, app, Android, media, and file types.
+     - Deliverable: bounded catalog contract and identity/property tests.
+     - Depends on: ARCH-010 S2.
+     - Acceptance: collisions, stale records, unknown kinds, and malformed provenance are rejected.
+     - Validation: mesh-type cargo tests on .90.
+     - Done when: schema and collision evidence are recorded.
+  2. S2 Implement source adapters and deduplication.
+     - Objective: project each approved source into one catalog with deterministic merge and unavailable state.
+     - Inputs: S1, peer directory, Workload, provider workers.
+     - Deliverable: adapter registry, merge policy, and hostile stale-source fixtures.
+     - Depends on: S1.
+     - Acceptance: one resource produces one card and source conflicts remain visible.
+     - Validation: adapter/catalog cargo tests on .50.
+     - Done when: all source kinds have fixtures.
+  3. S3 Implement freshness and presentation.
+     - Objective: render search, filters, grouping, capability badges, provenance, and unavailable/reconnecting state from bounded snapshots.
+     - Inputs: S1/S2 and UX-009/012.
+     - Deliverable: Remote Sessions model/surface and deterministic captures.
+     - Depends on: S2.
+     - Acceptance: render path performs no Bus/network/backend I/O.
+     - Validation: shell model/render cargo tests.
+     - Done when: wide/narrow/largest-text evidence passes.
+  4. S4 Route typed actions through authority.
+     - Objective: issue Open/Start/Resume/Transfer requests with target, generation, authorization, and cancellation through Workload/Bus.
+     - Inputs: ARCH-010, FUNC-016, and resource contracts.
+     - Deliverable: action adapter and negative bypass tests.
+     - Depends on: S2.
+     - Acceptance: no raw command, direct lifecycle topic, arbitrary path, or silent target substitution exists.
+     - Validation: authority scan and Workload/action cargo tests on BigBoy.
+     - Done when: every card action has a typed reply path.
+  5. S5 Prove universal discovery and recovery.
+     - Objective: exercise peer loss/rejoin, stale catalogs, duplicate sources, action failure, reconnect, and five-seat acceptance.
+     - Inputs: S1-S4 and CRIT-006/007.
+     - Deliverable: catalog/action/live evidence bundle.
+     - Depends on: S4.
+     - Acceptance: unavailable and recovery states are honest and bounded.
+     - Validation: farm catalog/route gates and live seats/lighthouses.
+     - Done when: every resource kind and failure case has evidence.
+- Scope: Owns resource identity/catalog, adapters, deduplication, Remote Sessions UI, and typed action routing. Workload mechanics, Music internals, and App/Android guest
+  internals remain in their owner epics.
+- Relevant files/components: mesh peer/resource/workload types, mackesd catalog workers, mde-shell-egui session/IAC/front door, mde-bus, and provider adapters.
+- Dependencies: ARCH-010, ARCH-009, FUNC-016, FUNC-018, FUNC-020, FUNC-021, UX-009, UX-012, CRIT-006/007.
 - Acceptance criteria:
-
-  1. Remote Sessions is the first and always-available Construct onboarding
-     surface and renders a browseable catalog with one card per deduplicated
-     resource, honest unavailable/offline states, and preserved session state.
-  2. Mesh, mDNS, local, trusted-LAN SSDP/UPnP, configured gateway, and typed
-     manual sources converge into the versioned catalog with bounded retries,
-     provenance, TTL/last-seen, health, and capability metadata.
-  3. A capability registry automatically exposes every supported native client
-     or typed platform adapter and rejects arbitrary commands and unsupported
-     launch actions.
-  4. All four named seats advertise and serve Sunshine; Dell and every seat
-     discover the service over the allowed LAN and Nebula paths, pair with
-     local approval, connect through the native Moonlight path, and recover
-     from reconnect/suspend/input/audio/frame failures. Public listeners and
-     UPnP port mapping remain absent.
-  5. SSH resources, SSH-forwarded X11 applications, and explicit full X11
-     desktop endpoints are separately labeled, authenticated, and launchable
-     only when the corresponding local/client capability is present.
-  6. Jellyfin, Subsonic/OpenSubsonic (including Navidrome/Airsonic), and the
-     supported DLNA/UPnP, MPD, file-share, and mesh-media resources are
-     detected and exposed through the correct typed client or unavailable
-     explanation.
-  7. Credentials never appear in discovery records/logs; trust, approval,
-     revocation, secret references, and LAN-vs-mesh policy are testable and
-     visible at the action boundary.
-  8. Existing desktop/media consumers remain compatible during migration and
-     no duplicate card or stale launch path survives the cutover.
-  9. Focused unit/property/contract tests, package/license/ABI checks, and
-     farm workspace gates pass; live GUI/transport evidence is captured on
-     reachable seats, with every unavailable provider or hardware dependency
-     recorded explicitly rather than implied by tests.
-- Verification method: Add mesh-type schema, identity/deduplication,
-  capability-admission, discovery TTL/retry, mDNS/SSDP fixtures, descriptor,
-  secret-redaction, trust, offline-retention, migration, and UI-state tests.
-  Add adapter tests for Moonlight pairing/session/reconnect, SSH auth and both
-  X11 modes, Jellyfin OpenAPI/auth, OpenSubsonic JSON/XML, DLNA/UPnP, MPD, and
-  file shares. Run focused jobs on the build farm plus workspace fmt/clippy,
-  worklist/doc/architecture/secret/package gates; put the longest
-  moonlight/codec/VDI integration build on BigBoy. Finish with live captures
-  from all four seats, LAN+Nebula firewall/listener inspection, pair/connect/
-  reconnect/input/audio proof, and honest unavailable-hardware/provider
-  records. Use `mdns-sd` and `rupnp`, official `moonlight-common-c`,
-  `russh`/`russh-config`, `x11rb`, `opensubsonic`, `progenitor`, `zbus`,
-  systemd, and firewalld D-Bus documentation as the implementation references.
-- Origin or merged source IDs: User decisions from the Remote Sessions
-  discovery interview: native plus approved adapters; all client-capable
-  resources; mesh/LAN/local/gateway discovery; browse-first cards; one card
-  with many transports; secret-store credentials; offline retention; visible
-  but action-gated LAN trust; embedded native handoff; and automatic typed
-  capability admission. Absorbs the Sunshine/Moonlight, SSH/X11, Jellyfin,
-  Subsonic, and universal-resource-browser request into one epic. Existing
-  lineage is `docs/design/desktop-chooser.md`, `docs/design/peer-directory.md`,
-  `docs/design/mesh-media-player.md`, WL-ARCH-008, and the Remote Proofing
-  evidence. External research references are `mdns-sd`, `rupnp`,
-  `moonlight-common-c`, `moonlight-embedded`, `russh`, `x11rb`, Jellyfin
-  OpenAPI, OpenSubsonic, `opensubsonic`, `progenitor`, `zbus`, systemd, and
-  firewalld upstream documentation.
+  1. Every supported resource appears once with identity, provenance, freshness, and capabilities.
+  2. Every action is typed, authorized, generation-bound, cancellable, and observable.
+  3. Five-seat/lighthouse loss, rejoin, and recovery produce no fabricated resource or side effect.
+- Verification method: schema/adapter/catalog/action cargo suites, authority scans, shell captures, and live fleet proof; use BigBoy for the broad catalog gate.
+- Origin or merged source IDs: Remote Sessions surveys and archived resource/session discovery workstreams.
 
 ### WL-FUNC-020 - Expose governed Android applications in Workloads
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Large
-- Problem: Workloads models Android as a two-layer Cuttlefish VM and can
-  provision the outer domain, but it does not yet project guest applications as
-  durable workload entries. A user therefore cannot see which AOSP applications
-  an Android image contains, whether each package is ready, or launch one through
-  a typed guest boundary. Treating package names or `adb shell` strings as
-  generic commands would violate the bounded Thin Client action model.
-- Required outcome: Workloads presents three honest application/workload
-  families: the dedicated Chromium VM, Android applications backed by an
-  admitted Cuttlefish Android VM, and Flatpak applications backed by App VMs.
-  Its Android section shows a governed AOSP starter catalog, per-VM package and
-  readiness evidence, and typed launch actions. Launching an available entry
-  starts or resumes its Android VM, opens the inner guest display, and dispatches
-  only a closed `MAIN` plus `LAUNCHER` intent; unavailable images, packages,
-  providers, capacity, or transports remain visible with exact reasons.
-- Current state: `DeliveryType::AndroidVm`, `android-provision`, the Cuttlefish
-  OpenTofu module, outer-VM lifecycle, and inner VNC/WebRTC console modeling are
-  present. `android_apps.rs` now defines a versioned nine-app AOSP starter set,
-  closed package and launch-intent identities, strict inventory validation, and
-  honest availability/readiness states. The active lifecycle-first Android
-  Plan and Run routes project those entries as integration-pending and
-  non-launchable. A live guest
-  inventory provider, image/package contract, typed dispatch worker, session
-  handoff, persistence, and Cuttlefish proof remain open.
+- Problem: Android is represented by partially integrated Cuttlefish layers without a complete signed app catalog, image/provider contract, lifecycle, or honest failure
+  UX.
+- Required outcome: Workloads exposes governed Android app, outer Android VM, and full Workstation desktop choices; the app path uses a signed AOSP/Cuttlefish image,
+  typed start/stop/readiness, VDI presentation, and bounded host isolation.
+- Current state: Android delivery/provisioning and outer-VM CloudRunner scaffolding exist; catalog, image, provider, app lifecycle, package, and live proof remain.
 - Remaining work:
-
-  1. Make the Workloads information architecture explicitly expose Chromium VM,
-     Android applications, and Flatpak/App VM entries without merging their
-     lifecycle or security boundaries. Keep Front Door as the normal Flatpak app
-     launch surface while Workloads owns the backing App VM lifecycle.
-  2. Add a versioned Android guest-inventory provider keyed by stable Android VM
-     identity. Report image provenance, package identity/version, launcher
-     resolvability, guest boot state, observation age, and exact unavailable
-     reasons through bounded records; reject unknown fields, duplicate apps,
-     arbitrary components, URIs, extras, flags, and command strings.
-  3. Pin and verify the supported Cuttlefish image manifest for Browser,
-     Calendar, Camera, Clock, Contacts, Files, Gallery/Photos, Calculator, and
-     Settings. Where an upstream image omits an app, either supply it through the
-     governed image build or report `image unavailable`; never fabricate an
-     installed state.
-  4. Add an authorized `action/android/app-launch` contract and `mackesd` worker
-     that accepts only the closed catalog identity plus target Android VM. Resolve
-     the package through the guest provider and dispatch the typed launcher
-     intent without shell interpolation, arbitrary `adb` arguments, or host app
-     execution. Publish correlated request, audit, readiness, and result records.
-  5. Connect launch to the existing Workloads/session-broker/VDI lifecycle: place
-     or resume the outer VM, wait for `cvd` and guest readiness, select the inner
-     VNC/WebRTC head, preserve focused input/audio/clipboard policy, and recover
-     across reconnect, suspend, and placement-node loss.
-  6. Fold live inventory into the pending Android cards, including per-VM scope,
-     offline retention, stale evidence, progress, retry, and inspect actions.
-     Enable Launch only when image, package, guest, authorization, capacity, and
-     console transport are all admitted.
-  7. Produce a real Cuttlefish image and nested-KVM lifecycle proof on a capable
-     placement host, then launch each starter app from reachable Workstation
-     seats and capture guest-owned frame, focused input, audio where applicable,
-     reconnect, failure, and unavailable-image evidence.
-- Scope: In scope are the governed AOSP starter catalog, Android image/package
-  manifest, per-VM guest inventory, typed launcher intent, Workloads projection,
-  existing Cuttlefish lifecycle/session/console integration, persistence,
-  authorization, recovery, and live proof. Out of scope are arbitrary APK
-  upload, Play Store or proprietary Google applications, unrestricted Android
-  intents, host-native Android execution, shell/command launchers, and collapsing
-  Android apps into Flatpak App VMs.
-- Relevant files/components:
-  `crates/mesh/mackes-mesh-types/src/android_apps.rs`,
-  `crates/mesh/mackes-mesh-types/src/cloud.rs`,
-  `crates/desktop/mde-shell-egui/src/iac/android_apps.rs`,
-  `crates/desktop/mde-shell-egui/src/iac/mod.rs`,
-  `crates/mesh/mackesd/src/workers/`, `infra/tofu/cloud/main.tf`,
-  `infra/tofu/cloud/modules/android_vm/`, Cuttlefish image packaging, and the
-  existing Workloads/session-broker/console-broker/VDI contracts.
-- Dependencies: Coordinate the top-level Workloads presentation with
-  WL-ARCH-008's Chromium VM and WL-FUNC-018's Flatpak/App VM ownership. Reuse
-  WL-CRIT-006 admission and live-evidence discipline. Live closure requires a
-  placement node with KVM, nested virtualization, and enough memory/storage for
-  the current Android profile; a Workstation seat may remain a client only.
+  1. S1 Freeze Android catalog/image contracts.
+     - Objective: define signed app identity, package/version, image digest, permissions, capabilities, resource profile, and guest readiness.
+     - Inputs: Android mesh types and provider policy.
+     - Deliverable: bounded contracts, importer, and hostile tests.
+     - Depends on: ARCH-010 S2.
+     - Acceptance: unsigned, stale, incompatible, or over-limit entries fail closed.
+     - Validation: mesh-type cargo tests on .50.
+     - Done when: catalog/image hashes and fixtures exist.
+  2. S2 Implement image and provider admission.
+     - Objective: verify AOSP/Cuttlefish image, host capability, nested virtualization, and provider health before placement.
+     - Inputs: S1, CloudRunner, node capabilities.
+     - Deliverable: provider adapter, preflight, and refusal diagnostics.
+     - Depends on: S1.
+     - Acceptance: no unsupported host receives Android and no fake ready state is emitted.
+     - Validation: provider/property cargo tests and package checks on BigBoy.
+     - Done when: preflight matrix is evidenced.
+  3. S3 Integrate typed app lifecycle.
+     - Objective: start one outer VM, install/launch/stop one approved app, and reclaim resources through Workload operations.
+     - Inputs: S1/S2 and ARCH-010 S3/S4.
+     - Deliverable: lifecycle adapter, generation/cancel/retry tests, and VDI source.
+     - Depends on: S2.
+     - Acceptance: duplicate/cancel/crash/restart never leaks VM, app, lease, or process.
+     - Validation: Workload/Android cargo tests on BigBoy.
+     - Done when: end-to-end operation trace exists.
+  4. S4 Render governed Android UX.
+     - Objective: show app cards, permission/approval, progress, VDI input, unavailable state, and cleanup in Workloads/Remote Sessions.
+     - Inputs: S3 and UX-009/012.
+     - Deliverable: render/model fixtures and typed action wiring.
+     - Depends on: S3.
+     - Acceptance: shell never launches adb, qemu, or package commands directly.
+     - Validation: shell render/authority tests.
+     - Done when: responsive captures and refusal states pass.
+  5. S5 Prove security, package, and live behavior.
+     - Objective: verify image provenance, SELinux/cgroup/device isolation, audio/input, reconnect, upgrade, and five-seat acceptance.
+     - Inputs: S1-S4 and CRIT-006/007.
+     - Deliverable: signed package/security/live evidence.
+     - Depends on: S4.
+     - Acceptance: host secrets/files are inaccessible and provider failures remain actionable.
+     - Validation: package/SELinux/VDI/live hardware gates.
+     - Done when: unavailable Cuttlefish hardware/provider is explicitly named.
+- Scope: Owns Android catalog/image/provider, outer VM/app lifecycle, VDI UX, policy, packaging, and proof. Generic Workload, Remote Sessions catalog, and native Music
+  are out of scope.
+- Relevant files/components: mesh Android/provider types, mackesd CloudRunner/Cuttlefish workers, Workloads/IAC shell, image-builder, libvirt/VDI packaging.
+- Dependencies: ARCH-010, FUNC-019, UX-009, UX-012, CRIT-006, CRIT-007.
 - Acceptance criteria:
+  1. Signed app/image identity and host preflight gate every operation.
+  2. One typed operation controls VM/app start, readiness, input, stop, cancel, retry, and cleanup.
+  3. Security/package/live evidence proves no host escape or invented readiness.
+- Verification method: contract/provider/Workload/shell/package/SELinux cargo gates and named Cuttlefish/live-seat proof; BigBoy runs the Android image gate.
+- Origin or merged source IDs: 2026-08-03 governed Android Workloads decision and archived Android/App VM workstreams.
 
-  1. Workloads visibly and separately presents the Chromium VM, Android apps,
-     and Flatpak/App VM family with stable identities and honest lifecycle state.
-  2. The nine governed starter apps appear in stable order with package,
-     category, target Android VM, availability, readiness, image provenance,
-     observation age, and actionable failure reason.
-  3. Launch is enabled only for a fresh, installed, ready package in an admitted
-     Android VM and emits only the closed `MAIN` plus `LAUNCHER` intent; hostile,
-     malformed, duplicated, oversized, stale, or command-shaped records fail
-     closed before authorization or guest contact.
-  4. Selecting an app places or resumes exactly one typed Android VM session,
-     opens the inner Cuttlefish display through the existing console/VDI path,
-     and preserves focused input plus supported audio/clipboard policy without a
-     host-native or arbitrary-command fallback.
-  5. Missing image packages, guest/provider loss, insufficient capacity,
-     authorization denial, console failure, and reconnect/suspend loss are
-     visible, auditable, retryable where safe, and never reported as success.
-  6. Catalog, inventory, action, worker, session, UI, image, and hostile-input
-     tests pass on the farm; a capable live host proves real Cuttlefish boot and
-     at least one frame/input launch for every available starter entry.
-- Verification method: Add mesh-type schema/round-trip/property tests; hostile
-  catalog and inventory fixtures; package-manifest and image-provenance gates;
-  worker authorization, replay, timeout, redaction, and dispatch tests; shell
-  pending/ready/stale/unavailable render tests; and session/console reconnect
-  coverage. Run independent farm jobs with the longest Cuttlefish/image gate on
-  BigBoy, plus worklist/doc/package/secret gates. Finish with live nested-KVM
-  guest package inventory and per-app frame/input evidence from reachable seats,
-  recording unavailable hardware or omitted upstream packages explicitly.
-- Origin or merged source IDs: 2026-08-03 operator decision that Workloads must
-  eventually list the Chromium VM, a set of AOSP Android apps, and Flatpaks.
-  Continues the archived WL-ARCH-007 Android VM preparation and live-proof gaps
-  without reopening that broader Workloads cockpit epic or duplicating
-  WL-ARCH-008/WL-FUNC-018.
-
+### WL-FUNC-021 - Deliver the Spotify-class Music workspace and service parity
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live
+  proof.
+- Required outcome: a near-Spotify workspace uses daemon-owned typed catalog, queue, playback, bookmarks, cache, and source authority; mde-media-core provides real mpv
+  frame/audio playback; Media UI covers local/Jellyfin/library flows; discovery, DLNA/cast, peer handoff, and live visual/audio proof pass.
+- Current state: daemon-owned catalog/queue/cache and typed playback, artwork,
+  browse/detail, and signed radio pass. Release 11 executes on all five seats;
+  named 38 Special, Black Ice, and Podcast details pass on Dell without the old
+  stale error; one daemon owns each seat; CPU/NWS and provider loss pass. Renderer and handoff remain.
+- **Daemon projection validation checkpoint (2026-08-06):** invalid newer `MusicWorkspaceSnapshotV1` content is refused and the last valid projection is retained;
+  revision zero is rejected; Music UI 4/4 `.50`, daemon validation 1/1 `.90`. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
+- **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
+- Remaining work:
+- **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** detail
+  loading is identity-bound; one current daemon and shell run per seat. Named
+  Dell records and synchronized five-seat CPU/NWS startup recovery pass. Evidence:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`,
+  `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
+- **Signed live-radio checkpoint (2026-08-08):** native F44 release 8 is live
+  on all five seats with host-encrypted Music credentials. Dell and seat 15
+  pass exact retained C-SPAN signed Play/Stop; Dell sink capture is non-silent
+  (2,621,440 bytes, 287,035 non-zero samples, peak 20,092, RMS 1,677.73).
+  T480/Eagle/Surface mutating playback and human speaker judgment remain open.
+  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-radio-release8-r1.md`.
+- **Library checkpoint (2026-08-06):** typed collections replace Airsonic rows; UI 44/44 on `.50`, fmt `.90`; `evidence/WL-FUNC-021-2026-08-06-daemon-library-r1.md`.
+- **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
+- **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass. Evidence:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-search-replay-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-source-identity-r1.md`.
+- **Jellyfin cache checkpoint (2026-08-07):** atomic verified cache; zero-byte/truncated entries refused (BigBoy 2/2);
+  mde-jellyfin 114/114 (90 unit/12 browse/2 outage/9 playback/1 doctest), Media UI 104/104; live download/network-loss and package proof remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`;
+- **mpv/recovery (2026-08-06):** BigBoy fixture 1/1 nonblank; media-core 239/239 retry/resume; `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`; live proof remains.
+- **Daemon Album/download/workerless checkpoint (2026-08-06):** Home, Library, and Search open retained albums; detail emits typed play without `LoadAlbum` worker requests.
+  Library, Album, and Downloads publish bounded actions; daemon is 168/168 on `.90`, Music UI is 47/47 on `.50`, and embedded construction starts no worker.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-managed-download-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-embedded-workerless-r1.md`.
+- **Typed target handoff checkpoint (2026-08-06):** bounded peer heartbeats project honestly; fresh idle mesh seats publish typed `transfer`, stale/owning peers remain browse-only.
+  Music UI is 48/48 on `.50`, format is clean, and the hostile test covers `peer:seat-15`; live owner-yield/resume and DLNA/provider/package proof remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-target-handoff-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-peer-targets-r1.md`.
+- **Cast checkpoint (2026-08-06):** bounded discovery and real DLNA `SetAVTransportURI`/`Play`/`Seek` are fixture-verified; media-core is 240/240 on BigBoy and format-clean.
+  Loopback renderer acceptance is recorded in `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`; live renderer, Chromecast, mesh-owner, and seat proof remain open.
+- **Live provider-loss checkpoint (2026-08-08):** release 11 on seat 15 passed a controlled healthy → provider loss → healthy transition with cached catalog/state available.
+  The daemon stayed active with zero restarts and the seat-local firewall rule was removed; two-catalog outage and audible stream continuity remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.
+- **Provider-loss loopback checkpoint (2026-08-06):** bounded FIN/reset and zero fallback requests are transport/policy proof only, not live provider/daemon/
+  decoder/hardware proof. `install-helpers/verify-music-network-loss.sh`;
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-network-loss-loopback-r1.md`.
+- **Provider-loss reconnect checkpoint (2026-08-06):** the native engine now
+  retries a failed Subsonic stream from the audible playhead using bounded
+  `timeOffset` resumes, clears buffered-ahead samples before retry, preserves
+  the complete-track cache, and refuses arbitrary direct/radio URLs. BigBoy
+  passed the full mde-musicd suite at 176/176, focused engine lane at 21/21,
+  and reconnect-timeout lane at 2/2. Controlled live provider loss/recovery now
+  passes on seat 15 while the daemon and cached typed surfaces stay available;
+  audible in-progress stream continuity remains open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-network-loss-reconnect-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-reconnect-timeout-r1.md`.
+- **Cast loopback checkpoint (2026-08-06):** a bounded local renderer accepts
+  discovery, description, `SetAVTransportURI`, `Play`, and finite `Seek`, while
+  malformed and non-finite seeks are refused and the listener is cleaned up.
+  Live DLNA/Chromecast, mesh-owner, and seat-handoff proof remain open.
+  `install-helpers/verify-music-cast-loopback.sh`;
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
+- **Roaming admission (2026-08-06):** 11/11; live two-seat proof open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`.
+- **Handoff replay (2026-08-06):** 1/1; live owner-yield/resume open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-handoff-replay-r1.md`.
+- **Cast runtime audit checkpoint (2026-08-06):** read-only seat inspection
+  found no physical UPnP renderer, usable Chromecast discovery path, target
+  cast-receiver unit, or second admitted peer. Typed mesh transfer and the
+  separate Media DLNA implementation remain fixture/source-proven only;
+  physical renderer, Chromecast, mesh-owner, and two-seat continuity proof
+  remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-runtime-audit-r1.md`.
+- **Cast-admission checkpoint (2026-08-06):** URLs, titles, and HTTP endpoints reject oversized/control-bearing input before the network gate; BigBoy tests
+  passed 20/20. Live renderer, Chromecast, mesh-owner, and seat proof remain open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-admission-r1.md`.
+- **Two-catalog outage checkpoint (2026-08-06):** source projection retains two admitted variants under one logical queue track.
+  Failed-first/healthy-second decoding is fixture-verified.
+  BigBoy fixture 1/1, source projection 1/1, and full mde-musicd 173/173; live provider outage, mid-track resume, and hardware/package proof remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-two-catalog-outage-r1.md`.
+- **Jellyfin outage (2026-08-06):** known-good cache survives failures; truncated manifests refused; 90 unit/12 browse/1 outage/9 playback/doctest pass; live proof remains.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-jellyfin-outage-r1.md`.
+- **UI authority checkpoint (2026-08-06):** embedded Music blocks legacy catalog/playback/worker fallbacks and reports missing daemon writers honestly.
+  Standalone compatibility remains explicit.
+  Music UI passed 52/52; live shell action traces, render captures, and standalone migration remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-ui-authority-r1.md`.
+- **Worker authority checkpoint (2026-08-07):** standalone compatibility pause/resume
+  is inert before an active track and after stop/natural end, so it cannot emit
+  invented playback state; worker tests passed 3/3 on `.50` and targeted format
+  passed on BigBoy. `docs/platform/evidence/WL-FUNC-021-2026-08-06-worker-authority-r2.md`.
+- **Real-mpv Media UI checkpoint (2026-08-07):** mde-media-egui 110/110; mde-media-core mpv 257 unit,
+  1 real-mpv fixture, and 1 doctest passed. Loading clears stale video frames.
+  Physical renderer, provider-loss, handoff, and second-seat proof remain open.
+  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-media-render-clear-r1.md`.
+- **Continuation (2026-08-07):** mde-musicd 182/182, roaming root-loss 18/18,
+  reconnect 8/8, mesh-router 26/26, and Dell CPU proof max 385‰/mean 283‰
+  passed. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-root-loss-r1.md`,
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-reconnect-loop-audit-r1.md`, and `docs/platform/evidence/WL-FUNC-021-2026-08-06-cpu-bridge-r1.md`.
+- **Live-boundary continuation (2026-08-07):** provider-loss loopback proves
+  same-provider `timeOffset=1` recovery with no fallback; cast found zero physical SSDP/Chromecast targets. Dell auth material provisioned, signed mutation refused,
+  then Dell became unreachable. Shell signing now matches daemon hostname canonicalization; the Fedora 44 release-5 RPM rebuilt and passed payload gates. Live loss, renderer,
+  Handoff, auth, and rotation remain; canonical peer filenames, bounded state, and DLNA Stop rollback pass 15/15, 27/27, 1/1; physical renderer/two-seat proof unavailable.
+  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`,
+  `docs/platform/evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-07-auth-runtime-guard-r1.md`.
+  New: `evidence/WL-FUNC-021-2026-08-07-peer-roster-canonical-r1.md`, `evidence/WL-FUNC-021-2026-08-07-cast-seek-rollback-r1.md`.
+  CPU mitigations are farm-verified; gateway phases pass focused tests; Dell/seat-15 release CPU proof passes.
+  `evidence/WL-FUNC-021-2026-08-07-runtime-status-phase-coalescing-r1.md`, `evidence/WL-FUNC-021-2026-08-07-mesh-status-dedupe-r1.md`.
+  Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; five-seat CPU/NWS recovery remains open.
+- **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427`
+  completed through `mde-musicd` while a bounded PipeWire default-sink monitor
+  captured 26.8 MiB of 48 kHz stereo s32le; 6,287,357/6,717,440 samples were
+  nonzero and playback returned 0. Temporary capture files were removed.
+  Provider/network-loss resume, physical-speaker judgment, and authenticated
+  mutation delivery remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-live-audio-capture-r1.md`.
+- **Live Music DRM checkpoint (2026-08-06):** seat 15 produced a settled
+  1920x1080 direct-DRM EGL frame (`DrmFourcc(XR30)`) with SHA-256
+  `3a7ec14c51a5a46dde509c2b6c57cba5920cdfb8af5da19917d20a385ff5a199`.
+  The generic Construct-Home verifier correctly rejected the taskbar-shaped
+  profile; the new Music-specific verifier self-test passed and accepted the
+  frame with 15 separated foreground components. The temporary drop-in was
+  removed and the service returned active with zero restarts. Full rendered
+  Music acceptance, provider/network-loss resume, handoff, and package proof
+  remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-live-drm-frame-r1.md`;
+  `install-helpers/verify-music-drm-proof.py`.
+- **RPM/install checkpoint (2026-08-06):** native F44 `.131` release 5 passed build/payload/size gates; base 83.5 MiB; Dell live proof passed (CPU max `437‰`, mean `218‰`).
+  Seat 15 remained release 4. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-dell-release5-cpu-r1.md`.
+- **Artwork/pagination checkpoint (2026-08-07):** mde-musicd 199/199, mde-music-egui 64/64, shell route 1/1, UI format pass; release-6
+  `magic-mesh-12.1.6-6.x86_64` is live on Dell and seat 15 (87,591,150 bytes; SHA-256 `eb9d6194b6a03a835a4b533f124260a39afbdb8297d81da410fdedf45f6d225e`).
+  Both live gates pass with `NRestarts=0`; album offsets 0, 100, and 1600 return distinct rows, final 70/`has_more=false`; album/podcast art are local JPEGs.
+  C-SPAN lacks a token; open: renderer, provider-loss, cast, handoff, radio playback, five-seat CPU/NWS.
+  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-music-artwork-release6-r1.md`.
+- **Mutation authorization delivery audit (2026-08-06):** the audit confirms
+  that the daemon's legacy HMAC verifier remains fail-closed, while the Music
+  lane now uses a dedicated domain-separated Ed25519 capability. The root DRM
+  shell alone receives the encrypted private seed; `mde-musicd` receives only a
+  validated public key, with exact-body digest, scope, expiry, and replay
+  checks. Shared types passed 431/431 tests and mde-musicd passed 174/174 on
+  the farm. Host provisioning and package paths are source-verified; live
+  authorized mutation delivery and installed-seat rotation proof remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-auth-delivery-audit-r2.md`.
+- **Mutation authorization package audit (2026-08-06):** base-RPM asset,
+  manifest, systemd, helper self-test, and package dependency checks found
+  that the provisioner also requires `openssl` and `curl`; those hard RPM
+  requirements are now declared in `crates/mesh/mackesd/Cargo.toml` and are
+  present in the fresh base RPM header. Installed-seat provisioning, mutation,
+  and rotation proof remain open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-06-auth-package-audit-r2.md`;
+  prior audit: `docs/platform/evidence/WL-FUNC-021-2026-08-06-auth-package-audit-r1.md`.
+- **Reusable live-seat gate (2026-08-06):**
+  `install-helpers/verify-music-live-seat.sh --self-test` passes without SSH,
+  and its bounded read-only default run passes on seat 15: `mde-musicd` active
+  with `NRestarts=0`, ping answered, canonical `get-state` answered, and
+  canonical `list-albums` answered. The explicit play probe was also run
+  against live song `23427`, bounded at 15 seconds with no client process left
+  behind; this does not claim audible or rendered acceptance. The helper uses
+  no secret output and caps SSH/command/probe timeouts.
+  1. S1 Freeze catalog/provider authority.
+     - Objective: make mde-musicd the only catalog/source/queue authority for Subsonic, local, Jellyfin, and approved providers.
+     - Inputs: music types/domain, resource catalog, Jellyfin store.
+     - Deliverable: bounded source contracts, provider selection, credentials redaction, and hostile tests.
+     - Depends on: FUNC-019 S1/S2.
+     - Acceptance: UI cannot invent a server, source, track, or queue state.
+     - Validation: mde-musicd and Jellyfin cargo tests on .50.
+     - Done when: source snapshots and provider failure evidence exist.
+  2. S2 Prove real playback.
+     - Objective: decode real audio/video with mpv, publish frame/audio/position/error, and recover from pause/seek/end/network loss.
+     - Inputs: S1, mde-media-core, PipeWire/fixture assets.
+     - Deliverable: engine adapter and nonblank-frame/resolved-audio fixtures.
+     - Depends on: S1.
+     - Acceptance: no fake success, silent fallback, unbounded event queue, or stale position.
+     - Validation: mde-media-core --features mpv cargo tests/doctests on BigBoy.
+     - Done when: frame/audio metrics and failure traces are recorded.
+  3. S3 Ship workspace and daemon-owned controls.
+     - Objective: render Home, Browse, Search, Queue, Now Playing, albums, artists, playlists, bookmarks, and typed transport controls.
+     - Inputs: S1/S2 and UX-009/012.
+     - Deliverable: Music UI model/render and signed Bus action integration.
+     - Depends on: S1, S2.
+     - Acceptance: GUI has no competing worker/store/playback authority.
+     - Validation: mde-music-egui and shell Music cargo tests on .50.
+     - Done when: responsive captures and action traces pass.
+  4. S4 Complete library, Jellyfin, cache, and bookmarks.
+     - Objective: load saved servers/profiles, browse/play libraries, download/cache bounded content, resume supported bookmarks, and report unavailable data honestly.
+     - Inputs: S1-S3, Jellyfin store, cache policy.
+     - Deliverable: library/cache/bookmark flows with atomic persistence and offline fixtures.
+     - Depends on: S3.
+     - Acceptance: credentials remain 0600; crash preserves old or new complete store; offline uses verified cache only.
+     - Validation: music/Jellyfin/cache cargo tests and secret scan.
+     - Done when: two-catalog and network-loss evidence exists.
+  5. S5 Complete discovery, cast, and peer handoff.
+     - Objective: discover bounded targets, perform typed DLNA/mesh handoff, seek after play, and preserve owner-yield/target-resume semantics.
+     - Inputs: media cast core, peer/resource contracts.
+     - Deliverable: discovery/cast/handoff adapters and refusal tests.
+     - Depends on: S2-S4 and FUNC-019 S4.
+     - Acceptance: malformed targets, nonfinite positions, failed seek, and conflicting owners fail closed.
+     - Validation: media cast cargo tests on BigBoy and live DLNA/peer fixture.
+     - Done when: handoff evidence names every unavailable target.
+  6. S6 Complete release proof.
+     - Objective: verify visual/audio playback, controls, cache, cast, handoff, package, RPM, Dell, and seat-15 acceptance.
+     - Inputs: S1-S5 and CRIT-006.
+     - Deliverable: signed Music/Media evidence bundle and rendered captures.
+     - Depends on: S5.
+     - Acceptance: live gaps remain explicit and do not become green by inference.
+     - Validation: farm music/media suites, RPM gates, and named live-seat commands.
+     - Done when: all required provider, hardware, and package results are recorded.
+- Scope: Owns Music workspace/service, Media Player core/UI/Jellyfin, catalog/playback/cache/bookmarks, discovery/casting/handoff, shell integration, packaging, and
+  proof. Generic Workload and collaboration transport remain elsewhere.
+- Relevant files/components: mde-musicd, mde-music-egui, mde-media-core, mde-media-egui, mde-jellyfin, shell Music mount, Bus/resource contracts, PipeWire/mpv, and
+  RPM/live scripts.
+- Dependencies: FUNC-019, ARCH-010, UX-009, UX-012, CRIT-006/007.
+- Acceptance criteria:
+  1. Daemon authority and real mpv frame/audio playback pass hostile and fixture tests.
+  2. Library/Jellyfin/cache/bookmark, discovery/cast, handoff, and network-loss flows are typed and bounded.
+  3. Five-seat visual/audio/package evidence proves the shipped release or names blockers.
+- Verification method: use @farm:{cargo test -p mde-musicd}
+  @farm:{cargo test -p mde-media-core --features mpv}
+  @farm:{cargo test -p mde-media-egui}
+  and shell/RPM/live gates with BigBoy for the longest media job.
+- Origin or merged source IDs: Spotify-class Music survey; archived WL-FUNC-007 and MEDIA-1..17; 2026-08-05/06 Music and Media evidence.
 ### WL-CRIT-006 - Production evidence, six-node acceptance, and corrected-forward recovery
-
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Construct has strong static engineering evidence but no single
-  authoritative production-readiness contract. GitHub CI, farm execution,
-  package compatibility, live hardware, multi-node recovery, and operator
-  evidence are described in separate places. The platform therefore risks a
-  static-green release being mistaken for a production-ready release.
-- Required outcome: GitHub required checks are authoritative, the farm is the
-  heavy self-hosted backend, and every release emits a signed evidence bundle.
-  Production promotion requires a verified three-lighthouse/three-workstation
-  topology, capability-based readiness, corrected-forward recovery, automatic
-  lighthouse failover, resource admission, minimal-retention policy, and a
-  permanent six-node integration/chaos gate.
-- Current state: Schema-4 release evidence, signing, CI/farm binding, strict
-  topology/recovery/live-attestation validators and collector, VDI evidence,
-  and SBOM/package/health/audit/backup foundations have fail-closed self-tests.
-  The live fleet currently shows three lighthouses plus five healthy
-  Workstations with unique overlays, including corrected-forward T480 and new
-  Surface enrollment. Production still lacks required-check publication,
-  drill-ledger-backed topology/recovery evidence, live VDI/audio proof, and a
-  signed promotion bundle; current health is not historical drill proof.
+- Problem: Static tests are strong but one signed release gate does not yet prove CI authority, farm topology, package integrity, five-seat behavior, lighthouses,
+  recovery, and corrected-forward deployment together.
+- Required outcome: GitHub required checks and farm evidence bind one revision; signed schema-5 evidence proves six-node/five-seat acceptance, package/runtime integrity,
+  recovery, and corrected-forward promotion without rollback.
+- Current state: evidence schema/signing, topology, recovery, and live/VDI helpers exist; current release binding, seats, lighthouse convergence, and complete failure
+  matrix remain.
 - Remaining work:
-
-  1. Make GitHub required checks the promotion authority and connect the farm as
-     the heavy self-hosted execution backend. The release envelope now consumes
-     `ci-gate.sh verify` as a fail-closed farm-result check and requires the
-     matching `github-required` result; complete the operational publication
-     of that GitHub/farm association. Until that path is operational,
-     production promotion remains blocked.
-  2. Define and verify the fixed six-node topology: three lighthouses and three
-     workstations, with explicit degraded and recovery states.
-  3. Implement guided scope-bound enrollment, capability quarantine, typed
-     readiness, per-domain merge/provenance contracts, and automatic lighthouse
-     failover.
-  4. Implement corrected-forward re-enrollment and preserve current encrypted
-     backups until replicated-live-state recovery has passed destructive drills.
-  5. Add typed workload resource admission, profile activation, retention rules,
-     redaction/purge behavior, and incident evidence bundles.
-  6. Maintain a permanent six-node testbed with nightly failure injection,
-     lighthouse loss, re-enrollment, VDI reconnect, workload pressure, and
-     state-convergence scenarios.
-  7. Reconcile normative guidance and historical banners across root, help,
-     operations, design, and tracked agent-skill docs; keep the canonical
-     worklist pointer and current gate list synchronized with dated evidence.
-  8. Make audio a hard release gate: every production candidate proves local
-     PulseAudio-compatible playback/capture, PipeWire/WirePlumber graph health,
-     VM/VDI audio, Mesh Collaboration Suite calls, and node-to-node direct or
-     relayed streaming on the six-node testbed. `.15` must pass the same gate;
-     a missing or broken PulseAudio compatibility layer fails promotion.
-- Scope: Cross-cutting release authority, topology, enrollment/recovery,
-  readiness, failover, state convergence, workload admission, retention,
-  provenance, incident evidence, and multi-node acceptance. Feature behavior
-  remains owned by WL-ARCH-008, WL-FUNC-011, WL-FUNC-016, WL-FUNC-017,
-  WL-UX-009, WL-UX-011, and WL-UX-012. Current encrypted backups remain in
-  service during the transition; this epic does not authorize disabling them.
-- Relevant files/components: `AI_GOVERNANCE.md`; `.github/workflows/ci.yml`;
-  `install-helpers/ci-gate.sh`; `install-helpers/xcp-build.sh`;
-  `docs/farm.md`; `docs/BUILD-ENVIRONMENT.md`; packaging/release helpers;
-  enrollment, health, audit, workload, and recovery contracts.
-- Dependencies: Coordinate Browser, Mesh Collaboration Suite, Clipboard, Maps,
-  Workers, theme, and taskbar acceptance with their existing epics. Use the
-  existing Bus, healthz, audit, CA, Workloads, and farm contracts rather than
-  creating a second authority.
+  1. S1 Define release gate matrix.
+     - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
+     - Inputs: governance, current CI, all active P0/P1 epics.
+     - Deliverable: machine-readable gate matrix and linted release plan.
+     - Depends on: none.
+     - Acceptance: no required gate is implied or duplicated.
+     - Validation: worklist/governance/supersession lint.
+     - Done when: matrix is reviewed and source revision is pinned.
+  2. S2 Bind and sign evidence.
+     - Objective: make every result include revision, command, environment, timestamp, hash, and limitation under schema 5.
+     - Inputs: evidence helpers and S1.
+     - Deliverable: signed evidence bundle and invalid-signature fixtures.
+     - Depends on: S1.
+     - Acceptance: missing, stale, altered, or unsigned evidence cannot promote.
+     - Validation: release-evidence cargo/script tests on .90.
+     - Done when: verifier accepts only the intended revision.
+  3. S3 Run farm/CI/package gates.
+     - Objective: execute required checks on explicit farm slots with BigBoy as long pole and publish artifacts.
+     - Inputs: pinned revision and S1/S2.
+     - Deliverable: CI run, RPM/payload report, test counts, and logs.
+     - Depends on: S2.
+     - Acceptance: required GitHub checks are the authoritative merge gate.
+     - Validation: full farm cargo/package/secret/architecture gates.
+     - Done when: all required checks are green or named blockers are carried.
+  4. S4 Run fleet and live-seat acceptance.
+     - Objective: deploy the same revision to release seat, Dell, Eagle, seat 15, T480, Surface, and three lighthouses with alert protocol.
+     - Inputs: S3, enrollment roster, rollout policy.
+     - Deliverable: runtime, GUI, network, audio, VDI, and package captures.
+     - Depends on: S3.
+     - Acceptance: no stale installed payload or missing seat/lighthouse is treated as pass.
+     - Validation: named live-seat and lighthouse scripts.
+     - Done when: every matrix row has direct evidence.
+  5. S5 Exercise failure and corrected-forward recovery.
+     - Objective: inject process, network, sleep, reboot, provider, package, and peer failures and recover by re-enrollment/corrected forward.
+     - Inputs: S4 and CRIT-007.
+     - Deliverable: fault traces, recovery logs, and no-rollback proof.
+     - Depends on: S4.
+     - Acceptance: no data loss, secret leak, false health, or service restart storm.
+     - Validation: chaos/recovery farm and live commands.
+     - Done when: failure matrix and remediation records are signed.
+  6. S6 Promote or block honestly.
+     - Objective: verify all gates and either publish production promotion or retain Remaining with exact blockers.
+     - Inputs: S1-S5.
+     - Deliverable: signed release decision and archive entry on closure.
+     - Depends on: S5.
+     - Acceptance: promotion is impossible with any missing hard gate.
+     - Validation: release verifier and final worklist lint.
+     - Done when: decision is reproducible from the evidence bundle.
+- Scope: Owns release gate authority, schema/signing, farm/CI/package/live evidence, topology, rollout, failure injection, and promotion decision. Feature implementation
+  remains in its owner epic.
+- Relevant files/components: AI_GOVERNANCE, CI workflow, install-helpers release/evidence/farm scripts, package manifests, docs/platform/evidence, five-seat and
+  lighthouse tooling.
+- Dependencies: all P0/P1 feature epics, CRIT-007, and the active repository revision.
 - Acceptance criteria:
-
-  1. A GitHub required-check result and signed release-evidence artifact exist
-     for every candidate release; farm execution is traceable by job and slot.
-  2. A release cannot receive a production verdict when a required static,
-     compatibility, topology, recovery, live, or hardware gate is missing,
-     stale, unavailable, or manually asserted.
-  3. Three lighthouses and three workstations pass join, steady-state, loss,
-     failover, re-enrollment, and corrected-forward recovery drills.
-  4. Node and capability readiness distinguish healthy, degraded, stale,
-     unavailable, blocked, and recovering without hiding unaffected services.
-  5. Workload placement explains resource/capability decisions and preserves
-     control-plane headroom; retention and purge rules are enforced.
-  6. Replicated domains expose deterministic merge rules, source identity,
-     revision provenance, conflict behavior, and bounded recovery.
-  7. Incident bundles correlate health, audit, worker, transport, workload,
-     certificate, and operator events without including secrets.
-  8. Existing encrypted backups remain verified until peer-replication recovery
-     is proven; the transition has an explicit evidence record.
-  9. The six-node testbed runs repeatable chaos and recovery scenarios and
-     publishes artifacts suitable for production promotion review.
-  10. Normative guidance names only current commands, roles, boundaries, and
-      gates; retired architecture docs are bannered; documentation and
-      worklist lints pass.
-  11. Audio passes on all six nodes: `pactl`/PulseAudio compatibility,
-       `pw-cli`/PipeWire graph, WirePlumber policy, ALSA/UCM device discovery,
-       speaker playback, microphone capture, HDMI/Bluetooth where present,
-       Browser/App VM/VDI audio, Mesh Collaboration Suite calls, and direct plus
-       relayed node-to-node streams. The `.15` evidence bundle includes live
-       playback, capture, reconnect, and recovery proof.
-- Verification method: Run worklist, governance, documentation, secret,
-  package, compatibility, and provenance lints; run GitHub required checks and
-  farm gates with BigBoy carrying the long pole; run parallel six-node tests for
-  join, failover, recovery, state convergence, resource pressure, retention,
-  and VDI reconnect; perform signed-artifact and Fedora transaction checks;
-  preserve live evidence bundles and explicit unavailable-hardware notes.
-- Origin or merged source IDs: Fit-for-purpose audit 2026-07-30 (`AUD-01`
-  through `AUD-07`, `AUD-09`, and `AUD-17` through `AUD-25`); operator-selected
-  production gate, topology, recovery, trust, retention, and testbed decisions.
+  1. One revision has complete signed farm, package, live-seat, lighthouse, and recovery evidence.
+  2. GitHub required checks and verifier reject missing, altered, stale, or mismatched evidence.
+  3. Promotion uses corrected-forward recovery and archives the closed epic.
+- Verification method: worklist/governance/doc/secret/supersession lints, farm cargo/package gates, release verifier, and named live scripts; longest job on BigBoy.
+- Origin or merged source IDs: 2026-07-30 fit-for-purpose audit and archived release/acceptance IDs.
 
 ### WL-CRIT-007 - Boot, sleep/resume, and fleet peer return recovery
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Mesh members can boot or return from laptop sleep with stale Nebula
-  state, missing lighthouse maps, duplicate overlay identities, or an
-  unavailable coordination quorum. Peers then remain absent or report errors
-  even when the local services appear active. The recovery watchdog also
-  ignored migrated identities stored under `identity/current`.
-- Required outcome: Every enrolled seat and lighthouse returns to a unique
-  overlay identity, current lighthouse roster, healthy etcd coordination,
-  active mackesd/Syncthing health, and visible peer presence after boot,
-  suspend/resume, underlay changes, and one lighthouse loss. Recovery must be
-  corrected-forward and must not require credential disclosure or manual
-  certificate editing.
-- Current state: Eight unique overlay identities cover the three-lighthouse
-  quorum and five Workstations. Surface is `peer:SURFACE`/`10.42.0.7`; T480's
-  old-CA state was backed up, removed via leave, and re-enrolled as
-  `peer:T480`/`10.42.0.8` with etcd/Syncthing restored. Join keeps an existing
-  role pin authoritative; leave removes old authority pins without following
-  symlinks, reports failure, and permits a new pin only after successful teardown.
-  Seat 15's reboot exposed a stale lighthouse override and three unshared
-  Syncthing peers; both were root-only backed up and corrected. It now reaches
-  all seven overlay nodes, has 4/4 folder peer connections, and passes
-  mesh-health. Physical laptop suspend/resume, lighthouse loss, and
-  drill-ledger-backed corrected-forward evidence remain missing; current health
-  alone does not close recovery.
+- Problem: boot and laptop sleep can leave Nebula, mackesd, Syncthing, etcd, and desktop state stale or duplicated.
+- Required outcome: every enrolled workstation and lighthouse returns to one authenticated identity, one healthy daemon/session, synchronized substrate, and visible
+  recovery state after boot, sleep, reboot, network transition, or corrected-forward upgrade.
+- Current state: eight identities and recovery helpers exist; the rejoin helper
+  now requires a successful `mackesd leave --yes`, validates that stale
+  certificate/key/role state is gone, and rejects unsupported roles before
+  joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
-  1. Add a durable enrollment/overlay identity collision check that refuses to
-     start a node when its certificate address is already claimed by another
-     active peer or lighthouse.
-  2. Make current lighthouse roster materialization boot- and resume-safe;
-     stale retired underlay addresses must not overwrite a healthy roster.
-  3. Add explicit post-resume recovery for Nebula, etcd clients, mackesd, and
-     Syncthing with bounded backoff and no restart storm.
-  4. Run a physical boot, suspend/resume, underlay reconnect, lighthouse-loss,
-     and corrected-forward re-enrollment drill on Dell, Eagle, and seat 15.
-  5. Resolve the seat's Documents bind-mount gate and disk-headroom warning,
-     then regenerate node-bound evidence for production acceptance.
-- Scope: Nebula identity/configuration, systemd ordering, mesh-health recovery,
-  etcd/Syncthing coordination and peer presence, enrollment/re-enrollment,
-  and six-node live evidence. It does not own MG90 telemetry semantics, which
-  remain under WL-FUNC-017.
-- Relevant files/components: `packaging/systemd/mackesd.service`,
-  `packaging/systemd/nebula.service.d/10-mesh-recovery.conf`,
-  `install-helpers/mesh-health-check.sh`, `install-helpers/verify-boot-recovery.sh`,
-  `install-helpers/setup-etcd.sh`, Nebula enrollment/materialization,
-  `docs/ops/mesh-boot-resume-diagnosis-2026-08-02.md`, and the live six-node
-  topology verifier.
-- Dependencies: WL-CRIT-006 production evidence and corrected-forward
-  recovery; the current etcd/Syncthing substrate; Nebula enrollment and CA
-  authority; physical Dell, Eagle, and seat hardware.
+- **Identity teardown checkpoint (2026-08-06):** `rejoin-v11-mesh.sh
+  --self-test` and the farm `.50` lane
+  `crit007-rejoin-selftest-20260806-r1` passed; failed leave or residual
+  identity now refuses corrected-forward join. Systemd ordering and
+  destructive live rejoin remain open. Evidence:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-06-rejoin-identity-r1.md`.
+  1. S1 Define boot dependency order and identity guard.
+     - Objective: order network, Nebula, mackesd, etcd, Syncthing, shell, and workload services with one stale-identity cleanup path.
+     - Inputs: systemd units, enrollment config, mesh-health checks.
+     - Deliverable: unit dependencies and hostile duplicate-identity tests.
+     - Depends on: none.
+     - Acceptance: no service starts before required identity/network readiness.
+     - Validation: systemd syntax and shell cargo tests.
+     - Done when: boot graph and tests are recorded.
+  2. S2 Implement sleep/network rejoin.
+     - Objective: detect suspend/resume and network changes, refresh Nebula, restore etcd/Syncthing, and publish bounded state.
+     - Inputs: S1 and mesh health worker.
+     - Deliverable: rejoin state machine, backoff, and offline/online fixtures.
+     - Depends on: S1.
+     - Acceptance: one identity and one session return without duplicate peers or writes.
+     - Validation: fault-injection cargo tests and live sleep/network probe.
+     - Done when: rejoin trace shows convergence.
+  3. S3 Recover workloads and desktop state.
+     - Objective: reconcile workload sessions, VDI leases, shell state, and local cache after reboot/suspend.
+     - Inputs: ARCH-010 and S2.
+     - Deliverable: restart/replay/re-attach tests and recovery UI.
+     - Depends on: S2.
+     - Acceptance: stale leases die, valid sessions resume, and failures are actionable.
+     - Validation: Workload/VDI cargo tests and seat proof.
+     - Done when: no duplicate VM/container/session exists.
+  4. S4 Prove fleet rollout and corrected forward.
+     - Objective: execute boot/sleep/reboot/upgrade recovery on all seats and lighthouses.
+     - Inputs: S1-S3, CRIT-006.
+     - Deliverable: signed recovery matrix.
+     - Depends on: S3.
+     - Acceptance: failed nodes re-enroll and recover without rollback or data loss.
+     - Validation: farm package gates and live seat/lighthouse scripts.
+     - Done when: all matrix rows have evidence or named blockers.
+- Scope: Owns identity, systemd ordering, Nebula/etcd/Syncthing rejoin, workload/desktop recovery, upgrade cleanup, and proof. Feature-specific behavior remains with its
+  owner epic.
+- Relevant files/components: mackesd/mde-shell systemd units, Nebula/mesh-health, etcd/Syncthing, Workload/VDI recovery, enrollment and rollout scripts.
+- Dependencies: ARCH-010, ARCH-009, CRIT-006, and the current eight-node roster.
 - Acceptance criteria:
-  1. A fresh boot and a suspend/resume cycle leave each node with the same
-     unique overlay address, current lighthouse maps, and active Nebula.
-  2. etcd endpoint health, leader election, peer heartbeats, and Syncthing
-     connections recover without manual service intervention.
-  3. `mackesd peers` reports all available seats and lighthouses online with
-     no duplicate overlay addresses or retired lighthouse endpoints.
-  4. The recovery watchdog acts on current-generation identities and remains
-     bounded under repeated underlay loss and resume events.
-  5. A node can be corrected-forward re-enrolled with preserved evidence and
-     no credentials in logs, Git, or worklist records.
-  6. The six-node boot/resume/lighthouse-loss evidence bundle passes the
-     production verifier and documents any unavailable physical proof.
-- Verification method: Run the worklist self-test and shell syntax checks;
-  use farm lanes for code/build gates; use real Dell, Eagle, and seat hardware
-  for reboot and suspend/resume; capture systemd, Nebula, etcd, Syncthing,
-  peer-directory, overlay-reachability, and node-bound evidence before and
-  after each transition.
-- Origin or merged source IDs: Operator-reported boot/sleep peer-return bug
-  (2026-08-02); live recovery evidence in
-  `docs/ops/mesh-boot-resume-diagnosis-2026-08-02.md`.
+  1. Boot, sleep, network transition, reboot, and upgrade restore one authenticated peer/session.
+  2. Stale identities, leases, rows, and processes are removed or surfaced as actionable failure.
+  3. All seats/lighthouses have direct recovery evidence.
+- Verification method: systemd/shell/Workload cargo gates, farm package checks, fault injection, and live recovery scripts; BigBoy runs the broadest gate.
+- Origin or merged source IDs: operator boot/sleep peer-return bug and archived recovery incidents.
 
 ## User Interface And Experience
 
@@ -2017,406 +1281,303 @@ remains here under a completed status.
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Shared Quazar fonts, light/dark palettes, style primitives, and some
-  surface migrations exist, but user-facing egui workspaces still drift in app
-  frames, navigation, state presentation, sheets/popovers, tooltips, motion,
-  icons, tables, and internal Editor/Terminal chrome. Older scope also assumes
-  a host Browser chrome exception that conflicts with WL-ARCH-008.
-- Required outcome: Every Construct-owned egui surface reads as one dense,
-  HIG-principled Quazar platform in Dark and Light: common app frame,
-  navigation, state components, sheets/popovers, typography, icons, motion, and
-  data presentation. Car supports governed Dark and Light modes; focused VDI
-  preserves full-screen pixels; guest applications, including
-  Chromium in `browser-vm`, remain outside Construct styling. Carbon is not a
-  theme or icon requirement; all retained or replacement assets use the shared
-  registry, have clear licensing, and form one coherent visual language. The
-  Terminal-pattern unified top bar is shared across workspaces, with approved
-  exemptions recorded individually; the side tab bar is 25% thinner, two-row,
-  and zebra-striped for differentiation.
-- Current state: Shared Quazar primitives and most Construct-owned route
-  migrations are landed, with focused farm suites and representative direct-DRM
-  evidence in the governed ledger. Multiple Dell and .138 Dark/Light, narrow,
-  and large-text slices are accepted, but evidence spans several payloads.
-  Current-payload full-matrix proof, remaining route/state adoption, package
-  transaction, style/asset cleanup, and production live acceptance remain open.
-  Exact payload, capture, regression, and resolution history is preserved in
-  the dated pre-lint-compaction snapshot.
+- Problem: Construct surfaces still diverge in typography, palette, icons, spacing, responsive layout, and motion despite shared primitives.
+- Required outcome: every Construct-owned egui surface uses the shared Quazar Style/Visuals, approved fonts/icons, Dark/Light appearances, responsive geometry, semantic
+  state language, and bounded motion with no hand-rolled surface styling.
+- Current state: shared style and many primitives exist; adoption gaps, icon audit, responsive outliers, and integrated visual proof remain.
 - Remaining work:
-
-  - Execution update (2026-08-01): host Browser packaging/runtime payloads were
-    removed from the working tree and the VM-only activation guard now evicts
-    stale host-helper tabs before selecting `browser-vm`. The local candidate
-    standalone tree remains audit-only: it lacks a root workspace, clean-clone
-    build proof, and complete dependency closure. Cargo/workspace and release
-    build cleanup, accepted standalone publication, host-source removal, and
-    live VDI framebuffer proof remain open.
-
-  0. Re-run the direct-DRM EGL-readback matrix against the current installed
-     `.138` payload `f58b42ba…` (and separately against Dell after it is
-     reachable) for every Construct-owned route that still relies on
-     representative or older-payload evidence (Editor, Terminal, Phones, Car,
-     and any remaining Workbench/Infra, Music, Media, Browser boundary, Mesh
-     Collaboration Suite, or Workers cells). Inspect Dark desktop, Light
-     desktop, narrow, and Light/Largest frames, retain readable captures,
-     and restore secure login-at-boot state after each proof batch. The
-     proof-only settle window is implemented and farm-tested; retain it for
-     asynchronous/expressive routes, with normal production timing unchanged.
-  1. Finish the shared app-frame and Terminal-pattern unified top bar, including
-     the per-workspace exemption review. Complete loading/empty/stale/offline/
-     error/destructive states, sheets, popovers, tooltips, table/list density,
-     icon registry/cache, and centralized expressive motion primitives;
-     reduced-motion substitutions are optional compatibility work, not a core
-     feature.
-  2. Migrate shell chrome and every launchable workspace to those primitives,
-     matching Terminal's top-of-space pattern and preserving only explicitly
-     approved Maps content-color and focused-VDI pixel exceptions.
-  3. Migrate Editor and Terminal internal tabs, toolbars, palettes, sidebars,
-     popovers, and status rows without changing editor/terminal behavior. Direct
-     Editor entry now collapses both optional sidebars, covered by the focused
-     farm test `direct_entry_collapses_all_optional_sidebars`; make
-     the side tab bar 25% thinner, two-row, and zebra-striped without clipping.
-  4. Apply the shared language to the Mesh Collaboration Suite, Workers, and
-     Construct-owned `browser-vm` connection/unavailable/diagnostic states. Do
-     not style the guest Chromium viewport or reintroduce host Browser chrome.
-  5. Complete Dark/Light, desktop/narrow/large-text, no-overlap, icon
-     licensing/raster, expressive motion, and representative live DRM proof.
-  Maps Drive HUD large-text geometry is now evidence-backed: the floating-action-
-  button lane is reserved and the health rail uses the fixed multi-row layout;
-  focused Maps tests and Light/Largest DRM evidence cover this slice. Broader
-  Maps state and full-route matrix coverage remain in items 2 and 5.
-- Scope: Current design authority, shared `mde-egui` and brand/icon primitives,
-  shell-owned chrome, launchable egui workspace frames, and Editor/Terminal
-  internal chrome. Behavior contracts, security/auth, full AccessKit rollout,
-  guest application UI, and general native-app hosting are out of scope.
-- Relevant files/components: `crates/shared/mde-egui/`,
-  `crates/shared/mde-theme/`, shell chrome, and all crates registered in the
-  embedded surface inventory.
-- Dependencies: Coordinate adoption with WL-ARCH-008, WL-FUNC-011, and
-  WL-UX-011. WL-ARCH-009 owns Workers behavior; WL-UX-011 owns node providers,
-  typed actions, integration, auditability, and vendor-pack contracts;
-  WL-UX-009 owns only shared visual adoption and render proof. WL-UX-012 owns
-  taskbar chrome,
-  WL-FUNC-017 owns MG90 telemetry semantics, and WL-CRIT-006 owns integrated
-  production evidence. Shared visual work may proceed independently and must
-  not block functional contracts or create a second product epic.
+  1. S1 Freeze tokens, fonts, and icon registry.
+     - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.
+     - Inputs: mde-egui style, platform interfaces, icon assets.
+     - Deliverable: registry, license manifest, and drift lint.
+     - Depends on: none.
+     - Acceptance: no new raw surface style or unlicensed icon is accepted.
+     - Validation: style/icon cargo tests and license scan on .50.
+     - Done when: registry hash and scan are recorded.
+  2. S2 Migrate Construct surfaces.
+     - Objective: replace local colors, spacing, typography, and icon choices in shell, Workers, Collaboration, Music, Maps, Browser connection, and Health.
+     - Inputs: S1 and owner epic route models.
+     - Deliverable: touched surfaces using shared primitives and negative raw-style scan.
+     - Depends on: S1.
+     - Acceptance: no Construct-owned surface bypasses Style/Visuals.
+     - Validation: focused crate tests and architecture scan.
+     - Done when: all active surfaces are inventoried and migrated.
+  3. S3 Implement responsive and appearance states.
+     - Objective: make wide, narrow, tablet, largest-text, Dark, Light, disabled, stale, and unavailable layouts readable and operable.
+     - Inputs: S1/S2 and render fixtures.
+     - Deliverable: deterministic screenshot fixtures and layout tests.
+     - Depends on: S2.
+     - Acceptance: no clipping, overlap, hidden control, or contrast failure in supported states.
+     - Validation: egui/surface cargo render tests on BigBoy.
+     - Done when: fixture set and human review record exist.
+  4. S4 Integrate motion and interaction policy.
+     - Objective: use centralized DRM-aware motion, focus/keyboard semantics, and event-only repaint without a second loop.
+     - Inputs: mde-egui motion/DRM and governance.
+     - Deliverable: motion/focus fixtures and repaint bounds.
+     - Depends on: S2.
+     - Acceptance: no continuously repainting idle surface or per-widget timing authority.
+     - Validation: motion/render cargo tests and direct-DRM capture.
+     - Done when: motion traces and reduced-motion compatibility evidence exist.
+  5. S5 Prove visual consistency.
+     - Objective: review all shipped Construct surfaces and package fonts/icons/styles in one release.
+     - Inputs: S1-S4 and CRIT-006.
+     - Deliverable: signed Dark/Light/large-text capture set and package report.
+     - Depends on: S3, S4.
+     - Acceptance: human review finds no competing design language.
+     - Validation: farm shell tests, RPM payload checks, and named seat captures.
+     - Done when: evidence is linked and limitations are explicit.
+- Scope: Owns shared egui style, typography, icon registry/licensing, responsive layout, semantic states, motion integration, and visual proof. It does not own guest
+  Browser chrome, health evaluation, or taskbar product behavior.
+- Relevant files/components: crates/shared/mde-egui style/visuals/motion, shell surface modules, icon/font assets, platform interface/design docs, render fixtures,
+  packaging.
+- Dependencies: ARCH-008, ARCH-009, FUNC-011, FUNC-017, FUNC-019, FUNC-021, UX-011/012/013/014.
 - Acceptance criteria:
-
-  1. Current authority contains no Carbon theme/icon requirement. Quazar
-     Dark/Light pass palette, contrast, font, shape, licensed-icon, and
-     deterministic screenshot tests.
-  2. Construct-owned surfaces use shared frames/navigation/state/dialog/tooltip
-     primitives unless an explicit governed exception is documented.
-  3. Editor and Terminal internal chrome is migrated; dense tables/lists are the
-     default operational idiom; expressive motion is centralized and tested.
-  4. Maps content exceptions are marked, focused VDI retains full-screen pixels,
-     Car Dark/Light behavior is tested, and guest Chromium receives no
-     Construct chrome.
-  5. Desktop, narrow, large-text, loading/error, and dynamic-data states render
-     without overlap, clipping, hidden controls, or unstable geometry.
-- Verification method: Run focused and integrated farm tests for `mde-egui`,
-  `mde-theme`, the shell, and touched workspace crates; palette/font/icon/frame/
-  state/motion and deterministic render tests; style-leak and supersession
-  lints; and representative DRM/Sunshine captures when hardware is reachable.
-- Origin or merged source IDs: 2026-07-26 operator unified-theme survey:
-  HIG Quazar, Dark plus Light, common app frame, shared state language,
-  sheets/popovers, dense operational views, centralized expressive motion,
-  broad icon adoption, Editor/Terminal internal chrome, and farm/live proof.
-  Reworked 2026-07-28 for the VM Browser architecture and 2026-07-29 to retire
-  all Carbon theme/icon requirements.
+  1. All Construct-owned surfaces use one Style/Visuals and licensed registry.
+  2. Dark/Light/responsive/largest-text/stale/unavailable captures are legible.
+  3. Motion, focus, repaint, package, and human review evidence pass.
+- Verification method: style/icon/render cargo gates, license/architecture scans, RPM checks, and direct-DRM/Sunshine captures; longest render gate on BigBoy.
+- Origin or merged source IDs: 2026-07-26 unified Quazar theme survey and archived visual workstreams.
 
 ### WL-UX-011 - Node hardware providers and safe controls for Workers
 
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: Node hardware and OS providers remain incomplete: Wi-Fi, keyboard
-  backlight, detailed sound, direct-seat input policy, laptop power/thermal,
-  docks, firmware, privacy, lifecycle, recovery, and safe OEM actions lack
-  uniform production behavior. Existing This Node pages mix provider truth,
-  presentation, and mutation, which would recreate a second interface after the
-  Workers cutover.
-- Required outcome: Complete credential-free, capability-driven node provider
-  contracts and allowlisted actions for Workers. Each observation, entity,
-  output, setting, event, and action has one canonical worker owner, explicit
-  applicability/freshness, honest unsupported/degraded states, and bounded
-  recovery/audit behavior. Node-local and trusted-session remote mutations use
-  the WL-ARCH-009 staged Action Console and preserve mesh reachability. Standard
-  and versioned OEM/vendor adapters are safely separated. This epic owns no
-  durable route, hierarchy, renderer, action tab, or health presentation.
-- Current state: Existing This Node code has a governed catalog and typed
-  credential-free providers for network, BlueZ, audio, display, input, power,
-  storage, firmware, privacy, and other local evidence, with focused farm proof.
-  It is migration source only: many actions remain unavailable or integration-
-  gated, broad OS-management ownership is incomplete, and live device, DRM,
-  audio, recovery, Surface, and fleet proof remains open. WL-ARCH-009 owns all
-  Workers presentation, aliases, Action Console behavior, and legacy deletion.
+- Problem: node hardware and OS observations/actions are incomplete, duplicated, and not consistently capability-driven or safe.
+- Required outcome: credential-free Workers providers publish bounded sourced hardware/OS entities and only allow capability-gated, generation-bound, audited safe
+  controls for Wi-Fi, audio, display, input, storage, printers, services, power, and virtualization.
+- Current state: device catalog and typed provider scaffolding exist; provider coverage, conflict/history, safe actions, and fleet proof remain.
 - Remaining work:
-
-  1. Produce a provider-to-worker migration matrix for every current This Node,
-     System, Storage, Device Manager, About, Control Center, and direct-seat
-     datum/action. Map each to one canonical worker ID from WL-ARCH-009, its
-     entity/output kind, applicability predicate, freshness, and typed action;
-     fail tests on unmapped or duplicate ownership.
-  2. Implement NetworkManager/ModemManager connectivity for Wi-Fi, Ethernet,
-     cellular/APN, hotspot, DNS/proxy, and imported WireGuard/OpenVPN. Preserve
-     `nebula1`, mesh DNS/routes, and lighthouse reachability; use an in-process
-     SecretAgent and never serialize credentials into Bus, logs, snapshots,
-     timeline events, previews, results, or UI state.
-  3. Complete BlueZ, display, audio, and privacy providers: pairing/trust/forget;
-     display enable/mode/refresh/arrangement/scale/rotation; LCD/DDC brightness;
-     PipeWire/WirePlumber device/port/profile/app/VM state and meters; and
-     camera/microphone inventory, use, and privacy state.
-  4. Complete keyboard/backlight, pointer, touch, pen, and gesture policy through
-     real udev/libinput direct-seat paths, including hotkeys, OSD, tap-to-click,
-     capability loss, device replacement, and reboot/resume persistence.
-  5. Implement battery/source/condition/time/charge-limit/profile/idle/lid/sleep
-     behavior plus typed thermals, fans, CPU, GPU, and safe performance-profile
-     controls. Hardware condition is provider evidence for the separate health
-     authority, not a score or issue presentation in Workers.
-  6. Complete device/driver inventory, storage, firmware, dock/Thunderbolt,
-     printers/peripherals, and Surface evidence as bounded entity/output models.
-     Expose explicit unsupported, unconfigured, stale, unavailable, and provider-
-     failure states rather than inferred or synthetic success.
-  7. Implement allowlisted hardware actions for platform profile, bounded fan
-     mode/curve, CPU power limit, GPU profile, device enablement, firmware,
-     storage, printer, and Thunderbolt authorization. Register every action on
-     its canonical action worker and expose it only through staged change sets.
-  8. Bound manufacturer writes with typed arming, impact/recovery metadata,
-     audit, thermal limits, watchdog recovery, and safe-profile fallback. Forbid
-     arbitrary sysfs, raw MSR/SMI, `/dev/mem`, arbitrary systemd properties,
-     untyped remote mutation, and shell-command composition.
-  9. Define the vendor-pack contract. Discover installed packs, validate version
-     and capability, keep standard and vendor controls distinct in provider
-     metadata, and fail honestly when missing, outdated, or unavailable. Support
-     capability-detected Microsoft Surface, Dell, Lenovo, HP, and ASUS adapters.
-  10. Complete OS-management providers for lifecycle/update, recovery/reset,
-      security/privacy/encryption, accounts/sign-in, applications/services,
-      backup/restore, component-local diagnostics, accessibility, locale/time,
-      and virtualization/remote access. Assign each to a canonical worker and
-      expose bounded observations, applicability, freshness, safe actions,
-      recovery, and audit pointers.
-  11. Reconcile Control Center and status chrome with the same typed authority
-      for connectivity, Bluetooth, sound, LCD/keyboard brightness, power,
-      numeric battery, and microphone/camera indicators. Keep Control Center
-      transient and do not create another durable hierarchy or health summary.
-  12. Adapt provider and action contracts to the WL-ARCH-009 shared runtime and
-      change-set schemas. Add hostile-input, bounds, redaction, capability-loss,
-      stale-generation, refusal, timeout, recovery, and audit tests for each
-      provider family and privileged adapter.
-  13. Complete physical proof across Seat 15, Dell, Eagle, T480, and Surface for
-      connectivity, audio, display/brightness, input, power/thermal, firmware,
-      docks, storage, privacy, and one safe reachable OEM action. Record absent
-      hardware/providers honestly; never infer capability from DMI alone.
-  14. Close Surface seat `172.20.146.79` with a native Fedora 44 release after
-      verifying FFmpeg sonames and complete seat/daemon/media payload. Repeat
-      reboot/resume, DRM, audio, input, connectivity, privacy, power/thermal,
-      storage, firmware, dock, provider-loss, refusal, safe-action, recovery,
-      audit, and zero-restart proof; restore secure login-at-boot afterward.
-- Scope: In scope are node observation providers, entity/output/action
-  contracts, direct-seat behavior, capability discovery, Control Center state,
-  OS-management sources, privileged hardware workers, vendor adapters, safety,
-  audit/recovery, packaging dependencies, and physical proof. Workers layout,
-  navigation, aliases, graph/tree/inspector, Action Console UI, health UI,
-  arbitrary path writes, lock/PAM replacement, and raw privileged interfaces
-  are out of scope.
-- Relevant files/components: current This Node/System/Storage/Device Manager
-  providers as migration sources; Control Center/status/direct-seat modules;
-  `mde-seat`; shared worker-runtime and change-set contracts; daemon network,
-  hardware, firmware, storage, host-state, desktop-state, lifecycle, backup,
-  printer, service, and virtualization workers; systemd/RPM dependencies.
-- Dependencies: WL-ARCH-009 owns the only Workers interface, route aliases,
-  Action Console, shared runtime integration, and old-renderer removal. Use
-  WL-UX-009 shared state primitives only where Control Center/OSD remains. The
-  separate health authority may consume provider evidence but is not owned here.
-  Coordinate release proof with WL-CRIT-006 and recovery with WL-CRIT-007.
+  1. S1 Freeze provider/entity/action contracts.
+     - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
+     - Inputs: worker contracts, existing This Node providers, UX-011 survey.
+     - Deliverable: bounded versioned contracts and hostile tests.
+     - Depends on: ARCH-009 S2.
+     - Acceptance: secrets, arbitrary properties, stale generations, and unknown actions fail closed.
+     - Validation: mesh-type/provider cargo tests on .90.
+     - Done when: contract evidence and source hashes exist.
+  2. S2 Implement observation providers.
+     - Objective: publish Wi-Fi, network, audio, display, input, storage, printer, service, power, privacy, and virtualization facts with one owner each.
+     - Inputs: Fedora APIs and device inventory policy.
+     - Deliverable: provider workers, source evidence, unavailable states.
+     - Depends on: S1.
+     - Acceptance: no fabricated value and no provider can publish another provider's entity.
+     - Validation: provider unit/property cargo tests.
+     - Done when: coverage matrix is complete or blockers named.
+  3. S3 Implement safe staged controls.
+     - Objective: preview, authorize, execute, audit, cancel, and recover allowlisted controls only.
+     - Inputs: S1/S2 and Workers Action Console.
+     - Deliverable: action adapters and refusal/partial-failure tests.
+     - Depends on: S2 and ARCH-009 S5.
+     - Acceptance: no raw shell, arbitrary path, secret, stale generation, or unconfirmed mutation is accepted.
+     - Validation: action-auth and package cargo tests on BigBoy.
+     - Done when: every control has preview/result evidence.
+  4. S4 Integrate Workers and fleet proof.
+     - Objective: render device-by-type/topology/entity details, conflicts, history, scans, and redacted exports across the fleet.
+     - Inputs: S1-S3 and UX-009.
+     - Deliverable: Workers device_inventory view and five-seat/three-lighthouse evidence.
+     - Depends on: S3.
+     - Acceptance: stale/failed providers remain visible and export contains no credentials.
+     - Validation: shell render, package, and live provider gates.
+     - Done when: every supported provider has direct evidence or a named blocker.
+- Scope: Owns node observation providers, entity/output/action contracts, safe controls, Workers device inventory, conflict/history/export, package, and proof. Workers
+  process split and generic navigation belong ARCH-009.
+- Relevant files/components: mesh provider types, mackesd host/device/storage/service/lifecycle workers, shell Workers/device inventory, Fedora
+  NetworkManager/udev/pipewire/storage/printer APIs, package policies.
+- Dependencies: ARCH-009, ARCH-010 action authority, UX-009, CRIT-006/007.
 - Acceptance criteria:
-
-  1. Every migrated node datum/action has exactly one canonical worker owner;
-     matrix and drift tests reject missing, duplicate, legacy, or generic-shell
-     ownership, and WL-ARCH-009 can consume the contract without shell-to-daemon
-     implementation coupling.
-  2. Connectivity, Bluetooth, display/brightness, audio/metering, privacy, and
-     input use real providers, preserve mesh reachability, and keep credentials
-     out of all observable and action state.
-  3. Keyboard backlight, tap-to-click, device policy, battery/power, thermals,
-     fans, CPU/GPU, firmware, docks, storage, printers, and supported OEM actions
-     perform real bounded work through canonical workers and staged change sets.
-  4. Unsupported, unconfigured, stale, unavailable, and failed providers remain
-     distinct; no capability or successful action is fabricated.
-  5. Privileged actions are allowlisted, generation-bound, armed, audited,
-     thermally constrained, watchdog-protected, and recover automatically to a
-     safe profile without arbitrary paths, commands, or secret exposure.
-  6. Vendor packs are discoverable, versioned, capability-aware, distinctly
-     identified in provider metadata, and governed by the same authorization,
-     safety, refusal, audit, and recovery boundaries as standard adapters.
-  7. Lifecycle, recovery, security/privacy, accounts, applications/services,
-     backup, component diagnostics, peripherals, accessibility, locale/time,
-     and virtualization providers expose bounded truth and safe actions through
-     their owning workers.
-  8. Control Center/status consume the same authority without a durable settings
-     tree, direct action bypass, or duplicate health summary. Provider evidence
-     reaches the separate health authority without appearing as Workers grades.
-  9. Farm tests and five-seat physical ledgers prove reachable hardware paths,
-     provider loss, refusal, recovery, audit, reboot/resume, and safe OEM action;
-     unavailable hardware is recorded honestly.
-- Verification method: Run contract fixtures and provider/action tests for every
-  mapping, hostile bound, redaction, capability transition, stale generation,
-  refusal, timeout, watchdog, safe fallback, recovery, and audit path. On the
-  farm run touched daemon/seat/shared-contract tests, package dependency and
-  payload checks, fmt, clippy, architecture, secret, and supersession gates,
-  placing the longest job on BigBoy. On Seat 15, Dell, Eagle, T480, and Surface,
-  capture the provider matrix, direct-seat behavior, one safe reachable OEM
-  action, reboot/resume, zero-restart service state, and honest unsupported
-  results; include the Surface native-Fedora-44 dependency audit.
-- Origin or merged source IDs: 2026-07-26 node GUI and hardware survey covering
-  connectivity, laptop depth, safe OEM writes, and Surface/Dell/Lenovo/HP/ASUS
-  adapters. The 2026-08-01 This Node hierarchy decisions are superseded by the
-  2026-08-03 Workers merge survey; this epic retains only independently
-  completable provider, action, safety, and physical-validation obligations.
+  1. Every provider has one owner, bounded sourced output, freshness, and unavailable state.
+  2. Every mutation is staged, capability/generation-bound, audited, cancellable, and safe.
+  3. Device inventory and fleet proof expose conflicts without secrets or fabricated data.
+- Verification method: provider/property/action cargo suites, authority/security/package scans, render fixtures, and live provider captures; BigBoy runs broad provider
+  checks.
+- Origin or merged source IDs: 2026-07-26 node hardware and safe-controls survey.
 
 ### WL-UX-012 - Full-width Construct taskbar and search-first Home
 
 - Status: Remaining
 - Priority: P1
 - Complexity: Epic
-- Problem: Construct Bottom mode is a fixed-width opaque-black capsule with
-  oversized pill geometry, tiny launcher-group labels, undersized responsive
-  controls, and no indication of the focused workspace. Fleet & Mesh and
-  Workloads are absent. Navigation, workspace shortcuts, remote-desktop pins,
-  and placement share one undifferentiated row. The Springboard App Grid
-  duplicates discovery even though Front Door already provides complete search
-  and routing.
-- Required outcome: Construct Bottom mode is a full-width, Windows 11-inspired
-  taskbar with icon-only navigation left, a geometrically centered
-  user-managed workspace strip, and placement utility right. Start opens and
-  focuses Front Door search. New profiles choose their initial pins during
-  first boot; migrated profiles preserve valid existing pins and never silently
-  restore a default list. Exactly one underline identifies the focused
-  workspace; no running/open indicator exists. Home is an icon-free wallpaper
-  and the App Grid is deleted. Bottom and Left layouts expose the same icon-only
-  System and Mesh Health control; its badge is the exact active unacknowledged
-  actionable count and A–F appears only in the centered health modal.
-- Current state: Navigation owns persisted placement, full-width 48px Bottom
-  geometry, fixed targets, centered and bounded pins, migration/first-boot
-  selection, singular focus marking, Start/Search routing, aliases, and motion
-  with focused farm coverage. Springboard is gesture-only and the App Grid is
-  removed. Both placements share the centralized health icon/count. Dark/Light
-  material, complete workspace-identity/focus handling,
-  large-overflow accessibility, and the final responsive live-render matrix
-  remain open. Exact implementation and proof history is preserved in the dated
-  pre-lint-compaction snapshot.
+- Problem: taskbar placement, Start/Search, Home, pins, clock/tray, and health entry still diverge from the operator-locked full-width Construct contract.
+- Required outcome: a 48px full-width taskbar supports Bottom/Left placement, icon-only Start/Search/Back/Home, user-managed centered pins, right-side placement control,
+  clock/tray semantics, and Bing-wallpaper Home with no second launcher.
+- Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and five-seat proof remain.
 - Remaining work:
-
-  1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
-     Carbon requirement. Supersede the bottom-centered Dock prohibition with
-     this full-width Construct taskbar while retaining egui, direct DRM, shared
-     `Style`, Construct/Car separation, the top status bar, and focused-VDI
-     auto-hide. State that Start opens search and is not a Start menu.
-  2. Replace Bottom geometry with a full-screen-width, 48px-high,
-     bottom-edge taskbar: no outer margin, square outer corners, 1px top border,
-     and shared low-elevation top shadow. Reserve exactly 48px in normal
-     workspace layout. Use 40x40 targets, 24px icons, 4px control radii, and
-     4px gaps; never shrink targets to the current 24px fallback.
-  3. Add three independent layout zones. Put icon-only Start, Back, and Home
-     left with 8px outer padding. Center workspace icons against the physical
-     screen center, not leftover space. Put the System and Mesh Health control
-     and Bottom/Left placement control right. Reserve symmetric center gutters from the larger side
-     cluster so unequal clusters never shift the workspace strip.
-  4. Add typed `OpenSearch` navigation. Start uses the existing Construct mark
-     and calls Front Door `open()` so search opens and requests text-field
-     focus. Clicking while visible refocuses the same overlay; it never creates
-     a Start menu or second search path. Use the tooltip/accessibility name
-     `Start - Search`.
-  5. Replace `DOCK_LAUNCHER_GROUPS` with a searchable pin catalog containing
-     `Workers`, `InfraCode`, `Desktop`, `Terminal`, `MapsLocation`,
-     `Collaboration`, `Music`, `Media`, and `Browser`. Present `InfraCode` as
-     `Workloads` without renaming its internal enum. Migrate persisted
-     `FleetMesh` and `Communications` pins to `Workers` and `Collaboration` as
-     part of their owning hard cuts. Use a first-boot pin selector for new
-     profiles rather than auto-pinning the catalog.
-  6. Version `settings-nav-bar.json` with `schema_version`, existing serialized
-     placement, and ordered `pinned_surfaces`. Preserve valid existing pins,
-     discard unknown surfaces, bound the list to the searchable catalog, and
-     send new profiles through first-boot selection. Never silently restore a
-     default list after migration; user choices remain authoritative.
-  7. Integrate the bounded first-boot pin selection into the remaining
-     profile/persistence acceptance path and Fleet & Mesh/Workloads exposure
-     without renaming the internal `Surface::InfraCode` identifier. Keep pin
-     changes immediate and reject pinning Start, Back, Home, overflow, and
-     placement controls.
-  8. Delete Springboard tile plates, labels, grid layout, keyboard selection,
-     tile activation, open-presence zoom ghosts, and their tests. Preserve the
-     wallpaper Home, Home intent, and pull-down-to-search gesture in a reduced
-     Home gesture layer.
-  9. Pass a focused target to the taskbar: `Home`, `Surface(Surface)`, or
-     `DesktopSource(id)`. Paint exactly one centered 18x3 accent underline 2px
-     above the bottom. Normalize Workbench, Mesh Map, and Explorer aliases to
-     Fleet & Mesh; match active VDI sources to their pinned desktop icon; mark
-     Home on wallpaper. Search leaves the underlying marker unchanged. Never
-     paint running/open/recent markers or expose taskbar Close actions.
-- Scope: Construct taskbar geometry, appearance, focus state, Start/Search,
-  default and user pins, overflow, preference migration, Bottom/Left
-  compatibility, health-icon parity, icon-free Home, and App Grid removal. Car
-  chrome, other top-status contents, search ranking/providers, workspace
-  business logic, VDI protocols, guest UI, and general accessibility rollout
-  are out of scope. Taskbar
-  tooltips, context menus, search results, and accessibility names may use text;
-  persistent taskbar and overflow controls remain icon-only.
-- Relevant files/components: Construct shell navigation and action dispatch;
-  Front Door result actions; Springboard/Home gesture layer; shared
-  `mde-egui::Style` and the existing icon registry.
-- Dependencies: Coordinate colors, elevation, motion, Dark/Light behavior, and
-  shared interactions with WL-UX-009 without blocking navigation work. Preserve
-  WL-ARCH-008's `Surface::Browser` route during its `browser-vm` cutover. Do not
-  duplicate WL-FUNC-017's Maps/MG90 implementation.
+  1. S1 Freeze geometry and placement.
+     - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
+     - Inputs: shell navigation, UX-009 Style/Visuals, platform interfaces.
+     - Deliverable: placement model and layout fixtures.
+     - Depends on: UX-009 S1.
+     - Acceptance: taskbar is full width, never overlaps content, and restores a valid placement.
+     - Validation: shell render cargo tests on .50.
+     - Done when: wide/narrow/largest-text captures pass.
+  2. S2 Implement icon actions and Front Door.
+     - Objective: make Start open Front Door search, Search focus search, Back navigate, Home open Bing-wallpaper Home, and no Start menu exist.
+     - Inputs: S1, Front Door, Home route.
+     - Deliverable: typed action map and navigation tests.
+     - Depends on: S1.
+     - Acceptance: each icon has one action and never launches a raw command or second launcher.
+     - Validation: shell navigation cargo tests.
+     - Done when: action trace and negative route scan pass.
+  3. S3 Implement pins, status, clock, and health anchor.
+     - Objective: persist user-managed centered pins and render right-side placement, FUNC-017 weather launcher, clock/tray, and Health modal entry using typed projections.
+     - Inputs: S1/S2, UX-013 health authority, and FUNC-017 weather projection/deep link.
+     - Deliverable: bounded settings, taskbar projection, disjoint weather/clock/tray targets, and migration tests.
+     - Depends on: S2.
+     - Acceptance: pins survive restart; health remains one modal authority; weather beside the clock opens Maps without becoming a second launcher or tray flyout.
+     - Validation: model/property/render cargo tests.
+     - Done when: persistence and deep-link evidence exists.
+  4. S4 Prove responsive and release behavior.
+     - Objective: verify Bottom/Left, Dark/Light, large text, lock, multi-display, session switching, package upgrade, and five-seat captures.
+     - Inputs: S1-S3, UX-009, CRIT-006/007.
+     - Deliverable: deterministic captures and rollout evidence.
+     - Depends on: S3.
+     - Acceptance: no clipping, hover-only meaning, duplicate launcher, or focus loss.
+     - Validation: shell cargo, package, and live-seat gates.
+     - Done when: every required state is directly reviewed.
+- Scope: Owns Construct taskbar geometry, placement, actions, pins, status/clock/tray, Home anchor, health entry, persistence, and proof. Guest Browser chrome, Workers
+  content, and health evaluation remain elsewhere.
+- Relevant files/components: shell nav/taskbar/home/front-door, mde-egui style/motion/input, health/taskbar bridge, settings persistence, render fixtures, package.
+- Dependencies: UX-009, UX-013, ARCH-009, FUNC-019, CRIT-006/007.
 - Acceptance criteria:
+  1. Full-width 48px Bottom/Left taskbar and icon-only actions match the lock.
+  2. Pins, placement, clock/tray, health deep link, and Home persist and remain bounded.
+  3. Five-seat responsive/package proof passes without a second launcher.
+- Verification method: shell model/render/navigation cargo gates, package checks, and direct-DRM/Sunshine captures on named seats.
+- Origin or merged source IDs: 2026-07-29 taskbar/Home operator lock and archived dock workstreams.
 
-  1. Bottom mode paints a full-width 48px taskbar with square screen-edge
-     geometry, shared Dark/Light material, 40px targets, and no pill, margin,
-     group heading, or raw opaque-black requirement.
-  2. Start, Back, and Home are left-aligned; user pins are centered on the
-     physical screen; placement is right-aligned; side-cluster width changes do
-     not move the centered strip.
-  3. Start opens and focuses Front Door without a Start menu, duplicate search
-     engine, or duplicate overlay.
-  4. New profiles complete first-boot pin selection; migrated profiles preserve
-     valid pins without silently restoring defaults. Fleet & Mesh and Workloads
-     are available in the searchable catalog. Pin, unpin, restart persistence,
-     malformed recovery, and placement preservation are tested; no reorder or
-     drag path exists.
-  5. Exactly one focus underline appears for Home, every pinned surface, Fleet
-     & Mesh aliases, Workloads, and matching pinned desktops. No open/running
-     marker or taskbar Close action exists.
-  6. Narrow layouts retain 40px targets, keep focus visible, and place hidden
-     pins in the icon-only single-column overflow without overlap or clipping.
-  7. Bottom and Left modes contain icons only and share persisted pin order; no
-     `Infra`, `Ops`, `Life`, or other taskbar group labels remain. Both expose
-     one accessible health icon whose tooltip and badge report the same exact
-     unacknowledged actionable count.
-  8. App Grid tiles, labels, selection, activation, and zoom ghosts are removed
-     and unreachable. Home remains wallpaper-backed; all surfaces remain
-     discoverable through Start/Search.
-  9. Back history, Home, surface routing, chooser-pinned desktop connection,
-     placement persistence, reduced motion, lock-curtain priority, and
-     immersive-VDI auto-hide continue to work.
-  10. Governance, platform-interface authority, implementation comments, tests,
-      and this worklist consistently describe the taskbar and contain no stale
-      pill/App Grid lock.
-- Verification method: Run worklist, doc-supersession, diff, and focused
-  preference/geometry/action/search/context/pin/focus/overflow/Home tests. Run
-  complete `mde-shell-egui`, `mde-egui`, and `mde-theme` tests on the build
-  farm, with the longest shell gate on BigBoy. Produce deterministic Dark/Light
-  captures at 480x480, 800x600, 1280x800, and 1920x1080 covering normal,
-  focused, overflow, search-open, and reduced-motion states. Complete
-  representative direct-DRM or Sunshine/Moonlight proof when a seat is
-  reachable; otherwise record hardware unavailability honestly.
-- Origin or merged source IDs: 2026-07-29 operator dock review: add Fleet &
-  Mesh and Workloads; use Windows 11-style full-width Bottom geometry; put
-  navigation left and user-pinned workspace icons center; add Start opening
-  search; show only the focused-workspace indicator; remove group labels; use
-  icon-only persistent chrome; remove the App Grid; and retain wallpaper Home.
-  Supersedes conflicting Springboard Dock portions of the 2026-07-22/26
-  interface locks without reviving the retired Start-menu implementation.
+### WL-UX-013 - System and Mesh Health history and expected-state intelligence
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: the centered Health modal lacks complete expected-state intent, adaptive durations, history/recurrence, safe recovery, and truthful transition handling.
+- Required outcome: one centered System and Mesh Health authority distinguishes expected absence from outage, computes A-F grades from signed bounded evidence, keeps
+  active issues above paged history, supports filters/detail/recurrence/export, and offers only governed recovery.
+- Current state: health contracts, worker, Bus projection, and A-F policy exist;
+  the expected-state boundary now covers max-timestamp return and rejects
+  oversized availability TTLs. Expected-state publishers, transition
+  evaluation, history/detail, recovery/export, and five-seat proof remain.
+- Remaining work:
+- **Expected-state boundary checkpoint (2026-08-06):** the health contract
+  suite covers `Sleeping → Returned` at the `u64::MAX` boundary and refuses an
+  overlong TTL; `.50` passed 1/1. Evidence:
+  `docs/platform/evidence/WL-UX-013-2026-08-06-health-boundary-r1.md`.
+  1. S1 Freeze health and expected-state contracts.
+     - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
+     - Inputs: health types, lifecycle/network/maintenance sources.
+     - Deliverable: contract/property/schema-skew tests.
+     - Depends on: ARCH-009 S2 and UX-011 S1.
+     - Acceptance: stale, replayed, contradictory, malformed timestamps and secrets fail closed.
+     - Validation: health cargo tests on .90.
+     - Done when: contract evidence is signed.
+  2. S2 Implement evaluation and escalation.
+     - Objective: publish expected state, distinguish planned sleep/shutdown/maintenance from outage, and apply device-aware escalation without false emergencies.
+     - Inputs: S1, provider facts, CRIT-007 transitions.
+     - Deliverable: evaluator, grade policy, transition fixtures.
+     - Depends on: S1.
+     - Acceptance: normal laptop/wireless transitions never fabricate warning/critical state.
+     - Validation: health/fault-injection cargo tests.
+     - Done when: every planned/unplanned case has a trace.
+  3. S3 Implement history, detail, filters, and recurrence.
+     - Objective: retain bounded active/history records, sort/filter/aggregate recurrence, page 24-hour data, and preserve selection on live updates.
+     - Inputs: S1/S2 and retention policy.
+     - Deliverable: modal model, history store, hostile paging/filter tests.
+     - Depends on: S2.
+     - Acceptance: active issues stay above history and no unbounded query materializes.
+     - Validation: health/UI cargo tests on BigBoy.
+     - Done when: all filter combinations and boundary durations pass.
+  4. S4 Implement governed recovery and export.
+     - Objective: preview/authorize safe refresh/retry, show progress/partial failure, and emit redacted support bundles.
+     - Inputs: S1-S3, ARCH-009 Action Console.
+     - Deliverable: recovery adapter, audit records, export verifier.
+     - Depends on: S3.
+     - Acceptance: arbitrary commands, secrets, stale targets, and unconfirmed mutations are rejected.
+     - Validation: action-auth/export cargo tests and secret scan.
+     - Done when: successful and failed recovery traces exist.
+  5. S5 Integrate modal and prove transitions.
+     - Objective: render wide/narrow/largest-text states and test boot/sleep/network/maintenance/outage/rejoin on all seats/lighthouses.
+     - Inputs: S1-S4, UX-009/012, CRIT-006/007.
+     - Deliverable: visual/live evidence bundle.
+     - Depends on: S4.
+     - Acceptance: Health is not duplicated in Workers, Collaboration, or Notification Center.
+     - Validation: shell render, package, and live transition gates.
+     - Done when: every planned/unplanned transition is directly evidenced.
+- Scope: Owns health wire/evaluation/history/detail/recovery/export/modal and live proof. Workers owns node management; taskbar owns entry; Kiron owns presentation; no
+  second health page or ledger.
+- Relevant files/components: mesh health types/workers, lifecycle/network/maintenance publishers, health_modal, taskbar/Workers deep links, action-audit/export,
+  systemd/network integration.
+- Dependencies: ARCH-009, UX-009, UX-011, UX-012, CRIT-006, CRIT-007.
+- Acceptance criteria:
+  1. Expected absence, outage, stale, rejoin, grade, duration, recurrence, and remediation are deterministic.
+  2. Modal history/detail/filter/export and safe recovery are bounded and redacted.
+  3. Five-seat/lighthouse proof shows no false emergency or duplicate authority.
+- Verification method: health/property/fault/UI/package cargo gates, secret scans, and direct transition captures; longest health suite on BigBoy.
+- Origin or merged source IDs: 2026-08-04 System and Mesh Health survey and archived health authority work.
+
+### WL-UX-014 - Grade-specific cinematic Kiron health lower thirds
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: KIRON has generic typed toasts but no governed A-F payload, authored scenes, audio, ticker, fallback ladder, or bounded health interaction.
+- Required outcome: one ToastHost renders six license-clean A-F health scenes and recovery transitions from UX-013 authority, with exact dwell/audio, grouping/ticker,
+  safe deep links, live-3D/pre-rendered/static fallback, and no second renderer or sound owner.
+- Current state: ToastHost queue, sound bridge, motion, and DRM/GLES seams exist; A-F schema, assets, renderer, fallback, ticker, and live proof remain.
+- Remaining work:
+  1. S1 Freeze authority, payload, and queue.
+     - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.
+     - Inputs: UX-013 health contract, mde-egui toast/motion.
+     - Deliverable: schema, queue state machine, hostile coalescing/ack tests.
+     - Depends on: UX-013 S1-S2.
+     - Acceptance: no health recalculation, second queue, ticker store, or duplicate sound path exists.
+     - Validation: toast/property cargo tests on .50.
+     - Done when: queue traces and schema evidence exist.
+  2. S2 Produce governed scenes and audio.
+     - Objective: author six original A-F scenes plus recovery transitions and audio with reproducible manifests, hashes, licenses, and size bounds.
+     - Inputs: approved art/audio sources and licensing policy.
+     - Deliverable: source assets, glTF/pre-rendered/static tiers, waveform/manifest package.
+     - Depends on: S1.
+     - Acceptance: missing, foreign, oversized, or unlicensed assets fail packaging.
+     - Validation: asset/license/package scripts and manifest tests.
+     - Done when: reproducible package is verified.
+  3. S3 Implement timeline and render tiers.
+     - Objective: run deterministic entry/action/settle/morph/recovery/exit timelines on wgpu and direct DRM/GLES with live 3D, pre-rendered, then static fallback.
+     - Inputs: S1/S2, mde-egui motion/DRM.
+     - Deliverable: backend-neutral state machine, renderer, admission, device-loss recovery.
+     - Depends on: S2.
+     - Acceptance: exact A=3, B=5, C=6, D=10, E=15, F-until-ack dwell and no duplicate sound.
+     - Validation: renderer/property/golden/video cargo tests on BigBoy.
+     - Done when: all tiers produce matching semantic traces and captures.
+  4. S4 Compose ticker, controls, and interruption policy.
+     - Objective: render full-width one-third lower third, fixed ticker, node/device/duration text, safe Workers deep link, lock/immersive/multi-display/redaction policy,
+       and audited read-only refresh.
+     - Inputs: S1-S3, ARCH-009 Workers, UX-012 taskbar.
+     - Deliverable: responsive composition and action/redaction fixtures.
+     - Depends on: S3.
+     - Acceptance: E/F interrupt per policy; all mutations remain Action Console preview/confirm.
+     - Validation: shell render/action/accessibility cargo tests.
+     - Done when: every policy state has a capture.
+  5. S5 Prove live performance and release.
+     - Objective: exercise all grades, fallback, audio, GPU loss, suspend/resume, lock, immersive, reduced motion, multi-display, package upgrade, and five-seat runtime.
+     - Inputs: S1-S4 and CRIT-006/007.
+     - Deliverable: frames, videos, waveforms, package manifest, and live evidence.
+     - Depends on: S4.
+     - Acceptance: admitted 1920x1080/60 target or honest fallback; no idle repaint, restart loop, or false health.
+     - Validation: farm renderer/package gates and named live-seat scripts.
+     - Done when: every required runtime result is evidenced or blocked explicitly.
+- Scope: Owns health-grade Kiron schema/queue/scenes/audio/render/fallback/ticker/controls/accessibility/package/proof. UX-013 owns evaluation/history; ARCH-009 owns
+  Workers; ordinary alerts and hardware OSD remain unchanged.
+- Relevant files/components: mde-egui toast/motion/drm, shell toast bridge/health/taskbar/Workers/audio, mesh health types, governed assets/manifests, RPM/render capture
+  tooling.
+- Dependencies: UX-013, ARCH-009, UX-009, UX-012, FUNC-011, CRIT-006.
+- Acceptance criteria:
+  1. One ToastHost renders six distinct grades, correct dwell/audio/grouping/ack, and no duplicate authority.
+  2. Live/pre-rendered/static tiers preserve semantics across device loss and all responsive/interruption states.
+  3. Asset provenance, package, farm, and five-seat evidence is reproducible.
+- Verification method: health/toast/asset/renderer/accessibility cargo gates, package/license checks, golden/video/waveform captures, and live five-seat proof; BigBoy
+  runs the longest renderer job.
+- Origin or merged source IDs: 2026-08-04 cinematic A-F Kiron survey and archived KIRON/toast workstreams.
 
 ## Stewardship
 

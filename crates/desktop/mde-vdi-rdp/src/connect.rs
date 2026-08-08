@@ -120,7 +120,6 @@ fn refresh_region_for_area(
         bottom,
     })
 }
-
 /// Select one process-level Rustls provider before IronRDP builds its TLS
 /// client. The complete Construct shell links dependencies that enable both
 /// `aws-lc-rs` and `ring`; Rustls correctly refuses to choose between them and

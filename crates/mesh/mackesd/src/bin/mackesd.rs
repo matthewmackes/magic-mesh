@@ -1140,6 +1140,11 @@ enum Cmd {
         /// Override the stable node id (defaults to `peer:<hostname>`).
         #[arg(long)]
         node_id: Option<String>,
+        /// Start exactly one ARCH-009 worker process group. Omitting this
+        /// option retains the transitional monolithic supervisor for local
+        /// development until the six-unit package cutover is complete.
+        #[arg(long, value_parser = mackesd_core::worker_role::WorkerGroup::parse)]
+        group: Option<mackesd_core::worker_role::WorkerGroup>,
     },
 
     // AUD3 S-3 (2026-06-12): `PeerCard` (PC-3.a) removed — it spawned
@@ -2154,11 +2159,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Serve {
             workgroup_root,
             node_id,
+            group,
         } => {
             // v2.0.0 Phase B.12 — unified meta-daemon entry point.
             // Boots the tokio runtime, registers the worker pool +
             // the existing reconcile worker, blocks on SIGTERM.
-            run_serve(workgroup_root, node_id, db_path)?;
+            run_serve(workgroup_root, node_id, group, db_path)?;
         }
         Cmd::Ca { sub } => cli::ca::run(sub, db_path)?,
         Cmd::Nebula { sub } => cli::nebula::run(sub, db_path)?,
@@ -2496,6 +2502,7 @@ fn bus_retention_policy(bus_root: &std::path::Path) -> mde_bus::retention::Reten
 fn run_serve(
     workgroup_root: Option<PathBuf>,
     node_id: Option<String>,
+    worker_group: Option<mackesd_core::worker_role::WorkerGroup>,
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
@@ -2621,6 +2628,10 @@ fn run_serve(
         // a dedicated OS thread inside the worker (so it can't stall the
         // tokio scheduler), but the supervisor owns its restart/breaker.
         let mut sup = Supervisor::new();
+        if let Some(group) = worker_group {
+            tracing::info!(group = %group, "WL-ARCH-009: enforcing one worker process group");
+            sup.set_worker_group(group);
+        }
         // EFF-24 — the live per-worker status registry: the supervisor
         // records alive/restarts/breaker transitions; the Bus healthz
         // folds them into the readiness verdict and the exporter emits
@@ -3171,8 +3182,9 @@ fn run_serve(
         // sibling. Still surfaced via Shell.Workers (the worker_names roster) AND
         // now the supervisor's status map.
         spawn_tiered(&mut sup, &worker_names, role_rank, "reconcile", || {
-            ReconcileWorker::new(workgroup_root, node_id, db_path)
+            ReconcileWorker::new(workgroup_root.clone(), node_id.clone(), db_path.clone())
         });
+        start_worker_runtime_status_publisher(&worker_status, &shutdown, &node_id);
 
         // BULLETPROOF-2 — the daemon is up (supervisor + all responders +
         // workers spawned). Tell systemd we're READY (Type=notify gate) and

@@ -16,17 +16,18 @@
 //! an allowlisted action KIND with typed params — and maps each allowlisted KIND
 //! onto an EXISTING mackesd verb mechanism. The first cut allowlists exactly one:
 //!
-//! * [`ActionRequest::ServiceLifecycle`] → the PD-11 [`crate::lifecycle`] verb.
-//!   It writes a typed [`crate::lifecycle::LifecycleRequest`] (kind ∈
-//!   {container,vm}, op ∈ {start,stop,restart} — both already allowlisted by
-//!   `lifecycle::valid_kind`/`valid_op`) to the target's replicated request dir.
-//!   The target node's own `lifecycle_exec` worker then validates the name
-//!   against **what that box actually offers** and runs the FIXED command plan
-//!   (`podman <op> <name>` / `virsh <verb> <name>` — `lifecycle::command_plan`,
-//!   the binary is hardcoded, the args come from the closed vocabulary). NO
-//!   `Command::new(<user string>)`, NO shell, NO push-SSH — the typed request is
-//!   carried by replication and the target runs it locally (§9: "Jobs are …
-//!   the target runs locally; no push-SSH").
+//! * [`ActionRequest::ServiceLifecycle`] → a signed Workload operation on
+//!   [`mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC`]. The node-local
+//!   `workload_compute` reconciler is the only VM/container actuator; this
+//!   worker never writes a legacy lifecycle request or invokes a backend.
+//!
+//! * [`ActionRequest::AndroidAppLaunch`] → the admitted Android guest provider
+//!   boundary. The request carries only a path-safe target, a bounded workload
+//!   identity, and a closed [`AospStarterApp`] value; the provider receives the
+//!   canonical [`AndroidGuestRequest::Launch`] envelope and returns a closed
+//!   outcome. An unconfigured adapter returns `Unavailable` and is surfaced as
+//!   a rejection — this worker never turns the typed request into a shell,
+//!   arbitrary intent, or an unverified live-guest claim.
 //!
 //! * [`ActionRequest::CodeEdit`] (FRONTDOOR-12) → a typed, **path-bounded** file
 //!   write + a FIXED-ARG `git commit`. This is the most sensitive AI capability
@@ -81,10 +82,18 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
-use crate::lifecycle::{self, LifecycleRequest};
+use mackes_mesh_types::android_apps::{
+    AndroidGuestLaunchOutcome, AndroidGuestRequest, AndroidGuestResponse, AospStarterApp,
+};
+use mackes_mesh_types::workloads::{
+    workload_state_topic, WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId,
+    WorkloadOperationAction, WorkloadOperationRequest, WorkloadProfile, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+    WORKLOAD_OPERATION_TOPIC,
+};
 
 use super::cloud::{
-    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
+    claim_nonce, verify_token, AndroidGuestProvider, AndroidGuestProviderRegistry,
+    AndroidGuestProviderRegistryError, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
     DEFAULT_AUTH_ROOT,
 };
 use super::{ShutdownToken, Worker};
@@ -118,25 +127,36 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// `serde` tags the variant by `kind` so the wire form is
 /// `{"kind":"service_lifecycle", ...typed params...}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionRequest {
     /// Start/stop/restart an EXISTING service (container or VM) on a target node,
-    /// via the PD-11 [`crate::lifecycle`] verb. The params mirror the typed
-    /// [`LifecycleRequest`] fields; `service_kind`/`op` are gated by the existing
-    /// `lifecycle::valid_kind`/`valid_op` allowlists before anything is written.
+    /// via the versioned Workload operation API. The service kind and operation
+    /// are mapped to the closed Workload backend/action enums before publication.
     ServiceLifecycle {
-        /// The node the action targets (its short hostname — the
-        /// `fleet/lifecycle/<target>` dir the executor on that box drains).
+        /// The node the action targets (its short hostname or canonical
+        /// `peer:<hostname>` Workload target).
         target_host: String,
-        /// `container` | `vm` — the typed service kind (allowlisted by
-        /// `lifecycle::valid_kind`).
+        /// `container` | `vm` — the typed service kind.
         service_kind: String,
         /// The container/guest name. NOT a command — the target validates it
         /// against its own live probe before acting (no arbitrary passthrough).
         name: String,
-        /// `start` | `stop` | `restart` — the typed op (allowlisted by
-        /// `lifecycle::valid_op`).
+        /// `start` | `stop` | `restart` — the typed operation.
         op: String,
+    },
+
+    /// Launch one governed AOSP starter app in one admitted Android VM guest.
+    /// The target and workload are bounded identities; `app` is a closed enum
+    /// whose canonical package/action/category are reconstructed at the guest
+    /// boundary. There is intentionally no package string, component, URI,
+    /// command, intent extras, or other execution-shaped field.
+    AndroidAppLaunch {
+        /// The path-safe mesh node that owns the Android VM.
+        target_host: String,
+        /// The bounded Android VM workload identity.
+        workload_id: String,
+        /// The governed AOSP starter application identity.
+        app: AospStarterApp,
     },
 
     /// FRONTDOOR-12 — apply a reviewed **code/config edit** to a single file
@@ -170,6 +190,7 @@ impl ActionRequest {
     pub const fn kind_tag(&self) -> &'static str {
         match self {
             ActionRequest::ServiceLifecycle { .. } => "service_lifecycle",
+            ActionRequest::AndroidAppLaunch { .. } => "android_app_launch",
             ActionRequest::CodeEdit { .. } => "code_edit",
         }
     }
@@ -402,23 +423,35 @@ impl ActionReply {
 /// JSON but carries an unknown `kind` tag fails here too (serde rejects the
 /// untagged variant) — so an un-allowlisted KIND can never reach a dispatcher.
 pub fn parse_action_request(body: &str) -> Result<ActionRequest, String> {
-    serde_json::from_str(body).map_err(|e| format!("malformed action request: {e}"))
+    // `schema_version` and `armed_token` belong to the execution envelope, not
+    // to the typed action kind. Strip only those two envelope fields before the
+    // closed enum deserializer runs; every other unknown field is rejected by
+    // `deny_unknown_fields` (including command/intent-shaped additions to the
+    // Android launch variant).
+    let mut value = serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|e| format!("malformed action request: {e}"))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("malformed action request: expected a JSON object with a kind tag".to_string());
+    };
+    object.remove("schema_version");
+    object.remove("armed_token");
+    serde_json::from_value(value).map_err(|e| format!("malformed action request: {e}"))
 }
 
-/// Validate a parsed request against the existing per-verb vocabulary gates.
-/// Pure + unit-testable: this is the allowlist enforcement that runs BEFORE any
-/// side effect. Returns the typed [`LifecycleRequest`] to dispatch, or a typed
-/// rejection reason.
+/// Build the closed Workload operation for one service-lifecycle action.
 ///
-/// For [`ActionRequest::ServiceLifecycle`] the gates are exactly
-/// `lifecycle::valid_kind` + `lifecycle::valid_op` — we do not re-derive the
-/// allowlist, we reuse the one the executor itself enforces, so the worker can
-/// never write a request the executor would refuse.
-pub fn plan_lifecycle(
+/// The action surface predates the Workload API and therefore does not carry
+/// resource values or a generation. We use the safe small profile for a first
+/// registration, then reuse the authoritative node projection when it already
+/// contains this workload. A missing image is intentionally left absent: the
+/// Workload actuator will reject an attempt to define an unknown VM rather than
+/// guessing at a host path.
+fn plan_workload_service_lifecycle(
     req: &ActionRequest,
-    ulid: &str,
-    from: &str,
-) -> Result<LifecycleRequest, String> {
+    request_id: &str,
+    state: Option<&mackes_mesh_types::workloads::WorkloadOperationStatus>,
+    now_ms: u64,
+) -> Result<WorkloadOperationRequest, String> {
     let ActionRequest::ServiceLifecycle {
         target_host,
         service_kind,
@@ -426,33 +459,127 @@ pub fn plan_lifecycle(
         op,
     } = req
     else {
-        return Err("plan_lifecycle: not a service_lifecycle request".to_string());
+        return Err("service_lifecycle: request kind mismatch".to_string());
     };
-    if target_host.trim().is_empty() {
+    let target_host = target_host.trim();
+    let name = name.trim();
+    if target_host.is_empty() {
         return Err("service_lifecycle: empty target_host".to_string());
     }
-    if name.trim().is_empty() {
+    if name.is_empty() {
         return Err("service_lifecycle: empty name".to_string());
     }
-    if !lifecycle::valid_kind(service_kind) {
-        return Err(format!(
-            "service_lifecycle: kind `{service_kind}` not allowlisted (container|vm)"
-        ));
-    }
-    if !lifecycle::valid_op(op) {
-        return Err(format!(
-            "service_lifecycle: op `{op}` not allowlisted (start|stop|restart)"
-        ));
-    }
-    Ok(LifecycleRequest {
-        // The request ulid IS the lifecycle id, so the requester can correlate
-        // the eventual `<id>.result.json` the target writes back.
-        id: ulid.to_string(),
-        kind: service_kind.clone(),
-        name: name.clone(),
-        op: op.clone(),
-        from: from.to_string(),
+    let (backend, kind_prefix) = match service_kind.as_str() {
+        "container" => (WorkloadBackend::QuadletSystemd, "container"),
+        "vm" => (WorkloadBackend::LibvirtVirtqemud, "vm"),
+        _ => {
+            return Err(format!(
+                "service_lifecycle: kind `{service_kind}` not allowlisted (container|vm)"
+            ))
+        }
+    };
+    let action = match op.as_str() {
+        "start" => WorkloadOperationAction::Start,
+        "stop" => WorkloadOperationAction::Stop,
+        "restart" => WorkloadOperationAction::Restart,
+        _ => {
+            return Err(format!(
+                "service_lifecycle: op `{op}` not allowlisted (start|stop|restart)"
+            ))
+        }
+    };
+    let target_node = if target_host.starts_with("peer:") {
+        target_host.to_owned()
+    } else {
+        format!("peer:{target_host}")
+    };
+    let workload_id = WorkloadId::new(format!("{kind_prefix}:{target_node}:{name}"))
+        .map_err(|error| format!("service_lifecycle: invalid workload identity: {error}"))?;
+    let (resources, expected_generation, image_ref) = state
+        .filter(|status| status.workload_id == workload_id && status.backend == backend)
+        .map(|status| {
+            (
+                status.resources,
+                status.generation,
+                None::<String>,
+            )
+        })
+        .unwrap_or((WorkloadProfile::Small.resources(), 0, None));
+    let deadline_at_ms = now_ms
+        .saturating_add(MAX_AUTH_TTL_MS as u64)
+        .saturating_sub(250);
+    Ok(WorkloadOperationRequest {
+        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        request_id: request_id.to_owned(),
+        workload_id,
+        backend,
+        resources,
+        image_ref,
+        target_node,
+        expected_generation,
+        action,
+        target_request_id: None,
+        deadline_at_ms,
+        preferred_attachment: Some(WorkloadAttachmentProtocol::Logs),
+        armed_token: None,
     })
+}
+
+fn workload_action_label(action: WorkloadOperationAction) -> &'static str {
+    match action {
+        WorkloadOperationAction::StartAndAttach => "start_and_attach",
+        WorkloadOperationAction::Start => "start",
+        WorkloadOperationAction::Stop => "stop",
+        WorkloadOperationAction::Restart => "restart",
+        WorkloadOperationAction::Destroy => "destroy",
+        WorkloadOperationAction::Pause => "pause",
+        WorkloadOperationAction::Resume => "resume",
+        WorkloadOperationAction::Open => "open",
+        WorkloadOperationAction::Reconcile => "reconcile",
+        WorkloadOperationAction::Cancel => "cancel",
+    }
+}
+
+/// Maximum target-host identity size accepted by the Android action. This is a
+/// filesystem-safe component bound, matching the platform's cloud path keys.
+const MAX_ANDROID_TARGET_HOST_BYTES: usize = 255;
+
+/// Validate and construct the canonical Android guest launch request for an
+/// admitted action. The target host is kept separately because it selects the
+/// owning mesh node; the guest boundary validates the workload/request ids and
+/// reconstructs the canonical launcher intent from the closed app enum.
+pub fn plan_android_app_launch(
+    req: &ActionRequest,
+    request_id: &str,
+) -> Result<AndroidGuestRequest, String> {
+    let ActionRequest::AndroidAppLaunch {
+        target_host,
+        workload_id,
+        app,
+    } = req
+    else {
+        return Err("plan_android_app_launch: not an android_app_launch request".to_string());
+    };
+    if !is_safe_android_target_host(target_host) {
+        return Err(
+            "android_app_launch: target_host must be one path-safe [A-Za-z0-9._-] segment"
+                .to_string(),
+        );
+    }
+    AndroidGuestRequest::launch(request_id, workload_id, *app).map_err(|error| {
+        format!("android_app_launch: guest request identity is invalid: {error:?}")
+    })
+}
+
+fn is_safe_android_target_host(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.trim() == value
+        && value.len() <= MAX_ANDROID_TARGET_HOST_BYTES
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
 }
 
 /// Stable semantic target for one administrative capability. The capability's
@@ -465,6 +592,14 @@ fn action_authorization_target(req: &ActionRequest) -> String {
             name,
             op,
         } => format!("service:{target_host}:{service_kind}:{name}:{op}"),
+        ActionRequest::AndroidAppLaunch {
+            target_host,
+            workload_id,
+            app,
+        } => format!(
+            "android-app:{target_host}:{workload_id}:{}",
+            app.package_id().as_str()
+        ),
         ActionRequest::CodeEdit { path, .. } => format!("code:{path}"),
     }
 }
@@ -483,14 +618,19 @@ pub struct ActionWorker {
     /// Shared leader lock (`<workgroup_root>/.mackesd-leader.lock`) — the same
     /// file every leader-gated worker contends on.
     leader_lock: PathBuf,
-    /// Workgroup root — the replicated volume the lifecycle verb writes under
-    /// (`<root>/fleet/lifecycle/<target>/`).
+    /// Workgroup root — the replicated volume used for the leader lock, audit,
+    /// and typed action support files. Workload operations use the Bus root.
     workgroup_root: PathBuf,
     /// This node's id (the lease holder + the `from`/actor on audit records).
     node_id: String,
     /// Root-credential verifier. Missing credentials install [`NullSigner`] and
     /// make every administrative mutation fail closed.
     signer: Arc<dyn TokenSigner>,
+    /// The same root credential, retained as a mint-capable signer for the
+    /// internal handoff from the authenticated action envelope to the typed
+    /// Workload operation envelope. Missing credentials leave this `None` and
+    /// the handoff fails closed.
+    workload_signer: Option<Arc<HmacTokenSigner>>,
     /// Shared host-local spent-nonce ledger used by every privileged action lane.
     auth_root: PathBuf,
     /// The hash-chained audit DB (the `events` table). Defaults to
@@ -500,6 +640,11 @@ pub struct ActionWorker {
     poll_interval: Duration,
     /// Override the Bus spool root. Tests point this at a tempdir.
     bus_root_override: Option<PathBuf>,
+    /// Bounded, workload-identity-keyed Android guest provider adapters. An
+    /// empty registry is the honest production default: inventory stays
+    /// pending and launches remain explicitly unavailable until a real guest
+    /// adapter is configured by startup wiring.
+    android_guest_providers: AndroidGuestProviderRegistry,
 }
 
 impl ActionWorker {
@@ -507,26 +652,32 @@ impl ActionWorker {
     /// `workgroup_root`, the canonical audit DB path, the default Bus root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
-        let signer: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
-            Ok(signer) => Arc::new(signer),
+        let workload_signer = match HmacTokenSigner::from_systemd_credential() {
+            Ok(signer) => Some(Arc::new(signer)),
             Err(error) => {
                 tracing::error!(
                     target: "mackesd::action",
                     %error,
                     "typed administrative authorization unavailable; actions are disabled"
                 );
-                Arc::new(NullSigner)
+                None
             }
         };
+        let signer: Arc<dyn TokenSigner> = workload_signer
+            .as_ref()
+            .map(|signer| Arc::clone(signer) as Arc<dyn TokenSigner>)
+            .unwrap_or_else(|| Arc::new(NullSigner));
         Self {
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             workgroup_root,
             node_id,
             signer,
+            workload_signer,
             auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
             db_path: crate::default_db_path(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            android_guest_providers: AndroidGuestProviderRegistry::new(),
         }
     }
 
@@ -552,12 +703,33 @@ impl ActionWorker {
         self
     }
 
+    /// Register one workload-scoped Android guest provider during startup or
+    /// test construction. Duplicate, invalid, and over-capacity identities
+    /// are returned as typed errors before the worker can run.
+    pub(crate) fn with_android_guest_provider(
+        mut self,
+        workload_id: impl Into<String>,
+        provider: Arc<dyn AndroidGuestProvider>,
+    ) -> Result<Self, AndroidGuestProviderRegistryError> {
+        self.android_guest_providers
+            .register(workload_id, provider)?;
+        Ok(self)
+    }
+
     /// Inject deterministic verifier/ledger state for hostile request tests.
     #[cfg(test)]
     #[must_use]
     fn with_authorization(mut self, signer: Arc<dyn TokenSigner>, root: PathBuf) -> Self {
         self.signer = signer;
+        self.workload_signer = None;
         self.auth_root = root;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_workload_signer(mut self, signer: Arc<HmacTokenSigner>) -> Self {
+        self.workload_signer = Some(signer);
         self
     }
 
@@ -605,6 +777,16 @@ impl ActionWorker {
                 "service_kind": service_kind,
                 "name": name,
                 "op": op,
+            }),
+            ActionRequest::AndroidAppLaunch {
+                target_host,
+                workload_id,
+                app,
+            } => serde_json::json!({
+                "target_host": target_host,
+                "workload_id": workload_id,
+                "app": app.package_id().as_str(),
+                "intent": "canonical_main_launcher",
             }),
             ActionRequest::CodeEdit { path, content } => serde_json::json!({
                 // The full content is recorded — the audit IS the durable record of
@@ -727,31 +909,158 @@ impl ActionWorker {
         reply
     }
 
-    /// Map an allowlisted typed request onto its EXISTING verb mechanism and
-    /// dispatch it. `ServiceLifecycle` writes a typed `lifecycle::write_request`
-    /// (no command). `CodeEdit` applies a path-bounded typed file write + a
+    /// Re-arm an already authenticated action as a short-lived Workload API
+    /// capability. The incoming action token is consumed by
+    /// `handle_wire_action`; this handoff gets a fresh nonce and binds the
+    /// exact unsigned Workload body before it is published.
+    fn arm_workload_request(
+        &self,
+        request: &WorkloadOperationRequest,
+        now_ms: u64,
+    ) -> Result<String, String> {
+        let signer = self
+            .workload_signer
+            .as_ref()
+            .ok_or_else(|| "Workload capability minting is unavailable".to_string())?;
+        let unsigned = serde_json::to_string(request)
+            .map_err(|error| format!("encode Workload operation: {error}"))?;
+        let digest = mackes_mesh_types::cloud::cloud_request_digest(&unsigned)
+            .map_err(|error| format!("digest Workload operation: {error}"))?;
+        let expires_at_ms = i64::try_from(
+            request
+                .deadline_at_ms
+                .min(now_ms.saturating_add(MAX_AUTH_TTL_MS as u64)),
+        )
+        .unwrap_or(i64::MAX);
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer.as_ref(),
+            &format!("action-workload-{}", request.request_id),
+            expires_at_ms,
+            crate::workers::workload_compute::AUTH_VERB,
+            &request.target_node,
+            &format!("workload:{}", request.workload_id.as_str()),
+            &digest,
+        )
+        .encode();
+        let mut value: serde_json::Value = serde_json::from_str(&unsigned)
+            .map_err(|error| format!("encode Workload envelope: {error}"))?;
+        value["armed_token"] = serde_json::Value::String(token);
+        serde_json::to_string(&value)
+            .map_err(|error| format!("serialize Workload operation: {error}"))
+    }
+
+    /// Map an allowlisted typed request onto its typed mechanism and dispatch
+    /// it. `ServiceLifecycle` publishes one signed Workload operation (no
+    /// backend call). `CodeEdit` applies a path-bounded typed file write + a
     /// FIXED-ARG `git commit` (the only spawned process, a literal binary with a
     /// closed arg vector — never a shell or a command string, §9). A vocabulary
     /// violation, an out-of-bounds path, or an I/O fault becomes a typed rejection.
     fn dispatch(&self, ulid: &str, req: &ActionRequest) -> ActionReply {
         match req {
             ActionRequest::ServiceLifecycle { target_host, .. } => {
-                let plan = match plan_lifecycle(req, ulid, &self.node_id) {
-                    Ok(p) => p,
+                let root = self
+                    .bus_root_override
+                    .clone()
+                    .or_else(default_bus_root)
+                    .ok_or_else(|| "no Bus root is configured for Workload operations".to_string());
+                let root = match root {
+                    Ok(root) => root,
                     Err(reason) => return ActionReply::rejected(reason),
                 };
-                // The existing PD-11 verb: write a typed LifecycleRequest to the
-                // target's replicated request dir. Replication carries it; the
-                // target's lifecycle_exec validates the name against its own probe
-                // and runs the FIXED command plan locally. No push, no shell.
-                match lifecycle::write_request(&self.workgroup_root, target_host, &plan) {
+                let persist = match Persist::open(root) {
+                    Ok(persist) => persist,
+                    Err(error) => {
+                        return ActionReply::rejected(format!(
+                            "service_lifecycle: open Workload Bus failed: {error}"
+                        ))
+                    }
+                };
+                let now_ms = u64::try_from(wall_now_ms()).unwrap_or(0);
+                let seed = match plan_workload_service_lifecycle(req, ulid, None, now_ms) {
+                    Ok(request) => request,
+                    Err(reason) => return ActionReply::rejected(reason),
+                };
+                let state = persist
+                    .read_latest(&workload_state_topic(&seed.target_node))
+                    .ok()
+                    .flatten()
+                    .and_then(|message| message.body)
+                    .and_then(|body| {
+                        serde_json::from_str::<mackes_mesh_types::workloads::WorkloadStateSnapshot>(
+                            &body,
+                        )
+                        .ok()
+                    })
+                    .and_then(|snapshot| {
+                        snapshot.validate(now_ms).ok()?;
+                        snapshot
+                            .workloads
+                            .into_iter()
+                            .find(|status| status.workload_id == seed.workload_id)
+                    });
+                let request = match plan_workload_service_lifecycle(req, ulid, state.as_ref(), now_ms) {
+                    Ok(request) => request,
+                    Err(reason) => return ActionReply::rejected(reason),
+                };
+                let body = match self.arm_workload_request(&request, now_ms) {
+                    Ok(body) => body,
+                    Err(reason) => return ActionReply::rejected(reason),
+                };
+                match persist.write(
+                    WORKLOAD_OPERATION_TOPIC,
+                    Priority::Default,
+                    Some("Workload service lifecycle"),
+                    Some(&body),
+                ) {
                     Ok(_) => ActionReply::ok(format!(
-                        "dispatched {} {} `{}` to {}",
-                        plan.op, plan.kind, plan.name, target_host
+                        "queued Workload {} `{}` on {} (request {})",
+                        workload_action_label(request.action),
+                        request.workload_id.as_str(),
+                        target_host,
+                        request.request_id
                     )),
-                    Err(e) => ActionReply::rejected(format!(
-                        "service_lifecycle: dispatch write failed: {e}"
+                    Err(error) => ActionReply::rejected(format!(
+                        "service_lifecycle: publish Workload operation failed: {error}"
                     )),
+                }
+            }
+            ActionRequest::AndroidAppLaunch {
+                target_host,
+                workload_id,
+                app,
+            } => {
+                let request = match plan_android_app_launch(req, ulid) {
+                    Ok(request) => request,
+                    Err(reason) => return ActionReply::rejected(reason),
+                };
+                let response = match self.android_guest_providers.dispatch(request) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return ActionReply::rejected(format!(
+                            "android_app_launch: provider boundary rejected the request: {error:?}"
+                        ));
+                    }
+                };
+                let AndroidGuestResponse::Launch(response) = response else {
+                    return ActionReply::rejected(
+                        "android_app_launch: provider returned the wrong response operation",
+                    );
+                };
+                match response.outcome {
+                    AndroidGuestLaunchOutcome::Started => ActionReply::ok(format!(
+                        "admitted Android app `{}` launch for `{workload_id}` on `{target_host}`",
+                        app.package_id().as_str()
+                    )),
+                    AndroidGuestLaunchOutcome::AlreadyRunning => ActionReply::ok(format!(
+                        "Android app `{}` is already running for `{workload_id}` on `{target_host}`",
+                        app.package_id().as_str()
+                    )),
+                    AndroidGuestLaunchOutcome::Unavailable => ActionReply::rejected(
+                        "android_app_launch: provider unavailable; no guest launch was claimed",
+                    ),
+                    AndroidGuestLaunchOutcome::Rejected => ActionReply::rejected(
+                        "android_app_launch: provider rejected the launch; no guest launch was claimed",
+                    ),
                 }
             }
             ActionRequest::CodeEdit { path, content } => self.apply_code_edit(path, content),
@@ -925,6 +1234,12 @@ impl ActionWorker {
 mod tests {
     use super::*;
 
+    use mackes_mesh_types::android_apps::{
+        AndroidAppInventory, AndroidGuestInventoryRequest, AndroidGuestLaunchRequest,
+    };
+
+    use super::super::cloud::AndroidGuestProvider;
+
     fn lifecycle_req(target: &str, kind: &str, name: &str, op: &str) -> String {
         serde_json::json!({
             "schema_version": 1,
@@ -935,6 +1250,39 @@ mod tests {
             "op": op,
         })
         .to_string()
+    }
+
+    fn read_workload_operation(tmp: &std::path::Path) -> Option<WorkloadOperationRequest> {
+        let persist = Persist::open(tmp.join("bus")).ok()?;
+        let body = persist
+            .read_latest(WORKLOAD_OPERATION_TOPIC)
+            .ok()??
+            .body?;
+        let now = u64::try_from(wall_now_ms()).ok()?;
+        WorkloadOperationRequest::from_json(&body, now).ok()
+    }
+
+    fn android_launch_req(target: &str, workload: &str, app: &str) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "android_app_launch",
+            "target_host": target,
+            "workload_id": workload,
+            "app": app,
+        })
+        .to_string()
+    }
+
+    struct ReadyActionProvider;
+
+    impl AndroidGuestProvider for ReadyActionProvider {
+        fn inventory(&self, request: &AndroidGuestInventoryRequest) -> AndroidAppInventory {
+            AndroidAppInventory::pending(request.workload_id.clone())
+        }
+
+        fn launch(&self, _request: &AndroidGuestLaunchRequest) -> AndroidGuestLaunchOutcome {
+            AndroidGuestLaunchOutcome::Started
+        }
     }
 
     fn armed_wire_with_ttl(
@@ -978,13 +1326,15 @@ mod tests {
         let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
         let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
             .with_db_path(tmp.path().join("audit.db"))
-            .with_authorization(signer.clone(), tmp.path().join("auth"));
+            .with_bus_root(tmp.path().join("bus"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"))
+            .with_workload_signer(signer.clone());
         let unsigned = lifecycle_req("oak", "container", "nginx", "restart");
 
         let refused = worker.handle_wire_action("01NOAUTH", &unsigned);
         assert!(!refused.ok);
         assert!(refused.error.unwrap().contains("not authorized"));
-        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+        assert!(read_workload_operation(tmp.path()).is_none());
 
         let mut legacy: serde_json::Value = serde_json::from_str(&unsigned).unwrap();
         legacy.as_object_mut().unwrap().remove("schema_version");
@@ -996,19 +1346,26 @@ mod tests {
         let refused = worker.handle_wire_action("01LEGACY", &legacy);
         assert!(!refused.ok);
         assert!(refused.error.unwrap().contains("schema_version 1"));
-        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+        assert!(read_workload_operation(tmp.path()).is_none());
 
         let armed = armed_wire(&unsigned, "action-single-use-nonce", signer.as_ref());
         let accepted = worker.handle_wire_action("01ARMED", &armed);
         assert!(accepted.ok, "{accepted:?}");
-        let requests = lifecycle::take_requests(tmp.path(), "oak");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].id, "01ARMED");
+        let request = read_workload_operation(tmp.path()).expect("published Workload operation");
+        assert_eq!(request.request_id, "01ARMED");
+        assert_eq!(request.target_node, "peer:oak");
+        assert_eq!(request.backend, WorkloadBackend::QuadletSystemd);
+        assert_eq!(request.action, WorkloadOperationAction::Restart);
 
         let replay = worker.handle_wire_action("01REPLAY", &armed);
         assert!(!replay.ok);
         assert!(replay.error.unwrap().contains("already used"));
-        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+        assert_eq!(
+            read_workload_operation(tmp.path())
+                .expect("original Workload operation remains")
+                .request_id,
+            "01ARMED"
+        );
     }
 
     #[test]
@@ -1017,7 +1374,9 @@ mod tests {
         let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
         let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
             .with_db_path(tmp.path().join("audit.db"))
-            .with_authorization(signer.clone(), tmp.path().join("auth"));
+            .with_bus_root(tmp.path().join("bus"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"))
+            .with_workload_signer(signer.clone());
         let unsigned = lifecycle_req("oak", "container", "nginx", "start");
         let armed = armed_wire(&unsigned, "action-body-bound-nonce", signer.as_ref());
         let mut altered: serde_json::Value = serde_json::from_str(&armed).unwrap();
@@ -1025,7 +1384,7 @@ mod tests {
 
         let refused = worker.handle_wire_action("01ALTERED", &altered.to_string());
         assert!(!refused.ok);
-        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+        assert!(read_workload_operation(tmp.path()).is_none());
     }
 
     #[test]
@@ -1034,7 +1393,9 @@ mod tests {
         let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
         let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
             .with_db_path(tmp.path().join("audit.db"))
-            .with_authorization(signer.clone(), tmp.path().join("auth"));
+            .with_bus_root(tmp.path().join("bus"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"))
+            .with_workload_signer(signer.clone());
         let unsigned = lifecycle_req("oak", "container", "nginx", "restart");
         let armed = armed_wire_with_ttl(
             &unsigned,
@@ -1049,7 +1410,7 @@ mod tests {
             .error
             .unwrap()
             .contains("exceeds the 30-second lifetime"));
-        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+        assert!(read_workload_operation(tmp.path()).is_none());
     }
 
     #[test]
@@ -1074,6 +1435,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_plan_allowlisted_android_app_launch() {
+        let req = parse_action_request(&android_launch_req("t480", "android-t480", "browser"))
+            .expect("parse");
+        assert_eq!(req.kind_tag(), "android_app_launch");
+        let guest_request = plan_android_app_launch(&req, "01ANDROID").expect("canonical plan");
+        match guest_request {
+            AndroidGuestRequest::Launch(request) => {
+                assert_eq!(request.request_id, "01ANDROID");
+                assert_eq!(request.workload_id, "android-t480");
+                assert_eq!(request.app, AospStarterApp::Browser);
+                assert_eq!(request.intent, AospStarterApp::Browser.launch_intent());
+            }
+            AndroidGuestRequest::Inventory(_) => panic!("launch action planned inventory"),
+        }
+    }
+
+    #[test]
+    fn android_app_launch_rejects_arbitrary_command_or_intent_fields() {
+        for extra in [
+            serde_json::json!({"command": "sh -c id"}),
+            serde_json::json!({
+                "intent": {"package_id": "com.android.browser", "action": "main"}
+            }),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&android_launch_req("t480", "android-t480", "browser"))
+                    .expect("request json");
+            let key = extra.as_object().unwrap().keys().next().unwrap().clone();
+            value[key.clone()] = extra[key.clone()].clone();
+            let error = parse_action_request(&value.to_string())
+                .expect_err("closed Android launch must reject execution-shaped fields");
+            assert!(error.contains("unknown field"), "{error}");
+        }
+
+        let error = parse_action_request(&android_launch_req(
+            "t480",
+            "android-t480",
+            "org.example.arbitrary",
+        ))
+        .expect_err("only governed starter apps are admitted");
+        assert!(error.contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn android_app_launch_rejects_unsafe_target_and_workload_identity() {
+        let unsafe_target =
+            parse_action_request(&android_launch_req("../../t480", "android-t480", "browser"))
+                .expect("serde admission");
+        assert!(plan_android_app_launch(&unsafe_target, "01ANDROID").is_err());
+
+        let unsafe_workload =
+            parse_action_request(&android_launch_req("t480", "android/t480", "browser"))
+                .expect("serde admission");
+        assert!(plan_android_app_launch(&unsafe_workload, "01ANDROID").is_err());
+    }
+
+    #[test]
     fn parse_rejects_unknown_kind_no_executor_reached() {
         // An un-allowlisted KIND fails to deserialize (serde rejects the tag) —
         // it can never reach a dispatcher. This is the §9 backstop: there is no
@@ -1090,38 +1508,34 @@ mod tests {
     }
 
     #[test]
-    fn plan_lifecycle_accepts_allowlisted_vocabulary() {
+    fn plan_workload_lifecycle_maps_closed_backend_and_action() {
         let req = parse_action_request(&lifecycle_req("oak", "vm", "win11", "stop")).unwrap();
-        let plan = plan_lifecycle(&req, "01HZX", "peer:self").expect("planned");
-        assert_eq!(plan.id, "01HZX");
-        assert_eq!(plan.kind, "vm");
-        assert_eq!(plan.name, "win11");
-        assert_eq!(plan.op, "stop");
-        assert_eq!(plan.from, "peer:self");
-        // The plan a real executor would accept: command_plan maps it to a FIXED
-        // (virsh, [shutdown, win11]) — no free-form command anywhere.
-        let (bin, args) = lifecycle::command_plan(&plan).expect("command plan");
-        assert_eq!(bin, "virsh");
-        assert_eq!(args, ["shutdown", "win11"]);
+        let plan = plan_workload_service_lifecycle(&req, "01HZX", None, 1_000).expect("planned");
+        assert_eq!(plan.request_id, "01HZX");
+        assert_eq!(plan.target_node, "peer:oak");
+        assert_eq!(plan.backend, WorkloadBackend::LibvirtVirtqemud);
+        assert_eq!(plan.action, WorkloadOperationAction::Stop);
+        assert_eq!(plan.workload_id.as_str(), "vm:peer:oak:win11");
+        assert!(plan.armed_token.is_none());
     }
 
     #[test]
-    fn plan_lifecycle_rejects_bad_op_and_kind() {
+    fn plan_workload_lifecycle_rejects_bad_op_and_kind() {
         let bad_op =
             parse_action_request(&lifecycle_req("oak", "container", "x", "explode")).unwrap();
-        assert!(plan_lifecycle(&bad_op, "u", "f").is_err());
+        assert!(plan_workload_service_lifecycle(&bad_op, "u", None, 1_000).is_err());
         let bad_kind = parse_action_request(&lifecycle_req("oak", "kernel", "x", "start")).unwrap();
-        assert!(plan_lifecycle(&bad_kind, "u", "f").is_err());
+        assert!(plan_workload_service_lifecycle(&bad_kind, "u", None, 1_000).is_err());
     }
 
     #[test]
-    fn plan_lifecycle_rejects_empty_target_and_name() {
+    fn plan_workload_lifecycle_rejects_empty_target_and_name() {
         let no_target =
             parse_action_request(&lifecycle_req("", "container", "x", "start")).unwrap();
-        assert!(plan_lifecycle(&no_target, "u", "f").is_err());
+        assert!(plan_workload_service_lifecycle(&no_target, "u", None, 1_000).is_err());
         let no_name =
             parse_action_request(&lifecycle_req("oak", "container", "", "start")).unwrap();
-        assert!(plan_lifecycle(&no_name, "u", "f").is_err());
+        assert!(plan_workload_service_lifecycle(&no_name, "u", None, 1_000).is_err());
     }
 
     #[test]
@@ -1140,41 +1554,98 @@ mod tests {
     }
 
     #[test]
-    fn handle_dispatches_allowlisted_action_writes_lifecycle_request() {
-        // The end-to-end allowlisted path: a valid service_lifecycle request is
-        // dispatched via the EXISTING verb (a typed file write the target's
-        // lifecycle_exec drains), and audited — no shell anywhere.
+    fn handle_dispatches_allowlisted_action_publishes_workload_operation() {
+        // The end-to-end allowlisted path publishes one typed Workload operation
+        // to the Bus; only workload_compute may actuate it.
         let tmp = tempfile::tempdir().unwrap();
+        let signer = Arc::new(HmacTokenSigner::new(b"action-workload-test-key".to_vec()));
         let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
-            .with_db_path(tmp.path().join("audit.db"));
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_bus_root(tmp.path().join("bus"))
+            .with_workload_signer(signer);
         let reply = w.handle_action(
             "01HZX",
             &lifecycle_req("oak", "container", "nginx", "restart"),
         );
         assert!(reply.ok, "{reply:?}");
-        // The lifecycle verb wrote the typed request the target will consume.
-        let got = lifecycle::take_requests(tmp.path(), "oak");
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].id, "01HZX");
-        assert_eq!(got[0].name, "nginx");
-        assert_eq!(got[0].op, "restart");
-        assert_eq!(got[0].from, "peer:self");
+        let got = read_workload_operation(tmp.path()).expect("Workload operation");
+        assert_eq!(got.request_id, "01HZX");
+        assert_eq!(got.workload_id.as_str(), "container:peer:oak:nginx");
+        assert_eq!(got.action, WorkloadOperationAction::Restart);
+    }
+
+    #[test]
+    fn handle_dispatches_android_launch_through_fail_closed_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"));
+        let reply = w.handle_action(
+            "01ANDROID",
+            &android_launch_req("t480", "android-t480", "browser"),
+        );
+        assert!(
+            !reply.ok,
+            "no real Android adapter is configured: {reply:?}"
+        );
+        assert!(reply
+            .error
+            .expect("fail-closed error")
+            .contains("provider unavailable"));
+    }
+
+    #[test]
+    fn authorized_android_launch_reaches_provider_then_stays_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
+        let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"));
+        let unsigned = android_launch_req("t480", "android-t480", "browser");
+        let armed = armed_wire(&unsigned, "android-launch-nonce", signer.as_ref());
+        let reply = worker.handle_wire_action("01ANDROID", &armed);
+        assert!(
+            !reply.ok,
+            "provider is intentionally unconfigured: {reply:?}"
+        );
+        assert!(reply
+            .error
+            .expect("unavailable error")
+            .contains("provider unavailable"));
+    }
+
+    #[test]
+    fn authorized_android_launch_uses_the_workload_scoped_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
+        let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"))
+            .with_android_guest_provider("android-t480", Arc::new(ReadyActionProvider))
+            .expect("valid workload provider registration");
+        let unsigned = android_launch_req("t480", "android-t480", "browser");
+        let armed = armed_wire(&unsigned, "android-scoped-provider-nonce", signer.as_ref());
+        let reply = worker.handle_wire_action("01ANDROIDREADY", &armed);
+        assert!(
+            reply.ok,
+            "registered provider should admit the launch: {reply:?}"
+        );
+        assert!(reply
+            .detail
+            .expect("success detail")
+            .contains("admitted Android app"));
     }
 
     #[test]
     fn handle_rejects_disallowed_action_without_dispatch() {
         // A vocabulary-violating request (valid KIND, bad op) is a typed
-        // rejection and writes NO lifecycle request — nothing is dispatched.
+        // rejection and publishes no Workload operation.
         let tmp = tempfile::tempdir().unwrap();
         let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
             .with_db_path(tmp.path().join("audit.db"));
         let reply = w.handle_action("01HZX", &lifecycle_req("oak", "container", "x", "explode"));
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("not allowlisted"));
-        assert!(
-            lifecycle::take_requests(tmp.path(), "oak").is_empty(),
-            "a rejected action must not dispatch anything"
-        );
+        assert!(read_workload_operation(tmp.path()).is_none());
     }
 
     #[test]
@@ -1183,8 +1654,11 @@ mod tests {
         // hash-chain row to the EXISTING events plane.
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("audit.db");
+        let signer = Arc::new(HmacTokenSigner::new(b"action-audit-test-key".to_vec()));
         let w = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
-            .with_db_path(db.clone());
+            .with_db_path(db.clone())
+            .with_bus_root(tmp.path().join("bus"))
+            .with_workload_signer(signer);
         // One accepted + one rejected → two audit rows, an intact chain.
         let _ = w.handle_action("01A", &lifecycle_req("oak", "container", "nginx", "start"));
         let _ = w.handle_action("01B", &lifecycle_req("oak", "container", "x", "explode"));

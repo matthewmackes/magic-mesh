@@ -11,9 +11,681 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Current wire schema.
 pub const HEALTH_SCHEMA_VERSION: u16 = 1;
+/// The only schema currently admitted for node availability intent records.
+pub const NODE_AVAILABILITY_INTENT_SCHEMA_VERSION: u16 = 1;
+/// The only schema currently admitted for an expected-return declaration.
+pub const EXPECTED_RETURN_SCHEMA_VERSION: u16 = 1;
+
+/// Keep rendered elapsed durations finite even when a hostile timestamp spans
+/// an implausible number of years. The formatter still uses the surveyed
+/// duration grammar after clamping to this bound.
+pub const MAX_HEALTH_DURATION_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1_000;
+/// Maximum validity window for one node-declared availability intent.
+pub const MAX_NODE_AVAILABILITY_INTENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+/// Maximum bytes for stable availability identities and event/source names.
+pub const MAX_NODE_AVAILABILITY_ID_BYTES: usize = 128;
+/// Maximum bytes for an operator-readable availability reason.
+pub const MAX_NODE_AVAILABILITY_REASON_BYTES: usize = 256;
+/// Maximum bytes for a connectivity interface identity.
+pub const MAX_NODE_CONNECTIVITY_INTERFACE_BYTES: usize = 64;
+
+/// Format elapsed time using the locale-independent health contract.
+///
+/// Intervals below one hour use readable minutes and seconds. Intervals from
+/// one hour through exactly 24 hours use `HH:MM:SS`; day notation begins only
+/// after 24 hours. Sub-second precision is intentionally discarded because
+/// health history is an elapsed-time presentation, not a wall-clock display.
+#[must_use]
+pub fn format_health_duration_ms(milliseconds: u64) -> String {
+    let milliseconds = milliseconds.min(MAX_HEALTH_DURATION_MS);
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+    const DAY_MS: u64 = 24 * HOUR_MS;
+
+    if milliseconds < HOUR_MS {
+        let seconds = milliseconds / 1_000;
+        let minutes = seconds / 60;
+        let remainder = seconds % 60;
+        return if minutes == 0 {
+            format!("{remainder}s")
+        } else {
+            format!("{minutes}m {remainder:02}s")
+        };
+    }
+
+    let seconds = milliseconds / 1_000;
+    if milliseconds <= DAY_MS {
+        let hours = seconds / 3_600;
+        let minutes = (seconds % 3_600) / 60;
+        let seconds = seconds % 60;
+        return format!("{hours:02}:{minutes:02}:{seconds:02}");
+    }
+
+    let days = seconds / 86_400;
+    let remainder = seconds % 86_400;
+    let hours = remainder / 3_600;
+    let minutes = (remainder % 3_600) / 60;
+    let seconds = remainder % 60;
+    format!("{days}d {hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// Compatibility spelling for consumers that already use the health modal's
+/// duration terminology. It delegates to the shared formatter above.
+#[must_use]
+pub fn format_duration_ms(milliseconds: u64) -> String {
+    format_health_duration_ms(milliseconds)
+}
+
+/// Closed node lifecycle states. `Unknown` is an explicit producer report; it
+/// is never synthesized as a planned absence by a consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeAvailabilityState {
+    Awake,
+    Sleeping,
+    ShuttingDown,
+    ShutDown,
+    ScheduledReboot,
+    Rebooting,
+    Maintenance,
+    AdapterMigration,
+    Returned,
+    Unknown,
+}
+
+impl NodeAvailabilityState {
+    /// Whether this state explicitly declares an expected absence.
+    #[must_use]
+    pub const fn expects_return(self) -> bool {
+        matches!(
+            self,
+            Self::Sleeping
+                | Self::ShuttingDown
+                | Self::ShutDown
+                | Self::ScheduledReboot
+                | Self::Rebooting
+                | Self::Maintenance
+                | Self::AdapterMigration
+        )
+    }
+}
+
+/// Device class used by the later health policy layer for escalation defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeDeviceClass {
+    Desktop,
+    Laptop,
+    WirelessDevice,
+    Server,
+    Lighthouse,
+    Unknown,
+}
+
+/// Closed physical/overlay connection vocabulary. Raw addresses and
+/// credentials do not belong in the health intent contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeConnectionType {
+    Ethernet,
+    Wifi,
+    Cellular,
+    Mesh,
+    Disconnected,
+    Unknown,
+}
+
+/// Address-family summary retained with a connectivity transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeAddressFamily {
+    None,
+    Ipv4,
+    Ipv6,
+    DualStack,
+    Unknown,
+}
+
+/// Bounded, credential-free connectivity facts before or after an adapter
+/// migration. It deliberately carries no address, URL, path, or raw provider
+/// output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConnectivitySummary {
+    pub connection_type: NodeConnectionType,
+    pub interface_id: Option<String>,
+    pub address_family: NodeAddressFamily,
+    pub reachable: bool,
+}
+
+impl NodeConnectivitySummary {
+    /// Validate a connectivity summary before accepting it into an intent.
+    pub fn validate(&self) -> Result<(), NodeAvailabilityValidationError> {
+        if let Some(interface_id) = &self.interface_id {
+            validate_identifier(
+                "connectivity.interface_id",
+                interface_id,
+                MAX_NODE_CONNECTIVITY_INTERFACE_BYTES,
+            )?;
+        }
+        if self.connection_type == NodeConnectionType::Disconnected {
+            if self.interface_id.is_some()
+                || self.address_family != NodeAddressFamily::None
+                || self.reachable
+            {
+                return Err(NodeAvailabilityValidationError::Contradictory(
+                    "disconnected connectivity carries live details",
+                ));
+            }
+        } else if self.reachable && self.address_family == NodeAddressFamily::None {
+            return Err(NodeAvailabilityValidationError::Contradictory(
+                "reachable connectivity has no address family",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A node-declared time at which an expected absence should have ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedReturn {
+    pub schema_version: u16,
+    pub expected_at_ms: u64,
+}
+
+impl ExpectedReturn {
+    /// Construct a versioned expected-return record without inventing any
+    /// policy default. Callers still need to validate the containing intent.
+    #[must_use]
+    pub const fn new(expected_at_ms: u64) -> Self {
+        Self {
+            schema_version: EXPECTED_RETURN_SCHEMA_VERSION,
+            expected_at_ms,
+        }
+    }
+
+    fn validate(
+        &self,
+        observed_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<(), NodeAvailabilityValidationError> {
+        if self.schema_version != EXPECTED_RETURN_SCHEMA_VERSION {
+            return Err(
+                NodeAvailabilityValidationError::UnsupportedExpectedReturnSchema(
+                    self.schema_version,
+                ),
+            );
+        }
+        if self.expected_at_ms < observed_at_ms || self.expected_at_ms > expires_at_ms {
+            return Err(NodeAvailabilityValidationError::InvalidTimestamp(
+                "expected_return.expected_at_ms",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Why a node availability intent was rejected at the shared contract
+/// boundary. The three terminal relationship variants are intentionally
+/// distinct so callers cannot silently turn a replay or stale report into a
+/// fresh outage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeAvailabilityValidationError {
+    UnsupportedSchema(u16),
+    UnsupportedExpectedReturnSchema(u16),
+    InvalidField(&'static str),
+    FieldTooLong(&'static str),
+    InvalidGeneration,
+    InvalidTimestamp(&'static str),
+    ExpiryTooFar,
+    ExpectedReturnRequired,
+    ExpectedReturnForbidden,
+    ConnectivityRequired(&'static str),
+    ConnectivityForbidden(&'static str),
+    Replay,
+    Stale,
+    Contradictory(&'static str),
+}
+
+impl fmt::Display for NodeAvailabilityValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "unsupported node availability schema {version}")
+            }
+            Self::UnsupportedExpectedReturnSchema(version) => {
+                write!(formatter, "unsupported expected-return schema {version}")
+            }
+            Self::InvalidField(field) => {
+                write!(formatter, "invalid node availability field {field}")
+            }
+            Self::FieldTooLong(field) => {
+                write!(formatter, "node availability field is too long: {field}")
+            }
+            Self::InvalidGeneration => formatter.write_str("invalid node availability generation"),
+            Self::InvalidTimestamp(field) => {
+                write!(formatter, "invalid node availability timestamp {field}")
+            }
+            Self::ExpiryTooFar => formatter.write_str("node availability expiry exceeds the bound"),
+            Self::ExpectedReturnRequired => {
+                formatter.write_str("this node availability state requires an expected return")
+            }
+            Self::ExpectedReturnForbidden => {
+                formatter.write_str("this node availability state cannot carry an expected return")
+            }
+            Self::ConnectivityRequired(state) => {
+                write!(formatter, "connectivity summaries are required for {state}")
+            }
+            Self::ConnectivityForbidden(state) => {
+                write!(
+                    formatter,
+                    "connectivity summaries are forbidden for {state}"
+                )
+            }
+            Self::Replay => formatter.write_str("replayed node availability event"),
+            Self::Stale => formatter.write_str("stale node availability event"),
+            Self::Contradictory(detail) => {
+                write!(formatter, "contradictory node availability event: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodeAvailabilityValidationError {}
+
+/// Versioned, bounded, node-owned expected-state intent. Consumers must call
+/// [`NodeAvailabilityIntent::validate_at`] or
+/// [`NodeAvailabilityIntent::validate_transition`] before folding it into
+/// health; absence without one of the explicit expected states is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeAvailabilityIntent {
+    pub schema_version: u16,
+    pub node_id: String,
+    pub device_id: String,
+    pub device_class: NodeDeviceClass,
+    pub connection_type: NodeConnectionType,
+    pub state: NodeAvailabilityState,
+    pub reason: String,
+    pub source: String,
+    pub event_id: String,
+    pub generation: u64,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub expected_return: Option<ExpectedReturn>,
+    pub old_connectivity: Option<NodeConnectivitySummary>,
+    pub new_connectivity: Option<NodeConnectivitySummary>,
+}
+
+impl NodeAvailabilityIntent {
+    /// Validate the shape and state relationships without comparing it to a
+    /// previous event or assuming a wall-clock time.
+    pub fn validate(&self) -> Result<(), NodeAvailabilityValidationError> {
+        if self.schema_version != NODE_AVAILABILITY_INTENT_SCHEMA_VERSION {
+            return Err(NodeAvailabilityValidationError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        validate_identifier("node_id", &self.node_id, MAX_NODE_AVAILABILITY_ID_BYTES)?;
+        validate_identifier("device_id", &self.device_id, MAX_NODE_AVAILABILITY_ID_BYTES)?;
+        validate_identifier("source", &self.source, MAX_NODE_AVAILABILITY_ID_BYTES)?;
+        validate_identifier("event_id", &self.event_id, MAX_NODE_AVAILABILITY_ID_BYTES)?;
+        validate_reason(&self.reason)?;
+        if self.generation == 0 {
+            return Err(NodeAvailabilityValidationError::InvalidGeneration);
+        }
+        if self.observed_at_ms == 0 {
+            return Err(NodeAvailabilityValidationError::InvalidTimestamp(
+                "observed_at_ms",
+            ));
+        }
+        if self.expires_at_ms <= self.observed_at_ms {
+            return Err(NodeAvailabilityValidationError::InvalidTimestamp(
+                "expires_at_ms",
+            ));
+        }
+        if self.expires_at_ms - self.observed_at_ms > MAX_NODE_AVAILABILITY_INTENT_TTL_MS {
+            return Err(NodeAvailabilityValidationError::ExpiryTooFar);
+        }
+
+        if self.state.expects_return() {
+            let Some(expected_return) = &self.expected_return else {
+                return Err(NodeAvailabilityValidationError::ExpectedReturnRequired);
+            };
+            expected_return.validate(self.observed_at_ms, self.expires_at_ms)?;
+        } else if self.expected_return.is_some() {
+            return Err(NodeAvailabilityValidationError::ExpectedReturnForbidden);
+        }
+
+        match self.state {
+            NodeAvailabilityState::AdapterMigration => {
+                let (Some(old), Some(new)) = (&self.old_connectivity, &self.new_connectivity)
+                else {
+                    return Err(NodeAvailabilityValidationError::ConnectivityRequired(
+                        "adapter_migration",
+                    ));
+                };
+                old.validate()?;
+                new.validate()?;
+                if old == new {
+                    return Err(NodeAvailabilityValidationError::Contradictory(
+                        "adapter migration has no connectivity change",
+                    ));
+                }
+                if old.connection_type != self.connection_type {
+                    return Err(NodeAvailabilityValidationError::Contradictory(
+                        "top-level connection does not match old connectivity",
+                    ));
+                }
+            }
+            NodeAvailabilityState::Returned => {
+                if let Some(old) = &self.old_connectivity {
+                    old.validate()?;
+                    if self.new_connectivity.is_none() {
+                        return Err(NodeAvailabilityValidationError::ConnectivityRequired(
+                            "returned.new_connectivity",
+                        ));
+                    }
+                }
+                if let Some(new) = &self.new_connectivity {
+                    new.validate()?;
+                }
+            }
+            _ => {
+                if self.old_connectivity.is_some() || self.new_connectivity.is_some() {
+                    return Err(NodeAvailabilityValidationError::ConnectivityForbidden(
+                        "state",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate that the intent is current at `now_ms`. Expiry is a stale
+    /// report, not evidence of an outage and never creates an inferred state.
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), NodeAvailabilityValidationError> {
+        self.validate()?;
+        if now_ms < self.observed_at_ms {
+            return Err(NodeAvailabilityValidationError::InvalidTimestamp(
+                "observed_at_ms",
+            ));
+        }
+        if now_ms > self.expires_at_ms {
+            return Err(NodeAvailabilityValidationError::Stale);
+        }
+        Ok(())
+    }
+
+    /// Validate this event against the immediately preceding event for the
+    /// same node. Generation and event identity make duplicate delivery
+    /// explicit; no consumer is allowed to repair a contradictory sequence by
+    /// guessing which state the node intended.
+    pub fn validate_transition(
+        &self,
+        previous: Option<&Self>,
+        now_ms: u64,
+    ) -> Result<(), NodeAvailabilityValidationError> {
+        self.validate_at(now_ms)?;
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        previous.validate()?;
+        if self.node_id != previous.node_id || self.device_id != previous.device_id {
+            return Err(NodeAvailabilityValidationError::Contradictory(
+                "node identity changed",
+            ));
+        }
+        if self.event_id == previous.event_id {
+            return Err(NodeAvailabilityValidationError::Replay);
+        }
+        if self.generation < previous.generation || self.observed_at_ms < previous.observed_at_ms {
+            return Err(NodeAvailabilityValidationError::Stale);
+        }
+        if self.generation == previous.generation {
+            return Err(NodeAvailabilityValidationError::Contradictory(
+                "generation reused for a different event",
+            ));
+        }
+        if !availability_transition_allowed(previous.state, self.state) {
+            return Err(NodeAvailabilityValidationError::Contradictory(
+                "invalid lifecycle transition",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit a record only after shape, current-time, replay, stale, and
+    /// lifecycle-transition checks have passed.
+    pub fn admitted(
+        self,
+        previous: Option<&Self>,
+        now_ms: u64,
+    ) -> Result<Self, NodeAvailabilityValidationError> {
+        self.validate_transition(previous, now_ms)?;
+        Ok(self)
+    }
+
+    /// Whether this record explicitly declares an expected absence.
+    #[must_use]
+    pub const fn expects_return(&self) -> bool {
+        self.state.expects_return()
+    }
+
+    /// Return the producer-declared expected return time, if one exists.
+    #[must_use]
+    pub const fn expected_return_at_ms(&self) -> Option<u64> {
+        match &self.expected_return {
+            Some(expected_return) => Some(expected_return.expected_at_ms),
+            None => None,
+        }
+    }
+}
+
+/// Result of applying a device-class availability policy to one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeAvailabilityAssessment {
+    /// The node has a fresh awake/returned report.
+    Available,
+    /// The node declared an absence and is still within its policy grace.
+    ExpectedAbsence,
+    /// A declared return was missed long enough to warn.
+    WarningMissedReturn,
+    /// A declared return was missed long enough to escalate.
+    CriticalMissedReturn,
+    /// No current intent is available and an observed node has gone stale.
+    WarningUnannounced,
+    /// No current intent is available and the stale node is critically late.
+    CriticalUnannounced,
+    /// No safe policy conclusion can be made from the supplied evidence.
+    Unknown,
+}
+
+/// Bounded escalation defaults for one device class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAvailabilityPolicy {
+    /// Delay after an expected return before a warning.
+    pub missed_return_warning_after_ms: u64,
+    /// Delay after an expected return before a critical state.
+    pub missed_return_critical_after_ms: u64,
+    /// Delay after the last observation before an unannounced warning.
+    pub unannounced_warning_after_ms: u64,
+    /// Delay after the last observation before an unannounced critical state.
+    pub unannounced_critical_after_ms: u64,
+}
+
+impl NodeAvailabilityPolicy {
+    /// Return the governed defaults for a node/device class.
+    #[must_use]
+    pub const fn for_device_class(device_class: NodeDeviceClass) -> Self {
+        match device_class {
+            NodeDeviceClass::Desktop => Self::new(30_000, 120_000, 30_000, 120_000),
+            NodeDeviceClass::Laptop => Self::new(60_000, 300_000, 60_000, 300_000),
+            NodeDeviceClass::WirelessDevice => Self::new(60_000, 300_000, 30_000, 180_000),
+            NodeDeviceClass::Server => Self::new(15_000, 60_000, 15_000, 60_000),
+            NodeDeviceClass::Lighthouse => Self::new(15_000, 60_000, 10_000, 30_000),
+            NodeDeviceClass::Unknown => Self::new(60_000, 300_000, 60_000, 300_000),
+        }
+    }
+
+    /// Construct explicit policy values for tests or a later governed config.
+    #[must_use]
+    pub const fn new(
+        missed_return_warning_after_ms: u64,
+        missed_return_critical_after_ms: u64,
+        unannounced_warning_after_ms: u64,
+        unannounced_critical_after_ms: u64,
+    ) -> Self {
+        Self {
+            missed_return_warning_after_ms,
+            missed_return_critical_after_ms,
+            unannounced_warning_after_ms,
+            unannounced_critical_after_ms,
+        }
+    }
+
+    /// Evaluate a current intent without inferring a state from its absence.
+    ///
+    /// `last_observed_at_ms` is an independent, typed heartbeat observation.
+    /// It is required before an unannounced outage can be reported; a missing
+    /// heartbeat timestamp remains [`NodeAvailabilityAssessment::Unknown`].
+    #[must_use]
+    pub fn assess(
+        &self,
+        intent: Option<&NodeAvailabilityIntent>,
+        now_ms: u64,
+        last_observed_at_ms: Option<u64>,
+    ) -> NodeAvailabilityAssessment {
+        let Some(intent) = intent else {
+            return self.assess_unannounced(now_ms, last_observed_at_ms);
+        };
+        if intent.validate().is_err() || now_ms < intent.observed_at_ms {
+            return NodeAvailabilityAssessment::Unknown;
+        }
+        if intent.state == NodeAvailabilityState::Unknown {
+            return NodeAvailabilityAssessment::Unknown;
+        }
+        if intent.expects_return() {
+            if now_ms > intent.expires_at_ms {
+                return self.assess_unannounced(now_ms, last_observed_at_ms);
+            }
+            let Some(expected_at_ms) = intent.expected_return_at_ms() else {
+                return NodeAvailabilityAssessment::Unknown;
+            };
+            return self.assess_expected_return(now_ms.saturating_sub(expected_at_ms));
+        }
+        if now_ms <= intent.expires_at_ms
+            && matches!(
+                intent.state,
+                NodeAvailabilityState::Awake | NodeAvailabilityState::Returned
+            )
+        {
+            NodeAvailabilityAssessment::Available
+        } else {
+            self.assess_unannounced(now_ms, last_observed_at_ms)
+        }
+    }
+
+    fn assess_expected_return(&self, elapsed_ms: u64) -> NodeAvailabilityAssessment {
+        if elapsed_ms >= self.missed_return_critical_after_ms {
+            NodeAvailabilityAssessment::CriticalMissedReturn
+        } else if elapsed_ms >= self.missed_return_warning_after_ms {
+            NodeAvailabilityAssessment::WarningMissedReturn
+        } else {
+            NodeAvailabilityAssessment::ExpectedAbsence
+        }
+    }
+
+    fn assess_unannounced(
+        &self,
+        now_ms: u64,
+        last_observed_at_ms: Option<u64>,
+    ) -> NodeAvailabilityAssessment {
+        let Some(last_observed_at_ms) = last_observed_at_ms else {
+            return NodeAvailabilityAssessment::Unknown;
+        };
+        if last_observed_at_ms > now_ms {
+            return NodeAvailabilityAssessment::Unknown;
+        }
+        let elapsed_ms = now_ms.saturating_sub(last_observed_at_ms);
+        if elapsed_ms >= self.unannounced_critical_after_ms {
+            NodeAvailabilityAssessment::CriticalUnannounced
+        } else if elapsed_ms >= self.unannounced_warning_after_ms {
+            NodeAvailabilityAssessment::WarningUnannounced
+        } else {
+            NodeAvailabilityAssessment::Unknown
+        }
+    }
+}
+
+fn availability_transition_allowed(
+    previous: NodeAvailabilityState,
+    current: NodeAvailabilityState,
+) -> bool {
+    if previous == NodeAvailabilityState::Unknown || current == NodeAvailabilityState::Unknown {
+        return true;
+    }
+    if previous == current {
+        return previous != NodeAvailabilityState::Returned;
+    }
+    match (previous, current) {
+        (NodeAvailabilityState::Awake, NodeAvailabilityState::Sleeping)
+        | (NodeAvailabilityState::Awake, NodeAvailabilityState::ShuttingDown)
+        | (NodeAvailabilityState::Awake, NodeAvailabilityState::ScheduledReboot)
+        | (NodeAvailabilityState::Awake, NodeAvailabilityState::Maintenance)
+        | (NodeAvailabilityState::Awake, NodeAvailabilityState::AdapterMigration)
+        | (NodeAvailabilityState::ShuttingDown, NodeAvailabilityState::ShutDown)
+        | (NodeAvailabilityState::ShuttingDown, NodeAvailabilityState::Rebooting)
+        | (NodeAvailabilityState::ShuttingDown, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::Sleeping, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::ScheduledReboot)
+        | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::Rebooting)
+        | (NodeAvailabilityState::ShutDown, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::ScheduledReboot, NodeAvailabilityState::Rebooting)
+        | (NodeAvailabilityState::ScheduledReboot, NodeAvailabilityState::ShutDown)
+        | (NodeAvailabilityState::ScheduledReboot, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::Rebooting, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::Maintenance, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::AdapterMigration, NodeAvailabilityState::Returned)
+        | (NodeAvailabilityState::Returned, NodeAvailabilityState::Awake) => true,
+        _ => false,
+    }
+}
+
+fn validate_identifier(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), NodeAvailabilityValidationError> {
+    if value.len() > max_bytes {
+        return Err(NodeAvailabilityValidationError::FieldTooLong(field));
+    }
+    if value.is_empty()
+        || value.trim() != value
+        || !value.is_ascii()
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+    {
+        return Err(NodeAvailabilityValidationError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_reason(value: &str) -> Result<(), NodeAvailabilityValidationError> {
+    if value.len() > MAX_NODE_AVAILABILITY_REASON_BYTES {
+        return Err(NodeAvailabilityValidationError::FieldTooLong("reason"));
+    }
+    if value.trim().is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(NodeAvailabilityValidationError::InvalidField("reason"));
+    }
+    Ok(())
+}
 /// Per-node state topic prefix.
 pub const NODE_HEALTH_TOPIC_PREFIX: &str = "state/health/node/";
 /// Roster-folded snapshot topic.
@@ -534,6 +1206,334 @@ mod tests {
             active_conditions: Vec::new(),
             resolved_conditions: Vec::new(),
         }
+    }
+
+    fn connectivity(
+        connection_type: NodeConnectionType,
+        interface_id: Option<&str>,
+        address_family: NodeAddressFamily,
+        reachable: bool,
+    ) -> NodeConnectivitySummary {
+        NodeConnectivitySummary {
+            connection_type,
+            interface_id: interface_id.map(str::to_owned),
+            address_family,
+            reachable,
+        }
+    }
+
+    fn availability(
+        state: NodeAvailabilityState,
+        generation: u64,
+        event_id: &str,
+        observed_at_ms: u64,
+    ) -> NodeAvailabilityIntent {
+        let (expected_return, old_connectivity, new_connectivity, connection_type) =
+            if state == NodeAvailabilityState::AdapterMigration {
+                (
+                    Some(ExpectedReturn::new(observed_at_ms + 5_000)),
+                    Some(connectivity(
+                        NodeConnectionType::Ethernet,
+                        Some("eno1"),
+                        NodeAddressFamily::Ipv4,
+                        true,
+                    )),
+                    Some(connectivity(
+                        NodeConnectionType::Wifi,
+                        Some("wlan0"),
+                        NodeAddressFamily::DualStack,
+                        true,
+                    )),
+                    NodeConnectionType::Ethernet,
+                )
+            } else {
+                (
+                    state
+                        .expects_return()
+                        .then(|| ExpectedReturn::new(observed_at_ms + 5_000)),
+                    None,
+                    None,
+                    NodeConnectionType::Ethernet,
+                )
+            };
+        NodeAvailabilityIntent {
+            schema_version: NODE_AVAILABILITY_INTENT_SCHEMA_VERSION,
+            node_id: "seat-15".into(),
+            device_id: "device-15".into(),
+            device_class: NodeDeviceClass::Desktop,
+            connection_type,
+            state,
+            reason: "operator-directed lifecycle transition".into(),
+            source: "mackesd.health".into(),
+            event_id: event_id.into(),
+            generation,
+            observed_at_ms,
+            expires_at_ms: observed_at_ms + 10_000,
+            expected_return,
+            old_connectivity,
+            new_connectivity,
+        }
+    }
+
+    #[test]
+    fn shared_duration_formatter_uses_exact_locale_independent_boundaries() {
+        assert_eq!(format_health_duration_ms(0), "0s");
+        assert_eq!(format_health_duration_ms(999), "0s");
+        assert_eq!(format_health_duration_ms(59_999), "59s");
+        assert_eq!(format_health_duration_ms(60_000), "1m 00s");
+        assert_eq!(format_health_duration_ms(3_599_999), "59m 59s");
+        assert_eq!(format_health_duration_ms(3_600_000), "01:00:00");
+        assert_eq!(format_health_duration_ms(86_400_000), "24:00:00");
+        assert_eq!(format_health_duration_ms(86_400_001), "1d 00:00:00");
+        assert_eq!(
+            format_health_duration_ms(2 * 86_400_000 + 3_600_000 + 12 * 60_000 + 8_000,),
+            "2d 01:12:08"
+        );
+        assert_eq!(
+            format_duration_ms(MAX_HEALTH_DURATION_MS + 1),
+            format_duration_ms(MAX_HEALTH_DURATION_MS)
+        );
+    }
+
+    #[test]
+    fn availability_states_are_closed_versioned_and_explicit() {
+        let states = [
+            NodeAvailabilityState::Awake,
+            NodeAvailabilityState::Sleeping,
+            NodeAvailabilityState::ShuttingDown,
+            NodeAvailabilityState::ShutDown,
+            NodeAvailabilityState::ScheduledReboot,
+            NodeAvailabilityState::Rebooting,
+            NodeAvailabilityState::Maintenance,
+            NodeAvailabilityState::AdapterMigration,
+            NodeAvailabilityState::Returned,
+            NodeAvailabilityState::Unknown,
+        ];
+        for (generation, state) in states.into_iter().enumerate() {
+            let intent = availability(state, generation as u64 + 1, "event-state", 1_000);
+            assert_eq!(intent.validate(), Ok(()), "state {state:?}");
+            assert_eq!(intent.expects_return(), state.expects_return());
+            assert_eq!(
+                intent.expected_return_at_ms(),
+                state.expects_return().then_some(6_000)
+            );
+            let encoded = serde_json::to_value(&intent).expect("availability serializes");
+            assert_eq!(encoded["state"], serde_json::to_value(state).unwrap());
+        }
+
+        let mut unknown = availability(NodeAvailabilityState::Unknown, 1, "event-unknown", 1_000);
+        unknown.expected_return = Some(ExpectedReturn::new(2_000));
+        assert_eq!(
+            unknown.validate(),
+            Err(NodeAvailabilityValidationError::ExpectedReturnForbidden)
+        );
+
+        let mut sleeping = availability(NodeAvailabilityState::Sleeping, 1, "event-sleep", 1_000);
+        sleeping.expected_return = None;
+        assert_eq!(
+            sleeping.validate(),
+            Err(NodeAvailabilityValidationError::ExpectedReturnRequired)
+        );
+    }
+
+    #[test]
+    fn availability_contract_rejects_bounds_schema_and_connectivity_contradictions() {
+        let mut intent = availability(
+            NodeAvailabilityState::AdapterMigration,
+            1,
+            "event-adapter",
+            1_000,
+        );
+        intent.old_connectivity = intent.new_connectivity.clone();
+        assert!(matches!(
+            intent.validate(),
+            Err(NodeAvailabilityValidationError::Contradictory(_))
+        ));
+
+        let mut wrong_old_connection = availability(
+            NodeAvailabilityState::AdapterMigration,
+            1,
+            "event-adapter-2",
+            1_000,
+        );
+        wrong_old_connection.connection_type = NodeConnectionType::Wifi;
+        assert!(matches!(
+            wrong_old_connection.validate(),
+            Err(NodeAvailabilityValidationError::Contradictory(_))
+        ));
+
+        let mut oversized = availability(NodeAvailabilityState::Awake, 1, "event-long", 1_000);
+        oversized.reason = "r".repeat(MAX_NODE_AVAILABILITY_REASON_BYTES + 1);
+        assert_eq!(
+            oversized.validate(),
+            Err(NodeAvailabilityValidationError::FieldTooLong("reason"))
+        );
+
+        let mut unsupported = availability(NodeAvailabilityState::Awake, 1, "event-schema", 1_000);
+        unsupported.schema_version += 1;
+        assert_eq!(
+            unsupported.validate(),
+            Err(NodeAvailabilityValidationError::UnsupportedSchema(
+                NODE_AVAILABILITY_INTENT_SCHEMA_VERSION + 1
+            ))
+        );
+
+        let mut expected_schema = availability(
+            NodeAvailabilityState::Sleeping,
+            1,
+            "event-return-schema",
+            1_000,
+        );
+        expected_schema
+            .expected_return
+            .as_mut()
+            .expect("sleeping has an expected return")
+            .schema_version += 1;
+        assert!(matches!(
+            expected_schema.validate(),
+            Err(NodeAvailabilityValidationError::UnsupportedExpectedReturnSchema(_))
+        ));
+
+        let mut unknown_fields = serde_json::to_value(availability(
+            NodeAvailabilityState::Awake,
+            1,
+            "event-unknown-field",
+            1_000,
+        ))
+        .expect("availability serializes");
+        unknown_fields["unadmitted"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<NodeAvailabilityIntent>(unknown_fields).is_err());
+    }
+
+    #[test]
+    fn availability_transition_validation_distinguishes_replay_stale_and_contradiction() {
+        let previous = availability(NodeAvailabilityState::Awake, 4, "event-4", 1_000);
+        assert_eq!(
+            previous.validate_transition(Some(&previous), 2_000),
+            Err(NodeAvailabilityValidationError::Replay)
+        );
+
+        let mut stale = availability(NodeAvailabilityState::Awake, 3, "event-3", 1_100);
+        stale.expires_at_ms = 20_000;
+        assert_eq!(
+            stale.validate_transition(Some(&previous), 2_000),
+            Err(NodeAvailabilityValidationError::Stale)
+        );
+
+        let same_generation = availability(NodeAvailabilityState::Awake, 4, "event-other", 1_100);
+        assert!(matches!(
+            same_generation.validate_transition(Some(&previous), 2_000),
+            Err(NodeAvailabilityValidationError::Contradictory(_))
+        ));
+
+        let sleeping = availability(NodeAvailabilityState::Sleeping, 5, "event-sleep", 2_100);
+        let contradictory = availability(
+            NodeAvailabilityState::ShuttingDown,
+            6,
+            "event-shutdown",
+            2_200,
+        );
+        assert!(matches!(
+            contradictory.validate_transition(Some(&sleeping), 2_500),
+            Err(NodeAvailabilityValidationError::Contradictory(_))
+        ));
+
+        let returned = availability(NodeAvailabilityState::Returned, 6, "event-return", 2_200);
+        assert_eq!(returned.validate_transition(Some(&sleeping), 2_500), Ok(()));
+        assert!(returned.admitted(Some(&sleeping), 2_500).is_ok());
+
+        let expired = availability(NodeAvailabilityState::Awake, 7, "event-expired", 3_000);
+        assert_eq!(
+            expired.validate_at(13_001),
+            Err(NodeAvailabilityValidationError::Stale)
+        );
+    }
+
+    #[test]
+    fn availability_history_handles_max_timestamp_boundary_and_rejects_oversized_ttl() {
+        let previous = availability(
+            NodeAvailabilityState::Sleeping,
+            1,
+            "event-sleep-max",
+            u64::MAX - 20_000,
+        );
+        let returned = availability(
+            NodeAvailabilityState::Returned,
+            2,
+            "event-return-max",
+            u64::MAX - 10_000,
+        );
+        assert_eq!(
+            returned.validate_transition(Some(&previous), u64::MAX),
+            Ok(())
+        );
+
+        let mut oversized = availability(NodeAvailabilityState::Awake, 1, "event-ttl", 1_000);
+        oversized.expires_at_ms = oversized
+            .observed_at_ms
+            .saturating_add(MAX_NODE_AVAILABILITY_INTENT_TTL_MS + 1);
+        assert_eq!(
+            oversized.validate(),
+            Err(NodeAvailabilityValidationError::ExpiryTooFar)
+        );
+    }
+
+    #[test]
+    fn availability_policy_keeps_expected_absence_informational_then_escalates() {
+        let policy = NodeAvailabilityPolicy::new(100, 200, 100, 200);
+        let sleeping = availability(NodeAvailabilityState::Sleeping, 1, "event-sleep", 1_000);
+        assert_eq!(
+            policy.assess(Some(&sleeping), 5_999, None),
+            NodeAvailabilityAssessment::ExpectedAbsence
+        );
+        assert_eq!(
+            policy.assess(Some(&sleeping), 6_100, None),
+            NodeAvailabilityAssessment::WarningMissedReturn
+        );
+        assert_eq!(
+            policy.assess(Some(&sleeping), 6_200, None),
+            NodeAvailabilityAssessment::CriticalMissedReturn
+        );
+
+        let awake = availability(NodeAvailabilityState::Awake, 2, "event-awake", 1_000);
+        assert_eq!(
+            policy.assess(Some(&awake), 2_000, None),
+            NodeAvailabilityAssessment::Available
+        );
+        assert_eq!(
+            policy.assess(Some(&awake), 1_050, None),
+            NodeAvailabilityAssessment::Available
+        );
+        assert_eq!(
+            policy.assess(None, 1_050, None),
+            NodeAvailabilityAssessment::Unknown
+        );
+        assert_eq!(
+            policy.assess(None, 1_100, Some(1_000)),
+            NodeAvailabilityAssessment::WarningUnannounced
+        );
+        assert_eq!(
+            policy.assess(None, 1_200, Some(1_000)),
+            NodeAvailabilityAssessment::CriticalUnannounced
+        );
+    }
+
+    #[test]
+    fn availability_policy_defaults_are_device_aware_and_bounded() {
+        assert_eq!(
+            NodeAvailabilityPolicy::for_device_class(NodeDeviceClass::Server),
+            NodeAvailabilityPolicy::new(15_000, 60_000, 15_000, 60_000)
+        );
+        assert_eq!(
+            NodeAvailabilityPolicy::for_device_class(NodeDeviceClass::Laptop),
+            NodeAvailabilityPolicy::new(60_000, 300_000, 60_000, 300_000)
+        );
+        assert!(
+            NodeAvailabilityPolicy::for_device_class(NodeDeviceClass::Lighthouse)
+                .unannounced_critical_after_ms
+                < NodeAvailabilityPolicy::for_device_class(NodeDeviceClass::Laptop)
+                    .unannounced_critical_after_ms
+        );
     }
 
     #[test]

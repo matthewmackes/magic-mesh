@@ -339,7 +339,7 @@ pub(crate) struct SystemState {
     /// a pick, and applied live to the context every frame by
     /// [`Self::apply_appearance`] (the [`SettingsNav`] client-data-dir JSON idiom).
     appearance: AppearanceConfig,
-    /// This Node → Clock & Date display zone, defaulting to Eastern Standard Time.
+    /// Workers → Clock & Date display zone, defaulting to Eastern Time.
     clock: ClockConfig,
     /// The seat's last-reported debounced hardware formfactor (SURFACE-9), mirrored
     /// in by the shell's formfactor pump. PLATFORM-INTERFACES Q42: formfactor ≠
@@ -6304,7 +6304,7 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     );
 }
 
-/// Personalization → Clock & Date: the visible shell clock's fixed-offset
+/// Personalization → Clock & Date: the visible shell clock's daylight-aware
 /// display zone. Persisted selection applies to the taskbar, clock face, and
 /// message timestamps; machine/mesh event timestamps remain UTC.
 fn clock_section(ui: &mut egui::Ui, clock: &mut ClockConfig) {
@@ -6332,7 +6332,7 @@ fn clock_section(ui: &mut egui::Ui, clock: &mut ClockConfig) {
     muted_note(
         ui,
         format!(
-            "Construct defaults to Eastern Standard Time (EST, UTC−05:00). Current: {}. \
+            "Construct defaults to Eastern Time (ET; daylight saving aware). Current: {}. \
              Mesh and audit timestamps remain UTC.",
             clock.zone.short_label()
         ),

@@ -52,9 +52,9 @@
 //!
 //! - **Cloud instance** — `Console` (routes to the Desktop/VDI surface when the
 //!   instance reports an address, else honestly disabled), and
-//!   `Start` / `Stop` / `Reboot` / `Delete` — each publishes an [`InstanceReq`]
-//!   on `action/cloud/<verb>`, the provider-neutral typed cloud bus the
-//!   **Workloads cloud worker** drains (§6 — a wire mirror, not a daemon-crate
+//!   `Start` / `Stop` / `Reboot` / `Delete` — each publishes a typed Workload
+//!   operation on `action/workload/operation`, the sole lifecycle lane the
+//!   **Workloads compute worker** drains (§6 — a wire mirror, not a daemon-crate
 //!   link, over the SAME Bus this surface reads `state/units` from). A
 //!   volume/image/network hero offers
 //!   `Inspect` (routes to the Cloud surface); its `Delete` is honestly disabled
@@ -94,6 +94,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use mackes_mesh_types::workloads::{
+    WorkloadBackend, WorkloadOperationAction, WorkloadProfile, WORKLOAD_OPERATION_TOPIC,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -613,11 +616,10 @@ impl UnitsClient for BusUnits {
 
 // ─────────────────────── the action-dispatch seam (EXPLORER-5) ───────────────────────
 
-/// The `action/cloud/` namespace prefix every provider-neutral Workloads cloud
-/// worker request rides — a **local mirror** of
-/// `mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX` (§6: the shell mirrors the
-/// wire contract, never links the daemon crate). A byte-pinned test keeps it
-/// equal to the shared prefix.
+/// Legacy cloud lifecycle mirrors retained only for the historical contract
+/// tests. Runtime Explorer dispatch uses [`WORKLOAD_OPERATION_TOPIC`]
+/// exclusively; no `action/cloud/instance-*` publisher remains reachable.
+#[cfg(test)]
 const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 
 /// The aggregator's E9 pull verb — a mirror of
@@ -625,12 +627,14 @@ const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 /// (empty) request forces a fresh live unit stream: the honest "health-check".
 const UNITS_REQUEST_TOPIC: &str = "action/units/get-stream";
 
-/// The Bus topic for cloud verb `verb`: `action/cloud/<verb>`.
+/// Historical topic formatting retained only by the legacy contract tests.
+#[cfg(test)]
 fn cloud_topic(verb: &str) -> String {
     format!("{CLOUD_ACTION_PREFIX}{verb}")
 }
 
 /// Exact cloud lifecycle request before its short-lived capability is inserted.
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct InstanceReq {
     /// Current typed cloud-action wire schema.
@@ -801,12 +805,12 @@ const fn verbs_for(kind: UnitKind) -> &'static [Verb] {
 /// A resolved real seam a verb dispatches through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HeroAction {
-    /// Publish an [`InstanceReq`] on the provider-neutral Workloads cloud bus.
-    Cloud {
-        /// The `instance-*` verb stem.
-        verb: &'static str,
-        /// The target Nova object id.
-        instance: String,
+    /// Publish a typed Workload operation on the sole lifecycle lane.
+    Workload {
+        /// The closed operation action understood by the compute worker.
+        action: WorkloadOperationAction,
+        /// The target workload identity derived from the roster object.
+        workload_id: String,
         /// The real placement node carried by the unit mirror.
         node: String,
     },
@@ -821,6 +825,7 @@ enum HeroAction {
     },
 }
 
+#[cfg(test)]
 fn authorized_instance_request_with(
     verb: &str,
     instance: &str,
@@ -848,9 +853,16 @@ fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
         if node.is_empty() {
             return Err("Cloud lifecycle requires an explicit placement node.".to_string());
         }
-        Ok(HeroAction::Cloud {
-            verb: stem,
-            instance: cloud_object_id(unit),
+        let action = match stem {
+            "instance-start" => WorkloadOperationAction::Start,
+            "instance-stop" => WorkloadOperationAction::Stop,
+            "instance-reboot" => WorkloadOperationAction::Restart,
+            "instance-delete" => WorkloadOperationAction::Destroy,
+            _ => return Err(format!("Unsupported instance lifecycle verb: {stem}")),
+        };
+        Ok(HeroAction::Workload {
+            action,
+            workload_id: format!("vm:{node}:{}", cloud_object_id(unit)),
             node: node.to_string(),
         })
     };
@@ -2830,18 +2842,32 @@ impl ExplorerState {
     /// Publish one resolved seam over the injected sink.
     fn dispatch(&self, action: &HeroAction) -> Result<(), String> {
         match action {
-            HeroAction::Cloud {
-                verb,
-                instance,
+            HeroAction::Workload {
+                action,
+                workload_id,
                 node,
             } => {
-                let body = authorized_instance_request_with(
-                    verb,
-                    instance,
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| "The system clock is before the Unix epoch.".to_string())
+                    .and_then(|duration| {
+                        u64::try_from(duration.as_millis()).map_err(|_| {
+                            "The system clock is outside the Workload API range.".to_string()
+                        })
+                    })?;
+                let request = crate::workload_api::request(
+                    workload_id,
                     node,
-                    crate::iac::authorize_root_mutation_body,
+                    WorkloadBackend::LibvirtVirtqemud,
+                    WorkloadProfile::Small.resources(),
+                    *action,
+                    None,
+                    0,
+                    now_ms,
                 )?;
-                self.action_sink.publish(&cloud_topic(verb), &body)
+                let body = serde_json::to_string(&request)
+                    .map_err(|error| format!("Could not encode Workload operation: {error}"))?;
+                self.action_sink.publish(WORKLOAD_OPERATION_TOPIC, &body)
             }
             HeroAction::Refresh => self.action_sink.publish(UNITS_REQUEST_TOPIC, "{}"),
             HeroAction::Goto { verb, headline } => self
@@ -3916,6 +3942,61 @@ impl ExplorerState {
             }
         }
         clusters
+    }
+}
+
+#[cfg(test)]
+mod typed_workload_tests {
+    use super::*;
+
+    fn instance() -> Unit {
+        Unit {
+            id: "cloud:instance:i-9".to_string(),
+            kind: UnitKind::Instance,
+            name: "web".to_string(),
+            reachability: Reachability::CloudObject {
+                node: "node-a".to_string(),
+            },
+            address: None,
+            health: None,
+            telemetry: None,
+            mesh: None,
+            first_seen_ms: 1,
+            last_seen_ms: 1,
+            extras: UnitExtras::default(),
+        }
+    }
+
+    #[test]
+    fn instance_lifecycle_resolves_to_the_typed_workload_lane() {
+        let unit = instance();
+        for (verb, expected_action) in [
+            (Verb::Start, WorkloadOperationAction::Start),
+            (Verb::Stop, WorkloadOperationAction::Stop),
+            (Verb::Reboot, WorkloadOperationAction::Restart),
+            (Verb::Delete, WorkloadOperationAction::Destroy),
+        ] {
+            let HeroAction::Workload {
+                action,
+                workload_id,
+                node,
+            } = verb_seam(verb, &unit).expect("typed lifecycle seam")
+            else {
+                panic!("instance lifecycle did not resolve to Workload");
+            };
+            assert_eq!(action, expected_action);
+            assert_eq!(workload_id, "vm:node-a:i-9");
+            assert_eq!(node, "node-a");
+        }
+        assert_eq!(WORKLOAD_OPERATION_TOPIC, "action/workload/operation");
+    }
+
+    #[test]
+    fn instance_lifecycle_requires_the_roster_placement_node() {
+        let mut unit = instance();
+        unit.reachability = Reachability::InMesh;
+        let error = verb_seam(Verb::Start, &unit).expect_err("missing placement must fail");
+        assert!(error.contains("explicit placement node"));
     }
 }
 

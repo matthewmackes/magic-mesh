@@ -116,6 +116,17 @@ degraded row because of its known disk-headroom alarm, so the final count is
 seven healthy plus one degraded rather than an eight-healthy acceptance claim.
 Both backups are local, root-only, and recoverable.
 
+### Current VM-capable bench correction (2026-08-05)
+
+The earlier no-`/dev/kvm` observation above is superseded by a fresh read-only
+probe after the operator enabled VM support. Seat 15 now exposes `/dev/kvm`,
+`qemu-kvm-10.2.2-1.fc44`, and `libvirt-daemon-kvm-12.0.0-3.fc44`; its
+`virsh` daemon is reachable, root has about 17 GiB free, and no guest is yet
+defined. It remains fixed-wired on `eno1` and retains the existing mesh
+identity; no address, route, bridge, or firewall change was made. The seat is
+now eligible for local Browser VM and Android VM test placement, subject to
+the image-size and nested-guest gates.
+
 ## Microsoft Surface seat
 
 The Microsoft Surface Pro 6 is a distinct seat at `172.20.146.79`; it is not

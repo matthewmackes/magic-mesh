@@ -84,6 +84,39 @@ pub enum DrmError {
     Present(String),
 }
 
+/// One bounded result from the node-local Display1 attachment source.
+///
+/// The source owns the received DMA-BUF descriptor until the DRM loop has
+/// completed its modeset/page-flip.  `Idle` is deliberately distinct from
+/// `Disconnected`: an idle native producer keeps the last direct scanout on
+/// screen, while a disconnected producer must release the native framebuffer
+/// and resume the GBM recovery path.
+#[derive(Debug)]
+pub enum Display1FramePoll {
+    /// No new frame is ready; retain the current scanout.
+    Idle,
+    /// One authenticated, bounded DMA-BUF frame ready for direct KMS import.
+    Frame {
+        /// Owned descriptor transferred by the local SCM_RIGHTS broker.
+        fd: OwnedFd,
+        /// Metadata validated by the broker/client before import.
+        metadata: ExternalDmaBufFrame,
+    },
+    /// The attachment lease/socket/producer is no longer usable.
+    Disconnected,
+}
+
+/// Non-blocking source for the native Display1 scanout path.
+///
+/// Implementations must perform authentication and bounded protocol checks
+/// before returning a frame. The render loop calls this at most once per
+/// display tick; implementations must never block or queue unbounded frames.
+pub trait Display1FrameSource {
+    /// Poll one frame at `now`, returning a typed recovery transition on
+    /// disconnect and a typed DRM error for a protocol/transport failure.
+    fn poll(&mut self, now: Instant) -> Result<Display1FramePoll, DrmError>;
+}
+
 impl std::fmt::Display for DrmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1342,6 +1375,27 @@ const ACCEL_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 /// contact events.
 const GESTURE_TICK_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Paint the direct-DRM cursor affordance. Windowed egui integrations translate
+/// `PlatformOutput::cursor_icon` to the native pointer, but the bare seat owns
+/// the whole framebuffer, so clickable controls need a visible software twin.
+/// The accent halo makes the Surface experience feel intentional without
+/// obscuring the pointer position or changing the default cursor's restrained
+/// crosshair treatment.
+fn paint_software_cursor(painter: &egui::Painter, position: egui::Pos2, cursor: egui::CursorIcon) {
+    if cursor == egui::CursorIcon::PointingHand {
+        painter.circle_filled(position, 8.0, crate::Style::ACCENT_HI.gamma_multiply(0.24));
+        painter.circle_stroke(
+            position,
+            8.0,
+            egui::Stroke::new(1.5, crate::Style::ACCENT_HI),
+        );
+        painter.circle_filled(position, 3.0, egui::Color32::WHITE);
+    } else {
+        painter.circle_filled(position, 4.0, egui::Color32::WHITE);
+        painter.circle_stroke(position, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+    }
+}
+
 /// Run an MCNF egui surface on the bare DRM/KMS seat (no compositor).
 ///
 /// `ui` paints the surface each frame against an [`egui::Context`] (the shared
@@ -1370,6 +1424,20 @@ pub fn run_drm(app_id: &str, ui: impl FnMut(&egui::Context)) -> Result<(), DrmEr
 pub fn run_drm_with_clipboard(
     app_id: &str,
     clipboard: &mut dyn crate::TextClipboard,
+    ui: impl FnMut(&egui::Context),
+) -> Result<(), DrmError> {
+    run_drm_with_clipboard_and_display1(app_id, clipboard, None, ui)
+}
+
+/// Run an MCNF egui surface with an optional authenticated native Display1
+/// source. When a source is present, its latest DMA-BUF is imported directly
+/// into KMS after the egui frame is rendered; no CPU framebuffer copy occurs.
+/// `Idle` retains the current native frame, and `Disconnected` tears down the
+/// native framebuffer before the normal GBM/SPICE recovery path resumes.
+pub fn run_drm_with_clipboard_and_display1(
+    app_id: &str,
+    clipboard: &mut dyn crate::TextClipboard,
+    mut display1: Option<&mut dyn Display1FrameSource>,
     mut ui: impl FnMut(&egui::Context),
 ) -> Result<(), DrmError> {
     let _ = app_id;
@@ -1607,6 +1675,10 @@ pub fn run_drm_with_clipboard(
     // NOT tracked here — it lives in `fb_cache`, keyed by the buffer-object, and is reused
     // across flips instead of being rebuilt every frame (perf-1).
     let mut prev: Option<gbm::BufferObject<()>> = None;
+    // The currently scanned-out native Display1 framebuffer and its DMA-BUF FD.
+    // The FD remains owned until the last KMS flip using the framebuffer has
+    // completed; dropping either earlier can invalidate the imported GEM.
+    let mut external_scanout: Option<(drm::control::framebuffer::Handle, OwnedFd)> = None;
     // perf-1: one DRM framebuffer per GBM buffer-object, keyed by its stable `gbm_bo`
     // pointer. The surface ring is a handful of buffers, so this stays tiny; destroyed en
     // masse at teardown.
@@ -1738,12 +1810,14 @@ pub fn run_drm_with_clipboard(
             .as_ref()
             .map(|_| ACCEL_SAMPLE_INTERVAL.saturating_sub(last_accel.elapsed()));
         let until_touch = (touch_active > 0).then_some(GESTURE_TICK_INTERVAL);
-        let until_periodic = match (until_accel, until_touch) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        // Display1 has no mde-bus wakeup and its local socket is deliberately
+        // hidden behind the source trait. A bounded 60 Hz poll keeps native
+        // frames flowing without allowing an attachment to spin the shell.
+        let until_display1 = display1.as_ref().map(|_| Duration::from_millis(16));
+        let until_periodic = [until_accel, until_touch, until_display1]
+            .into_iter()
+            .flatten()
+            .min();
         let timeout = wake::poll_timeout_ms(until_repaint, until_periodic);
         let mut pfd = libc::pollfd {
             fd: libinput.as_raw_fd(),
@@ -2119,7 +2193,7 @@ pub fn run_drm_with_clipboard(
             force_render = true;
         }
 
-        let first_frame = prev.is_none();
+        let first_frame = prev.is_none() && external_scanout.is_none();
         let repaint_due = next_repaint_at.is_some_and(|t| Instant::now() >= t);
         if !wake::should_render(
             first_frame,
@@ -2148,14 +2222,11 @@ pub fn run_drm_with_clipboard(
         let cur = pointer;
         let mut full_output = egui_ctx.run(raw_input, |ctx| {
             ui(ctx);
-            // Software cursor: draw a small crosshair/dot at the pointer position.
-            // The DRM backend has no OS cursor; we own the whole framebuffer.
             let layer = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Tooltip,
                 egui::Id::new("drm_cursor"),
             ));
-            layer.circle_filled(cur, 4.0, egui::Color32::WHITE);
-            layer.circle_stroke(cur, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            paint_software_cursor(&layer, cur, ctx.output(|output| output.cursor_icon));
         });
         // a11y-01: hand this frame's AccessKit tree to the consumer seam (a no-op unless
         // AccessKit is enabled). Done before `shapes` / `textures_delta` are consumed
@@ -2218,8 +2289,52 @@ pub fn run_drm_with_clipboard(
         }
         egl.swap_buffers(display, surface).map_err(egl_err)?;
 
-        // 4. scan the new front buffer out — set_crtc on the first frame, page-flip
-        //    after (waiting for the flip to complete before recycling buffers).
+        // 4. Prefer the latest authenticated Display1 frame. The source is
+        // polled only after rendering so the UI loop never performs blocking
+        // backend work, and every imported FD is retained through the KMS
+        // completion boundary.
+        let display1_state = if let Some(source) = display1.as_mut() {
+            Some((*source).poll(Instant::now())?)
+        } else {
+            None
+        };
+        match display1_state {
+            Some(Display1FramePoll::Frame { fd, metadata }) => {
+                if let Err(error) = present_external_scanout(
+                    &gbm,
+                    &heads,
+                    wp,
+                    hp,
+                    fd,
+                    metadata,
+                    &mut external_scanout,
+                    &mut prev,
+                ) {
+                    // The helper has already released the new descriptor on
+                    // import/present failure. It may still hold the previous
+                    // or newly-installed native framebuffer when cleanup
+                    // itself failed, so force the same ordered teardown before
+                    // surfacing the typed error.
+                    let _ = clear_external_scanout(&gbm, &mut external_scanout);
+                    return Err(error);
+                }
+                continue;
+            }
+            Some(Display1FramePoll::Idle) if external_scanout.is_some() => {
+                // The last native frame is still valid. Do not lock a GBM BO
+                // or replace it merely because egui repainted internally.
+                continue;
+            }
+            Some(Display1FramePoll::Disconnected) => {
+                clear_external_scanout(&gbm, &mut external_scanout)?;
+            }
+            Some(Display1FramePoll::Idle) | None => {}
+        }
+
+        // 5. Scan the new GBM front buffer out — set_crtc on the first frame,
+        // page-flip after (waiting for the flip to complete before recycling
+        // buffers). This is also the independent recovery path after a native
+        // Display1 disconnect.
         let bo = unsafe {
             gbm_surface
                 .lock_front_buffer()
@@ -2291,6 +2406,7 @@ pub fn run_drm_with_clipboard(
     if let Some(bo) = prev.take() {
         drop(bo);
     }
+    clear_external_scanout(&gbm, &mut external_scanout)?;
     // Destroy the framebuffers cached across the surface's buffer-object ring (perf-1).
     for (_, fb) in fb_cache {
         let _ = gbm.destroy_framebuffer(fb);
@@ -2570,6 +2686,91 @@ struct ReimportedGemBuffer {
     handle: buffer::Handle,
 }
 
+/// Metadata required to import one externally-owned DMA-BUF into KMS.  The
+/// descriptor itself remains an owned FD supplied by the authenticated
+/// Display1 broker; this record carries only bounded geometry/format data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalDmaBufFrame {
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Bytes per row.
+    pub stride: u32,
+    /// DRM fourcc code.
+    pub fourcc: u32,
+    /// DRM modifier code (`0` is linear).
+    pub modifier: u64,
+}
+
+impl ExternalDmaBufFrame {
+    /// Validate geometry before asking the kernel to import an FD.
+    pub fn validate(self) -> Result<(), DrmError> {
+        if self.width == 0 || self.height == 0 || self.width > 16_384 || self.height > 16_384 {
+            return Err(DrmError::Present(
+                "external DMA-BUF geometry out of bounds".into(),
+            ));
+        }
+        if self.stride < self.width.saturating_mul(4) || self.stride > 65_536 {
+            return Err(DrmError::Present(
+                "external DMA-BUF stride out of bounds".into(),
+            ));
+        }
+        if gbm::Format::try_from(self.fourcc).is_err() {
+            return Err(DrmError::Present(
+                "external DMA-BUF fourcc is unsupported".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Import a broker-delivered DMA-BUF as a real KMS framebuffer.  This is the
+/// production shell-side half of the QEMU Display1 path: PRIME import and KMS
+/// framebuffer creation operate directly on the received FD, with no CPU copy.
+/// The returned handle must remain alive until the page-flip using it completes.
+pub fn import_external_dmabuf(
+    gbm: &gbm::Device<Card>,
+    fd: BorrowedFd<'_>,
+    frame: ExternalDmaBufFrame,
+) -> Result<drm::control::framebuffer::Handle, DrmError> {
+    frame.validate()?;
+    let format = gbm::Format::try_from(frame.fourcc)
+        .map_err(|_| DrmError::Present("external DMA-BUF fourcc is unsupported".into()))?;
+    let reimported_handle = gbm
+        .prime_fd_to_buffer(fd)
+        .map_err(|e| DrmError::Present(format!("prime_fd_to_buffer: {e}")))?;
+    let modifier = explicit_modifier(gbm::Modifier::from(frame.modifier));
+    let planar = ReimportedGemBuffer {
+        width: frame.width,
+        height: frame.height,
+        format,
+        modifier,
+        pitch: frame.stride,
+        handle: reimported_handle,
+    };
+    let flags = if modifier.is_some() {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    };
+    gbm.add_planar_framebuffer(&planar, flags)
+        .map_err(|e| DrmError::Present(format!("add_planar_framebuffer: {e}")))
+}
+
+/// Release a framebuffer returned by [`import_external_dmabuf`]. The active
+/// DRM render loop owns the GBM device, so cleanup is explicit at the page-flip
+/// boundary; callers must invoke this after the last flip/fence before dropping
+/// the broker-delivered DMA-BUF FD. This keeps recovery, resize, and crash
+/// teardown from leaking a KMS framebuffer object.
+pub fn destroy_external_framebuffer(
+    gbm: &gbm::Device<Card>,
+    framebuffer: drm::control::framebuffer::Handle,
+) -> Result<(), DrmError> {
+    gbm.destroy_framebuffer(framebuffer)
+        .map_err(|error| DrmError::Present(format!("destroy external framebuffer: {error}")))
+}
+
 impl buffer::PlanarBuffer for ReimportedGemBuffer {
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -2594,6 +2795,98 @@ impl buffer::PlanarBuffer for ReimportedGemBuffer {
     fn offsets(&self) -> [u32; 4] {
         [0, 0, 0, 0]
     }
+}
+
+/// Release the currently scanned-out native framebuffer before its DMA-BUF FD.
+/// KMS owns the imported GEM reference until the framebuffer object is removed;
+/// this ordering is part of the Display1 lifetime contract.
+fn clear_external_scanout(
+    gbm: &gbm::Device<Card>,
+    external: &mut Option<(drm::control::framebuffer::Handle, OwnedFd)>,
+) -> Result<(), DrmError> {
+    let Some((framebuffer, fd)) = external.take() else {
+        return Ok(());
+    };
+    let result = destroy_external_framebuffer(gbm, framebuffer);
+    drop(fd);
+    result
+}
+
+/// Import and present one native Display1 frame without staging it through
+/// CPU memory. The first frame uses a modeset; subsequent frames use page-flip
+/// and wait for every mirrored head before releasing the previous framebuffer
+/// and descriptor.
+fn present_external_scanout(
+    gbm: &gbm::Device<Card>,
+    heads: &[Output],
+    expected_width: u32,
+    expected_height: u32,
+    fd: OwnedFd,
+    metadata: ExternalDmaBufFrame,
+    external: &mut Option<(drm::control::framebuffer::Handle, OwnedFd)>,
+    previous_gbm: &mut Option<gbm::BufferObject<()>>,
+) -> Result<(), DrmError> {
+    if metadata.width != expected_width || metadata.height != expected_height {
+        return Err(DrmError::Present(format!(
+            "Display1 frame geometry {}x{} does not match KMS mode {}x{}",
+            metadata.width, metadata.height, expected_width, expected_height
+        )));
+    }
+
+    let framebuffer = match import_external_dmabuf(gbm, fd.as_fd(), metadata) {
+        Ok(framebuffer) => framebuffer,
+        Err(error) => {
+            drop(fd);
+            return Err(error);
+        }
+    };
+    let replacing = external.is_some();
+    let present_result: Result<(), DrmError> = if replacing {
+        (|| {
+            for head in heads {
+                gbm.page_flip(
+                    head.crtc,
+                    framebuffer,
+                    drm::control::PageFlipFlags::EVENT,
+                    None,
+                )
+                .map_err(|error| DrmError::Present(format!("Display1 page_flip: {error}")))?;
+            }
+            let mut pending = heads.len();
+            while pending > 0 {
+                let events = gbm.receive_events().map_err(|error| {
+                    DrmError::Present(format!("Display1 receive_events: {error}"))
+                })?;
+                for event in events {
+                    if matches!(event, drm::control::Event::PageFlip(_)) {
+                        pending -= 1;
+                    }
+                }
+            }
+            Ok(())
+        })()
+    } else {
+        let framebuffers = vec![framebuffer; heads.len()];
+        set_layout(gbm, heads, &framebuffers)
+    };
+
+    if let Err(error) = present_result {
+        let _ = destroy_external_framebuffer(gbm, framebuffer);
+        drop(fd);
+        return Err(error);
+    }
+
+    if let Some((old_framebuffer, old_fd)) = external.replace((framebuffer, fd)) {
+        let result = destroy_external_framebuffer(gbm, old_framebuffer);
+        drop(old_fd);
+        result?;
+    }
+    if !replacing {
+        if let Some(previous) = previous_gbm.take() {
+            drop(previous);
+        }
+    }
+    Ok(())
 }
 
 /// `Some(modifier)` unless `modifier` is GBM's driver-implicit/unspecified
@@ -2702,10 +2995,34 @@ mod tests {
         clear_rgba, drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers,
         drm_screen_for_scale, explicit_modifier, open_primary_node, probe_prime_import_liveness,
         push_drm_clipboard_shortcut, refresh_drm_clipboard_text, store_drm_clipboard_output,
-        DrmError, ReimportedGemBuffer,
+        DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
     };
     use crate::{MemoryTextClipboard, TextClipboard};
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
+
+    #[test]
+    fn external_dmabuf_metadata_is_bounded_before_prime_import() {
+        let valid = ExternalDmaBufFrame {
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            fourcc: 0x3432_5258,
+            modifier: 0,
+        };
+        assert!(valid.validate().is_ok());
+        assert!(ExternalDmaBufFrame { width: 0, ..valid }
+            .validate()
+            .is_err());
+        assert!(ExternalDmaBufFrame {
+            stride: 64,
+            ..valid
+        }
+        .validate()
+        .is_err());
+        assert!(ExternalDmaBufFrame { fourcc: 0, ..valid }
+            .validate()
+            .is_err());
+    }
 
     #[test]
     fn drm_viewport_tracks_runtime_text_scale() {

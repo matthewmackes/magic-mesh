@@ -45,7 +45,7 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
@@ -58,6 +58,10 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::cache;
+use crate::reconnect::{
+    backoff_delay_secs, DEFAULT_BASE_SECS, DEFAULT_CAP_SECS, RECONNECT_CONNECT_TIMEOUT_SECS,
+    RECONNECT_REQUEST_TIMEOUT_SECS,
+};
 
 /// Gapless pre-buffer lead (ms): the higher-level queue driver (AIR-2.c)
 /// starts resolving the next track's stream URL once the current track
@@ -65,6 +69,8 @@ use crate::cache;
 /// exposes the signal; the engine's own `play(list)` is already gapless
 /// without it.
 pub const GAPLESS_LEAD_MS: u64 = 5_000;
+/// Maximum number of bounded mid-track reconnects before playback stops.
+pub const MAX_MIDTRACK_RECONNECTS: u32 = 3;
 
 // ───────────────────────── pure helpers ─────────────────────────
 
@@ -87,6 +93,26 @@ pub enum SourceCodec {
     Opus,
     /// Unknown suffix: probe from the bytes with no extension hint.
     Unknown,
+}
+
+/// One logical queue track with an ordered set of admitted source candidates.
+/// Candidates are retried only when an earlier source fails before producing
+/// decodable audio; the engine still records one gapless boundary per logical
+/// track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackTrack {
+    /// Network or local source URL plus its decoder hint, best first.
+    pub candidates: Vec<(String, SourceCodec)>,
+}
+
+impl PlaybackTrack {
+    /// Construct one logical track from a single source for legacy callers.
+    #[must_use]
+    pub fn single(url: String, codec: SourceCodec) -> Self {
+        Self {
+            candidates: vec![(url, codec)],
+        }
+    }
 }
 
 impl SourceCodec {
@@ -155,6 +181,24 @@ fn stream_cache_identity(url: &str, codec: SourceCodec) -> Option<(String, Strin
         return None;
     }
     Some((song_id, codec.cache_suffix().to_string()))
+}
+
+/// Private source URL used to route an offline queue entry through the same
+/// decoder/cache path as a live Airsonic stream. It is never sent to the
+/// network: [`decode_track`] handles this scheme locally.
+const CACHED_STREAM_SCHEME: &str = "mde-cache";
+
+/// Build a bounded, URL-encoded local source for a cached song.
+#[must_use]
+pub fn cached_stream_url(song_id: &str) -> String {
+    let mut url = reqwest::Url::parse("mde-cache:///stream")
+        .expect("the built-in cached stream URL must be valid");
+    url.query_pairs_mut().append_pair("id", song_id);
+    url.to_string()
+}
+
+fn is_cached_stream_url(url: &str) -> bool {
+    reqwest::Url::parse(url).map_or(false, |parsed| parsed.scheme() == CACHED_STREAM_SCHEME)
 }
 
 /// Should the queue driver begin pre-buffering the next track? True once
@@ -349,6 +393,31 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         track_at_frame(&starts, played)
     }
+
+    /// Current audible position within the track, independent of the decode
+    /// thread's buffered-ahead samples.
+    fn position_ms(&self) -> u64 {
+        if self.device_rate == 0 {
+            return 0;
+        }
+        let played = self.frames_played.load(Ordering::Relaxed);
+        let (_, start) = self.current_track();
+        played.saturating_sub(start).saturating_mul(1000) / u64::from(self.device_rate)
+    }
+
+    /// Drop samples that were decoded beyond the audible playhead before a
+    /// reconnect. The resumed HTTP request starts at the saved playhead, so
+    /// retaining the buffered tail would duplicate audio.
+    fn discard_buffered_tail(&self) {
+        self.ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.frames_enqueued.store(
+            self.frames_played.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// A cheap-to-clone, `Send + Sync` control surface for the engine. All
@@ -460,9 +529,44 @@ impl EngineHandle {
     /// driver can map the audible track back to the right queue index as gapless
     /// playback crosses track boundaries.
     pub fn play_from(&self, tracks: Vec<(String, SourceCodec)>, base_cursor: usize) {
+        self.play_from_candidates(
+            tracks
+                .into_iter()
+                .map(|(url, codec)| PlaybackTrack::single(url, codec))
+                .collect(),
+            base_cursor,
+        );
+    }
+
+    /// AIR-2.c — start logical queue tracks with ordered source fallbacks.
+    /// A fallback is attempted only when its predecessor fails before adding
+    /// samples, so the audible queue boundary remains one track per queue row.
+    pub fn play_from_candidates(&self, tracks: Vec<PlaybackTrack>, base_cursor: usize) {
+        let _ = self.play_from_candidates_internal(tracks, base_cursor, None);
+    }
+
+    /// Start logical queue tracks and request an initial finite-track position.
+    /// The seek is queued before the decode thread opens the source, so a
+    /// position-continuous handoff does not race the decoder's first packet.
+    /// Live/unseekable sources fail closed to their normal position-zero start.
+    pub fn play_from_candidates_at(
+        &self,
+        tracks: Vec<PlaybackTrack>,
+        base_cursor: usize,
+        position_ms: u64,
+    ) -> bool {
+        self.play_from_candidates_internal(tracks, base_cursor, Some(position_ms))
+    }
+
+    fn play_from_candidates_internal(
+        &self,
+        tracks: Vec<PlaybackTrack>,
+        base_cursor: usize,
+        initial_position_ms: Option<u64>,
+    ) -> bool {
         self.stop();
         if tracks.is_empty() {
-            return;
+            return false;
         }
         self.shared.stop.store(false, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
@@ -474,23 +578,72 @@ impl EngineHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.shared.play_base.store(base_cursor, Ordering::Relaxed);
-        self.shared.seek_ms.store(-1, Ordering::Relaxed);
+        let initial_seek = initial_position_ms
+            .filter(|position| *position <= i64::MAX as u64)
+            .map_or(-1, |position| position as i64);
+        self.shared.seek_ms.store(initial_seek, Ordering::Relaxed);
         self.shared.decode_done.store(false, Ordering::Relaxed);
 
         let shared = self.shared.clone();
         let handle = std::thread::Builder::new()
             .name("mde-musicd-decode".to_string())
             .spawn(move || {
-                for (url, codec) in tracks {
+                for track in tracks {
                     if shared.stop.load(Ordering::Relaxed) {
                         break;
                     }
                     // AIR-2.c — mark this track's start frame BEFORE feeding any
                     // of its samples, so the boundary map stays accurate.
                     shared.begin_track();
-                    if let Err(e) = decode_track(&url, codec, &shared) {
-                        tracing::warn!(error = %e, "decode_track failed");
+                    let mut played = false;
+                    for (url, codec) in track.candidates {
+                        if shared.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        shared.seekable.store(false, Ordering::Relaxed);
+                        let frames_before = shared.frames_enqueued.load(Ordering::Relaxed);
+                        match decode_track(&url, codec, &shared) {
+                            Ok(()) => {
+                                played = true;
+                                break;
+                            }
+                            Err(error) => {
+                                let emitted_audio = shared.frames_enqueued.load(Ordering::Relaxed)
+                                    > frames_before;
+                                if !should_try_fallback(emitted_audio) {
+                                    // A fallback starts at position zero. For a
+                                    // Subsonic stream, reconnect at the audible
+                                    // playhead instead; arbitrary live URLs cannot
+                                    // prove a resumable offset and remain fail-closed.
+                                    if reconnect_after_loss(&url, codec, &shared) {
+                                        played = true;
+                                        break;
+                                    }
+                                    tracing::warn!(
+                                        error = %error,
+                                        "source failed after audio started; bounded resume unavailable; advancing without replaying fallback"
+                                    );
+                                    played = true;
+                                    break;
+                                }
+                                tracing::warn!(
+                                    error = %error,
+                                    "source failed before audio started; trying next admitted source"
+                                );
+                            }
+                        }
                     }
+                    if !played {
+                        tracing::warn!("all admitted playback sources failed for one queue track");
+                    }
+                }
+                // A source loss, exhausted fallback set, or normal end leaves
+                // no audible work behind. Clear the playing flag before the
+                // daemon samples this state; otherwise a failed provider can
+                // leave a silent engine claiming mesh playback ownership.
+                if !shared.stop.load(Ordering::Relaxed) {
+                    shared.playing.store(false, Ordering::Relaxed);
+                    shared.seekable.store(false, Ordering::Relaxed);
                 }
                 shared.decode_done.store(true, Ordering::Relaxed);
             });
@@ -506,8 +659,10 @@ impl EngineHandle {
                 // Nothing will play — let the playhead/idle checks settle.
                 self.shared.decode_done.store(true, Ordering::Relaxed);
                 self.shared.playing.store(false, Ordering::Relaxed);
+                return false;
             }
         }
+        true
     }
 
     /// Pause output (the ring is preserved; [`resume`](Engine::resume)
@@ -591,13 +746,7 @@ impl EngineHandle {
     /// + the AIR-8 heartbeat report the right position. (AIR-2.c)
     #[must_use]
     pub fn position_ms(&self) -> u64 {
-        if self.shared.device_rate == 0 {
-            return 0;
-        }
-        let played = self.shared.frames_played.load(Ordering::Relaxed);
-        let (_, start) = self.shared.current_track();
-        let frames = played.saturating_sub(start);
-        frames * 1000 / u64::from(self.shared.device_rate)
+        self.shared.position_ms()
     }
 
     /// AIR-2.c — the index, relative to the track list handed to
@@ -747,9 +896,41 @@ fn apply_pending_seek(format: &mut dyn FormatReader, track_id: u32, shared: &Sha
 /// into the shared ring. Returns when the track is exhausted or `stop` is
 /// signalled.
 fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), String> {
+    decode_track_at(url, codec, shared, None)
+}
+
+/// Decode a track, optionally asking a Subsonic stream endpoint to begin at a
+/// bounded resume offset. A reconnect never falls back to the full cached
+/// source or overwrites the complete-track cache with an offset response.
+fn decode_track_at(
+    url: &str,
+    codec: SourceCodec,
+    shared: &Shared,
+    resume_ms: Option<u64>,
+) -> Result<(), String> {
+    let request_url = resume_ms
+        .and_then(|position| resume_stream_url(url, position))
+        .unwrap_or_else(|| url.to_owned());
+    if resume_ms.is_some() && request_url == url {
+        return Err(format!(
+            "source does not expose a resumable stream endpoint: {url}"
+        ));
+    }
+    let allow_cache = resume_ms.is_none();
     let cache_identity = stream_cache_identity(url, codec);
-    let source: Box<dyn symphonia::core::io::MediaSource> =
-        match reqwest::blocking::get(url).and_then(reqwest::blocking::Response::error_for_status) {
+    let source: Box<dyn symphonia::core::io::MediaSource> = if is_cached_stream_url(url) {
+        Box::new(Cursor::new(cached_track_source(
+            cache_identity.as_ref(),
+            &format!("offline cache unavailable for {url}"),
+            shared,
+        )?))
+    } else {
+        match fetch_stream_response(
+            &request_url,
+            resume_ms.map(|_| Duration::from_secs(RECONNECT_REQUEST_TIMEOUT_SECS)),
+        )
+        .and_then(|response| response.error_for_status().map_err(|error| error.to_string()))
+        {
             Ok(resp) => {
                 // AIR — radio/live streams are infinite (no Content-Length / chunked), so
                 // buffering the whole body with `.bytes()` never returns → "error decoding
@@ -764,41 +945,41 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
                 if finite {
                     let bytes = match resp.bytes() {
                         Ok(bytes) => bytes.to_vec(),
-                        Err(e) => cached_track_source(
+                        Err(e) if allow_cache => cached_track_source(
                             cache_identity.as_ref(),
-                            &format!("read body {url}: {e}"),
+                            &format!("read body {request_url}: {e}"),
                             shared,
                         )?,
+                        Err(e) => return Err(format!("read body {request_url}: {e}")),
                     };
-                    if let Some((song_id, suffix)) = &cache_identity {
-                        let _ = cache::write_cached_track(
-                            &cache::cache_dir(),
-                            song_id,
-                            suffix,
-                            &bytes,
-                            cache::now_ms(),
-                            false,
-                        );
+                    if allow_cache {
+                        if let Some((song_id, suffix)) = &cache_identity {
+                            let _ = cache::write_cached_track(
+                                &cache::cache_dir(),
+                                song_id,
+                                suffix,
+                                &bytes,
+                                cache::now_ms(),
+                                false,
+                            );
+                        }
                     }
                     Box::new(Cursor::new(bytes))
                 } else {
-                    // Stream: a producer thread copies the response into a pipe; the decoder
-                    // reads the pipe as an unseekable MediaSource (PipeReader is Send+Sync).
-                    let (reader, mut writer) =
-                        std::io::pipe().map_err(|e| format!("pipe {url}: {e}"))?;
-                    let mut resp = resp;
-                    std::thread::spawn(move || {
-                        let _ = std::io::copy(&mut resp, &mut writer);
-                    });
-                    Box::new(ReadOnlySource::new(reader))
+                    // Keep the response as the decoder's reader. A producer pipe would
+                    // turn a provider read error into an indistinguishable clean EOF by
+                    // discarding the producer's `io::copy` result.
+                    Box::new(ReadOnlySource::new(resp))
                 }
             }
-            Err(e) => Box::new(Cursor::new(cached_track_source(
+            Err(e) if allow_cache => Box::new(Cursor::new(cached_track_source(
                 cache_identity.as_ref(),
-                &format!("fetch {url}: {e}"),
+                &format!("fetch {request_url}: {e}"),
                 shared,
             )?)),
-        };
+            Err(e) => return Err(format!("fetch {request_url}: {e}")),
+        }
+    };
 
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
@@ -812,7 +993,7 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|e| format!("probe {url}: {e}"))?;
+        .map_err(|e| format!("probe {request_url}: {e}"))?;
     let mut format = probed.format;
 
     let track = format
@@ -840,7 +1021,7 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("decoder for {url}: {e}"))?;
+        .map_err(|e| format!("decoder for {request_url}: {e}"))?;
 
     let dst_rate = shared.device_rate;
     let dst_ch = shared.device_channels as usize;
@@ -853,10 +1034,13 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
         if apply_pending_seek(format.as_mut(), track_id, shared) {
             decoder.reset();
         }
-        // End of stream (UnexpectedEof) or a fatal reset — this track is
-        // done; the caller advances to the next one gaplessly.
-        let Ok(packet) = format.next_packet() else {
-            break;
+        // Symphonia represents a clean unseekable EOF as UnexpectedEof. Any
+        // other packet-read error is a provider/source failure and must reach
+        // the candidate policy above instead of silently advancing.
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(error) if is_clean_stream_eof(&error) => break,
+            Err(error) => return Err(format!("read {request_url}: {error}")),
         };
         if packet.track_id() != track_id {
             continue;
@@ -864,7 +1048,7 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
         let audio_ref = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(SymphoniaError::DecodeError(_)) => continue, // recoverable
-            Err(_) => break,
+            Err(error) => return Err(format!("decode {request_url}: {error}")),
         };
         let spec: SignalSpec = *audio_ref.spec();
         let cap = audio_ref.capacity() as u64;
@@ -893,6 +1077,103 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
         shared.push_samples(&mapped);
     }
     Ok(())
+}
+
+/// Fetch one stream response. Initial/radio requests intentionally retain the
+/// existing no-total-timeout behavior because an active live stream has no
+/// finite body. Resumed finite-track requests are different: a provider that
+/// accepts the reconnect and then stalls must not pin the decoder thread
+/// forever, so they get a bounded connect timeout and per-request deadline.
+fn fetch_stream_response(
+    request_url: &str,
+    reconnect_timeout: Option<Duration>,
+) -> Result<reqwest::blocking::Response, String> {
+    if let Some(timeout) = reconnect_timeout {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(RECONNECT_CONNECT_TIMEOUT_SECS))
+            .build()
+            .map_err(|error| format!("build reconnect HTTP client: {error}"))?;
+        client
+            .get(request_url)
+            .timeout(timeout)
+            .send()
+            .map_err(|error| error.to_string())
+    } else {
+        reqwest::blocking::get(request_url).map_err(|error| error.to_string())
+    }
+}
+
+/// Return a Subsonic stream URL with its integer-second resume offset, or
+/// `None` for arbitrary radio/direct URLs that cannot prove this contract.
+fn resume_stream_url(url: &str, position_ms: u64) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    let is_stream = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        == Some("stream");
+    let has_song_id = parsed
+        .query_pairs()
+        .any(|(key, value)| key == "id" && !value.trim().is_empty());
+    if !is_stream || !has_song_id {
+        return None;
+    }
+    let offset_secs = position_ms.saturating_add(999) / 1000;
+    let pairs = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "timeOffset")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for (key, value) in pairs {
+            query.append_pair(&key, &value);
+        }
+        query.append_pair("timeOffset", &offset_secs.to_string());
+    }
+    Some(parsed.to_string())
+}
+
+/// Retry a mid-track Subsonic stream from the audible playhead. The wait is
+/// bounded and interruptible so stop/shutdown remains responsive.
+fn reconnect_after_loss(url: &str, codec: SourceCodec, shared: &Shared) -> bool {
+    if resume_stream_url(url, shared.position_ms()).is_none() {
+        // A direct/radio URL cannot prove a position-continuous retry. Fail
+        // closed by dropping decoded-but-not-yet-audible samples; otherwise a
+        // later resume could emit stale audio and keep the engine active after
+        // the provider has already been lost.
+        shared.discard_buffered_tail();
+        return false;
+    }
+    for attempt in 0..MAX_MIDTRACK_RECONNECTS {
+        let delay_secs = backoff_delay_secs(attempt, DEFAULT_BASE_SECS, DEFAULT_CAP_SECS);
+        let deadline = Instant::now() + Duration::from_secs(delay_secs);
+        while Instant::now() < deadline {
+            if shared.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+        }
+        if shared.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let position_ms = shared.position_ms();
+        shared.discard_buffered_tail();
+        match decode_track_at(url, codec, shared, Some(position_ms)) {
+            Ok(()) => {
+                tracing::info!(attempt = attempt + 1, position_ms, "music stream resumed");
+                return true;
+            }
+            Err(error) => tracing::warn!(
+                attempt = attempt + 1,
+                position_ms,
+                error = %error,
+                "music stream reconnect attempt failed"
+            ),
+        }
+    }
+    false
 }
 
 fn cached_track_source(
@@ -980,8 +1261,10 @@ fn decode_opus(
             // is nothing more to discard.
             to_skip = 0;
         }
-        let Ok(packet) = format.next_packet() else {
-            break;
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(error) if is_clean_stream_eof(&error) => break,
+            Err(error) => return Err(format!("read opus stream: {error}")),
         };
         if packet.track_id() != track_id {
             continue;
@@ -1011,6 +1294,24 @@ fn decode_opus(
         shared.push_samples(&mapped);
     }
     Ok(())
+}
+
+/// Symphonia uses `UnexpectedEof` for a normal end of an unseekable stream.
+/// Other I/O errors carry provider/network failure and must remain visible to
+/// the caller so source fallback policy can distinguish them.
+fn is_clean_stream_eof(error: &SymphoniaError) -> bool {
+    matches!(
+        error,
+        SymphoniaError::IoError(io_error)
+            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Candidate fallbacks start from byte zero, so they are safe only when the
+/// failed source emitted no audio for this logical queue track.
+#[must_use]
+fn should_try_fallback(emitted_audio: bool) -> bool {
+    !emitted_audio
 }
 
 #[cfg(test)]
@@ -1088,6 +1389,628 @@ mod tests {
             None,
             "raw radio URLs are not finite Airsonic track cache entries"
         );
+    }
+
+    #[test]
+    fn cached_stream_url_round_trips_opaque_song_id_without_networking() {
+        let url = cached_stream_url("song/7?edition=lossless");
+        assert!(is_cached_stream_url(&url));
+        assert_eq!(
+            stream_cache_identity(&url, SourceCodec::Flac),
+            Some(("song/7?edition=lossless".to_string(), "flac".to_string()))
+        );
+    }
+
+    #[test]
+    fn packet_read_only_treats_unexpected_eof_as_clean_completion() {
+        let clean_eof = SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "end of stream",
+        ));
+        let provider_reset = SymphoniaError::IoError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "provider disconnected",
+        ));
+        assert!(is_clean_stream_eof(&clean_eof));
+        assert!(!is_clean_stream_eof(&provider_reset));
+        assert!(!is_clean_stream_eof(&SymphoniaError::DecodeError(
+            "malformed packet",
+        )));
+    }
+
+    #[test]
+    fn reconnect_request_timeout_rejects_a_provider_that_stalls_after_headers() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled provider");
+        let address = listener.local_addr().expect("stalled provider address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept reconnect");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write stalled headers");
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let url = format!("http://127.0.0.1:{}/rest/stream?id=song-7", address.port());
+        let result = fetch_stream_response(&url, Some(Duration::from_millis(50)))
+            .and_then(|response| response.error_for_status().map_err(|error| error.to_string()))
+            .and_then(|mut response| {
+                let mut body = Vec::new();
+                response
+                    .read_to_end(&mut body)
+                    .map(|_| body)
+                    .map_err(|error| error.to_string())
+            });
+
+        assert!(result.is_err(), "a stalled resumed body must fail boundedly");
+        server.join().expect("stalled provider completed");
+    }
+
+    #[test]
+    fn fallback_is_bounded_to_failures_before_audio() {
+        assert!(should_try_fallback(false));
+        assert!(
+            !should_try_fallback(true),
+            "replaying a partially-heard track from byte zero would duplicate audio"
+        );
+    }
+
+    #[test]
+    fn unresumable_provider_loss_discards_buffered_audio() {
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::from([0.75, -0.75, 0.5, -0.5])),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            frames_played: AtomicU64::new(2_400),
+            frames_enqueued: AtomicU64::new(4_800),
+            track_starts: Mutex::new(vec![0]),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+        });
+
+        assert!(!reconnect_after_loss(
+            "https://radio.example/live.mp3",
+            SourceCodec::Mp3,
+            &shared
+        ));
+        assert!(
+            shared
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "unresumable loss must not leave stale decoded samples"
+        );
+        assert_eq!(
+            shared.frames_enqueued.load(Ordering::Relaxed),
+            2_400,
+            "the buffered-frame boundary must rewind to the audible playhead"
+        );
+    }
+
+    #[test]
+    fn provider_failure_clears_playing_authority_after_decode_exits() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed provider");
+        let address = listener.local_addr().expect("failed provider address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept failed provider");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write failed provider response");
+        });
+
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::new()),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(true),
+            frames_played: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(Vec::new()),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+        });
+        let handle = EngineHandle {
+            shared: shared.clone(),
+            decode: Arc::new(Mutex::new(None)),
+        };
+        handle.play_from_candidates(
+            vec![PlaybackTrack::single(
+                format!(
+                    "http://127.0.0.1:{}/rest/stream?id=authority-loss-{}",
+                    address.port(),
+                    address.port()
+                ),
+                SourceCodec::Unknown,
+            )],
+            0,
+        );
+
+        for _ in 0..200 {
+            if shared.decode_done.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shared.decode_done.load(Ordering::Relaxed));
+        assert!(!handle.is_playing(), "failed provider must not retain ownership");
+        assert!(!handle.is_active(), "failed provider must leave no active audio");
+
+        handle.stop();
+        server.join().expect("failed provider fixture completed");
+    }
+
+    #[test]
+    fn resumable_stream_url_preserves_identity_and_uses_bounded_offset() {
+        let url = "http://gateway.mesh:4040/mde/airsonic/source-1/rest/stream?u=alice&id=song%2F7&v=1.16.1";
+        let resumed = resume_stream_url(url, 42_001).expect("Subsonic stream is resumable");
+        assert!(resumed.contains("id=song%2F7"));
+        assert!(resumed.contains("timeOffset=43"));
+        assert_eq!(
+            resume_stream_url("https://radio.example/live.mp3", 42_000),
+            None
+        );
+    }
+
+    #[test]
+    fn reconnect_budget_is_bounded_and_interruptible() {
+        assert_eq!(MAX_MIDTRACK_RECONNECTS, 3);
+        assert_eq!(
+            backoff_delay_secs(0, DEFAULT_BASE_SECS, DEFAULT_CAP_SECS),
+            1
+        );
+        assert_eq!(
+            backoff_delay_secs(2, DEFAULT_BASE_SECS, DEFAULT_CAP_SECS),
+            4
+        );
+    }
+
+    #[test]
+    fn two_catalog_outage_uses_next_admitted_source_once_without_duplicate_boundary() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).expect("fixture request read");
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                assert!(bytes.len() < 16 * 1024, "fixture request remains bounded");
+            }
+            String::from_utf8(bytes).expect("fixture request is UTF-8")
+        }
+
+        fn wav_fixture() -> Vec<u8> {
+            let frames = 1_000_u32;
+            let channels = 2_u16;
+            let sample_rate = 48_000_u32;
+            let bits = 16_u16;
+            let block_align = channels * (bits / 8);
+            let data_len = frames * u32::from(block_align);
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16_u32.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&channels.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+            wav.extend_from_slice(&block_align.to_le_bytes());
+            wav.extend_from_slice(&bits.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for frame in 0..frames {
+                let sample = if frame % 2 == 0 {
+                    2_000_i16
+                } else {
+                    -2_000_i16
+                };
+                wav.extend_from_slice(&sample.to_le_bytes());
+                wav.extend_from_slice(&(-sample).to_le_bytes());
+            }
+            wav
+        }
+
+        let audio = wav_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind catalog fixture");
+        let address = listener.local_addr().expect("catalog fixture address");
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept catalog request");
+                let request = read_request(&mut stream);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("request path")
+                    .to_owned();
+                let reply = if path == "/catalog-a" {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    assert_eq!(path, "/catalog-b");
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        audio.len(),
+                        ""
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&audio);
+                    response
+                };
+                stream.write_all(&reply).expect("write catalog response");
+                paths.push(path);
+            }
+            paths
+        });
+
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::new()),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(true),
+            frames_played: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(Vec::new()),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 1_000_000,
+            play_base: AtomicUsize::new(0),
+        });
+        let handle = EngineHandle {
+            shared: shared.clone(),
+            decode: Arc::new(Mutex::new(None)),
+        };
+        handle.play_from_candidates(
+            vec![PlaybackTrack {
+                candidates: vec![
+                    (
+                        format!("http://127.0.0.1:{}/catalog-a", address.port()),
+                        SourceCodec::Wav,
+                    ),
+                    (
+                        format!("http://127.0.0.1:{}/catalog-b", address.port()),
+                        SourceCodec::Wav,
+                    ),
+                ],
+            }],
+            0,
+        );
+
+        for _ in 0..200 {
+            if shared.decode_done.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shared.decode_done.load(Ordering::Relaxed));
+        assert!(
+            shared.frames_enqueued.load(Ordering::Relaxed) > 0,
+            "the healthy second catalog must produce decoded audio"
+        );
+        assert_eq!(
+            shared
+                .track_starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[0],
+            "two source candidates still represent one logical queue track"
+        );
+        handle.stop();
+        assert_eq!(
+            server.join().expect("catalog fixture completed"),
+            vec!["/catalog-a", "/catalog-b"]
+        );
+    }
+
+    #[test]
+    fn midstream_reset_reconnects_at_audible_offset_and_discards_ahead_buffer() {
+        use socket2::Socket;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        fn read_request(stream: &mut TcpStream) -> String {
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = stream
+                    .read(&mut buf)
+                    .expect("reconnect fixture request read");
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                assert!(bytes.len() < 16 * 1024, "reconnect request remains bounded");
+            }
+            String::from_utf8(bytes).expect("reconnect request is UTF-8")
+        }
+
+        fn wav_fixture(frames: u32, sample: i16) -> Vec<u8> {
+            let channels = 2_u16;
+            let sample_rate = 48_000_u32;
+            let bits = 16_u16;
+            let block_align = channels * (bits / 8);
+            let data_len = frames * u32::from(block_align);
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16_u32.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&channels.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+            wav.extend_from_slice(&block_align.to_le_bytes());
+            wav.extend_from_slice(&bits.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for _ in 0..frames {
+                wav.extend_from_slice(&sample.to_le_bytes());
+                wav.extend_from_slice(&(-sample).to_le_bytes());
+            }
+            wav
+        }
+
+        let first = wav_fixture(9_600, 1_000);
+        let continuation = wav_fixture(2_400, 12_000);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reconnect fixture");
+        let address = listener.local_addr().expect("reconnect fixture address");
+        let server = thread::spawn(move || {
+            let (mut initial, _) = listener.accept().expect("accept initial stream");
+            let request = read_request(&mut initial);
+            assert!(request.contains("/rest/stream?id=song-7"));
+            initial
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .expect("write initial headers");
+            initial
+                .write_all(&first[..44 + 4_800 * 4])
+                .expect("write partial initial audio");
+            initial.flush().expect("flush partial initial audio");
+            let reset_socket = Socket::from(initial);
+            reset_socket
+                .set_linger(Some(Duration::ZERO))
+                .expect("arm reset on initial stream");
+            drop(reset_socket);
+
+            let (mut resumed, _) = listener.accept().expect("accept resumed stream");
+            let request = read_request(&mut resumed);
+            assert!(
+                request.contains("id=song-7"),
+                "song identity must be retained"
+            );
+            assert!(
+                request.contains("timeOffset=1"),
+                "reconnect must use the audible playhead's bounded second offset, request={request:?}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                continuation.len()
+            );
+            resumed
+                .write_all(response.as_bytes())
+                .expect("write resumed headers");
+            resumed
+                .write_all(&continuation)
+                .expect("write resumed audio");
+            vec![request]
+        });
+
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::new()),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            frames_played: AtomicU64::new(2_400),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(Vec::new()),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 1_000_000,
+            play_base: AtomicUsize::new(0),
+        });
+        shared.begin_track();
+
+        let url = format!("http://127.0.0.1:{}/rest/stream?id=song-7", address.port());
+        let initial_result = decode_track(&url, SourceCodec::Wav, &shared);
+        assert!(
+            initial_result.is_err(),
+            "the reset source must reach bounded reconnect handling"
+        );
+        assert!(
+            shared.frames_enqueued.load(Ordering::Relaxed) > 2_400,
+            "the failed stream must have produced buffered-ahead audio"
+        );
+        assert_eq!(
+            shared.position_ms(),
+            50,
+            "fixture playhead before reconnect"
+        );
+
+        assert!(reconnect_after_loss(&url, SourceCodec::Wav, &shared));
+        assert_eq!(shared.position_ms(), 50);
+        assert_eq!(
+            shared.frames_enqueued.load(Ordering::Relaxed),
+            4_800,
+            "discarding the 2,400-frame ahead tail then adding 2,400 resumed frames"
+        );
+        let ring = shared
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!ring.is_empty(), "resumed stream must enqueue audio");
+        assert!(
+            ring.iter().any(|sample| sample.abs() > 0.3),
+            "resumed samples must be audible rather than silence"
+        );
+        drop(ring);
+        assert_eq!(server.join().expect("reconnect fixture completed").len(), 1);
+    }
+
+    #[test]
+    fn finite_handoff_start_seeks_before_decoding_audio() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        fn read_request(stream: &mut TcpStream) {
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).expect("handoff fixture request read");
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                assert!(bytes.len() < 16 * 1024, "handoff request remains bounded");
+            }
+        }
+
+        fn wav_fixture(frames: u32) -> Vec<u8> {
+            let channels = 2_u16;
+            let sample_rate = 48_000_u32;
+            let bits = 16_u16;
+            let block_align = channels * (bits / 8);
+            let data_len = frames * u32::from(block_align);
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16_u32.to_le_bytes());
+            wav.extend_from_slice(&1_u16.to_le_bytes());
+            wav.extend_from_slice(&channels.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+            wav.extend_from_slice(&block_align.to_le_bytes());
+            wav.extend_from_slice(&bits.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for frame in 0..frames {
+                let sample = if frame < 2_400 { 1_000_i16 } else { 12_000_i16 };
+                wav.extend_from_slice(&sample.to_le_bytes());
+                wav.extend_from_slice(&(-sample).to_le_bytes());
+            }
+            wav
+        }
+
+        let audio = wav_fixture(4_800);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind handoff fixture");
+        let address = listener.local_addr().expect("handoff fixture address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept handoff source");
+            read_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                audio.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write handoff headers");
+            stream.write_all(&audio).expect("write handoff audio");
+        });
+
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(VecDeque::new()),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(true),
+            frames_played: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(Vec::new()),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: 48_000,
+            device_channels: 2,
+            target_ring: 1_000_000,
+            play_base: AtomicUsize::new(0),
+        });
+        let handle = EngineHandle {
+            shared: shared.clone(),
+            decode: Arc::new(Mutex::new(None)),
+        };
+        let url = format!(
+            "http://127.0.0.1:{}/rest/stream?id=handoff-song",
+            address.port()
+        );
+        assert!(handle.play_from_candidates_at(
+            vec![PlaybackTrack::single(url, SourceCodec::Wav)],
+            0,
+            50
+        ));
+        for _ in 0..200 {
+            if shared.decode_done.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shared.decode_done.load(Ordering::Relaxed));
+        assert_eq!(shared.position_ms(), 50);
+        assert_eq!(
+            shared.frames_played.load(Ordering::Relaxed),
+            ms_to_frames(50, 48_000)
+        );
+        assert!(
+            shared.frames_enqueued.load(Ordering::Relaxed) > 2_400,
+            "target decoder must enqueue audio after the requested handoff position"
+        );
+        assert!(
+            shared
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|sample| sample.abs() > 0.3),
+            "target decoder must produce non-silent resumed audio"
+        );
+        handle.stop();
+        server.join().expect("handoff fixture completed");
     }
 
     #[test]

@@ -7,9 +7,13 @@ dedicated `browser-vm-chromium` image. The image verifier is a static contents
 gate; it does not claim that a VM has booted or that a VDI endpoint is live.
 
 Build a signed/recorded ext4-rootfs disk artifact on the build farm with the Fedora-44
-`magic-mesh-lighthouse` guest RPM, then set `browser_base_image_source` to the resulting qcow2 and
-pass the resulting image digest in the typed `browser-provision` request. A
-missing or malformed digest is refused before desired state is written.
+`magic-mesh-lighthouse` guest RPM, publish it into the promoted mesh image
+catalog, then use its `browser-vm-chromium:VERSION` reference with
+`request-browser-vm-workload`. The helper sends exactly one typed
+`StartAndAttach` request to `action/workload/operation`; WorkloadCompute owns
+domain lifecycle and the authenticated QEMU Display1 lease. A Browser launcher
+must never publish the retired `browser-provision` action or connect directly
+to a SPICE endpoint.
 
 When `--disk qcow2` or `--disk raw` is requested, the image builder binds the
 output virtual size to `BROWSER_VM_DISK_GB` from `profile.env` (currently 64
@@ -26,6 +30,15 @@ new base as `root:qemu` mode `0440`, restores its libvirt SELinux label when
 changes. It accepts no guest password, token, or credential. Publication does
 not attach the base directly: the domain must use a separate writable qcow2
 overlay whose absolute immediate backing filename is the published base.
+
+Existing Browser VMs are migrated with
+`migrate-display1-domain.sh apply --target HOST`. The migration backs up the
+inactive libvirt XML, preserves every guest disk/source unchanged, adds QEMU
+Display1 and virtio video, and retains SPICE only as a loopback recovery
+transport. If the guest is running, it requests a normal shutdown and exits
+without changing the definition when that shutdown does not complete; it never
+force-destroys a live VM. The converted guest remains stopped, and the next
+Browser launch uses the canonical `StartAndAttach` path.
 
 `profile.env` is the small, reviewable contract at the Construct/Browser VM
 boundary. It identifies the guest image and immutable source provenance

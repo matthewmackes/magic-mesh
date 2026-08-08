@@ -46,7 +46,17 @@ SH
 cat > "$MOCK_BIN/etcdctl" <<'SH'
 #!/usr/bin/env bash
 case " $* " in
-    *" endpoint health "*) exit 0 ;;
+    *" endpoint health "*)
+        case "${TEST_ETCD_HEALTH:-healthy}" in
+            first-down)
+                case "$*" in
+                    *"--endpoints=https://10.42.0.1:2379"*) exit 1 ;;
+                esac
+                ;;
+            all-down) exit 1 ;;
+        esac
+        exit 0
+        ;;
     *" put "*)
         [ "${TEST_ETCD_MODE:-authoritative}" != offline ]
         ;;
@@ -284,6 +294,30 @@ run_health_case stale-unshared no-alert "$HEALTHY_CONNECTIONS"
 run_health_case disconnected-folder-peer alert "$DISCONNECTED_CONNECTIONS"
 printf 'ok: health ignores stale/unshared globals and accepts all connected folder peers\n'
 printf 'ok: health alerts 1/2 when a real managed-folder peer is disconnected\n'
+
+# A single slow/unreachable member must not make the watchdog restart a healthy
+# local etcd while another coordination endpoint answers.
+ENDPOINTS_MULTI="$TEST_ROOT/endpoints-multi"
+printf 'https://10.42.0.1:2379\nhttps://10.42.0.2:2379\n' > "$ENDPOINTS_MULTI"
+HEALTH_ENDPOINT_CASE="$TEST_ROOT/health-endpoint-any"
+mkdir -p "$HEALTH_ENDPOINT_CASE/nebula" "$HEALTH_ENDPOINT_CASE/run" "$HEALTH_ENDPOINT_CASE/home"
+: > "$HEALTH_ENDPOINT_CASE/nebula/host.crt"
+printf 'lighthouse:\n  am_lighthouse: true\n' > "$HEALTH_ENDPOINT_CASE/nebula/config.yaml"
+printf 'role = "Workstation"\n' > "$HEALTH_ENDPOINT_CASE/role.toml"
+ENDPOINT_CALLS="$HEALTH_ENDPOINT_CASE/calls.log"
+: > "$ENDPOINT_CALLS"
+TEST_CALL_LOG="$ENDPOINT_CALLS" TEST_ETCD_MODE=authoritative TEST_ETCD_HEALTH=first-down \
+TEST_GLOBAL_DEVICES_FILE="$GLOBAL_DEVICES_FILE" TEST_FOLDER_DEVICES_FILE="$FOLDER_DEVICES_FILE" \
+TEST_SYSTEM_FILE="$SYSTEM_FILE" TEST_CONNECTIONS_FILE="$HEALTHY_CONNECTIONS" \
+MCNF_NEBULA_DIR="$HEALTH_ENDPOINT_CASE/nebula" MCNF_ROLE_FILE="$HEALTH_ENDPOINT_CASE/role.toml" \
+MCNF_HEALTH_RUN_DIR="$HEALTH_ENDPOINT_CASE/run" MCNF_ETCD_ENDPOINTS_FILE="$ENDPOINTS_MULTI" \
+MCNF_SYNCTHING_HOME="$HEALTH_ENDPOINT_CASE/home" MESH_ALERT_BIN="$MOCK_BIN/mesh-alert" \
+    "$HEALTH" >"$HEALTH_ENDPOINT_CASE/stdout" 2>"$HEALTH_ENDPOINT_CASE/stderr"
+if grep -q 'systemctl restart etcd.service' "$ENDPOINT_CALLS"; then
+    printf 'watchdog restarted etcd despite a healthy coordination endpoint\n' >&2
+    exit 1
+fi
+printf 'ok: health leaves etcd alone when any coordination endpoint is healthy\n'
 
 RECONCILE_GLOBAL="$TEST_ROOT/reconcile-global.txt"
 RECONCILE_FOLDER="$TEST_ROOT/reconcile-folder.txt"

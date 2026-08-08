@@ -62,6 +62,17 @@ trap 'handle_shutdown TERM' TERM
 trap 'handle_shutdown INT' INT
 trap 'handle_shutdown HUP' HUP
 
+# Sway has to be live, the session bus/portal and PipeWire have to answer, and
+# the admitted Flatpak must be installed before this launcher can publish a
+# connected state. The probe writes an unavailable record and exits non-zero
+# when any guest-owned prerequisite is absent; there is no host fallback.
+if ! preflight_report=$(/usr/local/libexec/mcnf-app-vm-runtime-probe); then
+    printf '%s\n' "$preflight_report" >&2
+    publish_runtime unavailable "guest runtime preflight unavailable"
+    exit 1
+fi
+printf '%s\n' "$preflight_report" >&2
+
 set +e
 /usr/bin/flatpak run --system curated "$app_id" &
 app_pid=$!

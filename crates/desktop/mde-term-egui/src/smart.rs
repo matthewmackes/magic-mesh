@@ -7,8 +7,8 @@
 //!   grows the selection to the right *thing*: a URL, a filesystem path, or a
 //!   word (double-click); [`line_span`] takes the whole line (triple-click).
 //! * **surface routing** — [`detect_launch`] classifies the token under the
-//!   pointer and, per design lock Q12, routes a URL to the **Bookmarks** mesh
-//!   browser and a path to the **Files** surface. The route is dispatched over
+//!   pointer and, per design lock Q12, routes a URL to the **Browser** surface
+//!   and a path to the **Files** surface. The route is dispatched over
 //!   the mesh Bus through the injectable [`LaunchBus`] seam (mirrors
 //!   [`crate::remote::PtyBus`]): production publishes a typed
 //!   [`OPEN_TOPIC`] request; tests record it.
@@ -39,8 +39,8 @@ pub enum SmartKind {
 /// Where a detected token opens — the routing half of the smart clipboard.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LaunchRoute {
-    /// A URL → the Bookmarks mesh browser.
-    Bookmarks(String),
+    /// A URL → the Browser surface, which owns the bookmark/provider UI.
+    Browser(String),
     /// A filesystem path → the Files surface.
     Files(String),
 }
@@ -55,7 +55,7 @@ pub const OPEN_TOPIC: &str = "action/desktop/open";
 /// wire shapes.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct LaunchRequest {
-    /// The target surface: `"bookmarks"` or `"files"`.
+    /// The target surface: `"browser"` or `"files"`.
     pub surface: String,
     /// The URL or path to open there.
     pub target: String,
@@ -66,8 +66,8 @@ impl LaunchRequest {
     #[must_use]
     pub fn of(route: &LaunchRoute) -> Self {
         match route {
-            LaunchRoute::Bookmarks(url) => Self {
-                surface: "bookmarks".to_string(),
+            LaunchRoute::Browser(url) => Self {
+                surface: "browser".to_string(),
                 target: url.clone(),
             },
             LaunchRoute::Files(path) => Self {
@@ -182,7 +182,7 @@ pub fn line_span(row: &[char]) -> Option<(usize, usize)> {
 }
 
 /// The launch route for a click at `col`, or `None` when the token is a plain
-/// word (or whitespace). A URL routes to Bookmarks, a path to Files.
+/// word (or whitespace). A URL routes to Browser, a path to Files.
 #[must_use]
 pub fn detect_launch(row: &[char], col: usize) -> Option<LaunchRoute> {
     let (kind, start, end) = smart_span(row, col)?;
@@ -194,7 +194,7 @@ pub fn detect_launch(row: &[char], col: usize) -> Option<LaunchRoute> {
 #[must_use]
 pub fn route(kind: SmartKind, text: &str) -> Option<LaunchRoute> {
     match kind {
-        SmartKind::Url => Some(LaunchRoute::Bookmarks(text.to_string())),
+        SmartKind::Url => Some(LaunchRoute::Browser(text.to_string())),
         SmartKind::Path => Some(LaunchRoute::Files(text.to_string())),
         SmartKind::Word | SmartKind::Line => None,
     }
@@ -335,7 +335,7 @@ mod tests {
         let r = row("open https://a.b/c or /etc/hosts");
         assert_eq!(
             detect_launch(&r, 8),
-            Some(LaunchRoute::Bookmarks("https://a.b/c".to_string()))
+            Some(LaunchRoute::Browser("https://a.b/c".to_string()))
         );
         assert_eq!(
             detect_launch(&r, 24),
@@ -349,7 +349,7 @@ mod tests {
     fn route_maps_kinds_to_surfaces() {
         assert_eq!(
             route(SmartKind::Url, "https://x"),
-            Some(LaunchRoute::Bookmarks("https://x".to_string()))
+            Some(LaunchRoute::Browser("https://x".to_string()))
         );
         assert_eq!(
             route(SmartKind::Path, "/x"),
@@ -361,8 +361,8 @@ mod tests {
 
     #[test]
     fn launch_request_encodes_the_surface_and_target() {
-        let req = LaunchRequest::of(&LaunchRoute::Bookmarks("https://x".into()));
-        assert_eq!(req.surface, "bookmarks");
+        let req = LaunchRequest::of(&LaunchRoute::Browser("https://x".into()));
+        assert_eq!(req.surface, "browser");
         assert_eq!(req.target, "https://x");
         let req = LaunchRequest::of(&LaunchRoute::Files("/x".into()));
         assert_eq!(req.surface, "files");
@@ -411,7 +411,7 @@ mod tests {
 
         // No-Bus node degrades to an honest error, never a panic.
         assert!(BusLaunchClient::with_root(None)
-            .open(&LaunchRoute::Bookmarks("https://x".into()))
+            .open(&LaunchRoute::Browser("https://x".into()))
             .is_err());
 
         std::fs::remove_dir_all(&dir).ok();

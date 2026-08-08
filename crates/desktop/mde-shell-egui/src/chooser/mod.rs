@@ -54,7 +54,9 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mackes_mesh_types::vdi_session::BrowserVmTransport;
+use mackes_mesh_types::workloads::{
+    WorkloadBackend, WorkloadOperationAction, WorkloadProfile,
+};
 use mde_egui::egui::{
     self, FontId, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
 };
@@ -433,23 +435,18 @@ fn group_by_node(sources: &[DesktopSource]) -> Vec<(&str, Vec<&DesktopSource>)> 
 
 // ─────────────────── CHOOSER-7: local-VM power controls ───────────────────
 
-/// The `action/vm/lifecycle` request topic the MV-3 `vm_lifecycle` worker drains
-/// (flat; host-targeted by the request's `host` field). MUST equal
-/// `mackesd::workers::vm_lifecycle::ACTION_TOPIC` (cross-checked in tests).
-const LIFECYCLE_TOPIC: &str = "action/vm/lifecycle";
-
-/// A power action a local-VM card button drives onto the mackesd `vm_lifecycle`
-/// worker. The card renders only the ops valid for the VM's live power state
+/// A power action a local-VM card button drives onto the typed Workload
+/// authority. The card renders only the ops valid for the VM's live power state
 /// (§7 — never a button that can't act).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PowerOp {
-    /// Boot a shut-off VM (`vm_lifecycle` Start).
+    /// Boot a shut-off VM through the typed Workload authority.
     Start,
-    /// Gracefully stop a running/paused VM (`vm_lifecycle` Stop, non-force).
+    /// Gracefully stop a running/paused VM.
     Stop,
-    /// Suspend a running VM (`vm_lifecycle` Pause).
+    /// Suspend a running VM.
     Pause,
-    /// Wake a paused VM (`vm_lifecycle` Resume).
+    /// Wake a paused VM.
     Resume,
 }
 
@@ -474,105 +471,14 @@ impl PowerOp {
         }
     }
 
-    /// The host-targeted `vm_lifecycle` request this op maps to. `host` is the VM's
-    /// node (the worker there acts only on requests that `targets()` its id).
-    fn to_request(self, host: &str, name: &str) -> VmPowerRequest {
-        let host = host.to_string();
-        let name = name.to_string();
+    /// Map the card operation to the sole Workload action contract.
+    const fn workload_action(self) -> WorkloadOperationAction {
         match self {
-            Self::Start => VmPowerRequest::Start { host, name },
-            Self::Stop => VmPowerRequest::Stop {
-                host,
-                name,
-                force: false,
-            },
-            Self::Pause => VmPowerRequest::Pause { host, name },
-            Self::Resume => VmPowerRequest::Resume { host, name },
+            Self::Start => WorkloadOperationAction::Start,
+            Self::Stop => WorkloadOperationAction::Stop,
+            Self::Pause => WorkloadOperationAction::Pause,
+            Self::Resume => WorkloadOperationAction::Resume,
         }
-    }
-}
-
-/// The shell-side mirror of the verbs the CHOOSER-7 card power controls emit onto
-/// the MV-3 `vm_lifecycle` worker — internally `op`-tagged exactly like the
-/// worker's `LifecycleAction` (`#[serde(tag = "op", rename_all = "snake_case")]`),
-/// so its `parse_action` accepts the body verbatim. This reuses the worker + its
-/// topic (§6), mirroring them locally like `datacenter::Lifecycle` /
-/// `discovery::ConnectRequest` do — the shell leans inward only on `mde-bus`,
-/// never the daemon crate. `host` is always a concrete node id.
-#[derive(Debug, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum VmPowerRequest {
-    /// Boot a defined VM.
-    Start { host: String, name: String },
-    /// Stop a running/paused VM (graceful unless `force`).
-    Stop {
-        host: String,
-        name: String,
-        force: bool,
-    },
-    /// Suspend a running VM.
-    Pause { host: String, name: String },
-    /// Resume a suspended VM.
-    Resume { host: String, name: String },
-}
-
-impl VmPowerRequest {
-    /// Serialize to the request body. A fixed, derive-backed shape → serialization
-    /// cannot realistically fail; an empty body (never produced here) is simply
-    /// rejected by the worker's parser.
-    fn to_body(&self) -> String {
-        let mut body = serde_json::to_value(self).unwrap_or_default();
-        if let Some(object) = body.as_object_mut() {
-            object.insert(
-                "schema_version".to_string(),
-                serde_json::Value::from(mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION),
-            );
-        }
-        body.to_string()
-    }
-
-    /// Capability binding shared with `vm_lifecycle`. The body digest also
-    /// binds `force` and every other request field.
-    fn authorization_context(&self) -> (&'static str, &str, &str) {
-        match self {
-            Self::Start { host, name } => ("vm-start", host, name),
-            Self::Stop { host, name, .. } => ("vm-stop", host, name),
-            Self::Pause { host, name } => ("vm-pause", host, name),
-            Self::Resume { host, name } => ("vm-resume", host, name),
-        }
-    }
-}
-
-/// Publish a VM power request to `action/vm/lifecycle` via the persist-first path
-/// (`mde-bus publish`'s own path): recorded locally + replicated to the target
-/// node by the Bus. Records any failure in `last_error` — never panics. The exact
-/// persist-write discipline as `discovery::publish` / `datacenter::publish` (§6).
-fn publish_power(bus_root: Option<&Path>, last_error: &mut Option<String>, req: &VmPowerRequest) {
-    let Some(root) = bus_root else {
-        *last_error = Some("No mesh Bus directory — VM power actions unavailable.".to_string());
-        return;
-    };
-    let unsigned = req.to_body();
-    let (verb, node, target) = req.authorization_context();
-    let body = match crate::iac::authorize_root_mutation_body(&unsigned, verb, node, target) {
-        Ok(body) => body,
-        Err(error) => {
-            *last_error = Some(format!("VM power authorization unavailable: {error}"));
-            return;
-        }
-    };
-    // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
-    // Persist::open because it needs the write Result to set `last_error`.
-    match mde_bus::persist::Persist::open(root.to_path_buf()).and_then(|p| {
-        p.write(
-            LIFECYCLE_TOPIC,
-            mde_bus::hooks::config::Priority::Default,
-            None,
-            Some(&body),
-        )
-    }) {
-        Ok(_) => *last_error = None,
-        Err(e) => *last_error = Some(format!("Couldn't publish VM power action: {e}")),
     }
 }
 
@@ -635,15 +541,33 @@ fn local_hypervisor_gate(lanes: &[LaneStatus]) -> Option<String> {
     }
 }
 
-/// Build the host-targeted `vm_lifecycle` request a card power click drives — the
-/// pure card→worker mapping. `None` when the source isn't a **local** VM (a peer
-/// VM is powered from its own node, not from here) or has left the roster.
-fn build_power_request(sources: &[DesktopSource], id: &str, op: PowerOp) -> Option<VmPowerRequest> {
-    let source = sources.iter().find(|s| s.id == id)?;
+/// Build the typed Workload request a card power click drives. `None` when the
+/// source isn't a **local** VM (a peer VM is powered from its own node, not from
+/// here) or has left the roster.
+fn build_power_request(
+    sources: &[DesktopSource],
+    id: &str,
+    op: PowerOp,
+    expected_generation: u64,
+    now_ms: u64,
+) -> Result<Option<mackes_mesh_types::workloads::WorkloadOperationRequest>, String> {
+    let Some(source) = sources.iter().find(|s| s.id == id) else {
+        return Ok(None);
+    };
     if source.origin != SourceOrigin::LocalVm {
-        return None;
+        return Ok(None);
     }
-    Some(op.to_request(&source.node, &source.name))
+    crate::workload_api::request(
+        &source.id,
+        &source.node,
+        WorkloadBackend::LibvirtVirtqemud,
+        WorkloadProfile::Small.resources(),
+        op.workload_action(),
+        None,
+        expected_generation,
+        now_ms,
+    )
+    .map(Some)
 }
 
 // ─────────────── CHOOSER-8: card actions + find + offline states ───────────────
@@ -668,8 +592,9 @@ const REFRESH_TOPIC: &str = "action/desktops/refresh";
 
 /// The shell-side mirror of the worker's `ManualSource` — the typed body of an
 /// `action/desktops/add-source` request (§9: host + port + protocol, never a
-/// command string). Mirrored locally like [`VmPowerRequest`], so the worker's
-/// `parse_add_source` accepts it verbatim (§6 — the Bus JSON is the seam). An
+/// command string). Mirrored locally like the other typed shell request
+/// shapes, so the worker's `parse_add_source` accepts it verbatim (§6 — the Bus
+/// JSON is the seam). An
 /// empty `name` is skipped so the worker defaults it to `host:port`.
 #[derive(Debug, Serialize)]
 struct AddSourceRequest {
@@ -1278,15 +1203,6 @@ struct ConnectDraft {
     cred_prompt: Option<CredentialPrompt>,
 }
 
-/// A Browser VM guest-login prompt retained only until the operator submits or
-/// cancels it. The target is kept beside the prompt so the resulting auth can
-/// re-enter the typed Browser VM VDI path without putting a credential in the
-/// Workloads/session record.
-struct BrowserVmAuthPrompt {
-    connect: crate::web::BrowserVmConnect,
-    prompt: CredentialPrompt,
-}
-
 /// The Chooser's state: the injectable roster read seam, the last published
 /// roster, the auto-popup **seen set** (lock 1), the pending CHOOSER-4 connect
 /// picker, and the one-shot connect hand-off the shell drains into
@@ -1328,10 +1244,6 @@ pub(crate) struct ChooserState {
     /// The connect the operator is configuring in the always-ask picker (lock 6/9/
     /// 12) — `None` when no card is being connected.
     pending: Option<ConnectDraft>,
-    /// A one-time guest-login prompt for the typed Browser VM shortcut. This is
-    /// separate from the external-source picker draft because Browser bypasses
-    /// the generic Chooser card UI while still using the same auth seam.
-    browser_vm_prompt: Option<BrowserVmAuthPrompt>,
     /// The request chosen this frame, if a connect fired — drained by the shell
     /// via [`Self::take_connect`] and handed to [`crate::vdi::VdiState`].
     connect: Option<ConnectRequest>,
@@ -1372,13 +1284,21 @@ pub(crate) struct ChooserState {
 
 impl Default for ChooserState {
     fn default() -> Self {
-        Self::with_client(
+        let bus_root = mde_bus::client_data_dir();
+        let mut state = Self::with_client(
             Box::new(BusDesktopSources::from_env()),
-            mde_bus::client_data_dir(),
+            bus_root.clone(),
             crate::discovery::local_peer(),
             Box::new(MeshCredentialStore),
             ChooserPrefs::open_default(),
-        )
+        );
+        // Production startup receives the approved publisher key through the
+        // exact host-bound systemd credential. Tests and injected chooser
+        // states continue to use `ResourceBrowserState::new`, which is the
+        // explicit untrusted read-only compatibility constructor.
+        state.resources =
+            ResourceBrowserState::from_systemd_publisher_credential(bus_root);
+        state
     }
 }
 
@@ -1408,7 +1328,6 @@ impl ChooserState {
             last_error: None,
             note: None,
             pending: None,
-            browser_vm_prompt: None,
             connect: None,
             thumbs: ThumbnailCache::default(),
             filter: FilterSort::default(),
@@ -1715,87 +1634,6 @@ impl ChooserState {
         self.connect.take()
     }
 
-    /// Resolve authentication for the exact typed Browser transport. Sunshine
-    /// uses mesh identity only. The explicit RDP alternate requires a guest
-    /// account/password, resolved through the existing sealed-credential seam.
-    pub(crate) fn browser_vm_auth(
-        &mut self,
-        connect: &crate::web::BrowserVmConnect,
-    ) -> Result<Option<DesktopAuth>, String> {
-        if self
-            .browser_vm_prompt
-            .as_ref()
-            .is_some_and(|pending| &pending.connect != connect)
-        {
-            self.browser_vm_prompt = None;
-        }
-        if connect.transport == BrowserVmTransport::Sunshine {
-            self.browser_vm_prompt = None;
-            return Ok(Some(DesktopAuth::mesh_identity(&self.client_peer)));
-        }
-        match auth::resolve_guest(
-            &self.client_peer,
-            &connect.target.workload,
-            VdiProtocol::Rdp,
-            self.creds.as_ref(),
-        )? {
-            AuthStage::Ready(auth) => Ok(Some(auth)),
-            AuthStage::Prompt(prompt) => {
-                if self.browser_vm_prompt.is_none() {
-                    self.browser_vm_prompt = Some(BrowserVmAuthPrompt {
-                        connect: connect.clone(),
-                        prompt,
-                    });
-                }
-                Ok(None)
-            }
-        }
-    }
-
-    /// Render and consume the Browser VM's one-time guest-login prompt. The
-    /// credential remains in memory only; `auth::remember` reports the honest
-    /// gated/sealed outcome while the VDI request carries it for this session.
-    pub(crate) fn render_browser_vm_auth_prompt(
-        &mut self,
-        ui: &mut egui::Ui,
-    ) -> Option<(crate::web::BrowserVmConnect, DesktopAuth)> {
-        let pending = self.browser_vm_prompt.as_mut()?;
-        ui.group(|ui| {
-            ui.label(RichText::new("Browser VM guest sign-in").size(Style::BODY));
-            render::credential_prompt_fields(ui, &mut pending.prompt);
-        });
-        let mut action = None;
-        ui.horizontal(|ui| {
-            if ui.button("Connect to Browser VM").clicked() {
-                action = Some(true);
-            }
-            if ui.button("Cancel").clicked() {
-                action = Some(false);
-            }
-        });
-        match action {
-            Some(true) => {
-                let pending = self.browser_vm_prompt.take()?;
-                let (auth, outcome) = auth::remember(self.creds.as_ref(), &pending.prompt);
-                self.note = Some(match outcome {
-                    SealOutcome::Sealed => "Browser VM credential sealed for reuse.".to_owned(),
-                    SealOutcome::Gated(reason) => format!(
-                        "Browser VM credential used for this session; persistence is gated: {reason}"
-                    ),
-                    SealOutcome::Failed(reason) => {
-                        format!("Browser VM credential persistence failed: {reason}")
-                    }
-                });
-                Some((pending.connect, auth))
-            }
-            Some(false) => {
-                self.browser_vm_prompt = None;
-                None
-            }
-            None => None,
-        }
-    }
-
     /// A cloned snapshot of the current roster (the render + act-on-click
     /// paths borrow it while mutating `self`), with the TESTVM-4 pinned
     /// endpoints folded in: any manual register the roster doesn't carry becomes
@@ -1979,28 +1817,52 @@ impl ChooserState {
         self.pending = None;
     }
 
-    /// CHOOSER-7 — a local-VM card power button was clicked: publish the
-    /// host-targeted `vm_lifecycle` request to `action/vm/lifecycle` (the ONE
-    /// shared emitter, §6). The action targets the VM's own node (the worker there
-    /// drops anything that doesn't `targets()` its id), and the discovery
-    /// aggregator republishes the VM's new power state, which the card reflects on
-    /// the next poll — never a faked local state flip here (§7). A publish failure
-    /// surfaces on `last_error`, never a panic.
+    /// CHOOSER-7 — a local-VM card power button was clicked: publish one
+    /// capability-bound Workload operation. The action targets the VM's own node,
+    /// and the authoritative workload projection drives the next card refresh —
+    /// never a faked local state flip here (§7). A publish failure surfaces on
+    /// `last_error`, never a panic.
     fn power_action(&mut self, sources: &[DesktopSource], id: &str, op: PowerOp) {
-        let Some(request) = build_power_request(sources, id, op) else {
+        let Some(source) = sources.iter().find(|s| s.id == id) else {
             return;
         };
-        publish_power(self.bus_root.as_deref(), &mut self.last_error, &request);
-        if self.last_error.is_none() {
-            if let Some(source) = sources.iter().find(|s| s.id == id) {
+        // Peer/remote sources are deliberately a no-op on this seat. Check
+        // origin before looking for the local Bus so an offline chooser can
+        // still render and ignore a remote card without a misleading error.
+        if source.origin != SourceOrigin::LocalVm {
+            return;
+        }
+        let Some(root) = self.bus_root.as_deref() else {
+            self.last_error = Some("No mesh Bus directory — VM power actions unavailable.".into());
+            return;
+        };
+        let expected_generation = mde_bus::persist::Persist::open(root.to_path_buf())
+            .ok()
+            .and_then(|persist| {
+                crate::workload_api::read_status(&persist, &source.node, &source.id)
+            })
+            .map_or(0, |status| status.generation);
+        let now_ms = unix_millis();
+        let request = match build_power_request(sources, id, op, expected_generation, now_ms) {
+            Ok(Some(request)) => request,
+            Ok(None) => return,
+            Err(error) => {
+                self.last_error = Some(format!("VM power authorization unavailable: {error}"));
+                return;
+            }
+        };
+        match crate::workload_api::publish(root, &request) {
+            Ok(_) => {
+                self.last_error = None;
                 self.note = Some(format!(
-                    "{} {} on {} — the vm_lifecycle worker is applying it; the card reflects \
-                     the new power state on the next refresh.",
+                    "{} {} on {} — the Workload worker is applying it; the card reflects the \
+                     authoritative state on the next refresh.",
                     op.verb(),
                     source.name,
                     source.node,
                 ));
             }
+            Err(error) => self.last_error = Some(error),
         }
     }
 
@@ -2477,8 +2339,8 @@ enum CardAction {
     Confirm,
     /// The connect picker was dismissed.
     Cancel,
-    /// CHOOSER-7 — a local-VM power button was clicked (drive the `vm_lifecycle`
-    /// worker for that VM).
+    /// CHOOSER-7 — a local-VM power button was clicked (drive the typed
+    /// Workload worker for that VM).
     Power {
         /// The source id (the roster key back to its node + name).
         id: String,

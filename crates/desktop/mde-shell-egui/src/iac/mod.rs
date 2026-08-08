@@ -29,8 +29,9 @@
 //! Every state is honest (§7): an off-mesh Bus is a silent degrade, an empty
 //! roster is a real "no workloads", and a panel with no landed backend render
 //! draws an honest **not yet built** stub rather than fake data. Every
-//! destructive intent passes a typed-confirm echo first (RUN-006), and every
-//! performed op lands in the session audit trail.
+//! destructive intent passes a typed-confirm echo first (RUN-006), while
+//! prepared service/image changes use a simple Yes/No review. Every performed
+//! op lands in the session audit trail.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -41,11 +42,19 @@ use serde::Deserialize;
 use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::{carbon_icon, card, field, muted_note, Style};
 
+use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
+use mackes_mesh_types::android_apps::AospStarterApp;
 use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
-    CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, DriftFlag,
-    WorkloadRow, WorkloadSpec, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
-    CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION, VERB_PLAN,
+    CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, DeploymentRole,
+    DriftFlag, WorkloadRow, WorkloadSpec, APP_VM_ALLOWED_CAPABILITIES, CLOUD_ACTION_SCHEMA_VERSION,
+    CLOUD_ARM_CREDENTIAL, CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION,
+    VERB_PLAN, VERB_SET_DESIRED,
+};
+use mackes_mesh_types::music_auth::{self, MusicAuthContext};
+use mackes_mesh_types::workloads::{
+    WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction, WorkloadOperationRequest,
+    WorkloadProfile,
 };
 
 use mde_bus::hooks::config::Priority;
@@ -66,6 +75,13 @@ pub(super) const WORKSPACE_TITLE: &str = "Workloads";
 /// (RUN-006's typed-arming idiom — the destructive-op hard wall).
 const APPLY_ECHO: &str = "apply";
 
+/// Typed Android launcher actions use the audited action worker rather than the
+/// cloud desired-state verbs. The body still carries only the closed app enum;
+/// these constants bind the capability to the worker's fixed execution lane.
+const EXEC_ACTION_TOPIC: &str = "action/exec/request";
+const EXEC_AUTH_VERB: &str = "exec-request";
+const EXEC_AUTH_NODE: &str = "fleet-control";
+
 /// The systemd credential is a 32-byte HMAC key encoded as 64 hex characters.
 /// Keep a small amount of whitespace headroom while refusing an unexpected file
 /// from becoming an unbounded allocation in the root shell.
@@ -74,6 +90,8 @@ const MAX_CLOUD_ARM_CREDENTIAL_BYTES: usize = 4 * 1024;
 /// Capability lifetime: enough for one local publish and mesh drain, while
 /// limiting interception value on the deliberately public Bus.
 const ARM_TOKEN_TTL_MS: i64 = 30_000;
+const MUSIC_AUTH_TTL_MS: i64 = music_auth::MUSIC_AUTH_MAX_TTL_MS;
+const MAX_MUSIC_AUTH_SEED_BYTES: usize = 4 * 1024;
 
 /// Load the production mint authority. Only the root DRM-shell service with its
 /// private systemd credential can mint; ad-hoc user sessions fail closed.
@@ -226,6 +244,108 @@ pub(crate) fn authorize_root_mutation_body(
     authorize_body_with_signer(&signer, body, verb, node, target)
 }
 
+/// Mint the Music-only asymmetric capability used by the user `mde-musicd`.
+/// The root DRM shell keeps the private seed in a dedicated systemd
+/// credential; only the resulting signature crosses the shared Bus.
+pub(crate) fn authorize_music_mutation_body(body: &str) -> Result<String, String> {
+    #[cfg(test)]
+    let seed = [7_u8; 32];
+    #[cfg(not(test))]
+    let seed = production_music_auth_seed()?;
+    let mut nonce_bytes = [0_u8; 32];
+    use rand::RngCore as _;
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = nonce_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| "The system clock is before the Unix epoch.".to_string())?;
+    let node = music_local_hostname();
+    music_auth::sign_request(
+        body,
+        MusicAuthContext {
+            verb: "music-workspace",
+            node: &node,
+            target: "workspace",
+        },
+        &seed,
+        &nonce,
+        now.saturating_add(MUSIC_AUTH_TTL_MS),
+    )
+}
+
+fn music_local_hostname() -> String {
+    // Keep the signer byte-compatible with mde-musicd::state::local_host.
+    // `$HOSTNAME` can be stale or differently normalized inside a user
+    // manager, which would make an otherwise valid Music capability fail
+    // closed as `unauthorized`.
+    let command = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty());
+    let file = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string());
+    let environment = std::env::var("HOSTNAME").ok();
+    select_music_hostname(command, file, environment)
+}
+
+fn select_music_hostname(
+    command: Option<String>,
+    file: Option<String>,
+    environment: Option<String>,
+) -> String {
+    fn clean(value: String) -> Option<String> {
+        let value = value.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    }
+
+    command
+        .and_then(clean)
+        .or_else(|| file.and_then(clean))
+        .or_else(|| environment.and_then(clean))
+        .unwrap_or_else(|| "unknown-node".to_string())
+}
+
+#[cfg(not(test))]
+fn production_music_auth_seed() -> Result<[u8; 32], String> {
+    if !rustix::process::geteuid().is_root() {
+        return Err("Music mutation authorization requires the root DRM shell.".to_string());
+    }
+    let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "Music action credential is unavailable.".to_string())?;
+    let path = directory.join(music_auth::MUSIC_AUTH_CREDENTIAL_NAME);
+    let raw = read_cloud_arm_credential(&path)?;
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| "Music action credential is not UTF-8.".to_string())?
+        .trim();
+    if text.len() > MAX_MUSIC_AUTH_SEED_BYTES || text.len() != 64 {
+        return Err("Music action credential must be exactly 64 hex characters.".to_string());
+    }
+    let mut seed = [0_u8; 32];
+    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        seed[index] = (music_hex(pair[0])? << 4) | music_hex(pair[1])?;
+    }
+    Ok(seed)
+}
+
+#[cfg(not(test))]
+fn music_hex(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("Music action credential contains non-hex data.".to_string()),
+    }
+}
+
 /// How often the folded `state/cloud` mirror is re-read while the surface is in
 /// view (a cheap bounded per-topic index probe).
 const REFRESH: Duration = Duration::from_secs(15);
@@ -240,9 +360,12 @@ pub(super) const CLOUD_MIRROR_STALE_AFTER_MS: i64 = 3 * 60 * 1000;
 const CLOUD_MIRROR_FUTURE_SKEW_MS: i64 = 30 * 1000;
 
 /// How long an emitted `action/cloud/*` request waits for its reply before it
-/// reads as unanswered — an honest "the cloud backend didn't respond" (§7),
-/// distinct from the worker's own gated/failed replies.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+/// reads as unanswered. Real OpenTofu plans routinely take tens of seconds, and
+/// image/service preparation may take minutes; the former four-second wall
+/// discarded valid late replies and replaced their actionable error with a
+/// misleading generic timeout. Keep the request correlated long enough for the
+/// backend to return its real typed result.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// The in-view repaint heartbeat that keeps the poll cadence alive.
 const POLL_REPAINT: Duration = Duration::from_secs(1);
@@ -257,6 +380,10 @@ fn unix_now_ms() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+fn workload_api_now_ms() -> u64 {
+    unix_now_ms().try_into().unwrap_or(0)
 }
 
 /// Classify a mirror at a supplied clock for deterministic tests and for every
@@ -369,6 +496,21 @@ fn lifecycle_request_body(node: &str, instance: &str, typed_name: Option<&str>) 
         body["typed_name"] = serde_json::Value::String(typed_name.to_string());
     }
     body.to_string()
+}
+
+/// Match the action worker's bounded Android identity vocabulary before the
+/// review sheet opens. Workload identities may include `:` because that is part
+/// of the shared Android guest contract; placement hosts are path-safe segments
+/// with no colon.
+fn is_safe_android_action_identity(value: &str, allow_colon: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value.trim() == value
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '-' | '_')
+                || (allow_colon && character == ':')
+        })
 }
 
 // ───────────────────────────── the delivery-type axis ───────────────────────
@@ -487,7 +629,7 @@ impl WorkloadsRoute {
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Provision => "Provision",
-            Self::Plan => "Plan",
+            Self::Plan => "Plan results",
             Self::Run => "Run",
             Self::Drift => "Drift",
             Self::Audit => "Audit",
@@ -725,6 +867,10 @@ struct CloudReply {
     /// Whether a destructive op (destroy / delete / reboot) was performed +
     /// audited on the events plane.
     audited: bool,
+    /// Optional typed action-worker detail. Cloud replies may omit this; it is
+    /// used to keep non-cloud execution replies visible without inventing a
+    /// cloud verb name.
+    detail: Option<String>,
 }
 
 /// One in-flight `action/cloud/*` request awaiting its `reply/<ulid>`.
@@ -732,8 +878,25 @@ struct CloudReply {
 struct Pending {
     /// The request ULID — the correlation key its reply rides.
     ulid: String,
+    /// The verb being awaited, used by the guided flow and visible status.
+    verb: String,
     /// When the request was published (drives [`REQUEST_TIMEOUT`]).
     sent: Instant,
+}
+
+/// Progress through the shared guided provisioning flow. This is deliberately
+/// delivery-neutral: every workload follows desired state → plan → live apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(super) enum ProvisionProgress {
+    /// The current draft has not been saved as desired state.
+    #[default]
+    Draft,
+    /// Desired state was accepted by the backend.
+    DesiredSaved,
+    /// The backend returned a successful dry-run plan.
+    Planned,
+    /// Live provisioning completed.
+    Applied,
 }
 
 /// The most recently resolved `console-attach` handle — the workload it answers
@@ -772,7 +935,7 @@ pub(super) enum ArmAction {
         name: String,
     },
     /// A route-specific live mutation whose complete body is frozen before the
-    /// typed-confirm dialog opens (image build/promote or container deploy).
+    /// simple Yes/No review opens (image build/promote or container deploy).
     Prepared {
         verb: &'static str,
         node: String,
@@ -781,6 +944,38 @@ pub(super) enum ArmAction {
         label: String,
         echo: String,
         word: &'static str,
+        subject: String,
+    },
+    /// A typed VM/container operation sent only to `action/workload/operation`.
+    Workload {
+        /// The already authorized, immutable operation request.
+        request: WorkloadOperationRequest,
+        /// Human-readable pending/audit label.
+        label: String,
+        /// Confirm button echo (kept short; the review is Yes/No).
+        echo: String,
+        /// Confirm button word.
+        word: &'static str,
+        /// Review subject.
+        subject: String,
+    },
+    /// A typed Android starter-app launch through the audited action worker.
+    /// The body is frozen before the Yes/No review and receives the same
+    /// short-lived, request-bound capability as every other privileged action.
+    ExecPrepared {
+        /// The placement node owning the Android guest.
+        node: String,
+        /// The capability target, including node/workload/package identity.
+        target: String,
+        /// Frozen typed action-worker JSON body.
+        body: String,
+        /// Human-readable pending/audit label.
+        label: String,
+        /// Confirm button echo (used by the generic review sheet).
+        echo: String,
+        /// Confirm button word.
+        word: &'static str,
+        /// Review subject.
         subject: String,
     },
 }
@@ -794,6 +989,8 @@ impl ArmAction {
             Self::Configure => "configure",
             Self::Lifecycle { verb, .. } => verb,
             Self::Prepared { verb, .. } => verb,
+            Self::Workload { .. } => "workload-operation",
+            Self::ExecPrepared { .. } => EXEC_AUTH_VERB,
         }
     }
 
@@ -803,6 +1000,8 @@ impl ArmAction {
             Self::Provision | Self::Configure => APPLY_ECHO.to_string(),
             Self::Lifecycle { name, .. } => name.clone(),
             Self::Prepared { echo, .. } => echo.clone(),
+            Self::Workload { echo, .. } => echo.clone(),
+            Self::ExecPrepared { echo, .. } => echo.clone(),
         }
     }
 
@@ -812,6 +1011,8 @@ impl ArmAction {
             Self::Provision | Self::Configure => "Apply",
             Self::Lifecycle { verb, .. } => verb_label(verb),
             Self::Prepared { word, .. } => word,
+            Self::Workload { word, .. } => word,
+            Self::ExecPrepared { word, .. } => word,
         }
     }
 
@@ -822,12 +1023,25 @@ impl ArmAction {
             Self::Configure => "the Ansible convergence (live apply)".to_string(),
             Self::Lifecycle { name, .. } => format!("workload {name}"),
             Self::Prepared { subject, .. } => subject.clone(),
+            Self::Workload { subject, .. } => subject.clone(),
+            Self::ExecPrepared { subject, .. } => subject.clone(),
         }
+    }
+
+    /// Prepared service/image actions use the low-friction explicit-choice
+    /// review. Live infrastructure applies and lifecycle mutations retain the
+    /// stronger typed-echo interlock.
+    const fn uses_yes_no_review(&self) -> bool {
+        matches!(
+            self,
+            Self::Prepared { .. } | Self::Workload { .. } | Self::ExecPrepared { .. }
+        )
     }
 }
 
-/// A pending mutation review sheet — the action it releases + the operator's
-/// exact echo so far. Nothing reaches the Bus until [`armed`] returns true.
+/// A pending mutation review sheet — the action it releases plus any typed echo
+/// entered for a strong-interlock action. Nothing reaches the Bus until the
+/// operator confirms through the review's action-appropriate gate.
 #[derive(Debug, Clone)]
 pub(super) struct ReviewSheetState {
     /// What confirming publishes.
@@ -863,7 +1077,13 @@ struct ReviewSheetFacts {
 
 fn review_sheet_facts(action: &ArmAction, state: &WorkloadsState) -> ReviewSheetFacts {
     let verb = action.verb();
-    let command = format!("action/cloud/{verb}");
+    let command = if matches!(action, ArmAction::ExecPrepared { .. }) {
+        EXEC_ACTION_TOPIC.to_string()
+    } else if matches!(action, ArmAction::Workload { .. }) {
+        mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC.to_string()
+    } else {
+        format!("action/cloud/{verb}")
+    };
     let subject = action.subject();
     match action {
         ArmAction::Provision => {
@@ -940,6 +1160,35 @@ fn review_sheet_facts(action: &ArmAction, state: &WorkloadsState) -> ReviewSheet
             format!(
                 "{label} affects target {target} on placement node {node}; authorization is \
                  bound to this frozen request body digest."
+            ),
+        ),
+        ArmAction::Workload { request, .. } => {
+            let body = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+            request_review_facts(
+                command,
+                subject,
+                format!("workload:{}", request.workload_id.as_str()),
+                request.target_node.clone(),
+                &body,
+                "The typed Workload reconciler owns admission, lifecycle, and readiness; no legacy VM/container topic is used.".to_string(),
+            )
+        }
+        ArmAction::ExecPrepared {
+            node,
+            target,
+            body,
+            label,
+            ..
+        } => request_review_facts(
+            command,
+            subject,
+            target.clone(),
+            node.clone(),
+            body,
+            format!(
+                "{label} targets only the admitted Android workload on {node}; the action \
+                 worker reconstructs the canonical MAIN + LAUNCHER intent and records the \
+                 outcome in its audit lane."
             ),
         ),
     }
@@ -1085,6 +1334,9 @@ pub struct WorkloadsState {
     mutation_pending: Option<Pending>,
     /// A transient one-line action note — honest feedback, never a silent op.
     note: Option<String>,
+    /// A typed Workload operation awaiting its node-local projection. Workload
+    /// actions do not produce cloud `reply/<ulid>` messages.
+    workload_pending: Option<(String, String, Instant)>,
     /// The session audit trail (newest last), capped at [`MAX_AUDIT`].
     audit: Vec<AuditEntry>,
     /// The workload name a just-issued `console-attach` targeted, so the reply's
@@ -1114,6 +1366,11 @@ pub struct WorkloadsState {
     /// The placement node the provision panel targets (from the placement
     /// picker); `None` until one is chosen.
     selected_node: Option<String>,
+    /// Current guided-flow milestone for the exact draft identified below.
+    provision_progress: ProvisionProgress,
+    /// Stable key for delivery + placement + form values. Any edit resets the
+    /// guided flow so a stale plan can never authorize a changed draft.
+    provision_draft_key: Option<String>,
 
     // ── the per-panel sub-state (each panel worker owns its own file) ──
     //
@@ -1150,6 +1407,7 @@ impl Default for WorkloadsState {
             arming: None,
             mutation_pending: None,
             note: None,
+            workload_pending: None,
             audit: Vec::new(),
             console_target: None,
             console: None,
@@ -1161,6 +1419,8 @@ impl Default for WorkloadsState {
             resource_sort: WorkloadSort::default(),
             expanded_resource: None,
             selected_node: None,
+            provision_progress: ProvisionProgress::Draft,
+            provision_draft_key: None,
             placement: placement::State::default(),
             form: provision_form::State::default(),
             configure: configure::State::default(),
@@ -1184,6 +1444,7 @@ impl WorkloadsState {
     pub fn poll(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.resolve_mutation();
+        self.resolve_workload_operation();
 
         let due = self
             .loaded_at
@@ -1201,10 +1462,10 @@ impl WorkloadsState {
     /// (never a silent op, §7); on a live apply, re-fold the mirror so the change
     /// reflects. A no-responder is an honest timeout.
     fn resolve_mutation(&mut self) {
-        let Some((ulid, sent)) = self
+        let Some((ulid, sent, pending_verb)) = self
             .mutation_pending
             .as_ref()
-            .map(|p| (p.ulid.clone(), p.sent))
+            .map(|p| (p.ulid.clone(), p.sent, p.verb.clone()))
         else {
             return;
         };
@@ -1216,18 +1477,60 @@ impl WorkloadsState {
             self.record_audit(entry);
             if reply.ok {
                 self.forced = true;
+                match reply.verb.as_str() {
+                    VERB_ANDROID_PROVISION | VERB_SET_DESIRED => {
+                        self.provision_progress = ProvisionProgress::DesiredSaved;
+                    }
+                    VERB_PLAN => self.provision_progress = ProvisionProgress::Planned,
+                    "provision" => self.provision_progress = ProvisionProgress::Applied,
+                    _ => {}
+                }
             }
             self.note = Some(note);
             self.mutation_pending = None;
         } else if sent.elapsed() >= REQUEST_TIMEOUT {
-            self.note = Some(
-                "The cloud backend did not answer the request — it may not be running on any \
-                 reachable node."
-                    .to_string(),
-            );
+            self.note = Some(format!(
+                "The cloud backend did not answer `{pending_verb}` within five minutes. The \
+                     request may still finish; check Audit before retrying."
+            ));
             self.mutation_pending = None;
             self.console_target = None;
         }
+    }
+
+    /// Resolve a typed Workload operation from the authoritative node snapshot.
+    /// A missing snapshot is simply pending; a terminal status becomes one
+    /// bounded audit entry and never falls back to the legacy cloud reply lane.
+    fn resolve_workload_operation(&mut self) {
+        let Some((node, workload_id, _sent)) = self.workload_pending.clone() else {
+            return;
+        };
+        let Some(persist) = self.persist() else {
+            return;
+        };
+        let Some(status) = crate::workload_api::read_status(&persist, &node, &workload_id) else {
+            return;
+        };
+        if !status.phase.is_terminal() {
+            return;
+        }
+        let ok = status.phase == mackes_mesh_types::workloads::WorkloadOperationPhase::Completed;
+        let detail = status
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("workload operation reached {:?}", status.phase));
+        self.record_audit(AuditEntry {
+            verb: "workload-operation".to_string(),
+            outcome: if ok { AuditOutcome::Applied } else { AuditOutcome::Failed },
+            detail: detail.clone(),
+        });
+        self.note = Some(if ok {
+            format!("Workload {workload_id} completed.")
+        } else {
+            format!("Workload {workload_id} failed: {detail}")
+        });
+        self.workload_pending = None;
+        self.forced = true;
     }
 
     /// Decode the settled `console-attach` reply's [`ConsoleEndpoint`] (the
@@ -1275,7 +1578,7 @@ impl WorkloadsState {
     /// convention).
     fn read_reply(&self, ulid: &str) -> Option<CloudReply> {
         let persist = self.persist()?;
-        let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
+        let msgs = persist.list_since_limit(&reply_topic(ulid), None, 1).ok()?;
         let body = msgs.first()?.body.as_deref()?;
         serde_json::from_str::<CloudReply>(body).ok()
     }
@@ -1286,7 +1589,7 @@ impl WorkloadsState {
     /// nothing has landed yet or the body doesn't decode.
     fn read_wire_reply(&self, ulid: &str) -> Option<WireCloudReply> {
         let persist = self.persist()?;
-        let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
+        let msgs = persist.list_since_limit(&reply_topic(ulid), None, 1).ok()?;
         let body = msgs.first()?.body.as_deref()?;
         serde_json::from_str(body).ok()
     }
@@ -1297,19 +1600,32 @@ impl WorkloadsState {
         BusReader::new(self.bus_root.clone()).open()
     }
 
-    /// Publish an `action/cloud/<verb>` request, answering a pending handle or an
-    /// honest error string (a missing Bus degrades, never panics — §7).
-    fn publish(&self, verb: &str, body: Option<&str>) -> Result<Pending, String> {
+    /// Publish one typed request on an explicit Bus topic, answering a pending
+    /// handle or an honest error string (a missing Bus degrades, never panics —
+    /// §7). Keeping the topic explicit lets the Android launcher use the
+    /// audited `action/exec/request` lane without pretending it is a cloud verb.
+    fn publish_topic(
+        &self,
+        topic: &str,
+        pending_verb: &str,
+        body: Option<&str>,
+    ) -> Result<Pending, String> {
         let persist = self
             .persist()
             .ok_or_else(|| "the local mesh Bus is unavailable".to_string())?;
-        let topic = format!("{}{verb}", mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX);
         publish_request(&persist, &topic, Priority::Default, None, body)
             .map(|ulid| Pending {
                 ulid,
+                verb: pending_verb.to_string(),
                 sent: Instant::now(),
             })
             .map_err(|e| e.to_string())
+    }
+
+    /// Publish an `action/cloud/<verb>` request through the shared cloud lane.
+    fn publish(&self, verb: &str, body: Option<&str>) -> Result<Pending, String> {
+        let topic = format!("{}{verb}", mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX);
+        self.publish_topic(&topic, verb, body)
     }
 
     /// Emit a mutation verb and track its reply — the honest outcome lands in the
@@ -1322,6 +1638,17 @@ impl WorkloadsState {
                 self.note = Some(format!("Requested {label}\u{2026}"));
             }
             Err(e) => self.note = Some(format!("Could not request {label}: {e}")),
+        }
+    }
+
+    /// Publish an already-authorized request on a non-cloud typed action lane.
+    fn issue_topic(&mut self, topic: &str, pending_verb: &str, body: &str, label: &str) {
+        match self.publish_topic(topic, pending_verb, Some(body)) {
+            Ok(pending) => {
+                self.mutation_pending = Some(pending);
+                self.note = Some(format!("Requested {label}\u{2026}"));
+            }
+            Err(error) => self.note = Some(format!("Could not request {label}: {error}")),
         }
     }
 
@@ -1365,7 +1692,7 @@ impl WorkloadsState {
         );
     }
 
-    /// Open typed confirmation for the dedicated Cuttlefish Android contract.
+    /// Open a simple Yes/No review for the dedicated Cuttlefish Android contract.
     /// `android-provision` persists the correctly sized Android desired slice;
     /// the separate Provision action is still required for a live VM apply.
     pub(super) fn arm_android_provision(&mut self, name: &str) {
@@ -1388,6 +1715,61 @@ impl WorkloadsState {
             "Prepare",
             format!("Cuttlefish Android desired state for {target}"),
         );
+    }
+
+    /// Open the explicit review for one fresh, launch-ready AOSP starter app.
+    /// The frozen body is consumed by the audited action worker, which rebuilds
+    /// the canonical guest launch intent from the closed app enum. No ADB,
+    /// host command, or direct guest claim is emitted by the shell.
+    pub(super) fn arm_android_app_launch(
+        &mut self,
+        target_host: &str,
+        workload_id: &str,
+        app: AospStarterApp,
+    ) {
+        let target_host = target_host.trim();
+        let workload_id = workload_id.trim();
+        if !is_safe_android_action_identity(target_host, false)
+            || !is_safe_android_action_identity(workload_id, true)
+        {
+            self.note = Some(
+                "Could not prepare Android launch: the node or workload identity is not a bounded typed identity. Nothing was sent."
+                    .to_string(),
+            );
+            return;
+        }
+        let target = format!(
+            "android-app:{target_host}:{workload_id}:{}",
+            app.package_id().as_str()
+        );
+        if target.len() > 255 {
+            self.note = Some(
+                "Could not prepare Android launch: the capability target exceeds its bound. Nothing was sent."
+                    .to_string(),
+            );
+            return;
+        }
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "kind": "android_app_launch",
+            "target_host": target_host,
+            "workload_id": workload_id,
+            "app": app,
+        })
+        .to_string();
+        self.note = None;
+        self.arming = Some(ReviewSheetState {
+            action: ArmAction::ExecPrepared {
+                node: target_host.to_owned(),
+                target,
+                body,
+                label: format!("launch {} in {workload_id}", app.display_name()),
+                echo: app.display_name().to_owned(),
+                word: "Launch",
+                subject: format!("{} in Android workload {workload_id}", app.display_name()),
+            },
+            typed: String::new(),
+        });
     }
 
     /// Record one session-audit row, trimming to [`MAX_AUDIT`] newest.
@@ -1438,8 +1820,69 @@ impl WorkloadsState {
     }
 
     /// Perform a confirmed action — called only past the review-sheet gate
-    /// ([`armed`]).
+    /// ([`armed`]). Android launcher requests use the audited execution lane;
+    /// the existing cloud lifecycle path remains unchanged for all other arms.
     fn perform(&mut self, action: ArmAction, typed: &str) {
+        match action {
+            ArmAction::Workload {
+                request,
+                label,
+                echo,
+                ..
+            } => {
+                if !armed(typed, &echo) {
+                    self.note = Some("Workload confirmation did not match; nothing was sent.".to_string());
+                    return;
+                }
+                let Some(root) = self.bus_root.as_deref() else {
+                    self.note = Some("Could not request workload: the local mesh Bus is unavailable.".to_string());
+                    return;
+                };
+                match crate::workload_api::publish(root, &request) {
+                    Ok(_) => {
+                        self.workload_pending = Some((
+                            request.target_node.clone(),
+                            request.workload_id.as_str().to_string(),
+                            Instant::now(),
+                        ));
+                        self.note = Some(format!("Requested {label}; waiting for Workload readiness."));
+                    }
+                    Err(error) => self.note = Some(format!("Could not request {label}: {error}")),
+                }
+            }
+            ArmAction::ExecPrepared {
+                node: _node,
+                target,
+                body,
+                label,
+                echo,
+                ..
+            } => {
+                if !armed(typed, &echo) {
+                    self.note = Some(
+                        "Typed Android launch confirmation did not match; nothing was sent."
+                            .to_string(),
+                    );
+                    return;
+                }
+                match self.authorize_body(&body, EXEC_AUTH_VERB, EXEC_AUTH_NODE, &target) {
+                    Ok(body) => self.issue_topic(
+                        EXEC_ACTION_TOPIC,
+                        "android-app-launch",
+                        &body,
+                        &label,
+                    ),
+                    Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
+                }
+            }
+            action => self.perform_cloud(action, typed),
+        }
+    }
+
+    /// Perform a confirmed `action/cloud/*` mutation. Kept separate from the
+    /// execution-lane wrapper so each request's topic and capability authority
+    /// stay explicit at the call site.
+    fn perform_cloud(&mut self, action: ArmAction, typed: &str) {
         let expected = action.echo();
         if !armed(typed, &expected) {
             self.note = Some("Typed confirmation did not match; nothing was sent.".to_string());
@@ -1476,19 +1919,12 @@ impl WorkloadsState {
                 )
             }
             ArmAction::Lifecycle {
-                verb,
-                node,
-                instance_id,
-                name,
+                verb, name, ..
             } => {
-                let body = lifecycle_request_body(&node, &instance_id, Some(&name));
-                (
-                    verb,
-                    node,
-                    instance_id,
-                    body,
-                    format!("{} on {name}", verb_label(verb)),
-                )
+                self.note = Some(format!(
+                    "Legacy lifecycle action {verb} for {name} is retired; use the typed Workload operation. Nothing was sent."
+                ));
+                return;
             }
             ArmAction::Prepared {
                 verb,
@@ -1498,6 +1934,12 @@ impl WorkloadsState {
                 label,
                 ..
             } => (verb, node, target, body, label),
+            ArmAction::Workload { .. } => unreachable!(
+                "typed Workload operations are handled before the cloud dispatcher"
+            ),
+            ArmAction::ExecPrepared { .. } => unreachable!(
+                "Android execution actions are handled before the cloud dispatcher"
+            ),
         };
         if requires_apply_capability && !self.selected_node_apply_armed() {
             self.note = Some(
@@ -1536,6 +1978,7 @@ impl WorkloadsState {
             );
             return;
         }
+        self.note = None;
         self.arming = Some(ReviewSheetState {
             action: ArmAction::Provision,
             typed: String::new(),
@@ -1559,31 +2002,117 @@ impl WorkloadsState {
             );
             return;
         }
+        self.note = None;
         self.arming = Some(ReviewSheetState {
             action: ArmAction::Configure,
             typed: String::new(),
         });
     }
 
-    /// Open review confirmation for a lifecycle mutation. Even start/stop require
-    /// confirmation because minting authority, not destructiveness, is the
-    /// security boundary.
-    pub(super) fn issue_lifecycle_direct(
+    /// Open a short Yes/No review for the sole typed Workload operation lane.
+    /// The legacy cloud/lifecycle verbs are deliberately not used for VM or
+    /// Quadlet day-2 controls.
+    pub(super) fn issue_workload_direct(
         &mut self,
         verb: &'static str,
         node: &str,
-        instance_id: &str,
+        workload_id: &str,
+        delivery: DeliveryType,
         name: &str,
     ) {
         let node = node.trim();
-        if node.is_empty() {
+        let workload_id = workload_id.trim();
+        if node.is_empty() || workload_id.is_empty() {
             self.note = Some(format!(
-                "Could not request {} on {name}: the workload has no placement node.",
+                "Could not request {} on {name}: the workload placement or identity is missing.",
                 verb_label(verb)
             ));
             return;
         }
-        self.arm_lifecycle(verb, node, instance_id, name);
+        let backend = if delivery == DeliveryType::ServiceContainer {
+            WorkloadBackend::QuadletSystemd
+        } else {
+            WorkloadBackend::LibvirtVirtqemud
+        };
+        let (action, attachment, label, word) = match verb {
+            "instance-start" => (
+                WorkloadOperationAction::StartAndAttach,
+                Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+                format!("start and attach {name}"),
+                "Start",
+            ),
+            "instance-stop" | "container-stop" => (
+                WorkloadOperationAction::Stop,
+                None,
+                format!("stop {name}"),
+                "Stop",
+            ),
+            "instance-reboot" | "container-restart" => (
+                WorkloadOperationAction::Restart,
+                Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+                format!("restart {name}"),
+                "Restart",
+            ),
+            "instance-open" => (
+                WorkloadOperationAction::Open,
+                Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+                format!("open {name}"),
+                "Open",
+            ),
+            "container-logs" => (
+                WorkloadOperationAction::Open,
+                Some(WorkloadAttachmentProtocol::Logs),
+                format!("open logs for {name}"),
+                "Open",
+            ),
+            "instance-delete" | "container-destroy" => (
+                WorkloadOperationAction::Destroy,
+                None,
+                format!("destroy {name}"),
+                "Destroy",
+            ),
+            _ => {
+                self.note = Some(format!(
+                    "Workload operation {verb} is not available on the typed API. Nothing was sent."
+                ));
+                return;
+            }
+        };
+        // Workload operations use a durable compare-and-swap generation. Read
+        // the authoritative node projection before minting the capability so
+        // a second click cannot be rejected merely because the shell retained
+        // an old zero-generation draft.
+        let expected_generation = self
+            .persist()
+            .and_then(|persist| crate::workload_api::read_status(&persist, node, workload_id))
+            .map(|status| status.generation)
+            .unwrap_or(0);
+        let request = match crate::workload_api::request(
+            workload_id,
+            node,
+            backend,
+            WorkloadProfile::Small.resources(),
+            action,
+            attachment,
+            expected_generation,
+            workload_api_now_ms(),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.note = Some(format!("Could not prepare {label}: {error}"));
+                return;
+            }
+        };
+        self.arming = Some(ReviewSheetState {
+            action: ArmAction::Workload {
+                request,
+                label: label.clone(),
+                echo: name.to_string(),
+                word,
+                subject: label,
+            },
+            typed: String::new(),
+        });
     }
 
     /// Issue the `console-attach` lifecycle verb, tracking the target workload
@@ -1608,17 +2137,12 @@ impl WorkloadsState {
             );
             return;
         }
-        self.console_target = Some(name.to_string());
-        let body = lifecycle_request_body(node, instance_id, None);
-        self.arm_prepared(
-            "console-attach",
-            node.trim().to_string(),
-            instance_id.to_string(),
-            body,
-            format!("console on {name}"),
-            name.to_string(),
-            "Attach",
-            format!("console for workload {name}"),
+        self.issue_workload_direct(
+            "instance-open",
+            node,
+            instance_id,
+            DeliveryType::DesktopVm,
+            name,
         );
     }
 
@@ -1692,6 +2216,7 @@ impl WorkloadsState {
             ));
             return;
         }
+        self.note = None;
         self.arming = Some(ReviewSheetState {
             action: ArmAction::Lifecycle {
                 verb,
@@ -1703,7 +2228,7 @@ impl WorkloadsState {
         });
     }
 
-    /// Open review confirmation for a fully prepared route mutation. The body is
+    /// Open a Yes/No review for a fully prepared route mutation. The body is
     /// frozen now, preventing form edits from changing what the later token binds.
     pub(super) fn arm_prepared(
         &mut self,
@@ -1722,6 +2247,7 @@ impl WorkloadsState {
             ));
             return;
         }
+        self.note = None;
         self.arming = Some(ReviewSheetState {
             action: ArmAction::Prepared {
                 verb,
@@ -1802,7 +2328,11 @@ impl WorkloadsState {
 
     /// Switch the active delivery view.
     pub(super) fn set_view(&mut self, view: DeliveryView) {
-        self.view = view;
+        if self.view != view {
+            self.view = view;
+            self.provision_progress = ProvisionProgress::Draft;
+            self.provision_draft_key = None;
+        }
     }
 
     /// Which lifecycle route is showing.
@@ -1814,6 +2344,25 @@ impl WorkloadsState {
     /// Switch the active lifecycle route.
     pub(super) fn set_route(&mut self, route: WorkloadsRoute) {
         self.route = route;
+    }
+
+    /// Keep progression bound to the exact delivery/placement/form draft. Any
+    /// edit invalidates the previous desired/plan milestone.
+    pub(super) fn sync_provision_draft(&mut self, key: String) {
+        if self.provision_draft_key.as_deref() != Some(key.as_str()) {
+            self.provision_draft_key = Some(key);
+            self.provision_progress = ProvisionProgress::Draft;
+        }
+    }
+
+    /// The next-step renderer reads the current backend-acknowledged milestone.
+    pub(super) const fn provision_progress(&self) -> ProvisionProgress {
+        self.provision_progress
+    }
+
+    /// Whether one cloud request is currently awaiting a typed reply.
+    pub(super) const fn mutation_is_pending(&self) -> bool {
+        self.mutation_pending.is_some()
     }
 
     /// Current resource table density.
@@ -1900,16 +2449,27 @@ impl WorkloadsState {
 }
 
 /// Fold a settled mutation reply into `(honest note, audit row)` (§7 — the pure
-/// seam shared by the poll path and the tests). `ok` reads applied; a `gated`
-/// reply reads staged (a dry-run — nothing applied) carrying the plan summary;
-/// an error reads failed.
+/// seam shared by the poll path and the tests). A successful plan reads as a
+/// completed dry-run; other `ok` replies read applied; a `gated` reply reads
+/// staged (a dry-run — nothing applied) carrying the plan summary; an error
+/// reads failed.
 fn fold_mutation(reply: &CloudReply) -> (String, AuditEntry) {
     let verb = if reply.verb.is_empty() {
         "cloud op".to_string()
     } else {
         reply.verb.clone()
     };
-    if reply.ok && reply.verb == VERB_ANDROID_PROVISION {
+    if reply.ok && reply.verb == VERB_PLAN {
+        (
+            "Dry-run plan completed; nothing was applied. Continue to live provision when ready."
+                .to_string(),
+            AuditEntry {
+                verb,
+                outcome: AuditOutcome::Staged,
+                detail: "dry-run plan completed; nothing applied".to_string(),
+            },
+        )
+    } else if reply.ok && reply.verb == VERB_ANDROID_PROVISION {
         let detail = "Cuttlefish desired state saved; live VM provision remains a separate action";
         (
             format!("{verb} saved desired state; no VM was provisioned yet."),
@@ -1920,6 +2480,20 @@ fn fold_mutation(reply: &CloudReply) -> (String, AuditEntry) {
             },
         )
     } else if reply.ok {
+        if reply.verb.is_empty() {
+            let detail = reply
+                .detail
+                .clone()
+                .unwrap_or_else(|| "typed action accepted".to_string());
+            return (
+                detail.clone(),
+                AuditEntry {
+                    verb,
+                    outcome: AuditOutcome::Applied,
+                    detail,
+                },
+            );
+        }
         let audited = if reply.audited { " (audited)" } else { "" };
         (
             format!("{verb} applied{audited}."),
@@ -1987,38 +2561,55 @@ pub fn infra_code_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     ui.separator();
     ui.add_space(Style::SP_XS);
 
+    let content_height = ui.available_height().max(320.0);
+    let show_health_rail = ui.available_width() >= 1_120.0;
     ui.horizontal_top(|ui| {
-        ui.set_min_height(560.0);
+        ui.set_min_height(content_height);
         ui.vertical(|ui| {
             ui.set_width(190.0);
-            route_sidebar(ui, state);
-            ui.add_space(Style::SP_S);
-            ui.separator();
-            ui.add_space(Style::SP_S);
-            delivery_filter_bar(ui, state);
-            ui.add_space(Style::SP_S);
-            density_selector(ui, state);
+            egui::ScrollArea::vertical()
+                .id_salt("workloads-navigation")
+                .max_height(content_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(state.arming.is_none(), |ui| {
+                        route_sidebar(ui, state);
+                        ui.add_space(Style::SP_S);
+                        ui.separator();
+                        ui.add_space(Style::SP_S);
+                        delivery_filter_bar(ui, state);
+                        ui.add_space(Style::SP_S);
+                        density_selector(ui, state);
+                    });
+                });
         });
 
         ui.separator();
 
         ui.vertical(|ui| {
-            ui.set_min_width(560.0);
+            ui.set_min_width(if show_health_rail { 500.0 } else { 360.0 });
             route_header(ui, state.route);
             ui.add_space(Style::SP_S);
-            render_review_sheet(ui, state);
             render_note(ui, state);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| route_body(ui, state));
+            if state.arming.is_some() {
+                render_review_sheet(ui, state);
+            } else {
+                let body_height = ui.available_height().max(220.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("workloads-route-body")
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| route_body(ui, state));
+            }
         });
 
-        ui.separator();
-
-        ui.vertical(|ui| {
-            ui.set_width(210.0);
-            health_rail(ui, state);
-        });
+        if show_health_rail {
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(210.0);
+                health_rail(ui, state);
+            });
+        }
     });
 }
 
@@ -2130,7 +2721,7 @@ fn route_header(ui: &mut egui::Ui, route: WorkloadsRoute) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, route.icon(), Style::ICON_S);
+            carbon_icon(ui, route.icon(), Style::ICON_L);
         });
         ui.add_space(Style::SP_XS);
         ui.label(
@@ -2185,13 +2776,32 @@ fn lifecycle_resource_route_for_filter(
         .map(DeliveryView::from_delivery_type)
         .unwrap_or(state.view);
     if should_show_android_starter_catalog(mode, effective_view) {
-        let mut vm_scopes = state
+        let mut vm_workloads = state
             .workloads_of(DeliveryView::AndroidVm)
-            .map(|row| format!("{} on {}", row.name, row.node))
+            .map(|row| android_apps::AndroidVmWorkload {
+                workload_id: row.name.clone(),
+                target_host: row.node.clone(),
+                vm_scope: format!("{} on {}", row.name, row.node),
+            })
             .collect::<Vec<_>>();
-        vm_scopes.sort_unstable();
-        vm_scopes.dedup();
-        android_apps::catalog_panel(ui, &vm_scopes);
+        vm_workloads.sort_by(|left, right| {
+            left.workload_id
+                .cmp(&right.workload_id)
+                .then_with(|| left.vm_scope.cmp(&right.vm_scope))
+        });
+        let android_inventories = state
+            .states
+            .iter()
+            .flat_map(|cloud_state| cloud_state.android_inventories.iter().cloned())
+            .collect::<Vec<_>>();
+        if let Some(selection) = android_apps::catalog_panel(ui, &vm_workloads, &android_inventories)
+        {
+            state.arm_android_app_launch(
+                &selection.target_host,
+                &selection.workload_id,
+                selection.app,
+            );
+        }
     }
     if matches!(mode, ResourceTableMode::Plan | ResourceTableMode::Run) {
         console_section(ui, state);
@@ -2388,22 +2998,81 @@ fn resource_row_actions(
     ui.horizontal(|ui| match row.delivery_type {
         DeliveryType::ServiceContainer => {
             if row_button(ui, "Restart", false).clicked() {
-                state.issue_lifecycle_direct("container-restart", &row.node, &row.name, &row.name);
+                state.issue_workload_direct(
+                    "container-restart",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Logs", false).clicked() {
-                state.issue_lifecycle_direct("container-logs", &row.node, &row.name, &row.name);
+                state.issue_workload_direct(
+                    "container-logs",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_lifecycle_direct("container-destroy", &row.node, &row.name, &row.name);
+                state.issue_workload_direct(
+                    "container-destroy",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
         }
         DeliveryType::ServiceVm => {
             vm_lifecycle_actions(ui, state, row, false);
         }
-        DeliveryType::DesktopVm | DeliveryType::AppVm | DeliveryType::AndroidVm => {
+        DeliveryType::AppVm => {
+            let launch_enabled = app_vm_launch_allowed(row, mode);
+            let color = if launch_enabled {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            };
+            if ui
+                .add_enabled(
+                    launch_enabled,
+                    egui::Button::new(
+                        RichText::new("Open app")
+                            .size(Style::SMALL)
+                            .color(color),
+                    ),
+                )
+                .clicked()
+            {
+                state.issue_app_launch(row);
+            }
+            vm_lifecycle_actions(ui, state, row, true);
+        }
+        DeliveryType::DesktopVm | DeliveryType::AndroidVm => {
             vm_lifecycle_actions(ui, state, row, true);
         }
     });
+}
+
+/// The active Workloads table may open an App VM only when the folded row
+/// carries a valid typed declaration. Plan and malformed/absent rows stay
+/// visibly disabled; the shell never invents a host-side launch fallback.
+fn app_vm_launch_allowed(row: &WorkloadRow, mode: ResourceTableMode) -> bool {
+    mode == ResourceTableMode::Run
+        && row.delivery_type == DeliveryType::AppVm
+        && row
+            .app
+            .as_ref()
+            .is_some_and(|request| {
+                request.validate().is_ok()
+                    && is_valid_flatpak_app_id(&request.app_id)
+                    && request
+                        .requested_capabilities
+                        .iter()
+                        .all(|capability| APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str()))
+            })
 }
 
 fn vm_lifecycle_actions(
@@ -2416,16 +3085,40 @@ fn vm_lifecycle_actions(
         state.issue_console_attach(&row.node, &row.name, &row.name);
     }
     if row_button(ui, "Start", false).clicked() {
-        state.issue_lifecycle_direct("instance-start", &row.node, &row.name, &row.name);
+        state.issue_workload_direct(
+            "instance-start",
+            &row.node,
+            &row.name,
+            row.delivery_type,
+            &row.name,
+        );
     }
     if row_button(ui, "Stop", false).clicked() {
-        state.issue_lifecycle_direct("instance-stop", &row.node, &row.name, &row.name);
+        state.issue_workload_direct(
+            "instance-stop",
+            &row.node,
+            &row.name,
+            row.delivery_type,
+            &row.name,
+        );
     }
-    if row_button(ui, "Reboot\u{2026}", true).clicked() {
-        state.arm_lifecycle("instance-reboot", &row.node, &row.name, &row.name);
+            if row_button(ui, "Reboot\u{2026}", true).clicked() {
+                state.issue_workload_direct(
+                    "instance-reboot",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
     }
     if row_button(ui, "Destroy\u{2026}", true).clicked() {
-        state.arm_lifecycle("instance-delete", &row.node, &row.name, &row.name);
+        state.issue_workload_direct(
+            "instance-delete",
+            &row.node,
+            &row.name,
+            row.delivery_type,
+            &row.name,
+        );
     }
 }
 
@@ -2747,49 +3440,91 @@ fn sidebar_row(
     accent: Color32,
 ) -> egui::Response {
     let color = if selected { accent } else { Style::TEXT_DIM };
-    let resp = ui
-        .horizontal(|ui| {
-            ui.scope(|ui| {
-                ui.visuals_mut().override_text_color = Some(color);
-                carbon_icon(ui, icon, Style::ICON_S);
-            });
-            ui.add_space(Style::SP_XS);
-            ui.label(RichText::new(label).size(Style::BODY).color(color).strong());
-        })
-        .response
-        .interact(Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    let row_size = egui::vec2(ui.available_width().max(1.0), Style::SP_L + Style::SP_S);
+    let (rect, resp) = ui.allocate_exact_size(row_size, Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if selected || resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            Style::RADIUS_S,
+            accent.gamma_multiply(if selected { 0.16 } else { 0.08 }),
+        );
     }
+    let inner = rect.shrink2(egui::vec2(Style::SP_S, Style::SP_XS));
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    row_ui.scope(|ui| {
+        ui.visuals_mut().override_text_color = Some(color);
+        carbon_icon(ui, icon, Style::ICON_M);
+    });
+    row_ui.add_space(Style::SP_XS);
+    row_ui.label(RichText::new(label).size(Style::BODY).color(color).strong());
     resp
 }
 
 /// A small text button sized for a roster row's inline lifecycle verb.
 fn row_button(ui: &mut egui::Ui, label: &str, danger: bool) -> egui::Response {
     let color = if danger { Style::DANGER } else { Style::TEXT };
-    ui.add(egui::Button::new(
-        RichText::new(label).size(Style::SMALL).color(color),
-    ))
+    ui.add(
+        egui::Button::new(RichText::new(label).size(Style::SMALL).color(color))
+            .min_size(egui::vec2(0.0, Style::density(ui.ctx()).min_hit_target())),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// The transient one-line action note (last issued op / its outcome) with a
-/// dismiss affordance — honest feedback, never a silent op.
+/// Prominent operation status. Pending and completed results occupy a stable
+/// location above the workflow instead of being buried among form controls.
 fn render_note(ui: &mut egui::Ui, state: &mut WorkloadsState) {
-    let Some(note) = state.note.clone() else {
+    let pending = state
+        .mutation_pending
+        .as_ref()
+        .map(|request| (request.verb.clone(), request.sent.elapsed().as_secs()));
+    let Some(note) = state.note.clone().or_else(|| {
+        pending
+            .as_ref()
+            .map(|(verb, _)| format!("Waiting for `{verb}`\u{2026}"))
+    }) else {
         return;
     };
-    ui.horizontal_wrapped(|ui| {
-        ui.colored_label(Style::ACCENT, RichText::new(note).size(Style::SMALL));
-        if ui.small_button("dismiss").clicked() {
-            state.note = None;
-        }
-    });
-    ui.add_space(Style::SP_XS);
+    let failed = note.contains("failed")
+        || note.contains("did not answer")
+        || note.contains("Could not")
+        || note.contains("unavailable");
+    let tone = if failed { Style::DANGER } else { Style::ACCENT };
+    egui::Frame::group(ui.style())
+        .fill(Style::SURFACE_HI)
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, tone))
+        .corner_radius(Style::RADIUS_S)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let title = if pending.is_some() {
+                    "Working"
+                } else if failed {
+                    "Action required"
+                } else {
+                    "Step result"
+                };
+                ui.colored_label(tone, RichText::new(title).size(Style::SMALL).strong());
+                let message = pending.as_ref().map_or(note.clone(), |(verb, elapsed)| {
+                    format!(
+                        "Waiting for the cloud backend to finish `{verb}` ({elapsed}s elapsed)."
+                    )
+                });
+                ui.label(RichText::new(message).size(Style::SMALL).color(Style::TEXT));
+                if pending.is_none() && ui.small_button("Dismiss").clicked() {
+                    state.note = None;
+                }
+            });
+        });
+    ui.add_space(Style::SP_S);
 }
 
-/// The pending mutation review sheet — the operator types the required echo;
-/// the confirm button is disabled (never omitted) until it matches, then
-/// releases the action. Cancel clears it. Nothing reaches the Bus until armed.
+/// The pending mutation review sheet. Prepared service/image changes present
+/// direct Yes/No controls; live apply and lifecycle actions retain the exact
+/// typed echo. Nothing reaches the Bus until the operator confirms.
 fn render_review_sheet(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let Some(snapshot) = state.arming.as_ref() else {
         return;
@@ -2797,6 +3532,7 @@ fn render_review_sheet(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let echo = snapshot.action.echo();
     let word = snapshot.action.confirm_word();
     let subject = snapshot.action.subject();
+    let uses_yes_no_review = snapshot.action.uses_yes_no_review();
     let facts = review_sheet_facts(&snapshot.action, state);
     let mut confirm = false;
     let mut cancel = false;
@@ -2806,14 +3542,23 @@ fn render_review_sheet(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::DANGER))
         .corner_radius(Style::RADIUS_S)
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(format!(
+            let prompt = if uses_yes_no_review {
+                format!(
+                    "Review {subject}. Choose Yes to {} it, or No to leave it unchanged. \
+                     Nothing is sent until you choose Yes.",
+                    word.to_lowercase()
+                )
+            } else {
+                format!(
                     "Review — type \u{201C}{echo}\u{201D} exactly to {} {subject}. Nothing is \
                      sent until it matches.",
                     word.to_lowercase()
-                ))
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
+                )
+            };
+            ui.label(
+                RichText::new(prompt)
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
             );
             ui.add_space(Style::SP_XS);
             ui.horizontal_wrapped(|ui| {
@@ -2833,43 +3578,67 @@ fn render_review_sheet(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             muted_note(ui, format!("Frozen body: {}", facts.body_preview));
             muted_note(ui, format!("Blast radius: {}", facts.impact));
             ui.add_space(Style::SP_XS);
-            let Some(arming) = state.arming.as_mut() else {
-                return;
-            };
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut arming.typed)
-                        .hint_text(echo.as_str())
-                        .desired_width(Style::SP_XL * 5.0),
-                );
-                ui.add_space(Style::SP_S);
-                let is_armed = armed(&arming.typed, &echo);
-                if ui
-                    .add_enabled(
-                        is_armed,
-                        egui::Button::new(
-                            RichText::new(word).size(Style::SMALL).color(Style::DANGER),
-                        ),
-                    )
-                    .clicked()
-                {
-                    confirm = true;
-                }
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new("Cancel").size(Style::SMALL),
-                    ))
-                    .clicked()
-                {
-                    cancel = true;
-                }
-            });
+            if uses_yes_no_review {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new("Yes").size(Style::SMALL).color(Style::DANGER),
+                        ))
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("No").size(Style::SMALL)))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            } else {
+                let Some(arming) = state.arming.as_mut() else {
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut arming.typed)
+                            .hint_text(echo.as_str())
+                            .desired_width(Style::SP_XL * 5.0),
+                    );
+                    ui.add_space(Style::SP_S);
+                    let is_armed = armed(&arming.typed, &echo);
+                    if ui
+                        .add_enabled(
+                            is_armed,
+                            egui::Button::new(
+                                RichText::new(word).size(Style::SMALL).color(Style::DANGER),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new("Cancel").size(Style::SMALL),
+                        ))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            }
         });
     ui.add_space(Style::SP_S);
 
     if confirm {
         if let Some(arming) = state.arming.take() {
-            state.perform(arming.action, &arming.typed);
+            let confirmation = if uses_yes_no_review {
+                echo.as_str()
+            } else {
+                arming.typed.as_str()
+            };
+            state.perform(arming.action, confirmation);
         }
     } else if cancel {
         state.arming = None;
@@ -3034,6 +3803,7 @@ mod browser_vm_target_tests {
     fn cloud_state(host: &str, published_at_ms: i64, workload: WorkloadRow) -> CloudState {
         CloudState {
             host: host.to_owned(),
+            role: DeploymentRole::Workstation,
             adapter: CloudProviderAdapter::ConstructCloud,
             health: Vec::new(),
             resources: Vec::new(),
@@ -3042,6 +3812,7 @@ mod browser_vm_target_tests {
             workloads: vec![workload],
             drift_summary: DriftSummary::default(),
             node_capacity: NodeCapacity::default(),
+            android_inventories: Vec::new(),
         }
     }
 

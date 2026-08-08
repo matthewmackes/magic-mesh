@@ -233,7 +233,7 @@ fn now_ms() -> u64 {
 }
 
 fn state_cmd(op: &StateOp) -> ExitCode {
-    let dir = state::data_dir();
+    let dir = state::coordination_dir();
     match op {
         StateOp::Show => {
             match state::read_state(&dir) {
@@ -249,24 +249,17 @@ fn state_cmd(op: &StateOp) -> ExitCode {
             ExitCode::SUCCESS
         }
         StateOp::ByPeer => {
-            let bp_dir = dir.join("music-state-by-peer");
-            match std::fs::read_dir(&bp_dir) {
-                Ok(rd) => {
-                    let mut any = false;
-                    for entry in rd.flatten() {
-                        if let Some(s) = std::fs::read_to_string(entry.path())
-                            .ok()
-                            .and_then(|t| serde_json::from_str::<state::MusicState>(&t).ok())
-                        {
-                            any = true;
-                            println!("{}: {}", s.peer, if s.playing { "playing" } else { "idle" });
-                        }
-                    }
-                    if !any {
-                        println!("no peer snapshots yet");
-                    }
+            let peers = state::read_all_peer_states(&dir);
+            if peers.is_empty() {
+                println!("no peer snapshots yet");
+            } else {
+                for peer in peers {
+                    println!(
+                        "{}: {}",
+                        peer.peer,
+                        if peer.playing { "playing" } else { "idle" }
+                    );
                 }
-                Err(_) => println!("no peer snapshots yet"),
             }
             ExitCode::SUCCESS
         }

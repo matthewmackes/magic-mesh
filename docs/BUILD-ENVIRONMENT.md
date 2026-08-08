@@ -54,10 +54,14 @@ has staged it.
 currently report **Fedora 42**. Therefore `xcp-build.sh rpm` produces a native
 F42-linked RPM, even when the target workstation is Fedora 44. Do not install a
 native farm RPM on an F44 Workstation seat unless `rpm -Uvh --test` passes; media
-and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). For an F44
-workstation deploy, use the native F44 BigBoy builder handoff documented in
-`docs/F44-BUILDER-AND-SEAT-DEPLOY.md`; the Fedora 44 container lane is a
-supplemental compatibility path, not the current physical-seat release cut.
+and ICU sonames can differ (`mpv-libs`, FFmpeg, ICU, Python). The five physical
+Workstation seats are Fedora 44: their standard release path is the dedicated
+native F44 BigBoy builder documented in `docs/F44-BUILDER-AND-SEAT-DEPLOY.md`,
+with `MCNF_RPM_TARGET_FEDORA=44` set so `xcp-build.sh` rejects a mismatched
+builder before compiling. The Fedora 44 container lane is compatibility proof,
+not the current physical-seat release cut. A F42 RPM's FFmpeg requirements must
+never be filtered or overridden: they are produced from the shell binary's ELF
+dependencies and would fail at runtime even if a transaction were forced.
 For any retained split Browser artifact, copy and install the base and Browser
 RPMs together and always run the transaction test first:
 `rpm -Uvh --test --replacepkgs --force --nosignature magic-mesh-*.rpm magic-mesh-browser-*.rpm`.
@@ -243,7 +247,8 @@ seats have encrypted disks and require a key at boot, so do not reboot them
 unless a reboot is genuinely required for the test or recovery path.
 
 **Direct-DRM validation seat (onboarded 2026-07-30, current-mesh enrollment
-corrected 2026-08-03):** T480 at `172.20.146.138` is an enrolled Fedora 44
+corrected 2026-08-03):** T480 at `172.20.146.68` (DHCP address observed
+2026-08-04) is an enrolled Fedora 44
 Workstation with `/dev/dri/card1`, the Construct DRM shell, and Nebula overlay
 `10.42.0.8`. Include it in direct-render validation alongside the primary
 Basement seat. It is a test seat, not a farm worker: do not add it to
@@ -251,7 +256,7 @@ Basement seat. It is a test seat, not a farm worker: do not add it to
 
 **Active Workstation seat inventory (operator 2026-08-03):** use all five
 enrolled seats for workstation deployment and seat verification: T480
-`172.20.146.138` (`10.42.0.8`), T470S Eagle `172.20.146.145` (`10.42.0.6`),
+`172.20.146.68` (`10.42.0.8`), T470S Eagle `172.20.146.88` (`10.42.0.6`),
 Basement seat 15 `172.20.0.15` (`10.42.0.5`), Dell `172.20.146.225`
 (`10.42.0.4`), and Microsoft Surface Pro 6 `172.20.146.79` (`10.42.0.7`).
 Surface is a seat, not seat 15 and not a farm worker. The historical Eagle

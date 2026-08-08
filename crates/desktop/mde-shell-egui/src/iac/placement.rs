@@ -8,6 +8,8 @@
 use mde_egui::egui::{self, Color32, RichText, Sense, Stroke};
 use mde_egui::{card, section, status_dot, Style};
 
+use mackes_mesh_types::cloud::DeploymentRole;
+
 use super::WorkloadsState;
 
 /// The near-full capacity threshold: at/above this fill fraction a bar warns
@@ -65,6 +67,17 @@ fn fmt_gib(mib: u32) -> String {
 /// the mutable borrow is honestly unused here.
 #[allow(clippy::needless_pass_by_ref_mut)]
 pub(super) fn placement_picker(ui: &mut egui::Ui, state: &mut WorkloadsState) -> Option<String> {
+    let selected = state.selected_node().map(str::to_string);
+    let selected_state = selected.as_deref().and_then(|selected| {
+        state
+            .states()
+            .iter()
+            .find(|cloud| {
+                cloud.host == selected && cloud.role == DeploymentRole::Workstation
+            })
+            .cloned()
+    });
+
     section().show(ui, |ui| {
         ui.label(
             RichText::new("Placement")
@@ -74,24 +87,41 @@ pub(super) fn placement_picker(ui: &mut egui::Ui, state: &mut WorkloadsState) ->
         );
         mde_egui::muted_note(
             ui,
-            "Choose the mesh node this workload runs on. Bars show used / total capacity per node.",
+            if selected_state.is_some() {
+                "Step 1 complete. This node is the target for the provisioning steps below."
+            } else {
+                "Step 1: choose the mesh node this workload runs on."
+            },
         );
     });
 
-    let selected = state.selected_node().map(str::to_string);
+    if let Some(cloud) = selected_state {
+        let change = card()
+            .show(ui, |ui| selected_node_summary(ui, &cloud))
+            .inner;
+        if change {
+            state.selected_node = None;
+        }
+        return None;
+    }
 
-    if state.states().is_empty() {
+    let eligible_nodes = state
+        .states()
+        .iter()
+        .filter(|cloud| cloud.role == DeploymentRole::Workstation)
+        .collect::<Vec<_>>();
+    if eligible_nodes.is_empty() {
         crate::empty_state::show(
             ui,
-            "No mesh nodes reporting",
-            "A node appears here once its state/cloud mirror lands on the Bus with its capacity. \
-             Off-mesh, this stays honestly empty.",
+            "No eligible Workstation placement nodes",
+            "Lighthouses are control-plane-only. A Workstation appears here once its \
+             state/cloud mirror lands on the Bus with capacity.",
         );
         return None;
     }
 
     let mut chosen: Option<String> = None;
-    for cs in state.states() {
+    for cs in eligible_nodes {
         let is_selected = selected.as_deref() == Some(cs.host.as_str());
         let mut frame = card();
         if is_selected {
@@ -104,6 +134,48 @@ pub(super) fn placement_picker(ui: &mut egui::Ui, state: &mut WorkloadsState) ->
         ui.add_space(Style::SP_S);
     }
     chosen
+}
+
+/// Compact completed placement step. Capacity details belong to node choice;
+/// once chosen, retain only the target, gate posture, and an explicit way back.
+fn selected_node_summary(ui: &mut egui::Ui, cloud: &mackes_mesh_types::cloud::CloudState) -> bool {
+    let fresh = super::cloud_state_is_fresh(cloud);
+    ui.horizontal_wrapped(|ui| {
+        status_dot(
+            ui,
+            if cloud.apply_armed && fresh {
+                Style::OK
+            } else {
+                Style::TEXT_DIM
+            },
+        );
+        ui.label(
+            RichText::new(format!("Selected: {}", cloud.host))
+                .size(Style::BODY)
+                .strong()
+                .color(Style::ACCENT_WORKLOADS),
+        );
+        let posture = if !fresh {
+            "stale mirror"
+        } else if cloud.apply_armed {
+            "live apply"
+        } else {
+            "plan-only"
+        };
+        ui.label(
+            RichText::new(posture)
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_S);
+        ui.add(egui::Button::new(
+            RichText::new("Change placement")
+                .size(Style::SMALL)
+                .color(Style::ACCENT_WORKLOADS),
+        ))
+        .clicked()
+    })
+    .inner
 }
 
 /// One node card: the host + its armed-apply posture, the vCPU + memory capacity

@@ -19,6 +19,16 @@ guest contract or required runtime packages are missing, or if a public
 Flatpak remote has been pre-admitted. It also carries the immutable
 `image-contract.json` profile marker; cloud-init refuses to admit an app when
 the image does not identify the `wayland-standard`/Sway/`curated` contract.
+The canonical build also binds the Git source revision into an image label and
+the guest-readable `/usr/share/mcnf/app-vm/source-commit` file; the static
+verifier rejects an image when either provenance value is absent or malformed.
+The image additionally carries strict, single-valued `image-provenance` and
+`runtime-readiness` manifests. The former binds the profile, resolved
+base-image digest, and source revision inside the guest to the immutable image
+labels. The latter names the guest-owned Sway executable, App VM supervisor
+entrypoint, readiness topic/state, and disabled host-fallback policy; missing,
+duplicated, unknown, or ambiguous evidence fails the static gate before a disk
+artifact can be emitted.
 Run `verify-contract.sh` for the focused static and fixture checks. The
 verifier includes a bounded terminal-runtime evidence fixture: `connected` and
 `reconnecting` are admitted, `failed` is rejected for readiness, and
@@ -36,6 +46,22 @@ The guest launcher also owns shutdown: TERM, INT, and HUP are trapped, the
 Flatpak child is terminated and waited for, and a terminal `failed` observation
 is published before the launcher exits. This prevents a stopped or reconnecting
 session from leaving an orphaned application painting a stale VDI surface.
+
+Before the launcher starts Flatpak, the image-owned
+`mcnf-app-vm-runtime-probe` performs a bounded guest preflight. It requires the
+immutable image contract, the active Sway control socket, the session bus's
+portal service, PipeWire/Pulse compatibility with at least one sink, the
+`curated` system remote, and the already-admitted Flatpak identity. It writes a
+mode-0600 `runtime-preflight.json` record under `/run/mcnf-app-vm`; a missing or
+non-responsive dependency records `state=unavailable` and exits non-zero, so
+the launcher publishes `unavailable` and never presents a host fallback as a
+connected App VM. A `ready` preflight is only a prerequisite: the launcher
+publishes `connected` only after the guest Flatpak process is started.
+
+`verify-contract.sh` runs the probe against both a complete fixture and a
+failed-Sway fixture. These are bounded guest-runtime checks, not live VDI or
+remote-seat acceptance; a deployed guest still needs an actual portal,
+PipeWire, Flatpak, and VDI session to produce a ready record.
 
 Build from the repository root with `build-image.sh`. The driver resolves the
 base image before invoking Podman, bounds a registry probe with

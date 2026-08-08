@@ -40,6 +40,11 @@ use crate::ipc::apps::{default_app_dirs, scan_local_apps, AppEntry};
 /// republish keeps a focused peer's set fresh without measurable idle cost.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Maximum deterministic spread before the first installed-app scan. The
+/// first scan still happens no later than the existing 60-second cadence, so
+/// the phase only breaks up a synchronized startup burst.
+pub const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+
 /// File this node's installed-app set is mirrored to under its QNM-Shared dir.
 pub const SHARED_INSTALLED_FILE: &str = "apps-installed.json";
 
@@ -79,7 +84,9 @@ pub fn installed_doc(hostname: &str, app_dirs: &[PathBuf]) -> InstalledApps {
 /// Write the installed-app document to `<mount>/<hostname>/apps-installed.json`,
 /// atomically (tmp+rename), mirroring
 /// [`crate::workers::apps_running::write_shared_running`]. No-op on an empty
-/// hostname. Best-effort — a write error is logged, never fatal.
+/// hostname. An unchanged serialized body is left in place so Syncthing does
+/// not observe a needless replacement on every 60-second tick. Best-effort —
+/// a write error is logged, never fatal.
 pub fn write_shared_installed(mount: &Path, doc: &InstalledApps) {
     if doc.hostname.is_empty() {
         return;
@@ -94,6 +101,9 @@ pub fn write_shared_installed(mount: &Path, doc: &InstalledApps) {
     };
     let tmp = dir.join("apps-installed.json.tmp");
     let final_path = dir.join(SHARED_INSTALLED_FILE);
+    if std::fs::read(&final_path).is_ok_and(|existing| existing.as_slice() == body.as_bytes()) {
+        return;
+    }
     if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
         tracing::warn!("apps_installed: write {} failed: {e}", tmp.display());
         return;
@@ -135,7 +145,7 @@ impl AppsInstalledWorker {
     fn tick_once(&self) {
         // Only publish when the share is a real mount — never write to a bare
         // local dir masquerading as the share (the WORKLOAD-FLEET-1 guard).
-        if !crate::workers::compute_registry::is_meshfs_mounted(&self.mount) {
+        if !crate::workers::runtime_probe::is_meshfs_mounted(&self.mount) {
             return;
         }
         let doc = installed_doc(&self.hostname, &default_app_dirs(&self.home));
@@ -150,6 +160,16 @@ impl Worker for AppsInstalledWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // Keep the old no-immediate-scan behavior, but spread the first
+        // filesystem/XDG scan across nodes that restart together. Subtracting
+        // the phase preserves the old first-scan deadline.
+        let first_delay = self
+            .tick
+            .saturating_sub(initial_phase(&self.hostname, self.tick));
+        tokio::select! {
+            _ = tokio::time::sleep(first_delay) => {}
+            _ = shutdown.wait() => return Ok(()),
+        }
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.tick) => {
@@ -160,6 +180,21 @@ impl Worker for AppsInstalledWorker {
         }
         Ok(())
     }
+}
+
+/// Return a stable bounded phase for the first installed-app scan. FNV-1a is
+/// sufficient because this is scheduling spread, not a security primitive.
+fn initial_phase(hostname: &str, tick: Duration) -> Duration {
+    let window_ms = tick.as_millis().min(MAX_INITIAL_PHASE.as_millis());
+    if hostname.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in hostname.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis((u128::from(hash) % (window_ms + 1)) as u64)
 }
 
 #[cfg(test)]
@@ -230,5 +265,52 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_shared_installed(tmp.path(), &InstalledApps::default());
         assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn write_shared_installed_skips_identical_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = InstalledApps {
+            hostname: "fedora".into(),
+            entries: vec![AppEntry {
+                id: "firefox".into(),
+                name: "Firefox".into(),
+                kind: "app".into(),
+                source: "xdg".into(),
+                node: "fedora".into(),
+                exec: "firefox %u".into(),
+                endpoint: String::new(),
+                icon: "firefox".into(),
+                health: String::new(),
+                state: String::new(),
+            }],
+        };
+        write_shared_installed(tmp.path(), &doc);
+        let path = tmp.path().join("fedora").join(SHARED_INSTALLED_FILE);
+        let before = std::fs::metadata(&path).unwrap();
+        write_shared_installed(tmp.path(), &doc);
+        let after = std::fs::metadata(&path).unwrap();
+
+        assert_eq!(before.ino(), after.ino(), "identical body must not rename");
+        assert!(!tmp
+            .path()
+            .join("fedora")
+            .join("apps-installed.json.tmp")
+            .exists());
+    }
+
+    #[test]
+    fn initial_phase_is_stable_bounded_and_preserves_scan_deadline() {
+        let phase = initial_phase("peer:seat15", DEFAULT_TICK_INTERVAL);
+        assert_eq!(phase, initial_phase("peer:seat15", DEFAULT_TICK_INTERVAL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        let first_delay = DEFAULT_TICK_INTERVAL.saturating_sub(phase);
+        assert!(first_delay <= DEFAULT_TICK_INTERVAL);
+        assert!(first_delay >= DEFAULT_TICK_INTERVAL - MAX_INITIAL_PHASE);
+        assert_eq!(initial_phase("", DEFAULT_TICK_INTERVAL), Duration::ZERO);
+        assert!(initial_phase("peer:seat15", Duration::from_millis(100))
+            <= Duration::from_millis(100));
     }
 }

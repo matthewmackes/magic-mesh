@@ -27,10 +27,10 @@
 
 use std::path::Path;
 
-use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
+use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
+use mackes_mesh_types::cloud::{APP_VM_ALLOWED_CAPABILITIES, CLOUD_ACTION_SCHEMA_VERSION};
 use mackes_mesh_types::vdi_session::{
-    AppVmLaunchRequest, AppVmLifecycleState, BrowserVmTransport, DesktopSessionProfile,
-    SessionRequest,
+    AppVmLaunchRequest, AppVmLifecycleState, SessionRequest,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -147,54 +147,13 @@ pub(crate) fn publish_open_record(
     publish_open_record_with_profile(bus_root, last_error, serving_peer, vm_id, client_peer, None)
 }
 
-/// Build + publish a Browser VM `Open` request with an explicit typed profile.
-/// The profile is intent only; the serving broker still discovers and probes the
-/// guest endpoint and never trusts a client-supplied address or credential.
-pub(crate) fn publish_browser_vm_open_record(
-    bus_root: Option<&Path>,
-    last_error: &mut Option<String>,
-    serving_peer: &str,
-    vm_id: &str,
-    client_peer: &str,
-) -> OpenPublication {
-    publish_browser_vm_open_record_with_transport(
-        bus_root,
-        last_error,
-        serving_peer,
-        vm_id,
-        client_peer,
-        BrowserVmTransport::Sunshine,
-    )
-}
-
-/// Build + publish a Browser VM `Open` with an exact transport selection. The
-/// default caller passes Sunshine; RDP reaches this seam only after the operator
-/// explicitly selects the one-session alternate.
-pub(crate) fn publish_browser_vm_open_record_with_transport(
-    bus_root: Option<&Path>,
-    last_error: &mut Option<String>,
-    serving_peer: &str,
-    vm_id: &str,
-    client_peer: &str,
-    transport: BrowserVmTransport,
-) -> OpenPublication {
-    publish_open_record_with_profile(
-        bus_root,
-        last_error,
-        serving_peer,
-        vm_id,
-        client_peer,
-        Some(transport.session_profile()),
-    )
-}
-
 fn publish_open_record_with_profile(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,
     serving_peer: &str,
     vm_id: &str,
     client_peer: &str,
-    profile: Option<DesktopSessionProfile>,
+    profile: Option<mackes_mesh_types::vdi_session::DesktopSessionProfile>,
 ) -> OpenPublication {
     let id = mint_session_id(vm_id, now_ms());
     let request = SessionRequest::Open {
@@ -223,6 +182,16 @@ pub(crate) fn publish_app_vm_open(
     request: AppVmLaunchRequest,
 ) -> Result<OpenPublication, String> {
     request.validate().map_err(|error| error.to_string())?;
+    if !is_valid_flatpak_app_id(&request.app_id) {
+        return Err("App VM open requires an admitted reverse-DNS Flatpak identity.".to_owned());
+    }
+    if request
+        .requested_capabilities
+        .iter()
+        .any(|capability| !APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str()))
+    {
+        return Err("App VM open requested a capability outside the guest policy.".to_owned());
+    }
     if serving_peer.trim().is_empty() || vm_id.trim().is_empty() || client_peer.trim().is_empty() {
         return Err("App VM open requires explicit serving, VM, and client peers.".to_owned());
     }
@@ -463,34 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn browser_open_defaults_to_sunshine_and_rdp_requires_explicit_selection() {
-        let mut last_error = None;
-        let default =
-            publish_browser_vm_open_record(None, &mut last_error, "dell", "browser-vm", "surface");
-        let default_request: SessionRequest =
-            serde_json::from_str(&default.body).expect("default Browser request");
-        assert_eq!(
-            default_request.browser_transport(),
-            Ok(Some(BrowserVmTransport::Sunshine))
-        );
-
-        let explicit = publish_browser_vm_open_record_with_transport(
-            None,
-            &mut last_error,
-            "dell",
-            "browser-vm",
-            "surface",
-            BrowserVmTransport::Rdp,
-        );
-        let explicit_request: SessionRequest =
-            serde_json::from_str(&explicit.body).expect("explicit RDP request");
-        assert_eq!(
-            explicit_request.browser_transport(),
-            Ok(Some(BrowserVmTransport::Rdp))
-        );
-        assert!(explicit.body.contains("browser_vm_rdp"));
-    }
-
     #[test]
     fn publish_open_writes_a_session_targeted_capability() {
         let bus = tempfile::tempdir().unwrap();
@@ -574,6 +515,50 @@ mod tests {
         )
         .expect_err("placement must be explicit");
         assert!(error.contains("explicit serving, VM, and client peers"));
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .list_since(ACTION_TOPIC, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn publish_app_vm_open_rejects_unadmitted_identity_and_capability() {
+        let bus = tempfile::tempdir().unwrap();
+        for (app_id, capabilities, expected) in [
+            (
+                "host-command",
+                vec!["clipboard".to_owned()],
+                "reverse-DNS Flatpak identity",
+            ),
+            (
+                "org.example.Writer",
+                vec!["host_socket".to_owned()],
+                "capability outside the guest policy",
+            ),
+        ] {
+            let request = AppVmLaunchRequest::new(
+                app_id,
+                "catalog-7",
+                "wayland-standard",
+                capabilities,
+                "app-session-7",
+                true,
+            )
+            .expect("syntactically bounded request");
+            let mut last_error = None;
+            let error = publish_app_vm_open(
+                Some(bus.path()),
+                &mut last_error,
+                "oak",
+                "app-vm-7",
+                "eagle",
+                request,
+            )
+            .expect_err("unadmitted App VM request must fail closed");
+            assert!(error.contains(expected), "{error}");
+            assert!(last_error.is_none());
+        }
         assert!(Persist::open(bus.path().to_path_buf())
             .unwrap()
             .list_since(ACTION_TOPIC, None)

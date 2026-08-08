@@ -37,6 +37,8 @@ pub const DEFAULT_ENDPOINT: &str = "https://api.weather.gov/alerts/active";
 pub const POLL: Duration = Duration::from_secs(60);
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const NO_FIX_RETRY: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+const RETRY_PHASE_MAX: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const ZONE_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ALERT_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -793,6 +795,41 @@ impl NwsAlertOverlayWorker {
     }
 }
 
+fn retry_ceiling(poll: Duration) -> Duration {
+    poll.min(RETRY_MAX)
+}
+
+fn retry_delay(current: Duration, poll: Duration) -> Duration {
+    current.max(NO_FIX_RETRY).min(retry_ceiling(poll))
+}
+
+fn backoff_retry(current: Duration, poll: Duration) -> Duration {
+    current.saturating_mul(2).min(retry_ceiling(poll))
+}
+
+/// Derive a stable phase from the node identity instead of using wall-clock
+/// randomness. A restart therefore keeps the seat off the common retry phase,
+/// while different hosts normally choose different offsets without adding a
+/// new source of entropy or making the retry behavior untestable.
+fn retry_phase(host: &str) -> Duration {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in host.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3_u64);
+    }
+    Duration::from_millis(hash % RETRY_PHASE_MAX.as_millis() as u64)
+}
+
+fn phase_desynchronized_retry_delay(
+    current: Duration,
+    poll: Duration,
+    phase: Duration,
+) -> Duration {
+    retry_delay(current, poll)
+        .saturating_add(phase.min(RETRY_PHASE_MAX))
+        .min(retry_ceiling(poll))
+}
+
 fn validated_vehicle_point(
     vehicle: &mackes_mesh_types::vehicle::VehicleState,
     expected_host: &str,
@@ -835,28 +872,47 @@ impl Worker for NwsAlertOverlayWorker {
         };
         let mut last_good = None;
         let mut retry = RETRY_MIN.min(self.poll);
+        let phase = retry_phase(&self.host);
+        let mut phase_pending = true;
+        let mut no_fix_published = false;
         loop {
             let Some(point) = self.current_vehicle_point() else {
-                self.publish_unavailable(
-                    &last_good,
-                    None,
-                    "fresh same-host MG90 vehicle fix unavailable",
-                );
+                if !no_fix_published {
+                    self.publish_unavailable(
+                        &last_good,
+                        None,
+                        "fresh same-host MG90 vehicle fix unavailable",
+                    );
+                    no_fix_published = true;
+                }
+                let delay = if phase_pending {
+                    phase_pending = false;
+                    phase_desynchronized_retry_delay(retry, self.poll, phase)
+                } else {
+                    retry_delay(retry, self.poll)
+                };
+                retry = backoff_retry(retry, self.poll);
                 tokio::select! {
                     () = shutdown.wait() => break,
-                    () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+                    () = tokio::time::sleep(delay) => {}
                 }
                 continue;
             };
+            no_fix_published = false;
             let Some(result) = self.fetch_async(probe.clone(), point, &mut shutdown).await else {
                 break;
             };
             let success = self.apply_result(result, point, &mut last_good);
-            let delay = if success { self.poll } else { retry };
+            let delay = if success {
+                phase_pending = true;
+                self.poll
+            } else {
+                retry_delay(retry, self.poll)
+            };
             retry = if success {
                 RETRY_MIN.min(self.poll)
             } else {
-                retry.saturating_mul(2).min(self.poll)
+                backoff_retry(retry, self.poll)
             };
             tokio::select! {
                 () = shutdown.wait() => break,
@@ -1341,6 +1397,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn no_fix_retry_is_bounded_and_phase_desynchronized() {
+        let long_poll = Duration::from_secs(90);
+        assert_eq!(retry_ceiling(long_poll), RETRY_MAX);
+        assert_eq!(retry_delay(Duration::from_secs(2), long_poll), RETRY_MIN);
+        assert_eq!(backoff_retry(RETRY_MIN, long_poll), Duration::from_secs(10));
+        assert_eq!(backoff_retry(Duration::from_secs(40), long_poll), RETRY_MAX);
+        assert_eq!(backoff_retry(RETRY_MAX, long_poll), RETRY_MAX);
+
+        let first_phase = retry_phase("seat-a");
+        let second_phase = retry_phase("seat-b");
+        assert_eq!(first_phase, retry_phase("seat-a"));
+        assert_ne!(first_phase, second_phase);
+        assert!(first_phase < RETRY_PHASE_MAX);
+        assert!(second_phase < RETRY_PHASE_MAX);
+
+        let first_delay = phase_desynchronized_retry_delay(RETRY_MIN, RETRY_MAX, first_phase);
+        assert!(first_delay >= RETRY_MIN);
+        assert!(first_delay <= RETRY_MAX);
+        assert_eq!(
+            phase_desynchronized_retry_delay(RETRY_MAX, RETRY_MAX, first_phase),
+            RETRY_MAX
+        );
+        assert_eq!(
+            phase_desynchronized_retry_delay(RETRY_MIN, RETRY_MAX, Duration::ZERO),
+            RETRY_MIN
+        );
+
+        let short_poll = Duration::from_millis(50);
+        assert_eq!(
+            phase_desynchronized_retry_delay(RETRY_MIN, short_poll, first_phase),
+            short_poll
+        );
+    }
+
     struct SlowProbe;
 
     impl NwsAlertProbe for SlowProbe {
@@ -1398,6 +1489,15 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
+
+        // Several bounded no-fix retry wakeups must not rewrite the same
+        // unavailable projection on every seat-local retry.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let rows = Persist::open(root.clone())
+            .expect("bus")
+            .list_since(&topic, None)
+            .expect("list no-fix rows");
+        assert_eq!(rows.len(), 1, "repeated no-fix retries must be coalesced");
 
         tx.send(true).expect("shutdown");
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;

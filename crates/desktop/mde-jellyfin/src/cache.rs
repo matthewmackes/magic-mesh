@@ -33,7 +33,7 @@
 //! Cross-device LRU is honest: [`touch`](OfflineCache::touch) bumps an entry's
 //! last-access on offline play, and the budget fold evicts the coldest first.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -180,6 +180,10 @@ struct MetadataManifest {
 /// Why an offline-cache operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
+    /// A zero-byte response cannot be played and must never become an offline
+    /// cache entry, even when a caller bypasses [`JellyfinClient::download`].
+    #[error("cannot cache empty media")]
+    EmptyMedia,
     /// A filesystem read/write failed.
     #[error("offline cache io error: {0}")]
     Io(String),
@@ -298,7 +302,8 @@ impl OfflineCache {
     /// Whether `item_id` is available offline.
     #[must_use]
     pub fn contains(&self, item_id: &str) -> bool {
-        self.get(item_id).is_some()
+        self.get(item_id)
+            .is_some_and(|entry| self.entry_file_is_intact(entry))
     }
 
     /// The total bytes currently held.
@@ -323,7 +328,9 @@ impl OfflineCache {
     /// offline player loads.
     #[must_use]
     pub fn local_path(&self, item_id: &str) -> Option<PathBuf> {
-        self.get(item_id).map(|e| self.root.join(&e.file_name))
+        self.get(item_id)
+            .filter(|entry| self.entry_file_is_intact(entry))
+            .map(|entry| self.root.join(&entry.file_name))
     }
 
     /// The manifest path (`<root>/manifest.json`).
@@ -401,6 +408,7 @@ impl OfflineCache {
     /// never fit); re-storing an already-cached item replaces it in place.
     ///
     /// # Errors
+    /// [`CacheError::EmptyMedia`] when `bytes` is empty,
     /// [`CacheError::OverBudget`] when the title exceeds the budget, or
     /// [`CacheError::Io`] / [`CacheError::Parse`] on a filesystem / manifest failure.
     pub fn store(
@@ -410,6 +418,9 @@ impl OfflineCache {
         now: u64,
     ) -> Result<CacheEntry, CacheError> {
         let incoming = bytes.len() as u64;
+        if bytes.is_empty() {
+            return Err(CacheError::EmptyMedia);
+        }
         if let Some(budget) = self.size_budget {
             if incoming > budget {
                 return Err(CacheError::OverBudget {
@@ -430,7 +441,7 @@ impl OfflineCache {
         let file_name = cache_file_name(req);
         let path = self.root.join(&file_name);
         std::fs::create_dir_all(&self.root).map_err(|e| CacheError::Io(e.to_string()))?;
-        std::fs::write(&path, bytes).map_err(|e| CacheError::Io(e.to_string()))?;
+        write_atomic(&path, bytes).map_err(|e| CacheError::Io(e.to_string()))?;
 
         // Upsert the manifest entry, preserving the download time on a replace but
         // refreshing last-access (a re-download is a use).
@@ -562,7 +573,22 @@ impl OfflineCache {
         };
         let json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| CacheError::Parse(e.to_string()))?;
-        std::fs::write(self.manifest_path(), json).map_err(|e| CacheError::Io(e.to_string()))
+        write_atomic(&self.manifest_path(), json.as_bytes())
+            .map_err(|e| CacheError::Io(e.to_string()))
+    }
+
+    fn entry_file_is_intact(&self, entry: &CacheEntry) -> bool {
+        if !safe_cache_file_name(&entry.file_name) {
+            return false;
+        }
+        std::fs::symlink_metadata(self.root.join(&entry.file_name)).is_ok_and(|metadata| {
+            // A zero-byte file is never a playable media copy.  Keep this
+            // invariant here as well as in `store`: a hostile or stale
+            // manifest must not turn an empty file into an offline fallback.
+            metadata.file_type().is_file()
+                && metadata.len() > 0
+                && metadata.len() == entry.byte_len
+        })
     }
 }
 
@@ -718,6 +744,43 @@ fn cache_file_name(req: &CacheRequest) -> String {
     )
 }
 
+fn safe_cache_file_name(file_name: &str) -> bool {
+    let components = Path::new(file_name).components().collect::<Vec<_>>();
+    !file_name.is_empty() && components.len() == 1 && matches!(components[0], Component::Normal(_))
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cache"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Reduce `s` to `[A-Za-z0-9_-]`, mapping every other byte to `_`.
 fn slug(s: &str) -> String {
     s.chars()
@@ -772,6 +835,56 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), b"MEDIA-BYTES");
         // The server-URL id is slugged into a valid file name.
         assert!(!entry.file_name.contains('/') && !entry.file_name.contains(':'));
+        let temporary_files = std::fs::read_dir(dir.path())
+            .expect("cache dir")
+            .filter_map(Result::ok)
+            .filter(|item| item.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temporary_files, 0, "atomic writes leave no temporary files");
+    }
+
+    #[test]
+    fn offline_availability_rejects_missing_or_truncated_files() {
+        let dir = tempdir().expect("tempdir");
+        let mut cache = OfflineCache::with_root(dir.path());
+        cache
+            .store(&req("m1", "Movie One"), b"MEDIA-BYTES", 100)
+            .expect("store");
+        let path = cache.local_path("m1").expect("path");
+
+        std::fs::write(&path, b"short").expect("truncate");
+        assert!(!cache.contains("m1"));
+        assert!(cache.local_path("m1").is_none());
+
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!cache.contains("m1"));
+        assert!(cache.local_path("m1").is_none());
+    }
+
+    #[test]
+    fn cache_rejects_empty_media_before_touching_existing_entries() {
+        let dir = tempdir().expect("tempdir");
+        let mut cache = OfflineCache::with_root(dir.path());
+        cache
+            .store(&req("m1", "Movie One"), b"MEDIA-BYTES", 100)
+            .expect("store");
+
+        let err = cache
+            .store(&req("m1", "Movie One"), &[], 200)
+            .expect_err("empty media must not be cached");
+        assert!(matches!(err, CacheError::EmptyMedia));
+        assert_eq!(cache.entries().len(), 1);
+        assert_eq!(
+            std::fs::read(cache.local_path("m1").expect("existing path")).expect("existing bytes"),
+            b"MEDIA-BYTES"
+        );
+    }
+
+    #[test]
+    fn cache_manifest_names_cannot_escape_the_cache_root() {
+        assert!(safe_cache_file_name("server_item.mkv"));
+        assert!(!safe_cache_file_name("../outside.mkv"));
+        assert!(!safe_cache_file_name("nested/item.mkv"));
     }
 
     #[test]

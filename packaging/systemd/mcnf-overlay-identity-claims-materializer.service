@@ -1,0 +1,34 @@
+[Unit]
+Description=Post-overlay authenticated overlay identity claim snapshot producer
+Documentation=https://github.com/matthewmackes/magic-mesh
+# ACTIVATION_BLOCKER=pre-nebula-current-authority-transport-unavailable
+# This producer reads the overlay-bound etcd lease namespace. It is useful for
+# producing and testing the authenticated local cache, but it cannot establish
+# current authority before Nebula starts. Deliberately no [Install] section and
+# no ordering edge into nebula.service exist until a separate authenticated
+# pre-Nebula transport refreshes the /run commitment during the current boot.
+After=network-online.target nebula.service etcd.service
+Wants=network-online.target
+ConditionPathExists=/etc/mackesd/overlay-identity-snapshot-hmac
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+StateDirectory=mackesd/overlay-identity-claims
+StateDirectoryMode=0700
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /run/mackesd
+ExecStart=/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py
+TimeoutStartSec=15
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/mackesd/overlay-identity-claims /run/mackesd
+ReadOnlyPaths=/etc/mackesd /proc/sys/kernel/random/boot_id
+RestrictSUIDSGID=yes
+LockPersonality=yes

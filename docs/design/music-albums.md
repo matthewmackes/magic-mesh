@@ -1,3 +1,7 @@
+> HISTORICAL / SUPERSEDED — The Spotify-class Music workspace and daemon
+> authority are now governed by WL-FUNC-021 in `docs/platform/WORKLIST.md`.
+> Retained only for migration context and existing service seams.
+
 # MUSIC-ALBUMS — Music app redesign (Claude Design import: Albums.dc.html)
 
 Source: claude.ai/design project `6cf3ae71-13c5-4fb6-8019-38eb5c9cf8d5`,

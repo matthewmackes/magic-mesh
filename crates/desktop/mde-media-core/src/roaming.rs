@@ -57,6 +57,12 @@ pub const SESSIONS_SUBDIR: &str = "media-sessions";
 /// a queue and a track list, but a hostile replicated row must not become an
 /// unbounded allocation before it is parsed.
 const MAX_SESSION_RECORD_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum queue entries admitted from one replicated session row.
+const MAX_SESSION_QUEUE_ITEMS: usize = 4_096;
+/// Maximum decoder tracks carried by one replicated session row.
+const MAX_SESSION_TRACKS: usize = 256;
+/// Maximum identity, seat, media, and display strings in one session row.
+const MAX_SESSION_TEXT_BYTES: usize = 4_096;
 
 // ── the synced session record ────────────────────────────────────────────────
 
@@ -288,9 +294,14 @@ impl RoamingStore {
             {
                 continue; // an in-flight atomic-write temp file
             }
+            let Some(seat_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
             if let Some(data) = read_bounded_session_record(&path) {
                 if let Ok(rec) = serde_json::from_str::<SessionRecord>(&data) {
-                    out.push(rec);
+                    if valid_session_record(&rec, identity, seat_stem) {
+                        out.push(rec);
+                    }
                 }
             }
         }
@@ -330,6 +341,70 @@ impl RoamingStore {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Admit only a session row that belongs to the requested identity and its
+/// single-writer seat file, and whose playback payload stays within the
+/// roaming contract. The byte cap protects parsing; these semantic checks
+/// protect lease selection and resume from a forged replicated row.
+fn valid_session_record(record: &SessionRecord, identity: &str, seat_stem: &str) -> bool {
+    let bounded_text = |value: &str| {
+        !value.is_empty()
+            && value.len() <= MAX_SESSION_TEXT_BYTES
+            && !value.chars().any(char::is_control)
+    };
+    if record.identity != identity
+        || !bounded_text(&record.identity)
+        || !bounded_text(&record.seat)
+        || sanitize(&record.seat) != seat_stem
+        || record.lease_gen == 0
+        || record.lease_gen == u64::MAX
+        || record.updated_ms == 0
+        || !record.position_secs.is_finite()
+        || record.position_secs < 0.0
+        || record.duration_secs.is_some_and(|duration| {
+            !duration.is_finite() || duration < 0.0 || record.position_secs > duration
+        })
+        || record
+            .media
+            .as_deref()
+            .is_some_and(|media| !bounded_text(media))
+        || record
+            .title
+            .as_deref()
+            .is_some_and(|title| !bounded_text(title))
+        || record.queue.len() > MAX_SESSION_QUEUE_ITEMS
+        || record
+            .queue
+            .current_index()
+            .is_some_and(|index| index >= record.queue.len())
+        || record.queue.items().iter().any(|item| {
+            !bounded_text(&item.url)
+                || item
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| !bounded_text(title))
+        })
+        || record.tracks.len() > MAX_SESSION_TRACKS
+        || record.tracks.iter().any(|track| {
+            track.id <= 0
+                || track
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| !bounded_text(title))
+                || track
+                    .lang
+                    .as_deref()
+                    .is_some_and(|lang| !bounded_text(lang))
+                || track
+                    .codec
+                    .as_deref()
+                    .is_some_and(|codec| !bounded_text(codec))
+        })
+    {
+        return false;
+    }
+    true
 }
 
 /// Read one replicated session record through a bounded descriptor.
@@ -432,8 +507,10 @@ fn sanitize(name: &str) -> String {
 
 /// A deferred resume seek — applied once the arriving seat's engine has the file
 /// open (the roamed position can't be sought until the media is loaded).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingResume {
+    /// The exact media URL/path that must be open before the seek is applied.
+    media: String,
     /// The position (seconds) to resume at.
     position: f64,
     /// Whether the roamed session was paused (so the arriving seat opens paused).
@@ -453,6 +530,12 @@ pub enum LoginOutcome {
     /// No resumable session existed; this seat took a fresh lease so a later seat
     /// can roam from here.
     FreshLease,
+    /// The replicated lease-generation space is exhausted, so this seat did not
+    /// claim a lease or resume playback.
+    LeaseUnavailable,
+    /// The prior owner's media could not be opened here, so the existing owner
+    /// keeps the lease and this seat does not claim or alter it.
+    ResumeUnavailable,
     /// The workgroup root is not provisioned — roaming is inert (honest offline).
     Offline,
 }
@@ -464,7 +547,7 @@ pub enum PollOutcome {
     Owner,
     /// Another seat acquired the lease — playback was released here (no double-play).
     Released,
-    /// The workgroup root is not provisioned — roaming is inert.
+    /// The workgroup root was not provisioned before login — roaming is inert.
     Offline,
 }
 
@@ -549,25 +632,40 @@ impl RoamingSession {
     /// Acquiring writes this seat's record at [`next_lease_gen`], so this seat is at
     /// once the sole owner and the seat it roamed from will release on its next
     /// [`poll`](Self::poll). A no-op ([`LoginOutcome::Offline`]) when the workgroup
-    /// root is not provisioned.
+    /// root is not provisioned, or [`LoginOutcome::LeaseUnavailable`] when no
+    /// admissible generation remains.
     pub fn login<E: MediaEngine>(&mut self, player: &mut Player<E>, now_ms: u64) -> LoginOutcome {
         if !self.store.is_ready() {
             return LoginOutcome::Offline;
         }
         let records = self.store.records(&self.identity);
         self.held_gen = next_lease_gen(&records);
+        self.pending = None;
         self.released = false;
+        if self.held_gen == u64::MAX {
+            self.held_gen = 0;
+            self.released = true;
+            return LoginOutcome::LeaseUnavailable;
+        }
         if let Some(current) = resolve_owner(&records) {
             if current.is_resumable() {
                 let owning = current.reseat(&self.seat, self.held_gen, now_ms);
                 let title = owning.title.clone();
                 let position = owning.position_secs;
                 let was_paused = matches!(current.state, PlayerState::Paused);
-                player.set_playlist(owning.queue.clone());
                 if let Some(media) = &owning.media {
-                    // Best-effort load; the pending seek lands once the file opens.
-                    let _ = player.load(media.clone());
+                    // Do not displace the current owner until this seat can at
+                    // least hand the target to its engine. A rejected load must
+                    // leave the target untouched and the source lease intact.
+                    if player.load(media.clone()).is_err() {
+                        self.held_gen = 0;
+                        self.released = true;
+                        return LoginOutcome::ResumeUnavailable;
+                    }
+                    player.set_playlist(owning.queue.clone());
+                    // The pending seek lands once the file opens.
                     self.pending = Some(PendingResume {
+                        media: media.clone(),
                         position,
                         was_paused,
                     });
@@ -590,13 +688,31 @@ impl RoamingSession {
     /// Land a pending resume seek once the engine has the file open (`Playing` /
     /// `Paused` after `FileLoaded`). Cheap + I/O-free — call every pump.
     pub fn apply_pending<E: MediaEngine>(&mut self, player: &mut Player<E>) {
-        let Some(pending) = self.pending else {
+        let Some(pending) = self.pending.clone() else {
             return;
         };
+        if !self.holds_current_lease() {
+            self.release_local(player);
+            return;
+        }
+        if player.media() != Some(pending.media.as_str()) {
+            // The handoff load failed or the user replaced it before it became
+            // ready. Never seek a stale handoff position into another item.
+            self.pending = None;
+            return;
+        }
         if matches!(player.state(), PlayerState::Playing | PlayerState::Paused) {
-            let _ = player.seek(pending.position);
-            if pending.was_paused {
+            if player.seek(pending.position).is_err() {
+                // Do not let a target that loaded at position zero keep playing
+                // when the handoff seek was rejected. Retain the request so a
+                // later pump can retry after the engine becomes seekable.
                 let _ = player.pause();
+                return;
+            }
+            if pending.was_paused && player.pause().is_err() {
+                // The position landed, but the source's paused intent did not;
+                // retain the request rather than claiming a complete handoff.
+                return;
             }
             self.pending = None;
         }
@@ -605,7 +721,7 @@ impl RoamingSession {
     /// Checkpoint the live player into this seat's record. A no-op before login /
     /// offline.
     pub fn publish<E: MediaEngine>(&mut self, player: &Player<E>, now_ms: u64) {
-        if self.held_gen == 0 || !self.store.is_ready() {
+        if !self.holds_current_lease() {
             return;
         }
         let rec = SessionRecord::capture(player, &self.identity, &self.seat, self.held_gen, now_ms);
@@ -614,25 +730,48 @@ impl RoamingSession {
 
     /// Converge with the shared plane: if this seat still owns the lease, checkpoint
     /// its live position; if another seat has acquired it, **release** — pause
-    /// playback so only the new owner plays (no double-play).
+    /// playback so only the new owner plays (no double-play). Losing an already-held
+    /// workgroup root is also a release: an active seat must not keep playing while
+    /// its lease/control plane is unavailable.
     pub fn poll<E: MediaEngine>(&mut self, player: &mut Player<E>, now_ms: u64) -> PollOutcome {
-        if self.held_gen == 0 || !self.store.is_ready() {
+        if self.held_gen == 0 {
             return PollOutcome::Offline;
         }
-        match self.store.owner_seat(&self.identity) {
-            Some(seat) if seat != self.seat => {
-                if !self.released {
-                    let _ = player.pause();
-                    self.released = true;
-                }
-                PollOutcome::Released
+        if !self.store.is_ready() {
+            if !self.released {
+                self.release_local(player);
             }
-            _ => {
-                self.released = false;
-                self.publish(player, now_ms);
-                PollOutcome::Owner
-            }
+            return PollOutcome::Released;
         }
+        if !self.holds_current_lease() {
+            if !self.released {
+                self.release_local(player);
+            }
+            return PollOutcome::Released;
+        }
+        self.released = false;
+        self.publish(player, now_ms);
+        PollOutcome::Owner
+    }
+
+    /// Stop this seat from producing playback while it no longer has a usable
+    /// shared lease. Clearing the deferred resume is essential: a later pump must
+    /// not seek into media after the seat has yielded ownership.
+    fn release_local<E: MediaEngine>(&mut self, player: &mut Player<E>) {
+        self.pending = None;
+        if matches!(player.state(), PlayerState::Loading | PlayerState::Playing) {
+            let _ = player.pause();
+        }
+        self.released = true;
+    }
+
+    /// Whether the shared plane still names this exact seat and generation as
+    /// owner. A missing, replaced, or otherwise invalid row is a yielded lease;
+    /// treating it as ownership would let a seat reassert after replication loss.
+    fn holds_current_lease(&self) -> bool {
+        self.store
+            .current(&self.identity)
+            .is_some_and(|record| record.seat == self.seat && record.lease_gen == self.held_gen)
     }
 }
 
@@ -689,8 +828,116 @@ pub fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::AudioConfig;
+    use crate::controls::{PlaybackControls, ScreenshotMode};
+    use crate::engine::{EngineError, EngineSignal, MediaEngine, VideoFrame};
     use crate::fake::FakeMpv;
     use crate::playlist::PlaylistItem;
+    use crate::subtitle::{SubtitleConfig, TrackSelection};
+    use crate::video::VideoConfig;
+
+    #[derive(Debug)]
+    struct SeekRejectingEngine {
+        inner: FakeMpv,
+        reject_seek: bool,
+    }
+
+    impl SeekRejectingEngine {
+        fn new() -> Self {
+            Self {
+                inner: FakeMpv::new().with_duration(120.0),
+                reject_seek: true,
+            }
+        }
+
+        fn allow_seek(&mut self) {
+            self.reject_seek = false;
+        }
+    }
+
+    impl MediaEngine for SeekRejectingEngine {
+        fn load_file(&mut self, url: &str) -> Result<(), EngineError> {
+            self.inner.load_file(url)
+        }
+
+        fn set_paused(&mut self, paused: bool) -> Result<(), EngineError> {
+            self.inner.set_paused(paused)
+        }
+
+        fn seek_absolute(&mut self, position_secs: f64) -> Result<(), EngineError> {
+            if self.reject_seek {
+                return Err(EngineError::Backend("fixture seek rejected".to_owned()));
+            }
+            self.inner.seek_absolute(position_secs)
+        }
+
+        fn stop(&mut self) -> Result<(), EngineError> {
+            self.inner.stop()
+        }
+
+        fn position(&self) -> Option<f64> {
+            self.inner.position()
+        }
+
+        fn duration(&self) -> Option<f64> {
+            self.inner.duration()
+        }
+
+        fn tracks(&self) -> Vec<Track> {
+            self.inner.tracks()
+        }
+
+        fn poll(&mut self) -> Vec<EngineSignal> {
+            self.inner.poll()
+        }
+
+        fn apply_audio_config(&mut self, config: &AudioConfig) -> Result<(), EngineError> {
+            self.inner.apply_audio_config(config)
+        }
+
+        fn apply_video_config(&mut self, config: &VideoConfig) -> Result<(), EngineError> {
+            self.inner.apply_video_config(config)
+        }
+
+        fn apply_track_selection(&mut self, selection: &TrackSelection) -> Result<(), EngineError> {
+            self.inner.apply_track_selection(selection)
+        }
+
+        fn apply_subtitle_config(&mut self, config: &SubtitleConfig) -> Result<(), EngineError> {
+            self.inner.apply_subtitle_config(config)
+        }
+
+        fn apply_playback_controls(
+            &mut self,
+            controls: &PlaybackControls,
+        ) -> Result<(), EngineError> {
+            self.inner.apply_playback_controls(controls)
+        }
+
+        fn frame_step(&mut self, forward: bool) -> Result<(), EngineError> {
+            self.inner.frame_step(forward)
+        }
+
+        fn screenshot(&mut self, mode: ScreenshotMode) -> Result<(), EngineError> {
+            self.inner.screenshot(mode)
+        }
+
+        fn chapter(&self) -> Option<i64> {
+            self.inner.chapter()
+        }
+
+        fn chapter_count(&self) -> Option<i64> {
+            self.inner.chapter_count()
+        }
+
+        fn set_chapter(&mut self, chapter: i64) -> Result<(), EngineError> {
+            self.inner.set_chapter(chapter)
+        }
+
+        fn latest_frame(&mut self) -> Option<VideoFrame> {
+            self.inner.latest_frame()
+        }
+    }
 
     fn player() -> Player<FakeMpv> {
         Player::new(FakeMpv::new().with_duration(120.0))
@@ -806,6 +1053,57 @@ mod tests {
     }
 
     #[test]
+    fn store_rejects_cross_identity_seat_and_semantic_tampering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RoamingStore::new(dir.path().to_path_buf());
+        store
+            .publish(&record("seat-a", 1, 100))
+            .expect("publish valid");
+        let identity_dir = dir.path().join(SESSIONS_SUBDIR).join("matthew");
+
+        let mut wrong_identity = record("seat-b", 2, 200);
+        wrong_identity.identity = "another-user".into();
+        std::fs::write(
+            identity_dir.join("seat-b.json"),
+            serde_json::to_string(&wrong_identity).expect("serialize identity tamper"),
+        )
+        .expect("write identity tamper");
+
+        let mut wrong_seat = record("seat-c", 3, 300);
+        std::fs::write(
+            identity_dir.join("seat-b-claimed.json"),
+            serde_json::to_string(&wrong_seat).expect("serialize seat tamper"),
+        )
+        .expect("write seat tamper");
+
+        wrong_seat.lease_gen = u64::MAX;
+        std::fs::write(
+            identity_dir.join("seat-c.json"),
+            serde_json::to_string(&wrong_seat).expect("serialize lease tamper"),
+        )
+        .expect("write lease tamper");
+
+        let mut oversized_title = record("seat-d", 4, 400);
+        oversized_title.title = Some("x".repeat(MAX_SESSION_TEXT_BYTES + 1));
+        std::fs::write(
+            identity_dir.join("seat-d.json"),
+            serde_json::to_string(&oversized_title).expect("serialize title tamper"),
+        )
+        .expect("write title tamper");
+
+        let mut negative_position = record("seat-e", 5, 500);
+        negative_position.position_secs = -1.0;
+        std::fs::write(
+            identity_dir.join("seat-e.json"),
+            serde_json::to_string(&negative_position).expect("serialize position tamper"),
+        )
+        .expect("write position tamper");
+
+        assert_eq!(store.records("matthew").len(), 1);
+        assert_eq!(store.owner_seat("matthew").as_deref(), Some("seat-a"));
+    }
+
+    #[test]
     fn store_is_inert_when_the_root_is_unprovisioned() {
         let store = RoamingStore::new(PathBuf::from("/no/such/mesh/root"));
         assert!(!store.is_ready());
@@ -899,6 +1197,204 @@ mod tests {
         let mut p = player();
         assert_eq!(session.login(&mut p, 1000), LoginOutcome::Offline);
         assert_eq!(session.held_gen(), 0);
+    }
+
+    #[test]
+    fn login_refuses_an_exhausted_lease_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = RoamingStore::new(dir.path().to_path_buf());
+        store
+            .publish(&record("seat-a", u64::MAX - 1, 1_000))
+            .expect("publish final admissible lease");
+
+        let mut session = RoamingSession::new(store.clone(), "matthew", "seat-b");
+        let mut p = player();
+        assert_eq!(
+            session.login(&mut p, 2_000),
+            LoginOutcome::LeaseUnavailable
+        );
+        assert_eq!(session.held_gen(), 0);
+        assert_eq!(store.owner_seat("matthew").as_deref(), Some("seat-a"));
+        assert_eq!(store.records("matthew").len(), 1);
+    }
+
+    #[test]
+    fn owner_yield_fails_closed_when_its_record_disappears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let store = RoamingStore::new(root.clone());
+        let mut session = RoamingSession::new(store.clone(), "matthew", "seat-a");
+        let mut p = player();
+        assert_eq!(session.login(&mut p, 1_000), LoginOutcome::FreshLease);
+        p.load("movie.mkv").expect("load");
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+
+        store.release("matthew", "seat-a").expect("remove lease");
+        session.publish(&p, 2_000);
+        assert!(store.records("matthew").is_empty(), "yielded seat cannot reassert");
+        assert_eq!(session.poll(&mut p, 3_000), PollOutcome::Released);
+        assert_eq!(p.state(), PlayerState::Paused);
+        assert_eq!(session.poll(&mut p, 4_000), PollOutcome::Released);
+    }
+
+    #[test]
+    fn active_owner_yields_when_the_workgroup_root_disappears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let store = RoamingStore::new(root.clone());
+        let mut session = RoamingSession::new(store, "matthew", "seat-a");
+        let mut p = player();
+        assert_eq!(session.login(&mut p, 1_000), LoginOutcome::FreshLease);
+        p.load("movie.mkv").expect("load");
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+
+        std::fs::remove_dir_all(&root).expect("unmount workgroup root");
+        assert_eq!(session.poll(&mut p, 2_000), PollOutcome::Released);
+        assert_eq!(p.state(), PlayerState::Paused);
+        assert_eq!(session.poll(&mut p, 3_000), PollOutcome::Released);
+    }
+
+    #[test]
+    fn pending_resume_is_cancelled_after_a_new_owner_yields_this_seat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let mut pa = player();
+        let mut sa = RoamingSession::new(RoamingStore::new(root.clone()), "matthew", "seat-a");
+        assert_eq!(sa.login(&mut pa, 1_000), LoginOutcome::FreshLease);
+        pa.load("movie.mkv").expect("load");
+        pa.pump();
+        pa.seek(45.0).expect("seek");
+        pa.pause().expect("pause");
+        sa.publish(&pa, 2_000);
+
+        let mut pb = player();
+        let mut sb = RoamingSession::new(RoamingStore::new(root.clone()), "matthew", "seat-b");
+        assert!(matches!(
+            sb.login(&mut pb, 3_000),
+            LoginOutcome::Resumed { .. }
+        ));
+
+        let mut pc = player();
+        let mut sc = RoamingSession::new(RoamingStore::new(root), "matthew", "seat-c");
+        assert!(matches!(
+            sc.login(&mut pc, 4_000),
+            LoginOutcome::Resumed { .. }
+        ));
+
+        sb.apply_pending(&mut pb);
+        assert!(sb.pending.is_none(), "yielded resume must be discarded");
+        pb.pump();
+        assert_eq!(pb.state(), PlayerState::Paused);
+        assert_eq!(pb.position(), 0.0, "yielded seat must not seek into resumed media");
+    }
+
+    #[test]
+    fn pending_resume_is_cancelled_when_the_user_replaces_media() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let mut pa = player();
+        let mut sa = RoamingSession::new(RoamingStore::new(root.clone()), "matthew", "seat-a");
+        assert_eq!(sa.login(&mut pa, 1_000), LoginOutcome::FreshLease);
+        pa.load("movie.mkv").expect("load");
+        pa.pump();
+        pa.seek(45.0).expect("seek");
+        pa.pause().expect("pause");
+        sa.publish(&pa, 2_000);
+
+        let mut pb = player();
+        let mut sb = RoamingSession::new(RoamingStore::new(root), "matthew", "seat-b");
+        assert!(matches!(
+            sb.login(&mut pb, 3_000),
+            LoginOutcome::Resumed { .. }
+        ));
+        assert!(sb.pending.is_some());
+
+        pb.load("different.mkv").expect("replace handoff media");
+        pb.pump();
+        sb.apply_pending(&mut pb);
+
+        assert!(sb.pending.is_none());
+        assert_eq!(pb.media(), Some("different.mkv"));
+        assert_eq!(pb.position(), 0.0, "stale handoff position must not leak");
+    }
+
+    #[test]
+    fn failed_handoff_load_does_not_arm_a_resume_seek() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let mut pa = player();
+        let mut sa = RoamingSession::new(RoamingStore::new(root.clone()), "matthew", "seat-a");
+        assert_eq!(sa.login(&mut pa, 1_000), LoginOutcome::FreshLease);
+        pa.playlist_mut().push(PlaylistItem::new("movie.mkv"));
+        pa.load("movie.mkv").expect("load");
+        pa.pump();
+        pa.seek(45.0).expect("seek");
+        pa.pause().expect("pause");
+        sa.publish(&pa, 2_000);
+
+        let mut pb = Player::new(FakeMpv::new().with_duration(120.0).failing_load());
+        let mut sb = RoamingSession::new(RoamingStore::new(root), "matthew", "seat-b");
+        assert_eq!(
+            sb.login(&mut pb, 3_000),
+            LoginOutcome::ResumeUnavailable
+        );
+        assert!(sb.pending.is_none(), "a rejected load cannot arm a resume");
+        assert_eq!(sb.held_gen(), 0, "failed target must not claim a lease");
+        assert_eq!(
+            sb.store().owner_seat("matthew").as_deref(),
+            Some("seat-a"),
+            "the source keeps ownership when the target cannot open media"
+        );
+        assert_eq!(pb.media(), None, "rejected load leaves the target untouched");
+        assert!(
+            pb.playlist().items().is_empty(),
+            "rejected load must not copy the source queue into the target"
+        );
+    }
+
+    #[test]
+    fn failed_target_seek_stays_paused_and_retries_the_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        let mut pa = player();
+        let mut sa = RoamingSession::new(RoamingStore::new(root.clone()), "matthew", "seat-a");
+        assert_eq!(sa.login(&mut pa, 1_000), LoginOutcome::FreshLease);
+        pa.load("movie.mkv").expect("load source");
+        pa.pump();
+        pa.seek(45.0).expect("seek source");
+        pa.pause().expect("pause source");
+        sa.publish(&pa, 2_000);
+
+        let mut pb = Player::new(SeekRejectingEngine::new());
+        let mut sb = RoamingSession::new(RoamingStore::new(root), "matthew", "seat-b");
+        assert!(matches!(
+            sb.login(&mut pb, 3_000),
+            LoginOutcome::Resumed {
+                position_secs: 45.0,
+                ..
+            }
+        ));
+
+        pb.pump();
+        sb.apply_pending(&mut pb);
+        assert_eq!(pb.state(), PlayerState::Paused);
+        assert_eq!(pb.position(), 0.0, "rejected seek must not claim a resume");
+        assert!(sb.pending.is_some(), "failed seek must remain retryable");
+
+        pb.engine_mut().allow_seek();
+        sb.apply_pending(&mut pb);
+        assert_eq!(pb.state(), PlayerState::Paused);
+        assert_eq!(pb.position(), 45.0);
+        assert!(
+            sb.pending.is_none(),
+            "successful retry completes the handoff"
+        );
     }
 
     // ── THE CRUX: two-seat resume with a single owned lease ────────────────────

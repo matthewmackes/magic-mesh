@@ -32,7 +32,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
@@ -61,18 +61,20 @@ const TIMERS_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 const DAY_SECS: i64 = 86_400;
 
 /// The user-facing clock zone used by Construct chrome and the clock face.
-/// Eastern Standard Time is the deterministic platform default; mesh and audit
-/// timestamps remain UTC and are not rewritten by this display preference.
+/// The persisted `EasternStandard` name remains compatible, but the display
+/// follows the US Eastern Time daylight-saving rules. Mesh and audit timestamps
+/// remain UTC and are not rewritten by this display preference.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClockZone {
-    /// UTC−05:00.
+    /// US Eastern Time (UTC−05:00 standard / UTC−04:00 daylight).
     EasternStandard,
-    /// UTC−06:00.
+    /// US Central Time (UTC−06:00 standard / UTC−05:00 daylight).
     CentralStandard,
-    /// UTC−07:00.
+    /// US Mountain Time (UTC−07:00 standard / UTC−06:00 daylight).
     MountainStandard,
-    /// UTC−08:00.
+    /// US Pacific Time (UTC−08:00 standard / UTC−07:00 daylight).
     PacificStandard,
     /// UTC±00:00.
     Utc,
@@ -95,25 +97,25 @@ impl ClockZone {
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::EasternStandard => "Eastern Standard Time",
-            Self::CentralStandard => "Central Standard Time",
-            Self::MountainStandard => "Mountain Standard Time",
-            Self::PacificStandard => "Pacific Standard Time",
+            Self::EasternStandard => "Eastern Time",
+            Self::CentralStandard => "Central Time",
+            Self::MountainStandard => "Mountain Time",
+            Self::PacificStandard => "Pacific Time",
             Self::Utc => "Coordinated Universal Time",
         }
     }
 
     pub(crate) const fn short_label(self) -> &'static str {
         match self {
-            Self::EasternStandard => "EST (UTC−05:00)",
-            Self::CentralStandard => "CST (UTC−06:00)",
-            Self::MountainStandard => "MST (UTC−07:00)",
-            Self::PacificStandard => "PST (UTC−08:00)",
+            Self::EasternStandard => "ET (UTC−05:00/UTC−04:00)",
+            Self::CentralStandard => "CT (UTC−06:00/UTC−05:00)",
+            Self::MountainStandard => "MT (UTC−07:00/UTC−06:00)",
+            Self::PacificStandard => "PT (UTC−08:00/UTC−07:00)",
             Self::Utc => "UTC (UTC±00:00)",
         }
     }
 
-    const fn offset_seconds(self) -> i64 {
+    const fn standard_offset_seconds(self) -> i64 {
         match self {
             Self::EasternStandard => -5 * 3600,
             Self::CentralStandard => -6 * 3600,
@@ -122,32 +124,92 @@ impl ClockZone {
             Self::Utc => 0,
         }
     }
+
+    const fn from_index(index: u8) -> Self {
+        match index {
+            1 => Self::CentralStandard,
+            2 => Self::MountainStandard,
+            3 => Self::PacificStandard,
+            4 => Self::Utc,
+            _ => Self::EasternStandard,
+        }
+    }
+
+    fn offset_seconds_at(self, unix_secs: i64) -> i64 {
+        let standard = self.standard_offset_seconds();
+        if matches!(self, Self::Utc) || !us_daylight_time(unix_secs, standard) {
+            standard
+        } else {
+            standard + 3600
+        }
+    }
 }
 
-static CLOCK_OFFSET_SECS: AtomicI64 = AtomicI64::new(-5 * 3600);
+static CLOCK_ZONE: AtomicU8 = AtomicU8::new(ClockZone::EasternStandard as u8);
 
 /// Apply the persisted display zone to every visible Construct clock.
 pub(crate) fn set_clock_zone(zone: ClockZone) {
-    CLOCK_OFFSET_SECS.store(zone.offset_seconds(), Ordering::Relaxed);
+    CLOCK_ZONE.store(zone as u8, Ordering::Relaxed);
 }
 
 /// Current Unix time shifted into the configured display zone.
 pub(crate) fn display_unix() -> i64 {
-    now_unix().saturating_add(CLOCK_OFFSET_SECS.load(Ordering::Relaxed))
+    let now = now_unix();
+    now.saturating_add(display_offset_seconds_at(now))
 }
 
-pub(crate) fn display_offset_seconds() -> i64 {
-    CLOCK_OFFSET_SECS.load(Ordering::Relaxed)
+/// The configured zone's UTC offset at an arbitrary Unix timestamp. Consumers
+/// formatting retained historical timestamps use this rather than the current
+/// offset so daylight-saving transitions do not shift old rows.
+pub(crate) fn display_offset_seconds_at(unix_secs: i64) -> i64 {
+    configured_clock_zone().offset_seconds_at(unix_secs)
 }
 
 pub(crate) fn display_zone_label() -> &'static str {
-    match CLOCK_OFFSET_SECS.load(Ordering::Relaxed) {
-        -18_000 => ClockZone::EasternStandard.label(),
-        -21_600 => ClockZone::CentralStandard.label(),
-        -25_200 => ClockZone::MountainStandard.label(),
-        -28_800 => ClockZone::PacificStandard.label(),
-        _ => ClockZone::Utc.label(),
+    configured_clock_zone().label()
+}
+
+fn configured_clock_zone() -> ClockZone {
+    ClockZone::from_index(CLOCK_ZONE.load(Ordering::Relaxed))
+}
+
+/// Return the Unix day containing the first occurrence of `month/day`.
+/// Howard Hinnant's inverse of `civil_from_days`, kept local so the DST rule
+/// remains deterministic and does not depend on the host's locale database.
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - if month <= 2 { 1 } else { 0 };
+    let era = (if year >= 0 { year } else { year - 399 }) / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365
+        + year_of_era / 4
+        - year_of_era / 100
+        + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+const fn sunday_on_or_after(first_day: i64) -> i64 {
+    // 1970-01-01 was Thursday; Sunday is weekday zero.
+    first_day + (7 - (first_day + 4).rem_euclid(7)).rem_euclid(7)
+}
+
+fn us_daylight_time(unix_secs: i64, standard_offset: i64) -> bool {
+    if standard_offset == 0 {
+        return false;
     }
+    let local_standard_day = (unix_secs + standard_offset).div_euclid(DAY_SECS);
+    let (year, _, _) = crate::chat::civil_from_days(local_standard_day);
+    if year < 2007 {
+        return false;
+    }
+    let march_first = days_from_civil(year, 3, 1);
+    let november_first = days_from_civil(year, 11, 1);
+    let start_day = sunday_on_or_after(march_first) + 7;
+    let end_day = sunday_on_or_after(november_first);
+    let start_utc = start_day * DAY_SECS + 2 * 3600 - standard_offset;
+    let end_utc = end_day * DAY_SECS + 2 * 3600 - (standard_offset + 3600);
+    (start_utc..end_utc).contains(&unix_secs)
 }
 
 // ──────────────────────────── the one clock (§6) ────────────────────────────
@@ -906,8 +968,9 @@ fn alarms_section(
 #[cfg(test)]
 mod tests {
     use super::{
-        alarm_fire_ts, baseline_arm, fmt_duration, hhmm, secs_to_next_minute, timers_panel,
-        AlarmEntry, TimerEntry, TimerRun, TimersFile, TimersState, DAY_SECS, NOTIFY_TOPIC,
+        alarm_fire_ts, baseline_arm, days_from_civil, fmt_duration, hhmm, secs_to_next_minute,
+        timers_panel, AlarmEntry, ClockZone, TimerEntry, TimerRun, TimersFile, TimersState,
+        DAY_SECS, NOTIFY_TOPIC,
     };
     use mde_bus::persist::Persist;
     use mde_egui::egui;
@@ -1039,6 +1102,22 @@ mod tests {
         assert_eq!(fmt_duration(0), "00:00");
         assert_eq!(fmt_duration(65), "01:05");
         assert_eq!(fmt_duration(3600 + 62), "1:01:02");
+    }
+
+    #[test]
+    fn us_time_zones_follow_daylight_saving_rules() {
+        let summer = days_from_civil(2026, 8, 7) * DAY_SECS + 12 * 3600;
+        let winter = days_from_civil(2026, 1, 7) * DAY_SECS + 12 * 3600;
+        assert_eq!(
+            ClockZone::EasternStandard.offset_seconds_at(summer),
+            -4 * 3600,
+            "Eastern Time must not remain one hour behind during daylight time"
+        );
+        assert_eq!(
+            ClockZone::EasternStandard.offset_seconds_at(winter),
+            -5 * 3600
+        );
+        assert_eq!(ClockZone::Utc.offset_seconds_at(summer), 0);
     }
 
     #[test]

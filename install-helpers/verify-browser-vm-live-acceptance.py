@@ -13,6 +13,8 @@ manually asserted counter into a pass.
 
 Usage:
   verify-browser-vm-live-acceptance.py validate acceptance.json
+  verify-browser-vm-live-acceptance.py assemble BUNDLE --output acceptance.json \
+    --source-commit <git-sha> --image-digest sha256:<64-hex> --transport rdp
   verify-browser-vm-live-acceptance.py --self-test
 """
 
@@ -27,6 +29,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from types import ModuleType
 from typing import Any, NoReturn
 
@@ -101,6 +104,23 @@ EXPECTED_AUDIO_CLAIMS = {
     "physical_audibility": "operator-confirmation-required",
     "production_audio_acceptance": "not-proven-by-this-validator",
 }
+EVIDENCE_KINDS = {
+    "browser_vm_deployment_receipt": "deployment_evidence",
+    "browser_vm_runtime_evidence": "runtime_evidence",
+    "browser_vm_media_probe": "media_evidence",
+    "browser_vm_performance": "performance_evidence",
+    "browser_vm_live_audio_samples": "audio_evidence",
+    "browser_vm_physical_audibility_confirmation": "physical_audibility_evidence",
+}
+ASSEMBLED_FIELDS = (
+    "deployment_evidence",
+    "vdi_evidence",
+    "runtime_evidence",
+    "media_evidence",
+    "performance_evidence",
+    "audio_evidence",
+    "physical_audibility_evidence",
+)
 
 
 class EvidenceError(ValueError):
@@ -203,6 +223,28 @@ def load_validator(name: str, filename: str) -> ModuleType:
     return module
 
 
+def load_validators() -> dict[str, ModuleType]:
+    """Load the repository-owned evidence validators without injectable seams."""
+    return {
+        "vdi_evidence": load_validator("browser_vdi_proof", "verify-vdi-live-proof.py"),
+        "deployment_evidence": load_validator(
+            "browser_deployment_receipt", "verify-browser-vm-deployment.py"
+        ),
+        "runtime_evidence": load_validator(
+            "browser_runtime_evidence", "verify-browser-vm-runtime-evidence.py"
+        ),
+        "media_evidence": load_validator(
+            "browser_media_evidence", "verify-browser-vm-media-evidence.py"
+        ),
+        "performance_evidence": load_validator(
+            "browser_performance_evidence", "verify-browser-vm-performance.py"
+        ),
+        "audio_evidence": load_validator(
+            "browser_live_audio_samples", "verify-browser-vm-live-audio.py"
+        ),
+    }
+
+
 def artifact_path(
     descriptor: Any,
     field: str,
@@ -242,6 +284,343 @@ def artifact_path(
     if actual != digest:
         fail(f"{field}.sha256 does not match the artifact")
     return resolved
+
+
+def artifact_descriptor(path: Path, artifact_root: Path) -> dict[str, str]:
+    root = artifact_root.resolve()
+    if path.is_symlink():
+        fail("assembled evidence must not be a symlink")
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise EvidenceError("assembled evidence escapes the evidence bundle") from exc
+    if not resolved.is_file():
+        fail("assembled evidence must be a regular file")
+    return {
+        "path": relative.as_posix(),
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+def resolve_assembly_paths(bundle_dir: Path, output: Path) -> tuple[Path, Path]:
+    try:
+        root_stat = bundle_dir.lstat()
+    except OSError as exc:
+        fail(f"bundle directory is not readable: {exc}")
+    if bundle_dir.is_symlink() or not bundle_dir.is_dir():
+        fail("bundle directory must be a real non-symlink directory")
+    if root_stat.st_mode & 0o022:
+        fail("bundle directory must not be writable by group or other")
+    root = bundle_dir.resolve()
+    requested = output if output.is_absolute() else root / output
+    if requested.is_symlink():
+        fail("output manifest must not be a symlink")
+    resolved_output = requested.resolve(strict=False)
+    try:
+        resolved_output.relative_to(root)
+    except ValueError as exc:
+        raise EvidenceError("output manifest escapes the evidence bundle") from exc
+    if resolved_output.exists():
+        fail("output manifest already exists")
+    parent = resolved_output.parent
+    if parent.is_symlink() or not parent.is_dir():
+        fail("output manifest parent must be an existing non-symlink directory")
+    try:
+        parent.resolve().relative_to(root)
+    except ValueError as exc:
+        raise EvidenceError("output manifest parent escapes the evidence bundle") from exc
+    return root, resolved_output
+
+
+def discover_json_artifacts(root: Path, output: Path) -> list[tuple[Path, dict[str, Any]]]:
+    """Read every in-bundle JSON file after rejecting links and special entries."""
+    paths: list[Path] = []
+
+    def walk(directory: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            fail(f"bundle directory is not readable: {exc}")
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink():
+                fail(f"bundle contains a symlink: {path.relative_to(root)}")
+            if entry.is_dir(follow_symlinks=False):
+                walk(path)
+            elif entry.is_file(follow_symlinks=False):
+                if path.suffix == ".json" and path != output:
+                    paths.append(path)
+            else:
+                fail(f"bundle contains a non-regular entry: {path.relative_to(root)}")
+
+    walk(root)
+    discovered: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        data = read_json(path)
+        if not isinstance(data, dict):
+            fail(f"JSON artifact is not an object: {path.relative_to(root)}")
+        reject_credential_fields(data, path.relative_to(root).as_posix())
+        discovered.append((path, data))
+    return discovered
+
+
+def classify_candidate(data: dict[str, Any]) -> str | None:
+    kind = data.get("kind")
+    if isinstance(kind, str) and kind in EVIDENCE_KINDS:
+        return EVIDENCE_KINDS[kind]
+    # VDI proof predates the kind discriminator. Keep this signature narrow so
+    # unrelated JSON records cannot be upgraded into VDI evidence.
+    if kind is None and {
+        "schema_version",
+        "source_commit",
+        "image_digest",
+        "status",
+        "protocol",
+        "target",
+        "probe",
+        "recorded_at",
+    }.issubset(data):
+        return "vdi_evidence"
+    return None
+
+
+def validate_assembly_candidates(
+    discovered: list[tuple[Path, dict[str, Any]]],
+    *,
+    artifact_root: Path,
+) -> dict[str, list[tuple[Path, dict[str, Any]]]]:
+    loaded = load_validators()
+    candidates = {field: [] for field in ASSEMBLED_FIELDS}
+    physical_candidates: list[tuple[Path, dict[str, Any]]] = []
+    for path, data in discovered:
+        field = classify_candidate(data)
+        if field is None:
+            continue
+        if field == "physical_audibility_evidence":
+            if frozenset(data) != PHYSICAL_AUDIBILITY_FIELDS:
+                fail(
+                    "physical_audibility_evidence candidate has missing or unexpected "
+                    f"fields: {path.relative_to(artifact_root)}"
+                )
+            physical_candidates.append((path, data))
+            continue
+        try:
+            if field == "vdi_evidence":
+                loaded[field].validate_evidence(data)
+            elif field == "audio_evidence":
+                loaded[field].validate_document(data, path.parent)
+            else:
+                result = loaded[field].validate_document(data)
+                if result.get("status") != "validated":
+                    fail(f"{field} candidate did not validate")
+        except Exception as exc:
+            fail(
+                f"invalid {field} candidate {path.relative_to(artifact_root)}: {exc}"
+            )
+        candidates[field].append((path, data))
+
+    # Physical listening evidence is relational. Validate each candidate using
+    # the unique already-validated deployment/audio pair named by its own
+    # immutable provenance, target, transport, and audio-manifest digest.
+    for path, data in physical_candidates:
+        deployment_contexts = [
+            item
+            for item in candidates["deployment_evidence"]
+            if item[1].get("source_commit") == data.get("source_commit")
+            and item[1].get("image_digest") == data.get("image_digest")
+            and item[1].get("target_host") == data.get("target_host")
+        ]
+        audio_contexts = [
+            item
+            for item in candidates["audio_evidence"]
+            if item[1].get("source_commit") == data.get("source_commit")
+            and item[1].get("image_digest") == data.get("image_digest")
+            and item[1].get("transport") == data.get("transport")
+            and artifact_descriptor(item[0], artifact_root)["sha256"]
+            == data.get("audio_manifest_sha256")
+        ]
+        contexts = [
+            (deployment, audio)
+            for deployment in deployment_contexts
+            for audio in audio_contexts
+        ]
+        if len(contexts) != 1:
+            fail(
+                "physical_audibility_evidence candidate does not name exactly one "
+                f"validated deployment/audio context: {path.relative_to(artifact_root)}"
+            )
+        deployment, audio = contexts[0]
+        audio_descriptor = artifact_descriptor(audio[0], artifact_root)
+        try:
+            validate_physical_audibility(
+                data,
+                transport=data.get("transport"),
+                source_commit=data.get("source_commit"),
+                image_digest=data.get("image_digest"),
+                target_host=deployment[1].get("target_host"),
+                audio_descriptor=audio_descriptor,
+                audio_data=audio[1],
+            )
+        except Exception as exc:
+            fail(
+                "invalid physical_audibility_evidence candidate "
+                f"{path.relative_to(artifact_root)}: {exc}"
+            )
+        candidates["physical_audibility_evidence"].append((path, data))
+    return candidates
+
+
+def candidate_transport(field: str, data: dict[str, Any]) -> Any:
+    if field == "vdi_evidence":
+        return data.get("protocol")
+    if field in {
+        "runtime_evidence",
+        "performance_evidence",
+        "audio_evidence",
+        "physical_audibility_evidence",
+    }:
+        return data.get("transport")
+    # Deployment and guest-local media schemas have no transport field; their
+    # immutable provenance is bound to the selected transport by the composite.
+    return "rdp"
+
+
+def select_candidate(
+    candidates: dict[str, list[tuple[Path, dict[str, Any]]]],
+    field: str,
+    *,
+    source_commit: str,
+    image_digest: str,
+    transport: str,
+) -> tuple[Path, dict[str, Any]]:
+    matches = [
+        item
+        for item in candidates[field]
+        if item[1].get("source_commit") == source_commit
+        and item[1].get("image_digest") == image_digest
+        and candidate_transport(field, item[1]) == transport
+    ]
+    if len(matches) != 1:
+        fail(
+            f"{field}: expected exactly one validated record for requested "
+            f"provenance and transport, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def deterministic_recorded_at(selected: dict[str, tuple[Path, dict[str, Any]]]) -> str:
+    timestamps: list[datetime] = []
+    for field, (_, data) in selected.items():
+        values = [data.get("recorded_at")]
+        if field == "physical_audibility_evidence":
+            values.append(data.get("confirmed_at"))
+        for value in values:
+            if not isinstance(value, str) or not value.endswith("Z"):
+                fail(f"{field} has no usable UTC evidence timestamp")
+            try:
+                parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+            except ValueError as exc:
+                fail(f"{field} has an invalid UTC evidence timestamp: {exc}")
+            timestamps.append(parsed)
+    latest = max(timestamps)
+    if latest.microsecond:
+        latest = latest.replace(microsecond=0) + timedelta(seconds=1)
+    return latest.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def atomic_write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    raw = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            # A same-directory hard link publishes the fully-fsynced inode in
+            # one operation and, unlike replace(), cannot clobber a path that
+            # races into existence after the preflight check.
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            fail("output manifest appeared during atomic assembly")
+        temporary.unlink()
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def assemble(
+    bundle_dir: Path,
+    output: Path,
+    *,
+    source_commit: str,
+    image_digest: str,
+    transport: str,
+) -> dict[str, Any]:
+    if COMMIT_RE.fullmatch(source_commit) is None or source_commit == "0" * 40:
+        fail("requested source_commit must be a non-null 40-character revision")
+    if (
+        IMAGE_DIGEST_RE.fullmatch(image_digest) is None
+        or image_digest == "sha256:" + "0" * 64
+    ):
+        fail("requested image_digest must be a non-null immutable sha256 digest")
+    if transport != "rdp":
+        fail("R1 assembly requires the rdp transport")
+    root, output_path = resolve_assembly_paths(bundle_dir, output)
+    discovered = discover_json_artifacts(root, output_path)
+    candidates = validate_assembly_candidates(discovered, artifact_root=root)
+    selected = {
+        field: select_candidate(
+            candidates,
+            field,
+            source_commit=source_commit,
+            image_digest=image_digest,
+            transport=transport,
+        )
+        for field in ASSEMBLED_FIELDS
+    }
+    descriptors = {
+        field: artifact_descriptor(path, root)
+        for field, (path, _) in selected.items()
+    }
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "browser_vm_live_acceptance",
+        "profile": "browser-vm-chromium",
+        "image": "browser-vm-chromium",
+        "source_commit": source_commit,
+        "image_digest": image_digest,
+        "status": "passed",
+        "source": "live-browser-vm-acceptance",
+        "transport": transport,
+        **descriptors,
+        "recorded_at": deterministic_recorded_at(selected),
+    }
+    # Validate before publication, then validate the exact bytes at the final
+    # path. Assembly only selects and hashes existing proof; it never upgrades it.
+    validate(manifest, artifact_root=root)
+    atomic_write_manifest(output_path, manifest)
+    try:
+        composite = validate(read_json(output_path), artifact_root=root)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+    return {
+        "status": "assembled",
+        "manifest": output_path.relative_to(root).as_posix(),
+        "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+        "composite": composite,
+    }
 
 
 def validate_physical_audibility(
@@ -365,21 +744,14 @@ def validate(
     # Promotion always loads the repository validators itself.  An injectable
     # validator map would let a caller replace the PCM analyzer with a stub and
     # recreate the legacy counter-only bypass.
-    loaded = {
-        "vdi": load_validator("browser_vdi_proof", "verify-vdi-live-proof.py"),
-        "deployment": load_validator("browser_deployment_receipt", "verify-browser-vm-deployment.py"),
-        "runtime": load_validator("browser_runtime_evidence", "verify-browser-vm-runtime-evidence.py"),
-        "media": load_validator("browser_media_evidence", "verify-browser-vm-media-evidence.py"),
-        "performance": load_validator("browser_performance_evidence", "verify-browser-vm-performance.py"),
-        "audio": load_validator("browser_live_audio_samples", "verify-browser-vm-live-audio.py"),
-    }
+    loaded = load_validators()
 
     deployment_path = artifact_path(
         bundle["deployment_evidence"], "deployment_evidence", artifact_root
     )
     deployment_data = read_json(deployment_path)
     try:
-        deployment_result = loaded["deployment"].validate_document(deployment_data)
+        deployment_result = loaded["deployment_evidence"].validate_document(deployment_data)
     except Exception as exc:
         fail(f"deployment_evidence is invalid: {exc}")
     if deployment_result.get("status") != "validated":
@@ -392,7 +764,7 @@ def validate(
     vdi_path = artifact_path(bundle["vdi_evidence"], "vdi_evidence", artifact_root)
     vdi_data = read_json(vdi_path)
     try:
-        loaded["vdi"].validate_evidence(vdi_data)
+        loaded["vdi_evidence"].validate_evidence(vdi_data)
     except Exception as exc:
         fail(f"vdi_evidence is invalid: {exc}")
     if vdi_data.get("status") != "observed":
@@ -414,7 +786,7 @@ def validate(
     )
     runtime_data = read_json(runtime_path)
     try:
-        runtime_result = loaded["runtime"].validate_document(runtime_data)
+        runtime_result = loaded["runtime_evidence"].validate_document(runtime_data)
     except Exception as exc:
         fail(f"runtime_evidence is invalid: {exc}")
     if runtime_result.get("status") != "validated":
@@ -436,7 +808,7 @@ def validate(
     media_path = artifact_path(bundle["media_evidence"], "media_evidence", artifact_root)
     media_data = read_json(media_path)
     try:
-        media_result = loaded["media"].validate_document(media_data)
+        media_result = loaded["media_evidence"].validate_document(media_data)
     except Exception as exc:
         fail(f"media_evidence is invalid: {exc}")
     if media_result.get("status") != "validated":
@@ -454,7 +826,7 @@ def validate(
     )
     performance_data = read_json(performance_path)
     try:
-        performance_result = loaded["performance"].validate_document(performance_data)
+        performance_result = loaded["performance_evidence"].validate_document(performance_data)
     except Exception as exc:
         fail(f"performance_evidence is invalid: {exc}")
     if performance_result.get("status") != "validated":
@@ -463,6 +835,8 @@ def validate(
         fail("performance_evidence source_commit does not match acceptance")
     if performance_data.get("image_digest") != image_digest:
         fail("performance_evidence image_digest does not match acceptance")
+    if performance_data.get("domain_uuid") != deployment_result.get("domain_uuid"):
+        fail("performance_evidence domain_uuid does not match deployment_evidence")
     validate_fresh_timestamp(
         performance_data.get("recorded_at"), "performance_evidence.recorded_at"
     )
@@ -471,7 +845,9 @@ def validate(
     audio_data = read_json(audio_path)
     reject_credential_fields(audio_data, "audio")
     try:
-        audio_result = loaded["audio"].validate_document(audio_data, audio_path.parent)
+        audio_result = loaded["audio_evidence"].validate_document(
+            audio_data, audio_path.parent
+        )
     except Exception as exc:
         fail(f"audio_evidence sample validation failed: {exc}")
     if audio_result.get("status") != "validated":
@@ -673,6 +1049,7 @@ def _fixture(root: Path) -> dict[str, Any]:
         "recorded_at": recorded_at,
     }
     deployment.validate_document(deployment_data)
+    performance_data["domain_uuid"] = deployment_data["domain_uuid"]
     runtime_data["recorded_at"] = recorded_at
     media_data["recorded_at"] = recorded_at
     performance_data["recorded_at"] = recorded_at
@@ -781,6 +1158,21 @@ def self_test() -> None:
         candidate = fresh()
         candidate["source_commit"] = "f" * 40
         expect_rejected(candidate, "source_commit", "acceptance provenance mismatch")
+
+        candidate = fresh()
+        _rewrite_json_artifact(
+            root,
+            candidate,
+            "performance_evidence",
+            lambda data: data.update(
+                {"domain_uuid": "77777777-7777-4777-8777-777777777777"}
+            ),
+        )
+        expect_rejected(
+            candidate,
+            "performance_evidence domain_uuid",
+            "performance/deployment identity mismatch",
+        )
 
         candidate = fresh()
         _rewrite_json_artifact(
@@ -1026,6 +1418,130 @@ def self_test() -> None:
         else:
             raise AssertionError("accepted a duplicate top-level acceptance field")
 
+        def assembly_case(name: str) -> tuple[Path, dict[str, Any]]:
+            case_root = root / name
+            case_root.mkdir(mode=0o700)
+            return case_root, _fixture(case_root)
+
+        case_root, case_bundle = assembly_case("assemble-happy")
+        assembled = assemble(
+            case_root,
+            Path("acceptance.json"),
+            source_commit=case_bundle["source_commit"],
+            image_digest=case_bundle["image_digest"],
+            transport="rdp",
+        )
+        assembled_path = case_root / assembled["manifest"]
+        assembled_data = read_json(assembled_path)
+        assert assembled["status"] == "assembled"
+        assert assembled["composite"]["status"] == "validated"
+        assert assembled_path.stat().st_mode & 0o777 == 0o600
+        assert assembled_data["recorded_at"] >= json.loads(
+            (case_root / case_bundle["physical_audibility_evidence"]["path"]).read_text(
+                encoding="utf-8"
+            )
+        )["confirmed_at"]
+        positive += 1
+
+        def expect_assembly_rejected(
+            case_root: Path,
+            case_bundle: dict[str, Any],
+            needle: str,
+            label: str,
+        ) -> None:
+            nonlocal negative
+            try:
+                assemble(
+                    case_root,
+                    Path("acceptance.json"),
+                    source_commit=case_bundle["source_commit"],
+                    image_digest=case_bundle["image_digest"],
+                    transport="rdp",
+                )
+            except EvidenceError as exc:
+                assert needle in str(exc), (label, needle, exc)
+                assert not (case_root / "acceptance.json").exists()
+                negative += 1
+            else:
+                raise AssertionError(f"assembled invalid evidence bundle: {label}")
+
+        case_root, case_bundle = assembly_case("assemble-mismatch")
+        runtime_path = case_root / case_bundle["runtime_evidence"]["path"]
+        runtime_data = json.loads(runtime_path.read_text(encoding="utf-8"))
+        runtime_data["source_commit"] = "f" * 40
+        runtime_path.write_text(
+            json.dumps(runtime_data, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        runtime_path.chmod(0o600)
+        expect_assembly_rejected(
+            case_root,
+            case_bundle,
+            "runtime_evidence: expected exactly one",
+            "provenance mismatch",
+        )
+
+        case_root, case_bundle = assembly_case("assemble-ambiguity")
+        performance_path = case_root / case_bundle["performance_evidence"]["path"]
+        duplicate_performance = json.loads(
+            performance_path.read_text(encoding="utf-8")
+        )
+        _write_artifact(
+            case_root, "evidence/performance-duplicate.json", duplicate_performance
+        )
+        expect_assembly_rejected(
+            case_root,
+            case_bundle,
+            "performance_evidence: expected exactly one",
+            "ambiguous performance evidence",
+        )
+
+        case_root, case_bundle = assembly_case("assemble-symlink")
+        (case_root / "evidence" / "deployment-link.json").symlink_to(
+            case_root / case_bundle["deployment_evidence"]["path"]
+        )
+        expect_assembly_rejected(
+            case_root, case_bundle, "contains a symlink", "symlinked evidence"
+        )
+
+        case_root, case_bundle = assembly_case("assemble-no-physical")
+        (case_root / case_bundle["physical_audibility_evidence"]["path"]).unlink()
+        expect_assembly_rejected(
+            case_root,
+            case_bundle,
+            "physical_audibility_evidence: expected exactly one",
+            "missing physical confirmation",
+        )
+
+        case_root, case_bundle = assembly_case("assemble-credential")
+        vdi_path = case_root / case_bundle["vdi_evidence"]["path"]
+        vdi_data = json.loads(vdi_path.read_text(encoding="utf-8"))
+        vdi_data["access_token"] = "must-never-enter-proof"
+        vdi_path.write_text(
+            json.dumps(vdi_data, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        vdi_path.chmod(0o600)
+        expect_assembly_rejected(
+            case_root,
+            case_bundle,
+            "credential-shaped field",
+            "credential-bearing evidence",
+        )
+
+        case_root, case_bundle = assembly_case("assemble-path-escape")
+        audio_path = case_root / case_bundle["audio_evidence"]["path"]
+        audio_data = json.loads(audio_path.read_text(encoding="utf-8"))
+        audio_data["captures"][0]["path"] = "../../../outside.wav"
+        audio_path.write_text(
+            json.dumps(audio_data, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        audio_path.chmod(0o600)
+        expect_assembly_rejected(
+            case_root,
+            case_bundle,
+            "within the evidence directory",
+            "audio sample path escape",
+        )
+
     print(
         "verify-browser-vm-live-acceptance: self-test passed "
         f"({positive} positive, {negative} negative cases)"
@@ -1034,19 +1550,65 @@ def self_test() -> None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("validate",))
+    parser.add_argument("command", nargs="?", choices=("validate", "assemble"))
     parser.add_argument("path", nargs="?", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--image-digest")
+    parser.add_argument("--transport", choices=("rdp",))
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.self_test:
-            if args.command is not None or args.path is not None:
-                parser.error("--self-test does not accept a command or path")
+            if any(
+                value is not None
+                for value in (
+                    args.command,
+                    args.path,
+                    args.output,
+                    args.source_commit,
+                    args.image_digest,
+                    args.transport,
+                )
+            ):
+                parser.error("--self-test does not accept assembly or validation arguments")
             self_test()
             return 0
-        if args.command != "validate" or args.path is None:
-            parser.error("use validate acceptance.json or --self-test")
-        result = validate(read_json(args.path), artifact_root=args.path.parent)
+        if args.command == "validate" and args.path is not None:
+            if any(
+                value is not None
+                for value in (
+                    args.output,
+                    args.source_commit,
+                    args.image_digest,
+                    args.transport,
+                )
+            ):
+                parser.error("validate does not accept assembly arguments")
+            result = validate(read_json(args.path), artifact_root=args.path.parent)
+        elif args.command == "assemble" and args.path is not None:
+            if any(
+                value is None
+                for value in (
+                    args.output,
+                    args.source_commit,
+                    args.image_digest,
+                    args.transport,
+                )
+            ):
+                parser.error(
+                    "assemble requires --output, --source-commit, --image-digest, "
+                    "and --transport rdp"
+                )
+            result = assemble(
+                args.path,
+                args.output,
+                source_commit=args.source_commit,
+                image_digest=args.image_digest,
+                transport=args.transport,
+            )
+        else:
+            parser.error("use validate, assemble, or --self-test")
         print(json.dumps(result, sort_keys=True))
         return 0
     except EvidenceError as exc:

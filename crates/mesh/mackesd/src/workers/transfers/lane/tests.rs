@@ -128,7 +128,6 @@ fn rsync_progress_parser_reads_progress2_percentages_only() {
 }
 
 #[test]
-#[test]
 fn sftp_plan_accepts_put_get_and_rejects_password_urls() {
     let tmp = tempfile::tempdir().unwrap();
     let local_source = tmp.path().join("upload.bin");

@@ -522,6 +522,7 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
 /// Map a `shell/goto/<name>` target to a dock [`Surface`] (case-insensitive).
 fn surface_by_name(name: &str) -> Option<Surface> {
     match name.to_ascii_lowercase().as_str() {
+        "workers" | "worker" => Some(Surface::Workers),
         "fleet-mesh" | "fleetmesh" | "fleet" => Some(Surface::FleetMesh),
         "workbench" => Some(Surface::Workbench),
         // OW-10 — the live Mesh Map. An all-green onboard self-test auto-opens it
@@ -537,7 +538,6 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // operator-facing profile name and the concrete surface name usable by
         // proof/deep-link callers.
         "car" | "auto-home" | "autohome" => Some(Surface::AutoHome),
-        "bookmarks" | "bookmark-manager" => Some(Surface::Bookmarks),
         "maps" | "location" | "maps-location" | "mapslocation" => Some(Surface::MapsLocation),
         // WL-FUNC-011 Phase-2 — the retired Chat / Voice / Editor surfaces folded
         // into the unified Communications hub, so their legacy `shell/goto` verbs
@@ -1168,10 +1168,7 @@ mod tests {
             resolve_action("shell/goto/browser"),
             Some(Navigate::Surface(Surface::Browser))
         ));
-        assert!(matches!(
-            resolve_action("shell/goto/bookmarks"),
-            Some(Navigate::Surface(Surface::Bookmarks))
-        ));
+        assert!(resolve_action("shell/goto/bookmarks").is_none());
         // WL-ARCH-006 — the retired Cloud plane's `instances`/`cloud` verbs now
         // land on the unified Workloads surface (Infra as Code).
         assert!(matches!(
@@ -1205,6 +1202,7 @@ mod tests {
     #[test]
     fn reach1_every_surface_has_a_goto_verb() {
         // REACH-1 — the six surfaces that used to silently no-op a shell/goto now resolve.
+        assert_eq!(surface_by_name("workers"), Some(Surface::Workers));
         assert_eq!(surface_by_name("explorer"), Some(Surface::Explorer));
         assert_eq!(surface_by_name("media"), Some(Surface::Media));
         assert_eq!(surface_by_name("terminal"), Some(Surface::Terminal));

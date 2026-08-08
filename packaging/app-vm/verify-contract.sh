@@ -7,6 +7,7 @@ APP_VM="$ROOT/packaging/app-vm"
 TEMPLATE="$ROOT/infra/tofu/cloud/cloud-init/mesh-join.yaml.tftpl"
 VALIDATOR="$APP_VM/validate-runtime-inputs.sh"
 LAUNCHER="$APP_VM/mcnf-app-vm-launch.sh"
+PROBE="$APP_VM/mcnf-app-vm-runtime-probe.sh"
 IMAGE_VERIFY="$APP_VM/verify-image.sh"
 BUILD="$APP_VM/build-image.sh"
 
@@ -20,8 +21,9 @@ require() {
 
 [ -x "$VALIDATOR" ] || { echo "FATAL: validator is not executable" >&2; exit 1; }
 [ -x "$LAUNCHER" ] || { echo "FATAL: launcher is not executable" >&2; exit 1; }
+[ -x "$PROBE" ] || { echo "FATAL: runtime probe is not executable" >&2; exit 1; }
 bash -n "$BUILD" "$IMAGE_VERIFY" "$0"
-sh -n "$VALIDATOR" "$LAUNCHER"
+sh -n "$VALIDATOR" "$LAUNCHER" "$PROBE"
 "$IMAGE_VERIFY" --self-test
 
 fixture=$(mktemp -d)
@@ -180,15 +182,130 @@ else
     :
 fi
 
+# Exercise the image-owned preflight against a complete guest fixture and a
+# deterministic missing-Sway failure. The helper must emit ready only after
+# every bounded guest dependency answers, and must overwrite that evidence with
+# unavailable when a runtime dependency disappears.
+probe_root="$fixture/app-vm-probe"
+probe_bin="$probe_root/bin"
+probe_run="$probe_root/run"
+mkdir -p "$probe_root/input" "$probe_bin" "$probe_run"
+printf '%s\n' '"org.example.Editor"' > "$probe_root/input/app-id"
+printf '%s\n' '"session-1"' > "$probe_root/input/session-id"
+printf '%s\n' 'app-vm-probe' > "$probe_root/hostname"
+printf '%s\n' \
+    '{"schema_version":1,"profile":"wayland-standard","compositor":"sway","flatpak_remote":"curated"}' \
+    > "$probe_root/image-contract.json"
+printf '%s\n' \
+    'schema_version=1' \
+    'profile=wayland-standard-v1' \
+    'ready_state=connected' \
+    'host_fallback=disabled' \
+    > "$probe_root/runtime-readiness"
+
+cat > "$probe_bin/timeout" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = --kill-after=1s ]; then shift; fi
+shift
+exec "$@"
+EOF
+cat > "$probe_bin/swaymsg" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$probe_bin/dbus-send" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$probe_bin/pw-cli" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$probe_bin/pactl" <<'EOF'
+#!/bin/sh
+case "$*" in
+    info) exit 0 ;;
+    'list short sinks') printf '%s\n' '0 fake-sink module-fake' ;;
+    *) exit 1 ;;
+esac
+EOF
+cat > "$probe_bin/flatpak" <<'EOF'
+#!/bin/sh
+case "$1:${2:-}:${3:-}" in
+    remotes:--system:--columns=name) printf '%s\n' curated ;;
+    info:--system:org.example.Editor) exit 0 ;;
+    *) exit 1 ;;
+esac
+EOF
+chmod 0755 "$probe_bin"/*
+
+probe_output=$(PATH="$probe_bin:/usr/bin:/bin" \
+    MCNF_APP_VM_INPUT_ROOT="$probe_root/input" \
+    MCNF_APP_VM_HOSTNAME_FILE="$probe_root/hostname" \
+    MCNF_APP_VM_CONTRACT_FILE="$probe_root/image-contract.json" \
+    MCNF_APP_VM_READINESS_FILE="$probe_root/runtime-readiness" \
+    MCNF_APP_VM_PREFLIGHT_EVIDENCE="$probe_run/runtime-preflight.json" \
+    WAYLAND_DISPLAY=wayland-1 \
+    SWAYSOCK="$probe_run/sway.sock" \
+    DBUS_SESSION_BUS_ADDRESS=unix:path="$probe_run/bus" \
+    XDG_RUNTIME_DIR="$probe_run" \
+    "$PROBE")
+printf '%s\n' "$probe_output" | grep -Fq '"state":"ready"' || {
+    echo "FATAL: App VM preflight rejected a complete guest fixture" >&2
+    exit 1
+}
+grep -Fq '"state":"ready"' "$probe_run/runtime-preflight.json" || {
+    echo "FATAL: App VM preflight did not persist ready evidence" >&2
+    exit 1
+}
+
+cat > "$probe_bin/swaymsg" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+if PATH="$probe_bin:/usr/bin:/bin" \
+    MCNF_APP_VM_INPUT_ROOT="$probe_root/input" \
+    MCNF_APP_VM_HOSTNAME_FILE="$probe_root/hostname" \
+    MCNF_APP_VM_CONTRACT_FILE="$probe_root/image-contract.json" \
+    MCNF_APP_VM_READINESS_FILE="$probe_root/runtime-readiness" \
+    MCNF_APP_VM_PREFLIGHT_EVIDENCE="$probe_run/runtime-preflight.json" \
+    WAYLAND_DISPLAY=wayland-1 \
+    SWAYSOCK="$probe_run/sway.sock" \
+    DBUS_SESSION_BUS_ADDRESS=unix:path="$probe_run/bus" \
+    XDG_RUNTIME_DIR="$probe_run" \
+    "$PROBE" > "$probe_run/unavailable.json"; then
+    echo "FATAL: App VM preflight reported ready without a working compositor" >&2
+    exit 1
+fi
+grep -Fq '"state":"unavailable"' "$probe_run/unavailable.json" || {
+    echo "FATAL: App VM preflight omitted unavailable evidence" >&2
+    exit 1
+}
+grep -Fq '"reason":"sway-unavailable"' "$probe_run/unavailable.json" || {
+    echo "FATAL: App VM preflight hid the missing compositor reason" >&2
+    exit 1
+}
+grep -Fq '"state":"unavailable"' "$probe_run/runtime-preflight.json" || {
+    echo "FATAL: App VM preflight left stale ready evidence after failure" >&2
+    exit 1
+}
+
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck "$VALIDATOR" "$APP_VM/build-image.sh" "$0"
+    shellcheck "$VALIDATOR" "$PROBE" "$APP_VM/build-image.sh" "$0"
 fi
 
 require 'COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate' "$APP_VM/Containerfile"
+require 'COPY packaging/app-vm/mcnf-app-vm-runtime-probe.sh /tmp/mcnf-app-vm-runtime-probe' "$APP_VM/Containerfile"
 require 'ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44' "$APP_VM/Containerfile"
+require 'ARG MCNF_APP_VM_SOURCE_COMMIT' "$APP_VM/Containerfile"
+require 'ARG MCNF_APP_VM_BASE_IMAGE_ID' "$APP_VM/Containerfile"
+require 'source-commit' "$APP_VM/Containerfile"
+require 'image-provenance' "$APP_VM/Containerfile"
+require 'runtime-readiness' "$APP_VM/Containerfile"
 require 'COPY packaging/app-vm/mcnf-app-vm-launch.sh /tmp/mcnf-app-vm-launch' "$APP_VM/Containerfile"
 require 'install -D -m 0755 /tmp/mcnf-app-vm-validate /usr/local/libexec/mcnf-app-vm-validate' "$APP_VM/Containerfile"
 require 'install -D -m 0755 /tmp/mcnf-app-vm-launch /usr/local/libexec/mcnf-app-vm-launch' "$APP_VM/Containerfile"
+require 'install -D -m 0755 /tmp/mcnf-app-vm-runtime-probe /usr/local/libexec/mcnf-app-vm-runtime-probe' "$APP_VM/Containerfile"
 require 'image-contract.json' "$APP_VM/Containerfile"
 require 'verify-image.sh' "$APP_VM/build-image.sh"
 require 'resolve_image' "$BUILD"
@@ -198,9 +315,20 @@ require 'context.containerignore' "$BUILD"
 require 'GATED[WL-FUNC-018/base-image]' "$BUILD"
 require 'org.mcnf.app-vm.profile' "$BUILD"
 require 'base-image-id' "$BUILD"
+require 'MCNF_APP_VM_SOURCE_COMMIT' "$BUILD"
+require 'MCNF_APP_VM_BASE_IMAGE_ID' "$BUILD"
+require 'org.mcnf.app-vm.source-commit' "$BUILD"
 require 'immutable profile provenance' "$IMAGE_VERIFY"
 require 'complete immutable base-image digest' "$IMAGE_VERIFY"
 require 'valid_sha256_digest' "$IMAGE_VERIFY"
+require 'MCNF_EXPECTED_SOURCE_COMMIT' "$IMAGE_VERIFY"
+require 'valid_source_commit' "$IMAGE_VERIFY"
+require 'manifest_has_exact_keys' "$IMAGE_VERIFY"
+require 'valid_provenance_manifest' "$IMAGE_VERIFY"
+require 'valid_readiness_manifest' "$IMAGE_VERIFY"
+require 'host_fallback=disabled' "$IMAGE_VERIFY"
+require 'compositor_executable=/usr/bin/sway' "$IMAGE_VERIFY"
+require 'supervisor_entrypoint=/usr/local/libexec/mcnf-app-vm-launch' "$IMAGE_VERIFY"
 require '/usr/local/libexec/mcnf-app-vm-validate' "$TEMPLATE"
 require 'image-contract.json' "$TEMPLATE"
 require 'guest-profile' "$TEMPLATE"
@@ -214,6 +342,8 @@ require 'publish_runtime starting_app' "$TEMPLATE"
 require '"generation":%s' "$TEMPLATE"
 require 'publish_runtime connected' "$APP_VM/mcnf-app-vm-launch.sh"
 require 'publish_runtime failed' "$APP_VM/mcnf-app-vm-launch.sh"
+require 'mcnf-app-vm-runtime-probe' "$APP_VM/mcnf-app-vm-launch.sh"
+require 'guest runtime preflight unavailable' "$APP_VM/mcnf-app-vm-launch.sh"
 require '"generation":%s' "$APP_VM/mcnf-app-vm-launch.sh"
 require "flatpak run --system curated \"\$app_id\"" "$APP_VM/mcnf-app-vm-launch.sh"
 require "trap 'handle_shutdown TERM' TERM" "$APP_VM/mcnf-app-vm-launch.sh"

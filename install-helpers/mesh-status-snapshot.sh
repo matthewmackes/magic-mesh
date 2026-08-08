@@ -41,9 +41,25 @@ s_workbench="$(command -v mde-shell-egui >/dev/null 2>&1 && echo true || echo fa
 
 if [ -n "$SELF" ] && [ -d "$WG" ]; then
     mkdir -p "$WG/$SELF" 2>/dev/null || true
-    cat > "$WG/$SELF/shell-status.json" 2>/dev/null <<EOF
+    STATUS_PATH="$WG/$SELF/shell-status.json"
+    STATUS_JSON="$(cat <<EOF
 {"version":"$VER","role":"$ROLE","services":{"mackesd":$s_mackesd,"nebula":$s_nebula,"sync":$s_sync,"bus":$s_bus,"dns":$s_dns,"voice":$s_voice,"music":$s_music,"kdc":$s_kdc,"workbench":$s_workbench},"updated_ms":$(( $(date +%s%3N) ))}
 EOF
+    )"
+    # updated_ms is a producer heartbeat, not a peer-state change. Comparing
+    # the stable payload before writing prevents Syncthing from propagating a
+    # new mtime every timer tick while retaining the timestamp whenever the
+    # service/version state actually changes. Missing, unreadable, or malformed
+    # files still take the existing best-effort rewrite path.
+    status_payload_unchanged() {
+        [ -r "$STATUS_PATH" ] || return 1
+        current_status="$(sed -E 's/"updated_ms":[0-9]+//' "$STATUS_PATH" 2>/dev/null)" || return 1
+        candidate_status="$(printf '%s\n' "$STATUS_JSON" | sed -E 's/"updated_ms":[0-9]+//')" || return 1
+        [ "$current_status" = "$candidate_status" ]
+    }
+    if ! status_payload_unchanged; then
+        printf '%s\n' "$STATUS_JSON" > "$STATUS_PATH" 2>/dev/null || true
+    fi
 fi
 
 # ── 2. aggregate the directory + every node's shell-status → snapshot ────────

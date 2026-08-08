@@ -12,11 +12,52 @@
 //! without an ambient tokio runtime (they build a private current-thread one —
 //! safe because both callers run OFF the tokio executor).
 
-use etcd_client::{Client, GetOptions, PutOptions};
+use etcd_client::{Client, GetOptions, PutOptions, Txn, TxnOp};
 
-use mackes_mesh_types::peers::PeerRecord;
+use mackes_mesh_types::peers::{OverlayIdentityClaim, PeerRecord};
 
 use super::etcd::{connect, peer_key, PEERS_PREFIX, PEER_LEASE_TTL_S};
+
+/// Lease-backed namespace for collision-detectable physical-machine and boot
+/// claims. The public certificate fingerprint groups one Nebula identity;
+/// machine and boot digests are separate key components so copied identities
+/// coexist and remain observable instead of overwriting one hostname row.
+pub const OVERLAY_IDENTITY_CLAIMS_PREFIX: &str = "/mesh/overlay-identity-claims/v1/";
+/// Exact byte length of every v1 claimant key: prefix plus three 64-byte
+/// lowercase SHA-256 components and their two separators.
+pub const OVERLAY_IDENTITY_CLAIM_KEY_BYTES: usize =
+    OVERLAY_IDENTITY_CLAIMS_PREFIX.len() + (3 * 64) + 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayIdentityClaimPublication {
+    key: String,
+    value: String,
+}
+
+fn overlay_identity_claim_publication(
+    rec: &PeerRecord,
+    claim: &OverlayIdentityClaim,
+) -> anyhow::Result<OverlayIdentityClaimPublication> {
+    claim.validate()?;
+    let expected_node_id = format!("peer:{}", rec.hostname);
+    if claim.nebula_node_id != expected_node_id || claim.nebula_name != expected_node_id {
+        anyhow::bail!(
+            "peer hostname does not exactly match caller-supplied Nebula node and certificate name"
+        );
+    }
+    if rec.overlay_ip.as_deref() != Some(claim.nebula_address.as_str()) {
+        anyhow::bail!("peer overlay address does not match caller-supplied Nebula claim");
+    }
+    let key = format!(
+        "{OVERLAY_IDENTITY_CLAIMS_PREFIX}{}/{}/{}",
+        claim.certificate_fingerprint, claim.machine_claimant_digest, claim.boot_claimant_digest
+    );
+    if key.len() != OVERLAY_IDENTITY_CLAIM_KEY_BYTES {
+        anyhow::bail!("overlay identity claim key escaped its exact v1 bound");
+    }
+    let value = claim.to_json()?;
+    Ok(OverlayIdentityClaimPublication { key, value })
+}
 
 /// Write `rec` to `/mesh/peers/<hostname>` under a fresh `PEER_LEASE_TTL_S`
 /// lease. Re-running each heartbeat keeps the record alive; stopping lets the
@@ -34,6 +75,48 @@ pub async fn put_peer(client: &mut Client, rec: &PeerRecord) -> anyhow::Result<(
             Some(PutOptions::new().with_lease(lease)),
         )
         .await?;
+    Ok(())
+}
+
+/// Atomically publish a peer directory row and its strict overlay claimant
+/// under one fresh [`PEER_LEASE_TTL_S`] etcd lease.
+///
+/// This is the fail-closed collision-authority seam: the caller must supply a
+/// fully validated public certificate identity plus privacy-bounded machine and
+/// boot digests. No hostname or `PeerRecord` field is promoted into missing
+/// identity authority. Repeating the same claimant refreshes the same key and
+/// value; a different machine or boot using the copied Nebula identity receives
+/// a distinct simultaneously-live key.
+///
+/// # Errors
+/// Returns an error before granting a lease when the claim is malformed or its
+/// exact node/name/address identity disagrees with the peer row, and propagates
+/// JSON, lease, or atomic etcd transaction failures.
+pub async fn put_peer_with_overlay_identity_claim(
+    client: &mut Client,
+    rec: &PeerRecord,
+    claim: &OverlayIdentityClaim,
+) -> anyhow::Result<()> {
+    let publication = overlay_identity_claim_publication(rec, claim)?;
+    let peer_json = serde_json::to_string(rec)?;
+    let lease = client.lease_grant(PEER_LEASE_TTL_S, None).await?.id();
+    let response = client
+        .txn(Txn::new().and_then([
+            TxnOp::put(
+                peer_key(&rec.hostname),
+                peer_json,
+                Some(PutOptions::new().with_lease(lease)),
+            ),
+            TxnOp::put(
+                publication.key,
+                publication.value,
+                Some(PutOptions::new().with_lease(lease)),
+            ),
+        ]))
+        .await?;
+    if !response.succeeded() {
+        anyhow::bail!("overlay identity claim transaction was not applied");
+    }
     Ok(())
 }
 
@@ -143,6 +226,26 @@ pub fn put_peer_blocking(endpoints: &[String], rec: &PeerRecord) -> bool {
     block_on(async {
         match connect(endpoints).await {
             Ok(mut c) => put_peer(&mut c, rec).await.is_ok(),
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Blocking bridge for [`put_peer_with_overlay_identity_claim`]. The required
+/// claim argument makes missing collision authority an explicit `false` result;
+/// callers cannot fall back to a hostname-derived or fabricated identity.
+#[must_use]
+pub fn put_peer_with_overlay_identity_claim_blocking(
+    endpoints: &[String],
+    rec: &PeerRecord,
+    claim: &OverlayIdentityClaim,
+) -> bool {
+    block_on(async {
+        match connect(endpoints).await {
+            Ok(mut client) => put_peer_with_overlay_identity_claim(&mut client, rec, claim)
+                .await
+                .is_ok(),
             Err(_) => false,
         }
     })
@@ -276,7 +379,35 @@ pub fn read_directory(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::block_on;
+    use super::{
+        block_on, overlay_identity_claim_publication, OVERLAY_IDENTITY_CLAIMS_PREFIX,
+        OVERLAY_IDENTITY_CLAIM_KEY_BYTES,
+    };
+    use mackes_mesh_types::peers::{OverlayIdentityClaim, PeerRecord};
+
+    const CERT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const MACHINE_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const MACHINE_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const BOOT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BOOT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn peer() -> PeerRecord {
+        let mut rec = PeerRecord::now("SURFACE", None, "healthy");
+        rec.overlay_ip = Some("10.42.0.7".into());
+        rec
+    }
+
+    fn claim(machine: &str, boot: &str) -> OverlayIdentityClaim {
+        OverlayIdentityClaim::new(
+            "peer:SURFACE",
+            "peer:SURFACE",
+            "10.42.0.7",
+            CERT,
+            machine,
+            boot,
+        )
+        .expect("valid claim")
+    }
 
     #[test]
     fn blocking_bridge_is_safe_inside_current_thread_runtime() {
@@ -288,5 +419,58 @@ mod tests {
         let result = runtime.block_on(async { block_on(async { 7_u8 }) });
 
         assert_eq!(result, Some(7));
+    }
+
+    #[test]
+    fn copied_identity_claimants_have_distinct_simultaneous_keys() {
+        let first = overlay_identity_claim_publication(&peer(), &claim(MACHINE_A, BOOT_A))
+            .expect("first publication");
+        let second = overlay_identity_claim_publication(&peer(), &claim(MACHINE_B, BOOT_B))
+            .expect("second publication");
+
+        let live = std::collections::BTreeMap::from([
+            (first.key.clone(), first.value),
+            (second.key.clone(), second.value),
+        ]);
+        assert_eq!(live.len(), 2, "copied identities must never overwrite");
+        assert_ne!(first.key, second.key);
+        assert_eq!(first.key.len(), OVERLAY_IDENTITY_CLAIM_KEY_BYTES);
+        assert_eq!(second.key.len(), OVERLAY_IDENTITY_CLAIM_KEY_BYTES);
+        assert!(first.key.starts_with(OVERLAY_IDENTITY_CLAIMS_PREFIX));
+        assert!(second.key.starts_with(OVERLAY_IDENTITY_CLAIMS_PREFIX));
+        assert!(first.key.contains(CERT));
+        assert!(second.key.contains(CERT));
+    }
+
+    #[test]
+    fn same_claimant_refresh_is_key_and_value_idempotent() {
+        let claim = claim(MACHINE_A, BOOT_A);
+        let first = overlay_identity_claim_publication(&peer(), &claim).expect("first refresh");
+        let second = overlay_identity_claim_publication(&peer(), &claim).expect("second refresh");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn publication_rejects_directory_address_mismatch() {
+        let mut rec = peer();
+        rec.overlay_ip = Some("10.42.0.8".into());
+
+        assert!(overlay_identity_claim_publication(&rec, &claim(MACHINE_A, BOOT_A)).is_err());
+    }
+
+    #[test]
+    fn publication_rejects_directory_identity_mismatch_at_same_address() {
+        let other = OverlayIdentityClaim::new(
+            "peer:OTHER",
+            "peer:OTHER",
+            "10.42.0.7",
+            CERT,
+            MACHINE_A,
+            BOOT_A,
+        )
+        .expect("valid but different identity");
+
+        assert!(overlay_identity_claim_publication(&peer(), &other).is_err());
     }
 }

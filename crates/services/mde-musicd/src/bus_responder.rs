@@ -14,18 +14,29 @@
 //! (the standard mackesd Bus-responder shape) that drives it off the
 //! Bus persistence store.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::airsonic::Client;
 use crate::creds;
-use crate::engine::{Engine, SourceCodec};
+use crate::domain::{
+    build_shelves, dedup_catalog, normalized_identity, ordered_variants, BookmarkItem, CatalogItem,
+    ContentKind, ContentRef, DownloadRecord, LibraryCollection, MusicActionRequestV1,
+    MusicActionResultV1, MusicStorageSnapshot, MusicWorkspaceSnapshotV1, PlaybackSnapshot,
+    QueueEntry, SearchPage, ServerCapabilities, SourceVariant, MAX_BOOKMARKS, MAX_COLLECTION_ITEMS,
+    MAX_LIBRARY_OFFSET, MAX_LIBRARY_PAGE_SIZE, MAX_PLAYLIST_FIELD_BYTES, MAX_SEARCH_ITEMS,
+    MAX_SOURCE_RECORDS, MUSIC_CONTRACT_VERSION,
+};
+use crate::engine::{Engine, PlaybackTrack, SourceCodec};
 
 /// Shared `ipc/action_auth` wire contract for the music responder.
 ///
@@ -37,13 +48,20 @@ use crate::engine::{Engine, SourceCodec};
 mod music_action_auth {
     use std::path::{Path, PathBuf};
 
+    use ed25519_dalek::VerifyingKey;
+    use mackes_mesh_types::music_auth::{self, MusicAuthContext};
     use serde_json::Value;
 
     pub(super) const SCHEMA_VERSION: u64 = 1;
     const MAX_TTL_MS: i64 = 30_000;
     const NONCE_MIN_LEN: usize = 8;
     const CREDENTIAL_NAME: &str = "cloud-arm-key";
-    const DEFAULT_AUTH_ROOT: &str = "/var/lib/mackesd/cloud-auth";
+    const MUSIC_AUTH_NONCE_DIRECTORY: &str = "music-auth-nonces";
+    const PUBLIC_KEY_ENV: &str = "MDE_MUSIC_ACTION_PUBLIC_KEY";
+
+    pub(super) fn production_auth_root() -> PathBuf {
+        crate::state::data_dir().join(MUSIC_AUTH_NONCE_DIRECTORY)
+    }
 
     #[derive(Debug, Clone)]
     struct ArmedToken {
@@ -88,6 +106,7 @@ mod music_action_auth {
 
     pub(super) struct Authorizer {
         key: Option<Vec<u8>>,
+        public_key: Option<VerifyingKey>,
         auth_root: PathBuf,
         test_now_ms: Option<i64>,
     }
@@ -97,6 +116,7 @@ mod music_action_auth {
             f.debug_struct("Authorizer")
                 .field("auth_root", &self.auth_root)
                 .field("has_key", &self.key.is_some())
+                .field("has_public_key", &self.public_key.is_some())
                 .finish_non_exhaustive()
         }
     }
@@ -104,7 +124,8 @@ mod music_action_auth {
     impl Authorizer {
         pub(super) fn production() -> Self {
             let key = load_production_key().ok();
-            if key.is_none() {
+            let public_key = load_production_public_key().ok();
+            if key.is_none() && public_key.is_none() {
                 tracing::error!(
                     target: "mde_musicd::action_auth",
                     "music mutation authorization unavailable; mutations are disabled"
@@ -112,7 +133,13 @@ mod music_action_auth {
             }
             Self {
                 key,
-                auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
+                public_key,
+                // mde-musicd is deliberately a user service. Its replay ledger
+                // must therefore live below the same user-owned durable state
+                // root as its catalog/queue, not below root-only mackesd state.
+                // The asymmetric public key still decides authorization; this
+                // directory only records already-consumed nonces.
+                auth_root: production_auth_root(),
                 test_now_ms: None,
             }
         }
@@ -121,6 +148,21 @@ mod music_action_auth {
         pub(super) fn for_test(key: &[u8], auth_root: PathBuf, now_ms: i64) -> Self {
             Self {
                 key: Some(key.to_vec()),
+                public_key: None,
+                auth_root,
+                test_now_ms: Some(now_ms),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn for_test_music(
+            public_key: VerifyingKey,
+            auth_root: PathBuf,
+            now_ms: i64,
+        ) -> Self {
+            Self {
+                key: None,
+                public_key: Some(public_key),
                 auth_root,
                 test_now_ms: Some(now_ms),
             }
@@ -151,6 +193,9 @@ mod music_action_auth {
                     "privileged action requires schema_version {SCHEMA_VERSION}"
                 ));
             }
+            if object.contains_key("music_auth") {
+                return self.authorize_music(body, verb, node, target);
+            }
             let raw_token = object
                 .get("armed_token")
                 .and_then(Value::as_str)
@@ -173,7 +218,7 @@ mod music_action_auth {
                 return Err("armed token does not authorize this request body".to_string());
             }
             let now_ms = self.now_ms();
-            if now_ms > token.expires_at_ms {
+            if now_ms >= token.expires_at_ms {
                 return Err("armed token has expired".to_string());
             }
             if token.expires_at_ms > now_ms.saturating_add(MAX_TTL_MS) {
@@ -186,6 +231,39 @@ mod music_action_auth {
             match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now_ms)? {
                 true => Ok(()),
                 false => Err("armed token was already used".to_string()),
+            }
+        }
+
+        fn authorize_music(
+            &self,
+            body: &str,
+            verb: &str,
+            node: &str,
+            target: &str,
+        ) -> Result<(), String> {
+            let public_key = self
+                .public_key
+                .clone()
+                .or_else(|| load_production_public_key().ok())
+                .ok_or_else(|| "music action public key is unavailable".to_string())?;
+            let token = music_auth::verify_request(
+                body,
+                MusicAuthContext { verb, node, target },
+                &public_key,
+            )?;
+            if token.nonce.len() < NONCE_MIN_LEN {
+                return Err("music_auth nonce is too short".to_string());
+            }
+            let now_ms = self.now_ms();
+            if now_ms >= token.expires_at_ms {
+                return Err("music_auth token has expired".to_string());
+            }
+            if token.expires_at_ms > now_ms.saturating_add(music_auth::MUSIC_AUTH_MAX_TTL_MS) {
+                return Err("music_auth token exceeds the 30-second lifetime".to_string());
+            }
+            match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now_ms)? {
+                true => Ok(()),
+                false => Err("music_auth token was already used".to_string()),
             }
         }
     }
@@ -207,6 +285,36 @@ mod music_action_auth {
             return Err("cloud arming credential must encode exactly 32 bytes".to_string());
         }
         Ok(key)
+    }
+
+    fn load_production_public_key() -> Result<VerifyingKey, String> {
+        let path = std::env::var_os(PUBLIC_KEY_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(music_auth::MUSIC_AUTH_PUBLIC_KEY_PATH));
+        if !path.is_absolute() {
+            return Err("music action public key path must be absolute".to_string());
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect music action public key: {error}"))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err("music action public key is not a regular file".to_string());
+        }
+        if metadata.len() > 4096 {
+            return Err("music action public key exceeds the 4 KiB cap".to_string());
+        }
+        let raw = std::fs::read(&path)
+            .map_err(|error| format!("read music action public key: {error}"))?;
+        let text = std::str::from_utf8(&raw)
+            .map_err(|_| "music action public key is not UTF-8".to_string())?
+            .trim();
+        let bytes = decode_hex(text)
+            .filter(|bytes| bytes.len() == 32)
+            .ok_or_else(|| "music action public key must encode 32 hexadecimal bytes".to_string())?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "music action public key must encode 32 bytes".to_string())?;
+        VerifyingKey::from_bytes(&bytes)
+            .map_err(|error| format!("parse music action public key: {error}"))
     }
 
     fn request_digest(raw: &str) -> Result<String, String> {
@@ -285,7 +393,7 @@ mod music_action_auth {
             let expired = std::fs::read_to_string(entry.path())
                 .ok()
                 .and_then(|value| value.trim().parse::<i64>().ok())
-                .is_some_and(|expiry| expiry < now_ms);
+                .is_some_and(|expiry| expiry <= now_ms);
             if expired {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -485,6 +593,1356 @@ use crate::state::{self, MusicState};
 
 /// Poll cadence for the action topics.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Browse requests are user-facing but not transport-critical.  Keep their
+/// Bus scans at a slower bounded cadence so an idle daemon does not prepare a
+/// query for every browse topic twice per second on every seat.
+pub const BROWSE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Credential files are operator-edited configuration, not a transport
+/// signal.  Re-reading and validating them every control sweep amplifies
+/// filesystem and JSON work across all seats, especially when no credentials
+/// exist yet.  A short bounded refresh keeps reconnect discovery responsive.
+pub const CREDS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Maximum deterministic startup offset for the responder sweep.  Every seat
+/// used to enter the fixed 500 ms loop at service start, making all music
+/// daemons wake together and amplify the same Bus/provider work across a
+/// workstation fleet.  A host-derived phase preserves the cadence and
+/// response bound while spreading those wakes over a small, bounded window.
+pub const MAX_INITIAL_POLL_PHASE: Duration = Duration::from_millis(251);
+/// Maximum retained messages admitted for one Music topic per poll.
+///
+/// The cursor advances only through this page so a delayed daemon drains a
+/// retained action backlog over bounded sweeps instead of materializing the
+/// whole history in one process queue.
+const MAX_MESSAGES_PER_POLL: usize = 64;
+/// Complete retained Music workspace read-model topic.
+pub const WORKSPACE_STATE_TOPIC: &str = "state/music/workspace";
+/// Durable monotonic revision for the retained workspace snapshot. The UI
+/// deliberately ignores snapshots at or below its last observed revision, so
+/// resetting this value on daemon restart would make a healthy workspace look
+/// permanently stale until the process happened to catch up.
+const WORKSPACE_REVISION_FILE: &str = "music-workspace-revision";
+/// Typed mutation topic for the complete Music workspace contract.
+pub const WORKSPACE_ACTION_VERB: &str = "workspace";
+const WORKSPACE_LEDGER_SCHEMA_VERSION: u16 = 1;
+const MAX_WORKSPACE_LEDGER_RECORDS: usize = 1024;
+const WORKSPACE_LEDGER_FILE: &str = "music-workspace-action-ledger.json";
+const DOWNLOAD_STORE_SCHEMA_VERSION: u16 = 1;
+const DOWNLOAD_STORE_FILE: &str = "music-downloads-v1.json";
+const CATALOG_STORE_SCHEMA_VERSION: u16 = 1;
+const CATALOG_STORE_FILE: &str = "music-catalog-v1.json";
+const MAX_CATALOG_ITEMS: usize = MAX_COLLECTION_ITEMS;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogPage {
+    offset: usize,
+    size: usize,
+    has_more: bool,
+    items: Vec<CatalogItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CatalogStoreFile {
+    schema_version: u16,
+    /// Current plural source representation.  `source` is retained only so
+    /// older catalog files can be read and migrated in memory.
+    #[serde(default)]
+    sources: Vec<ServerCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<ServerCapabilities>,
+    albums: Vec<CatalogItem>,
+    artists: Vec<CatalogItem>,
+    #[serde(default)]
+    podcasts: Vec<CatalogItem>,
+    #[serde(default)]
+    radio: Vec<CatalogItem>,
+    #[serde(default)]
+    episodes: Vec<CatalogItem>,
+    songs: Vec<CatalogItem>,
+    starred: Vec<CatalogItem>,
+    recent: Vec<CatalogItem>,
+    frequent: Vec<CatalogItem>,
+    #[serde(default)]
+    bookmarks: Vec<BookmarkItem>,
+    search: Option<SearchPage>,
+    /// Last provider page for each browse collection. The full catalog cache
+    /// remains separately bounded; this page is what makes catalogs larger
+    /// than the retained cache navigable without publishing every row.
+    #[serde(default)]
+    pages: BTreeMap<String, CatalogPage>,
+}
+
+impl Default for CatalogStoreFile {
+    fn default() -> Self {
+        Self {
+            schema_version: CATALOG_STORE_SCHEMA_VERSION,
+            sources: Vec::new(),
+            source: None,
+            albums: Vec::new(),
+            artists: Vec::new(),
+            podcasts: Vec::new(),
+            radio: Vec::new(),
+            episodes: Vec::new(),
+            songs: Vec::new(),
+            starred: Vec::new(),
+            recent: Vec::new(),
+            frequent: Vec::new(),
+            bookmarks: Vec::new(),
+            search: None,
+            pages: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceLedgerRecord {
+    request_id: String,
+    result: MusicActionResultV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceLedgerFile {
+    schema_version: u16,
+    records: Vec<WorkspaceLedgerRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkspaceActionLedger {
+    records: Vec<WorkspaceLedgerRecord>,
+}
+
+impl WorkspaceActionLedger {
+    fn contains(&self, request_id: &str) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.request_id == request_id)
+    }
+
+    fn reserve(&mut self, request_id: &str, revision: u64) -> bool {
+        if self.contains(request_id) {
+            return false;
+        }
+        if self.records.len() == MAX_WORKSPACE_LEDGER_RECORDS {
+            self.records.remove(0);
+        }
+        self.records.push(WorkspaceLedgerRecord {
+            request_id: request_id.to_string(),
+            result: typed_result(request_id, false, revision, Some("in_flight")),
+        });
+        true
+    }
+
+    fn finish(&mut self, request_id: &str, result: MusicActionResultV1) {
+        if let Some(record) = self
+            .records
+            .iter_mut()
+            .find(|record| record.request_id == request_id)
+        {
+            record.result = result;
+        }
+    }
+
+    fn release(&mut self, request_id: &str) {
+        self.records
+            .retain(|record| record.request_id != request_id);
+    }
+}
+
+fn workspace_ledger_path(dir: &Path) -> PathBuf {
+    dir.join(WORKSPACE_LEDGER_FILE)
+}
+
+fn workspace_revision_path(dir: &Path) -> PathBuf {
+    dir.join(WORKSPACE_REVISION_FILE)
+}
+
+/// Load the last published workspace revision. An absent record is the clean
+/// first-start state; malformed or unreadable state is an error because
+/// publishing a reset revision would strand existing clients behind a false
+/// stale-result guard.
+fn load_workspace_revision(dir: &Path) -> std::io::Result<u64> {
+    let path = workspace_revision_path(dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        if !path.exists() {
+            return Ok(0);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "music workspace revision could not be read",
+        ));
+    };
+    raw.trim().parse::<u64>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "music workspace revision is not an unsigned integer",
+        )
+    })
+}
+
+/// Persist the next revision before its snapshot is exposed on the Bus. This
+/// keeps a crash between the two writes safe: a later daemon restart advances
+/// again instead of reusing a revision already visible to a client.
+fn persist_workspace_revision(dir: &Path, revision: u64) -> std::io::Result<()> {
+    if revision == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workspace revision must be non-zero",
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    persist_json_atomic(&workspace_revision_path(dir), &revision)
+}
+
+/// Persist one daemon-owned JSON record without exposing a partially-written
+/// state file or sharing a fixed temporary pathname between writers/restarts.
+/// The retained Music stores contain credentials-adjacent metadata and queue
+/// identities, so newly-created files are owner-readable on Unix.
+fn persist_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temporary = path.with_extension(format!("json.tmp-{}-{nonce}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            OpenOptions::new().read(true).open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn load_workspace_ledger(dir: &Path) -> std::io::Result<WorkspaceActionLedger> {
+    let path = workspace_ledger_path(dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(WorkspaceActionLedger::default());
+    };
+    let file: WorkspaceLedgerFile = serde_json::from_str(&raw).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("music action ledger: {error}"),
+        )
+    })?;
+    let mut request_ids = HashSet::with_capacity(file.records.len());
+    let invalid = file.schema_version != WORKSPACE_LEDGER_SCHEMA_VERSION
+        || file.records.len() > MAX_WORKSPACE_LEDGER_RECORDS
+        || file.records.iter().any(|record| {
+            record.request_id.is_empty()
+                || record.request_id.len() > crate::domain::MAX_REQUEST_ID_BYTES
+                || record.request_id.chars().any(char::is_control)
+                || record.result.request_id != record.request_id
+                || !request_ids.insert(record.request_id.clone())
+        });
+    if invalid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "music action ledger has an unsupported schema or bound violation",
+        ));
+    }
+    Ok(WorkspaceActionLedger {
+        records: file.records,
+    })
+}
+
+fn persist_workspace_ledger(dir: &Path, ledger: &WorkspaceActionLedger) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = workspace_ledger_path(dir);
+    persist_json_atomic(
+        &path,
+        &WorkspaceLedgerFile {
+            schema_version: WORKSPACE_LEDGER_SCHEMA_VERSION,
+            records: ledger.records.clone(),
+        },
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DownloadStoreFile {
+    schema_version: u16,
+    records: Vec<DownloadRecord>,
+}
+
+fn downloads_path(dir: &Path) -> PathBuf {
+    dir.join(DOWNLOAD_STORE_FILE)
+}
+
+fn valid_download_record(record: &DownloadRecord) -> bool {
+    !record.content.source_id.trim().is_empty()
+        && !record.content.remote_id.trim().is_empty()
+        && matches!(
+            record.content.kind,
+            ContentKind::Music
+                | ContentKind::Episode
+                | ContentKind::Chapter
+                | ContentKind::Audiobook
+        )
+        && matches!(
+            record.state.as_str(),
+            "queued" | "downloading" | "ready" | "failed" | "cancelled"
+        )
+        && record.state.len() <= MAX_PLAYLIST_FIELD_BYTES
+        && record.error_code.as_ref().is_none_or(|error| {
+            error.len() <= MAX_PLAYLIST_FIELD_BYTES && !error.chars().any(char::is_control)
+        })
+}
+
+fn load_downloads(dir: &Path) -> std::io::Result<Vec<DownloadRecord>> {
+    let path = downloads_path(dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let file: DownloadStoreFile = serde_json::from_str(&raw).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("music download store: {error}"),
+        )
+    })?;
+    if file.schema_version != DOWNLOAD_STORE_SCHEMA_VERSION
+        || file.records.len() > crate::domain::MAX_QUEUE_ITEMS
+        || file
+            .records
+            .iter()
+            .any(|record| !valid_download_record(record))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "music download store has an unsupported schema or bound violation",
+        ));
+    }
+    Ok(file.records)
+}
+
+fn persist_downloads(dir: &Path, records: &[DownloadRecord]) -> std::io::Result<()> {
+    if records.len() > crate::domain::MAX_QUEUE_ITEMS
+        || records.iter().any(|r| !valid_download_record(r))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "music download store exceeds its contract bounds",
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = downloads_path(dir);
+    persist_json_atomic(
+        &path,
+        &DownloadStoreFile {
+            schema_version: DOWNLOAD_STORE_SCHEMA_VERSION,
+            records: records.to_vec(),
+        },
+    )
+}
+
+/// Convert in-flight downloads left by a crashed daemon into an honest,
+/// retryable failure before the next workspace snapshot is published. The
+/// cache writer only installs a complete file after the provider response has
+/// finished, so a durable `downloading` record cannot safely claim that its
+/// bytes are resumable.
+fn recover_interrupted_downloads(dir: &Path) -> std::io::Result<bool> {
+    let mut records = load_downloads(dir)?;
+    let mut changed = false;
+    for record in &mut records {
+        if record.state == "downloading" {
+            record.state = "failed".to_string();
+            record.bytes = 0;
+            record.total_bytes = None;
+            record.pinned = false;
+            record.error_code = Some("download_interrupted".to_string());
+            changed = true;
+        }
+    }
+    if changed {
+        persist_downloads(dir, &records)?;
+    }
+    Ok(changed)
+}
+
+fn catalog_path(dir: &Path) -> PathBuf {
+    dir.join(CATALOG_STORE_FILE)
+}
+
+fn valid_catalog_store_item(item: &CatalogItem) -> bool {
+    !item.id.trim().is_empty()
+        && item.variants.len() <= crate::domain::MAX_SOURCE_VARIANTS
+        && item.variants.iter().all(|variant| {
+            !variant.content.source_id.trim().is_empty()
+                && !variant.content.remote_id.trim().is_empty()
+        })
+}
+
+fn valid_catalog_page(page: &CatalogPage) -> bool {
+    page.size > 0
+        && page.size <= MAX_LIBRARY_PAGE_SIZE
+        && page.offset <= MAX_LIBRARY_OFFSET
+        && page.items.len() <= MAX_COLLECTION_ITEMS
+        && page.items.len() <= page.size
+        && page.items.iter().all(valid_catalog_store_item)
+}
+
+fn valid_catalog_store_bookmark(bookmark: &BookmarkItem) -> bool {
+    !bookmark.content.source_id.trim().is_empty()
+        && !bookmark.content.remote_id.trim().is_empty()
+        && !bookmark.title.trim().is_empty()
+        && bookmark
+            .duration_ms
+            .is_none_or(|duration| bookmark.position_ms <= duration)
+}
+
+fn valid_catalog_source(source: &ServerCapabilities) -> bool {
+    !source.source_id.trim().is_empty()
+        && source.source_id.len() <= MAX_PLAYLIST_FIELD_BYTES
+        && source.api_profile.len() <= MAX_PLAYLIST_FIELD_BYTES
+        && source.features.len() <= 64
+        && source.features.iter().all(|feature| {
+            !feature.is_empty()
+                && feature.len() <= MAX_PLAYLIST_FIELD_BYTES
+                && !feature.chars().any(char::is_control)
+        })
+}
+
+fn set_catalog_variants_reachable(file: &mut CatalogStoreFile, source_id: &str, reachable: bool) {
+    let update_item = |item: &mut CatalogItem| {
+        for variant in &mut item.variants {
+            if variant.content.source_id == source_id {
+                variant.reachable = reachable;
+            }
+        }
+    };
+    for items in [
+        &mut file.albums,
+        &mut file.artists,
+        &mut file.podcasts,
+        &mut file.radio,
+        &mut file.episodes,
+        &mut file.songs,
+        &mut file.starred,
+        &mut file.recent,
+        &mut file.frequent,
+    ] {
+        for item in items {
+            update_item(item);
+        }
+    }
+    for page in file.pages.values_mut() {
+        for item in &mut page.items {
+            update_item(item);
+        }
+    }
+    if let Some(page) = &mut file.search {
+        for items in page.groups.values_mut() {
+            for item in items {
+                update_item(item);
+            }
+        }
+    }
+}
+
+fn load_catalog(dir: &Path) -> std::io::Result<CatalogStoreFile> {
+    let path = catalog_path(dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(CatalogStoreFile::default());
+    };
+    let mut file: CatalogStoreFile = serde_json::from_str(&raw).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("music catalog store: {error}"),
+        )
+    })?;
+    if file.sources.is_empty() {
+        if let Some(source) = file.source.take() {
+            file.sources.push(source);
+        }
+    }
+    if file.sources.len() > creds::MAX_CONFIGURED_SOURCES
+        || file
+            .sources
+            .iter()
+            .any(|source| !valid_catalog_source(source))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "music catalog store has an unsupported source bound or identity",
+        ));
+    }
+    let collections = [
+        &file.albums,
+        &file.artists,
+        &file.podcasts,
+        &file.radio,
+        &file.episodes,
+        &file.songs,
+        &file.starred,
+        &file.recent,
+        &file.frequent,
+    ];
+    if file.schema_version != CATALOG_STORE_SCHEMA_VERSION
+        || collections.iter().any(|items| {
+            items.len() > MAX_CATALOG_ITEMS || items.iter().any(|i| !valid_catalog_store_item(i))
+        })
+        || file.bookmarks.len() > MAX_BOOKMARKS
+        || file
+            .bookmarks
+            .iter()
+            .any(|bookmark| !valid_catalog_store_bookmark(bookmark))
+        || file.search.as_ref().is_some_and(|page| {
+            page.groups.values().map(Vec::len).sum::<usize>() > MAX_SEARCH_ITEMS
+                || page
+                    .groups
+                    .values()
+                    .flat_map(|items| items.iter())
+                    .any(|item| !valid_catalog_store_item(item))
+        })
+        || file.pages.len() > MAX_SOURCE_RECORDS
+        || file
+            .pages
+            .iter()
+            .any(|(key, page)| key.trim().is_empty() || !valid_catalog_page(page))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "music catalog store has an unsupported schema or bound violation",
+        ));
+    }
+    Ok(file)
+}
+
+fn persist_catalog(dir: &Path, file: &CatalogStoreFile) -> std::io::Result<()> {
+    let collections = [
+        &file.albums,
+        &file.artists,
+        &file.podcasts,
+        &file.radio,
+        &file.episodes,
+        &file.songs,
+        &file.starred,
+        &file.recent,
+        &file.frequent,
+    ];
+    if file.schema_version != CATALOG_STORE_SCHEMA_VERSION
+        || file.sources.len() > creds::MAX_CONFIGURED_SOURCES
+        || file
+            .sources
+            .iter()
+            .any(|source| !valid_catalog_source(source))
+        || collections.iter().any(|items| {
+            items.len() > MAX_CATALOG_ITEMS || items.iter().any(|i| !valid_catalog_store_item(i))
+        })
+        || file.bookmarks.len() > MAX_BOOKMARKS
+        || file
+            .bookmarks
+            .iter()
+            .any(|bookmark| !valid_catalog_store_bookmark(bookmark))
+        || file.pages.len() > MAX_SOURCE_RECORDS
+        || file
+            .pages
+            .iter()
+            .any(|(key, page)| key.trim().is_empty() || !valid_catalog_page(page))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "music catalog store exceeds its contract bounds",
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = catalog_path(dir);
+    persist_json_atomic(&path, file)
+}
+
+fn catalog_source<'a>(
+    file: &'a mut CatalogStoreFile,
+    client: &Client,
+) -> Option<&'a mut ServerCapabilities> {
+    let source_id = catalog_source_id(client);
+    if let Some(index) = file
+        .sources
+        .iter()
+        .position(|source| source.source_id == source_id)
+    {
+        return Some(&mut file.sources[index]);
+    }
+    if file.sources.len() == creds::MAX_CONFIGURED_SOURCES {
+        // The configured source list is bounded.  Keep the existing source
+        // rows stable; the caller still records its content variants using
+        // the source id, but does not let metadata grow without bound.
+        return None;
+    }
+    file.sources.push(ServerCapabilities {
+        source_id,
+        api_profile: format!("subsonic/{}", client.api_version()),
+        reachable: true,
+        authentication_required: false,
+        features: BTreeSet::new(),
+    });
+    file.sources.last_mut()
+}
+
+fn catalog_source_id(client: &Client) -> String {
+    let base = client.base_url().trim().trim_end_matches('/');
+    let suffix: String = base
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PLAYLIST_FIELD_BYTES.saturating_sub(9))
+        .collect();
+    format!("airsonic:{suffix}")
+}
+
+fn catalog_variant(source_id: &str, remote_id: &str, kind: ContentKind) -> Option<SourceVariant> {
+    Some(SourceVariant {
+        content: ContentRef::new(source_id, remote_id, kind)?,
+        cached: false,
+        reachable: true,
+        operator_priority: 0,
+        latency_ms: None,
+    })
+}
+
+fn album_catalog_item(
+    source_id: &str,
+    album: &crate::airsonic::Album,
+    starred: bool,
+) -> Option<CatalogItem> {
+    Some(CatalogItem {
+        id: normalized_identity(ContentKind::Album, &album.name, &album.artist, "", None),
+        kind: ContentKind::Album,
+        title: album.name.clone(),
+        creator: album.artist.clone(),
+        parent_title: String::new(),
+        duration_ms: None,
+        artwork_ref: (!album.cover_art.is_empty()).then(|| album.cover_art.clone()),
+        starred,
+        cached: false,
+        variants: vec![catalog_variant(source_id, &album.id, ContentKind::Album)?],
+    })
+}
+
+fn artist_catalog_item(source_id: &str, artist: &crate::airsonic::Artist) -> Option<CatalogItem> {
+    Some(CatalogItem {
+        id: normalized_identity(ContentKind::Artist, &artist.name, "", "", None),
+        kind: ContentKind::Artist,
+        title: artist.name.clone(),
+        creator: artist.name.clone(),
+        parent_title: String::new(),
+        duration_ms: None,
+        artwork_ref: None,
+        starred: false,
+        cached: false,
+        variants: vec![catalog_variant(source_id, &artist.id, ContentKind::Artist)?],
+    })
+}
+
+fn podcast_catalog_item(
+    source_id: &str,
+    channel: &crate::airsonic::PodcastChannel,
+) -> Option<CatalogItem> {
+    Some(CatalogItem {
+        id: normalized_identity(ContentKind::Podcast, &channel.title, "", "", None),
+        kind: ContentKind::Podcast,
+        title: channel.title.clone(),
+        creator: String::new(),
+        parent_title: String::new(),
+        duration_ms: None,
+        artwork_ref: (!channel.artwork_ref.is_empty()).then(|| channel.artwork_ref.clone()),
+        starred: false,
+        cached: false,
+        variants: vec![catalog_variant(
+            source_id,
+            &channel.id,
+            ContentKind::Podcast,
+        )?],
+    })
+}
+
+fn radio_catalog_item(
+    source_id: &str,
+    station: &crate::airsonic::RadioStation,
+) -> Option<CatalogItem> {
+    Some(CatalogItem {
+        id: normalized_identity(ContentKind::Radio, &station.name, "", "", None),
+        kind: ContentKind::Radio,
+        title: station.name.clone(),
+        creator: "Internet radio".to_string(),
+        parent_title: String::new(),
+        duration_ms: None,
+        artwork_ref: (!station.artwork_ref.is_empty()).then(|| station.artwork_ref.clone()),
+        starred: false,
+        cached: false,
+        // The engine's existing Airsonic stream seam treats an http(s) remote
+        // id as a direct stream URL. Keep the provider station id in the
+        // display identity, but retain the URL in the playable variant.
+        variants: vec![catalog_variant(
+            source_id,
+            &station.stream_url,
+            ContentKind::Radio,
+        )?],
+    })
+}
+
+fn podcast_episode_catalog_item(
+    source_id: &str,
+    episode: &crate::airsonic::PodcastEpisode,
+    parent_title: &str,
+) -> Option<CatalogItem> {
+    Some(CatalogItem {
+        id: normalized_identity(
+            ContentKind::Episode,
+            &episode.title,
+            "",
+            parent_title,
+            None,
+        ),
+        kind: ContentKind::Episode,
+        title: episode.title.clone(),
+        creator: String::new(),
+        parent_title: parent_title.to_string(),
+        duration_ms: None,
+        artwork_ref: (!episode.artwork_ref.is_empty()).then(|| episode.artwork_ref.clone()),
+        starred: false,
+        cached: false,
+        variants: vec![catalog_variant(
+            source_id,
+            &episode.id,
+            ContentKind::Episode,
+        )?],
+    })
+}
+
+fn song_catalog_item(source_id: &str, song: &crate::airsonic::Song) -> Option<CatalogItem> {
+    Some(CatalogItem {
+        id: normalized_identity(
+            ContentKind::Music,
+            &song.title,
+            &song.artist,
+            &song.album,
+            (song.duration > 0).then(|| u64::from(song.duration) * 1_000),
+        ),
+        kind: ContentKind::Music,
+        title: song.title.clone(),
+        creator: song.artist.clone(),
+        parent_title: song.album.clone(),
+        duration_ms: (song.duration > 0).then(|| u64::from(song.duration) * 1_000),
+        artwork_ref: (!song.cover_art.is_empty()).then(|| song.cover_art.clone()),
+        starred: false,
+        cached: false,
+        variants: vec![catalog_variant(source_id, &song.id, ContentKind::Music)?],
+    })
+}
+
+fn bookmark_content_kind(kind: &str) -> Option<ContentKind> {
+    match kind {
+        "music" | "song" | "track" => Some(ContentKind::Music),
+        "episode" | "podcast" => Some(ContentKind::Episode),
+        "chapter" => Some(ContentKind::Chapter),
+        "audiobook" | "book" => Some(ContentKind::Audiobook),
+        _ => None,
+    }
+}
+
+fn bookmark_item(source_id: &str, bookmark: &crate::airsonic::Bookmark) -> Option<BookmarkItem> {
+    let kind = bookmark_content_kind(&bookmark.kind)?;
+    Some(BookmarkItem {
+        content: ContentRef::new(source_id, &bookmark.id, kind)?,
+        title: bookmark.title.clone(),
+        creator: bookmark.creator.clone(),
+        parent_title: bookmark.parent_title.clone(),
+        position_ms: bookmark.position_ms,
+        duration_ms: bookmark.duration_ms,
+        artwork_ref: bookmark.artwork_ref.clone(),
+    })
+}
+
+fn decode_catalog_rows<T: serde::de::DeserializeOwned>(result: &Value, key: &str) -> Vec<T> {
+    result
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| serde_json::from_value(row.clone()).ok())
+                .take(MAX_CATALOG_ITEMS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn merge_catalog_items(slot: &mut Vec<CatalogItem>, incoming: Vec<CatalogItem>) {
+    let existing = std::mem::take(slot);
+    *slot = dedup_catalog(existing.into_iter().chain(incoming))
+        .into_iter()
+        .take(MAX_CATALOG_ITEMS)
+        .collect();
+}
+
+fn merge_bookmarks(slot: &mut Vec<BookmarkItem>, incoming: Vec<BookmarkItem>) {
+    let mut merged = std::mem::take(slot);
+    for bookmark in incoming {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.content == bookmark.content)
+        {
+            *existing = bookmark;
+        } else {
+            merged.push(bookmark);
+        }
+    }
+    merged.truncate(MAX_BOOKMARKS);
+    *slot = merged;
+}
+
+/// Replace a provider cover-art token with the daemon-local cache path after a
+/// successful `get-cover-art` browse request. The provider token remains the
+/// request key until this point; the retained path is what lets an embedded
+/// surface render without credentials or a second network authority.
+fn retain_cover_art_path(file: &mut CatalogStoreFile, cover_id: &str, path: &str) {
+    if !path.starts_with('/')
+        || path.len() > MAX_PLAYLIST_FIELD_BYTES
+        || path.chars().any(char::is_control)
+    {
+        return;
+    }
+    let update = |items: &mut [CatalogItem]| {
+        for item in items {
+            if item.artwork_ref.as_deref() == Some(cover_id) {
+                item.artwork_ref = Some(path.to_owned());
+            }
+        }
+    };
+    for items in [
+        &mut file.albums,
+        &mut file.artists,
+        &mut file.podcasts,
+        &mut file.radio,
+        &mut file.episodes,
+        &mut file.songs,
+        &mut file.starred,
+        &mut file.recent,
+        &mut file.frequent,
+    ] {
+        update(items);
+    }
+    for page in file.pages.values_mut() {
+        update(&mut page.items);
+    }
+    if let Some(search) = &mut file.search {
+        for items in search.groups.values_mut() {
+            update(items);
+        }
+    }
+}
+
+fn record_catalog_response(dir: &Path, client: &Client, verb: &str, body: &str, reply: &str) {
+    let Ok(envelope) = serde_json::from_str::<Value>(reply) else {
+        record_catalog_failure(dir, client);
+        return;
+    };
+    if envelope.get("ok") != Some(&Value::Bool(true)) {
+        let authentication_required = envelope
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64)
+            .is_some_and(|code| matches!(code, 40 | 41));
+        record_catalog_failure_with_auth(dir, client, Some(authentication_required));
+        return;
+    }
+    let Some(result) = envelope.get("result") else {
+        return;
+    };
+    let source_id = catalog_source_id(client);
+    let mut file = match load_catalog(dir) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, "music catalog store refused before update");
+            return;
+        }
+    };
+    let Some(source) = catalog_source(&mut file, client) else {
+        tracing::warn!(source_id = %source_id, "music catalog source bound reached");
+        return;
+    };
+    source.source_id = source_id.clone();
+    source.api_profile = format!("subsonic/{}", client.api_version());
+    source.reachable = true;
+    source.authentication_required = false;
+    source.features.insert(verb.to_string());
+    set_catalog_variants_reachable(&mut file, &source_id, true);
+    if matches!(verb, "albums-by-artist" | "get-artist") {
+        // A detail response must be visible to the artist detail route even
+        // when the last library page did not contain that artist's albums.
+        // The bounded aggregate cache remains the detail fallback; the next
+        // explicit library browse restores the paged list projection.
+        file.pages.remove("albums");
+    }
+
+    match verb {
+        "list-albums"
+        | "albums-by-genre"
+        | "albums-by-artist"
+        | "get-artist"
+        | "get-album" => {
+            let starred = false;
+            merge_catalog_items(
+                &mut file.albums,
+                decode_catalog_rows::<crate::airsonic::Album>(result, "albums")
+                    .iter()
+                    .filter_map(|album| album_catalog_item(&source_id, album, starred))
+                    .collect(),
+            );
+            if let Some(album) = result.get("album").and_then(|value| {
+                serde_json::from_value::<crate::airsonic::Album>(value.clone()).ok()
+            }) {
+                merge_catalog_items(
+                    &mut file.albums,
+                    album_catalog_item(&source_id, &album, false)
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            merge_catalog_items(
+                &mut file.songs,
+                decode_catalog_rows::<crate::airsonic::Song>(result, "songs")
+                    .iter()
+                    .filter_map(|song| song_catalog_item(&source_id, song))
+                    .collect(),
+            );
+        }
+        "list-starred" => {
+            let items: Vec<CatalogItem> =
+                decode_catalog_rows::<crate::airsonic::Album>(result, "albums")
+                    .iter()
+                    .filter_map(|album| album_catalog_item(&source_id, album, true))
+                    .collect();
+            merge_catalog_items(&mut file.starred, items.clone());
+            merge_catalog_items(&mut file.albums, items);
+        }
+        "list-recents" => merge_catalog_items(
+            &mut file.recent,
+            decode_catalog_rows::<crate::airsonic::Album>(result, "albums")
+                .iter()
+                .filter_map(|album| album_catalog_item(&source_id, album, false))
+                .collect(),
+        ),
+        "list-frequent" => merge_catalog_items(
+            &mut file.frequent,
+            decode_catalog_rows::<crate::airsonic::Album>(result, "albums")
+                .iter()
+                .filter_map(|album| album_catalog_item(&source_id, album, false))
+                .collect(),
+        ),
+        "list-bookmarks" => merge_bookmarks(
+            &mut file.bookmarks,
+            decode_catalog_rows::<crate::airsonic::Bookmark>(result, "bookmarks")
+                .iter()
+                .filter_map(|bookmark| bookmark_item(&source_id, bookmark))
+                .collect(),
+        ),
+        "list-artists" => merge_catalog_items(
+            &mut file.artists,
+            decode_catalog_rows::<crate::airsonic::Artist>(result, "artists")
+                .iter()
+                .filter_map(|artist| artist_catalog_item(&source_id, artist))
+                .collect(),
+        ),
+        "list-podcasts" => merge_catalog_items(
+            &mut file.podcasts,
+            decode_catalog_rows::<crate::airsonic::PodcastChannel>(result, "podcasts")
+                .iter()
+                .filter_map(|channel| podcast_catalog_item(&source_id, channel))
+                .collect(),
+        ),
+        "list-radio" => merge_catalog_items(
+            &mut file.radio,
+            decode_catalog_rows::<crate::airsonic::RadioStation>(result, "radio")
+                .iter()
+                .filter_map(|station| radio_catalog_item(&source_id, station))
+                .collect(),
+        ),
+        "podcast-episodes" => merge_catalog_items(
+            &mut file.episodes,
+            {
+                let channel_id = serde_json::from_str::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                let parent_title = file
+                    .podcasts
+                    .iter()
+                    .find(|podcast| {
+                        podcast.variants.iter().any(|variant| {
+                            variant.content.source_id == source_id
+                                && variant.content.remote_id == channel_id
+                        })
+                    })
+                    .map(|podcast| podcast.title.as_str())
+                    .unwrap_or_default();
+                decode_catalog_rows::<crate::airsonic::PodcastEpisode>(result, "episodes")
+                    .iter()
+                    .filter_map(|episode| {
+                        podcast_episode_catalog_item(&source_id, episode, parent_title)
+                    })
+                    .collect()
+            },
+        ),
+        "get-song" => {
+            if let Some(song) = result.get("song").and_then(|value| {
+                serde_json::from_value::<crate::airsonic::Song>(value.clone()).ok()
+            }) {
+                merge_catalog_items(
+                    &mut file.songs,
+                    song_catalog_item(&source_id, &song).into_iter().collect(),
+                );
+            }
+        }
+        "search" => {
+            let mut groups = std::collections::BTreeMap::new();
+            let albums = decode_catalog_rows::<crate::airsonic::Album>(result, "albums")
+                .iter()
+                .filter_map(|album| album_catalog_item(&source_id, album, false))
+                .collect::<Vec<_>>();
+            let artists = decode_catalog_rows::<crate::airsonic::Artist>(result, "artists")
+                .iter()
+                .filter_map(|artist| artist_catalog_item(&source_id, artist))
+                .collect::<Vec<_>>();
+            let songs = decode_catalog_rows::<crate::airsonic::Song>(result, "songs")
+                .iter()
+                .filter_map(|song| song_catalog_item(&source_id, song))
+                .collect::<Vec<_>>();
+            if !artists.is_empty() {
+                groups.insert(ContentKind::Artist, artists.clone());
+                merge_catalog_items(&mut file.artists, artists);
+            }
+            if !albums.is_empty() {
+                groups.insert(ContentKind::Album, albums.clone());
+                merge_catalog_items(&mut file.albums, albums);
+            }
+            if !songs.is_empty() {
+                groups.insert(ContentKind::Music, songs.clone());
+                merge_catalog_items(&mut file.songs, songs);
+            }
+            let query = search_query_from(body);
+            let generation = file
+                .search
+                .as_ref()
+                .map_or(1, |page| page.generation.saturating_add(1));
+            let mut page = SearchPage {
+                generation,
+                query,
+                groups,
+                has_more: false,
+            };
+            if let Some(previous) = file.search.take() {
+                if previous.query == page.query {
+                    for (kind, items) in previous.groups {
+                        let slot = page.groups.entry(kind).or_default();
+                        merge_catalog_items(slot, items);
+                    }
+                }
+            }
+            file.search = Some(page);
+        }
+        "get-cover-art" => {
+            let cover_id = song_id_from(body).unwrap_or_default();
+            if let Some(path) = result.get("path").and_then(Value::as_str) {
+                retain_cover_art_path(&mut file, &cover_id, path);
+            }
+        }
+        _ => {}
+    }
+    record_browse_page(&mut file, &source_id, verb, body, result);
+    if let Err(error) = persist_catalog(dir, &file) {
+        tracing::warn!(%error, "music catalog store update failed");
+    }
+}
+
+fn record_catalog_failure(dir: &Path, client: &Client) {
+    record_catalog_failure_with_auth(dir, client, None);
+}
+
+fn record_catalog_failure_with_auth(
+    dir: &Path,
+    client: &Client,
+    authentication_required: Option<bool>,
+) {
+    let source_id = catalog_source_id(client);
+    let mut file = match load_catalog(dir) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(%error, "music catalog store refused before failure update");
+            return;
+        }
+    };
+    if let Some(source) = catalog_source(&mut file, client) {
+        source.source_id = source_id.clone();
+        source.api_profile = format!("subsonic/{}", client.api_version());
+        source.reachable = false;
+        if let Some(authentication_required) = authentication_required {
+            source.authentication_required = authentication_required;
+        }
+        set_catalog_variants_reachable(&mut file, &source_id, false);
+        if let Err(error) = persist_catalog(dir, &file) {
+            tracing::warn!(%error, "music catalog source failure update failed");
+        }
+    }
+}
+
+fn download_identity(request: &MusicActionRequestV1) -> Result<&ContentRef, &'static str> {
+    let content = request.content.as_ref().ok_or("missing_content")?;
+    if !matches!(
+        content.kind,
+        ContentKind::Music | ContentKind::Episode | ContentKind::Chapter | ContentKind::Audiobook
+    ) {
+        return Err("unsupported_source");
+    }
+    Ok(content)
+}
+
+/// Resolve a managed download against the same retained source admission used
+/// by typed playback/progress. A configured provider is not enough: a
+/// non-legacy identity must still be present in the daemon catalog and match
+/// the selected provider's stable source id.
+fn admitted_download_client<'a>(
+    request: &MusicActionRequestV1,
+    clients: &'a [&Client],
+    data_dir: &Path,
+) -> Result<&'a Client, &'static str> {
+    let content = download_identity(request)?;
+    if content.source_id == "legacy" {
+        return clients.first().copied().ok_or("source_unavailable");
+    }
+    let catalog = load_catalog(data_dir).unwrap_or_default();
+    if !catalog_contains_variant(&catalog, content) {
+        return Err("unsupported_source");
+    }
+    clients
+        .iter()
+        .copied()
+        .find(|candidate| catalog_source_id(candidate) == content.source_id)
+        .ok_or("source_unavailable")
+}
+
+fn replace_download_record(
+    records: &mut Vec<DownloadRecord>,
+    content: &ContentRef,
+    state: &str,
+    bytes: u64,
+    total_bytes: Option<u64>,
+    error_code: Option<&str>,
+) {
+    let pinned = records
+        .iter()
+        .find(|record| record.content == *content)
+        .is_some_and(|record| record.pinned);
+    records.retain(|record| record.content != *content);
+    records.push(DownloadRecord {
+        content: content.clone(),
+        state: state.to_string(),
+        bytes,
+        total_bytes,
+        pinned,
+        error_code: error_code.map(str::to_string),
+    });
+}
+
+fn cache_cap_bytes() -> u64 {
+    std::env::var("MDE_MUSIC_CACHE_CAP_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(crate::cache::DEFAULT_CAP_BYTES)
+}
+
+fn reconcile_evicted_downloads(records: &mut Vec<DownloadRecord>, evicted: &[String]) {
+    for record in records.iter_mut().filter(|record| {
+        record.state == "ready" && evicted.iter().any(|id| id == &record.content.remote_id)
+    }) {
+        record.state = "failed".to_string();
+        record.bytes = 0;
+        record.total_bytes = None;
+        record.pinned = false;
+        record.error_code = Some("cache_evicted".to_string());
+    }
+}
+
+fn download_to_cache(
+    request: &MusicActionRequestV1,
+    client: &Client,
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    cache_dir: &Path,
+) -> Result<(), &'static str> {
+    let content = download_identity(request)?;
+    let mut records = load_downloads(data_dir).map_err(|_| "download_store_unavailable")?;
+    // Publish an observable in-flight state before contacting the provider;
+    // a restart or workspace snapshot must not make a slow download look idle.
+    replace_download_record(&mut records, content, "downloading", 0, None, None);
+    persist_downloads(data_dir, &records).map_err(|_| "download_store_unavailable")?;
+
+    const PROGRESS_INTERVAL_BYTES: u64 = 256 * 1024;
+    let mut last_progress = 0_u64;
+    let bytes = match rt.block_on(client.get_stream_bytes_with_progress(
+        &content.remote_id,
+        |received, total| {
+            // Persist progress at a bounded cadence so a large response does
+            // not turn every transport chunk into a journal/fsync storm. The
+            // final chunk is always recorded before the ready transition.
+            let final_chunk = total.is_some_and(|size| received >= size);
+            if !final_chunk && received.saturating_sub(last_progress) < PROGRESS_INTERVAL_BYTES {
+                return;
+            }
+            last_progress = received;
+            replace_download_record(&mut records, content, "downloading", received, total, None);
+            if let Err(error) = persist_downloads(data_dir, &records) {
+                tracing::debug!(%error, received, "music download progress persistence deferred");
+            }
+        },
+    )) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            replace_download_record(
+                &mut records,
+                content,
+                "failed",
+                0,
+                None,
+                Some("download_failed"),
+            );
+            let _ = persist_downloads(data_dir, &records);
+            return Err("download_failed");
+        }
+    };
+    if bytes.is_empty() {
+        replace_download_record(
+            &mut records,
+            content,
+            "failed",
+            0,
+            Some(0),
+            Some("download_empty"),
+        );
+        let _ = persist_downloads(data_dir, &records);
+        return Err("download_empty");
+    }
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if crate::cache::write_cached_track(
+        cache_dir,
+        &content.remote_id,
+        "audio",
+        &bytes,
+        crate::cache::now_ms(),
+        records
+            .iter()
+            .find(|record| record.content == *content)
+            .is_some_and(|record| record.pinned),
+    )
+    .is_err()
+    {
+        replace_download_record(
+            &mut records,
+            content,
+            "failed",
+            0,
+            Some(size),
+            Some("download_persist_failed"),
+        );
+        let _ = persist_downloads(data_dir, &records);
+        return Err("download_persist_failed");
+    }
+    let evicted = crate::cache::run_gc(cache_dir, cache_cap_bytes())
+        .map_err(|_| "download_cache_gc_failed")?;
+    replace_download_record(&mut records, content, "ready", size, Some(size), None);
+    reconcile_evicted_downloads(&mut records, &evicted);
+    if evicted.iter().any(|id| id == &content.remote_id) {
+        replace_download_record(
+            &mut records,
+            content,
+            "failed",
+            0,
+            None,
+            Some("cache_evicted"),
+        );
+        return persist_downloads(data_dir, &records).map_err(|_| "download_store_unavailable");
+    }
+    persist_downloads(data_dir, &records).map_err(|_| "download_store_unavailable")
+}
+
+fn cancel_download(request: &MusicActionRequestV1, data_dir: &Path) -> Result<(), &'static str> {
+    let content = download_identity(request)?;
+    let mut records = load_downloads(data_dir).map_err(|_| "download_store_unavailable")?;
+    let Some(record) = records.iter_mut().find(|record| record.content == *content) else {
+        return Err("download_not_found");
+    };
+    record.state = "cancelled".to_string();
+    record.error_code = None;
+    persist_downloads(data_dir, &records).map_err(|_| "download_store_unavailable")
+}
+
+fn remove_download(
+    request: &MusicActionRequestV1,
+    data_dir: &Path,
+    cache_dir: &Path,
+) -> Result<(), &'static str> {
+    let content = download_identity(request)?;
+    let mut records = load_downloads(data_dir).map_err(|_| "download_store_unavailable")?;
+    let before = records.len();
+    records.retain(|record| record.content != *content);
+    if before == records.len() {
+        return Err("download_not_found");
+    }
+    crate::cache::remove_cached_track(cache_dir, &content.remote_id)
+        .map_err(|_| "download_remove_failed")?;
+    persist_downloads(data_dir, &records).map_err(|_| "download_store_unavailable")
+}
+
+fn set_download_pinned(
+    request: &MusicActionRequestV1,
+    data_dir: &Path,
+    cache_dir: &Path,
+    pinned: bool,
+) -> Result<(), &'static str> {
+    let content = download_identity(request)?;
+    let mut records = load_downloads(data_dir).map_err(|_| "download_store_unavailable")?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.content == *content)
+        .ok_or("download_not_found")?;
+    record.pinned = pinned;
+
+    let mut index = crate::cache::read_index(cache_dir);
+    if index.entries.contains_key(&content.remote_id) {
+        index.set_starred(&content.remote_id, pinned);
+        crate::cache::write_index(cache_dir, &index).map_err(|_| "download_pin_persist_failed")?;
+    }
+    persist_downloads(data_dir, &records).map_err(|_| "download_store_unavailable")
+}
+
+fn typed_result(
+    request_id: &str,
+    accepted: bool,
+    revision: u64,
+    error_code: Option<&str>,
+) -> MusicActionResultV1 {
+    MusicActionResultV1 {
+        schema_version: MUSIC_CONTRACT_VERSION,
+        request_id: request_id.to_string(),
+        accepted,
+        revision,
+        error_code: error_code.map(str::to_string),
+    }
+}
 
 /// The queue-control verbs served on `action/music/<verb>` (synchronous
 /// — they only touch the local queue file).
@@ -504,7 +1962,7 @@ pub const ACTION_VERBS: [&str; 10] = [
 
 /// The library-browse verbs served on `action/music/<verb>`
 /// (asynchronous — each proxies an Airsonic REST call).
-pub const BROWSE_VERBS: [&str; 23] = [
+pub const BROWSE_VERBS: [&str; 25] = [
     "list-albums",
     "list-artists",
     "search",
@@ -512,11 +1970,13 @@ pub const BROWSE_VERBS: [&str; 23] = [
     "list-genres",
     "albums-by-genre",
     "albums-by-artist",
+    "get-artist",
     "get-song",
     "get-cover-art",
     "list-podcasts",
     "list-radio",
     "podcast-episodes",
+    "list-bookmarks",
     "list-recents",
     "list-playlists",
     "get-playlist",
@@ -556,6 +2016,216 @@ pub const PEER_VERBS: [&str; 2] = ["peer-states", "take-over"];
 /// Authoritative-state write cadence while playing (AIR-8's 5 s heartbeat,
 /// so a stale owner frees the mesh after `STATE_STALE_MS`).
 pub const STATE_WRITE_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum host-derived phase for the first active-playback heartbeat.  The
+/// heartbeat remains five seconds apart after that first write, but seats that
+/// start playback together do not all hit the Bus and state file at once.
+pub const MAX_STATE_WRITE_PHASE: Duration = Duration::from_secs(2);
+
+/// Resolve one queued provider id through the retained source variants. A
+/// source-aware catalog identity is preferred using the same cache/reachability
+/// ordering as playback; legacy queues remain visible when the catalog has not
+/// projected a matching row yet.
+fn workspace_content_ref(catalog: &CatalogStoreFile, remote_id: &str) -> ContentRef {
+    let fallback = || {
+        ContentRef::new("legacy", remote_id, ContentKind::Music)
+            .expect("queue ids are validated before entering the workspace projection")
+    };
+    let Some(item) = catalog
+        .songs
+        .iter()
+        .chain(catalog.episodes.iter())
+        .chain(catalog.radio.iter())
+        .find(|item| {
+            matches!(
+                item.kind,
+                ContentKind::Music
+                    | ContentKind::Episode
+                    | ContentKind::Chapter
+                    | ContentKind::Audiobook
+                    | ContentKind::Radio
+            ) && item
+                .variants
+                .iter()
+                .any(|variant| variant.content.remote_id == remote_id)
+        })
+    else {
+        if let Some(bookmark) = catalog
+            .bookmarks
+            .iter()
+            .find(|bookmark| bookmark.content.remote_id == remote_id)
+        {
+            return bookmark.content.clone();
+        }
+        return fallback();
+    };
+    ordered_variants(&item.variants)
+        .into_iter()
+        .next()
+        .or_else(|| item.variants.first())
+        .map_or_else(fallback, |variant| variant.content.clone())
+}
+
+/// Build the complete typed workspace snapshot consumed by a surface. No
+/// playable cached entry is discarded during migration; queues without a
+/// matching retained catalog row keep their explicit `legacy` identity.
+#[must_use]
+pub fn workspace_snapshot(
+    queue: &Queue,
+    engine: Option<&Engine>,
+    revision: u64,
+) -> MusicWorkspaceSnapshotV1 {
+    workspace_snapshot_from_dirs(
+        queue,
+        engine,
+        revision,
+        &state::data_dir(),
+        &state::coordination_dir(),
+    )
+}
+
+#[cfg(test)]
+fn workspace_snapshot_from_dir(
+    queue: &Queue,
+    engine: Option<&Engine>,
+    revision: u64,
+    data_dir: &Path,
+) -> MusicWorkspaceSnapshotV1 {
+    workspace_snapshot_from_dirs(queue, engine, revision, data_dir, data_dir)
+}
+
+fn workspace_snapshot_from_dirs(
+    queue: &Queue,
+    engine: Option<&Engine>,
+    revision: u64,
+    data_dir: &Path,
+    coordination_dir: &Path,
+) -> MusicWorkspaceSnapshotV1 {
+    let queue_revision = queue::revision(queue);
+    let catalog = load_catalog(data_dir).unwrap_or_default();
+    let current = queue
+        .current()
+        .map(|remote_id| workspace_content_ref(&catalog, remote_id));
+    let current_position = engine.map_or(0, |value| value.position_ms());
+    let playing = engine.is_some_and(|value| value.is_playing());
+    let (shuffle, repeat) = crate::mpris::workspace_playback_policy(data_dir);
+    let duration_ms = None;
+    let queue_entries = queue
+        .songs
+        .iter()
+        .enumerate()
+        .map(|(index, remote_id)| QueueEntry {
+            id: format!("legacy-{index}"),
+            content: workspace_content_ref(&catalog, remote_id),
+            title: remote_id.clone(),
+        })
+        .collect();
+    let shelves = build_shelves(&catalog.albums, &catalog.starred, &catalog.recent);
+    let mut collections = Vec::new();
+    for (key, title, kind, items) in [
+        ("albums", "Albums", ContentKind::Album, &catalog.albums),
+        ("artists", "Artists", ContentKind::Artist, &catalog.artists),
+        (
+            "podcasts",
+            "Podcasts",
+            ContentKind::Podcast,
+            &catalog.podcasts,
+        ),
+        ("radio", "Radio", ContentKind::Radio, &catalog.radio),
+        (
+            "episodes",
+            "Episodes",
+            ContentKind::Episode,
+            &catalog.episodes,
+        ),
+        ("songs", "Songs", ContentKind::Music, &catalog.songs),
+    ] {
+        let page = catalog.pages.get(key);
+        let projected_items = page.map_or(items.as_slice(), |page| page.items.as_slice());
+        if !projected_items.is_empty() || page.is_some() {
+            collections.push(LibraryCollection {
+                key: key.to_string(),
+                title: title.to_string(),
+                kind,
+                items: projected_items.to_vec(),
+                mutable: false,
+                offset: page.map_or(0, |page| page.offset),
+                page_size: page.map_or(0, |page| page.size),
+                has_more: page.is_some_and(|page| page.has_more),
+            });
+        }
+    }
+    let any_source_reachable = catalog.sources.iter().any(|source| source.reachable);
+    let sources = catalog.sources;
+    MusicWorkspaceSnapshotV1 {
+        schema_version: MUSIC_CONTRACT_VERSION,
+        revision,
+        shelves,
+        bookmarks: catalog.bookmarks,
+        collections,
+        search: catalog.search,
+        playback: PlaybackSnapshot {
+            current,
+            playing,
+            position_ms: current_position,
+            duration_ms,
+            volume_milli: engine.map_or(1000, |value| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let volume = (value.volume().clamp(0.0, 1.0) * 1000.0) as u16;
+                volume
+            }),
+            shuffle,
+            repeat: repeat.to_string(),
+            queue_revision,
+            seekable: engine.is_some_and(|value| value.is_seekable()),
+        },
+        queue: queue_entries,
+        downloads: load_downloads(&state::data_dir()).unwrap_or_default(),
+        storage: MusicStorageSnapshot {
+            used_bytes: crate::cache::read_index(&crate::cache::cache_dir()).total_bytes(),
+            cap_bytes: cache_cap_bytes(),
+        },
+        targets: playback_targets(engine.is_some(), coordination_dir),
+        sources,
+        any_source_reachable,
+    }
+}
+
+/// Publish one complete workspace snapshot over the retained state lane.
+pub fn publish_workspace_snapshot(
+    persist: &Persist,
+    queue_path: &Path,
+    engine: Option<&Engine>,
+    revision: u64,
+) {
+    let snapshot = workspace_snapshot_from_dirs(
+        &queue::read_from(queue_path),
+        engine,
+        revision,
+        &state::data_dir(),
+        &state::coordination_dir(),
+    );
+    if snapshot.validate().is_ok() {
+        if let Ok(body) = serde_json::to_string(&snapshot) {
+            let _ = persist.write(WORKSPACE_STATE_TOPIC, Priority::Default, None, Some(&body));
+        }
+    }
+}
+
+/// Compare two workspace projections without treating the monotonic revision
+/// as content.  Revisions exist to order real updates; incrementing one for an
+/// unchanged idle projection only creates synchronized JSON/index writes on
+/// every seat and does not help a reader converge.
+#[must_use]
+fn workspace_snapshot_content_eq(
+    left: &MusicWorkspaceSnapshotV1,
+    right: &MusicWorkspaceSnapshotV1,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.revision = 0;
+    right.revision = 0;
+    left == right
+}
 
 /// Result of dispatching one action: the JSON reply + whether the queue
 /// changed (and so must be persisted).
@@ -596,6 +2266,26 @@ fn song_id_from(body: &str) -> Option<String> {
     }
     // Fall back to the raw body as the id (a bare, unquoted id string).
     Some(trimmed.trim_matches('"').to_string())
+}
+
+/// Extract a bounded search query from either `{"query":"..."}` or the
+/// legacy bare-string request shape.
+fn search_query_from(body: &str) -> String {
+    let query = serde_json::from_str::<Value>(body.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("query")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| song_id_from(body))
+        .unwrap_or_default();
+    query
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PLAYLIST_FIELD_BYTES)
+        .collect()
 }
 
 fn queue_reply(q: &Queue, mutated: bool) -> Dispatch {
@@ -800,6 +2490,121 @@ fn index_from(body: &str) -> Option<usize> {
         .map(|n| n as usize)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BrowsePageRequest {
+    offset: usize,
+    size: usize,
+}
+
+fn browse_page_request(body: &str) -> BrowsePageRequest {
+    let value = serde_json::from_str::<Value>(body).unwrap_or_default();
+    let offset = value
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map_or(0, |value| (value as usize).min(MAX_LIBRARY_OFFSET));
+    let size = value
+        .get("size")
+        .and_then(Value::as_u64)
+        .map_or(100, |value| {
+            (value as usize).clamp(1, MAX_LIBRARY_PAGE_SIZE)
+        });
+    BrowsePageRequest { offset, size }
+}
+
+fn page_slice<T>(items: Vec<T>, request: BrowsePageRequest) -> (Vec<T>, usize, bool) {
+    let total = items.len();
+    let start = request.offset.min(total);
+    let end = start.saturating_add(request.size).min(total);
+    let page = items.into_iter().skip(start).take(end - start).collect();
+    (page, start, end < total)
+}
+
+fn browse_collection_key(verb: &str) -> Option<&'static str> {
+    match verb {
+        "list-albums" => Some("albums"),
+        "list-artists" => Some("artists"),
+        "list-podcasts" => Some("podcasts"),
+        "list-radio" => Some("radio"),
+        _ => None,
+    }
+}
+
+fn record_browse_page(
+    file: &mut CatalogStoreFile,
+    source_id: &str,
+    verb: &str,
+    body: &str,
+    result: &Value,
+) {
+    let Some(key) = browse_collection_key(verb) else {
+        return;
+    };
+    let items = match verb {
+        "list-albums" => decode_catalog_rows::<crate::airsonic::Album>(result, "albums")
+            .iter()
+            .filter_map(|album| album_catalog_item(source_id, album, false))
+            .collect::<Vec<_>>(),
+        "list-artists" => decode_catalog_rows::<crate::airsonic::Artist>(result, "artists")
+            .iter()
+            .filter_map(|artist| artist_catalog_item(source_id, artist))
+            .collect::<Vec<_>>(),
+        "list-podcasts" => {
+            decode_catalog_rows::<crate::airsonic::PodcastChannel>(result, "podcasts")
+                .iter()
+                .filter_map(|channel| podcast_catalog_item(source_id, channel))
+                .collect::<Vec<_>>()
+        }
+        "list-radio" => decode_catalog_rows::<crate::airsonic::RadioStation>(result, "radio")
+            .iter()
+            .filter_map(|station| radio_catalog_item(source_id, station))
+            .collect::<Vec<_>>(),
+        _ => return,
+    };
+    let request = browse_page_request(body);
+    let offset = result
+        .get("offset")
+        .and_then(Value::as_u64)
+        .map_or(request.offset, |value| {
+            (value as usize).min(MAX_LIBRARY_OFFSET)
+        });
+    let size = result
+        .get("size")
+        .and_then(Value::as_u64)
+        .map_or(request.size, |value| {
+            (value as usize).clamp(1, MAX_LIBRARY_PAGE_SIZE)
+        });
+    let has_more = result
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(items.len() == size);
+    let page = CatalogPage {
+        offset,
+        size,
+        has_more,
+        items,
+    };
+    if let Some(previous) = file.pages.get_mut(key) {
+        if previous.offset == page.offset {
+            let merged = dedup_catalog(
+                previous
+                    .items
+                    .drain(..)
+                    .chain(page.items)
+                    .collect::<Vec<_>>(),
+            );
+            previous.items = merged.into_iter().take(MAX_COLLECTION_ITEMS).collect();
+            previous.size = previous
+                .size
+                .max(page.size)
+                .max(previous.items.len())
+                .min(MAX_LIBRARY_PAGE_SIZE);
+            previous.has_more |= page.has_more;
+            return;
+        }
+    }
+    file.pages.insert(key.to_string(), page);
+}
+
 /// Reply JSON for a library-browse verb. Proxies the Airsonic REST call
 /// via the shared [`Client`]; missing creds / server errors become an
 /// `{ok:false,error}` reply rather than a panic. I/O, so not pure — the
@@ -812,18 +2617,44 @@ fn dispatch_browse(
 ) -> String {
     let result: Result<serde_json::Value, String> = rt.block_on(async {
         match verb {
-            "list-albums" => client
-                .get_album_list2("newest", 100)
-                .await
-                .map(|a| json!({ "albums": a }))
-                .map_err(|e| e.to_string()),
-            "list-artists" => client
-                .get_artists()
-                .await
-                .map(|a| json!({ "artists": a }))
-                .map_err(|e| e.to_string()),
+            "list-albums" => {
+                let request = browse_page_request(body);
+                client
+                    .get_album_list2_page(
+                        "newest",
+                        request.size as u32,
+                        request.offset as u32,
+                    )
+                    .await
+                    .map(|page| {
+                        let has_more = page.albums.len() == page.page_size as usize;
+                        json!({
+                            "albums": page.albums,
+                            "offset": page.offset,
+                            "size": page.page_size,
+                            "has_more": has_more,
+                        })
+                    })
+                    .map_err(|e| e.to_string())
+            }
+            "list-artists" => {
+                let request = browse_page_request(body);
+                client
+                    .get_artists()
+                    .await
+                    .map(|artists| {
+                        let (artists, offset, has_more) = page_slice(artists, request);
+                        json!({
+                            "artists": artists,
+                            "offset": offset,
+                            "size": request.size,
+                            "has_more": has_more,
+                        })
+                    })
+                    .map_err(|e| e.to_string())
+            }
             "search" => {
-                let query = song_id_from(body).unwrap_or_default();
+                let query = search_query_from(body);
                 client
                     .search3(&query)
                     .await
@@ -865,7 +2696,7 @@ fn dispatch_browse(
             }
             // Artist browse — one artist's albums (the dead "click an artist"
             // path now loads its next layer).
-            "albums-by-artist" => {
+            "albums-by-artist" | "get-artist" => {
                 let id = song_id_from(body).unwrap_or_default();
                 client
                     .get_artist(&id)
@@ -905,11 +2736,22 @@ fn dispatch_browse(
                         .map_err(|e| e.to_string())
                 }
             }
-            "list-podcasts" => client
-                .get_podcast_channels()
-                .await
-                .map(|c| json!({ "podcasts": c }))
-                .map_err(|e| e.to_string()),
+            "list-podcasts" => {
+                let request = browse_page_request(body);
+                client
+                    .get_podcast_channels()
+                    .await
+                    .map(|podcasts| {
+                        let (podcasts, offset, has_more) = page_slice(podcasts, request);
+                        json!({
+                            "podcasts": podcasts,
+                            "offset": offset,
+                            "size": request.size,
+                            "has_more": has_more,
+                        })
+                    })
+                    .map_err(|e| e.to_string())
+            }
             // SVC-3 — the Radio hub card: the server's saved stations.
             // MUSIC-RESPONSIVE-7 — serve a fresh cached list (no upstream call);
             // only the first open (or a stale cache) hits the server.
@@ -919,8 +2761,20 @@ fn dispatch_browse(
                         .filter(|(at, _)| at.elapsed() < RADIO_CACHE_TTL)
                         .map(|(_, v)| v.clone())
                 });
+                let request = browse_page_request(body);
                 if let Some(v) = cached {
-                    Ok(v)
+                    let stations = v
+                        .get("radio")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let (stations, offset, has_more) = page_slice(stations, request);
+                    Ok(json!({
+                        "radio": stations,
+                        "offset": offset,
+                        "size": request.size,
+                        "has_more": has_more,
+                    }))
                 } else {
                     match client.get_internet_radio_stations().await {
                         Ok(r) => {
@@ -928,7 +2782,18 @@ fn dispatch_browse(
                             if let Ok(mut g) = RADIO_CACHE.lock() {
                                 *g = Some((Instant::now(), v.clone()));
                             }
-                            Ok(v)
+                            let stations = v
+                                .get("radio")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            let (stations, offset, has_more) = page_slice(stations, request);
+                            Ok(json!({
+                                "radio": stations,
+                                "offset": offset,
+                                "size": request.size,
+                                "has_more": has_more,
+                            }))
                         }
                         Err(e) => Err(e.to_string()),
                     }
@@ -942,6 +2807,11 @@ fn dispatch_browse(
                     .map(|e| json!({ "episodes": e }))
                     .map_err(|e| e.to_string())
             }
+            "list-bookmarks" => client
+                .get_bookmarks()
+                .await
+                .map(|bookmarks| json!({ "bookmarks": bookmarks }))
+                .map_err(|e| e.to_string()),
             // AIR-4.b — Recents hub card: recently-added albums (reuses
             // getAlbumList2 with type=recent).
             "list-recents" => client
@@ -1074,6 +2944,7 @@ fn music_mutation_scope(verb: &str) -> Option<&'static str> {
         "playlist-create" | "playlist-update" | "playlist-delete" | "playlist-reorder" => {
             Some("playlists")
         }
+        WORKSPACE_ACTION_VERB => Some("workspace"),
         "play" | "pause" | "resume" | "stop" | "set-volume" | "seek" => Some("transport"),
         "take-over" => Some("peer-takeover"),
         // `get-queue`, browse, `get-state`, and `peer-states` are reads.
@@ -1081,12 +2952,23 @@ fn music_mutation_scope(verb: &str) -> Option<&'static str> {
     }
 }
 
+fn music_action_scope(verb: &str, body: &str) -> Option<&'static str> {
+    if verb == WORKSPACE_ACTION_VERB
+        && serde_json::from_str::<Value>(body)
+            .ok()
+            .is_some_and(|value| value.get("action").and_then(Value::as_str) == Some("transfer"))
+    {
+        return Some("peer-takeover");
+    }
+    music_mutation_scope(verb)
+}
+
 fn authorize_music_mutation(
     authorizer: &music_action_auth::Authorizer,
     verb: &str,
     body: &str,
 ) -> Result<(), String> {
-    let Some(target) = music_mutation_scope(verb) else {
+    let Some(target) = music_action_scope(verb, body) else {
         return Ok(());
     };
     let auth_verb = format!("music-{verb}");
@@ -1100,6 +2982,689 @@ fn unauthorized_reply(verb: &str, error: &str) -> String {
         "error": format!("{verb}: authorization refused: {error}")
     })
     .to_string()
+}
+
+fn request_id_from_body(body: &str) -> String {
+    let Some(request_id) = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }) else {
+        return "invalid-request".to_string();
+    };
+    if request_id.is_empty()
+        || request_id.len() > crate::domain::MAX_REQUEST_ID_BYTES
+        || request_id.chars().any(char::is_control)
+    {
+        "invalid-request".to_string()
+    } else {
+        request_id
+    }
+}
+
+fn typed_reply(result: &MusicActionResultV1) -> String {
+    // All fields are bounded scalar values, so serialization cannot fail in
+    // practice. Keep the fallback typed and redacted if that ever changes.
+    serde_json::to_string(result).unwrap_or_else(|_| {
+        r#"{"schema_version":1,"request_id":"invalid-request","accepted":false,"revision":0,"error_code":"reply_failed"}"#
+            .to_string()
+    })
+}
+
+fn typed_transport_error(reply: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<Value>(reply) else {
+        return "transport_rejected";
+    };
+    let Some(error) = value.get("error").and_then(Value::as_str) else {
+        return "transport_rejected";
+    };
+    if error.contains("no audio output") {
+        "audio_unavailable"
+    } else if error.contains("Airsonic") {
+        "source_unavailable"
+    } else if error.contains("queue is empty") {
+        "queue_empty"
+    } else if error == "not_seekable" {
+        "not_seekable"
+    } else if error == "nothing_to_resume" {
+        "nothing_to_resume"
+    } else {
+        "transport_rejected"
+    }
+}
+
+fn accepted_json(reply: &str) -> Result<bool, &'static str> {
+    let value = serde_json::from_str::<Value>(reply).map_err(|_| "transport_rejected")?;
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(true)
+    } else {
+        Err(typed_transport_error(reply))
+    }
+}
+
+#[cfg(test)]
+fn apply_workspace_action(
+    request: &MusicActionRequestV1,
+    queue: &mut Queue,
+    engine: Option<&Engine>,
+    client: Option<&Client>,
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+) -> Result<bool, &'static str> {
+    let clients = client.into_iter().collect::<Vec<_>>();
+    apply_workspace_action_with_clients(request, queue, engine, &clients, rt, data_dir)
+}
+
+/// Apply one typed workspace action against the bounded set of admitted
+/// sources.  The compatibility wrapper above keeps the focused single-client
+/// callers intact, while the production responder passes the complete source
+/// set so a selected catalog variant can be played without bypassing the
+/// daemon-owned queue and engine authorities.
+#[cfg(test)]
+fn apply_workspace_action_with_clients(
+    request: &MusicActionRequestV1,
+    queue: &mut Queue,
+    engine: Option<&Engine>,
+    clients: &[&Client],
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+) -> Result<bool, &'static str> {
+    apply_workspace_action_with_clients_and_coordination(
+        request, queue, engine, clients, rt, data_dir, data_dir,
+    )
+}
+
+fn apply_workspace_action_with_clients_and_coordination(
+    request: &MusicActionRequestV1,
+    queue: &mut Queue,
+    engine: Option<&Engine>,
+    clients: &[&Client],
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    coordination_dir: &Path,
+) -> Result<bool, &'static str> {
+    let client = clients.first().copied();
+    match request.action.as_str() {
+        "play" => {
+            if let Some(content) = request.content.as_ref() {
+                if !matches!(
+                    content.kind,
+                    ContentKind::Music
+                        | ContentKind::Episode
+                        | ContentKind::Chapter
+                        | ContentKind::Audiobook
+                        | ContentKind::Radio
+                ) {
+                    return Err("unsupported_content");
+                }
+                if content.source_id != "legacy" {
+                    let catalog = load_catalog(data_dir).unwrap_or_default();
+                    let typed_resume = matches!(
+                        content.kind,
+                        ContentKind::Episode
+                            | ContentKind::Chapter
+                            | ContentKind::Audiobook
+                            | ContentKind::Radio
+                    );
+                    let mut playback_queue = queue.clone();
+                    let queue_changed =
+                        if playback_queue.current() == Some(content.remote_id.as_str()) {
+                            false
+                        } else if typed_resume {
+                            playback_queue.select_or_enqueue(content.remote_id.clone())
+                        } else {
+                            return Err("content_not_current");
+                        };
+                    let upcoming = selected_source_upcoming_candidates(
+                        &playback_queue,
+                        content,
+                        clients,
+                        &catalog,
+                        &crate::cache::cache_dir(),
+                    )?;
+                    let engine = engine.ok_or("audio_unavailable")?;
+                    let position_ms = typed_play_start_position(content, request.position_ms)?;
+                    if !engine.play_from_candidates_at(
+                        upcoming,
+                        playback_queue.current,
+                        position_ms,
+                    ) {
+                        return Err("audio_unavailable");
+                    }
+                    *queue = playback_queue;
+                    write_playback_state(true, content.remote_id.as_str(), position_ms);
+                    return Ok(queue_changed);
+                }
+                if queue.current() != Some(content.remote_id.as_str()) {
+                    return Err("content_not_current");
+                }
+            }
+            accepted_json(&apply_transport_with_clients(
+                "play", "", engine, clients, queue,
+            ))
+        }
+        "pause" | "resume" | "stop" => {
+            if matches!(request.action.as_str(), "pause" | "stop") {
+                finalize_progress_for_transport(
+                    queue,
+                    request.content.as_ref(),
+                    engine,
+                    clients,
+                    rt,
+                    data_dir,
+                    request.action.as_str(),
+                );
+            }
+            accepted_json(&apply_transport_with_clients(
+                request.action.as_str(),
+                "",
+                engine,
+                clients,
+                queue,
+            ))
+        }
+        "seek" => {
+            let position_ms = request.position_ms.ok_or("missing_position")?;
+            let body = json!({ "position_ms": position_ms }).to_string();
+            accepted_json(&apply_transport_with_clients(
+                "seek", &body, engine, clients, queue,
+            ))
+        }
+        "set_volume" => {
+            let volume_milli = request.volume_milli.ok_or("missing_volume")?;
+            let body = json!({ "volume": f32::from(volume_milli) / 1000.0 }).to_string();
+            accepted_json(&apply_transport_with_clients(
+                "set-volume",
+                &body,
+                engine,
+                clients,
+                queue,
+            ))
+        }
+        "star" | "unstar" => {
+            let content = request.content.as_ref().ok_or("missing_content")?;
+            if !matches!(
+                content.kind,
+                ContentKind::Music | ContentKind::Album | ContentKind::Artist
+            ) {
+                return Err("unsupported_source");
+            }
+            let client = if content.source_id == "legacy" {
+                client.ok_or("source_unavailable")?
+            } else {
+                let catalog = load_catalog(data_dir).unwrap_or_default();
+                if !catalog_contains_variant(&catalog, content) {
+                    return Err("unsupported_source");
+                }
+                clients
+                    .iter()
+                    .copied()
+                    .find(|candidate| catalog_source_id(candidate) == content.source_id)
+                    .ok_or("source_unavailable")?
+            };
+            let result = if request.action == "star" {
+                rt.block_on(client.star(&content.remote_id))
+            } else {
+                rt.block_on(client.unstar(&content.remote_id))
+            };
+            result.map(|()| false).map_err(|_| "curation_failed")
+        }
+        "scrobble" => {
+            let content = request.content.as_ref().ok_or("missing_content")?;
+            let client = admitted_progress_client(content, clients, data_dir)?;
+            let position_ms = request.position_ms.ok_or("missing_position")?;
+            rt.block_on(client.scrobble(&content.remote_id, position_ms))
+                .map(|()| false)
+                .map_err(|_| "progress_write_failed")
+        }
+        "bookmark" | "bookmark_delete" => {
+            let content = request.content.as_ref().ok_or("missing_content")?;
+            if !matches!(
+                content.kind,
+                ContentKind::Episode | ContentKind::Chapter | ContentKind::Audiobook
+            ) {
+                return Err("unsupported_source");
+            }
+            let client = admitted_progress_client(content, clients, data_dir)?;
+            let result = if request.action == "bookmark" {
+                rt.block_on(client.create_bookmark(
+                    &content.remote_id,
+                    request.position_ms.ok_or("missing_position")?,
+                ))
+            } else {
+                rt.block_on(client.delete_bookmark(&content.remote_id))
+            };
+            result.map(|()| false).map_err(|_| "bookmark_write_failed")
+        }
+        "shuffle" => {
+            crate::mpris::set_workspace_shuffle(data_dir, request.shuffle.ok_or("missing_shuffle")?)
+                .map(|()| false)
+        }
+        "repeat" => crate::mpris::set_workspace_repeat(
+            data_dir,
+            request.repeat.as_deref().ok_or("missing_repeat")?,
+        )
+        .map(|()| false),
+        "next" => {
+            let dispatch = dispatch_queue_action("next", "", queue);
+            accepted_json(&dispatch.reply_json).map(|_| dispatch.mutated)
+        }
+        "previous" => {
+            let dispatch = dispatch_queue_action("prev", "", queue);
+            accepted_json(&dispatch.reply_json).map(|_| dispatch.mutated)
+        }
+        "queue_clear" => {
+            let dispatch = dispatch_queue_action("clear", "", queue);
+            accepted_json(&dispatch.reply_json).map(|_| dispatch.mutated)
+        }
+        "queue_move" => {
+            let from = request.queue_index.ok_or("missing_queue_index")?;
+            let to = request
+                .target_queue_index
+                .ok_or("missing_target_queue_index")?;
+            let body = json!({ "from": from, "to": to }).to_string();
+            let dispatch = dispatch_queue_action("queue-move", &body, queue);
+            accepted_json(&dispatch.reply_json).map(|_| dispatch.mutated)
+        }
+        "queue_remove" => {
+            let index = request.queue_index.ok_or("missing_queue_index")?;
+            let body = json!({ "index": index }).to_string();
+            let dispatch = dispatch_queue_action("queue-remove", &body, queue);
+            accepted_json(&dispatch.reply_json).map(|_| dispatch.mutated)
+        }
+        "playlist_create" => {
+            let client = client.ok_or("source_unavailable")?;
+            let name = request
+                .playlist_name
+                .as_deref()
+                .ok_or("missing_playlist_name")?;
+            rt.block_on(client.create_playlist(name, &request.playlist_song_ids))
+                .map(|()| false)
+                .map_err(|_| "playlist_mutation_failed")
+        }
+        "playlist_update" => {
+            let playlist = request.playlist.as_ref().ok_or("missing_playlist")?;
+            let client = admitted_playlist_client(request, clients, data_dir)?;
+            let remove_indices = request
+                .playlist_remove_indices
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>();
+            rt.block_on(client.update_playlist(
+                &playlist.remote_id,
+                request.playlist_name.as_deref(),
+                &request.playlist_song_ids,
+                &remove_indices,
+            ))
+            .map(|()| false)
+            .map_err(|_| "playlist_mutation_failed")
+        }
+        "playlist_delete" => {
+            let playlist = request.playlist.as_ref().ok_or("missing_playlist")?;
+            let client = admitted_playlist_client(request, clients, data_dir)?;
+            rt.block_on(client.delete_playlist(&playlist.remote_id))
+                .map(|()| false)
+                .map_err(|_| "playlist_mutation_failed")
+        }
+        "playlist_reorder" => {
+            let playlist = request.playlist.as_ref().ok_or("missing_playlist")?;
+            let client = admitted_playlist_client(request, clients, data_dir)?;
+            rt.block_on(client.reorder_playlist(&playlist.remote_id, &request.playlist_song_ids))
+                .map(|()| false)
+                .map_err(|_| "playlist_mutation_failed")
+        }
+        "download" => {
+            let client = admitted_download_client(request, clients, data_dir)?;
+            download_to_cache(request, client, rt, data_dir, &crate::cache::cache_dir())
+                .map(|()| false)
+        }
+        "cancel_download" => cancel_download(request, data_dir).map(|()| false),
+        "remove_download" => {
+            remove_download(request, data_dir, &crate::cache::cache_dir()).map(|()| false)
+        }
+        "pin_download" => {
+            set_download_pinned(request, data_dir, &crate::cache::cache_dir(), true).map(|()| false)
+        }
+        "unpin_download" => {
+            set_download_pinned(request, data_dir, &crate::cache::cache_dir(), false)
+                .map(|()| false)
+        }
+        "transfer" => {
+            let target_peer = request
+                .target_peer
+                .as_deref()
+                .ok_or("missing_target_peer")?;
+            let local_peer = state::local_host();
+            if target_peer == local_peer {
+                return Err("target_is_local_peer");
+            }
+            let target_state = state::read_all_peer_states(coordination_dir)
+                .into_iter()
+                .find(|peer| peer.peer == target_peer)
+                .ok_or("target_not_admitted")?;
+            if state::now_ms().saturating_sub(target_state.updated_ms) > state::STATE_STALE_MS {
+                return Err("target_stale");
+            }
+            if target_state.playing {
+                return Err("target_busy");
+            }
+            let Some(engine) = engine else {
+                return Err("audio_unavailable");
+            };
+            if !engine.is_active() {
+                return Err("playback_not_active");
+            }
+            if state::read_all_peer_states(coordination_dir)
+                .into_iter()
+                .any(|peer| {
+                    peer.peer != local_peer
+                        && peer.playing
+                        && state::now_ms().saturating_sub(peer.updated_ms) <= state::STATE_STALE_MS
+                })
+            {
+                return Err("playback_owned_elsewhere");
+            }
+            state::post_takeover(
+                coordination_dir,
+                target_peer,
+                Some(local_peer),
+                state::now_ms(),
+            )
+            .map(|_| false)
+            .map_err(|_| "handoff_persist_failed")
+        }
+        _ => Err("unknown_action"),
+    }
+}
+
+fn admitted_playlist_client<'a>(
+    request: &MusicActionRequestV1,
+    clients: &'a [&Client],
+    data_dir: &Path,
+) -> Result<&'a Client, &'static str> {
+    let playlist = request.playlist.as_ref().ok_or("missing_playlist")?;
+    if playlist.kind != ContentKind::Playlist {
+        return Err("unsupported_source");
+    }
+    if playlist.source_id == "legacy" {
+        return clients.first().copied().ok_or("source_unavailable");
+    }
+    let catalog = load_catalog(data_dir).unwrap_or_default();
+    if !catalog_contains_variant(&catalog, playlist) {
+        return Err("unsupported_source");
+    }
+    clients
+        .iter()
+        .copied()
+        .find(|candidate| catalog_source_id(candidate) == playlist.source_id)
+        .ok_or("source_unavailable")
+}
+
+/// Resolve the provider for one playable retained identity before writing
+/// final playback progress.  The source choice follows the same admission
+/// rule as explicit `scrobble`: legacy queues use the primary client, while a
+/// non-legacy identity must still be present in the bounded catalog and match
+/// an admitted client.  This prevents pause/stop/close from turning a
+/// source-less queue id into a write against an unrelated provider.
+fn admitted_progress_client<'a>(
+    content: &ContentRef,
+    clients: &'a [&Client],
+    data_dir: &Path,
+) -> Result<&'a Client, &'static str> {
+    if !matches!(
+        content.kind,
+        ContentKind::Music | ContentKind::Episode | ContentKind::Chapter | ContentKind::Audiobook
+    ) {
+        return Err("unsupported_source");
+    }
+    if content.source_id == "legacy" {
+        return clients.first().copied().ok_or("source_unavailable");
+    }
+    let catalog = load_catalog(data_dir).unwrap_or_default();
+    if !catalog_contains_variant(&catalog, content) {
+        return Err("unsupported_source");
+    }
+    clients
+        .iter()
+        .copied()
+        .find(|candidate| catalog_source_id(candidate) == content.source_id)
+        .ok_or("source_unavailable")
+}
+
+/// Best-effort final progress write for a daemon-owned transport boundary.
+/// Playback control remains authoritative even when the provider is offline;
+/// the failure is logged with a redacted code and the next explicit or close
+/// attempt can retry it.  An explicit identity must describe the current
+/// queued remote id, otherwise the request is ignored rather than scrobbling
+/// an unrelated item.
+fn finalize_progress_for_transport(
+    queue: &Queue,
+    explicit_content: Option<&ContentRef>,
+    engine: Option<&Engine>,
+    clients: &[&Client],
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    boundary: &str,
+) {
+    let Some(engine) = engine else { return };
+    if !engine.is_active() {
+        return;
+    }
+    let Some(remote_id) = queue.current() else {
+        return;
+    };
+    let selected = explicit_content.cloned().unwrap_or_else(|| {
+        workspace_content_ref(&load_catalog(data_dir).unwrap_or_default(), remote_id)
+    });
+    if selected.remote_id != remote_id {
+        tracing::warn!(
+            boundary,
+            "music final progress skipped for a non-current content identity"
+        );
+        return;
+    }
+    let Ok(client) = admitted_progress_client(&selected, clients, data_dir) else {
+        tracing::debug!(boundary, source_id = %selected.source_id, "music final progress skipped: source unavailable");
+        return;
+    };
+    if let Err(error) = rt.block_on(client.scrobble(&selected.remote_id, engine.position_ms())) {
+        tracing::warn!(boundary, source_id = %selected.source_id, error = %error, "music final progress write failed");
+    }
+}
+
+fn poll_workspace_with_authorizer(
+    persist: &Persist,
+    queue_path: &Path,
+    engine: Option<&Engine>,
+    clients: &[&Client],
+    rt: &tokio::runtime::Runtime,
+    cursors: &mut HashMap<String, String>,
+    ledger: &mut Option<WorkspaceActionLedger>,
+    authorizer: &music_action_auth::Authorizer,
+) {
+    let topic = format!("action/music/{WORKSPACE_ACTION_VERB}");
+    let since = cursors.get(&topic).map(String::as_str);
+    let msgs = match persist.list_since_limit(&topic, since, MAX_MESSAGES_PER_POLL) {
+        Ok(messages) => messages,
+        Err(_) => return,
+    };
+    let mut queue = queue::read_from(queue_path);
+    let data_dir = state::data_dir();
+    for msg in msgs {
+        cursors.insert(topic.clone(), msg.ulid.clone());
+        let body = msg.body.as_deref().unwrap_or("");
+        let request_id = request_id_from_body(body);
+        let reply = if let Err(_error) =
+            authorize_music_mutation(authorizer, WORKSPACE_ACTION_VERB, body)
+        {
+            typed_result(
+                &request_id,
+                false,
+                queue::revision(&queue),
+                Some("unauthorized"),
+            )
+        } else {
+            let request = match parse_authorized_workspace_request(body) {
+                Ok(request) => request,
+                Err(_) => {
+                    let result = typed_result(
+                        &request_id,
+                        false,
+                        queue::revision(&queue),
+                        Some("invalid_request"),
+                    );
+                    let reply = typed_reply(&result);
+                    let _ = persist.write(
+                        &reply_topic(&msg.ulid),
+                        Priority::Default,
+                        None,
+                        Some(&reply),
+                    );
+                    continue;
+                }
+            };
+            if let Err(error_code) = request.validate() {
+                typed_result(
+                    &request.request_id,
+                    false,
+                    queue::revision(&queue),
+                    Some(error_code),
+                )
+            } else {
+                let Some(action_ledger) = ledger.as_mut() else {
+                    // A corrupt/unreadable retained ledger disables typed
+                    // mutations for this process; reads and legacy lanes keep
+                    // operating, but no side effect is attempted here.
+                    let result = typed_result(
+                        &request.request_id,
+                        false,
+                        queue::revision(&queue),
+                        Some("ledger_unavailable"),
+                    );
+                    let reply = typed_reply(&result);
+                    let _ = persist.write(
+                        &reply_topic(&msg.ulid),
+                        Priority::Default,
+                        None,
+                        Some(&reply),
+                    );
+                    continue;
+                };
+                if action_ledger.contains(&request.request_id) {
+                    action_ledger
+                        .records
+                        .iter()
+                        .find(|record| record.request_id == request.request_id)
+                        .map(|record| record.result.clone())
+                        .unwrap_or_else(|| {
+                            typed_result(
+                                &request.request_id,
+                                false,
+                                queue::revision(&queue),
+                                Some("replayed_request"),
+                            )
+                        })
+                } else {
+                    let revision = queue::revision(&queue);
+                    if !action_ledger.reserve(&request.request_id, revision) {
+                        typed_result(
+                            &request.request_id,
+                            false,
+                            revision,
+                            Some("replayed_request"),
+                        )
+                    } else if persist_workspace_ledger(&data_dir, action_ledger).is_err() {
+                        action_ledger.release(&request.request_id);
+                        typed_result(
+                            &request.request_id,
+                            false,
+                            revision,
+                            Some("ledger_unavailable"),
+                        )
+                    } else if request
+                        .expected_queue_revision
+                        .is_some_and(|expected| expected != revision)
+                    {
+                        let result = typed_result(
+                            &request.request_id,
+                            false,
+                            revision,
+                            Some("stale_queue_revision"),
+                        );
+                        action_ledger.finish(&request.request_id, result.clone());
+                        let _ = persist_workspace_ledger(&data_dir, action_ledger);
+                        result
+                    } else {
+                        let previous_queue = queue.clone();
+                        let coordination_dir = state::coordination_dir();
+                        let result = match apply_workspace_action_with_clients_and_coordination(
+                            &request,
+                            &mut queue,
+                            engine,
+                            clients,
+                            rt,
+                            &data_dir,
+                            &coordination_dir,
+                        ) {
+                            Ok(mutated) => {
+                                if mutated && queue::write_to(queue_path, &queue).is_err() {
+                                    queue = previous_queue;
+                                    typed_result(
+                                        &request.request_id,
+                                        false,
+                                        revision,
+                                        Some("state_persist_failed"),
+                                    )
+                                } else {
+                                    typed_result(
+                                        &request.request_id,
+                                        true,
+                                        queue::revision(&queue),
+                                        None,
+                                    )
+                                }
+                            }
+                            Err(error_code) => {
+                                typed_result(&request.request_id, false, revision, Some(error_code))
+                            }
+                        };
+                        action_ledger.finish(&request.request_id, result.clone());
+                        if let Err(error) = persist_workspace_ledger(&data_dir, action_ledger) {
+                            tracing::error!(
+                                request_id = %request.request_id,
+                                error = %error,
+                                "music action ledger finalization failed"
+                            );
+                        }
+                        result
+                    }
+                }
+            }
+        };
+        let reply = typed_reply(&reply);
+        let _ = persist.write(
+            &reply_topic(&msg.ulid),
+            Priority::Default,
+            None,
+            Some(&reply),
+        );
+    }
+}
+
+/// Deserialize an already-authorized workspace request without weakening the
+/// domain contract's `deny_unknown_fields` boundary. `music_auth` is a wire
+/// envelope field verified immediately before this call; it is not part of the
+/// retained action and must be removed before decoding `MusicActionRequestV1`.
+/// Every other unknown field remains a hard error.
+fn parse_authorized_workspace_request(
+    body: &str,
+) -> Result<MusicActionRequestV1, serde_json::Error> {
+    let mut value = serde_json::from_str::<Value>(body)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("music_auth");
+    }
+    serde_json::from_value(value)
 }
 
 /// One browse-poll sweep: for each browse verb, dispatch new requests
@@ -1127,10 +3692,102 @@ fn poll_browse_with_authorizer(
     client: Option<&Client>,
     authorizer: &music_action_auth::Authorizer,
 ) {
+    let clients = client.into_iter().collect::<Vec<_>>();
+    poll_browse_with_clients(persist, rt, cursors, &clients, authorizer);
+}
+
+/// Read-only catalog lanes may fan out to every configured source. Playlist
+/// reads and provider mutations remain on the primary client because their IDs
+/// and write authority are not yet source-routed at the public wire boundary;
+/// typed playback may explicitly select a retained source variant.
+fn multi_source_browse_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "list-albums"
+            | "list-artists"
+            | "search"
+            | "list-genres"
+            | "albums-by-genre"
+            | "list-recents"
+            | "list-frequent"
+            | "list-starred"
+            | "list-bookmarks"
+    )
+}
+
+fn merge_source_array(target: &mut Vec<Value>, incoming: &[Value], source_id: &str) {
+    let mut rows = incoming.to_vec();
+    for row in &mut rows {
+        if let Some(object) = row.as_object_mut() {
+            object
+                .entry("source_id")
+                .or_insert_with(|| Value::String(source_id.to_string()));
+        }
+        if target.len() < MAX_COLLECTION_ITEMS && !target.contains(row) {
+            target.push(row.clone());
+        }
+    }
+}
+
+fn merge_browse_replies(verb: &str, replies: Vec<(String, String)>) -> String {
+    let mut merged: Option<Value> = None;
+    let mut first_error = None;
+    for (source_id, reply) in replies {
+        let Ok(envelope) = serde_json::from_str::<Value>(&reply) else {
+            continue;
+        };
+        if envelope.get("ok") != Some(&Value::Bool(true)) {
+            if first_error.is_none() {
+                first_error = envelope.get("error").cloned();
+            }
+            continue;
+        }
+        let Some(result) = envelope.get("result").cloned() else {
+            continue;
+        };
+        let Some(result_object) = result.as_object() else {
+            continue;
+        };
+        let target = merged.get_or_insert_with(|| json!({}));
+        let Some(target_object) = target.as_object_mut() else {
+            continue;
+        };
+        for (key, value) in result_object {
+            let Some(incoming) = value.as_array() else {
+                target_object
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+                continue;
+            };
+            let slot = target_object
+                .entry(key.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(target_rows) = slot.as_array_mut() {
+                merge_source_array(target_rows, incoming, &source_id);
+            }
+        }
+    }
+    if let Some(result) = merged {
+        return json!({ "ok": true, "result": result }).to_string();
+    }
+    json!({
+        "ok": false,
+        "error": first_error.unwrap_or_else(|| Value::String(format!("{verb}: no source available")))
+    })
+    .to_string()
+}
+
+fn poll_browse_with_clients(
+    persist: &Persist,
+    rt: &tokio::runtime::Runtime,
+    cursors: &mut HashMap<String, String>,
+    clients: &[&Client],
+    authorizer: &music_action_auth::Authorizer,
+) {
     for verb in BROWSE_VERBS {
         let topic = format!("action/music/{verb}");
         let since = cursors.get(&topic).map(String::as_str);
-        let msgs = match persist.list_since(&topic, since) {
+        let msgs = match persist.list_since_limit(&topic, since, MAX_MESSAGES_PER_POLL) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -1139,12 +3796,31 @@ fn poll_browse_with_authorizer(
             let body = msg.body.as_deref().unwrap_or("");
             let reply = match authorize_music_mutation(authorizer, verb, body) {
                 Err(error) => unauthorized_reply(verb, &error),
-                Ok(()) => match client {
-                    Some(c) => dispatch_browse(verb, body, c, rt),
-                    None => {
-                        json!({ "ok": false, "error": "no Airsonic server configured" }).to_string()
+                Ok(()) if clients.is_empty() => {
+                    json!({ "ok": false, "error": "no Airsonic server configured" }).to_string()
+                }
+                Ok(()) if multi_source_browse_verb(verb) => {
+                    let mut replies = Vec::with_capacity(clients.len());
+                    for client in clients {
+                        let source_id = catalog_source_id(client);
+                        let source_reply = dispatch_browse(verb, body, client, rt);
+                        record_catalog_response(
+                            &state::data_dir(),
+                            client,
+                            verb,
+                            body,
+                            &source_reply,
+                        );
+                        replies.push((source_id, source_reply));
                     }
-                },
+                    merge_browse_replies(verb, replies)
+                }
+                Ok(()) => {
+                    let client = clients[0];
+                    let reply = dispatch_browse(verb, body, client, rt);
+                    record_catalog_response(&state::data_dir(), client, verb, body, &reply);
+                    reply
+                }
             };
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
@@ -1240,17 +3916,532 @@ fn write_playback_state(playing: bool, song_id: &str, position_ms: u64) {
         position_ms,
         updated_ms: state::now_ms(),
     };
-    let _ = state::write_state(&state::data_dir(), &st);
+    let _ = state::write_state(&state::coordination_dir(), &st);
 }
 
-/// Apply one transport request to the engine + queue, returning the reply
-/// JSON. Side effects (engine + the AIR-8 state write); the pure
-/// verb→command parse is [`parse_transport`].
+/// Build the durable state left by an owner that yielded a playback handoff.
+/// Keeping the song and exact position in the same authoritative state file
+/// gives the requesting peer a typed resume point without creating a second
+/// handoff payload or control plane.
+#[must_use]
+fn handoff_state(queue: &Queue, peer: &str, position_ms: u64) -> MusicState {
+    MusicState {
+        peer: peer.to_string(),
+        playing: false,
+        song_id: queue.current().unwrap_or_default().to_string(),
+        position_ms,
+        updated_ms: state::now_ms(),
+    }
+}
+
+/// Yield the local engine to the newest admitted takeover intent. The intent
+/// remains beside the durable completion until the requester consumes both;
+/// that binding prevents a stale or spoofed completion from authorizing a
+/// target-side resume. If no local engine exists the request remains pending
+/// for a reachable owner instead of claiming a handoff that did not happen.
+fn apply_pending_handoff(engine: Option<&Engine>, queue_path: &Path) {
+    let Some(engine) = engine else { return };
+    let dir = state::coordination_dir();
+    let my_host = state::local_host();
+    let intents = state::read_intents(&dir);
+    let Some(intent) = state::pending_takeover_for(&intents, &my_host) else {
+        return;
+    };
+    // Do not rewrite a completion that is waiting for its requester. Keeping
+    // the intent live makes it the authorization record for the target-side
+    // consumer and keeps retries idempotent across responder sweeps.
+    if state::read_completions(&dir)
+        .iter()
+        .any(|completion| completion.intent_id == intent.intent_id)
+    {
+        return;
+    }
+    let queue = queue::read_from(queue_path);
+    let position_ms = engine.position_ms();
+    engine.pause();
+    let snapshot = handoff_state(&queue, &my_host, position_ms);
+    if let Err(error) = state::write_state(&dir, &snapshot) {
+        tracing::warn!(%error, intent_id = %intent.intent_id, "music handoff state could not be persisted; retaining intent");
+        return;
+    }
+    let completion = state::HandoffCompletion {
+        intent_id: intent.intent_id.clone(),
+        from_peer: intent.from_peer.clone(),
+        owner_peer: my_host.clone(),
+        song_id: snapshot.song_id.clone(),
+        position_ms: snapshot.position_ms,
+        completed_ms: snapshot.updated_ms,
+    };
+    if let Err(error) = state::write_completion(&dir, &completion) {
+        tracing::warn!(%error, intent_id = %intent.intent_id, "music handoff completion could not be persisted; retaining intent");
+        return;
+    }
+    tracing::info!(
+        intent_id = %intent.intent_id,
+        from_peer = %intent.from_peer,
+        song_id = %snapshot.song_id,
+        position_ms = snapshot.position_ms,
+        "music playback yielded to takeover request"
+    );
+}
+
+/// Consume a durable owner-yield completion on the requesting peer. The
+/// target reuses the daemon's existing queue/source-selection authority and
+/// asks the native engine to seek before its first decoded packet. A completion
+/// remains available until a playback start has been admitted; it is then
+/// cleared with its request. The request binding rejects stale/replayed or
+/// unauthorized completion files before they can alter the queue or engine.
+fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients: &[&Client]) {
+    let Some(engine) = engine else { return };
+    let dir = state::coordination_dir();
+    let my_host = state::local_host();
+    let intents = state::read_intents(&dir);
+    for completion in state::read_completions(&dir) {
+        if !state::completion_matches_intent(&completion, &intents, &my_host) {
+            tracing::warn!(
+                intent_id = %completion.intent_id,
+                from_peer = %completion.from_peer,
+                owner_peer = %completion.owner_peer,
+                "music handoff completion has no matching pending intent; dropping it"
+            );
+            state::clear_completion(&dir, &completion.intent_id);
+            continue;
+        }
+        let mut queue = queue::read_from(queue_path);
+        let Some(queue_index) = queue
+            .songs
+            .iter()
+            .position(|song_id| song_id == &completion.song_id)
+        else {
+            tracing::warn!(
+                intent_id = %completion.intent_id,
+                song_id = %completion.song_id,
+                "music handoff completion does not match the local queue; retaining it"
+            );
+            continue;
+        };
+        queue.current = queue_index;
+        if queue::write_to(queue_path, &queue).is_err() {
+            tracing::warn!(intent_id = %completion.intent_id, "music handoff queue could not be persisted; retaining completion");
+            continue;
+        }
+        let upcoming = if clients.is_empty() {
+            cached_upcoming_tracks(&queue, &crate::cache::cache_dir()).map(|tracks| {
+                tracks
+                    .into_iter()
+                    .map(|(url, codec)| PlaybackTrack::single(url, codec))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            let catalog = load_catalog(&dir).unwrap_or_default();
+            source_aware_upcoming_candidates(&queue, clients, &catalog)
+        };
+        let Some(upcoming) = upcoming.filter(|tracks| !tracks.is_empty()) else {
+            tracing::warn!(intent_id = %completion.intent_id, "music handoff target has no admitted playback source; retaining completion");
+            continue;
+        };
+        if !engine.play_from_candidates_at(upcoming, queue.current, completion.position_ms) {
+            tracing::warn!(intent_id = %completion.intent_id, "music handoff target could not start the native engine; retaining completion");
+            continue;
+        }
+        let target_state = MusicState {
+            peer: my_host.clone(),
+            playing: true,
+            song_id: completion.song_id.clone(),
+            position_ms: completion.position_ms,
+            updated_ms: state::now_ms(),
+        };
+        if let Err(error) = state::write_state(&dir, &target_state) {
+            tracing::warn!(%error, intent_id = %completion.intent_id, "music handoff target state could not be persisted; heartbeat will repair it");
+        }
+        // Retire the authorization record first. If cleanup is interrupted
+        // after this point, the completion is no longer eligible for replay.
+        state::clear_intent(&dir, &completion.intent_id);
+        state::clear_completion(&dir, &completion.intent_id);
+        tracing::info!(
+            intent_id = %completion.intent_id,
+            owner_peer = %completion.owner_peer,
+            song_id = %completion.song_id,
+            position_ms = completion.position_ms,
+            "music playback resumed from owner-yield completion"
+        );
+    }
+}
+
+/// Project only targets this daemon can prove through local audio and bounded
+/// peer-heartbeat state. Remote seats with a fresh idle heartbeat are
+/// actionable; stale or currently-owning peers remain visible with an honest
+/// refusal reason instead of becoming fabricated renderers.
+fn playback_targets(audio_available: bool, data_dir: &Path) -> Vec<crate::domain::PlaybackTarget> {
+    let local_peer = state::local_host();
+    let now = state::now_ms();
+    let mut targets = local_playback_targets(audio_available);
+    for peer in state::read_all_peer_states(data_dir)
+        .into_iter()
+        .filter(|peer| peer.peer != local_peer)
+    {
+        let stale = now.saturating_sub(peer.updated_ms) > state::STATE_STALE_MS;
+        let unavailable_reason = if stale {
+            Some("peer heartbeat is stale".to_owned())
+        } else if peer.playing {
+            Some("peer currently owns playback".to_owned())
+        } else {
+            None
+        };
+        targets.push(crate::domain::PlaybackTarget {
+            id: peer.peer.clone(),
+            name: peer.peer,
+            kind: "mesh_seat".to_owned(),
+            available: unavailable_reason.is_none(),
+            unavailable_reason,
+        });
+    }
+    targets.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    targets.truncate(MAX_SOURCE_RECORDS);
+    targets
+}
+
+/// Project only the local target. Remote seats enter through
+/// [`playback_targets`] after their bounded peer heartbeat is validated.
+fn local_playback_targets(audio_available: bool) -> Vec<crate::domain::PlaybackTarget> {
+    if !audio_available {
+        return Vec::new();
+    }
+    vec![crate::domain::PlaybackTarget {
+        id: format!("local-seat:{}", state::local_host()),
+        name: state::local_host(),
+        kind: "local_seat".to_string(),
+        available: true,
+        unavailable_reason: None,
+    }]
+}
+
+/// Resolve the queued tail entirely from the finite audio cache. Returning
+/// `None` for any missing entry is deliberate: offline play must not start a
+/// partial album and then fail after the source has already been lost.
+fn cached_upcoming_tracks(
+    queue: &crate::queue::Queue,
+    cache_dir: &Path,
+) -> Option<Vec<(String, SourceCodec)>> {
+    let tracks: Option<Vec<(String, SourceCodec)>> = queue
+        .songs
+        .iter()
+        .skip(queue.current)
+        .map(|song_id| {
+            let suffix = crate::cache::cached_track_suffix(cache_dir, song_id)?;
+            Some((
+                crate::engine::cached_stream_url(song_id),
+                SourceCodec::from_suffix(&suffix),
+            ))
+        })
+        .collect();
+    let tracks = tracks?;
+    (!tracks.is_empty()).then_some(tracks)
+}
+
+/// Select one admitted client for each queued song from the retained source
+/// variants. The fallback to the first client preserves legacy queues whose
+/// catalog has not been projected yet; once a variant is known, the domain
+/// policy orders cache/reachability/priority/latency and the selected source
+/// identity is resolved back to the live client without exposing credentials.
+#[cfg(test)]
+fn source_aware_upcoming_tracks(
+    queue: &crate::queue::Queue,
+    clients: &[&Client],
+    catalog: &CatalogStoreFile,
+) -> Option<Vec<(String, SourceCodec)>> {
+    source_aware_upcoming_candidates(queue, clients, catalog).map(|tracks| {
+        tracks
+            .into_iter()
+            .filter_map(|track| track.candidates.into_iter().next())
+            .collect()
+    })
+}
+
+/// Resolve every logical queue entry to the ordered admitted sources that can
+/// serve it. Keeping candidates grouped by queue entry lets the engine retry a
+/// failed source without manufacturing an extra audible queue track.
+fn source_aware_upcoming_candidates(
+    queue: &crate::queue::Queue,
+    clients: &[&Client],
+    catalog: &CatalogStoreFile,
+) -> Option<Vec<PlaybackTrack>> {
+    let fallback = clients.first().copied()?;
+    let tracks: Vec<PlaybackTrack> = queue
+        .songs
+        .iter()
+        .skip(queue.current)
+        .map(|song_id| {
+            let retained_item = catalog
+                .songs
+                .iter()
+                .chain(catalog.episodes.iter())
+                .chain(catalog.radio.iter())
+                .find(|item| {
+                    matches!(
+                        item.kind,
+                        ContentKind::Music
+                            | ContentKind::Episode
+                            | ContentKind::Chapter
+                            | ContentKind::Audiobook
+                            | ContentKind::Radio
+                    ) && item
+                        .variants
+                        .iter()
+                        .any(|variant| variant.content.remote_id == *song_id)
+                });
+            let candidates = if let Some(item) = retained_item {
+                let candidates = ordered_variants(&item.variants)
+                    .into_iter()
+                    .filter_map(|variant| {
+                        clients
+                            .iter()
+                            .copied()
+                            .find(|client| catalog_source_id(client) == variant.content.source_id)
+                            .and_then(|client| {
+                                let url = if variant.content.kind == ContentKind::Radio {
+                                    direct_radio_stream_url(&variant.content)?.to_string()
+                                } else {
+                                    client.stream_url(&variant.content.remote_id)
+                                };
+                                Some((url, SourceCodec::Unknown))
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if item.kind != ContentKind::Radio && candidates.is_empty() {
+                    vec![(fallback.stream_url(song_id), SourceCodec::Unknown)]
+                } else {
+                    candidates
+                }
+            } else {
+                let candidates = catalog
+                    .bookmarks
+                    .iter()
+                    .filter(|bookmark| bookmark.content.remote_id == *song_id)
+                    .filter_map(|bookmark| {
+                        clients
+                            .iter()
+                            .copied()
+                            .find(|client| catalog_source_id(client) == bookmark.content.source_id)
+                            .map(|client| {
+                                (
+                                    client.stream_url(&bookmark.content.remote_id),
+                                    SourceCodec::Unknown,
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    vec![(fallback.stream_url(song_id), SourceCodec::Unknown)]
+                } else {
+                    candidates
+                }
+            };
+            PlaybackTrack { candidates }
+        })
+        .collect();
+    (!tracks.is_empty() && tracks.iter().all(|track| !track.candidates.is_empty()))
+        .then_some(tracks)
+}
+
+/// Accept an Internet-radio locator only as the exact HTTP(S) URL retained in
+/// its typed catalog variant. This check lives in the responder so radio can
+/// never fall through the song-id `/rest/stream` construction path.
+fn direct_radio_stream_url(content: &ContentRef) -> Option<&str> {
+    if content.kind != ContentKind::Radio {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(&content.remote_id).ok()?;
+    (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some())
+        .then_some(content.remote_id.as_str())
+}
+
+fn retained_radio_stream_url<'a>(
+    catalog: &CatalogStoreFile,
+    selected: &'a ContentRef,
+) -> Result<&'a str, &'static str> {
+    if selected.kind != ContentKind::Radio
+        || !catalog.radio.iter().any(|item| {
+            item.kind == ContentKind::Radio
+                && item
+                    .variants
+                    .iter()
+                    .any(|variant| variant.content == *selected)
+        })
+    {
+        return Err("unsupported_source");
+    }
+    direct_radio_stream_url(selected).ok_or("invalid_stream_url")
+}
+
+fn typed_play_start_position(
+    content: &ContentRef,
+    requested_position_ms: Option<u64>,
+) -> Result<u64, &'static str> {
+    let position_ms = requested_position_ms.unwrap_or(0);
+    if content.kind == ContentKind::Radio && position_ms != 0 {
+        return Err("not_seekable");
+    }
+    Ok(position_ms)
+}
+
+/// Resolve a typed workspace play request while honoring the source variant
+/// selected by the caller.  The rest of the queue still uses the normal
+/// bounded source policy, but the first logical track is pinned to the
+/// requested admitted source (or its finite local cache when that source is
+/// currently unavailable).  This keeps source selection inside the daemon's
+/// existing queue/engine path instead of reintroducing GUI-owned provider
+/// playback.
+fn selected_source_upcoming_candidates(
+    queue: &crate::queue::Queue,
+    selected: &ContentRef,
+    clients: &[&Client],
+    catalog: &CatalogStoreFile,
+    cache_dir: &Path,
+) -> Result<Vec<PlaybackTrack>, &'static str> {
+    let retained_radio_url = if selected.kind == ContentKind::Radio {
+        Some(retained_radio_stream_url(catalog, selected)?)
+    } else {
+        None
+    };
+    let cached_variant = catalog
+        .songs
+        .iter()
+        .chain(catalog.episodes.iter())
+        .chain(catalog.radio.iter())
+        .find_map(|item| {
+            (matches!(
+                item.kind,
+                ContentKind::Music
+                    | ContentKind::Episode
+                    | ContentKind::Chapter
+                    | ContentKind::Audiobook
+                    | ContentKind::Radio
+            ))
+            .then(|| {
+                item.variants
+                    .iter()
+                    .find(|variant| variant.content == *selected)
+                    .map(|variant| variant.cached)
+            })
+            .flatten()
+        });
+    let bookmark_admitted = catalog
+        .bookmarks
+        .iter()
+        .any(|bookmark| bookmark.content == *selected);
+    if cached_variant.is_none() && !bookmark_admitted {
+        return Err("unsupported_source");
+    }
+
+    let mut tracks = if clients.is_empty() {
+        cached_upcoming_tracks(queue, cache_dir)
+            .map(|tracks| {
+                tracks
+                    .into_iter()
+                    .map(|(url, codec)| PlaybackTrack::single(url, codec))
+                    .collect::<Vec<_>>()
+            })
+            .ok_or("source_unavailable")?
+    } else {
+        source_aware_upcoming_candidates(queue, clients, catalog).ok_or("source_unavailable")?
+    };
+    let first = tracks.first_mut().ok_or("queue_empty")?;
+
+    if let Some(client) = clients
+        .iter()
+        .copied()
+        .find(|client| catalog_source_id(client) == selected.source_id)
+    {
+        let selected_candidate = (
+            retained_radio_url
+                .map_or_else(|| client.stream_url(&selected.remote_id), ToOwned::to_owned),
+            SourceCodec::Unknown,
+        );
+        first
+            .candidates
+            .retain(|candidate| candidate.0 != selected_candidate.0);
+        first.candidates.insert(0, selected_candidate);
+        return Ok(tracks);
+    }
+
+    if selected.kind != ContentKind::Radio
+        && (cached_variant == Some(true)
+            || crate::cache::cached_track_suffix(cache_dir, &selected.remote_id).is_some())
+    {
+        let suffix = crate::cache::cached_track_suffix(cache_dir, &selected.remote_id)
+            .ok_or("source_unavailable")?;
+        let selected_candidate = (
+            crate::engine::cached_stream_url(&selected.remote_id),
+            SourceCodec::from_suffix(&suffix),
+        );
+        first
+            .candidates
+            .retain(|candidate| candidate.0 != selected_candidate.0);
+        first.candidates.insert(0, selected_candidate);
+        return Ok(tracks);
+    }
+
+    Err("source_unavailable")
+}
+
+/// Return true only for a source/content identity retained by the daemon's
+/// bounded catalog projection. Typed curation must not turn an arbitrary
+/// source id into a provider mutation just because a client happens to be
+/// configured for a similar URL.
+fn catalog_contains_variant(catalog: &CatalogStoreFile, selected: &ContentRef) -> bool {
+    let collections = [
+        &catalog.albums,
+        &catalog.artists,
+        &catalog.podcasts,
+        &catalog.radio,
+        &catalog.episodes,
+        &catalog.songs,
+        &catalog.starred,
+        &catalog.recent,
+        &catalog.frequent,
+    ];
+    collections.iter().any(|items| {
+        items.iter().any(|item| {
+            item.variants
+                .iter()
+                .any(|variant| variant.content == *selected)
+        })
+    }) || catalog.search.as_ref().is_some_and(|page| {
+        page.groups.values().any(|items| {
+            items.iter().any(|item| {
+                item.variants
+                    .iter()
+                    .any(|variant| variant.content == *selected)
+            })
+        })
+    }) || catalog
+        .bookmarks
+        .iter()
+        .any(|bookmark| bookmark.content == *selected)
+}
+
+/// Compatibility wrapper for callers/tests that have only the primary client.
+#[cfg(test)]
 fn apply_transport(
     verb: &str,
     body: &str,
     engine: Option<&Engine>,
     client: Option<&Client>,
+    queue: &Queue,
+) -> String {
+    let clients = client.into_iter().collect::<Vec<_>>();
+    apply_transport_with_clients(verb, body, engine, &clients, queue)
+}
+
+/// Apply one transport request to the engine + queue, returning the reply
+/// JSON. Side effects (engine + the AIR-8 state write); the pure
+/// verb→command parse is [`parse_transport`].
+fn apply_transport_with_clients(
+    verb: &str,
+    body: &str,
+    engine: Option<&Engine>,
+    clients: &[&Client],
     queue: &Queue,
 ) -> String {
     let Some(cmd) = parse_transport(verb, body) else {
@@ -1274,7 +4465,7 @@ fn apply_transport(
             "volume": engine.map_or(1.0_f32, |e| e.volume()),
             "song_id": queue.current(),
             "audio_available": engine.is_some(),
-            "needs_airsonic": client.is_none(),
+            "needs_airsonic": clients.is_empty(),
             // MUSIC-RFX-2 — the GUI shows the scrubber only for a seekable track.
             "seekable": engine.map_or(false, |e| e.is_seekable()),
         })
@@ -1283,27 +4474,51 @@ fn apply_transport(
             let Some(engine) = engine else {
                 return no_audio();
             };
-            let Some(client) = client else {
-                return json!({ "ok": false, "error": "no Airsonic server configured" })
-                    .to_string();
-            };
             // Gapless album: hand the engine current..end in one list. The
             // base cursor lets the AIR-2.c auto-advance driver map the audible
             // track back to the right queue index as playback crosses gapless
             // boundaries.
-            let upcoming: Vec<(String, SourceCodec)> = queue
-                .songs
-                .iter()
-                .skip(queue.current)
-                .map(|id| (client.stream_url(id), SourceCodec::Unknown))
-                .collect();
+            let (upcoming, offline) = if !clients.is_empty() {
+                let catalog = load_catalog(&state::data_dir()).unwrap_or_default();
+                let Some(upcoming) = source_aware_upcoming_candidates(queue, clients, &catalog)
+                else {
+                    return json!({ "ok": false, "error": "queue is empty" }).to_string();
+                };
+                (upcoming, false)
+            } else {
+                let Some(upcoming) = cached_upcoming_tracks(queue, &crate::cache::cache_dir())
+                else {
+                    return json!({
+                        "ok": false,
+                        "error": "no Airsonic server configured and queued tracks are not fully cached"
+                    })
+                    .to_string();
+                };
+                (
+                    upcoming
+                        .into_iter()
+                        .map(|(url, codec)| PlaybackTrack::single(url, codec))
+                        .collect(),
+                    true,
+                )
+            };
             if upcoming.is_empty() {
                 return json!({ "ok": false, "error": "queue is empty" }).to_string();
             }
-            engine.play_from(upcoming, queue.current);
+            if offline {
+                engine.play_from(
+                    upcoming
+                        .into_iter()
+                        .filter_map(|track| track.candidates.into_iter().next())
+                        .collect(),
+                    queue.current,
+                );
+            } else {
+                engine.play_from_candidates(upcoming, queue.current);
+            }
             let song = queue.current().unwrap_or("");
             write_playback_state(true, song, 0);
-            json!({ "ok": true, "playing": true, "song_id": song }).to_string()
+            json!({ "ok": true, "playing": true, "offline": offline, "song_id": song }).to_string()
         }
         TransportCommand::Pause => {
             let Some(engine) = engine else {
@@ -1317,9 +4532,24 @@ fn apply_transport(
             let Some(engine) = engine else {
                 return no_audio();
             };
+            let Some(position_ms) = resumable_position(engine.is_active(), engine.position_ms())
+            else {
+                return json!({
+                    "ok": false,
+                    "error": "nothing_to_resume",
+                    "playing": false,
+                    "position_ms": engine.position_ms(),
+                })
+                .to_string();
+            };
             engine.resume();
-            write_playback_state(true, queue.current().unwrap_or(""), engine.position_ms());
-            json!({ "ok": true, "playing": true }).to_string()
+            write_playback_state(true, queue.current().unwrap_or(""), position_ms);
+            json!({
+                "ok": true,
+                "playing": true,
+                "position_ms": position_ms,
+            })
+            .to_string()
         }
         TransportCommand::Stop => {
             let Some(engine) = engine else {
@@ -1343,13 +4573,41 @@ fn apply_transport(
             // No-op for a live/radio stream (engine.seek returns false); the GUI
             // hides the scrubber off get-state's `seekable`, so this is defensive.
             let accepted = engine.seek(target_ms);
+            let reported_position_ms = if accepted {
+                target_ms
+            } else {
+                engine.position_ms()
+            };
             write_playback_state(
                 engine.is_playing(),
                 queue.current().unwrap_or(""),
-                target_ms,
+                reported_position_ms,
             );
-            json!({ "ok": true, "seeked": accepted, "position_ms": target_ms }).to_string()
+            seek_transport_reply(accepted, reported_position_ms)
         }
+    }
+}
+
+fn resumable_position(active: bool, position_ms: u64) -> Option<u64> {
+    active.then_some(position_ms)
+}
+
+fn seek_transport_reply(accepted: bool, position_ms: u64) -> String {
+    if accepted {
+        json!({
+            "ok": true,
+            "seeked": true,
+            "position_ms": position_ms,
+        })
+        .to_string()
+    } else {
+        json!({
+            "ok": false,
+            "error": "not_seekable",
+            "seeked": false,
+            "position_ms": position_ms,
+        })
+        .to_string()
     }
 }
 
@@ -1365,7 +4623,8 @@ pub fn poll_transport(
     client: Option<&Client>,
 ) {
     let authorizer = music_action_auth::Authorizer::production();
-    poll_transport_with_authorizer(persist, queue_path, engine, cursors, client, &authorizer);
+    let clients = client.into_iter().collect::<Vec<_>>();
+    poll_transport_with_authorizer(persist, queue_path, engine, cursors, &clients, &authorizer);
 }
 
 fn poll_transport_with_authorizer(
@@ -1373,14 +4632,14 @@ fn poll_transport_with_authorizer(
     queue_path: &Path,
     engine: Option<&Engine>,
     cursors: &mut HashMap<String, String>,
-    client: Option<&Client>,
+    clients: &[&Client],
     authorizer: &music_action_auth::Authorizer,
 ) {
     let queue = queue::read_from(queue_path);
     for verb in TRANSPORT_VERBS {
         let topic = format!("action/music/{verb}");
         let since = cursors.get(&topic).map(String::as_str);
-        let msgs = match persist.list_since(&topic, since) {
+        let msgs = match persist.list_since_limit(&topic, since, MAX_MESSAGES_PER_POLL) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -1389,7 +4648,7 @@ fn poll_transport_with_authorizer(
             let body = msg.body.as_deref().unwrap_or("");
             let reply = match authorize_music_mutation(authorizer, verb, body) {
                 Err(error) => unauthorized_reply(verb, &error),
-                Ok(()) => apply_transport(verb, body, engine, client, &queue),
+                Ok(()) => apply_transport_with_clients(verb, body, engine, clients, &queue),
             };
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
@@ -1444,14 +4703,18 @@ fn advance_queue_cursor(engine: Option<&Engine>, queue_path: &Path) {
 }
 
 /// Heartbeat this peer's playback state every [`STATE_WRITE_INTERVAL`]
-/// while playing (AIR-8).
+/// while playing (AIR-8), and clear an ended engine's ownership claim. The
+/// latter matters after provider loss: the engine can finish its bounded
+/// fallback/reconnect path between sweeps and must not leave a silent peer
+/// claiming playback until the stale-state timeout.
 fn write_periodic_state(engine: Option<&Engine>, queue_path: &Path) {
     let Some(engine) = engine else { return };
-    if !engine.is_playing() {
-        return;
-    }
     let queue = queue::read_from(queue_path);
-    write_playback_state(true, queue.current().unwrap_or(""), engine.position_ms());
+    if engine.is_playing() {
+        write_playback_state(true, queue.current().unwrap_or(""), engine.position_ms());
+    } else if !engine.is_active() {
+        write_playback_state(false, queue.current().unwrap_or(""), engine.position_ms());
+    }
 }
 
 /// Run the Bus responder loop.
@@ -1476,20 +4739,62 @@ pub fn airsonic_creds_changed(cached: Option<&creds::Creds>, current: &creds::Cr
 /// client, rebuilding it ONLY when the creds changed since the cached build (a
 /// mid-session connect/disconnect). Reusing the client keeps reqwest's
 /// connection pool warm across sweeps. `None` = no creds configured.
-fn refresh_airsonic_client(cache: &mut Option<(creds::Creds, Client)>) -> Option<&Client> {
-    match creds::load().ok() {
-        Some(current) => {
-            if airsonic_creds_changed(cache.as_ref().map(|(c, _)| c), &current) {
-                let client = Client::new(&current.server_url, &current.username, &current.password);
-                *cache = Some((current, client));
-            }
-            cache.as_ref().map(|(_, c)| c)
+fn refresh_airsonic_clients(cache: &mut Vec<(creds::Creds, Client)>) {
+    let currents = match creds::load_all() {
+        Ok(sources) => sources,
+        Err(creds::CredsError::Missing(_)) => {
+            cache.clear();
+            return;
         }
-        None => {
-            *cache = None;
-            None
+        Err(error) => {
+            tracing::warn!(%error, "airsonic source list unavailable; retaining warm clients");
+            return;
+        }
+    };
+    let mut old = std::mem::take(cache);
+    let mut refreshed = Vec::with_capacity(currents.len());
+    for current in currents {
+        if let Some(index) = old.iter().position(|(cached, _)| cached == &current) {
+            let (_, client) = old.swap_remove(index);
+            refreshed.push((current, client));
+        } else {
+            let client = Client::new(&current.server_url, &current.username, &current.password);
+            refreshed.push((current, client));
         }
     }
+    *cache = refreshed;
+}
+
+/// Return a stable, bounded startup phase for the music responder.
+///
+/// The phase is deliberately a tiny FNV-1a calculation rather than random
+/// state: restarting one seat produces the same placement, while different
+/// host identities normally land in different buckets.  Keeping this pure
+/// makes the common-mode mitigation directly testable without launching the
+/// daemon or touching the Bus store.
+#[must_use]
+pub fn initial_poll_phase(host: &str) -> Duration {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in host.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    Duration::from_millis(u64::from(hash % MAX_INITIAL_POLL_PHASE.as_millis() as u32))
+}
+
+/// Return a stable, bounded phase for the first active-playback heartbeat.
+/// Use a distinct seed from [`initial_poll_phase`] so control and heartbeat
+/// work do not collapse onto the same host bucket.
+#[must_use]
+pub fn initial_state_write_phase(host: &str) -> Duration {
+    let mut hash = 0x9e37_79b9_u32;
+    for byte in host.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    Duration::from_millis(u64::from(
+        hash % (MAX_STATE_WRITE_PHASE.as_millis() as u32 + 1),
+    ))
 }
 
 /// Run the single-threaded music bus responder until `should_stop` returns true.
@@ -1509,7 +4814,8 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     // (`Persist::reopen_if_index_changed`), driven once per sweep below.
     // MUSIC-WEDGE — seed every poll cursor at the topic's CURRENT tail so a
     // restart skips the historical backlog. Without this, the first sweep's
-    // `list_since(None)` returns every request ever made on each action topic
+    // `list_since_limit(None, MAX_MESSAGES_PER_POLL)` returns only the first
+    // bounded page on each action topic
     // and the single-threaded loop reprocesses the whole backlog (each browse
     // verb = an Airsonic round-trip) before answering anything new — observed
     // live as the daemon "not responding" after a restart, and a stale `play`
@@ -1533,10 +4839,25 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     // playback the Bus does. Held for the serve loop's lifetime; dropping
     // it (when serve returns) stops the surface thread. A headless peer
     // with no audio engine — or no session bus — simply skips it.
-    let mut _mpris = engine
-        .as_ref()
-        .map(|e| crate::mpris::spawn(e.handle(), queue_path.to_path_buf(), state::data_dir()));
-    let mut last_state_write = Instant::now();
+    let mut _mpris = engine.as_ref().map(|e| {
+        crate::mpris::spawn(
+            e.handle(),
+            queue_path.to_path_buf(),
+            state::data_dir(),
+            state::coordination_dir(),
+        )
+    });
+    let mut workspace_revision = match load_workspace_revision(&state::data_dir()) {
+        Ok(revision) => Some(revision),
+        Err(error) => {
+            tracing::error!(error = %error, "music workspace revision unavailable; retained snapshots disabled");
+            None
+        }
+    };
+    // Last workspace projection written by this process, excluding its
+    // revision.  A stable idle daemon should not rewrite the same retained
+    // body every five seconds merely because its timer fired.
+    let mut last_workspace_snapshot: Option<MusicWorkspaceSnapshotV1> = None;
     // MUSIC-AUDIO-BOOTRACE-1 — re-acquire the output device if it wasn't
     // available at startup. On a cold boot mde-musicd can start before the
     // PipeWire user session is ready, leaving `engine = None` (audio_available
@@ -1549,9 +4870,10 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
     // browse was a cold connect). Pre-open it at startup and warm the socket
     // with a cheap `ping` so the operator's first browse rides an established
     // connection instead of the launch-time cold-connect timeout. Rebuilt only
-    // on a creds change (refresh_airsonic_client).
-    let mut airsonic: Option<(creds::Creds, Client)> = None;
-    if let Some(client) = refresh_airsonic_client(&mut airsonic) {
+    // on a creds change (refresh_airsonic_clients).
+    let mut airsonic: Vec<(creds::Creds, Client)> = Vec::new();
+    refresh_airsonic_clients(&mut airsonic);
+    for (_, client) in &airsonic {
         match rt.block_on(client.ping()) {
             Ok(_) => tracing::info!("airsonic connection warmed at startup"),
             Err(e) => {
@@ -1559,7 +4881,37 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             }
         }
     }
+    let mut last_creds_refresh = Instant::now();
+    // The first loop performs one browse scan immediately; later scans are
+    // deliberately slower than the transport/control-plane cadence.
+    let mut browse_poll_due = true;
+    let mut last_browse_poll = Instant::now();
     let authorizer = music_action_auth::Authorizer::production();
+    let mut workspace_ledger = match load_workspace_ledger(&state::data_dir()) {
+        Ok(ledger) => Some(ledger),
+        Err(error) => {
+            tracing::error!(error = %error, "music workspace action ledger unavailable");
+            None
+        }
+    };
+    if let Err(error) = recover_interrupted_downloads(&state::data_dir()) {
+        tracing::warn!(%error, "music download recovery could not reconcile interrupted records");
+    }
+    // Spread the first full sweep across the bounded host phase.  Sleep in
+    // short chunks so SIGTERM/stop predicates remain responsive even when a
+    // phase is at the upper bound.
+    let host = state::local_host();
+    let phase = initial_poll_phase(&host);
+    let state_write_phase = initial_state_write_phase(&host);
+    let mut last_state_write = Instant::now() - STATE_WRITE_INTERVAL - state_write_phase;
+    let phase_deadline = Instant::now() + phase;
+    while !should_stop() {
+        let remaining = phase_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
     while !should_stop() {
         if engine.is_none() && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL {
             last_audio_retry = Instant::now();
@@ -1569,6 +4921,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
                     e.handle(),
                     queue_path.to_path_buf(),
                     state::data_dir(),
+                    state::coordination_dir(),
                 ));
                 engine = Some(e);
             }
@@ -1593,25 +4946,127 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         // gapless playback crosses boundaries, BEFORE poll_transport so a
         // get-state in this same sweep reports the song you actually hear.
         advance_queue_cursor(engine.as_ref(), queue_path);
-        // MUSIC-RESPONSIVE-10 — refresh the shared client once per sweep (cheap;
-        // rebuilds only on a creds change) and hand it to both network pollers.
-        let client = refresh_airsonic_client(&mut airsonic);
+        // MUSIC-RESPONSIVE-10 — refresh the shared clients on a short bounded
+        // configuration cadence rather than once per 500 ms control sweep.
+        // The primary is passed to provider mutations; the full bounded set is
+        // passed to transport, typed source-aware playback, and catalog work.
+        if last_creds_refresh.elapsed() >= CREDS_REFRESH_INTERVAL {
+            refresh_airsonic_clients(&mut airsonic);
+            last_creds_refresh = Instant::now();
+        }
+        let clients = airsonic
+            .iter()
+            .map(|(_, client)| client)
+            .collect::<Vec<_>>();
         poll_transport_with_authorizer(
             &persist,
             queue_path,
             engine.as_ref(),
             &mut cursors,
-            client,
+            &clients,
+            &authorizer,
+        );
+        // The typed workspace lane is the migration seam for the GUI. It
+        // refuses unsupported actions instead of claiming parity that has not
+        // yet been implemented in the daemon authority.
+        poll_workspace_with_authorizer(
+            &persist,
+            queue_path,
+            engine.as_ref(),
+            &clients,
+            &rt,
+            &mut cursors,
+            &mut workspace_ledger,
             &authorizer,
         );
         poll_peers_with_authorizer(&persist, &mut cursors, &authorizer);
-        poll_browse_with_authorizer(&persist, &rt, &mut cursors, client, &authorizer);
+        apply_pending_handoff(engine.as_ref(), queue_path);
+        apply_handoff_completions(engine.as_ref(), queue_path, &clients);
+        if browse_poll_due || last_browse_poll.elapsed() >= BROWSE_POLL_INTERVAL {
+            poll_browse_with_clients(&persist, &rt, &mut cursors, &clients, &authorizer);
+            last_browse_poll = Instant::now();
+            browse_poll_due = false;
+        }
         if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
             write_periodic_state(engine.as_ref(), queue_path);
+            if let Some(current_revision) = workspace_revision {
+                if let Some(next_revision) = current_revision.checked_add(1) {
+                    let snapshot = workspace_snapshot_from_dirs(
+                        &queue::read_from(queue_path),
+                        engine.as_ref(),
+                        next_revision,
+                        &state::data_dir(),
+                        &state::coordination_dir(),
+                    );
+                    if let Err(error_code) = snapshot.validate() {
+                        tracing::warn!(
+                            revision = next_revision,
+                            error_code,
+                            "music workspace snapshot rejected before publication"
+                        );
+                    } else if !last_workspace_snapshot
+                        .as_ref()
+                        .is_some_and(|previous| workspace_snapshot_content_eq(previous, &snapshot))
+                    {
+                        if persist_workspace_revision(&state::data_dir(), next_revision).is_ok() {
+                            match serde_json::to_string(&snapshot) {
+                                Ok(body) => match persist.write(
+                                    WORKSPACE_STATE_TOPIC,
+                                    Priority::Default,
+                                    None,
+                                    Some(&body),
+                                ) {
+                                    Ok(_) => {
+                                        last_workspace_snapshot = Some(snapshot);
+                                        workspace_revision = Some(next_revision);
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            revision = next_revision,
+                                            error = %error,
+                                            "music workspace snapshot could not be published; retrying"
+                                        );
+                                    }
+                                },
+                                Err(error) => tracing::warn!(
+                                    revision = next_revision,
+                                    error = %error,
+                                    "music workspace snapshot could not be encoded; retrying"
+                                ),
+                            }
+                        } else {
+                            tracing::error!(
+                                revision = next_revision,
+                                "music workspace revision could not be persisted; snapshot publication disabled"
+                            );
+                            workspace_revision = None;
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        "music workspace revision exhausted; snapshot publication disabled"
+                    );
+                    workspace_revision = None;
+                }
+            }
             last_state_write = Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    let clients = airsonic
+        .iter()
+        .map(|(_, client)| client)
+        .collect::<Vec<_>>();
+    let queue = queue::read_from(queue_path);
+    finalize_progress_for_transport(
+        &queue,
+        None,
+        engine.as_ref(),
+        &clients,
+        &rt,
+        &state::data_dir(),
+        "close",
+    );
 }
 
 /// MUSIC-WEDGE — build the initial cursor map seeded at each polled topic's
@@ -1625,6 +5080,7 @@ pub fn seed_cursors_at_tail(persist: &Persist) -> HashMap<String, String> {
         .iter()
         .chain(BROWSE_VERBS.iter())
         .chain(TRANSPORT_VERBS.iter())
+        .chain([WORKSPACE_ACTION_VERB].iter())
         .chain(PEER_VERBS.iter());
     for verb in verbs {
         let topic = format!("action/music/{verb}");
@@ -1647,11 +5103,11 @@ fn poll_peers_with_authorizer(
     cursors: &mut HashMap<String, String>,
     authorizer: &music_action_auth::Authorizer,
 ) {
-    let dir = state::data_dir();
+    let dir = state::coordination_dir();
     for verb in PEER_VERBS {
         let topic = format!("action/music/{verb}");
         let since = cursors.get(&topic).map(String::as_str);
-        let msgs = match persist.list_since(&topic, since) {
+        let msgs = match persist.list_since_limit(&topic, since, MAX_MESSAGES_PER_POLL) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -1689,7 +5145,7 @@ fn poll_once_with_authorizer(
     for verb in ACTION_VERBS {
         let topic = format!("action/music/{verb}");
         let since = cursors.get(&topic).map(String::as_str);
-        let msgs = match persist.list_since(&topic, since) {
+        let msgs = match persist.list_since_limit(&topic, since, MAX_MESSAGES_PER_POLL) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -1720,17 +5176,93 @@ mod tests {
     const AUTH_KEY: &[u8] = b"music-action-auth-test-key";
     const AUTH_NOW_MS: i64 = 1_700_000_000_000;
 
+    #[test]
+    fn bookmark_projection_keeps_resume_position_and_rejects_unknown_media() {
+        let bookmark = crate::airsonic::Bookmark {
+            id: "episode-1".into(),
+            title: "Episode One".into(),
+            position_ms: 42_000,
+            kind: "podcast".into(),
+            creator: "The Show".into(),
+            parent_title: "Feed One".into(),
+            duration_ms: Some(120_000),
+            artwork_ref: Some("art-1".into()),
+        };
+        let projected = bookmark_item("airsonic:http://one.test", &bookmark).unwrap();
+        assert_eq!(projected.content.kind, ContentKind::Episode);
+        assert_eq!(projected.content.remote_id, "episode-1");
+        assert_eq!(projected.position_ms, 42_000);
+        assert!(bookmark_item(
+            "airsonic:http://one.test",
+            &crate::airsonic::Bookmark {
+                kind: "video".into(),
+                ..bookmark
+            }
+        )
+        .is_none());
+    }
+
     fn test_authorizer(root: &Path) -> music_action_auth::Authorizer {
         music_action_auth::Authorizer::for_test(AUTH_KEY, root.join("auth"), AUTH_NOW_MS)
     }
 
+    fn one_shot_json_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind one-shot server");
+        let addr = listener.local_addr().expect("one-shot address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}")
+    }
+
+    fn one_shot_bytes_server(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind byte server");
+        let addr = listener.local_addr().expect("byte server addr");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        });
+        format!("http://{addr}")
+    }
+
     fn armed_test_body(unsigned: &str, verb: &str, target: &str, nonce: &str) -> String {
+        armed_test_body_with_expiry(unsigned, verb, target, nonce, AUTH_NOW_MS + 30_000)
+    }
+
+    fn armed_test_body_with_expiry(
+        unsigned: &str,
+        verb: &str,
+        target: &str,
+        nonce: &str,
+        expires_at_ms: i64,
+    ) -> String {
         let node = state::local_host();
         let request_sha256 = music_action_auth::request_digest_for_test(unsigned);
-        let payload = format!(
-            "v2|{nonce}|{}|music-{verb}|{node}|{target}|{request_sha256}",
-            AUTH_NOW_MS + 30_000
-        );
+        let payload =
+            format!("v2|{nonce}|{expires_at_ms}|music-{verb}|{node}|{target}|{request_sha256}");
         let signature = music_action_auth::sign_for_test(AUTH_KEY, &payload);
         let token = format!("{payload}|{signature}");
         let mut body: serde_json::Value = serde_json::from_str(unsigned).unwrap();
@@ -1738,6 +5270,104 @@ mod tests {
             .unwrap()
             .insert("armed_token".to_string(), serde_json::Value::String(token));
         body.to_string()
+    }
+
+    #[test]
+    fn production_music_nonce_ledger_is_user_owned_state() {
+        let root = music_action_auth::production_auth_root();
+        assert!(root.ends_with(".local/share/mde/music-auth-nonces"));
+        assert!(!root.starts_with("/var/lib/mackesd"));
+    }
+
+    #[test]
+    fn music_action_auth_rejects_capabilities_at_the_expiry_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let node = state::local_host();
+        let unsigned = r#"{"schema_version":1,"song_id":"track-a"}"#;
+        let legacy = armed_test_body_with_expiry(
+            unsigned,
+            "enqueue",
+            "queue",
+            "music-expiry-legacy",
+            AUTH_NOW_MS,
+        );
+        assert!(test_authorizer(root.path())
+            .authorize(&legacy, "music-enqueue", &node, "queue")
+            .unwrap_err()
+            .contains("expired"));
+
+        let seed = [9_u8; 32];
+        let signed = mackes_mesh_types::music_auth::sign_request(
+            r#"{"action":"play","request_id":"expiry-ed25519","schema_version":1}"#,
+            mackes_mesh_types::music_auth::MusicAuthContext {
+                verb: "music-workspace",
+                node: &node,
+                target: "workspace",
+            },
+            &seed,
+            "music-expiry-ed25519",
+            AUTH_NOW_MS,
+        )
+        .unwrap();
+        let verifier = music_action_auth::Authorizer::for_test_music(
+            ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key(),
+            root.path().join("music-auth"),
+            AUTH_NOW_MS,
+        );
+        assert!(verifier
+            .authorize(&signed, "music-workspace", &node, "workspace")
+            .unwrap_err()
+            .contains("expired"));
+    }
+
+    #[test]
+    fn workspace_revision_is_durable_across_daemon_restarts() {
+        let root = tempfile::tempdir().expect("revision root");
+        assert_eq!(
+            load_workspace_revision(root.path()).expect("first start"),
+            0
+        );
+
+        persist_workspace_revision(root.path(), 41).expect("persist first revision");
+        assert_eq!(
+            load_workspace_revision(root.path()).expect("reload first revision"),
+            41
+        );
+
+        persist_workspace_revision(
+            root.path(),
+            load_workspace_revision(root.path()).expect("read before next") + 1,
+        )
+        .expect("persist next revision");
+        assert_eq!(
+            load_workspace_revision(root.path()).expect("reload next"),
+            42
+        );
+    }
+
+    #[test]
+    fn workspace_revision_rejects_corrupt_state_instead_of_resetting() {
+        let root = tempfile::tempdir().expect("revision root");
+        std::fs::write(workspace_revision_path(root.path()), b"not-a-revision")
+            .expect("write corrupt revision");
+        assert_eq!(
+            load_workspace_revision(root.path())
+                .expect_err("corrupt revision must fail closed")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn unchanged_workspace_projection_ignores_revision_for_dedupe() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let first = workspace_snapshot_from_dir(&Queue::default(), None, 41, root.path());
+        let second = workspace_snapshot_from_dir(&Queue::default(), None, 42, root.path());
+        assert!(workspace_snapshot_content_eq(&first, &second));
+
+        let mut changed = second.clone();
+        changed.any_source_reachable = !changed.any_source_reachable;
+        assert!(!workspace_snapshot_content_eq(&first, &changed));
     }
 
     #[test]
@@ -1767,6 +5397,10 @@ mod tests {
             assert_eq!(music_mutation_scope(verb), Some("transport"), "{verb}");
         }
         assert_eq!(music_mutation_scope("take-over"), Some("peer-takeover"));
+        assert_eq!(
+            music_action_scope(WORKSPACE_ACTION_VERB, r#"{"action":"transfer"}"#),
+            Some("peer-takeover")
+        );
         for verb in [
             "get-queue",
             "list-albums",
@@ -1815,6 +5449,76 @@ mod tests {
             music_action_auth::sign_for_test(b"key", "The quick brown fox jumps over the lazy dog"),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    #[test]
+    fn music_action_auth_ed25519_is_scoped_and_single_use() {
+        use ed25519_dalek::SigningKey;
+        use mackes_mesh_types::music_auth::{self, MusicAuthContext};
+
+        let root = tempfile::tempdir().unwrap();
+        let seed = [9_u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let node = state::local_host();
+        let unsigned = r#"{"schema_version":1,"action":"play","request_id":"r1"}"#;
+        let signed = music_auth::sign_request(
+            unsigned,
+            MusicAuthContext {
+                verb: "music-workspace",
+                node: &node,
+                target: "workspace",
+            },
+            &seed,
+            "music-ed25519-nonce",
+            AUTH_NOW_MS + 30_000,
+        )
+        .unwrap();
+        let authorizer = music_action_auth::Authorizer::for_test_music(
+            signing_key.verifying_key(),
+            root.path().join("auth"),
+            AUTH_NOW_MS,
+        );
+        assert!(authorizer
+            .authorize(&signed, "music-workspace", &node, "workspace")
+            .is_ok());
+        assert!(authorizer
+            .authorize(&signed, "music-workspace", &node, "workspace")
+            .unwrap_err()
+            .contains("already used"));
+        let tampered = signed.replace("play", "pause");
+        assert!(authorizer
+            .authorize(&tampered, "music-workspace", &node, "workspace")
+            .is_err());
+    }
+
+    #[test]
+    fn signed_workspace_envelope_decodes_without_weakening_unknown_field_rejection() {
+        use mackes_mesh_types::music_auth::{self, MusicAuthContext};
+
+        let unsigned = r#"{"schema_version":1,"action":"play","request_id":"radio-play","content":{"source_id":"airsonic:http://radio.test","remote_id":"https://stream.test/live","kind":"radio"}}"#;
+        let signed = music_auth::sign_request(
+            unsigned,
+            MusicAuthContext {
+                verb: "music-workspace",
+                node: &state::local_host(),
+                target: "workspace",
+            },
+            &[9_u8; 32],
+            "signed-workspace-decode",
+            AUTH_NOW_MS + 30_000,
+        )
+        .unwrap();
+        let request = parse_authorized_workspace_request(&signed)
+            .expect("verified music_auth is a wire field, not a domain field");
+        assert_eq!(request.action, "play");
+        assert_eq!(request.content.unwrap().kind, ContentKind::Radio);
+
+        let mut hostile: Value = serde_json::from_str(&signed).unwrap();
+        hostile
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), Value::Bool(true));
+        assert!(parse_authorized_workspace_request(&hostile.to_string()).is_err());
     }
 
     #[test]
@@ -1899,6 +5603,19 @@ mod tests {
         assert!(t.contains("\"ok\":true") && t.contains("intent_id"));
         assert_eq!(state::read_intents(dir.path()).len(), 1);
         assert!(dispatch_peer("bogus", "", dir.path()).contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn handoff_snapshot_preserves_queue_song_and_position() {
+        let queue = Queue {
+            songs: vec!["song-a".into(), "song-b".into()],
+            current: 1,
+        };
+        let snapshot = handoff_state(&queue, "anvil", 42_500);
+        assert_eq!(snapshot.peer, "anvil");
+        assert!(!snapshot.playing);
+        assert_eq!(snapshot.song_id, "song-b");
+        assert_eq!(snapshot.position_ms, 42_500);
     }
 
     #[test]
@@ -2032,6 +5749,29 @@ mod tests {
     }
 
     #[test]
+    fn initial_poll_phase_is_stable_and_bounded() {
+        let first = initial_poll_phase("seat-15");
+        assert_eq!(first, initial_poll_phase("seat-15"));
+        assert!(first < MAX_INITIAL_POLL_PHASE);
+        assert!(initial_poll_phase("seat-16") < MAX_INITIAL_POLL_PHASE);
+    }
+
+    #[test]
+    fn initial_state_write_phase_is_stable_bounded_and_independent() {
+        let first = initial_state_write_phase("seat-15");
+        assert_eq!(first, initial_state_write_phase("seat-15"));
+        assert!(first <= MAX_STATE_WRITE_PHASE);
+        assert!(initial_state_write_phase("seat-16") <= MAX_STATE_WRITE_PHASE);
+        assert_ne!(first, initial_poll_phase("seat-15"));
+    }
+
+    #[test]
+    fn idle_non_transport_cadences_are_slower_than_control_polling() {
+        assert!(POLL_INTERVAL < BROWSE_POLL_INTERVAL);
+        assert!(POLL_INTERVAL < CREDS_REFRESH_INTERVAL);
+    }
+
+    #[test]
     fn poll_once_round_trips_a_request() {
         let dir = tempfile::tempdir().unwrap();
         let persist = Persist::open(dir.path().join("bus")).unwrap();
@@ -2060,6 +5800,59 @@ mod tests {
         assert_eq!(
             persist
                 .list_since(&reply_topic(&req.ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn queue_action_recovery_reads_a_bounded_page_and_advances_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().join("bus")).unwrap();
+        let queue_path = dir.path().join("queue.json");
+        let authorizer = test_authorizer(dir.path());
+        let mut actions = Vec::new();
+        for index in 0..(MAX_MESSAGES_PER_POLL + 1) {
+            actions.push(
+                persist
+                    .write(
+                        "action/music/enqueue",
+                        Priority::Default,
+                        None,
+                        Some(&format!(r#"{{"song_id":"bounded-{index}"}}"#)),
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let mut cursors = HashMap::new();
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
+        let page_last = MAX_MESSAGES_PER_POLL - 1;
+        assert_eq!(
+            cursors.get("action/music/enqueue").map(String::as_str),
+            Some(actions[page_last].ulid.as_str())
+        );
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&actions[page_last].ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(persist
+            .list_since(&reply_topic(&actions[MAX_MESSAGES_PER_POLL].ulid), None)
+            .unwrap()
+            .is_empty());
+
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
+        assert_eq!(
+            cursors.get("action/music/enqueue").map(String::as_str),
+            Some(actions[MAX_MESSAGES_PER_POLL].ulid.as_str())
+        );
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&actions[MAX_MESSAGES_PER_POLL].ulid), None)
                 .unwrap()
                 .len(),
             1
@@ -2131,6 +5924,31 @@ mod tests {
     }
 
     #[test]
+    fn typed_radio_live_transport_refuses_seek_and_idle_resume_without_inventing_position() {
+        assert_eq!(resumable_position(false, 12_345), None);
+        assert_eq!(resumable_position(true, 12_345), Some(12_345));
+
+        let rejected: Value = serde_json::from_str(&seek_transport_reply(false, 12_345)).unwrap();
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["seeked"], false);
+        assert_eq!(rejected["error"], "not_seekable");
+        assert_eq!(rejected["position_ms"], 12_345);
+        assert_eq!(
+            accepted_json(&seek_transport_reply(false, 12_345)),
+            Err("not_seekable")
+        );
+        assert_eq!(
+            accepted_json(r#"{"ok":false,"error":"nothing_to_resume"}"#),
+            Err("nothing_to_resume")
+        );
+
+        let accepted: Value = serde_json::from_str(&seek_transport_reply(true, 42_000)).unwrap();
+        assert_eq!(accepted["ok"], true);
+        assert_eq!(accepted["seeked"], true);
+        assert_eq!(accepted["position_ms"], 42_000);
+    }
+
+    #[test]
     fn parse_transport_set_volume_forms() {
         // bare number, JSON object, and an out-of-range value (engine clamps).
         assert_eq!(
@@ -2168,5 +5986,1994 @@ mod tests {
         let play = apply_transport("play", "", None, None, &queue);
         let pv: serde_json::Value = serde_json::from_str(&play).unwrap();
         assert_eq!(pv["ok"], false);
+    }
+
+    #[test]
+    fn workspace_targets_only_project_a_proven_local_seat() {
+        assert!(local_playback_targets(false).is_empty());
+        let targets = local_playback_targets(true);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kind, "local_seat");
+        assert!(targets[0].available);
+        assert!(targets[0].id.starts_with("local-seat:"));
+    }
+
+    #[test]
+    fn workspace_targets_project_fresh_idle_and_refused_peer_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = state::now_ms();
+        state::write_state(
+            dir.path(),
+            &state::MusicState {
+                peer: "seat-15".into(),
+                playing: false,
+                song_id: String::new(),
+                position_ms: 0,
+                updated_ms: now,
+            },
+        )
+        .unwrap();
+        state::write_state(
+            dir.path(),
+            &state::MusicState {
+                peer: "seat-16".into(),
+                playing: true,
+                song_id: "song-1".into(),
+                position_ms: 1200,
+                updated_ms: now,
+            },
+        )
+        .unwrap();
+        state::write_state(
+            dir.path(),
+            &state::MusicState {
+                peer: "seat-17".into(),
+                playing: false,
+                song_id: String::new(),
+                position_ms: 0,
+                updated_ms: now.saturating_sub(state::STATE_STALE_MS + 1),
+            },
+        )
+        .unwrap();
+
+        let targets = playback_targets(true, dir.path());
+        let target = |peer: &str| targets.iter().find(|item| item.id == peer).unwrap();
+        assert!(target("seat-15").available);
+        assert!(!target("seat-16").available);
+        assert_eq!(
+            target("seat-16").unavailable_reason.as_deref(),
+            Some("peer currently owns playback")
+        );
+        assert!(!target("seat-17").available);
+        assert_eq!(
+            target("seat-17").unavailable_reason.as_deref(),
+            Some("peer heartbeat is stale")
+        );
+    }
+
+    #[test]
+    fn offline_play_requires_every_upcoming_track_to_be_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = queue::Queue {
+            songs: vec!["song-a".to_string(), "song-b".to_string()],
+            current: 0,
+        };
+
+        crate::cache::write_cached_track(dir.path(), "song-a", "flac", b"cached-a", 10, false)
+            .unwrap();
+        assert!(
+            cached_upcoming_tracks(&queue, dir.path()).is_none(),
+            "offline playback must not start a partial queued tail"
+        );
+
+        crate::cache::write_cached_track(dir.path(), "song-b", "mp3", b"cached-b", 11, false)
+            .unwrap();
+        let tracks = cached_upcoming_tracks(&queue, dir.path()).expect("fully cached queue");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].1, SourceCodec::Flac);
+        assert_eq!(tracks[1].1, SourceCodec::Mp3);
+        assert!(tracks[0].0.starts_with("mde-cache:"));
+    }
+
+    #[test]
+    fn source_aware_playback_keeps_two_catalog_candidates_under_one_queue_track() {
+        let first = Client::with_salt("http://one.test", "alice", "pw", "one");
+        let second = Client::with_salt("http://two.test", "alice", "pw", "two");
+        let first_source = catalog_source_id(&first);
+        let second_source = catalog_source_id(&second);
+        let catalog = CatalogStoreFile {
+            songs: vec![CatalogItem {
+                id: "music|song".to_string(),
+                kind: ContentKind::Music,
+                title: "Song".to_string(),
+                creator: "Artist".to_string(),
+                parent_title: "Album".to_string(),
+                duration_ms: Some(180_000),
+                artwork_ref: None,
+                starred: false,
+                cached: false,
+                variants: vec![
+                    SourceVariant {
+                        content: ContentRef::new(&first_source, "song-7", ContentKind::Music)
+                            .unwrap(),
+                        cached: false,
+                        reachable: true,
+                        operator_priority: 1,
+                        latency_ms: Some(20),
+                    },
+                    SourceVariant {
+                        content: ContentRef::new(&second_source, "song-7", ContentKind::Music)
+                            .unwrap(),
+                        cached: false,
+                        reachable: true,
+                        operator_priority: 9,
+                        latency_ms: Some(5),
+                    },
+                ],
+            }],
+            ..CatalogStoreFile::default()
+        };
+        let queue = queue::Queue {
+            songs: vec!["song-7".to_string()],
+            current: 0,
+        };
+        let clients = vec![&first, &second];
+        let candidates = source_aware_upcoming_candidates(&queue, &clients, &catalog)
+            .expect("two admitted source candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].candidates.len(), 2);
+        assert!(candidates[0].candidates[0]
+            .0
+            .starts_with("http://two.test/"));
+        assert!(candidates[0].candidates[1]
+            .0
+            .starts_with("http://one.test/"));
+    }
+
+    #[test]
+    fn source_aware_playback_resolves_selected_variant_to_its_client() {
+        let first = Client::with_salt("http://one.test", "alice", "pw", "one");
+        let second = Client::with_salt("http://two.test", "alice", "pw", "two");
+        let second_source = catalog_source_id(&second);
+        let catalog = CatalogStoreFile {
+            songs: vec![CatalogItem {
+                id: "music|song".to_string(),
+                kind: ContentKind::Music,
+                title: "Song".to_string(),
+                creator: "Artist".to_string(),
+                parent_title: "Album".to_string(),
+                duration_ms: Some(180_000),
+                artwork_ref: None,
+                starred: false,
+                cached: false,
+                variants: vec![SourceVariant {
+                    content: ContentRef::new(&second_source, "song-7", ContentKind::Music).unwrap(),
+                    cached: false,
+                    reachable: true,
+                    operator_priority: 9,
+                    latency_ms: Some(5),
+                }],
+            }],
+            ..CatalogStoreFile::default()
+        };
+        let queue = queue::Queue {
+            songs: vec!["song-7".to_string()],
+            current: 0,
+        };
+        let clients = vec![&first, &second];
+        let tracks = source_aware_upcoming_tracks(&queue, &clients, &catalog)
+            .expect("admitted source variant");
+        assert!(tracks[0].0.starts_with("http://two.test/"));
+    }
+
+    #[test]
+    fn workspace_queue_projection_preserves_source_variant_identity() {
+        let source_id = "airsonic:http://two.test";
+        let catalog = CatalogStoreFile {
+            songs: vec![CatalogItem {
+                id: "music|song".to_string(),
+                kind: ContentKind::Music,
+                title: "Song".to_string(),
+                creator: "Artist".to_string(),
+                parent_title: "Album".to_string(),
+                duration_ms: Some(180_000),
+                artwork_ref: None,
+                starred: false,
+                cached: false,
+                variants: vec![SourceVariant {
+                    content: ContentRef::new(source_id, "song-7", ContentKind::Music).unwrap(),
+                    cached: false,
+                    reachable: true,
+                    operator_priority: 1,
+                    latency_ms: Some(5),
+                }],
+            }],
+            bookmarks: vec![BookmarkItem {
+                content: ContentRef::new(
+                    "airsonic:http://one.test",
+                    "episode-7",
+                    ContentKind::Episode,
+                )
+                .unwrap(),
+                title: "Episode".into(),
+                creator: "Host".into(),
+                parent_title: "Show".into(),
+                position_ms: 1_000,
+                duration_ms: Some(10_000),
+                artwork_ref: None,
+            }],
+            ..CatalogStoreFile::default()
+        };
+        let projected = workspace_content_ref(&catalog, "song-7");
+        assert_eq!(projected.source_id, source_id);
+        assert_eq!(projected.remote_id, "song-7");
+        let bookmark_projected = workspace_content_ref(&catalog, "episode-7");
+        assert_eq!(bookmark_projected.source_id, "airsonic:http://one.test");
+        assert_eq!(bookmark_projected.kind, ContentKind::Episode);
+        assert_eq!(
+            workspace_content_ref(&catalog, "legacy-only").source_id,
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn catalog_source_health_updates_all_retained_variant_views() {
+        let source_id = "airsonic:http://one.test";
+        let variant = catalog_variant(source_id, "song-7", ContentKind::Music).unwrap();
+        let item = CatalogItem {
+            id: "music|song".to_string(),
+            kind: ContentKind::Music,
+            title: "Song".to_string(),
+            creator: "Artist".to_string(),
+            parent_title: "Album".to_string(),
+            duration_ms: None,
+            artwork_ref: None,
+            starred: false,
+            cached: false,
+            variants: vec![variant],
+        };
+        let mut file = CatalogStoreFile {
+            songs: vec![item.clone()],
+            search: Some(SearchPage {
+                generation: 1,
+                query: "song".to_string(),
+                groups: [(ContentKind::Music, vec![item])].into_iter().collect(),
+                has_more: false,
+            }),
+            ..CatalogStoreFile::default()
+        };
+
+        set_catalog_variants_reachable(&mut file, source_id, false);
+        assert!(!file.songs[0].variants[0].reachable);
+        assert!(
+            !file.search.as_ref().unwrap().groups[&ContentKind::Music][0].variants[0].reachable
+        );
+        set_catalog_variants_reachable(&mut file, source_id, true);
+        assert!(file.songs[0].variants[0].reachable);
+    }
+
+    #[test]
+    fn catalog_source_records_authentication_required_separately_from_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://one.test", "alice", "pw", "auth-state");
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-artists",
+            "",
+            r#"{"ok":false,"error":{"code":40,"message":"authentication required"}}"#,
+        );
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(file.sources.len(), 1);
+        assert!(!file.sources[0].reachable);
+        assert!(file.sources[0].authentication_required);
+
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-artists",
+            "",
+            r#"{"ok":true,"result":{"artists":[]}}"#,
+        );
+        let file = load_catalog(dir.path()).unwrap();
+        assert!(file.sources[0].reachable);
+        assert!(!file.sources[0].authentication_required);
+        assert!(file.sources[0].features.contains("list-artists"));
+    }
+
+    #[test]
+    fn interrupted_download_recovery_clears_phantom_progress() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let interrupted = DownloadRecord {
+            content: ContentRef::new("legacy", "song-interrupted", ContentKind::Music).unwrap(),
+            state: "downloading".into(),
+            bytes: 4096,
+            total_bytes: Some(8192),
+            pinned: true,
+            error_code: None,
+        };
+        let ready = DownloadRecord {
+            content: ContentRef::new("legacy", "song-ready", ContentKind::Music).unwrap(),
+            state: "ready".into(),
+            bytes: 12,
+            total_bytes: Some(12),
+            pinned: true,
+            error_code: None,
+        };
+        persist_downloads(data_dir.path(), &[interrupted, ready]).unwrap();
+
+        assert!(recover_interrupted_downloads(data_dir.path()).unwrap());
+        let records = load_downloads(data_dir.path()).unwrap();
+        assert_eq!(records[0].state, "failed");
+        assert_eq!(records[0].bytes, 0);
+        assert_eq!(records[0].total_bytes, None);
+        assert!(!records[0].pinned);
+        assert_eq!(
+            records[0].error_code.as_deref(),
+            Some("download_interrupted")
+        );
+        assert_eq!(records[1].state, "ready");
+        assert!(!recover_interrupted_downloads(data_dir.path()).unwrap());
+    }
+
+    #[test]
+    fn download_empty_response_retains_a_redacted_failed_record() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "download-empty".into(),
+            action: "download".into(),
+            content: Some(ContentRef::new("legacy", "song-empty", ContentKind::Music).unwrap()),
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        let client = Client::with_salt(
+            one_shot_bytes_server(b""),
+            "alice",
+            "pw-do-not-persist",
+            "download-empty",
+        );
+        assert_eq!(
+            download_to_cache(&request, &client, &rt, data_dir.path(), cache_dir.path()),
+            Err("download_empty")
+        );
+        let records = load_downloads(data_dir.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "failed");
+        assert_eq!(records[0].bytes, 0);
+        assert_eq!(records[0].error_code.as_deref(), Some("download_empty"));
+        assert!(!serde_json::to_string(&records)
+            .unwrap()
+            .contains("pw-do-not-persist"));
+    }
+
+    #[test]
+    fn workspace_ledger_is_bounded_and_replays_without_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = WorkspaceActionLedger::default();
+        assert!(ledger.reserve("request-0", 7));
+        ledger.finish("request-0", typed_result("request-0", true, 8, None));
+        assert!(!ledger.reserve("request-0", 9));
+
+        for index in 1..=MAX_WORKSPACE_LEDGER_RECORDS {
+            assert!(ledger.reserve(&format!("request-{index}"), index as u64));
+        }
+        assert_eq!(ledger.records.len(), MAX_WORKSPACE_LEDGER_RECORDS);
+        assert!(!ledger.contains("request-0"));
+        assert!(ledger.contains("request-1024"));
+
+        persist_workspace_ledger(dir.path(), &ledger).unwrap();
+        let restored = load_workspace_ledger(dir.path()).unwrap();
+        assert_eq!(restored.records.len(), MAX_WORKSPACE_LEDGER_RECORDS);
+        assert!(restored.contains("request-1024"));
+    }
+
+    #[test]
+    fn retained_music_json_is_private_and_leaves_no_temporary_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = WorkspaceActionLedger::default();
+        assert!(ledger.reserve("private-state", 1));
+        persist_workspace_ledger(dir.path(), &ledger).unwrap();
+        persist_workspace_ledger(dir.path(), &ledger).unwrap();
+
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(WORKSPACE_LEDGER_FILE)]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(WORKSPACE_LEDGER_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn successful_browse_replies_persist_typed_catalog_and_search_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://music.test", "alice", "pw", "catalog");
+        let albums = r#"{
+            "ok":true,
+            "result":{"albums":[{"id":"album-1","name":"Blue","artist":"Artist","songCount":2,"coverArt":"art-1"}]}
+        }"#;
+        record_catalog_response(dir.path(), &client, "list-albums", "", albums);
+        let search = r#"{
+            "ok":true,
+            "result":{"artists":[{"id":"artist-1","name":"Artist","albumCount":1}],"albums":[],"songs":[{"id":"song-1","title":"Blue Sky","artist":"Artist","album":"Blue","duration":42}]}
+        }"#;
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "search",
+            "{\"query\":\"blue\"}",
+            search,
+        );
+
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(file.sources.len(), 1);
+        assert_eq!(file.sources[0].source_id, "airsonic:http://music.test");
+        assert_eq!(file.albums.len(), 1);
+        assert_eq!(file.albums[0].variants[0].content.remote_id, "album-1");
+        assert_eq!(file.pages["albums"].offset, 0);
+        assert_eq!(file.pages["albums"].size, 100);
+        assert!(!file.pages["albums"].has_more);
+        assert_eq!(file.search.as_ref().unwrap().query, "blue");
+        assert_eq!(file.search.as_ref().unwrap().groups.len(), 2);
+        assert!(file.artists.iter().any(|item| item.title == "Artist"));
+        assert!(file.songs.iter().any(|item| item.title == "Blue Sky"));
+    }
+
+    #[test]
+    fn cover_art_path_is_projected_into_cached_catalog_and_page_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://music.test", "alice", "pw", "art-path");
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-albums",
+            r#"{"offset":0,"size":100}"#,
+            r#"{"ok":true,"result":{"albums":[{"id":"album-1","name":"Blue","artist":"Artist","coverArt":"art-1"}],"offset":0,"size":100,"has_more":false}}"#,
+        );
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "get-cover-art",
+            r#"{"id":"art-1"}"#,
+            r#"{"ok":true,"result":{"path":"/var/cache/mde/music/artwork/art-1.jpg","bytes":42}}"#,
+        );
+
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(
+            file.albums[0].artwork_ref.as_deref(),
+            Some("/var/cache/mde/music/artwork/art-1.jpg")
+        );
+        assert_eq!(
+            file.pages["albums"].items[0].artwork_ref.as_deref(),
+            Some("/var/cache/mde/music/artwork/art-1.jpg")
+        );
+    }
+
+    #[test]
+    fn provider_artwork_tokens_and_paths_retain_for_podcast_radio_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://music.test", "alice", "pw", "art-hubs");
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-podcasts",
+            "",
+            r#"{"ok":true,"result":{"podcasts":[{"id":"feed-1","title":"Mesh Weekly","coverArt":"feed-art"}]}}"#,
+        );
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-radio",
+            "",
+            r#"{"ok":true,"result":{"radio":[{"id":"station-1","name":"Mesh FM","streamUrl":"https://radio.test/live","coverArt":"radio-art"}]}}"#,
+        );
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "podcast-episodes",
+            r#"{"id":"feed-1"}"#,
+            r#"{"ok":true,"result":{"episodes":[{"id":"episode-1","title":"Episode 1","coverArt":"episode-art"}]}}"#,
+        );
+
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(file.podcasts[0].artwork_ref.as_deref(), Some("feed-art"));
+        assert_eq!(file.radio[0].artwork_ref.as_deref(), Some("radio-art"));
+        assert_eq!(file.episodes[0].artwork_ref.as_deref(), Some("episode-art"));
+        assert_eq!(file.episodes[0].parent_title, "Mesh Weekly");
+
+        for (cover_id, path) in [
+            ("feed-art", "/var/cache/mde/music/artwork/feed-art.jpg"),
+            ("radio-art", "/var/cache/mde/music/artwork/radio-art.jpg"),
+            ("episode-art", "/var/cache/mde/music/artwork/episode-art.jpg"),
+        ] {
+            record_catalog_response(
+                dir.path(),
+                &client,
+                "get-cover-art",
+                &format!(r#"{{"id":"{cover_id}"}}"#),
+                &format!(r#"{{"ok":true,"result":{{"path":"{path}"}}}}"#),
+            );
+        }
+
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(
+            file.podcasts[0].artwork_ref.as_deref(),
+            Some("/var/cache/mde/music/artwork/feed-art.jpg")
+        );
+        assert_eq!(
+            file.radio[0].artwork_ref.as_deref(),
+            Some("/var/cache/mde/music/artwork/radio-art.jpg")
+        );
+        assert_eq!(
+            file.episodes[0].artwork_ref.as_deref(),
+            Some("/var/cache/mde/music/artwork/episode-art.jpg")
+        );
+    }
+
+    #[test]
+    fn provider_hub_browse_rows_reach_typed_workspace_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://music.test", "alice", "pw", "hubs");
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-podcasts",
+            "",
+            r#"{"ok":true,"result":{"podcasts":[{"id":"feed-1","title":"Mesh Weekly"}]}}"#,
+        );
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-radio",
+            "",
+            r#"{"ok":true,"result":{"radio":[{"id":"station-1","name":"Mesh FM","streamUrl":"https://radio.test/live"}]}}"#,
+        );
+
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(file.podcasts.len(), 1);
+        assert_eq!(file.podcasts[0].kind, ContentKind::Podcast);
+        assert_eq!(file.radio.len(), 1);
+        assert_eq!(file.radio[0].kind, ContentKind::Radio);
+        assert_eq!(
+            file.radio[0].variants[0].content.source_id,
+            "airsonic:http://music.test"
+        );
+        assert_eq!(
+            file.radio[0].variants[0].content.remote_id,
+            "https://radio.test/live"
+        );
+
+        let snapshot = workspace_snapshot_from_dir(&Queue::default(), None, 9, dir.path());
+        assert!(snapshot
+            .collections
+            .iter()
+            .any(|collection| collection.kind == ContentKind::Podcast));
+        assert!(snapshot
+            .collections
+            .iter()
+            .any(|collection| collection.kind == ContentKind::Radio));
+    }
+
+    #[test]
+    fn artist_album_and_podcast_detail_replies_retain_bounded_typed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://music.test", "alice", "pw", "detail");
+
+        // The exact Subsonic getArtist endpoint is exposed by the daemon as
+        // both `get-artist` and its older `albums-by-artist` alias. Both
+        // replies must feed the same source-qualified album projection.
+        assert!(BROWSE_VERBS.contains(&"get-artist"));
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "get-artist",
+            r#"{"id":"artist-1"}"#,
+            r#"{"ok":true,"result":{"albums":[{"id":"album-1","name":"Blue","artist":"Artist","artistId":"artist-1","songCount":2}]}}"#,
+        );
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "get-album",
+            r#"{"id":"album-1"}"#,
+            r#"{"ok":true,"result":{"album":{"id":"album-1","name":"Blue","artist":"Artist","artistId":"artist-1","songCount":2},"songs":[{"id":"song-1","title":"Blue Sky","artist":"Artist","album":"Blue","duration":42}]}}"#,
+        );
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "list-podcasts",
+            "",
+            r#"{"ok":true,"result":{"podcasts":[{"id":"feed-1","title":"Mesh Weekly"}]}}"#,
+        );
+
+        let episodes = (0..MAX_CATALOG_ITEMS + 3)
+            .map(|index| {
+                json!({
+                    "id": format!("episode-{index}"),
+                    "title": format!("Episode {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "podcast-episodes",
+            r#"{"id":"feed-1"}"#,
+            &json!({ "ok": true, "result": { "episodes": episodes } }).to_string(),
+        );
+
+        let file = load_catalog(dir.path()).unwrap();
+        assert_eq!(file.albums.len(), 1);
+        assert_eq!(
+            file.albums[0].variants[0].content,
+            ContentRef::new(
+                "airsonic:http://music.test",
+                "album-1",
+                ContentKind::Album
+            )
+            .unwrap()
+        );
+        assert!(file.songs.iter().any(|item| {
+            item.kind == ContentKind::Music
+                && item
+                    .variants
+                    .iter()
+                    .any(|variant| variant.content.remote_id == "song-1")
+        }));
+        assert_eq!(file.episodes.len(), MAX_CATALOG_ITEMS);
+        assert!(file.episodes.iter().all(|item| {
+            item.kind == ContentKind::Episode
+                && item.parent_title == "Mesh Weekly"
+                && item.variants.len() == 1
+                && item.variants[0].content.source_id == "airsonic:http://music.test"
+        }));
+        assert_eq!(
+            file.episodes[0].variants[0].content.remote_id,
+            "episode-0"
+        );
+
+        let snapshot = workspace_snapshot_from_dir(&Queue::default(), None, 10, dir.path());
+        let episodes = snapshot
+            .collections
+            .iter()
+            .find(|collection| collection.kind == ContentKind::Episode)
+            .expect("episode collection is retained");
+        assert_eq!(episodes.items.len(), MAX_COLLECTION_ITEMS);
+        assert!(snapshot.validate().is_ok());
+        assert_eq!(
+            workspace_content_ref(&file, "episode-0"),
+            ContentRef::new(
+                "airsonic:http://music.test",
+                "episode-0",
+                ContentKind::Episode
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn multi_source_catalog_fanout_merges_rows_and_keeps_source_identity() {
+        let merged = merge_browse_replies(
+            "search",
+            vec![
+                (
+                    "airsonic:http://one.test".into(),
+                    r#"{"ok":true,"result":{"albums":[{"id":"same","name":"Blue","artist":"Artist"}]}}"#.into(),
+                ),
+                (
+                    "airsonic:http://two.test".into(),
+                    r#"{"ok":true,"result":{"albums":[{"id":"same","name":"Blue","artist":"Artist"}]}}"#.into(),
+                ),
+            ],
+        );
+        let value: Value = serde_json::from_str(&merged).unwrap();
+        let albums = value["result"]["albums"].as_array().unwrap();
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0]["source_id"], "airsonic:http://one.test");
+        assert_eq!(albums[1]["source_id"], "airsonic:http://two.test");
+    }
+
+    #[test]
+    fn typed_play_selection_uses_requested_admitted_source_variant() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let first = Client::with_salt("http://one.test", "alice", "pw", "play-one");
+        let second = Client::with_salt("http://two.test", "alice", "pw", "play-two");
+        let selected =
+            ContentRef::new("airsonic:http://two.test", "song-a", ContentKind::Music).unwrap();
+        let catalog = CatalogStoreFile {
+            songs: vec![CatalogItem {
+                id: "song-a".into(),
+                kind: ContentKind::Music,
+                title: "Blue Sky".into(),
+                creator: "Artist".into(),
+                parent_title: "Blue".into(),
+                duration_ms: Some(42_000),
+                artwork_ref: None,
+                starred: false,
+                cached: false,
+                variants: vec![
+                    SourceVariant {
+                        content: ContentRef::new(
+                            "airsonic:http://one.test",
+                            "song-a",
+                            ContentKind::Music,
+                        )
+                        .unwrap(),
+                        cached: false,
+                        reachable: true,
+                        operator_priority: 0,
+                        latency_ms: None,
+                    },
+                    SourceVariant {
+                        content: selected.clone(),
+                        cached: false,
+                        reachable: true,
+                        operator_priority: 0,
+                        latency_ms: None,
+                    },
+                ],
+            }],
+            ..CatalogStoreFile::default()
+        };
+        let queue = Queue {
+            songs: vec!["song-a".into(), "song-b".into()],
+            current: 0,
+        };
+        let clients = vec![&first, &second];
+        let tracks = selected_source_upcoming_candidates(
+            &queue,
+            &selected,
+            &clients,
+            &catalog,
+            cache_dir.path(),
+        )
+        .unwrap();
+        assert!(tracks[0].candidates[0].0.starts_with("http://two.test/"));
+        assert!(tracks[0]
+            .candidates
+            .iter()
+            .any(|(url, _)| url.starts_with("http://one.test/")));
+
+        let untrusted =
+            ContentRef::new("airsonic:http://unknown.test", "song-a", ContentKind::Music).unwrap();
+        assert_eq!(
+            selected_source_upcoming_candidates(
+                &queue,
+                &untrusted,
+                &clients,
+                &catalog,
+                cache_dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_play_selection_accepts_an_admitted_bookmark_audio_variant() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let first = Client::with_salt("http://one.test", "alice", "pw", "bookmark-play-one");
+        let second = Client::with_salt("http://two.test", "alice", "pw", "bookmark-play-two");
+        let selected = ContentRef::new(
+            "airsonic:http://two.test",
+            "episode-a",
+            ContentKind::Episode,
+        )
+        .unwrap();
+        let catalog = CatalogStoreFile {
+            bookmarks: vec![BookmarkItem {
+                content: selected.clone(),
+                title: "Episode A".into(),
+                creator: "Host".into(),
+                parent_title: "Show".into(),
+                position_ms: 12_000,
+                duration_ms: Some(90_000),
+                artwork_ref: None,
+            }],
+            ..CatalogStoreFile::default()
+        };
+        let queue = Queue {
+            songs: vec!["episode-a".into()],
+            current: 0,
+        };
+        let clients = vec![&first, &second];
+        let tracks = selected_source_upcoming_candidates(
+            &queue,
+            &selected,
+            &clients,
+            &catalog,
+            cache_dir.path(),
+        )
+        .expect("admitted bookmark should resolve through the typed source policy");
+        assert!(tracks[0].candidates[0].0.starts_with("http://two.test/"));
+
+        let untrusted = ContentRef::new(
+            "airsonic:http://unknown.test",
+            "episode-a",
+            ContentKind::Episode,
+        )
+        .unwrap();
+        assert_eq!(
+            selected_source_upcoming_candidates(
+                &queue,
+                &untrusted,
+                &clients,
+                &catalog,
+                cache_dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_radio_play_selection_accepts_an_admitted_stream_url() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://radio.test", "alice", "pw", "radio-play");
+        let selected = ContentRef::new(
+            "airsonic:http://radio.test",
+            "https://stream.test/cspan-live",
+            ContentKind::Radio,
+        )
+        .unwrap();
+        let catalog = CatalogStoreFile {
+            radio: vec![CatalogItem {
+                id: "radio-cspan".into(),
+                kind: ContentKind::Radio,
+                title: "C-SPAN Radio".into(),
+                creator: "Internet radio".into(),
+                parent_title: String::new(),
+                duration_ms: None,
+                artwork_ref: None,
+                starred: false,
+                cached: false,
+                variants: vec![SourceVariant {
+                    content: selected.clone(),
+                    cached: false,
+                    reachable: true,
+                    operator_priority: 0,
+                    latency_ms: None,
+                }],
+            }],
+            ..CatalogStoreFile::default()
+        };
+        let queue = Queue {
+            songs: vec![selected.remote_id.clone()],
+            current: 0,
+        };
+
+        let tracks = selected_source_upcoming_candidates(
+            &queue,
+            &selected,
+            &[&client],
+            &catalog,
+            cache_dir.path(),
+        )
+        .expect("an admitted radio station must resolve to its direct stream");
+        assert_eq!(
+            tracks[0].candidates,
+            vec![(
+                "https://stream.test/cspan-live".to_string(),
+                SourceCodec::Unknown,
+            )]
+        );
+        assert!(!tracks[0].candidates[0].0.contains("/rest/stream"));
+        assert_eq!(typed_play_start_position(&selected, None), Ok(0));
+        assert_eq!(
+            typed_play_start_position(&selected, Some(1)),
+            Err("not_seekable")
+        );
+    }
+
+    #[test]
+    fn typed_radio_play_rejects_unretained_mismatched_and_missing_urls() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://radio.test", "alice", "pw", "radio-admission");
+        let retained = ContentRef::new(
+            "airsonic:http://radio.test",
+            "https://stream.test/retained",
+            ContentKind::Radio,
+        )
+        .unwrap();
+        let retained_item = |content: ContentRef| CatalogItem {
+            id: "radio-station".into(),
+            kind: ContentKind::Radio,
+            title: "Internet Radio".into(),
+            creator: "Internet radio".into(),
+            parent_title: String::new(),
+            duration_ms: None,
+            artwork_ref: None,
+            starred: false,
+            cached: false,
+            variants: vec![SourceVariant {
+                content,
+                cached: false,
+                reachable: true,
+                operator_priority: 0,
+                latency_ms: None,
+            }],
+        };
+        let catalog = CatalogStoreFile {
+            radio: vec![retained_item(retained.clone())],
+            ..CatalogStoreFile::default()
+        };
+        let queue = Queue {
+            songs: vec![retained.remote_id.clone()],
+            current: 0,
+        };
+
+        for rejected in [
+            ContentRef::new(
+                &retained.source_id,
+                "https://stream.test/not-retained",
+                ContentKind::Radio,
+            )
+            .unwrap(),
+            ContentRef::new(
+                "airsonic:http://other.test",
+                &retained.remote_id,
+                ContentKind::Radio,
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(
+                selected_source_upcoming_candidates(
+                    &queue,
+                    &rejected,
+                    &[&client],
+                    &catalog,
+                    cache_dir.path(),
+                ),
+                Err("unsupported_source")
+            );
+        }
+
+        for missing_or_non_url in ["", "station-id"] {
+            let malformed = ContentRef {
+                source_id: retained.source_id.clone(),
+                remote_id: missing_or_non_url.to_string(),
+                kind: ContentKind::Radio,
+            };
+            let malformed_catalog = CatalogStoreFile {
+                radio: vec![retained_item(malformed.clone())],
+                ..CatalogStoreFile::default()
+            };
+            let malformed_queue = Queue {
+                songs: vec![malformed.remote_id.clone()],
+                current: 0,
+            };
+            assert_eq!(
+                selected_source_upcoming_candidates(
+                    &malformed_queue,
+                    &malformed,
+                    &[&client],
+                    &malformed_catalog,
+                    cache_dir.path(),
+                ),
+                Err("invalid_stream_url")
+            );
+            assert_eq!(
+                source_aware_upcoming_candidates(&malformed_queue, &[&client], &malformed_catalog,),
+                None,
+                "malformed retained radio must not fall through to /rest/stream",
+            );
+        }
+    }
+
+    #[test]
+    fn typed_workspace_queue_actions_use_the_shared_queue_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut queue = Queue {
+            songs: vec!["a".into(), "b".into(), "c".into()],
+            current: 0,
+        };
+        let mut move_request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "move-1".into(),
+            action: "queue_move".into(),
+            content: None,
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: Some(2),
+            target_queue_index: Some(1),
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Ok(true)
+        );
+        assert_eq!(queue.songs, ["a", "c", "b"]);
+
+        move_request.action = "queue_remove".into();
+        move_request.queue_index = Some(1);
+        move_request.target_queue_index = None;
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Ok(true)
+        );
+        assert_eq!(queue.songs, ["a", "b"]);
+
+        move_request.action = "shuffle".into();
+        move_request.shuffle = Some(true);
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Ok(false)
+        );
+        assert_eq!(
+            crate::mpris::workspace_playback_policy(dir.path()),
+            (true, "off")
+        );
+
+        move_request.action = "repeat".into();
+        move_request.shuffle = None;
+        move_request.repeat = Some("context".into());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Ok(false)
+        );
+        assert_eq!(
+            crate::mpris::workspace_playback_policy(dir.path()),
+            (true, "context")
+        );
+
+        move_request.action = "download".into();
+        move_request.content =
+            Some(ContentRef::new("legacy", "song-download", ContentKind::Music).unwrap());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Err("source_unavailable")
+        );
+
+        move_request.action = "transfer".into();
+        move_request.target_peer = Some(state::local_host());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Err("target_is_local_peer")
+        );
+        state::write_state(
+            dir.path(),
+            &state::MusicState {
+                peer: "seat-15".into(),
+                playing: false,
+                song_id: String::new(),
+                position_ms: 0,
+                updated_ms: state::now_ms(),
+            },
+        )
+        .unwrap();
+        move_request.target_peer = Some("seat-15".into());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Err("audio_unavailable")
+        );
+        move_request.target_peer = Some("unknown-seat".into());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Err("target_not_admitted")
+        );
+        state::write_state(
+            dir.path(),
+            &state::MusicState {
+                peer: "busy-seat".into(),
+                playing: true,
+                song_id: "song-1".into(),
+                position_ms: 100,
+                updated_ms: state::now_ms(),
+            },
+        )
+        .unwrap();
+        move_request.target_peer = Some("busy-seat".into());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Err("target_busy")
+        );
+        state::write_state(
+            dir.path(),
+            &state::MusicState {
+                peer: "stale-seat".into(),
+                playing: false,
+                song_id: String::new(),
+                position_ms: 0,
+                updated_ms: state::now_ms().saturating_sub(state::STATE_STALE_MS + 1),
+            },
+        )
+        .unwrap();
+        move_request.target_peer = Some("stale-seat".into());
+        assert_eq!(
+            apply_workspace_action(&move_request, &mut queue, None, None, &rt, dir.path()),
+            Err("target_stale")
+        );
+    }
+
+    #[test]
+    fn transfer_admission_reads_only_the_mesh_coordination_root() {
+        let local_data = tempfile::tempdir().unwrap();
+        let coordination = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let target = "remote-seat";
+        let target_state = state::MusicState {
+            peer: target.into(),
+            playing: false,
+            song_id: String::new(),
+            position_ms: 0,
+            updated_ms: state::now_ms(),
+        };
+        state::write_state(local_data.path(), &target_state).unwrap();
+        let request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "transfer-root-split".into(),
+            action: "transfer".into(),
+            content: None,
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: Some(target.into()),
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        let mut queue = Queue::default();
+
+        assert_eq!(
+            apply_workspace_action_with_clients_and_coordination(
+                &request,
+                &mut queue,
+                None,
+                &[],
+                &rt,
+                local_data.path(),
+                coordination.path(),
+            ),
+            Err("target_not_admitted"),
+            "a local-only heartbeat must not fabricate a mesh handoff target",
+        );
+
+        state::write_state(coordination.path(), &target_state).unwrap();
+        assert_eq!(
+            apply_workspace_action_with_clients_and_coordination(
+                &request,
+                &mut queue,
+                None,
+                &[],
+                &rt,
+                local_data.path(),
+                coordination.path(),
+            ),
+            Err("audio_unavailable"),
+            "the same fresh heartbeat becomes admissible only on the mesh root",
+        );
+    }
+
+    #[test]
+    fn typed_star_actions_use_admitted_provider_and_refuse_other_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "star-action",
+        );
+        let unstar_client = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "unstar-action",
+        );
+        let mut queue = Queue::default();
+        let mut request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "star-1".into(),
+            action: "star".into(),
+            content: Some(ContentRef::new("legacy", "song-1", ContentKind::Music).unwrap()),
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        assert!(request.validate().is_ok());
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&client),
+                &tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.action = "unstar".into();
+        request.request_id = "unstar-1".into();
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&unstar_client),
+                &tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.content = ContentRef::new("untrusted-source", "song-1", ContentKind::Music);
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&unstar_client),
+                &tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+                dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_source_curation_uses_the_selected_admitted_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "source-one",
+        );
+        let second = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "source-two",
+        );
+        let selected = ContentRef::new(
+            &catalog_source_id(&second),
+            "song-selected",
+            ContentKind::Music,
+        )
+        .unwrap();
+        persist_catalog(
+            dir.path(),
+            &CatalogStoreFile {
+                schema_version: CATALOG_STORE_SCHEMA_VERSION,
+                songs: vec![CatalogItem {
+                    id: "music|song-selected".into(),
+                    kind: ContentKind::Music,
+                    title: "Selected Song".into(),
+                    creator: "Artist".into(),
+                    parent_title: "Album".into(),
+                    duration_ms: Some(42_000),
+                    artwork_ref: None,
+                    starred: false,
+                    cached: false,
+                    variants: vec![catalog_variant(
+                        &selected.source_id,
+                        &selected.remote_id,
+                        ContentKind::Music,
+                    )
+                    .unwrap()],
+                }],
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+        let mut request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "source-star-1".into(),
+            action: "star".into(),
+            content: Some(selected.clone()),
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        let mut queue = Queue::default();
+        let clients = vec![&first, &second];
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &request,
+                &mut queue,
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.content = Some(
+            ContentRef::new(
+                "airsonic:http://unadmitted.test",
+                "song-selected",
+                ContentKind::Music,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &request,
+                &mut queue,
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_scrobble_uses_the_selected_admitted_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rejected = Client::with_salt(
+            one_shot_json_server(
+                r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"wrong provider"}}}"#,
+            ),
+            "alice",
+            "pw",
+            "scrobble-source-one",
+        );
+        let selected = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "scrobble-source-two",
+        );
+        let selected_ref = ContentRef::new(
+            &catalog_source_id(&selected),
+            "song-progress",
+            ContentKind::Music,
+        )
+        .unwrap();
+        persist_catalog(
+            dir.path(),
+            &CatalogStoreFile {
+                schema_version: CATALOG_STORE_SCHEMA_VERSION,
+                songs: vec![CatalogItem {
+                    id: "music|song-progress".into(),
+                    kind: ContentKind::Music,
+                    title: "Progress Song".into(),
+                    creator: "Mesh Artist".into(),
+                    parent_title: "Album".into(),
+                    duration_ms: Some(90_000),
+                    artwork_ref: None,
+                    starred: false,
+                    cached: false,
+                    variants: vec![catalog_variant(
+                        &selected_ref.source_id,
+                        &selected_ref.remote_id,
+                        ContentKind::Music,
+                    )
+                    .unwrap()],
+                }],
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+        let request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "scrobble-selected".into(),
+            action: "scrobble".into(),
+            content: Some(selected_ref),
+            expected_queue_revision: None,
+            position_ms: Some(42_500),
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        assert!(request.validate().is_ok());
+        let clients = vec![&rejected, &selected];
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &request,
+                &mut Queue::default(),
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        let mut unadmitted = request;
+        unadmitted.content = Some(
+            ContentRef::new(
+                "airsonic:http://unadmitted.test",
+                "song-progress",
+                ContentKind::Music,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &unadmitted,
+                &mut Queue::default(),
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_bookmark_uses_the_selected_admitted_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rejected = Client::with_salt(
+            one_shot_json_server(
+                r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"wrong provider"}}}"#,
+            ),
+            "alice",
+            "pw",
+            "bookmark-source-one",
+        );
+        let selected = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "bookmark-source-two",
+        );
+        let selected_ref = ContentRef::new(
+            &catalog_source_id(&selected),
+            "episode-bookmark",
+            ContentKind::Episode,
+        )
+        .unwrap();
+        persist_catalog(
+            dir.path(),
+            &CatalogStoreFile {
+                schema_version: CATALOG_STORE_SCHEMA_VERSION,
+                songs: vec![CatalogItem {
+                    id: "episode|episode-bookmark".into(),
+                    kind: ContentKind::Episode,
+                    title: "Episode Bookmark".into(),
+                    creator: "Mesh Podcast".into(),
+                    parent_title: "Feed".into(),
+                    duration_ms: Some(120_000),
+                    artwork_ref: None,
+                    starred: false,
+                    cached: false,
+                    variants: vec![catalog_variant(
+                        &selected_ref.source_id,
+                        &selected_ref.remote_id,
+                        ContentKind::Episode,
+                    )
+                    .unwrap()],
+                }],
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+        let request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "bookmark-selected".into(),
+            action: "bookmark".into(),
+            content: Some(selected_ref),
+            expected_queue_revision: None,
+            position_ms: Some(37_000),
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        assert!(request.validate().is_ok());
+        let clients = vec![&rejected, &selected];
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &request,
+                &mut Queue::default(),
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        let mut unadmitted = request;
+        unadmitted.content = Some(
+            ContentRef::new(
+                "airsonic:http://unadmitted.test",
+                "episode-bookmark",
+                ContentKind::Episode,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &unadmitted,
+                &mut Queue::default(),
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_playlist_mutation_uses_the_selected_admitted_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rejected = Client::with_salt(
+            one_shot_json_server(
+                r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"wrong provider"}}}"#,
+            ),
+            "alice",
+            "pw",
+            "playlist-source-one",
+        );
+        let selected = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "playlist-source-two",
+        );
+        let selected_ref = ContentRef::new(
+            &catalog_source_id(&selected),
+            "playlist-selected",
+            ContentKind::Playlist,
+        )
+        .unwrap();
+        persist_catalog(
+            dir.path(),
+            &CatalogStoreFile {
+                schema_version: CATALOG_STORE_SCHEMA_VERSION,
+                songs: vec![CatalogItem {
+                    id: "playlist|playlist-selected".into(),
+                    kind: ContentKind::Playlist,
+                    title: "Selected Playlist".into(),
+                    creator: "Mesh User".into(),
+                    parent_title: String::new(),
+                    duration_ms: None,
+                    artwork_ref: None,
+                    starred: false,
+                    cached: false,
+                    variants: vec![catalog_variant(
+                        &selected_ref.source_id,
+                        &selected_ref.remote_id,
+                        ContentKind::Playlist,
+                    )
+                    .unwrap()],
+                }],
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+        let mut request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "playlist-source-update".into(),
+            action: "playlist_update".into(),
+            content: None,
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: Some(selected_ref),
+            playlist_name: Some("Selected Playlist Renamed".into()),
+            playlist_song_ids: vec!["song-1".into()],
+            playlist_remove_indices: vec![0],
+            armed_token: None,
+        };
+        assert!(request.validate().is_ok());
+        let clients = vec![&rejected, &selected];
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &request,
+                &mut Queue::default(),
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.playlist = Some(
+            ContentRef::new(
+                "airsonic:http://unadmitted.test",
+                "playlist-selected",
+                ContentKind::Playlist,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            apply_workspace_action_with_clients(
+                &request,
+                &mut Queue::default(),
+                None,
+                &clients,
+                &rt,
+                dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn typed_playlist_actions_use_the_admitted_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+        let mut queue = Queue::default();
+        let mut request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "playlist-create-1".into(),
+            action: "playlist_create".into(),
+            content: None,
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: Some("Roadtrip".into()),
+            playlist_song_ids: vec!["song-1".into(), "song-2".into()],
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        assert!(request.validate().is_ok());
+        let create_client =
+            Client::with_salt(one_shot_json_server(body), "alice", "pw", "playlist-create");
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&create_client),
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.action = "playlist_update".into();
+        request.request_id = "playlist-update-1".into();
+        request.content = None;
+        request.playlist =
+            Some(ContentRef::new("legacy", "playlist-1", ContentKind::Playlist).unwrap());
+        request.playlist_name = Some("Roadtrip 2026".into());
+        request.playlist_song_ids = vec!["song-3".into()];
+        request.playlist_remove_indices = vec![0];
+        let update_client =
+            Client::with_salt(one_shot_json_server(body), "alice", "pw", "playlist-update");
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&update_client),
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.action = "playlist_delete".into();
+        request.request_id = "playlist-delete-1".into();
+        request.playlist_name = None;
+        request.playlist_song_ids.clear();
+        request.playlist_remove_indices.clear();
+        let delete_client =
+            Client::with_salt(one_shot_json_server(body), "alice", "pw", "playlist-delete");
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&delete_client),
+                &rt,
+                dir.path(),
+            ),
+            Ok(false)
+        );
+
+        request.action = "playlist_reorder".into();
+        request.request_id = "playlist-reorder-1".into();
+        request.playlist_song_ids = vec!["song-2".into(), "song-1".into()];
+        request.playlist =
+            Some(ContentRef::new("untrusted-source", "playlist-1", ContentKind::Playlist).unwrap());
+        assert_eq!(
+            apply_workspace_action(
+                &request,
+                &mut queue,
+                None,
+                Some(&delete_client),
+                &rt,
+                dir.path(),
+            ),
+            Err("unsupported_source")
+        );
+    }
+
+    #[test]
+    fn admitted_download_selects_retained_nonlegacy_provider() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let first = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "download-first",
+        );
+        let second = Client::with_salt(
+            one_shot_json_server(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#),
+            "alice",
+            "pw",
+            "download-second",
+        );
+        let selected = ContentRef::new(
+            &catalog_source_id(&second),
+            "song-selected",
+            ContentKind::Music,
+        )
+        .unwrap();
+        persist_catalog(
+            data_dir.path(),
+            &CatalogStoreFile {
+                schema_version: CATALOG_STORE_SCHEMA_VERSION,
+                songs: vec![CatalogItem {
+                    id: "music|song-selected".into(),
+                    kind: ContentKind::Music,
+                    title: "Selected song".into(),
+                    creator: "Artist".into(),
+                    parent_title: "Album".into(),
+                    duration_ms: Some(42_000),
+                    artwork_ref: None,
+                    starred: false,
+                    cached: false,
+                    variants: vec![catalog_variant(
+                        &selected.source_id,
+                        &selected.remote_id,
+                        ContentKind::Music,
+                    )
+                    .unwrap()],
+                }],
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+        let request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "download-selected".into(),
+            action: "download".into(),
+            content: Some(selected.clone()),
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        let clients = vec![&first, &second];
+        let chosen = admitted_download_client(&request, &clients, data_dir.path()).unwrap();
+        assert_eq!(catalog_source_id(chosen), selected.source_id);
+    }
+
+    #[test]
+    fn typed_download_lifecycle_writes_and_removes_durable_record() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "download-1".into(),
+            action: "download".into(),
+            content: Some(ContentRef::new("legacy", "song-download", ContentKind::Music).unwrap()),
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: None,
+        };
+        let client = Client::with_salt(
+            one_shot_bytes_server(b"finite-audio"),
+            "alice",
+            "pw",
+            "download",
+        );
+        assert!(request.validate().is_ok());
+        download_to_cache(&request, &client, &rt, data_dir.path(), cache_dir.path()).unwrap();
+        let records = load_downloads(data_dir.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "ready");
+        assert_eq!(records[0].bytes, 12);
+        assert_eq!(
+            crate::cache::read_cached_track_bytes(cache_dir.path(), "song-download", 20),
+            Some(b"finite-audio".to_vec())
+        );
+
+        request.action = "pin_download".into();
+        request.request_id = "download-pin-1".into();
+        set_download_pinned(&request, data_dir.path(), cache_dir.path(), true).unwrap();
+        assert!(load_downloads(data_dir.path()).unwrap()[0].pinned);
+        assert!(crate::cache::read_index(cache_dir.path())
+            .entries
+            .get("song-download")
+            .is_some_and(|entry| entry.starred));
+
+        request.action = "unpin_download".into();
+        request.request_id = "download-unpin-1".into();
+        set_download_pinned(&request, data_dir.path(), cache_dir.path(), false).unwrap();
+        assert!(!load_downloads(data_dir.path()).unwrap()[0].pinned);
+        assert!(!crate::cache::read_index(cache_dir.path())
+            .entries
+            .get("song-download")
+            .is_some_and(|entry| entry.starred));
+
+        request.action = "cancel_download".into();
+        request.request_id = "download-cancel-1".into();
+        cancel_download(&request, data_dir.path()).unwrap();
+        assert_eq!(
+            load_downloads(data_dir.path()).unwrap()[0].state,
+            "cancelled"
+        );
+
+        request.action = "remove_download".into();
+        request.request_id = "download-remove-1".into();
+        remove_download(&request, data_dir.path(), cache_dir.path()).unwrap();
+        assert!(load_downloads(data_dir.path()).unwrap().is_empty());
+        assert!(!cache_dir.path().join("song-download.audio").exists());
+
+        request.content = Some(ContentRef::new("legacy", "radio-1", ContentKind::Radio).unwrap());
+        assert_eq!(download_identity(&request), Err("unsupported_source"));
+    }
+
+    #[test]
+    fn typed_request_serialization_does_not_retain_armed_token() {
+        let request = MusicActionRequestV1 {
+            schema_version: MUSIC_CONTRACT_VERSION,
+            request_id: "redaction-1".into(),
+            action: "play".into(),
+            content: None,
+            expected_queue_revision: None,
+            position_ms: None,
+            volume_milli: None,
+            shuffle: None,
+            repeat: None,
+            queue_index: None,
+            target_queue_index: None,
+            target_peer: None,
+            playlist: None,
+            playlist_name: None,
+            playlist_song_ids: Vec::new(),
+            playlist_remove_indices: Vec::new(),
+            armed_token: Some("secret-token".into()),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(!wire.contains("secret-token"));
+        assert_eq!(request_id_from_body(&wire), "redaction-1");
+        assert_eq!(request_id_from_body("{}"), "invalid-request");
     }
 }

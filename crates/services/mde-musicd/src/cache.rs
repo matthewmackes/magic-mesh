@@ -23,6 +23,8 @@ use serde_json::Value;
 
 /// Default cache cap: 10 GiB (Q27 — settings-adjustable).
 pub const DEFAULT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Version of the durable cache index envelope.
+pub const CACHE_SCHEMA_VERSION: u16 = 1;
 
 /// MUSIC-ART-SYNC — the communal cover-art cache on the QNM-Shared mount. mackesd
 /// (root) provisions `<mount>/music/artwork` 0777; musicd reads-through /
@@ -135,6 +137,12 @@ pub struct CacheIndex {
     pub entries: BTreeMap<String, CacheEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheFileV1 {
+    schema_version: u16,
+    index: CacheIndex,
+}
+
 impl CacheIndex {
     /// Total bytes across every cached track.
     #[must_use]
@@ -243,6 +251,21 @@ pub fn read_cached_track_bytes(dir: &Path, song_id: &str, now_ms: u64) -> Option
     Some(bytes)
 }
 
+/// Return the suffix for a fully cached track without reading its audio bytes
+/// or changing its LRU timestamp. Playback uses this bounded probe to decide
+/// whether a queue can be served during an Airsonic outage.
+#[must_use]
+pub fn cached_track_suffix(dir: &Path, song_id: &str) -> Option<String> {
+    let index = read_index(dir);
+    let entry = index.entries.get(song_id)?;
+    if entry.bytes == 0 {
+        return None;
+    }
+    let path = track_path(dir, song_id, &entry.suffix);
+    let metadata = std::fs::metadata(path).ok()?;
+    (metadata.is_file() && metadata.len() > 0).then(|| entry.suffix.clone())
+}
+
 /// Write a fully-fetched finite stream into the recently-played audio cache.
 /// Temp-then-rename keeps readers from seeing partial audio if playback is
 /// interrupted mid-write; index persistence is best-effort for the caller.
@@ -272,6 +295,24 @@ pub fn write_cached_track(
         starred,
     );
     write_index(dir, &index)
+}
+
+/// Remove one cached finite track and its index entry. Missing tracks are a
+/// successful no-op so a durable download record can be removed after an
+/// eviction or manual cache cleanup without manufacturing a failure.
+pub fn remove_cached_track(dir: &Path, song_id: &str) -> std::io::Result<bool> {
+    let mut index = read_index(dir);
+    let Some(entry) = index.entries.remove(song_id) else {
+        return Ok(false);
+    };
+    let path = track_path(dir, song_id, &entry.suffix);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    write_index(dir, &index)?;
+    Ok(true)
 }
 
 /// Directory for durable Airsonic metadata replies. Tests can override it with
@@ -339,10 +380,17 @@ pub fn index_path(dir: &Path) -> PathBuf {
 /// cache is a rebuildable best-effort store, never a hard error).
 #[must_use]
 pub fn read_index(dir: &Path) -> CacheIndex {
-    std::fs::read_to_string(index_path(dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(text) = std::fs::read_to_string(index_path(dir)).ok() else {
+        return CacheIndex::default();
+    };
+    if let Ok(envelope) = serde_json::from_str::<CacheFileV1>(&text) {
+        if envelope.schema_version == CACHE_SCHEMA_VERSION {
+            return envelope.index;
+        }
+    }
+    // Version-zero migration: preserve the old index and rewrite it on the next
+    // cache operation; media bytes remain in their existing safe paths.
+    serde_json::from_str(&text).unwrap_or_default()
 }
 
 /// Write the index to `dir`, creating it if needed.
@@ -351,8 +399,11 @@ pub fn read_index(dir: &Path) -> CacheIndex {
 /// IO / serialization failures.
 pub fn write_index(dir: &Path, index: &CacheIndex) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(index)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_string_pretty(&CacheFileV1 {
+        schema_version: CACHE_SCHEMA_VERSION,
+        index: index.clone(),
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(index_path(dir), json)
 }
 
@@ -531,6 +582,10 @@ mod tests {
         let dir = tempdir().unwrap();
         write_cached_track(dir.path(), "song/7", "flac", b"audio-bytes", 10, false).unwrap();
         assert!(track_path(dir.path(), "song/7", "flac").exists());
+        assert_eq!(
+            cached_track_suffix(dir.path(), "song/7"),
+            Some("flac".to_string())
+        );
 
         let bytes = read_cached_track_bytes(dir.path(), "song/7", 99).expect("cached audio");
         assert_eq!(bytes, b"audio-bytes");
@@ -539,6 +594,18 @@ mod tests {
             index.entries.get("song/7").map(|e| e.last_played_ms),
             Some(99)
         );
+        std::fs::remove_file(track_path(dir.path(), "song/7", "flac")).unwrap();
+        assert_eq!(cached_track_suffix(dir.path(), "song/7"), None);
+    }
+
+    #[test]
+    fn removing_cached_track_removes_bytes_and_index_entry() {
+        let dir = tempdir().unwrap();
+        write_cached_track(dir.path(), "song-8", "audio", b"bytes", 10, false).unwrap();
+        assert!(remove_cached_track(dir.path(), "song-8").unwrap());
+        assert!(!track_path(dir.path(), "song-8", "audio").exists());
+        assert!(!read_index(dir.path()).entries.contains_key("song-8"));
+        assert!(!remove_cached_track(dir.path(), "song-8").unwrap());
     }
 
     #[test]

@@ -16,7 +16,7 @@
 #![cfg(feature = "async-services")]
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -29,6 +29,70 @@ pub const TOPIC: &str = "state/boot-readiness";
 
 /// Publish cadence — fast enough to feel live while the chain converges.
 pub const INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum deterministic spread before the first full blocking probe batch.
+/// The first batch still begins within the normal publication cadence, while
+/// different node identities avoid forking `systemctl`/`ping` and opening the
+/// directory store in lockstep after a fleet restart.
+pub const MAX_INITIAL_PHASE: Duration = Duration::from_millis(1_500);
+
+/// Failed blocking probes must not re-fork/reconnect on every publish tick.
+/// Keep the first retry responsive, then back off to a bounded steady-state.
+pub const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(4);
+/// Maximum delay between retries for a continuously failed probe group.
+pub const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Healthy source probes need not repeat at the 2-second publication cadence.
+/// The cached result is still published every tick, while this slower source
+/// recheck avoids repeatedly spawning `systemctl`, TCP, directory, and `ping`
+/// work on every node when readiness is stable.
+pub const HEALTHY_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Default)]
+struct FailureBackoff {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl FailureBackoff {
+    fn due(&self, now: Instant) -> bool {
+        self.retry_at.map_or(true, |retry_at| now >= retry_at)
+    }
+
+    fn record(&mut self, failed: bool, now: Instant) {
+        if failed {
+            self.retry_at = Some(now + failure_backoff_delay(self.failures));
+            self.failures = self.failures.saturating_add(1);
+        } else {
+            self.failures = 0;
+            self.retry_at = Some(now + HEALTHY_RECHECK_INTERVAL);
+        }
+    }
+}
+
+#[must_use]
+fn failure_backoff_delay(failures: u32) -> Duration {
+    FAILURE_BACKOFF_INITIAL
+        .saturating_mul(1_u32 << failures.min(4))
+        .min(FAILURE_BACKOFF_MAX)
+}
+
+/// Return a stable bounded phase for the first expensive probe batch.
+///
+/// FNV-1a is sufficient here because this is scheduling spread, not a security
+/// primitive. An empty identity deliberately disables the hash phase; the
+/// first-delay calculation still preserves the existing cadence deadline.
+fn initial_phase_for(node_id: &str, interval: Duration) -> Duration {
+    let window_ms = interval.as_millis().min(MAX_INITIAL_PHASE.as_millis());
+    if node_id.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in node_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis((u128::from(hash) % (window_ms + 1)) as u64)
+}
 
 /// One gathered observation of the fabric bring-up state (impure inputs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -399,6 +463,34 @@ fn gather_services() -> Vec<ServiceProbe> {
     ]
 }
 
+/// A false fabric observation means at least one of the blocking readiness
+/// checks is still failing. Cached values remain visible while its retry gate
+/// is closed, so the published status does not flap to an invented success.
+/// Healthy sources are also rechecked on a slower cadence; publication remains
+/// fast without making every node repeatedly fork/process/network-probe the same
+/// stable state.
+fn fabric_probe_failed(probe: &BootProbe) -> bool {
+    !probe.nebula_up
+        || probe.overlay_ip.is_empty()
+        || !probe.bus_ok
+        || !probe.qnm_mounted
+        || probe.peer_count == 0
+}
+
+/// Only count peers with an address as failed ping probes. Missing overlay IPs
+/// are a normal boot-pending state and do not justify retrying `ping` sooner.
+fn ping_probe_failed(pings: &[PingResult]) -> bool {
+    pings
+        .iter()
+        .any(|ping| !ping.overlay_ip.is_empty() && ping.rtt_ms.is_none())
+}
+
+fn services_probe_failed(services: &[ServiceProbe]) -> bool {
+    services
+        .iter()
+        .any(|service| !service.active || service.reachable == Some(false))
+}
+
 /// `systemctl is-active <unit>` ⇒ true iff the unit is active.
 fn systemctl_active(unit: &str) -> bool {
     std::process::Command::new("systemctl")
@@ -472,21 +564,92 @@ impl Worker for BootReadinessWorker {
             tracing::debug!("boot_readiness: no bus data dir; worker idle");
             return Ok(());
         };
+        let mut probe_backoff = FailureBackoff::default();
+        let mut ping_backoff = FailureBackoff::default();
+        let mut service_backoff = FailureBackoff::default();
+        let mut cached_probe: Option<BootProbe> = None;
+        let mut cached_pings: Option<Vec<PingResult>> = None;
+        let mut cached_services: Option<Vec<ServiceProbe>> = None;
+
+        // Keep the first full probe batch within the old two-second freshness
+        // deadline, but anchor it to a stable node-specific phase so seats do
+        // not all fork processes and perform network/filesystem work together.
+        // Selecting shutdown during the delay keeps daemon cancellation prompt.
+        let first_delay = INTERVAL.saturating_sub(initial_phase_for(&self.node_id, INTERVAL));
+        tokio::select! {
+            _ = shutdown.wait() => return Ok(()),
+            _ = tokio::time::sleep(first_delay) => {}
+        }
         loop {
-            // The probe + publish are sync (Persist isn't Send); run on a blocking
-            // thread so the async runtime isn't stalled. BOOT-STATUS-2 gathers the
-            // app-daemon liveness + per-peer pings here too (systemctl + `ping`).
-            let probe = self.probe();
-            let pings = self.probe_pings();
+            let now = Instant::now();
+            let probe_due = probe_backoff.due(now);
+            let pings_due = ping_backoff.due(now);
+            let services_due = service_backoff.due(now);
+            let workgroup_root = self.workgroup_root.clone();
+            let node_id = self.node_id.clone();
+            let db_path = self.db_path.clone();
             let bus_root = bus_root.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let services = gather_services();
+            let previous_probe = cached_probe.clone();
+            let previous_pings = cached_pings.clone();
+            let previous_services = cached_services.clone();
+
+            // All probes are synchronous (systemctl, filesystem, TCP, directory,
+            // and `ping`) and must stay off the async executor. Failed groups are
+            // gated by bounded backoff; the cached result still gets published at
+            // the normal cadence while a retry is pending.
+            let result = tokio::task::spawn_blocking(move || {
+                let worker = BootReadinessWorker::new(workgroup_root, node_id, db_path);
+                let probe = if probe_due {
+                    worker.probe()
+                } else {
+                    previous_probe.unwrap_or_default()
+                };
+                let pings = if pings_due {
+                    worker.probe_pings()
+                } else {
+                    previous_pings.unwrap_or_default()
+                };
+                let services = if services_due {
+                    gather_services()
+                } else {
+                    previous_services.unwrap_or_default()
+                };
                 if let Ok(persist) = Persist::open(bus_root) {
                     let snap = build_readiness(&probe, &services, &pings, now_ms());
                     let _ = persist.write(TOPIC, Priority::Default, None, Some(&snap.to_string()));
                 }
+                (probe, pings, services)
             })
             .await;
+
+            match result {
+                Ok((probe, pings, services)) => {
+                    if probe_due {
+                        probe_backoff.record(fabric_probe_failed(&probe), now);
+                        cached_probe = Some(probe);
+                    }
+                    if pings_due {
+                        ping_backoff.record(ping_probe_failed(&pings), now);
+                        cached_pings = Some(pings);
+                    }
+                    if services_due {
+                        service_backoff.record(services_probe_failed(&services), now);
+                        cached_services = Some(services);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "boot_readiness: blocking probe batch failed");
+                    if probe_due {
+                        probe_backoff.record(true, now);
+                    }
+                    if pings_due {
+                        ping_backoff.record(true, now);
+                    }
+                    if services_due {
+                        service_backoff.record(true, now);
+                    }
+                }
+            }
             tokio::select! {
                 _ = shutdown.wait() => break,
                 () = tokio::time::sleep(INTERVAL) => {}
@@ -502,6 +665,80 @@ mod tests {
 
     fn val(v: &serde_json::Value, i: usize, k: &str) -> String {
         v["steps"][i][k].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn failed_probe_backoff_is_exponential_and_bounded() {
+        assert_eq!(failure_backoff_delay(0), Duration::from_secs(4));
+        assert_eq!(failure_backoff_delay(1), Duration::from_secs(8));
+        assert_eq!(failure_backoff_delay(2), Duration::from_secs(16));
+        assert_eq!(failure_backoff_delay(3), Duration::from_secs(32));
+        assert_eq!(failure_backoff_delay(4), FAILURE_BACKOFF_MAX);
+        assert_eq!(failure_backoff_delay(100), FAILURE_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn successful_probe_resets_failed_probe_backoff() {
+        let now = Instant::now();
+        let mut backoff = FailureBackoff::default();
+        assert!(backoff.due(now));
+
+        backoff.record(true, now);
+        assert!(!backoff.due(now + Duration::from_secs(3)));
+        assert!(backoff.due(now + FAILURE_BACKOFF_INITIAL));
+
+        backoff.record(true, now + FAILURE_BACKOFF_INITIAL);
+        backoff.record(false, now + Duration::from_secs(12));
+        assert!(!backoff.due(now + Duration::from_secs(12)));
+        assert!(backoff.due(now + Duration::from_secs(22)));
+
+        backoff.record(true, now + Duration::from_secs(22));
+        assert_eq!(backoff.retry_at, Some(now + Duration::from_secs(26)));
+    }
+
+    #[test]
+    fn only_actual_failed_blocking_probes_trigger_backoff() {
+        assert!(!ping_probe_failed(&[PingResult {
+            peer: "pending".into(),
+            overlay_ip: String::new(),
+            role: "peer".into(),
+            rtt_ms: None,
+        }]));
+        assert!(ping_probe_failed(&[PingResult {
+            peer: "offline".into(),
+            overlay_ip: "10.42.0.9".into(),
+            role: "peer".into(),
+            rtt_ms: None,
+        }]));
+
+        assert!(!services_probe_failed(&[ServiceProbe {
+            id: "musicd",
+            label: "Music daemon",
+            active: true,
+            reachable: None,
+        }]));
+        assert!(services_probe_failed(&[ServiceProbe {
+            id: "netdata",
+            label: "Live metrics",
+            active: true,
+            reachable: Some(false),
+        }]));
+    }
+
+    #[test]
+    fn initial_phase_is_stable_bounded_and_preserves_probe_deadline() {
+        let phase = initial_phase_for("peer:seat15", INTERVAL);
+        assert_eq!(phase, initial_phase_for("peer:seat15", INTERVAL));
+        assert!(phase <= MAX_INITIAL_PHASE);
+        assert_ne!(phase, initial_phase_for("peer:seat16", INTERVAL));
+
+        let first_delay = INTERVAL.saturating_sub(phase);
+        assert!(first_delay <= INTERVAL);
+        assert!(first_delay >= INTERVAL - MAX_INITIAL_PHASE);
+        assert_eq!(initial_phase_for("", INTERVAL), Duration::ZERO);
+
+        let short_interval = Duration::from_millis(100);
+        assert!(initial_phase_for("peer:seat15", short_interval) <= short_interval);
     }
 
     #[test]

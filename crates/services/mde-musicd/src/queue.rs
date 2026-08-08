@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Version of the durable queue envelope. Legacy bare `Queue` JSON is still
+/// read and rewritten into this envelope without dropping usable entries.
+pub const QUEUE_SCHEMA_VERSION: u16 = 1;
+
 /// An ordered playback queue with a current-track cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queue {
@@ -24,6 +28,12 @@ pub struct Queue {
     /// clamped into range by the accessors.
     #[serde(default)]
     pub current: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueueFileV1 {
+    schema_version: u16,
+    queue: Queue,
 }
 
 impl Queue {
@@ -40,6 +50,24 @@ impl Queue {
         } else {
             let at = (self.current + 1).min(self.songs.len());
             self.songs.insert(at, song_id.into());
+        }
+    }
+
+    /// Select an existing entry or append and select a new one.
+    ///
+    /// This is the single queue-authority seam used by typed resume actions:
+    /// callers cannot mutate the cursor and list independently, and the
+    /// returned flag tells the caller whether the durable queue changed.
+    pub fn select_or_enqueue(&mut self, song_id: impl Into<String>) -> bool {
+        let song_id = song_id.into();
+        if let Some(index) = self.songs.iter().position(|entry| entry == &song_id) {
+            let changed = self.current != index;
+            self.current = index;
+            changed
+        } else {
+            self.songs.push(song_id);
+            self.current = self.songs.len() - 1;
+            true
         }
     }
 
@@ -184,10 +212,17 @@ pub fn queue_path() -> PathBuf {
 /// queue is rebuildable, never a hard error).
 #[must_use]
 pub fn read_from(path: &Path) -> Queue {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(text) = std::fs::read_to_string(path).ok() else {
+        return Queue::default();
+    };
+    if let Ok(envelope) = serde_json::from_str::<QueueFileV1>(&text) {
+        if envelope.schema_version == QUEUE_SCHEMA_VERSION {
+            return envelope.queue;
+        }
+    }
+    // Version-zero migration: preserve the old queue and let the next mutation
+    // rewrite it using the bounded versioned envelope.
+    serde_json::from_str(&text).unwrap_or_default()
 }
 
 /// Write the queue to `path`, creating the parent dir.
@@ -198,9 +233,37 @@ pub fn write_to(path: &Path, queue: &Queue) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(queue)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_string_pretty(&QueueFileV1 {
+        schema_version: QUEUE_SCHEMA_VERSION,
+        queue: queue.clone(),
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, json)
+}
+
+/// Return the deterministic compare-and-swap revision for a queue.
+///
+/// The revision is derived from the complete ordered queue and cursor rather
+/// than process-local time, so a restarted daemon preserves the same
+/// precondition for typed Bus mutations.
+#[must_use]
+pub fn revision(queue: &Queue) -> u64 {
+    // FNV-1a is used only as a bounded optimistic-concurrency token; the
+    // authenticated action envelope remains the security boundary.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in queue.current.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in queue
+        .songs
+        .iter()
+        .flat_map(|song| song.as_bytes().iter().copied().chain(std::iter::once(0)))
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -257,6 +320,16 @@ mod tests {
     }
 
     #[test]
+    fn revision_changes_with_order_and_cursor_and_survives_clone() {
+        let first = q(&["a", "b"], 0);
+        let reordered = q(&["b", "a"], 0);
+        let moved = q(&["a", "b"], 1);
+        assert_ne!(revision(&first), revision(&reordered));
+        assert_ne!(revision(&first), revision(&moved));
+        assert_eq!(revision(&first), revision(&first.clone()));
+    }
+
+    #[test]
     fn enqueue_and_current() {
         let mut q = Queue::default();
         assert!(q.current().is_none());
@@ -298,6 +371,21 @@ mod tests {
     }
 
     #[test]
+    fn select_or_enqueue_keeps_cursor_and_list_atomic() {
+        let mut queue = Queue {
+            songs: vec!["a".into(), "b".into()],
+            current: 0,
+        };
+        assert!(queue.select_or_enqueue("b"));
+        assert_eq!(queue.current(), Some("b"));
+        assert_eq!(queue.songs, ["a", "b"]);
+        assert!(!queue.select_or_enqueue("b"));
+        assert!(queue.select_or_enqueue("c"));
+        assert_eq!(queue.current(), Some("c"));
+        assert_eq!(queue.songs, ["a", "b", "c"]);
+    }
+
+    #[test]
     fn clear_resets() {
         let mut q = Queue::default();
         q.enqueue("a");
@@ -333,5 +421,20 @@ mod tests {
     fn read_absent_is_empty() {
         let dir = tempdir().unwrap();
         assert_eq!(read_from(&dir.path().join("none.json")), Queue::default());
+    }
+
+    #[test]
+    fn legacy_queue_migrates_without_losing_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&q(&["source/song"], 0)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_from(&path).current(), Some("source/song"));
+        write_to(&path, &read_from(&path)).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("schema_version"));
     }
 }

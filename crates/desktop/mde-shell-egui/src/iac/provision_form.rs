@@ -11,9 +11,9 @@
 use mde_egui::egui::{self, Color32, Response, RichText};
 use mde_egui::{card, field, section, Style, TypographyRole};
 
-use mackes_mesh_types::cloud::WorkloadSpec;
+use mackes_mesh_types::cloud::{StoragePool, WorkloadSpec};
 
-use super::{DeliveryView, WorkloadsState};
+use super::{DeliveryView, ProvisionProgress, WorkloadsState};
 
 /// The provision form's own draft spec (U15 owns these fields). Defaults size a
 /// modest VM; the operator tunes them before authoring.
@@ -27,6 +27,8 @@ pub(super) struct State {
     memory_mb: u32,
     /// Root disk in GiB.
     disk_gb: u32,
+    /// Host-local VM/container storage target selected in Deployment.
+    storage_pool: StoragePool,
     /// The base image name; blank = the delivery type's golden default (`None`).
     image: String,
     /// Whether the workload gets its own isolated network segment.
@@ -42,6 +44,7 @@ impl Default for State {
             vcpu: 2,
             memory_mb: 4096,
             disk_gb: 40,
+            storage_pool: StoragePool::default(),
             image: String::new(),
             network_isolation: false,
             raw_hcl: String::new(),
@@ -50,6 +53,24 @@ impl Default for State {
 }
 
 impl State {
+    /// Stable identity for the exact draft governed by the guided-flow
+    /// milestones. Changing any authoring input invalidates the prior plan.
+    pub(super) fn workflow_key(&self, view: DeliveryView, node: &str) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}",
+            view,
+            node.trim(),
+            self.name.trim(),
+            self.vcpu,
+            self.memory_mb,
+            self.disk_gb,
+            self.storage_pool,
+            self.image.trim(),
+            self.network_isolation,
+            self.raw_hcl.trim()
+        )
+    }
+
     /// Author the wire [`WorkloadSpec`] from the draft, for `view`'s delivery type
     /// on `node`. Blank image / raw-HCL fold to `None` (the honest "unset" — a
     /// golden default / pure-form authoring), and the name is trimmed.
@@ -61,6 +82,7 @@ impl State {
             vcpu: self.vcpu,
             memory_mb: self.memory_mb,
             disk_gb: self.disk_gb,
+            storage_pool: self.storage_pool,
             image: non_empty(&self.image),
             image_digest: None,
             network_isolation: self.network_isolation,
@@ -133,6 +155,10 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 
     let valid = state.form.is_valid();
     let live_apply_available = state.selected_node_apply_armed();
+    let draft_key = state.form.workflow_key(view, &node);
+    state.sync_provision_draft(draft_key);
+    let progress = state.provision_progress();
+    let request_pending = state.mutation_is_pending();
     provision_target_summary(ui, view, &node, live_apply_available);
     ui.add_space(Style::SP_S);
 
@@ -148,6 +174,8 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         &mut state.form,
         valid,
         live_apply_available,
+        progress,
+        request_pending,
         &mut set_desired,
         &mut plan,
         &mut provision,
@@ -178,61 +206,35 @@ fn provision_workspace(
     form: &mut State,
     valid: bool,
     live_apply_available: bool,
+    progress: ProvisionProgress,
+    request_pending: bool,
     set_desired: &mut bool,
     plan: &mut bool,
     provision: &mut bool,
     android_prepare: &mut bool,
 ) {
-    let width = ui.available_width();
-    if width >= 760.0 {
-        ui.horizontal_top(|ui| {
-            let total = ui.available_width();
-            let left_w = (total * 0.58).clamp(420.0, (total - 300.0).max(420.0));
-            ui.vertical(|ui| {
-                ui.set_width(left_w);
-                provision_editor(ui, form);
-            });
-            ui.add_space(Style::SP_S);
-            ui.vertical(|ui| {
-                ui.set_min_width((total - left_w - Style::SP_M).max(280.0));
-                sticky_action_tray(ui, view, valid, live_apply_available, true, |ui| {
-                    provision_action_controls(
-                        ui,
-                        view,
-                        valid,
-                        live_apply_available,
-                        set_desired,
-                        plan,
-                        provision,
-                        android_prepare,
-                    );
-                });
-                ui.add_space(Style::SP_S);
-                hcl_override_section(ui, form, true);
-                ui.add_space(Style::SP_S);
-                validation_section(ui, form, live_apply_available, true);
-            });
-        });
-    } else {
-        provision_editor(ui, form);
-        ui.add_space(Style::SP_S);
-        hcl_override_section(ui, form, false);
-        ui.add_space(Style::SP_S);
-        validation_section(ui, form, live_apply_available, false);
-        ui.add_space(Style::SP_S);
-        sticky_action_tray(ui, view, valid, live_apply_available, false, |ui| {
-            provision_action_controls(
-                ui,
-                view,
-                valid,
-                live_apply_available,
-                set_desired,
-                plan,
-                provision,
-                android_prepare,
-            );
-        });
-    }
+    guided_progress(ui, progress, valid);
+    ui.add_space(Style::SP_S);
+    next_step_panel(ui, |ui| {
+        provision_action_controls(
+            ui,
+            view,
+            valid,
+            live_apply_available,
+            progress,
+            request_pending,
+            set_desired,
+            plan,
+            provision,
+            android_prepare,
+        );
+    });
+    ui.add_space(Style::SP_S);
+    provision_editor(ui, form);
+    ui.add_space(Style::SP_S);
+    hcl_override_section(ui, form, false);
+    ui.add_space(Style::SP_S);
+    validation_section(ui, form, live_apply_available, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,39 +243,88 @@ fn provision_action_controls(
     view: DeliveryView,
     valid: bool,
     live_apply_available: bool,
+    progress: ProvisionProgress,
+    request_pending: bool,
     set_desired: &mut bool,
     plan: &mut bool,
     provision: &mut bool,
     android_prepare: &mut bool,
 ) {
-    if action_button(ui, valid, "Set desired", Style::ACCENT_WORKLOADS).clicked() {
-        *set_desired = true;
-    }
-    ui.add_space(Style::SP_S);
-    if action_button(ui, valid, "Plan", Style::ACCENT).clicked() {
-        *plan = true;
-    }
-    ui.add_space(Style::SP_S);
-    if action_button(
-        ui,
-        live_provision_enabled(valid, live_apply_available),
-        "Provision\u{2026}",
-        Style::DANGER,
-    )
-    .clicked()
-    {
-        *provision = true;
-    }
-    if view == DeliveryView::AndroidVm
-        && action_button(
+    if request_pending {
+        mde_egui::muted_note(
             ui,
-            true,
-            "Prepare Android VM\u{2026}",
-            Style::ACCENT_WORKLOADS,
-        )
-        .clicked()
-    {
-        *android_prepare = true;
+            "Waiting for the cloud backend. This step remains active until its typed result returns.",
+        );
+        return;
+    }
+
+    match progress {
+        ProvisionProgress::Draft => {
+            let (label, detail) = if view == DeliveryView::AndroidVm {
+                (
+                    "Prepare Android VM\u{2026}",
+                    "Step 3 of 5 — save the governed Cuttlefish desired state.",
+                )
+            } else {
+                (
+                    "Save desired state\u{2026}",
+                    "Step 3 of 5 — save this workload draft before planning it.",
+                )
+            };
+            mde_egui::muted_note(ui, detail);
+            if action_button(ui, valid, label, Style::ACCENT_WORKLOADS).clicked() {
+                if view == DeliveryView::AndroidVm {
+                    *android_prepare = true;
+                } else {
+                    *set_desired = true;
+                }
+            }
+        }
+        ProvisionProgress::DesiredSaved => {
+            mde_egui::muted_note(
+                ui,
+                "Step 4 of 5 — run the required dry-run plan. Nothing is applied.",
+            );
+            if action_button(ui, valid, "Run dry-run plan", Style::ACCENT).clicked() {
+                *plan = true;
+            }
+        }
+        ProvisionProgress::Planned => {
+            mde_egui::muted_note(
+                ui,
+                "Step 5 of 5 — review and apply the plan to the selected node.",
+            );
+            if action_button(
+                ui,
+                live_provision_enabled(valid, live_apply_available),
+                "Provision live\u{2026}",
+                Style::DANGER,
+            )
+            .clicked()
+            {
+                *provision = true;
+            }
+            if !live_apply_available {
+                mde_egui::muted_note(
+                    ui,
+                    "Live apply is unavailable because this node currently reports plan-only.",
+                );
+            }
+        }
+        ProvisionProgress::Applied => {
+            ui.colored_label(
+                Style::ACCENT,
+                RichText::new("✓ Provisioning complete")
+                    .size(Style::BODY)
+                    .strong(),
+            );
+        }
+    }
+    if !live_apply_available && progress < ProvisionProgress::Applied {
+        mde_egui::muted_note(
+            ui,
+            "Plan-only node: desired state and dry-run are available; live provision will remain disabled.",
+        );
     }
 }
 
@@ -409,6 +460,26 @@ fn provision_editor(ui: &mut egui::Ui, form: &mut State) {
                 .size(Style::SMALL)
                 .color(Style::TEXT),
         );
+        labelled(ui, "Storage", |ui| {
+            egui::ComboBox::from_id_salt("provision-storage-pool")
+                .selected_text(form.storage_pool.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut form.storage_pool,
+                        StoragePool::LocalXfs,
+                        StoragePool::LocalXfs.label(),
+                    );
+                    ui.selectable_value(
+                        &mut form.storage_pool,
+                        StoragePool::DefaultLibvirt,
+                        StoragePool::DefaultLibvirt.label(),
+                    );
+                });
+        });
+        mde_egui::muted_note(
+            ui,
+            "Local XFS stores VM disks and container data on the host's dedicated /var/lib/mde-vms partition.",
+        );
     });
 }
 
@@ -519,76 +590,60 @@ fn validation_row(ui: &mut egui::Ui, ok: bool, label: &str, detail: &str) {
     });
 }
 
-fn sticky_action_tray(
-    ui: &mut egui::Ui,
-    view: DeliveryView,
-    valid: bool,
-    live_apply_available: bool,
-    compact: bool,
-    add_actions: impl FnOnce(&mut egui::Ui),
-) {
+/// Always-visible map of the one shared provisioning sequence. It replaces the
+/// unrelated-looking "Sticky actions" tray with an explicit ordered contract.
+fn guided_progress(ui: &mut egui::Ui, progress: ProvisionProgress, valid: bool) {
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Guided provisioning")
+                .size(Style::BODY)
+                .strong()
+                .color(Style::TEXT),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for (index, (label, complete)) in [
+                ("Placement", true),
+                ("Workload details", valid),
+                ("Desired state", progress >= ProvisionProgress::DesiredSaved),
+                ("Dry-run plan", progress >= ProvisionProgress::Planned),
+                ("Live provision", progress >= ProvisionProgress::Applied),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index > 0 {
+                    ui.label(RichText::new("→").color(Style::TEXT_DIM));
+                }
+                let tone = if complete { Style::ACCENT } else { Style::TEXT_DIM };
+                ui.label(
+                    RichText::new(format!("{} {label}", index + 1))
+                        .size(Style::SMALL)
+                        .strong()
+                        .color(tone),
+                );
+            }
+        });
+        mde_egui::muted_note(
+            ui,
+            "Complete the highlighted sequence in order. Only the next valid action is offered below.",
+        );
+    });
+}
+
+/// The single next action, placed in document order after validation. Only one
+/// primary control is shown so navigation labels cannot be mistaken for work.
+fn next_step_panel(ui: &mut egui::Ui, add_action: impl FnOnce(&mut egui::Ui)) {
     ui.scope(|ui| {
         ui.visuals_mut().widgets.noninteractive.bg_fill = Style::SURFACE_HI;
         card().show(ui, |ui| {
-            if compact {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("Sticky actions")
-                            .size(Style::SMALL)
-                            .strong()
-                            .color(Style::TEXT_DIM),
-                    );
-                    add_actions(ui);
-                    if !valid {
-                        ui.label(
-                            RichText::new("A workload name is required.")
-                                .size(Style::SMALL)
-                                .color(Style::DANGER),
-                        );
-                    } else if !live_apply_available {
-                        ui.label(
-                            RichText::new(
-                                "Provision is disabled because the selected node is plan-only.",
-                            )
-                            .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
-                        );
-                    }
-                });
-                return;
-            }
             ui.label(
-                RichText::new("Sticky actions")
-                    .size(Style::SMALL)
+                RichText::new("Next step")
+                    .size(Style::BODY)
                     .strong()
-                    .color(Style::TEXT_DIM),
+                    .color(Style::ACCENT_WORKLOADS),
             );
-            ui.horizontal_wrapped(add_actions);
-            mde_egui::muted_note(
-                ui,
-                "Set desired persists the spec; Plan is a dry-run (counts only); Provision opens a \
-                 typed review sheet before any live apply.",
-            );
-            if !valid {
-                mde_egui::muted_note(
-                    ui,
-                    "A workload name is required before any action can publish.",
-                );
-            } else if !live_apply_available {
-                mde_egui::muted_note(
-                    ui,
-                    "Provision is disabled because the selected node is plan-only or no longer \
-                     reports an armed-apply capability.",
-                );
-            }
-            if view == DeliveryView::AndroidVm {
-                mde_egui::muted_note(
-                    ui,
-                    "Prepare Android VM uses the dedicated android-provision contract and saves a \
-                     Cuttlefish-sized desired spec; it does not claim the VM is live until \
-                     Provision runs.",
-                );
-            }
+            ui.add_space(Style::SP_XS);
+            add_action(ui);
         });
     });
 }

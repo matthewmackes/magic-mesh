@@ -787,6 +787,11 @@ pub enum JellyfinError {
     /// The response body was not the expected JSON shape.
     #[error("jellyfin response parse error: {0}")]
     Parse(String),
+    /// A stream/download endpoint answered successfully but supplied no media
+    /// bytes.  An empty successful response is not a playable offline title and
+    /// must not be admitted to the cache.
+    #[error("jellyfin media response was empty")]
+    EmptyMedia,
     /// A browse call was made before a `UserId` was set (no saved auth).
     #[error("jellyfin client is not authenticated (no UserId)")]
     NotAuthenticated,
@@ -1294,8 +1299,10 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// network.
     ///
     /// # Errors
-    /// [`JellyfinError::Transport`] on a connect / read failure, or
-    /// [`JellyfinError::Http`] on a non-2xx status.
+    /// [`JellyfinError::Transport`] on a connect / read failure,
+    /// [`JellyfinError::Http`] on a non-2xx status, or
+    /// [`JellyfinError::EmptyMedia`] when a successful response contains no
+    /// media bytes.
     pub fn download(&self, url: &str) -> Result<Vec<u8>, JellyfinError> {
         self.require_action(JellyfinAction::Stream)?;
         let headers = vec![(
@@ -1310,6 +1317,9 @@ impl<T: HttpTransport> JellyfinClient<T> {
             return Err(JellyfinError::Http {
                 status: response.status,
             });
+        }
+        if response.body.is_empty() {
+            return Err(JellyfinError::EmptyMedia);
         }
         Ok(response.body)
     }
@@ -1556,5 +1566,29 @@ mod tests {
             .download("https://j.mesh/Videos/x/stream")
             .expect_err("404");
         assert!(matches!(err, JellyfinError::Http { status: 404 }));
+    }
+
+    #[test]
+    fn download_rejects_an_empty_success_before_offline_cache_admission() {
+        use crate::net::{HttpResponse, HttpTransport, TransportError};
+
+        // A provider-side interruption can produce a successful status with no
+        // payload.  It must not be mistaken for a valid zero-byte media file.
+        struct EmptyMedia;
+        impl HttpTransport for EmptyMedia {
+            fn execute(&self, _request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: Vec::new(),
+                })
+            }
+        }
+
+        let client =
+            JellyfinClient::new("https://j.mesh", device(), EmptyMedia).with_auth("T", "u");
+        let err = client
+            .download("https://j.mesh/Videos/x/stream")
+            .expect_err("empty media must not be admitted");
+        assert!(matches!(err, JellyfinError::EmptyMedia));
     }
 }

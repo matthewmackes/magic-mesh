@@ -10,7 +10,7 @@
 //!
 //! This lens emits the [`VERB_IMAGE_BUILD`] verb through the cockpit's preserved
 //! emit path (the same `issue` seam the provision lens uses) for `build` /
-//! `promote`; a live build/promote requires exact typed confirmation and a
+//! `promote`; a live build/promote requires an explicit Yes/No review and a
 //! target/body-bound token minted by the root DRM shell.
 //!
 //! The roster itself is sourced from the `image-build` `list` reply. Because the
@@ -27,7 +27,6 @@ use mde_egui::{carbon_icon, Style};
 use mackes_mesh_types::cloud::{
     CloudReply as WireCloudReply, DeliveryType, ImageRow, VERB_IMAGE_BUILD,
 };
-use mde_bus::rpc::reply_topic;
 
 use super::{row_button, WorkloadsState};
 
@@ -259,7 +258,7 @@ fn advance(state: &mut WorkloadsState) {
     else {
         return;
     };
-    if let Some(reply) = read_reply(state, &ulid) {
+    if let Some(reply) = state.read_wire_reply(&ulid) {
         state.images.roster_req = None;
         if let Some(rows) = reply.images {
             state.images.status = Some(format!("Resolved {} golden image(s).", rows.len()));
@@ -279,17 +278,6 @@ fn advance(state: &mut WorkloadsState) {
                 .to_string(),
         );
     }
-}
-
-/// Read the wire cloud reply on `reply/<ulid>` off the Bus, if one has landed —
-/// the full-payload [`WireCloudReply`] (carrying `images`), which the shell's own
-/// lean mutation mirror deliberately drops. Returns owned data so the immutable
-/// Bus borrow ends before the caller writes the result back.
-fn read_reply(state: &WorkloadsState, ulid: &str) -> Option<WireCloudReply> {
-    let persist = state.persist()?;
-    let msgs = persist.list_since(&reply_topic(ulid), None).ok()?;
-    let body = msgs.first()?.body.as_deref()?;
-    serde_json::from_str(body).ok()
 }
 
 /// The lens header card — the Workloads-accent glyph, the title, and the honest
@@ -407,7 +395,7 @@ fn build_controls(ui: &mut egui::Ui, state: &mut WorkloadsState) -> Option<Image
         });
         mde_egui::muted_note(
             ui,
-            "Build and promote open exact typed confirmation. The root DRM shell then mints \
+            "Build and promote open a Yes/No review. The root DRM shell then mints \
              a single-use capability bound to the selected node and frozen request.",
         );
     });

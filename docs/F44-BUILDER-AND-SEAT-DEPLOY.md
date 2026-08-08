@@ -1,8 +1,8 @@
 # F44 builder + physical-seat deploy (ffmpeg soname epoch skew)
 
 > **CURRENT DEPLOYMENT AUTHORITY — 2026-08-03:** the Fedora 44 Workstation
-> target is exactly five physical seats: T480 `172.20.146.138`, Eagle
-> `172.20.146.145`, Basement seat 15 `172.20.0.15`, Dell `172.20.146.225`, and
+> target is exactly five physical seats: T480 `172.20.146.68`, Eagle
+> `172.20.146.88`, Basement seat 15 `172.20.0.15`, Dell `172.20.146.225`, and
 > Microsoft Surface `172.20.146.79`. Their current overlay assignments are in
 > §2 and §7. The earlier `.13`, `.2`, and `.216` seat addresses and the July
 > mesh map are historical and **must not be used for deployment**. Reconcile
@@ -66,8 +66,8 @@ VMs. This is the canonical target set as of 2026-08-03:
 
 | seat | LAN address | current overlay | deployment notes |
 |---|---:|---:|---|
-| **T480** | `172.20.146.138` | `10.42.0.8` | Direct-DRM seat; current-mesh enrollment corrected on 2026-08-03 |
-| **Eagle** | `172.20.146.145` | `10.42.0.6` | T470S Workstation; exclude from bench testing, but include in fleet deployment |
+| **T480** | `172.20.146.68` | `10.42.0.8` | Direct-DRM seat; DHCP address observed 2026-08-04; current-mesh enrollment corrected on 2026-08-03 |
+| **Eagle** | `172.20.146.88` | `10.42.0.6` | T470S Workstation; DHCP address observed 2026-08-04; exclude from bench testing, but include in fleet deployment |
 | **Basement seat 15** | `172.20.0.15` | `10.42.0.5` | Low free-space condition; no `/dev/kvm`, so client/non-KVM placement only |
 | **Dell** | `172.20.146.225` | `10.42.0.4` | Preserve its existing Browser VM domain during package deployment |
 | **Microsoft Surface** | `172.20.146.79` | `10.42.0.7` | Distinct from seat 15; current Browser VM baseline exceeds its local capacity |
@@ -182,8 +182,12 @@ systemd-devel`); if you hit it on an older builder, `dnf install -y libinput-dev
 # 1. bake the toolchain (rust 1.94 + mpv-libs-devel + the -devel set):
 ./install-helpers/setup-build-vm-toolchain.sh --host 172.20.0.131 --user mm
 # 2. cut the RPM natively on F44 (xcp-build drives sync + the workspace release,
-#    DRM/live-VDI/media shell relink, and generate-rpm, then pulls the RPM):
-MCNF_BUILD_HOST=172.20.0.131 ./install-helpers/xcp-build.sh rpm
+#    DRM/live-VDI/media shell relink, and generate-rpm, then pulls the RPM).
+#    The explicit target guard is mandatory for a physical-seat artifact: it
+#    rejects an accidental F42 builder before it can create unusable FFmpeg-7
+#    ELF dependencies for Fedora 44's FFmpeg-8 userspace.
+MCNF_BUILD_HOST=172.20.0.131 MCNF_RPM_TARGET_FEDORA=44 \
+  ./install-helpers/xcp-build.sh rpm
 ```
 - Canonical features: `MDE_RPM_SHELL_FEATURES="drm,live-vdi,media-mpv"`,
   `MDE_RPM_LOCKED="--locked"` (`install-helpers/rpm-features.sh`).
@@ -252,9 +256,9 @@ five Workstations report four of four Syncthing folder peers connected.
 |---:|---|---:|
 | `10.42.0.4` | Dell | `172.20.146.225` |
 | `10.42.0.5` | Basement seat 15 | `172.20.0.15` |
-| `10.42.0.6` | Eagle | `172.20.146.145` |
+| `10.42.0.6` | Eagle | `172.20.146.88` |
 | `10.42.0.7` | Surface (`peer:SURFACE`) | `172.20.146.79` |
-| `10.42.0.8` | T480 (`peer:T480`) | `172.20.146.138` |
+| `10.42.0.8` | T480 (`peer:T480`) | `172.20.146.68` |
 
 The current CA SHA-256 recorded on T480, Surface, and the lighthouses is
 `0b359a2378a0407ec824631a153aaaec62485e20f4220061bd3ea383e829bc6c`.

@@ -47,8 +47,11 @@ directory, encrypts it with `systemd-creds`, and installs
 `/etc/credstore.encrypted/cloud-arm-key` mode 0600, then installs
 `LoadCredentialEncrypted` drop-ins for `mackesd.service` and
 `mde-shell-egui.service`. systemd exposes the plaintext only in each unit's
-private read-only `$CREDENTIALS_DIRECTORY`. Missing, malformed, unsealed, or
-non-root access fails closed; it never falls back to an environment variable.
+private read-only `$CREDENTIALS_DIRECTORY`. The boot-time `--refresh` mode
+stages the drop-ins and reloads systemd without restarting a live daemon or
+seat; use the explicit `--restart` form when you have scheduled a controlled
+restart. Missing, malformed, unsealed, or non-root access fails closed; it
+never falls back to an environment variable.
 
 Always check the operation result:
 

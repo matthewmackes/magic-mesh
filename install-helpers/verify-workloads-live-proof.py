@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Workloads live evidence collector for WL-ARCH-007.
+"""Read-only Workloads live evidence collector for WL-ARCH-010.
 
 This helper is deliberately a verifier, not an actuator.  It never publishes Bus
 messages, never calls mutating `virsh`/`podman`/`systemctl` verbs, and never reads
@@ -45,30 +45,109 @@ DEFAULT_CREDENTIAL_PATH = Path("/etc/credstore.encrypted/cloud-arm-key")
 DEFAULT_LIBVIRT_URI = "qemu:///system"
 DEFAULT_NETWORK = "default"
 DEFAULT_POOL = "mde-vms"
+DEFAULT_ROLE_PATH = Path("/var/lib/mde/role.toml")
 
 CLOUD_PREFIX = "state/cloud/"
-VM_LIFECYCLE_ACTION_TOPIC = "action/vm/lifecycle"
-VM_INSTANCES_TOPIC = "event/vm/instances"
+WORKLOAD_OPERATION_TOPIC = "action/workload/operation"
 ONBOARD_APPLY_ACTION_TOPIC = "action/onboard/apply"
 ONBOARD_APPLY_EVENT_TOPIC = "event/onboard/apply"
-VM_LIFECYCLE_MUTATION_OPS = {
-    "attach_usb",
-    "create",
-    "destroy",
-    "detach_usb",
-    "pause",
-    "resume",
+WORKLOAD_OPERATION_ACTIONS = {
+    "start_and_attach",
     "start",
     "stop",
+    "restart",
+    "destroy",
+    "pause",
+    "resume",
+    "open",
+    "reconcile",
+    "cancel",
 }
-VM_LIFECYCLE_ACTION_OPS = VM_LIFECYCLE_MUTATION_OPS | {"refresh"}
 
 MAX_MESSAGE_BYTES = 1_048_576
 MAX_DROPIN_BYTES = 16 * 1024
 MAX_TOPIC_SCAN_ROWS = 256
 REQUIRED_CLOUD_TOOLS = ("opentofu", "ansible", "libvirt")
-LIFECYCLE_ACTION_FUTURE_SKEW_MS = 30 * 1000
+WORKLOAD_OPERATION_FUTURE_SKEW_MS = 30 * 1000
 ONBOARD_ACK_FUTURE_SKEW_MS = 30 * 1000
+WORKLOAD_STATE_PREFIX = "state/workloads/"
+WORKLOAD_STATE_FUTURE_SKEW_MS = 30 * 1000
+WORKLOAD_CONTRACT_SCHEMA_VERSION = 1
+MAX_WORKLOADS_PER_NODE = 256
+MAX_WORKLOAD_IDENTIFIER_BYTES = 128
+MAX_WORKLOAD_TEXT_BYTES = 512
+MAX_WORKLOAD_ATTEMPTS = 32
+
+WORKLOAD_BACKENDS = {"libvirt_virtqemud", "quadlet_systemd"}
+WORKLOAD_PHASES = {
+    "queued",
+    "validating",
+    "admitting",
+    "defining",
+    "starting",
+    "waiting_for_guest",
+    "waiting_for_service",
+    "preparing_display",
+    "waiting_for_first_frame",
+    "ready",
+    "stopping",
+    "completed",
+    "failed",
+    "cancelled",
+}
+WORKLOAD_TERMINAL_PHASES = {"completed", "failed", "cancelled"}
+WORKLOAD_ADMITTED_PHASES = {
+    "admitting",
+    "defining",
+    "starting",
+    "waiting_for_guest",
+    "waiting_for_service",
+    "preparing_display",
+    "waiting_for_first_frame",
+    "ready",
+    "completed",
+}
+WORKLOAD_POWER_STATES = {
+    "defined",
+    "starting",
+    "running",
+    "paused",
+    "stopping",
+    "stopped",
+    "failed",
+}
+WORKLOAD_READINESS = {
+    "unknown",
+    "waiting_for_placement",
+    "waiting_for_guest",
+    "waiting_for_service",
+    "preparing_display",
+    "ready",
+    "degraded",
+    "unavailable",
+    "failed",
+}
+WORKLOAD_HEALTH = {"unknown", "healthy", "degraded", "failed"}
+WORKLOAD_PRESSURE = {"normal", "constrained", "saturated"}
+WORKLOAD_ATTACHMENT_PROTOCOLS = {
+    "qemu_display1_dmabuf",
+    "rdp",
+    "spice",
+    "vnc",
+    "sunshine",
+    "web_rtc",
+    "logs",
+    "terminal",
+    "ports",
+}
+WORKSTATION_ROLE_ALIASES = {
+    "workstation",
+    "full",
+    "xcpng",
+    "xcp-ng",
+    "server",
+    "headless",
+}
 
 BAD_REQUIRED_STATUSES = {"blocked", "error"}
 
@@ -548,29 +627,371 @@ def check_cloud_mirror(args: argparse.Namespace, checks: list[Check]) -> None:
         checks.append(Check("state/cloud mirror", "error" if required else "warn", str(exc), required))
 
 
-def _instance_name(action: dict[str, Any]) -> str:
-    if isinstance(action.get("name"), str):
-        return action["name"]
-    spec = action.get("spec")
-    if isinstance(spec, dict) and isinstance(spec.get("name"), str):
-        return spec["name"]
-    return ""
+def select_workload_topic(
+    bus_root: Path, node: str | None
+) -> tuple[str | None, list[str], list[str]]:
+    """Select one node-scoped typed Workload projection without guessing."""
+    topics = list_topics(bus_root, WORKLOAD_STATE_PREFIX)
+    candidates = node_candidates(node)
+    for candidate in candidates:
+        topic = f"{WORKLOAD_STATE_PREFIX}{candidate}"
+        if topic in topics:
+            return topic, topics, candidates
+    if len(topics) == 1:
+        return topics[0], topics, candidates
+    return None, topics, candidates
 
 
-def _fresh_lifecycle_action_target(
+def _valid_workload_identifier(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value.encode("utf-8")) <= MAX_WORKLOAD_IDENTIFIER_BYTES
+        and all(char.isascii() and (char.isalnum() or char in "-_.:") for char in value)
+    )
+
+
+def _valid_workload_text(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value.encode("utf-8")) <= MAX_WORKLOAD_TEXT_BYTES
+        and not any(ord(char) < 0x20 for char in value)
+    )
+
+
+def _is_workload_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _key_blockers(
+    value: Any, required: set[str], optional: set[str], label: str
+) -> list[str]:
+    if not isinstance(value, dict):
+        return [f"{label} is not an object"]
+    keys = set(value)
+    blockers = [f"{label} missing {key}" for key in sorted(required - keys)]
+    blockers.extend(f"{label} has unknown field {key}" for key in sorted(keys - required - optional))
+    return blockers
+
+
+def _validate_workload_resources(value: Any, label: str) -> list[str]:
+    blockers = _key_blockers(value, {"vcpu", "memory_mb", "disk_gb"}, set(), label)
+    if blockers or not isinstance(value, dict):
+        return blockers
+    bounds = {"vcpu": (1, 64), "memory_mb": (512, 262_144), "disk_gb": (1, 4_096)}
+    for field, (minimum, maximum) in bounds.items():
+        number = value.get(field)
+        if not _is_workload_integer(number) or not minimum <= number <= maximum:
+            blockers.append(f"{label}.{field} is outside the bounded contract")
+    return blockers
+
+
+def _validate_workload_signals(value: Any, label: str) -> list[str]:
+    required = {
+        "guest_agent",
+        "network",
+        "service",
+        "display",
+        "application",
+        "health",
+        "pressure",
+        "progress_percent",
+    }
+    blockers = _key_blockers(value, required, set(), label)
+    if blockers or not isinstance(value, dict):
+        return blockers
+    for field in ("guest_agent", "network", "service", "display", "application"):
+        if value.get(field) not in WORKLOAD_READINESS:
+            blockers.append(f"{label}.{field} is not a known readiness value")
+    if value.get("health") not in WORKLOAD_HEALTH:
+        blockers.append(f"{label}.health is not a known health value")
+    if value.get("pressure") not in WORKLOAD_PRESSURE:
+        blockers.append(f"{label}.pressure is not a known pressure value")
+    progress = value.get("progress_percent")
+    if not _is_workload_integer(progress) or not 0 <= progress <= 100:
+        blockers.append(f"{label}.progress_percent is outside 0..100")
+    return blockers
+
+
+def _validate_workload_attachment(
+    value: Any, status_workload_id: str, now: int, label: str
+) -> list[str]:
+    required = {
+        "schema_version",
+        "lease_id",
+        "nonce",
+        "workload_id",
+        "generation",
+        "protocol",
+        "expires_at_ms",
+    }
+    blockers = _key_blockers(value, required, set(), label)
+    if blockers or not isinstance(value, dict):
+        return blockers
+    if value.get("schema_version") != WORKLOAD_CONTRACT_SCHEMA_VERSION:
+        blockers.append(f"{label}.schema_version is unsupported")
+    for field in ("lease_id", "nonce", "workload_id"):
+        if not _valid_workload_identifier(value.get(field)):
+            blockers.append(f"{label}.{field} is not a bounded identifier")
+    if value.get("workload_id") != status_workload_id:
+        blockers.append(f"{label}.workload_id does not match its status")
+    if value.get("protocol") not in WORKLOAD_ATTACHMENT_PROTOCOLS:
+        blockers.append(f"{label}.protocol is unknown")
+    generation = value.get("generation")
+    if not _is_workload_integer(generation) or generation <= 0:
+        blockers.append(f"{label}.generation is invalid")
+    expires_at_ms = value.get("expires_at_ms")
+    if not _is_workload_integer(expires_at_ms) or expires_at_ms <= now:
+        blockers.append(f"{label}.expires_at_ms is missing or expired")
+    return blockers
+
+
+def _validate_workload_status(status: Any, index: int, now: int) -> list[str]:
+    required = {
+        "schema_version",
+        "request_id",
+        "workload_id",
+        "backend",
+        "resources",
+        "generation",
+        "phase",
+        "power",
+        "readiness",
+        "retryable",
+    }
+    optional = {"image_ref", "signals", "attempt", "next_retry_at_ms", "reason", "remediation", "attachment"}
+    label = f"workloads[{index}]"
+    blockers = _key_blockers(status, required, optional, label)
+    if blockers or not isinstance(status, dict):
+        return blockers
+    if status.get("schema_version") != WORKLOAD_CONTRACT_SCHEMA_VERSION:
+        blockers.append(f"{label}.schema_version is unsupported")
+    for field in ("request_id", "workload_id"):
+        if not _valid_workload_identifier(status.get(field)):
+            blockers.append(f"{label}.{field} is not a bounded identifier")
+    if status.get("backend") not in WORKLOAD_BACKENDS:
+        blockers.append(f"{label}.backend is unknown")
+    blockers.extend(_validate_workload_resources(status.get("resources"), f"{label}.resources"))
+    generation = status.get("generation")
+    if not _is_workload_integer(generation) or generation <= 0:
+        blockers.append(f"{label}.generation is invalid")
+    phase = status.get("phase")
+    if phase not in WORKLOAD_PHASES:
+        blockers.append(f"{label}.phase is unknown")
+    for field, allowed in (
+        ("power", WORKLOAD_POWER_STATES),
+        ("readiness", WORKLOAD_READINESS),
+    ):
+        if status.get(field) not in allowed:
+            blockers.append(f"{label}.{field} is unknown")
+    retryable = status.get("retryable")
+    if not isinstance(retryable, bool):
+        blockers.append(f"{label}.retryable is not boolean")
+    attempt = status.get("attempt", 0)
+    if not _is_workload_integer(attempt) or not 0 <= attempt <= MAX_WORKLOAD_ATTEMPTS:
+        blockers.append(f"{label}.attempt is outside 0..{MAX_WORKLOAD_ATTEMPTS}")
+    next_retry_at_ms = status.get("next_retry_at_ms", 0)
+    if not _is_workload_integer(next_retry_at_ms) or next_retry_at_ms < 0:
+        blockers.append(f"{label}.next_retry_at_ms is invalid")
+    if phase in WORKLOAD_TERMINAL_PHASES and retryable:
+        blockers.append(f"{label} is terminal but marked retryable")
+    if phase in WORKLOAD_TERMINAL_PHASES and next_retry_at_ms:
+        blockers.append(f"{label} is terminal but has a retry schedule")
+    if phase == "failed" and not _valid_workload_text(status.get("reason")):
+        blockers.append(f"{label}.reason is required for failed status")
+    for field in ("reason", "remediation"):
+        value = status.get(field)
+        if value is not None and not _valid_workload_text(value):
+            blockers.append(f"{label}.{field} is not bounded text")
+    image_ref = status.get("image_ref")
+    if image_ref is not None and not _valid_workload_identifier(image_ref):
+        blockers.append(f"{label}.image_ref is not a catalog identifier")
+    if "signals" in status:
+        blockers.extend(_validate_workload_signals(status["signals"], f"{label}.signals"))
+    attachment = status.get("attachment")
+    if attachment is not None:
+        workload_id = status.get("workload_id")
+        blockers.extend(
+            _validate_workload_attachment(
+                attachment,
+                workload_id if isinstance(workload_id, str) else "",
+                now,
+                f"{label}.attachment",
+            )
+        )
+    return blockers
+
+
+def _parse_role_pin(text: str) -> str | None:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        rest = line.removeprefix("role")
+        if rest != line and rest.lstrip().startswith("="):
+            value = rest.lstrip()[1:].strip().strip('"').strip()
+            return value.lower() if value else None
+    return None
+
+
+def check_workload_placement(args: argparse.Namespace, checks: list[Check]) -> None:
+    required = (
+        args.require_all
+        or args.require_workload_placement
+        or args.require_workload_admission
+        or args.require_workload_recovery
+    )
+    path = Path(args.role_path)
+    try:
+        role = _parse_role_pin(_bounded_text(path, MAX_DROPIN_BYTES))
+        if role is None:
+            checks.append(
+                Check("Workload placement role", "blocked" if required else "warn", "role pin is missing or malformed", required)
+            )
+            return
+        if role == "lighthouse":
+            checks.append(
+                Check("Workload placement role", "blocked" if required else "warn", "pinned lighthouse role cannot host Workloads", required, {"role": role, "path": str(path)})
+            )
+            return
+        if role not in WORKSTATION_ROLE_ALIASES:
+            checks.append(
+                Check("Workload placement role", "blocked" if required else "warn", "pinned role is not a Workstation-compatible role", required, {"role": role, "path": str(path)})
+            )
+            return
+        checks.append(
+            Check("Workload placement role", "ok", "pinned role resolves to Workstation; Lighthouse placement is refused", required, {"role": "workstation", "path": str(path)})
+        )
+    except (FileNotFoundError, ProofError, OSError) as exc:
+        checks.append(Check("Workload placement role", "blocked" if required else "warn", str(exc), required))
+
+
+def check_workload_state(args: argparse.Namespace, checks: list[Check]) -> None:
+    required = (
+        args.require_all
+        or args.require_workload_state
+        or args.require_workload_admission
+        or args.require_workload_recovery
+    )
+    bus_root = Path(args.bus_root)
+    try:
+        topic, topics, candidates = select_workload_topic(bus_root, args.node)
+        if topic is None:
+            detail = "no unambiguous state/workloads/<node> projection"
+            if topics:
+                detail += f" for {candidates}; available: {', '.join(topics[:8])}"
+            checks.append(Check("typed Workload state", "blocked" if required else "warn", detail, required))
+            return
+        rows = read_topic_rows(bus_root, topic, 1)
+        if not rows:
+            checks.append(Check("typed Workload state", "blocked" if required else "warn", f"no indexed rows for {topic}", required))
+            return
+        index, _envelope, payload, digest = rows[0]
+        if payload is None:
+            checks.append(Check("typed Workload state", "blocked" if required else "warn", f"{topic} has no JSON body", required))
+            return
+        topic_node = topic.removeprefix(WORKLOAD_STATE_PREFIX)
+        blockers = _key_blockers(payload, {"schema_version", "node", "observed_at_ms", "workloads"}, set(), "snapshot")
+        if payload.get("schema_version") != WORKLOAD_CONTRACT_SCHEMA_VERSION:
+            blockers.append("snapshot.schema_version is unsupported")
+        snapshot_node = payload.get("node")
+        if not _valid_workload_identifier(snapshot_node):
+            blockers.append("snapshot.node is not a bounded identifier")
+        if snapshot_node != topic_node:
+            blockers.append("snapshot.node does not match its node-scoped topic")
+        observed_at_ms = payload.get("observed_at_ms")
+        age_s: float | None = None
+        if not _is_workload_integer(observed_at_ms) or observed_at_ms <= 0:
+            blockers.append("snapshot.observed_at_ms is invalid")
+        else:
+            age_ms = now_ms() - observed_at_ms
+            if age_ms < -WORKLOAD_STATE_FUTURE_SKEW_MS:
+                blockers.append("snapshot.observed_at_ms is too far in the future")
+            age_s = max(0.0, age_ms / 1000.0)
+            if age_s > args.max_workload_age_seconds:
+                blockers.append(f"snapshot stale age={age_s:.1f}s > {args.max_workload_age_seconds}s")
+        workloads = payload.get("workloads")
+        if not isinstance(workloads, list):
+            blockers.append("snapshot.workloads is not a list")
+            workloads = []
+        elif len(workloads) > MAX_WORKLOADS_PER_NODE:
+            blockers.append(f"snapshot.workloads exceeds {MAX_WORKLOADS_PER_NODE}")
+        seen_ids: set[str] = set()
+        admission_count = 0
+        attempted_count = 0
+        retryable_count = 0
+        lease_count = 0
+        workload_summaries: list[str] = []
+        for item, status in enumerate(workloads):
+            blockers.extend(_validate_workload_status(status, item, now_ms()))
+            if not isinstance(status, dict):
+                continue
+            workload_id = status.get("workload_id")
+            if isinstance(workload_id, str):
+                if workload_id in seen_ids:
+                    blockers.append(f"duplicate workload_id {workload_id!r} in snapshot")
+                seen_ids.add(workload_id)
+                workload_summaries.append(f"{workload_id}:{status.get('phase')}")
+            if status.get("phase") in WORKLOAD_ADMITTED_PHASES:
+                admission_count += 1
+            if _is_workload_integer(status.get("attempt", 0)) and status.get("attempt", 0) > 0:
+                attempted_count += 1
+            if status.get("retryable") is True:
+                retryable_count += 1
+            if status.get("attachment") is not None:
+                lease_count += 1
+        if args.expect_workload_id:
+            expected = next(
+                (status for status in workloads if isinstance(status, dict) and status.get("workload_id") == args.expect_workload_id),
+                None,
+            )
+            if expected is None:
+                blockers.append(f"expected workload {args.expect_workload_id!r} absent from snapshot")
+            elif args.expect_workload_phase and expected.get("phase") != args.expect_workload_phase:
+                blockers.append(
+                    f"expected workload phase={expected.get('phase')!r}, expected {args.expect_workload_phase!r}"
+                )
+        elif args.expect_workload_phase:
+            blockers.append("--expect-workload-phase requires --expect-workload-id")
+        if args.require_workload_admission and admission_count == 0:
+            blockers.append("no workload has reached the typed admitting/reconciliation phases")
+        if args.require_workload_recovery and attempted_count == 0:
+            blockers.append("no persisted adapter attempt was observed; restart/recovery is not proven")
+        evidence = {
+            "topic": topic,
+            "ulid": index["ulid"],
+            "sha256": digest,
+            "node": snapshot_node,
+            "age_seconds": round(age_s, 3) if age_s is not None else None,
+            "workload_count": len(workloads),
+            "workloads": workload_summaries[:32],
+            "admission_phase_count": admission_count,
+            "attempted_workload_count": attempted_count,
+            "retryable_workload_count": retryable_count,
+            "attachment_count": lease_count,
+        }
+        if blockers:
+            checks.append(Check("typed Workload state", "blocked" if required else "warn", "; ".join(blockers), required, evidence))
+        else:
+            checks.append(Check("typed Workload state", "ok", f"fresh schema-{WORKLOAD_CONTRACT_SCHEMA_VERSION} projection for {snapshot_node}; bounded fields and node placement verified", required, evidence))
+    except ProofError as exc:
+        checks.append(Check("typed Workload state", "error" if required else "warn", str(exc), required))
+
+
+def _fresh_workload_operation_target(
     args: argparse.Namespace,
     candidates: list[str],
 ) -> tuple[str | None, str | None, dict[str, Any]]:
-    """Return the fresh authorized lifecycle target this proof should correlate."""
-    rows = read_topic_rows(Path(args.bus_root), VM_LIFECYCLE_ACTION_TOPIC, args.bus_scan_limit)
+    """Return the fresh authorized Workload target this proof should correlate."""
+    rows = read_topic_rows(Path(args.bus_root), WORKLOAD_OPERATION_TOPIC, args.bus_scan_limit)
     for index, _envelope, payload, digest in rows:
         if payload is None:
             continue
-        host = payload.get("host")
-        if not isinstance(host, str) or host not in candidates:
+        target_node = payload.get("target_node")
+        if not isinstance(target_node, str) or target_node not in candidates:
             continue
-        op = payload.get("op")
-        name = _instance_name(payload)
+        action = payload.get("action")
+        workload_id = payload.get("workload_id")
         schema = payload.get("schema_version")
         has_token = isinstance(payload.get("armed_token"), str) and bool(payload.get("armed_token"))
         ts_unix_ms = index.get("ts_unix_ms")
@@ -578,25 +999,25 @@ def _fresh_lifecycle_action_target(
             not isinstance(ts_unix_ms, int)
             or schema != 1
             or not has_token
-            or not isinstance(op, str)
-            or op not in VM_LIFECYCLE_ACTION_OPS
-            or not name
+            or not isinstance(action, str)
+            or action not in WORKLOAD_OPERATION_ACTIONS
+            or not _valid_workload_identifier(workload_id)
         ):
             continue
         age_ms = now_ms() - ts_unix_ms
-        if age_ms < -LIFECYCLE_ACTION_FUTURE_SKEW_MS:
+        if age_ms < -WORKLOAD_OPERATION_FUTURE_SKEW_MS:
             continue
-        if max(0.0, age_ms / 1000.0) > args.max_lifecycle_action_age_seconds:
+        if max(0.0, age_ms / 1000.0) > args.max_workload_operation_age_seconds:
             continue
         evidence = {
-            "topic": VM_LIFECYCLE_ACTION_TOPIC,
+            "topic": WORKLOAD_OPERATION_TOPIC,
             "ulid": index["ulid"],
             "sha256": digest,
-            "host": host,
-            "op": op,
-            "target": name,
+            "target_node": target_node,
+            "action": action,
+            "target": workload_id,
         }
-        return name, op, evidence
+        return workload_id, action, evidence
     return None, None, {}
 
 
@@ -755,33 +1176,33 @@ def _matching_onboard_apply_action(
     )
 
 
-def check_lifecycle_action(args: argparse.Namespace, checks: list[Check]) -> None:
-    required = args.require_all or args.require_lifecycle_action
+def check_workload_operation(args: argparse.Namespace, checks: list[Check]) -> None:
+    required = args.require_all or args.require_workload_operation
     bus_root = Path(args.bus_root)
     candidates = node_candidates(args.node)
     try:
-        rows = read_topic_rows(bus_root, VM_LIFECYCLE_ACTION_TOPIC, args.bus_scan_limit)
+        rows = read_topic_rows(bus_root, WORKLOAD_OPERATION_TOPIC, args.bus_scan_limit)
         selected: tuple[dict[str, Any], dict[str, Any], str] | None = None
         for index, _envelope, payload, digest in rows:
             if payload is None:
                 continue
-            host = payload.get("host")
-            if isinstance(host, str) and host in candidates:
+            target_node = payload.get("target_node")
+            if isinstance(target_node, str) and target_node in candidates:
                 selected = (index, payload, digest)
                 break
         if selected is None:
             checks.append(
                 Check(
-                    "vm_lifecycle action",
+                    "typed Workload operation",
                     "blocked" if required else "warn",
-                    f"no retained action/vm/lifecycle message for {candidates}",
+                    f"no retained action/workload/operation message for {candidates}",
                     required,
                 )
             )
             return
         index, payload, digest = selected
-        op = payload.get("op")
-        name = _instance_name(payload)
+        action = payload.get("action")
+        workload_id = payload.get("workload_id")
         schema = payload.get("schema_version")
         has_token = isinstance(payload.get("armed_token"), str) and bool(payload.get("armed_token"))
         ts_unix_ms = index.get("ts_unix_ms")
@@ -791,128 +1212,46 @@ def check_lifecycle_action(args: argparse.Namespace, checks: list[Check]) -> Non
             blockers.append(f"Bus timestamp is not an integer: {ts_unix_ms!r}")
         else:
             age_ms = now_ms() - ts_unix_ms
-            if age_ms < -LIFECYCLE_ACTION_FUTURE_SKEW_MS:
+            if age_ms < -WORKLOAD_OPERATION_FUTURE_SKEW_MS:
                 blockers.append(
                     f"future Bus timestamp age={age_ms / 1000.0:.1f}s "
-                    f"< -{LIFECYCLE_ACTION_FUTURE_SKEW_MS / 1000.0:.0f}s"
+                    f"< -{WORKLOAD_OPERATION_FUTURE_SKEW_MS / 1000.0:.0f}s"
                 )
             age_s = max(0.0, age_ms / 1000.0)
-            if age_s > args.max_lifecycle_action_age_seconds:
+            if age_s > args.max_workload_operation_age_seconds:
                 blockers.append(
-                    f"stale action age={age_s:.1f}s > {args.max_lifecycle_action_age_seconds}s"
+                    f"stale operation age={age_s:.1f}s > {args.max_workload_operation_age_seconds}s"
                 )
         if schema != 1:
             blockers.append(f"schema_version={schema!r}, expected 1")
         if not has_token:
             blockers.append("armed_token missing")
-        if not isinstance(op, str):
-            blockers.append("op missing")
-        elif op not in VM_LIFECYCLE_ACTION_OPS:
-            blockers.append(f"unknown lifecycle op {op!r}")
-        if not name and op != "refresh":
-            blockers.append("target VM name missing")
+        if not isinstance(action, str):
+            blockers.append("action missing")
+        elif action not in WORKLOAD_OPERATION_ACTIONS:
+            blockers.append(f"unknown Workload action {action!r}")
+        if not _valid_workload_identifier(workload_id):
+            blockers.append("workload_id is missing or unbounded")
+        deadline_at_ms = payload.get("deadline_at_ms")
+        if not _is_workload_integer(deadline_at_ms) or deadline_at_ms <= now_ms():
+            blockers.append("deadline_at_ms is missing or expired")
         evidence = {
-            "topic": VM_LIFECYCLE_ACTION_TOPIC,
+            "topic": WORKLOAD_OPERATION_TOPIC,
             "ulid": index["ulid"],
             "sha256": digest,
-            "host": payload.get("host"),
-            "op": op,
-            "target": name,
+            "target_node": payload.get("target_node"),
+            "action": action,
+            "target": workload_id,
             "schema_version": schema,
             "age_seconds": round(age_s, 3) if age_s is not None else None,
             "armed_token": "present-redacted" if has_token else "missing",
         }
         if blockers:
-            checks.append(Check("vm_lifecycle action", "blocked" if required else "warn", "; ".join(blockers), required, evidence))
+            checks.append(Check("typed Workload operation", "blocked" if required else "warn", "; ".join(blockers), required, evidence))
         else:
-            checks.append(Check("vm_lifecycle action", "ok", f"retained authorized {op} for {name or payload.get('host')} (token redacted)", required, evidence))
+            checks.append(Check("typed Workload operation", "ok", f"retained authorized {action} for {workload_id} (token redacted)", required, evidence))
     except ProofError as exc:
-        checks.append(Check("vm_lifecycle action", "error" if required else "warn", str(exc), required))
-
-
-def check_vm_roster(args: argparse.Namespace, checks: list[Check]) -> None:
-    required = args.require_all or args.require_vm_roster
-    bus_root = Path(args.bus_root)
-    candidates = node_candidates(args.node)
-    try:
-        rows = read_topic_rows(bus_root, VM_INSTANCES_TOPIC, args.bus_scan_limit)
-        selected = first_matching_payload(rows, candidates, "host")
-        if selected is None:
-            checks.append(Check("vm_lifecycle roster", "blocked" if required else "warn", f"no event/vm/instances report for {candidates}", required))
-            return
-        index, _envelope, payload, digest = selected
-        published = payload.get("published_at_ms")
-        instances = payload.get("instances") if isinstance(payload.get("instances"), list) else []
-        if not isinstance(published, int):
-            checks.append(Check("vm_lifecycle roster", "blocked" if required else "warn", "roster has no integer published_at_ms", required))
-            return
-        age_s = max(0.0, (now_ms() - published) / 1000.0)
-        names = [
-            f"{item.get('name')}:{item.get('state')}"
-            for item in instances
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        ]
-        inferred_vm: str | None = None
-        inferred_op: str | None = None
-        inferred_action: dict[str, Any] = {}
-        should_correlate_lifecycle = (
-            required
-            and not args.expect_vm
-            and (args.require_all or getattr(args, "require_lifecycle_action", False))
-        )
-        if should_correlate_lifecycle:
-            inferred_vm, inferred_op, inferred_action = _fresh_lifecycle_action_target(
-                args, candidates
-            )
-        blockers: list[str] = []
-        if age_s > args.max_roster_age_seconds:
-            blockers.append(f"stale age={age_s:.1f}s > {args.max_roster_age_seconds}s")
-        expected_vm = args.expect_vm or inferred_vm
-        if expected_vm:
-            found = False
-            for item in instances:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("name") == expected_vm:
-                    found = True
-                    if args.expect_vm_state and item.get("state") != args.expect_vm_state:
-                        blockers.append(
-                            f"{expected_vm} state={item.get('state')!r}, expected {args.expect_vm_state!r}"
-                        )
-                    break
-            if not found:
-                if inferred_vm:
-                    blockers.append(
-                        f"lifecycle action target {inferred_vm!r} absent from roster"
-                    )
-                else:
-                    blockers.append(f"expected VM {expected_vm!r} absent from roster")
-        if args.require_running_vm and not any(
-            isinstance(item, dict) and item.get("state") == "running" for item in instances
-        ):
-            blockers.append("no running VM in roster")
-        evidence = {
-            "topic": VM_INSTANCES_TOPIC,
-            "ulid": index["ulid"],
-            "sha256": digest,
-            "host": payload.get("host"),
-            "age_seconds": round(age_s, 3),
-            "instances": names[:32],
-            "instance_count": len(instances),
-        }
-        if inferred_action:
-            evidence["correlated_lifecycle_action"] = inferred_action
-        if blockers:
-            checks.append(Check("vm_lifecycle roster", "blocked" if required else "warn", "; ".join(blockers), required, evidence))
-        else:
-            detail = f"fresh roster for {payload.get('host')} with {len(instances)} instance(s)"
-            if expected_vm:
-                detail += f"; {expected_vm} observed"
-                if inferred_op:
-                    detail += f" for retained {inferred_op} action"
-            checks.append(Check("vm_lifecycle roster", "ok", detail, required, evidence))
-    except ProofError as exc:
-        checks.append(Check("vm_lifecycle roster", "error" if required else "warn", str(exc), required))
+        checks.append(Check("typed Workload operation", "error" if required else "warn", str(exc), required))
 
 
 def check_onboard_open_broker(args: argparse.Namespace, checks: list[Check]) -> None:
@@ -1144,15 +1483,18 @@ def collect_checks(args: argparse.Namespace) -> list[Check]:
     require_mackesd = (
         args.require_all
         or args.require_cloud_mirror
-        or args.require_vm_roster
-        or args.require_lifecycle_action
+        or args.require_workload_operation
         or args.require_onboard_open_broker
+        or args.require_workload_state
+        or args.require_workload_admission
+        or args.require_workload_recovery
     )
     check_services(args, checks, require_mackesd)
     check_cloud_arm(args, checks)
     check_cloud_mirror(args, checks)
-    check_lifecycle_action(args, checks)
-    check_vm_roster(args, checks)
+    check_workload_placement(args, checks)
+    check_workload_state(args, checks)
+    check_workload_operation(args, checks)
     check_onboard_open_broker(args, checks)
     check_podman(args, checks)
     check_libvirt(args, checks)
@@ -1258,6 +1600,102 @@ def self_test() -> int:
         rows = read_topic_rows(root, "state/cloud/node-a", 1)
         assert rows[0][2] is not None
         assert rows[0][2]["adapter"] == "construct_cloud"
+        workload_ts = now_ms()
+        workload_status = {
+            "schema_version": WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            "request_id": "op-workload-1",
+            "workload_id": "demo-workload",
+            "backend": "libvirt_virtqemud",
+            "resources": {"vcpu": 2, "memory_mb": 4_096, "disk_gb": 32},
+            "image_ref": "fedora:1.0",
+            "generation": 1,
+            "phase": "waiting_for_guest",
+            "power": "starting",
+            "readiness": "waiting_for_guest",
+            "signals": {
+                "guest_agent": "waiting_for_guest",
+                "network": "unknown",
+                "service": "unknown",
+                "display": "unknown",
+                "application": "unknown",
+                "health": "unknown",
+                "pressure": "normal",
+                "progress_percent": 60,
+            },
+            "retryable": True,
+            "attempt": 2,
+            "next_retry_at_ms": workload_ts + 5_000,
+            "reason": "temporary adapter failure",
+            "remediation": "adapter will retry with bounded backoff",
+            "attachment": None,
+        }
+        _write_bus_message(
+            root,
+            f"{WORKLOAD_STATE_PREFIX}node-a",
+            "ZZZWORKLOADSLIVEPROOF0012",
+            {
+                "schema_version": WORKLOAD_CONTRACT_SCHEMA_VERSION,
+                "node": "node-a",
+                "observed_at_ms": workload_ts,
+                "workloads": [workload_status],
+            },
+            workload_ts,
+        )
+        workload_args = argparse.Namespace(
+            require_all=False,
+            require_workload_state=True,
+            require_workload_placement=False,
+            require_workload_admission=True,
+            require_workload_recovery=True,
+            bus_root=str(root),
+            node="node-a",
+            bus_scan_limit=8,
+            max_workload_age_seconds=120.0,
+            expect_workload_id="demo-workload",
+            expect_workload_phase="waiting_for_guest",
+        )
+        workload_checks: list[Check] = []
+        check_workload_state(workload_args, workload_checks)
+        assert workload_checks[0].status == "ok"
+        assert workload_checks[0].evidence["admission_phase_count"] == 1
+        assert workload_checks[0].evidence["attempted_workload_count"] == 1
+        assert workload_checks[0].evidence["node"] == "node-a"
+        workload_bad = dict(workload_status)
+        workload_bad["resources"] = {"vcpu": 65, "memory_mb": 4_096, "disk_gb": 32}
+        _write_bus_message(
+            root,
+            f"{WORKLOAD_STATE_PREFIX}node-a",
+            "ZZZWORKLOADSLIVEPROOF0013",
+            {
+                "schema_version": WORKLOAD_CONTRACT_SCHEMA_VERSION,
+                "node": "peer:node-a",
+                "observed_at_ms": workload_ts,
+                "workloads": [workload_bad],
+            },
+            workload_ts,
+        )
+        workload_checks = []
+        check_workload_state(workload_args, workload_checks)
+        assert workload_checks[0].status == "blocked"
+        assert "snapshot.node does not match" in workload_checks[0].detail
+        assert "resources.vcpu" in workload_checks[0].detail
+        role_path = root / "role.toml"
+        role_path.write_text('role = "workstation"\n', encoding="utf-8")
+        placement_args = argparse.Namespace(
+            require_all=False,
+            require_workload_placement=True,
+            require_workload_admission=False,
+            require_workload_recovery=False,
+            role_path=str(role_path),
+        )
+        placement_checks: list[Check] = []
+        check_workload_placement(placement_args, placement_checks)
+        assert placement_checks[0].status == "ok"
+        role_path.write_text('role = "lighthouse"\n', encoding="utf-8")
+        placement_checks = []
+        check_workload_placement(placement_args, placement_checks)
+        assert placement_checks[0].status == "blocked"
+        assert "cannot host Workloads" in placement_checks[0].detail
         link = root / "state" / "cloud" / "node-a" / "01JWORKLOADSLIVEPROOF0002.json"
         link.symlink_to(root / "state" / "cloud" / "node-a" / "01JWORKLOADSLIVEPROOF0001.json")
         with sqlite3.connect(root / "index.sqlite") as conn:
@@ -1272,138 +1710,76 @@ def self_test() -> int:
             raise AssertionError("symlinked indexed message was accepted")
         except ProofError as exc:
             assert "symlink" in str(exc)
+        operation_base = {
+            "schema_version": 1,
+            "request_id": "proof-operation-1",
+            "workload_id": "demo-workload",
+            "backend": "libvirt_virtqemud",
+            "resources": {"vcpu": 2, "memory_mb": 4_096, "disk_gb": 32},
+            "target_node": "node-a",
+            "expected_generation": 0,
+            "action": "start",
+            "target_request_id": None,
+            "deadline_at_ms": now_ms() + 20_000,
+            "preferred_attachment": None,
+            "armed_token": "super-secret-token",
+        }
         _write_bus_message(
             root,
-            VM_LIFECYCLE_ACTION_TOPIC,
+            WORKLOAD_OPERATION_TOPIC,
             "ZZZWORKLOADSLIVEPROOF0003",
-            {
-                "schema_version": 1,
-                "host": "node-a",
-                "op": "start",
-                "name": "demo-vm",
-                "armed_token": "super-secret-token",
-            },
+            operation_base,
             ts - 200_000,
         )
-        lifecycle_args = argparse.Namespace(
+        operation_args = argparse.Namespace(
             require_all=False,
-            require_lifecycle_action=True,
+            require_workload_operation=True,
             bus_root=str(root),
             node="node-a",
             bus_scan_limit=8,
-            max_lifecycle_action_age_seconds=120.0,
+            max_workload_operation_age_seconds=120.0,
         )
-        lifecycle_checks: list[Check] = []
-        check_lifecycle_action(lifecycle_args, lifecycle_checks)
-        assert lifecycle_checks[0].status == "blocked"
-        assert "stale action age" in lifecycle_checks[0].detail
-        stale_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
+        operation_checks: list[Check] = []
+        check_workload_operation(operation_args, operation_checks)
+        assert operation_checks[0].status == "blocked"
+        assert "stale operation age" in operation_checks[0].detail
+        stale_json = json.dumps(operation_checks[0].to_json(), sort_keys=True)
         assert "super-secret-token" not in stale_json
         assert "present-redacted" in stale_json
+        invalid_operation = dict(operation_base)
+        invalid_operation["request_id"] = "proof-operation-2"
+        invalid_operation["action"] = "teleport"
+        invalid_operation["armed_token"] = "invalid-op-super-secret-token"
         _write_bus_message(
             root,
-            VM_LIFECYCLE_ACTION_TOPIC,
+            WORKLOAD_OPERATION_TOPIC,
             "ZZZWORKLOADSLIVEPROOF0004",
-            {
-                "schema_version": 1,
-                "host": "node-a",
-                "op": "teleport",
-                "name": "demo-vm",
-                "armed_token": "invalid-op-super-secret-token",
-            },
+            invalid_operation,
             now_ms(),
         )
-        lifecycle_checks = []
-        check_lifecycle_action(lifecycle_args, lifecycle_checks)
-        assert lifecycle_checks[0].status == "blocked"
-        assert "unknown lifecycle op" in lifecycle_checks[0].detail
-        invalid_op_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
-        assert "invalid-op-super-secret-token" not in invalid_op_json
-        assert "present-redacted" in invalid_op_json
+        operation_checks = []
+        check_workload_operation(operation_args, operation_checks)
+        assert operation_checks[0].status == "blocked"
+        assert "unknown Workload action" in operation_checks[0].detail
+        invalid_json = json.dumps(operation_checks[0].to_json(), sort_keys=True)
+        assert "invalid-op-super-secret-token" not in invalid_json
+        assert "present-redacted" in invalid_json
+        fresh_operation = dict(operation_base)
+        fresh_operation["request_id"] = "proof-operation-3"
+        fresh_operation["armed_token"] = "new-super-secret-token"
         _write_bus_message(
             root,
-            VM_LIFECYCLE_ACTION_TOPIC,
+            WORKLOAD_OPERATION_TOPIC,
             "ZZZWORKLOADSLIVEPROOF0005",
-            {
-                "schema_version": 1,
-                "host": "node-a",
-                "op": "start",
-                "name": "demo-vm",
-                "armed_token": "new-super-secret-token",
-            },
+            fresh_operation,
             now_ms(),
         )
-        lifecycle_checks = []
-        check_lifecycle_action(lifecycle_args, lifecycle_checks)
-        assert lifecycle_checks[0].status == "ok"
-        fresh_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
+        operation_checks = []
+        check_workload_operation(operation_args, operation_checks)
+        assert operation_checks[0].status == "ok"
+        fresh_json = json.dumps(operation_checks[0].to_json(), sort_keys=True)
         assert "new-super-secret-token" not in fresh_json
         assert "present-redacted" in fresh_json
-        _write_bus_message(
-            root,
-            VM_INSTANCES_TOPIC,
-            "ZZZWORKLOADSLIVEPROOF0006",
-            {
-                "host": "peer:node-a",
-                "published_at_ms": now_ms(),
-                "instances": [{"name": "demo-vm", "state": "running"}],
-            },
-            now_ms(),
-        )
-        roster_args = argparse.Namespace(
-            require_all=False,
-            require_vm_roster=True,
-            require_lifecycle_action=False,
-            bus_root=str(root),
-            node="node-a",
-            bus_scan_limit=8,
-            max_roster_age_seconds=120.0,
-            max_lifecycle_action_age_seconds=120.0,
-            expect_vm="demo-vm",
-            expect_vm_state="running",
-            require_running_vm=True,
-        )
-        roster_checks: list[Check] = []
-        check_vm_roster(roster_args, roster_checks)
-        assert roster_checks[0].status == "ok"
-        assert roster_checks[0].evidence["host"] == "peer:node-a"
-        roster_args.expect_vm = None
-        roster_args.expect_vm_state = None
-        roster_args.require_lifecycle_action = True
-        roster_checks = []
-        check_vm_roster(roster_args, roster_checks)
-        assert roster_checks[0].status == "ok"
-        assert roster_checks[0].evidence["correlated_lifecycle_action"]["target"] == "demo-vm"
-        _write_bus_message(
-            root,
-            VM_INSTANCES_TOPIC,
-            "ZZZWORKLOADSLIVEPROOF0006M",
-            {
-                "host": "peer:node-a",
-                "published_at_ms": now_ms(),
-                "instances": [{"name": "other-vm", "state": "running"}],
-            },
-            now_ms(),
-        )
-        roster_checks = []
-        check_vm_roster(roster_args, roster_checks)
-        assert roster_checks[0].status == "blocked"
-        assert "lifecycle action target 'demo-vm' absent from roster" in roster_checks[0].detail
-        _write_bus_message(
-            root,
-            VM_INSTANCES_TOPIC,
-            "ZZZWORKLOADSLIVEPROOF0006Z",
-            {
-                "host": "peer:node-a",
-                "published_at_ms": now_ms(),
-                "instances": [{"name": "demo-vm", "state": "running"}],
-            },
-            now_ms(),
-        )
-        roster_checks = []
-        check_vm_roster(roster_args, roster_checks)
-        assert roster_checks[0].status == "ok"
-        assert "retained start action" in roster_checks[0].detail
         onboard_args = lambda node: argparse.Namespace(
             require_all=False,
             require_onboard_open_broker=True,
@@ -1522,30 +1898,33 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--node", help="placement node id to match in Bus mirrors (default: hostname candidates)")
     parser.add_argument("--bus-root", default=str(Path(os.environ.get("MDE_BUS_ROOT", str(DEFAULT_BUS_ROOT)))))
     parser.add_argument("--credential-path", default=os.environ.get("MCNF_CLOUD_ARM_CREDENTIAL_PATH", str(DEFAULT_CREDENTIAL_PATH)))
+    parser.add_argument("--role-path", default=os.environ.get("MDE_ROLE_PATH", str(DEFAULT_ROLE_PATH)))
     parser.add_argument("--libvirt-uri", default=os.environ.get("MDE_LIBVIRT_URI", DEFAULT_LIBVIRT_URI))
     parser.add_argument("--libvirt-network", default=DEFAULT_NETWORK)
     parser.add_argument("--libvirt-pool", default=DEFAULT_POOL)
     parser.add_argument("--bootstrap-host", help="optional remote host for a TCP-only SSH reachability proof")
     parser.add_argument("--bootstrap-port", type=int, default=22)
-    parser.add_argument("--expect-vm", help="require this VM name in event/vm/instances")
-    parser.add_argument("--expect-vm-state", help="when --expect-vm is set, require this exact virsh state")
     parser.add_argument("--max-cloud-age-seconds", type=float, default=120.0)
-    parser.add_argument("--max-lifecycle-action-age-seconds", type=float, default=120.0)
+    parser.add_argument("--max-workload-operation-age-seconds", type=float, default=120.0)
     parser.add_argument("--max-onboard-ack-age-seconds", type=float, default=120.0)
-    parser.add_argument("--max-roster-age-seconds", type=float, default=120.0)
+    parser.add_argument("--max-workload-age-seconds", type=float, default=120.0)
     parser.add_argument("--bus-scan-limit", type=int, default=64)
     parser.add_argument("--command-timeout", type=float, default=5.0)
     parser.add_argument("--tcp-timeout", type=float, default=3.0)
     parser.add_argument("--require-all", action="store_true", help="require every live Workloads proof seam this helper can inspect")
     parser.add_argument("--require-cloud-arm", action="store_true")
     parser.add_argument("--require-cloud-mirror", action="store_true")
-    parser.add_argument("--require-lifecycle-action", action="store_true")
-    parser.add_argument("--require-vm-roster", action="store_true")
+    parser.add_argument("--require-workload-operation", action="store_true", help="require a fresh authorized typed Workload operation")
     parser.add_argument("--require-onboard-open-broker", action="store_true")
+    parser.add_argument("--require-workload-state", action="store_true", help="require a fresh typed state/workloads/<node> projection")
+    parser.add_argument("--require-workload-placement", action="store_true", help="require a pinned Workstation-compatible role")
+    parser.add_argument("--require-workload-admission", action="store_true", help="require a workload observed at or beyond the typed admitting phase")
+    parser.add_argument("--require-workload-recovery", action="store_true", help="require persisted adapter-attempt evidence; does not simulate a restart")
+    parser.add_argument("--expect-workload-id", help="require this workload id in the typed Workload projection")
+    parser.add_argument("--expect-workload-phase", help="when --expect-workload-id is set, require this exact phase")
     parser.add_argument("--require-podman", action="store_true")
     parser.add_argument("--require-libvirt", action="store_true")
     parser.add_argument("--require-bootstrap-ssh", action="store_true")
-    parser.add_argument("--require-running-vm", action="store_true")
     parser.add_argument("--require-seat", action="store_true", help="require mde-shell-egui.service to be active")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--verbose", action="store_true")
@@ -1555,12 +1934,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error(f"--bus-scan-limit must be 1..{MAX_TOPIC_SCAN_ROWS}")
     if args.bootstrap_port <= 0 or args.bootstrap_port > 65535:
         parser.error("--bootstrap-port must be 1..65535")
-    if args.expect_vm_state and not args.expect_vm:
-        parser.error("--expect-vm-state requires --expect-vm")
-    if not args.max_lifecycle_action_age_seconds >= 0:
-        parser.error("--max-lifecycle-action-age-seconds must be non-negative")
+    if not args.max_workload_operation_age_seconds >= 0:
+        parser.error("--max-workload-operation-age-seconds must be non-negative")
     if not args.max_onboard_ack_age_seconds >= 0:
         parser.error("--max-onboard-ack-age-seconds must be non-negative")
+    if not args.max_workload_age_seconds >= 0:
+        parser.error("--max-workload-age-seconds must be non-negative")
+    if args.expect_workload_phase and args.expect_workload_phase not in WORKLOAD_PHASES:
+        parser.error("--expect-workload-phase must name a known Workload phase")
+    if args.expect_workload_id and not _valid_workload_identifier(args.expect_workload_id):
+        parser.error("--expect-workload-id must be a bounded Workload identifier")
+    if args.expect_workload_phase and not args.expect_workload_id:
+        parser.error("--expect-workload-phase requires --expect-workload-id")
     return args
 
 

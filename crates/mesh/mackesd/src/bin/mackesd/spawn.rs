@@ -37,6 +37,9 @@ pub(crate) fn spawn_tiered<W, F>(
     W: mackesd_core::workers::Worker,
     F: FnOnce() -> W,
 {
+    if !sup.accepts_worker(name) {
+        return;
+    }
     if !mackesd_core::worker_role::runs(name, role_rank) {
         return;
     }
@@ -50,6 +53,116 @@ pub(crate) fn spawn_tiered<W, F>(
         .lock()
         .expect("worker_names mutex")
         .push(name.into());
+}
+
+/// WL-ARCH-009 — publish the supervisor's real lifecycle map as bounded
+/// per-worker Bus rows, one aggregate node record, and the canonical runtime
+/// file. The sampler consumes only explicit supervisor transitions; it never
+/// probes PIDs or treats a missing worker as healthy.
+pub(crate) fn start_worker_runtime_status_publisher(
+    worker_status: &mackesd_core::workers::WorkerStatusMap,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    node_id: &str,
+) {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    const STATUS_POLL: std::time::Duration =
+        mackesd_core::workers::worker_runtime_status::STATUS_POLL_INTERVAL;
+
+    let status_path = PathBuf::from("/run/mde/mackesd-status.json");
+    if mackesd_core::workers::worker_runtime_status::node_status_topic(node_id).is_err() {
+        tracing::warn!(
+            node_id,
+            "worker runtime status publisher rejected node identity"
+        );
+        return;
+    }
+
+    let status = Arc::clone(worker_status);
+    let stop = Arc::clone(shutdown);
+    let node_id = node_id.to_owned();
+    std::thread::Builder::new()
+        .name("worker-runtime-status".into())
+        .spawn(move || {
+            let mut sampler =
+                mackesd_core::workers::worker_runtime_status::WorkerRuntimeSampler::default();
+            let mut coalescer =
+                mackesd_core::workers::worker_runtime_status::WorkerRuntimeStatusCoalescer::default();
+            let mut persist = mde_bus::default_data_dir()
+                .and_then(|root| mde_bus::persist::Persist::open(root).ok());
+            let mut failure_retry = STATUS_POLL;
+            while !stop.load(Ordering::Relaxed) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                let delay = match sampler.sample(&status, &node_id, now_ms) {
+                    Ok(snapshot) => {
+                        if coalescer.should_publish(&snapshot, now_ms) {
+                            let mut publication_ok = true;
+                            if let Err(error) = mackesd_core::workers::worker_runtime_status::write_runtime_status_file(
+                                &status_path,
+                                &snapshot,
+                            ) {
+                                tracing::warn!(%error, "worker runtime status file write failed");
+                                publication_ok = false;
+                            }
+                            if persist.is_none() {
+                                persist = mde_bus::default_data_dir()
+                                    .and_then(|root| mde_bus::persist::Persist::open(root).ok());
+                            }
+                            if let Some(bus) = persist.as_mut() {
+                                if let Err(error) = mackesd_core::workers::worker_runtime_status::publish_node_status(
+                                    bus,
+                                    &snapshot,
+                                ) {
+                                    tracing::warn!(%error, "worker runtime Bus publication failed");
+                                    publication_ok = false;
+                                }
+                            }
+                            if publication_ok {
+                                coalescer.mark_published(&snapshot, now_ms);
+                            }
+                        } else {
+                            tracing::trace!("worker runtime status sample coalesced");
+                        }
+                        failure_retry = STATUS_POLL;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                            .unwrap_or(0);
+                        mackesd_core::workers::worker_runtime_status::status_phase_delay(
+                            &node_id, now_ms,
+                        )
+                    }
+                    Err(error) => {
+                        let delay = failure_retry.saturating_add(
+                            mackesd_core::workers::worker_runtime_status::status_retry_jitter(
+                                &node_id,
+                            ),
+                        );
+                        tracing::warn!(%error, ?delay, "worker runtime supervisor sample rejected; backing off");
+                        failure_retry =
+                            mackesd_core::workers::worker_runtime_status::next_status_failure_retry(
+                                failure_retry,
+                            );
+                        delay
+                    }
+                };
+                let sleep_cycles = (delay.as_millis() + 99) / 100;
+                for _ in 0..sleep_cycles {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        })
+        .map(|_| tracing::info!("worker runtime status publisher started"))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "worker runtime status publisher thread failed to start")
+        });
 }
 
 // run_serve round-2 extract: the Nebula-status + Shell control-surface Bus
@@ -947,7 +1060,9 @@ pub(crate) fn start_platform_bus_responders(
                         )
                         .build_directory(now)
                     };
-                    let inv_doc = move || mackesd_core::ipc::apps::read_local_inventory(&inv_node);
+                    let inv_doc = move || {
+                        mackesd_core::ipc::apps::read_local_workload_state(&inv_node)
+                    };
                     mackesd_core::ipc::apps::serve_bus(
                         &persist,
                         &apps_svc,
@@ -1195,30 +1310,23 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     spawn_tiered(sup, worker_names, role_rank, "kvm_health", || {
         mackesd_core::workers::kvm_health::KvmHealthWorker::new(node_id.clone())
     });
-    // MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator
-    // the Datacenter UI drives. Drains `action/vm/lifecycle` (create-from-
-    // image / start / stop / destroy / list, each addressed to a target
-    // node id) via an injectable LibvirtBackend that shells `virsh`/
-    // `qemu-img` through the bounded proc path, and publishes this node's VM
-    // instance roster to `event/vm/instances`. Universal like kvm_health —
-    // every node can host datacenter VMs — so it gates through the
-    // rank-0-default worker resolver (runs everywhere). node_id is both the
-    // event `host` stamp and the action target this worker matches.
-    spawn_tiered(sup, worker_names, role_rank, "vm_lifecycle", || {
-        mackesd_core::workers::vm_lifecycle::VmLifecycleWorker::new(node_id.clone())
-    });
-    // MV-4 — the container worker: the Podman container-lifecycle actuator (the
-    // container half of the mesh management layer, companion to MV-3
-    // vm_lifecycle). Drains `action/container/lifecycle` (run / stop / rm /
-    // list, each addressed to a target node id) via an injectable
-    // PodmanBackend that shells `podman` through the bounded proc path, and
-    // publishes this node's container roster to `event/podman/containers`.
-    // Universal like vm_lifecycle — every node can host datacenter containers —
-    // so it gates through the rank-0-default worker resolver (runs everywhere).
-    // node_id is both the event `host` stamp and the action target this worker
-    // matches.
-    spawn_tiered(sup, worker_names, role_rank, "container", || {
-        mackesd_core::workers::container::ContainerWorker::new(node_id.clone())
+    // WL-ARCH-010 — the sole VM/container operation lane. It owns the
+    // durable request journal, bounded admission, libvirt/Quadlet adapter
+    // dispatch, and state/workloads/<node> projection. The worker itself is
+    // rank-1 so Lighthouses cannot host or reconcile workloads.
+    spawn_tiered(sup, worker_names, role_rank, "workload_compute", || {
+        mackesd_core::workers::workload_compute::WorkloadComputeWorker::new(
+            node_id.clone(),
+            role_rank,
+        )
+        // Keep the journal node-local, but bind the production actuator to
+        // the daemon's resolved shared root so approved image/catalog state
+        // is read from the same workgroup used by the rest of the daemon.
+        .with_actuator(Box::new(
+            mackesd_core::workers::workload_compute::SystemWorkloadActuator::new(
+                workgroup_root.clone(),
+            ),
+        ))
     });
     // E12-20 — the storage worker: the privileged owner of the Workbench
     // Storage plane (GParted for the mesh). Owns a typed StorageOp pending
@@ -1476,22 +1584,10 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             node_id.clone(),
         )
     });
-    // VDI-VM-1 — the console_broker worker: the serving-side half that actually
-    // makes a LOCAL KVM VM's console reachable on the mesh. Every VM binds SPICE
-    // to 127.0.0.1 (vm_lifecycle's domain XML), so session_broker can track a
-    // local-VM session but there is no reachable endpoint to attach frames.
-    // For each VDI `Open` naming a VM this node serves, this worker resolves the
-    // live console (`virsh domdisplay`), relays that loopback port onto the
-    // Nebula overlay with a scoped socat (the compute_expose forward pattern),
-    // and publishes the overlay `host:port` back on the session record
-    // (`state/vdi/console`, keyed by session id) for the client shell to
-    // resolve. Serving-peer-gated (NOT leader-gated: the relay + loopback
-    // console are physically on the serving host); runs everywhere like
-    // session_broker. Honest-gates (never a fake endpoint) when the VM is off /
-    // has no graphics / socat|virsh|overlay is absent — §7.
-    spawn_tiered(sup, worker_names, role_rank, "console_broker", || {
-        mackesd_core::workers::console_broker::ConsoleBrokerWorker::new(node_id.clone())
-    });
+    // WL-ARCH-010 — Display1 attachment is issued by workload_compute only.
+    // The retired console_broker cannot be spawned: its raw overlay endpoint
+    // relay would be a second presentation authority beside the authenticated,
+    // expiring local Workload attachment lease.
     // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
     // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
     // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —
@@ -1606,7 +1702,7 @@ pub(crate) fn spawn_mesh_plumbing_workers(
 ) {
     use mackesd_core::workers::{
         device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile, job_exec,
-        lifecycle_exec, mesh_dns, netstate_apply, presence_watch, router_action, ssh_pubkey_gossip,
+        mesh_dns, netstate_apply, presence_watch, router_action, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, validation_suite, RestartPolicy, Spawn,
     };
     // NF-21.1 — sshd overlay-bind worker. Polls
@@ -1623,23 +1719,18 @@ pub(crate) fn spawn_mesh_plumbing_workers(
     // ed25519 pubkey into <root>/ssh-keys/ and merge every peer's
     // published key into ~/.ssh/authorized_keys (managed block,
     // write-on-change). Syncthing replication is the transport.
-    // PD-11 — the lifecycle executor: descriptor-gated container/VM
-    // start/stop requests from peers, via replicated request files.
-    spawn_tiered(sup, worker_names, role_rank, "lifecycle_exec", || {
-        lifecycle_exec::LifecycleExecWorker::new(
-            workgroup_root.clone(),
-            node_id
-                .strip_prefix("peer:")
-                .unwrap_or(&node_id)
-                .to_string(),
-        )
-    });
+    // WL-ARCH-010 — VM/container lifecycle is owned exclusively by
+    // workload_compute through the versioned Workload API. The former
+    // replicated-file lifecycle executor is intentionally not spawned:
+    // keeping it live would create a second actuator and allow stale requests
+    // to race the reconciler.
     // DEVMGR-8 — the device-control executor: drains this box's replicated
     // fleet/device-control/<self>/ for typed privileged-op requests the
     // Device-Manager surface dispatches (enable/disable, reload module,
     // rescan bus), gates each against this node's own published inventory
     // (L9 rail), executes the FIXED sysfs/ip/modprobe seam, hash-chain audits
-    // it, and notifies on failure. Universal (rank 0) like lifecycle_exec.
+    // it, and notifies on failure. Universal (rank 0), like the other
+    // independently addressed control workers.
     spawn_tiered(sup, worker_names, role_rank, "device_control", || {
         device_control::DeviceControlExecWorker::new(
             workgroup_root.clone(),
@@ -2062,9 +2153,9 @@ pub(crate) fn spawn_datacenter_scheduler_workers(
     // each action exactly once. It accepts a TYPED ActionRequest enum (an
     // allowlisted KIND + typed params — NEVER a command string; §9 forbids a
     // raw-shell channel) and maps each allowlisted KIND onto an EXISTING verb:
-    // the first cut allowlists `service_lifecycle`, dispatched via the PD-11
-    // `lifecycle` verb (a typed request the target's own `lifecycle_exec`
-    // validates against its live probe and runs locally — no push, no shell).
+    // the first cut allowlists `service_lifecycle`; its legacy lifecycle verb
+    // is retained only as an input-validation marker while callers migrate to
+    // the Workload API. No lifecycle executor is spawned to act on it.
     // Every action is hash-chain audited via the existing events plane (§8),
     // and an unknown/disallowed action degrades to a typed rejection, never a
     // panic (Q33).
@@ -2340,27 +2431,10 @@ pub(crate) fn spawn_fleet_compute_workers(
         .expect("worker_names mutex")
         .push("selinux_monitor".into());
 
-    // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
-    // Polls virsh + podman every 10 s; the per-peer inventory bus
-    // publish (`compute/inventory/<peer-nebula-addr>`) is on-change +
-    // a 60 s heartbeat per BUS-RUN-FULL-1 (docs/DECISIONS.md ADR-0005)
-    // — the cross-node fleet view reads the replicated
-    // compute-inventory.json file, the bus topic's only consumer is
-    // this node's own Workloads source. Silent no-op on peers without
-    // virsh/podman (lighthouse, container-stripped). The nebula
-    // address is auto-detected from the local nebula1 interface at
-    // tick time (empty hint = runtime detect).
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::compute_registry::ComputeRegistryWorker::new(
-            fw_host.clone(),
-            String::new(),
-        ),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("compute_registry".into());
+    // WL-ARCH-010 — the legacy virsh/podman inventory poller is not a live
+    // authority. WorkloadCompute publishes the authoritative
+    // `state/workloads/<node>` projection; no second runtime inventory lane is
+    // spawned here.
 
     // ROUTER-3/4 — per-node, always-on router-registry: discover the node's
     // primary router/firewall (lowest-metric default route + gateway MAC),
@@ -2579,26 +2653,13 @@ pub(crate) fn spawn_fleet_compute_workers(
         .expect("worker_names mutex")
         .push("compute_migrate".into());
 
-    // VIRT-21 (v5.0.0) — compute_event_toast. Subscribes to every
-    // compute/event/<peer> topic and raises an FDO desktop toast on
-    // VM start/stop/crash so fleet lifecycle changes surface without
-    // keeping mde-virtual open.
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::compute_event_toast::ComputeEventToastWorker::new(),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("compute_event_toast".into());
-
     // VIRT-6 (v5.0.0) — compute_provision. Drains this peer's
     // `compute/create/<addr>` topic: ensures the mde-vms pool,
     // allocates a per-peer /24 VM IP, runs requester-side
     // nebula-cert keygen + the cert-sign RPC, builds the NoCloud
     // seed, virt-installs the VM (with virtiofs MeshFS share when
     // requested + mounted), acks on compute/create-ack/<ulid>, and
-    // fires an immediate inventory publish. workgroup_root + node_id
+    // reports completion only through its typed acknowledgement. workgroup_root + node_id
     // locate this peer's nebula-bundle.json for the guest
     // lighthouse roster.
     sup.spawn(Spawn::new(

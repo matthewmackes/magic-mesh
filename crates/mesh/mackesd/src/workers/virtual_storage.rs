@@ -815,6 +815,14 @@ pub enum VopInvalid {
         /// The current size.
         current_mib: u64,
     },
+    /// An image path is not a canonical, direct child of the managed image root.
+    #[error("unsafe image path {path}: {reason}")]
+    UnsafeImagePath {
+        /// The untrusted image path.
+        path: String,
+        /// Why the path was refused.
+        reason: String,
+    },
     /// The named volume is absent.
     #[error("unknown volume {0}")]
     UnknownVolume(String),
@@ -915,6 +923,108 @@ fn require_qcow2<'a>(topo: &'a VirtualTopology, path: &Path) -> Result<&'a Image
     } else {
         Err(VopInvalid::NotQcow2(disp(path)))
     }
+}
+
+/// Return every host image path an operation may read or write.
+fn image_paths(op: &VirtualStorageOp) -> Vec<&Path> {
+    match op {
+        VirtualStorageOp::ImageCreate { path, .. }
+        | VirtualStorageOp::ImageResize { path, .. }
+        | VirtualStorageOp::ImageSnapshot { path, .. }
+        | VirtualStorageOp::ImageRevert { path, .. }
+        | VirtualStorageOp::ImageDeleteSnapshot { path, .. }
+        | VirtualStorageOp::ImageDelete { path } => vec![path],
+        VirtualStorageOp::ImageConvert { src, dst, .. } => vec![src, dst],
+        VirtualStorageOp::ImageCloneGolden { golden, dest, .. } => vec![golden, dest],
+        VirtualStorageOp::VolumeCreate { .. }
+        | VirtualStorageOp::VolumeRemove { .. }
+        | VirtualStorageOp::VolumePrune => Vec::new(),
+    }
+}
+
+/// Refuse an image path unless it is a canonical, direct child of `local_dir`.
+///
+/// The virtual-storage executor shells qemu-img with paths supplied by a signed
+/// Bus request. Signature validation authenticates the sender, but it does not
+/// make a path safe. Keep this check at apply time so a stale or hostile request
+/// cannot turn a create/convert/clone into a write outside `~/Local`, and reject
+/// symlinks before any backend can follow them. Missing final files are allowed
+/// for destinations; their parent and the managed root must already be real
+/// directories.
+fn validate_image_path(path: &Path, local_dir: &Path) -> Result<(), VopInvalid> {
+    let reject = |reason: &str| {
+        Err(VopInvalid::UnsafeImagePath {
+            path: disp(path),
+            reason: reason.to_string(),
+        })
+    };
+
+    if !local_dir.is_absolute() {
+        return reject("managed image root is not absolute");
+    }
+    let root_meta = match std::fs::symlink_metadata(local_dir) {
+        Ok(meta) => meta,
+        Err(error) => return reject(&format!("managed image root is unavailable: {error}")),
+    };
+    if root_meta.file_type().is_symlink() {
+        return reject("managed image root is a symlink");
+    }
+    if !root_meta.is_dir() {
+        return reject("managed image root is not a directory");
+    }
+    let canonical_root = match std::fs::canonicalize(local_dir) {
+        Ok(root) => root,
+        Err(error) => return reject(&format!("managed image root cannot be canonicalized: {error}")),
+    };
+    // Reject a root containing a symlinked ancestor as well as a symlink at the
+    // final component. The executor must receive one stable root identity.
+    if canonical_root != local_dir {
+        return reject("managed image root is not canonical");
+    }
+
+    if !path.is_absolute() {
+        return reject("image path is not absolute");
+    }
+    let relative = match path.strip_prefix(local_dir) {
+        Ok(relative) => relative,
+        Err(_) => return reject("image path escapes the managed image root"),
+    };
+    let components: Vec<_> = relative.components().collect();
+    if components.len() != 1
+        || !matches!(components[0], std::path::Component::Normal(_))
+    {
+        return reject("image path must be one direct child without . or .. components");
+    }
+    if !is_image_file(path) {
+        return reject("image path has an unmanaged extension");
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => reject("image path is a symlink"),
+        Ok(_) => {
+            let canonical_path = match std::fs::canonicalize(path) {
+                Ok(path) => path,
+                Err(error) => return reject(&format!("image path cannot be canonicalized: {error}")),
+            };
+            if canonical_path != path || !canonical_path.starts_with(&canonical_root) {
+                return reject("image path is not a canonical child of the managed root");
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => reject(&format!("image path metadata failed: {error}")),
+    }
+}
+
+/// Apply-time image-root validation for the production sub-worker.
+fn validate_vop_in_dir(
+    op: &VirtualStorageOp,
+    local_dir: &Path,
+) -> Result<(), VopInvalid> {
+    for path in image_paths(op) {
+        validate_image_path(path, local_dir)?;
+    }
+    Ok(())
 }
 
 /// Validate every op in `queue` against `topo` (stage-time advisory), parallel to
@@ -1086,9 +1196,9 @@ impl VirtualInUseProbe for ComputeVirtualInUse {
         // ── virsh: running libvirt domains → their disk source (E12-20 source) ──
         if let Some(uuids) = bounded_stdout("virsh", &["list", "--state-running", "--uuid"]) {
             snap.vm_tool = true;
-            for uuid in super::compute_registry::parse_virsh_uuid_list(&uuids) {
+            for uuid in super::runtime_probe::parse_virsh_uuid_list(&uuids) {
                 if let Some(blk) = bounded_stdout("virsh", &["domblklist", "--details", &uuid]) {
-                    if let Some(src) = super::compute_registry::parse_virsh_domblklist(&blk) {
+                    if let Some(src) = super::runtime_probe::parse_virsh_domblklist(&blk) {
                         let name = bounded_stdout("virsh", &["domname", &uuid])
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
@@ -1105,7 +1215,7 @@ impl VirtualInUseProbe for ComputeVirtualInUse {
             &["ps", "--format", "json", "--filter", "status=running"],
         ) {
             snap.container_tool = true;
-            for c in super::compute_registry::parse_podman_ps_json(&json) {
+            for c in super::runtime_probe::parse_podman_ps_json(&json) {
                 if let Some(mounts) = bounded_stdout(
                     "podman",
                     &[
@@ -1550,6 +1660,18 @@ pub fn apply_queue(
     live: &VirtualTopology,
     snap: &VirtualInUseSnapshot,
     executor: &dyn VirtualExecutor,
+    on_progress: impl FnMut(usize, &VOpStatus),
+) -> VirtualQueueOutcome {
+    apply_queue_with_root(queue, live, snap, None, executor, on_progress)
+}
+
+/// Apply a queue with the managed image-root boundary enabled.
+fn apply_queue_with_root(
+    queue: &VirtualStorageQueue,
+    live: &VirtualTopology,
+    snap: &VirtualInUseSnapshot,
+    local_dir: Option<&Path>,
+    executor: &dyn VirtualExecutor,
     mut on_progress: impl FnMut(usize, &VOpStatus),
 ) -> VirtualQueueOutcome {
     let mut statuses = vec![VOpStatus::Pending; queue.ops.len()];
@@ -1557,6 +1679,14 @@ pub fn apply_queue(
     let mut applied = 0usize;
 
     for (i, op) in queue.ops.iter().enumerate() {
+        if let Some(local_dir) = local_dir {
+            if let Err(inv) = validate_vop_in_dir(op, local_dir) {
+                statuses[i] = VOpStatus::Invalidated(inv);
+                on_progress(i, &statuses[i]);
+                halted_at = Some(i);
+                break;
+            }
+        }
         if let Err(inv) = validate_vop(op, live) {
             statuses[i] = VOpStatus::Invalidated(inv);
             on_progress(i, &statuses[i]);
@@ -1888,20 +2018,27 @@ impl VirtualStorage {
         let total = queue.ops.len();
         let host = self.node_id.clone();
         let topic = progress_topic(&self.node_id);
-        let outcome = apply_queue(queue, &live, &snap, &*self.executor, |idx, status| {
-            if let Some(state) = status.progress() {
-                let progress = VirtualProgress {
-                    host: host.clone(),
-                    target: target.clone(),
-                    op_index: idx,
-                    total,
-                    op_kind: queue.ops.get(idx).map_or("?", |o| o.kind()).to_string(),
-                    state,
-                    published_at_ms: now_ms(),
-                };
-                publish_json(Some(bus_root), &topic, &progress);
-            }
-        });
+        let outcome = apply_queue_with_root(
+            queue,
+            &live,
+            &snap,
+            Some(&self.local_dir),
+            &*self.executor,
+            |idx, status| {
+                if let Some(state) = status.progress() {
+                    let progress = VirtualProgress {
+                        host: host.clone(),
+                        target: target.clone(),
+                        op_index: idx,
+                        total,
+                        op_kind: queue.ops.get(idx).map_or("?", |o| o.kind()).to_string(),
+                        state,
+                        published_at_ms: now_ms(),
+                    };
+                    publish_json(Some(bus_root), &topic, &progress);
+                }
+            },
+        );
         if !outcome.is_success() {
             tracing::warn!(
                 target: "mackesd::alert",
@@ -2477,6 +2614,57 @@ mod tests {
         assert_eq!(outcome.halted_at, Some(1));
         assert_eq!(outcome.applied, 1);
         assert!(matches!(outcome.statuses[2], VOpStatus::Pending));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_json_image_paths_stop_before_the_executor() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let symlink_path = root.path().join("linked.qcow2");
+        symlink(outside.path().join("outside.qcow2"), &symlink_path).unwrap();
+        let escaped_path = outside.path().join("escape.qcow2");
+
+        for path in [&symlink_path, &escaped_path] {
+            let path_text = path.to_string_lossy().into_owned();
+            let body = serde_json::json!({
+                "verb": "apply",
+                "armed_target": path_text.clone(),
+                "queue": {
+                    "ops": [{
+                        "op": "image_create",
+                        "path": path_text,
+                        "format": "qcow2",
+                        "size_mib": 1024
+                    }]
+                }
+            })
+            .to_string();
+            let VirtualStorageRequest::Apply { queue, .. } = parse_request(&body).unwrap() else {
+                panic!("hostile image request did not parse as Apply");
+            };
+            let executor = FakeExec::ok();
+            let outcome = apply_queue_with_root(
+                &queue,
+                &VirtualTopology::default(),
+                &VirtualInUseSnapshot {
+                    vm_tool: true,
+                    container_tool: true,
+                    ..VirtualInUseSnapshot::default()
+                },
+                Some(root.path()),
+                &executor,
+                |_, _| {},
+            );
+
+            assert!(matches!(
+                outcome.statuses.first(),
+                Some(VOpStatus::Invalidated(VopInvalid::UnsafeImagePath { .. }))
+            ));
+            assert_eq!(*executor.seen.lock().unwrap(), 0);
+        }
     }
 
     // ── bus contract ──

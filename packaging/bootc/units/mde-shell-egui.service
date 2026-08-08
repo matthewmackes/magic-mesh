@@ -73,6 +73,15 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 # Keep delegation at the service boundary; Browser engine confinement belongs to
 # the Browser VM rather than the host seat.
 Delegate=yes
+# The shell owns presentation/input, not guest compute. Bound its cgroup so a
+# stalled preview or GPU recovery cannot consume all host CPU/tasks/I/O.
+CPUAccounting=true
+CPUQuota=300%
+TasksMax=2048
+MemoryAccounting=true
+MemoryHigh=1G
+MemoryMax=2G
+IOReadBandwidthMax=/var/lib/mde-vms 200M
 Restart=always
 RestartSec=2
 # `OnFailure=getty@tty1.service` above restores the console only after the

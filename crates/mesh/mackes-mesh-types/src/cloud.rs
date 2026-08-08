@@ -29,6 +29,8 @@
 //! backend can be swapped without the consumer knowing.
 use serde::{Deserialize, Serialize};
 
+use crate::android_apps::AndroidAppInventory;
+
 // ─────────────────────────── the service catalog ───────────────────────────
 
 /// A Keystone endpoint interface (`public` / `internal` / `admin`) — the three
@@ -1723,6 +1725,13 @@ pub fn cloud_state_topic(node: &str) -> String {
     format!("{CLOUD_STATE_PREFIX}{node}")
 }
 
+/// Maximum number of Android guest-inventory records one cloud mirror may carry.
+///
+/// The records themselves carry the bounded `workload_id`, package, provenance,
+/// and observation fields. This outer cap keeps a malformed or stale producer
+/// from turning one retained cloud mirror into an unbounded Workloads payload.
+pub const MAX_ANDROID_INVENTORIES_PER_STATE: usize = 128;
+
 /// The per-node cloud backend status the mackesd cloud worker publishes on
 /// [`cloud_state_topic`].
 ///
@@ -1732,10 +1741,36 @@ pub fn cloud_state_topic(node: &str) -> String {
 /// carries the live roster the READ verbs discovered (an empty table is a real
 /// "no instances", never invented). `apply_armed` mirrors whether the operator
 /// gate (`MDE_CLOUD_APPLY=1`) is set, so the surface shows plan-only vs. live.
+///
+/// The deployment role is part of the mirror so placement cannot accidentally
+/// offer a control-plane lighthouse as a workload host. Older mirrors omit the
+/// field and deserialize as [`DeploymentRole::Unknown`], which is intentionally
+/// not eligible for new workload placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentRole {
+    /// Control-plane relay/coordination node; never a workload target.
+    Lighthouse,
+    /// KVM/libvirt workload host.
+    Workstation,
+    /// A legacy or incomplete mirror whose role is not known.
+    Unknown,
+}
+
+impl Default for DeploymentRole {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Per-node cloud backend status and placement-role mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudState {
     /// This node's id (the mirror `host` stamp + the topic namespace).
     pub host: String,
+    /// The pinned deployment role. Lighthouses are control-plane-only.
+    #[serde(default)]
+    pub role: DeploymentRole,
     /// Which backend adapter produced this mirror (Phase B = the
     /// [`CloudProviderAdapter::ConstructCloud`] OpenTofu+Ansible backend over
     /// local libvirt).
@@ -1760,6 +1795,34 @@ pub struct CloudState {
     /// This node's compute capacity — feeds the placement picker's capacity bars.
     #[serde(default)]
     pub node_capacity: NodeCapacity,
+    /// Optional per-Android-VM guest inventory, keyed by each record's stable
+    /// [`AndroidAppInventory::workload_id`]. Older mirrors omit this field and
+    /// deserialize to an empty vector; an empty vector means no inventory was
+    /// admitted, not that the guest is ready.
+    #[serde(default, deserialize_with = "deserialize_android_inventories")]
+    pub android_inventories: Vec<AndroidAppInventory>,
+}
+
+fn deserialize_android_inventories<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AndroidAppInventory>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let inventories = Vec::<AndroidAppInventory>::deserialize(deserializer)?;
+    if inventories.len() > MAX_ANDROID_INVENTORIES_PER_STATE {
+        return Err(serde::de::Error::custom(format!(
+            "too many Android inventories: {} > {}",
+            inventories.len(),
+            MAX_ANDROID_INVENTORIES_PER_STATE
+        )));
+    }
+    for inventory in &inventories {
+        inventory.validate().map_err(|error| {
+            serde::de::Error::custom(format!("invalid Android inventory: {error:?}"))
+        })?;
+    }
+    Ok(inventories)
 }
 
 impl CloudState {
@@ -1856,6 +1919,48 @@ impl DeliveryType {
     }
 }
 
+/// The operator-selectable host-local storage target for a workload.
+///
+/// `LocalXfs` is the managed pool backed by the host's dedicated XFS VM
+/// partition (`/var/lib/mde-vms`). `DefaultLibvirt` keeps the explicit escape
+/// hatch for hosts that already have a separately managed libvirt `default`
+/// pool. The enum is deliberately closed so a desired-state document cannot
+/// smuggle an arbitrary host path into the deployment backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePool {
+    /// The managed XFS-backed `mde-vms` libvirt pool (the normal choice).
+    LocalXfs,
+    /// The host's pre-existing libvirt `default` pool, when one is available.
+    DefaultLibvirt,
+}
+
+impl StoragePool {
+    /// Stable libvirt pool name emitted into the OpenTofu tfvars document.
+    #[must_use]
+    pub const fn pool_name(self) -> &'static str {
+        match self {
+            Self::LocalXfs => "mde-vms",
+            Self::DefaultLibvirt => "default",
+        }
+    }
+
+    /// Short operator-facing label for the Deployment selector.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LocalXfs => "Local XFS (recommended)",
+            Self::DefaultLibvirt => "Libvirt default pool",
+        }
+    }
+}
+
+impl Default for StoragePool {
+    fn default() -> Self {
+        Self::LocalXfs
+    }
+}
+
 /// One workload's desired state — the row the GUI form (or raw-HCL escape hatch)
 /// authors and `set-desired` persists into the node's desired-state doc. The worker
 /// renders these into `terraform.tfvars.json` for the placement node's slice.
@@ -1876,6 +1981,10 @@ pub struct WorkloadSpec {
     /// Root disk in GiB (VM workloads).
     #[serde(default)]
     pub disk_gb: u32,
+    /// The closed-set host storage target for this workload's VM/container data.
+    /// Missing legacy fields default to the managed local XFS pool.
+    #[serde(default)]
+    pub storage_pool: StoragePool,
     /// The base image name (convention-path auto-discovery in the libvirt pool);
     /// `None` uses the delivery type's golden default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2119,6 +2228,7 @@ impl AppVmProfile {
             vcpu: self.vcpu,
             memory_mb: self.memory_mb,
             disk_gb: self.disk_gb,
+            storage_pool: StoragePool::default(),
             image: Some("app-vm-wayland-standard".to_owned()),
             image_digest: None,
             network_isolation: self.network_isolation,
@@ -2165,6 +2275,7 @@ impl BrowserVmProfile {
             vcpu: self.vcpu,
             memory_mb: self.memory_mb,
             disk_gb: self.disk_gb,
+            storage_pool: StoragePool::default(),
             image: Some("browser-vm-chromium".to_owned()),
             image_digest: None,
             network_isolation: false,
@@ -3169,6 +3280,7 @@ mod facade_tests {
         .expect("table");
         let state = CloudState {
             host: "eagle".to_string(),
+            role: DeploymentRole::Workstation,
             adapter: CloudProviderAdapter::ConstructCloud,
             health: vec![up("opentofu"), up("ansible")],
             resources: vec![table],
@@ -3177,6 +3289,7 @@ mod facade_tests {
             workloads: Vec::new(),
             drift_summary: DriftSummary::default(),
             node_capacity: NodeCapacity::default(),
+            android_inventories: Vec::new(),
         };
         assert!(state.backend_ready(), "both tools Up ⇒ ready");
         assert_eq!(
@@ -3189,6 +3302,20 @@ mod facade_tests {
         let back: CloudState = serde_json::from_str(&s).unwrap();
         assert_eq!(state, back);
         assert!(s.contains(r#""adapter":"construct_cloud""#));
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&s).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("CloudState JSON object")
+            .remove("android_inventories");
+        let legacy_back: CloudState = serde_json::from_value(legacy).unwrap();
+        assert!(legacy_back.android_inventories.is_empty());
+
+        let mut malformed = serde_json::to_value(&state).unwrap();
+        let mut invalid_inventory = AndroidAppInventory::pending("android-valid");
+        invalid_inventory.workload_id = "../android-invalid".to_owned();
+        malformed["android_inventories"] = serde_json::json!([invalid_inventory]);
+        assert!(serde_json::from_value::<CloudState>(malformed).is_err());
 
         // An Absent tool drops readiness (never a fabricated up).
         let mut degraded = state.clone();

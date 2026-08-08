@@ -1,20 +1,12 @@
-//! U19 — the **Containers** lens: the `container-deploy` form. The GUI fields
-//! (name / image / published ports / named volumes / env) render a Podman
-//! **Quadlet** `.container` unit, installed as a systemd service by the
-//! container-host role — **rootless by default** (least privilege). Any OCI
-//! registry is allowed (no allowlist).
+//! U19 — the **Containers** lens: a non-mutating Quadlet draft and preview.
 //!
-//! The lens emits [`VERB_CONTAINER_DEPLOY`] through the cockpit's preserved emit
-//! path (the same `issue` seam the provision lens uses). A live install requires
-//! exact typed confirmation and a target/body-bound token minted by the root DRM
-//! shell. The unit is previewed live below the form (a faithful mirror of the
-//! backend's render) so the operator reviews exactly what would be installed before
-//! requesting it.
+//! The old `container-deploy` publication path is retired here. The typed
+//! Workload operation API currently exposes lifecycle operations, but does not
+//! expose an authorized container-create request carrying this form's image and
+//! Quadlet fields. Until that API exists, this lens must remain preview-only.
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::{carbon_icon, Style};
-
-use mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY;
 
 use super::WorkloadsState;
 
@@ -35,9 +27,8 @@ pub(super) struct State {
     rootful: bool,
 }
 
-/// Split a free-text multiline field into trimmed, non-empty entries (one per
-/// line) — the shape the `container-deploy` body's `ports` / `volumes` / `env`
-/// arrays take.
+/// Split a free-text multiline field into trimmed, non-empty entries for the
+/// preview's `ports` / `volumes` / `env` lines.
 fn split_lines(s: &str) -> Vec<String> {
     s.lines()
         .map(str::trim)
@@ -46,9 +37,8 @@ fn split_lines(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a container / unit name is a path-safe `[A-Za-z0-9._-]+` token (mirrors
-/// the backend's `is_unit_safe`, so the form only enables a deploy the worker will
-/// accept). Empty / `.` / `..` are refused.
+/// Whether a container / unit name is a path-safe `[A-Za-z0-9._-]+` token.
+/// Empty / `.` / `..` are refused.
 fn is_unit_safe(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -57,9 +47,8 @@ fn is_unit_safe(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-/// Render the rootless-by-default Podman Quadlet `.container` unit the form would
-/// deploy — a faithful local preview of what the backend emits, so the operator
-/// reviews the exact unit before requesting an install.
+/// Render the rootless-by-default Podman Quadlet `.container` unit as a local
+/// preview. It is deliberately not sent to a worker.
 fn render_quadlet(
     name: &str,
     image: &str,
@@ -73,7 +62,7 @@ fn render_quadlet(
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "# Rendered by MCNF Workloads (container-deploy) \u{2014} {scope} by default."
+        "# Rendered by MCNF Workloads (preview only) \u{2014} {scope} by default."
     );
     let _ = writeln!(s, "[Unit]");
     let _ = writeln!(s, "Description=MCNF service container: {name}");
@@ -104,30 +93,6 @@ fn render_quadlet(
     s
 }
 
-/// Build the JSON `container-deploy` request body from the frozen form. The root
-/// shell inserts a target-bound token only after typed confirmation.
-fn deploy_request_body(
-    node: &str,
-    name: &str,
-    image: &str,
-    rootful: bool,
-    ports: &[String],
-    env: &[String],
-    volumes: &[String],
-) -> String {
-    serde_json::json!({
-        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
-        "node": node,
-        "name": name,
-        "image": image,
-        "ports": ports,
-        "env": env,
-        "volumes": volumes,
-        "rootful": rootful,
-    })
-    .to_string()
-}
-
 /// Render the Containers lens.
 pub(super) fn containers_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     header(ui);
@@ -135,58 +100,33 @@ pub(super) fn containers_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     form(ui, state);
     ui.add_space(Style::SP_S);
 
-    // Snapshot the form into owned values so the immutable field borrows end before
-    // the mutable emit seam runs.
+    // Snapshot the form into owned values for the non-mutating preview.
     let name = state.containers.name.trim().to_string();
     let image = state.containers.image.trim().to_string();
     let rootful = state.containers.rootful;
     let ports = split_lines(&state.containers.ports);
     let env = split_lines(&state.containers.env);
     let volumes = split_lines(&state.containers.volumes);
-    let node = state
-        .selected_node()
-        .map(str::trim)
-        .filter(|node| !node.is_empty())
-        .map(str::to_string)
-        .unwrap_or_default();
-
     preview(ui, &name, &image, rootful, &ports, &env, &volumes);
     ui.add_space(Style::SP_S);
 
-    let ready = is_unit_safe(&name) && !image.is_empty() && !node.is_empty();
-    let deploy = ui
-        .add_enabled(
-            ready,
-            egui::Button::new(
-                RichText::new("Deploy container\u{2026}")
-                    .size(Style::SMALL)
-                    .color(Style::ACCENT),
-            ),
-        )
-        .clicked();
+    let _ = ui.add_enabled(
+        false,
+        egui::Button::new(
+            RichText::new("Deploy unavailable — typed API pending")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        ),
+    );
     mde_egui::muted_note(
         ui,
-        "Deploy opens exact typed confirmation. The root DRM shell then mints a single-use \
-         capability bound to this placement node and the complete frozen unit request.",
+        "Preview only: the typed Workload API does not yet accept an authorized \
+         container-create request with image, ports, volumes, and environment. Nothing is sent.",
     );
-
-    if deploy {
-        let body = deploy_request_body(&node, &name, &image, rootful, &ports, &env, &volumes);
-        state.arm_prepared(
-            VERB_CONTAINER_DEPLOY,
-            node,
-            name.clone(),
-            body,
-            format!("container deploy ({name})"),
-            name.clone(),
-            "Deploy",
-            format!("container {name}"),
-        );
-    }
 }
 
 /// The lens header card — the Workloads-accent glyph, the title, and the
-/// rootless / any-registry blurb.
+/// preview-only status.
 fn header(ui: &mut egui::Ui) {
     mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -204,8 +144,8 @@ fn header(ui: &mut egui::Ui) {
         });
         mde_egui::muted_note(
             ui,
-            "A rootless Podman Quadlet .container unit, installed as a systemd service. Any OCI \
-             registry \u{2014} no allowlist.",
+            "Draft a rootless-by-default Podman Quadlet unit. Installation is unavailable until \
+             the typed Workload create API carries the complete declaration.",
         );
     });
 }
@@ -376,21 +316,4 @@ mod tests {
         assert_eq!(v, vec!["a".to_string(), "b:c".to_string()]);
     }
 
-    #[test]
-    fn deploy_body_is_rootless_by_default_and_carries_the_lists() {
-        let body = deploy_request_body(
-            "eagle",
-            "web",
-            "img:1",
-            false,
-            &["8080:80".to_string()],
-            &[],
-            &[],
-        );
-        assert!(body.contains(r#""rootful":false"#), "{body}");
-        assert!(body.contains(r#""schema_version":1"#), "{body}");
-        assert!(body.contains(r#""ports":["8080:80"]"#), "{body}");
-        assert!(body.contains(r#""node":"eagle""#), "{body}");
-        assert!(body.contains(r#""name":"web""#), "{body}");
-    }
 }

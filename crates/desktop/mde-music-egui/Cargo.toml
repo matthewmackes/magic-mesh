@@ -29,6 +29,10 @@ name = "mde-music-egui"
 path = "src/main.rs"
 
 [dependencies]
+# Read-only workspace snapshots come from the canonical retained Bus lane; the
+# Music surface never writes provider or playback state directly through this
+# dependency.
+mde-bus    = { path = "../../platform/mde-bus" }
 # §4/§5 harness — the one inward desktop dependency: run_client (the eframe
 # Wayland-client runner), the shared Style, and the re-exported egui/eframe so
 # the surface shares one toolkit resolution.
@@ -37,10 +41,17 @@ mde-egui   = { path = "../../shared/mde-egui" }
 # listing + authenticated stream URL), creds (the shared credential loader),
 # engine::{Engine, SourceCodec} (native playback), all already tested there.
 mde-musicd = { path = "../../services/mde-musicd" }
+serde_json = { workspace = true }
+# Decode the daemon's local cover-art cache into egui textures. The daemon owns
+# network fetches; this crate only decodes already-admitted local bytes.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # The worker thread owns a current-thread Tokio runtime to drive the async
 # airsonic client (`net` = the IO driver hyper needs; `time` = the client's
 # connect/total timeouts). The UI thread never blocks on it.
 tokio      = { version = "1", features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

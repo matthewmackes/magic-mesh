@@ -1386,29 +1386,43 @@ fn power_state_reflection_offers_state_appropriate_actions() {
 }
 
 #[test]
-fn the_lifecycle_topic_matches_the_worker_contract() {
-    // Cross-check: MUST equal mackesd::workers::vm_lifecycle::ACTION_TOPIC.
-    assert_eq!(LIFECYCLE_TOPIC, "action/vm/lifecycle");
+fn the_workload_topic_is_the_only_power_contract() {
+    assert_eq!(
+        mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC,
+        "action/workload/operation"
+    );
 }
 
 #[test]
 fn power_publish_mints_an_exact_body_bound_direct_libvirt_capability() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut error = None;
-    let request = PowerOp::Pause.to_request("elm", "dev");
-    publish_power(Some(tmp.path()), &mut error, &request);
-    assert!(error.is_none(), "{error:?}");
+    let request = crate::workload_api::request(
+        "vm:elm:dev",
+        "elm",
+        mackes_mesh_types::workloads::WorkloadBackend::LibvirtVirtqemud,
+        mackes_mesh_types::workloads::WorkloadProfile::Small.resources(),
+        mackes_mesh_types::workloads::WorkloadOperationAction::Pause,
+        None,
+        0,
+        unix_millis(),
+    )
+    .expect("typed request");
+    crate::workload_api::publish(tmp.path(), &request).expect("publish");
     let persist = mde_bus::persist::Persist::open(tmp.path().to_path_buf()).unwrap();
-    let messages = persist.list_since(LIFECYCLE_TOPIC, None).unwrap();
+    let messages = persist
+        .list_since(mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC, None)
+        .unwrap();
     assert_eq!(messages.len(), 1);
     let body = messages[0].body.as_deref().unwrap();
-    let value: serde_json::Value = serde_json::from_str(body).unwrap();
-    let token =
-        mackes_mesh_types::cloud::CloudArmedToken::parse(value["armed_token"].as_str().unwrap())
-            .unwrap();
-    assert_eq!(token.verb, "vm-pause");
+    let value: mackes_mesh_types::workloads::WorkloadOperationRequest =
+        serde_json::from_str(body).unwrap();
+    let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+        value.armed_token.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(token.verb, "workload-operation");
     assert_eq!(token.node, "elm");
-    assert_eq!(token.target, "dev");
+    assert_eq!(token.target, "workload:vm:elm:dev");
     assert_eq!(
         token.request_sha256,
         mackes_mesh_types::cloud::cloud_request_digest(body).unwrap()
@@ -1416,31 +1430,23 @@ fn power_publish_mints_an_exact_body_bound_direct_libvirt_capability() {
 }
 
 #[test]
-fn power_ops_map_to_the_host_targeted_vm_lifecycle_verbs() {
-    // Action dispatch (wire): each op serialises to the worker's LifecycleAction
-    // shape, host-targeted so it can only act on the named node.
-    let body = |op: PowerOp| op.to_request("elm", "dev").to_body();
-    let start: serde_json::Value = serde_json::from_str(&body(PowerOp::Start)).unwrap();
-    assert_eq!(start["op"], "start");
-    assert_eq!(start["schema_version"], 1);
-    let stop: serde_json::Value = serde_json::from_str(&body(PowerOp::Stop)).unwrap();
-    assert_eq!(stop["op"], "stop");
-    assert_eq!(stop["force"], false, "the card issues a graceful stop");
-    let pause: serde_json::Value = serde_json::from_str(&body(PowerOp::Pause)).unwrap();
-    assert_eq!(pause["op"], "pause");
-    let resume: serde_json::Value = serde_json::from_str(&body(PowerOp::Resume)).unwrap();
-    assert_eq!(resume["op"], "resume");
-    for op in [
-        PowerOp::Start,
-        PowerOp::Stop,
-        PowerOp::Pause,
-        PowerOp::Resume,
-    ] {
-        let v: serde_json::Value = serde_json::from_str(&body(op)).unwrap();
-        assert_eq!(v["schema_version"], 1, "versioned action contract");
-        assert_eq!(v["host"], "elm", "host-targeted");
-        assert_eq!(v["name"], "dev");
-    }
+fn power_ops_map_to_typed_workload_actions() {
+    assert_eq!(
+        PowerOp::Start.workload_action(),
+        mackes_mesh_types::workloads::WorkloadOperationAction::Start
+    );
+    assert_eq!(
+        PowerOp::Stop.workload_action(),
+        mackes_mesh_types::workloads::WorkloadOperationAction::Stop
+    );
+    assert_eq!(
+        PowerOp::Pause.workload_action(),
+        mackes_mesh_types::workloads::WorkloadOperationAction::Pause
+    );
+    assert_eq!(
+        PowerOp::Resume.workload_action(),
+        mackes_mesh_types::workloads::WorkloadOperationAction::Resume
+    );
 }
 
 #[test]
@@ -1451,17 +1457,22 @@ fn build_power_request_targets_local_vms_and_skips_peers() {
         local_vm("dev", "elm", "shut off"),
         source("peer:oak", "oak", &[Protocol::Rdp]),
     ];
-    let req = build_power_request(&sources, "vm:elm:dev", PowerOp::Start).expect("local maps");
-    let v: serde_json::Value = serde_json::from_str(&req.to_body()).unwrap();
-    assert_eq!(v["op"], "start");
-    assert_eq!(v["host"], "elm");
-    assert_eq!(v["name"], "dev");
+    let req = build_power_request(&sources, "vm:elm:dev", PowerOp::Start, 0, unix_millis())
+        .expect("authorization")
+        .expect("local maps");
+    assert_eq!(req.action, WorkloadOperationAction::Start);
+    assert_eq!(req.target_node, "elm");
+    assert_eq!(req.workload_id.as_str(), "vm:elm:dev");
     assert!(
-        build_power_request(&sources, "peer:oak", PowerOp::Stop).is_none(),
+        build_power_request(&sources, "peer:oak", PowerOp::Stop, 0, unix_millis())
+            .expect("peer is a no-op")
+            .is_none(),
         "a peer source is not driven from here"
     );
     assert!(
-        build_power_request(&sources, "vm:elm:ghost", PowerOp::Start).is_none(),
+        build_power_request(&sources, "vm:elm:ghost", PowerOp::Start, 0, unix_millis())
+            .expect("vanished id is a no-op")
+            .is_none(),
         "a vanished id maps to nothing"
     );
 }

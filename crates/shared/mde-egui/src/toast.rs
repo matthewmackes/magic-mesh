@@ -13,7 +13,8 @@
 //!   headline, optional action, dwell).
 //! - [`ToastHost`] — the **pure, headless-testable** state machine: a one-at-a-time
 //!   rotating alert queue with Critical-preempt + until-acknowledged hold, a
-//!   "N more" backlog counter, hover-pause, and a *separate* replace-in-place OSD
+//!   "N more" backlog counter, five-second transient dwell, hover-pause, and a
+//!   *separate* replace-in-place OSD
 //!   level channel. Time is **injected** ([`ToastHost::tick`] takes the elapsed
 //!   delta) — the model never reads a wall clock, so it is unit-tested without a GPU
 //!   or a clock.
@@ -32,17 +33,17 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{pos2, vec2, Align, Align2, Color32, Context, FontId, Rect, Sense, Ui};
+use egui::{Align, Align2, Color32, Context, FontId, Rect, Sense, Ui, pos2, vec2};
 
 use crate::carbon::paint_carbon;
 use crate::motion::Spring;
 use crate::style::{Elevation, TypographyRole};
 use crate::{Motion, Style};
 
-/// Default on-screen dwell for an [`Severity::Info`] chyron — short, low-friction.
-pub const DWELL_INFO: Duration = Duration::from_secs(4);
-/// Default on-screen dwell for a [`Severity::Warning`] chyron — worth reading.
-pub const DWELL_WARNING: Duration = Duration::from_secs(7);
+/// Default on-screen dwell for an [`Severity::Info`] chyron.
+pub const DWELL_INFO: Duration = Duration::from_secs(5);
+/// Default on-screen dwell for a [`Severity::Warning`] chyron.
+pub const DWELL_WARNING: Duration = Duration::from_secs(5);
 /// Dwell for the centered OSD pill — a quick hardware-feedback flash.
 pub const DWELL_OSD: Duration = Duration::from_millis(1500);
 
@@ -94,8 +95,8 @@ impl Severity {
         }
     }
 
-    /// The severity-scaled default [`Dwell`]: Info short, Warning longer, and a
-    /// Critical holds [`Dwell::UntilAck`] (safety over immersion — lock 6).
+    /// The default [`Dwell`]: non-critical messages remain for five seconds and
+    /// a Critical holds [`Dwell::UntilAck`] (safety over immersion — lock 6).
     #[must_use]
     pub const fn dwell(self) -> Dwell {
         match self {
@@ -212,7 +213,7 @@ pub struct Toast {
     pub headline: String,
     /// The optional click-through button (label + opaque verb).
     pub action: Option<ToastAction>,
-    /// How long this toast dwells before the host advances (severity-scaled).
+    /// How long this toast dwells before the host advances.
     pub dwell: Dwell,
 }
 
@@ -594,10 +595,14 @@ impl ToastHost {
 // ── the HIG banner card (WL-UX-006/U13 — PLATFORM-INTERFACES Q14) ────────────
 
 /// The banner card's widest reading — narrower screens inset by [`Style::SP_L`].
-const BANNER_MAX_W: f32 = 520.0;
+const BANNER_MAX_W: f32 = 900.0;
 /// The banner card height on the spacing ladder: a `TYPE_BODY` title line over a
 /// `TYPE_FOOTNOTE` detail line plus padding.
 const BANNER_H: f32 = Style::SP_XL + Style::SP_L;
+/// Narrow banners stack their command row below the message instead of letting
+/// buttons consume or overlap the text lane.
+const BANNER_STACKED_H: f32 = BANNER_H * 2.0;
+const BANNER_STACKED_BREAKPOINT: f32 = 640.0;
 /// Resting gap between the banner card and the screen's top edge.
 const BANNER_MARGIN: f32 = Style::SP_M;
 /// Below this drop progress the banner is treated as gone — aligned with the
@@ -606,10 +611,15 @@ const BANNER_MARGIN: f32 = Style::SP_M;
 const BANNER_GONE: f32 = 0.02;
 /// The severity glyph's square plate, on the spacing ladder.
 const BANNER_GLYPH_PLATE: f32 = Style::SP_XL;
+/// Width of each banner command. Keeping this in the geometry contract lets the
+/// text lane stop before controls instead of painting beneath them.
+const BANNER_BUTTON_W: f32 = Style::SP_XL * 2.6;
+/// Reserved width for countdown and backlog metadata.
+const BANNER_META_W: f32 = Style::SP_XL * 3.25;
 
 /// The AI-generated deployment alert is intentionally compact: a readable
 /// desktop modal, not a full-screen takeover or an unconstrained message panel.
-const AI_ALERT_MAX_W: f32 = 460.0;
+const AI_ALERT_MAX_W: f32 = 680.0;
 const AI_ALERT_H: f32 = 224.0;
 const AI_ALERT_MARGIN: f32 = Style::SP_L;
 const AI_ALERT_BUTTON_W: f32 = 132.0;
@@ -621,11 +631,43 @@ const AI_ALERT_BLOCKER_ID: &str = "kiron-ai-alert-blocker";
 /// spring's overshoot past `1` reads as the drop's bounce.
 fn banner_rect(screen: Rect, t: f32) -> Rect {
     let w = (screen.width() - 2.0 * Style::SP_L).clamp(0.0, BANNER_MAX_W);
+    let h = if w < BANNER_STACKED_BREAKPOINT {
+        BANNER_STACKED_H
+    } else {
+        BANNER_H
+    };
     let x = screen.center().x - w / 2.0;
-    let parked = screen.top() - BANNER_H - Style::SP_L;
+    let parked = screen.top() - h - Style::SP_L;
     let resting = screen.top() + BANNER_MARGIN;
     let y = (resting - parked).mul_add(t, parked);
-    Rect::from_min_size(pos2(x, y), vec2(w, BANNER_H))
+    Rect::from_min_size(pos2(x, y), vec2(w, h))
+}
+
+fn banner_is_stacked(card: Rect) -> bool {
+    card.width() < BANNER_STACKED_BREAKPOINT
+}
+
+fn banner_control_rect(card: Rect) -> Rect {
+    if banner_is_stacked(card) {
+        Rect::from_min_max(pos2(card.left(), card.top() + BANNER_H), card.max)
+    } else {
+        card
+    }
+}
+
+/// Right edge of the banner's dedicated text lane. The countdown/backlog and
+/// buttons own everything to its right, so even an unusually long headline can
+/// only truncate — it cannot overlap a control.
+fn banner_text_right(card: Rect, has_action: bool) -> f32 {
+    let button_count = if has_action { 2.0 } else { 1.0 };
+    let button_gaps = if has_action { Style::SP_S } else { 0.0 };
+    card.right()
+        - Style::SP_M
+        - BANNER_BUTTON_W * button_count
+        - button_gaps
+        - Style::SP_S
+        - BANNER_META_W
+        - Style::SP_M
 }
 
 /// Centered constrained alert geometry. Motion is a restrained scale/fade from
@@ -679,7 +721,12 @@ fn paint_banner(
 
     let screen = ui.ctx().screen_rect();
     let card = banner_rect(screen, t);
-    let cy = card.center().y;
+    let stacked = banner_is_stacked(card);
+    let message_cy = if stacked {
+        card.top() + BANNER_H / 2.0
+    } else {
+        card.center().y
+    };
 
     // Independent clone of the painter so the widget `put`s below can borrow `ui`.
     let painter = ui.painter().clone();
@@ -697,7 +744,10 @@ fn paint_banner(
 
     // Left: the Carbon severity glyph on a severity-tinted plate.
     let plate = Rect::from_center_size(
-        pos2(card.left() + Style::SP_M + BANNER_GLYPH_PLATE / 2.0, cy),
+        pos2(
+            card.left() + Style::SP_M + BANNER_GLYPH_PLATE / 2.0,
+            message_cy,
+        ),
         vec2(BANNER_GLYPH_PLATE, BANNER_GLYPH_PLATE),
     );
     painter.rect_filled(plate, Style::RADIUS_S, color.gamma_multiply(0.18 * alpha));
@@ -713,10 +763,22 @@ fn paint_banner(
 
     // Center: the TYPE_BODY headline over a TYPE_FOOTNOTE `source · flag`
     // detail, clipped to the card (the old full-width band never truncated).
-    let clipped = painter.with_clip_rect(card);
     let text_left = plate.right() + Style::SP_M;
+    let text_right = if stacked {
+        card.right() - Style::SP_M
+    } else {
+        banner_text_right(card, toast.action.is_some())
+    }
+    .max(text_left);
+    let text_bottom = if stacked {
+        card.top() + BANNER_H
+    } else {
+        card.bottom()
+    };
+    let text_clip = Rect::from_min_max(pos2(text_left, card.top()), pos2(text_right, text_bottom));
+    let clipped = painter.with_clip_rect(text_clip);
     clipped.text(
-        pos2(text_left, cy - Style::SP_XS / 2.0),
+        pos2(text_left, message_cy - Style::SP_XS / 2.0),
         Align2::LEFT_BOTTOM,
         &toast.headline,
         banner_title_font(),
@@ -729,7 +791,7 @@ fn paint_banner(
         (true, true) => String::new(),
     };
     clipped.text(
-        pos2(text_left, cy + Style::SP_XS / 2.0),
+        pos2(text_left, message_cy + Style::SP_XS / 2.0),
         Align2::LEFT_TOP,
         detail,
         banner_detail_font(),
@@ -737,7 +799,15 @@ fn paint_banner(
     );
 
     // Right: dismiss/ack button, optional action button, then countdown + "N more".
-    paint_banner_controls(ui, &painter, card, toast, backlog, remaining)
+    paint_banner_controls(
+        ui,
+        &painter,
+        card,
+        banner_control_rect(card),
+        toast,
+        backlog,
+        remaining,
+    )
 }
 
 /// Paint the dedicated AI operator alert: a centered, red, constrained card
@@ -913,16 +983,17 @@ fn paint_ai_generated_alert(
 fn paint_banner_controls(
     ui: &mut Ui,
     painter: &egui::Painter,
-    band: Rect,
+    hover_band: Rect,
+    control_band: Rect,
     toast: &Toast,
     backlog: usize,
     remaining: Option<Duration>,
 ) -> BandOutcome {
     let critical = matches!(toast.tier, Tier::Alert(Severity::Critical));
-    let cy = band.center().y;
-    let btn_h = band.height() - Style::SP_M;
-    let btn_w = Style::SP_XL * 2.6;
-    let mut rx = band.right() - Style::SP_M;
+    let cy = control_band.center().y;
+    let btn_h = (control_band.height() - Style::SP_M).min(BANNER_H - Style::SP_M);
+    let btn_w = BANNER_BUTTON_W;
+    let mut rx = control_band.right() - Style::SP_M;
     let mut out = BandOutcome::default();
 
     let (label, is_ack) = if critical {
@@ -987,7 +1058,7 @@ fn paint_banner_controls(
     }
 
     // Hover over the whole band pauses the countdown.
-    let hover = ui.interact(band, egui::Id::new(CHYRON_HOVER_ID), Sense::hover());
+    let hover = ui.interact(hover_band, egui::Id::new(CHYRON_HOVER_ID), Sense::hover());
     out.hovered = hover.hovered() || dismiss_resp.hovered();
     out
 }
@@ -1069,15 +1140,18 @@ mod tests {
     // ── model ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn severity_dwell_scales_and_critical_holds() {
+    fn transient_messages_dwell_five_seconds_and_critical_holds() {
+        assert_eq!(DWELL_INFO, Duration::from_secs(5));
+        assert_eq!(DWELL_WARNING, Duration::from_secs(5));
         assert!(matches!(Severity::Info.dwell(), Dwell::For(DWELL_INFO)));
         assert!(matches!(
             Severity::Warning.dwell(),
             Dwell::For(DWELL_WARNING)
         ));
         assert!(matches!(Severity::Critical.dwell(), Dwell::UntilAck));
-        // Info dwells shorter than Warning; Critical is greatest severity.
-        assert!(DWELL_INFO < DWELL_WARNING);
+        // Both transient tiers use the requested five-second timeout; Critical
+        // remains the greatest severity and requires acknowledgement.
+        assert_eq!(DWELL_INFO, DWELL_WARNING);
         assert!(Severity::Info < Severity::Warning);
         assert!(Severity::Warning < Severity::Critical);
     }
@@ -1509,6 +1583,45 @@ mod tests {
     }
 
     #[test]
+    fn banner_is_wider_and_text_never_enters_the_control_lane() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(1280.0, 720.0));
+        let card = banner_rect(screen, 1.0);
+        assert_eq!(card.width(), BANNER_MAX_W);
+        assert!(
+            card.width() > 520.0,
+            "desktop messages must have more room than the retired 520px banner"
+        );
+
+        for has_action in [false, true] {
+            let text_right = banner_text_right(card, has_action);
+            let button_count = if has_action { 2.0 } else { 1.0 };
+            let button_gaps = if has_action { Style::SP_S } else { 0.0 };
+            let control_lane_left = card.right()
+                - Style::SP_M
+                - BANNER_BUTTON_W * button_count
+                - button_gaps
+                - Style::SP_S
+                - BANNER_META_W;
+            assert!(
+                text_right <= control_lane_left - Style::SP_M,
+                "message text must stop before metadata and controls"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_banner_stacks_message_above_controls() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0));
+        let card = banner_rect(screen, 1.0);
+        let controls = banner_control_rect(card);
+        assert!(banner_is_stacked(card));
+        assert_eq!(card.height(), BANNER_STACKED_H);
+        assert_eq!(controls.top(), card.top() + BANNER_H);
+        assert_eq!(controls.bottom(), card.bottom());
+        assert!(controls.top() >= card.top() + BANNER_H);
+    }
+
+    #[test]
     fn ai_generated_alert_is_centered_and_constrained_on_wide_and_narrow_screens() {
         for screen in [
             Rect::from_min_size(egui::Pos2::ZERO, vec2(1920.0, 1080.0)),
@@ -1521,6 +1634,12 @@ mod tests {
             assert!(card.width() <= screen.width() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
             assert!(card.height() <= screen.height() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
         }
+        let desktop = Rect::from_min_size(egui::Pos2::ZERO, vec2(1920.0, 1080.0));
+        assert_eq!(ai_alert_rect(desktop, 1.0).width(), AI_ALERT_MAX_W);
+        assert!(
+            AI_ALERT_MAX_W > 460.0,
+            "operator messages must have more room than the retired 460px card"
+        );
     }
 
     #[test]
@@ -1573,5 +1692,71 @@ mod tests {
             Style::typography_font_with_size(TypographyRole::Mono, Style::SMALL).family,
             FontFamily::Monospace
         );
+    }
+
+    /// Optional render-proof fixture for the two popup presentations. Normal
+    /// test runs stay filesystem-free; GUI proof jobs opt in with an output dir.
+    #[test]
+    fn render_wide_popup_message_proofs_when_requested() {
+        let Some(output_dir) = std::env::var_os("MDE_TOAST_PROOF_DIR") else {
+            return;
+        };
+        let output_dir = std::path::PathBuf::from(output_dir);
+        std::fs::create_dir_all(&output_dir).expect("create toast proof directory");
+        let size = vec2(1280.0, 720.0);
+
+        let banner = Toast::alert(
+            Severity::Warning,
+            "Basement-Test-Workstation",
+            "SYSTEM",
+            "Firmware metadata refresh completed successfully after provider recovery",
+        )
+        .with_action("Open", "shell/goto/system");
+        let png = crate::capture::capture_ui_png(size, 1.0, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Style::BG))
+                .show(ctx, |ui| {
+                    let _ = paint_banner(ui, &banner, 2, Some(Duration::from_secs(5)), 1.0);
+                });
+        })
+        .expect("render standard popup proof");
+        std::fs::write(output_dir.join("popup-message-wide-banner.png"), png)
+            .expect("write standard popup proof");
+
+        let narrow_size = vec2(400.0, 300.0);
+        let png = crate::capture::capture_ui_png(narrow_size, 1.0, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Style::BG))
+                .show(ctx, |ui| {
+                    let _ = paint_banner(ui, &banner, 2, Some(Duration::from_secs(5)), 1.0);
+                });
+        })
+        .expect("render narrow popup proof");
+        std::fs::write(output_dir.join("popup-message-narrow-banner.png"), png)
+            .expect("write narrow popup proof");
+
+        let operator = Toast::alert(
+            Severity::Warning,
+            "deployment-controller",
+            AI_GENERATED_ALERT_FLAG,
+            "The corrected preview will restart the desktop shell on all five seats",
+        )
+        .with_action("Review", "shell/goto/notifications");
+        let png = crate::capture::capture_ui_png(size, 1.0, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Style::BG))
+                .show(ctx, |ui| {
+                    let _ = paint_ai_generated_alert(
+                        ui,
+                        &operator,
+                        1,
+                        Some(Duration::from_secs(5)),
+                        1.0,
+                    );
+                });
+        })
+        .expect("render centered popup proof");
+        std::fs::write(output_dir.join("popup-message-wide-operator.png"), png)
+            .expect("write centered popup proof");
     }
 }

@@ -41,6 +41,12 @@ use crate::store::{list_nodes, NodeRow};
 /// Default sweep cadence — 30 s between full peer scans.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Keep the recurring sweep phase small enough that a peer measurement is
+/// never older than the configured cadence just because of desynchronization.
+/// A deterministic phase spreads nodes that boot together without making the
+/// panel wait longer for its first refreshed result.
+pub const MAX_HOST_PHASE: Duration = Duration::from_secs(5);
+
 // (the per-probe deadline lives in `transport_probe::PROBE_TIMEOUT`)
 
 /// One peer's measured latency for a single ping pass.
@@ -138,10 +144,18 @@ impl Worker for MeshLatencyWorker {
         )
         .await;
 
+        // Keep the boot-time cache behavior above, but do not put every seat
+        // back on the same recurring boundary. The first post-boot delay is
+        // shortened by this node's deterministic phase, so the next sweep is
+        // still due no later than the configured interval.
+        let phase = host_phase(&self.local_node_id, self.interval);
+        let first_delay = self.interval.saturating_sub(phase);
+        let mut first_tick = true;
         loop {
             tokio::select! {
                 _ = shutdown.wait() => break,
-                _ = tokio::time::sleep(self.interval) => {
+                _ = tokio::time::sleep(if first_tick { first_delay } else { self.interval }) => {
+                    first_tick = false;
                     let _ = sweep_once(
                         Arc::clone(&self.store),
                         &self.local_node_id,
@@ -226,6 +240,28 @@ async fn sweep_once(
     Ok(())
 }
 
+/// Return a stable, bounded phase for a node's recurring sweep.
+///
+/// This intentionally uses the enrolled node id rather than wall-clock time
+/// or process randomness: every restart of one node gets the same phase, while
+/// different enrolled nodes normally land in different buckets. The phase is
+/// at most five seconds and at most one fifth of a short test/configured
+/// interval.
+fn host_phase(local_node_id: &str, interval: Duration) -> Duration {
+    let window_ms = (interval.as_millis() / 5).min(MAX_HOST_PHASE.as_millis());
+    if local_node_id.is_empty() || window_ms == 0 {
+        return Duration::ZERO;
+    }
+
+    // FNV-1a is sufficient here: this is scheduling spread, not security.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in local_node_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Duration::from_millis((u128::from(hash) % (window_ms + 1)) as u64)
+}
+
 fn ping_host(host: &str) -> Option<f64> {
     // PD-6 / ENT-13 — the transport probe, not ICMP: a timed TCP
     // handshake through the overlay tunnel.
@@ -266,6 +302,20 @@ mod tests {
     #[test]
     fn ping_host_with_empty_target_returns_none() {
         assert_eq!(ping_host(""), None);
+    }
+
+    #[test]
+    fn host_phase_is_stable_bounded_and_keeps_freshness_deadline() {
+        let interval = Duration::from_secs(30);
+        let first = host_phase("peer:seat15", interval);
+        assert_eq!(first, host_phase("peer:seat15", interval));
+        assert!(first <= MAX_HOST_PHASE);
+        let first_delay = interval.saturating_sub(first);
+        assert!(first_delay >= interval - MAX_HOST_PHASE);
+
+        let short_interval = Duration::from_millis(100);
+        assert!(host_phase("peer:seat15", short_interval) <= Duration::from_millis(20));
+        assert_eq!(host_phase("", interval), Duration::ZERO);
     }
 
     #[test]

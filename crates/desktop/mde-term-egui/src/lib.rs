@@ -63,7 +63,7 @@
 //!   tokens and scrolls the current one into view. [`smart`] classifies the
 //!   token under a double-click (word / URL / path) or a triple-click (line),
 //!   drives copy-on-select + middle-click paste, and — per design lock Q12 —
-//!   routes a Ctrl-clicked URL to the Bookmarks browser / a path to the Files
+//!   routes a Ctrl-clicked URL to the Browser / a path to the Files
 //!   surface over the Bus ([`smart::LaunchBus`], published on
 //!   [`smart::OPEN_TOPIC`]).
 //!

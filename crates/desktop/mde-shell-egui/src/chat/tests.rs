@@ -930,9 +930,10 @@ fn message_row_renders_a_timestamp() {
     use mde_egui::egui::{pos2, vec2, Rect};
 
     // A known epoch: 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC.
-    // Chat follows the configured This Node display zone (EST by default),
-    // so derive the expected local wall time instead of assuming UTC.
-    let shifted = 1_700_000_000_i64 + crate::timers::display_offset_seconds();
+    // Chat follows the configured This Node display zone (daylight-aware), so
+    // derive the expected local wall time instead of assuming UTC.
+    let shifted = 1_700_000_000_i64
+        + crate::timers::display_offset_seconds_at(1_700_000_000);
     let tod = shifted.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(shifted.div_euclid(86_400));
     let expected_hh_mm = format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60);

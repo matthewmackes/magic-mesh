@@ -517,6 +517,64 @@ impl Style {
     /// Categorical accent — **Media** (Carbon magenta).
     pub const ACCENT_MEDIA: Color32 = Color32::from_rgb(0xFF, 0x7E, 0xB6);
 
+    // ── Music workspace semantics ─────────────────────────────────────────
+    // Music intentionally owns a small semantic palette while consuming the
+    // Quazar geometry, type, density, and motion system above. The green is
+    // an open, Spotify-like media affordance without importing any proprietary
+    // brand asset, wordmark, font, or artwork.
+    /// Music action green in dark mode.
+    pub const MUSIC_GREEN: Color32 = Color32::from_rgb(0x1E, 0xD7, 0x60);
+    /// Contrast-safe darker green for light-mode links and text accents.
+    pub const MUSIC_GREEN_LIGHT: Color32 = Color32::from_rgb(0x0B, 0x7A, 0x3A);
+    /// Dark text used on a green-filled Music action.
+    pub const MUSIC_ON_GREEN: Color32 = Color32::from_rgb(0x06, 0x20, 0x10);
+    /// Deep charcoal Music ground used only in the dark workspace shell.
+    pub const MUSIC_BG: Color32 = Color32::from_rgb(0x0F, 0x10, 0x12);
+    /// Raised charcoal Music panel.
+    pub const MUSIC_SURFACE: Color32 = Color32::from_rgb(0x18, 0x1A, 0x1D);
+    /// Music shell gutter.
+    pub const MUSIC_GUTTER: f32 = 8.0;
+    /// Expanded library rail width.
+    pub const MUSIC_LIBRARY_RAIL: f32 = 280.0;
+    /// Collapsed library rail width.
+    pub const MUSIC_LIBRARY_COLLAPSED: f32 = 72.0;
+    /// Expanded Now Playing rail width.
+    pub const MUSIC_NOW_PLAYING_RAIL: f32 = 340.0;
+    /// Bottom player height on wide layouts.
+    pub const MUSIC_PLAYER_H: f32 = 88.0;
+    /// Mini-player height on narrow layouts.
+    pub const MUSIC_MINI_PLAYER_H: f32 = 64.0;
+    /// Wide hero artwork size.
+    pub const MUSIC_HERO_ART_WIDE: f32 = 232.0;
+    /// Narrow hero artwork size.
+    pub const MUSIC_HERO_ART_NARROW: f32 = 160.0;
+    /// Music title typography helper.
+    #[must_use]
+    pub fn music_title(text: impl Into<String>) -> RichText {
+        Self::typography_text(text, TypographyRole::Title).color(Self::TEXT_STRONG)
+    }
+
+    /// Music body typography helper.
+    #[must_use]
+    pub fn music_body(text: impl Into<String>) -> RichText {
+        Self::typography_text(text, TypographyRole::Body).color(Self::TEXT)
+    }
+
+    /// Resolve Music's green for the installed appearance.
+    #[must_use]
+    pub const fn music_green_for_scheme(scheme: StyleColorScheme) -> Color32 {
+        match scheme {
+            StyleColorScheme::Light => Self::MUSIC_GREEN_LIGHT,
+            StyleColorScheme::Dark | StyleColorScheme::AutoSync3 => Self::MUSIC_GREEN,
+        }
+    }
+
+    /// Resolve the text color used inside a green-filled Music action.
+    #[must_use]
+    pub const fn music_on_green_for_scheme(_scheme: StyleColorScheme) -> Color32 {
+        Self::MUSIC_ON_GREEN
+    }
+
     // ── Node capability grade ramp (A–F, green→red) ─────────────────────────
     // NODE-GRADE-3 (design docs/design/node-grade.md #4): ONE shared A–F ramp that
     // every grade UI reads — the dock's per-node capability list (NODE-GRADE-2)
@@ -653,14 +711,14 @@ impl Style {
     // The optical-size ladder for glyphs (Carbon icons render crisp at any of
     // these; see [`crate::carbon`]). One scale so a toolbar glyph, a menu glyph,
     // and a status dot never each pick a private pixel size (UI-VIS-119/120).
-    /// Small icon — inline status affordances, dense rows.
-    pub const ICON_S: f32 = 14.0;
+    /// Small icon — inline status affordances and compact rows.
+    pub const ICON_S: f32 = 16.0;
     /// Medium icon — the default toolbar / menu glyph optical size.
-    pub const ICON_M: f32 = 16.0;
-    /// Large icon — prominent chrome actions, section headers.
-    pub const ICON_L: f32 = 20.0;
-    /// Extra-large icon — launcher tiles, hero / empty-state glyphs, touch targets.
-    pub const ICON_XL: f32 = 24.0;
+    pub const ICON_M: f32 = 20.0;
+    /// Large icon — prominent chrome actions and section headers.
+    pub const ICON_L: f32 = 24.0;
+    /// Extra-large icon — launcher tiles, hero / empty-state glyphs, and touch targets.
+    pub const ICON_XL: f32 = 32.0;
     /// Vertical padding for ordinary egui buttons. Kept well below the base 8px
     /// gutter so toolbar rows read refined without changing the minimum hit target.
     pub const CONTROL_PAD_Y: f32 = Self::SP_XS;

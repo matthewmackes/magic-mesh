@@ -282,6 +282,10 @@ pub const ACTION_VERBS: [&str; 22] = [
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+/// Maximum number of retained action requests admitted by one responder tick.
+/// The SQL limit is applied before decoding so a stalled Datacenter consumer
+/// cannot materialize its entire retained action history.
+pub const MAX_MESSAGES_PER_POLL: usize = 64;
 
 /// Action topic for `verb`: `action/dc/<verb>`.
 #[must_use]
@@ -2271,7 +2275,7 @@ pub fn poll_once(
     for verb in ACTION_VERBS {
         let topic = action_topic(verb);
         let since = cursors.get(&topic).map(String::as_str);
-        let msgs = match persist.list_since(&topic, since) {
+        let msgs = match persist.list_since_limit(&topic, since, MAX_MESSAGES_PER_POLL) {
             Ok(m) => m,
             Err(e) => {
                 tracing::debug!(topic = %topic, error = %e, "dc responder: list_since failed");
@@ -3713,5 +3717,64 @@ mod tests {
             json!({ "snapshot": "ffaa-0011", "dom0": "10.0.0.1", "confirm": true }).to_string();
         let r = build_reply(&s, "vm-snapshot-delete", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
+    }
+
+    #[test]
+    fn datacenter_action_recovery_reads_a_bounded_page_and_advances_cursor() {
+        use mde_bus::rpc::publish_request;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let svc = DatacenterService::new(tmp.path().to_path_buf());
+        let topic = action_topic("genesis-plan");
+        let mut requests = Vec::new();
+        for index in 0..(MAX_MESSAGES_PER_POLL + 1) {
+            let body = json!({
+                "mesh_id": format!("mesh-{index}"),
+                "region": "nyc3"
+            })
+            .to_string();
+            requests.push(
+                publish_request(&persist, &topic, Priority::Default, None, Some(&body)).unwrap(),
+            );
+        }
+
+        let first_page = persist
+            .list_since_limit(&topic, None, MAX_MESSAGES_PER_POLL)
+            .unwrap();
+        assert_eq!(first_page.len(), MAX_MESSAGES_PER_POLL);
+        assert_eq!(first_page[0].ulid, requests[0]);
+        assert_eq!(first_page[63].ulid, requests[63]);
+
+        let mut cursors = HashMap::new();
+        poll_once(&persist, &svc, &mut cursors);
+        assert_eq!(
+            cursors.get(&topic),
+            Some(&requests[MAX_MESSAGES_PER_POLL - 1])
+        );
+        for request in &requests[..MAX_MESSAGES_PER_POLL] {
+            assert_eq!(
+                persist
+                    .list_since(&reply_topic(request), None)
+                    .unwrap()
+                    .len(),
+                1,
+                "first page request did not receive a reply"
+            );
+        }
+        assert!(persist
+            .list_since(&reply_topic(&requests[MAX_MESSAGES_PER_POLL]), None)
+            .unwrap()
+            .is_empty());
+
+        poll_once(&persist, &svc, &mut cursors);
+        assert_eq!(cursors.get(&topic), Some(&requests[MAX_MESSAGES_PER_POLL]));
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&requests[MAX_MESSAGES_PER_POLL]), None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

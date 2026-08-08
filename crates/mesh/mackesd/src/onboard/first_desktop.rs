@@ -19,7 +19,7 @@
 //!   building the cloud placement request.
 //! * [`FirstDesktopApply`] — the injectable side-effect seam
 //!   ([`FirstDesktopApply::place_desktop`] → [`FirstDesktopApply::open_session`]).
-//!   Production [`LiveFirstDesktop`] uses the signed `vm_lifecycle` Bus publisher
+//!   Production [`LiveFirstDesktop`] uses the signed Workload operation API
 //!   in async builds and returns a typed [`FirstDesktopError::IntegrationGated`]
 //!   when the Bus, arming credential, backend, or roster observation is
 //!   unavailable; tests drive recording fakes.
@@ -36,8 +36,8 @@
 //! * The **VM** is described by a lean [`CloudDesktopSpec`]: VM name, target peer,
 //!   golden disk path, client peer, owner, flavor, and default libvirt sizing. That
 //!   folds directly into the existing
-//!   [`vm_lifecycle`](crate::workers::vm_lifecycle) `Create`/`Start` verbs in
-//!   async builds; this unit does not build a parallel cloud model.
+//!   typed Workload `StartAndAttach` request; this unit does not build a parallel
+//!   cloud model or lifecycle channel.
 //! * The **session** is the broker's
 //!   [`SessionRequest::Open`](crate::workers::session_broker::SessionRequest) wire
 //!   verb on [`ACTION_TOPIC`](crate::workers::session_broker::ACTION_TOPIC): after
@@ -64,23 +64,26 @@ use crate::image_catalog::{images_dir, ImageKind, ImageManifest};
 /// The default first-desktop flavor. Mirrors the broker's Standard desktop
 /// class (`m1.medium`) without pulling the async worker module into lean builds.
 pub const DEFAULT_DESKTOP_FLAVOR: &str = "m1.medium";
-/// Default first-desktop vCPU count for the libvirt lifecycle bridge.
+/// Default first-desktop vCPU count for the Workload operation.
 pub const DEFAULT_DESKTOP_VCPUS: u32 = 2;
-/// Default first-desktop RAM in MiB for the libvirt lifecycle bridge.
+/// Default first-desktop RAM in MiB for the Workload operation.
 pub const DEFAULT_DESKTOP_RAM_MB: u64 = 4096;
-/// Default first-desktop disk size in GiB for the libvirt lifecycle bridge.
+/// Default first-desktop disk size in GiB for the Workload operation.
 pub const DEFAULT_DESKTOP_DISK_GB: u64 = 40;
 /// Default first-desktop libvirt network.
 pub const DEFAULT_DESKTOP_NETWORK: &str = "default";
-/// Maximum lifetime minted for first-desktop lifecycle capabilities.
+/// How long the live first-desktop placement seam waits for a completed Workload.
 #[cfg(feature = "async-services")]
-pub const VM_LIFECYCLE_AUTH_TTL_MS: i64 = 30_000;
-/// How long the live first-desktop placement seam waits for a running VM roster.
+pub const WORKLOAD_PLACE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll cadence while waiting for `state/workloads/<node>`.
 #[cfg(feature = "async-services")]
-pub const VM_LIFECYCLE_PLACE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Poll cadence while waiting for `event/vm/instances`.
+pub const WORKLOAD_PLACE_POLL: Duration = Duration::from_millis(200);
+/// Maximum lifetime of a first-desktop Workload capability.
 #[cfg(feature = "async-services")]
-pub const VM_LIFECYCLE_PLACE_POLL: Duration = Duration::from_millis(200);
+const WORKLOAD_AUTH_TTL_MS: i64 = 30_000;
+/// Topic used by the sole Workload operation API.
+#[cfg(feature = "async-services")]
+const WORKLOAD_OPERATION_TOPIC: &str = mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC;
 
 /// The broker session topic this verb's session-open publishes on.
 ///
@@ -156,9 +159,8 @@ impl FirstDesktopStep {
     }
 }
 
-/// The desktop placement this onboarding verb asks the VDI broker to perform —
-/// the session/owner/image the local-first libvirt placement path (the
-/// `vm_lifecycle` worker) boots the desktop from once that leg is wired.
+/// The desktop placement this onboarding verb asks the Workload reconciler to
+/// perform — the session/owner/image for the local-first libvirt path.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CloudDesktopSpec {
     /// The libvirt domain name to create/start.
@@ -173,15 +175,17 @@ pub struct CloudDesktopSpec {
     pub owner: String,
     /// The image manifest name to boot.
     pub image: String,
+    /// The exact approved catalog version selected for this desktop.
+    pub image_version: String,
     /// The versioned golden base disk path to use as the VM backing image.
     pub image_path: String,
     /// The selected flavor.
     pub flavor: String,
-    /// Virtual CPUs for the lifecycle create request.
+    /// Virtual CPUs for the Workload operation.
     pub vcpus: u32,
-    /// RAM in MiB for the lifecycle create request.
+    /// RAM in MiB for the Workload operation.
     pub ram_mb: u64,
-    /// Disk size in GiB for the lifecycle create request.
+    /// Disk size in GiB for the Workload operation.
     pub disk_gb: u64,
     /// Libvirt network for the first desktop NIC.
     pub network: String,
@@ -436,6 +440,7 @@ pub fn build_cloud_desktop_spec(
         placement_peer: node_id.to_string(),
         owner: node_id.to_string(),
         image: image.name.clone(),
+        image_version: image.version.clone(),
         image_path: golden_base_disk(workgroup_root, image)
             .to_string_lossy()
             .into_owned(),
@@ -447,56 +452,10 @@ pub fn build_cloud_desktop_spec(
     }
 }
 
-/// Fold a planned first-desktop placement into the existing `vm_lifecycle`
-/// `Create` action (§6 reuse: no parallel VM create wire type).
-#[cfg(feature = "async-services")]
-#[must_use]
-pub fn lifecycle_create_action(
-    desktop: &CloudDesktopSpec,
-) -> crate::workers::vm_lifecycle::LifecycleAction {
-    crate::workers::vm_lifecycle::LifecycleAction::Create {
-        host: desktop.placement_peer.clone(),
-        spec: crate::workers::vm_lifecycle::VmSpec {
-            name: desktop.vm_name.clone(),
-            vcpus: desktop.vcpus,
-            ram_mb: desktop.ram_mb,
-            disk_gb: desktop.disk_gb,
-            image_path: Some(desktop.image_path.clone()),
-            network: Some(desktop.network.clone()),
-            pci_passthrough: Vec::new(),
-        },
-    }
-}
-
-/// Fold a planned first-desktop placement into the existing `vm_lifecycle`
-/// `Start` action.
-#[cfg(feature = "async-services")]
-#[must_use]
-pub fn lifecycle_start_action(
-    desktop: &CloudDesktopSpec,
-) -> crate::workers::vm_lifecycle::LifecycleAction {
-    crate::workers::vm_lifecycle::LifecycleAction::Start {
-        host: desktop.placement_peer.clone(),
-        name: desktop.vm_name.clone(),
-    }
-}
-
-/// The ordered lifecycle actions needed before the broker session can be opened.
-#[cfg(feature = "async-services")]
-#[must_use]
-pub fn lifecycle_actions(
-    desktop: &CloudDesktopSpec,
-) -> [crate::workers::vm_lifecycle::LifecycleAction; 2] {
-    [
-        lifecycle_create_action(desktop),
-        lifecycle_start_action(desktop),
-    ]
-}
-
-/// Publish the typed lifecycle actions needed to place a first desktop.
-pub trait VmLifecyclePlace {
-    /// Create/start the desktop VM and return once the lifecycle roster proves it
-    /// is running.
+/// Publish the single typed Workload operation needed to place a first desktop.
+pub trait WorkloadPlace {
+    /// Start and attach the desktop VM and return once the Workload projection
+    /// proves that its native attachment is ready.
     ///
     /// # Errors
     /// [`FirstDesktopError`] when the Bus, authorization, backend, or roster
@@ -504,260 +463,97 @@ pub trait VmLifecyclePlace {
     fn place(&self, desktop: &CloudDesktopSpec) -> Result<BootedDesktop, FirstDesktopError>;
 }
 
-/// Fail-closed fallback for builds/environments without the live lifecycle seam.
+/// Fail-closed fallback for builds/environments without the live Workload seam.
 #[cfg(not(feature = "async-services"))]
-struct GatedVmLifecyclePlace;
+struct GatedWorkloadPlace;
 
 #[cfg(not(feature = "async-services"))]
-impl VmLifecyclePlace for GatedVmLifecyclePlace {
+impl WorkloadPlace for GatedWorkloadPlace {
     fn place(&self, desktop: &CloudDesktopSpec) -> Result<BootedDesktop, FirstDesktopError> {
-        Err(vm_lifecycle_integration_gate(
+        Err(workload_integration_gate(
             desktop,
-            "the Bus lifecycle publisher is not compiled into this build",
+            "the Workload operation publisher is not compiled into this build",
         ))
     }
 }
 
 #[cfg(feature = "async-services")]
-type LifecycleTokenSigner = dyn mackes_mesh_types::cloud::CloudTokenSigner + Send + Sync;
+type WorkloadTokenSigner = dyn mackes_mesh_types::cloud::CloudTokenSigner + Send + Sync;
 
-/// Live `action/vm/lifecycle` publisher for first-desktop placement.
+/// Live sole-API Workload publisher for first-desktop placement.
 #[cfg(feature = "async-services")]
-pub struct BusVmLifecyclePlace {
+struct BusWorkloadPlace {
     bus_root: Option<PathBuf>,
-    signer: Option<Arc<LifecycleTokenSigner>>,
+    signer: Option<Arc<WorkloadTokenSigner>>,
     timeout: Duration,
     poll: Duration,
 }
 
 #[cfg(feature = "async-services")]
-impl Default for BusVmLifecyclePlace {
-    fn default() -> Self {
-        Self {
-            bus_root: None,
-            signer: None,
-            timeout: VM_LIFECYCLE_PLACE_TIMEOUT,
-            poll: VM_LIFECYCLE_PLACE_POLL,
-        }
-    }
-}
-
-#[cfg(feature = "async-services")]
-impl BusVmLifecyclePlace {
-    /// Use the production Bus root and systemd cloud-arm credential.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[cfg(test)]
-    fn with_bus_root(mut self, root: PathBuf) -> Self {
-        self.bus_root = Some(root);
-        self
-    }
-
-    #[cfg(test)]
-    fn with_signer(mut self, signer: Arc<LifecycleTokenSigner>) -> Self {
-        self.signer = Some(signer);
-        self
-    }
-
-    #[cfg(test)]
-    fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_poll(mut self, poll: Duration) -> Self {
-        self.poll = poll;
-        self
-    }
-
+impl BusWorkloadPlace {
     fn bus_root(&self) -> Result<PathBuf, FirstDesktopError> {
-        self.bus_root
-            .clone()
-            .or_else(crate::bus_publish::default_bus_root)
-            .ok_or_else(|| FirstDesktopError::IntegrationGated {
-                step: "place-desktop",
-                reason: "no Mackes Bus root is configured for action/vm/lifecycle".to_string(),
-            })
+        self.bus_root.clone().or_else(crate::bus_publish::default_bus_root).ok_or_else(|| FirstDesktopError::IntegrationGated {
+            step: "place-desktop",
+            reason: "no Mackes Bus root is configured for the Workload operation API".into(),
+        })
     }
-
-    fn signer(&self) -> Result<Arc<LifecycleTokenSigner>, FirstDesktopError> {
-        if let Some(signer) = &self.signer {
-            return Ok(Arc::clone(signer));
-        }
+    fn signer(&self) -> Result<Arc<WorkloadTokenSigner>, FirstDesktopError> {
+        if let Some(signer) = &self.signer { return Ok(Arc::clone(signer)); }
         crate::workers::cloud::HmacTokenSigner::from_systemd_credential()
-            .map(|signer| Arc::new(signer) as Arc<LifecycleTokenSigner>)
-            .map_err(|reason| FirstDesktopError::IntegrationGated {
-                step: "place-desktop",
-                reason: format!("cannot arm vm_lifecycle request: {reason}"),
-            })
+            .map(|signer| Arc::new(signer) as Arc<WorkloadTokenSigner>)
+            .map_err(|reason| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot arm Workload request from the Bus: {reason}") })
+    }
+    fn request_body(desktop: &CloudDesktopSpec, signer: &WorkloadTokenSigner) -> Result<(String, String), FirstDesktopError> {
+        use mackes_mesh_types::workloads::{WorkloadAttachmentProtocol, WorkloadBackend, WorkloadId, WorkloadOperationAction, WorkloadOperationRequest, WorkloadResources, WORKLOAD_CONTRACT_SCHEMA_VERSION};
+        let workload_id = WorkloadId::new(format!("vm:{}:{}", desktop.placement_peer, desktop.vm_name)).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("invalid Workload id: {error}") })?;
+        let now = now_ms();
+        let request = WorkloadOperationRequest {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: format!("first-desktop-workload-{}-{}", desktop.vm_name, uuid::Uuid::new_v4().simple()),
+            workload_id,
+            backend: WorkloadBackend::LibvirtVirtqemud,
+            resources: WorkloadResources { vcpu: u16::try_from(desktop.vcpus).map_err(|_| FirstDesktopError::Failed { step: "place-desktop", reason: "desktop vCPU count exceeds Workload contract".into() })?, memory_mb: u32::try_from(desktop.ram_mb).map_err(|_| FirstDesktopError::Failed { step: "place-desktop", reason: "desktop memory exceeds Workload contract".into() })?, disk_gb: u32::try_from(desktop.disk_gb).map_err(|_| FirstDesktopError::Failed { step: "place-desktop", reason: "desktop disk exceeds Workload contract".into() })? },
+            image_ref: Some(format!("{}:{}", desktop.image, desktop.image_version)),
+            target_node: desktop.placement_peer.clone(), expected_generation: 0, action: WorkloadOperationAction::StartAndAttach,
+            target_request_id: None, deadline_at_ms: u64::try_from(now).unwrap_or(0).saturating_add(20_000), preferred_attachment: Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf), armed_token: None,
+        };
+        let unsigned = serde_json::to_string(&request).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("encode Workload request: {error}") })?;
+        let digest = mackes_mesh_types::cloud::cloud_request_digest(&unsigned).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("digest Workload request: {error}") })?;
+        let target = format!("workload:{}", request.workload_id.as_str());
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(signer, &format!("first-desktop-{}", request.request_id), now.saturating_add(WORKLOAD_AUTH_TTL_MS), "workload-operation", &request.target_node, &target, &digest).encode();
+        let mut value: serde_json::Value = serde_json::from_str(&unsigned).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("encode Workload object: {error}") })?;
+        value["armed_token"] = serde_json::Value::String(token);
+        let body = serde_json::to_string(&value).map_err(|error| FirstDesktopError::Failed { step: "place-desktop", reason: format!("serialize armed Workload request: {error}") })?;
+        Ok((request.request_id, body))
     }
 }
 
 #[cfg(feature = "async-services")]
-impl VmLifecyclePlace for BusVmLifecyclePlace {
+impl WorkloadPlace for BusWorkloadPlace {
     fn place(&self, desktop: &CloudDesktopSpec) -> Result<BootedDesktop, FirstDesktopError> {
-        let bus_root = self.bus_root()?;
-        let signer = self.signer().map_err(|error| match error {
-            FirstDesktopError::IntegrationGated { reason, .. } => {
-                vm_lifecycle_integration_gate(desktop, &reason)
+        let root = self.bus_root().map_err(|error| workload_integration_gate(desktop, &error.to_string()))?;
+        let signer = self.signer().map_err(|error| workload_integration_gate(desktop, &error.to_string()))?;
+        let (request_id, body) = Self::request_body(desktop, signer.as_ref())?;
+        let persist = mde_bus::persist::Persist::open(root.clone()).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot open Workload Bus {}: {error}", root.display()) })?;
+        let state_topic = mackes_mesh_types::workloads::workload_state_topic(&desktop.placement_peer);
+        let mut cursor = persist.latest_ulid(&state_topic).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot read Workload state cursor: {error}") })?;
+        persist.write(WORKLOAD_OPERATION_TOPIC, mde_bus::hooks::config::Priority::Default, Some("Workload StartAndAttach"), Some(&body)).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot publish Workload operation: {error}") })?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let messages = persist.list_since(&state_topic, cursor.as_deref()).map_err(|error| FirstDesktopError::IntegrationGated { step: "place-desktop", reason: format!("cannot read Workload projection: {error}") })?;
+            for message in messages {
+                cursor = Some(message.ulid.clone());
+                let Some(body) = message.body.as_deref() else { continue; };
+                let Ok(snapshot) = serde_json::from_str::<mackes_mesh_types::workloads::WorkloadStateSnapshot>(body) else { continue; };
+                if let Some(status) = snapshot.workloads.iter().find(|status| status.request_id == request_id) {
+                    if status.phase == mackes_mesh_types::workloads::WorkloadOperationPhase::Completed { return Ok(BootedDesktop { vm_id: desktop.vm_name.clone(), serving_peer: desktop.placement_peer.clone() }); }
+                    if status.phase == mackes_mesh_types::workloads::WorkloadOperationPhase::Failed { return Err(workload_integration_gate(desktop, status.reason.as_deref().unwrap_or("Workload operation failed"))); }
+                }
             }
-            other => other,
-        })?;
-        let actions = lifecycle_actions(desktop);
-        let persist = mde_bus::persist::Persist::open(bus_root.clone()).map_err(|error| {
-            FirstDesktopError::IntegrationGated {
-                step: "place-desktop",
-                reason: format!("cannot open Mackes Bus {}: {error}", bus_root.display()),
-            }
-        })?;
-        let mut cursor = persist
-            .latest_ulid(crate::workers::vm_lifecycle::INSTANCES_TOPIC)
-            .map_err(|error| FirstDesktopError::IntegrationGated {
-                step: "place-desktop",
-                reason: format!("cannot read vm_lifecycle roster cursor: {error}"),
-            })?;
-        for (index, action) in actions.iter().enumerate() {
-            let body = authorized_lifecycle_body(
-                action,
-                signer.as_ref(),
-                &next_lifecycle_nonce(&desktop.vm_name, index),
-                now_ms(),
-            )?;
-            persist
-                .write(
-                    crate::workers::vm_lifecycle::ACTION_TOPIC,
-                    mde_bus::hooks::config::Priority::Default,
-                    None,
-                    Some(&body),
-                )
-                .map_err(|error| FirstDesktopError::IntegrationGated {
-                    step: "place-desktop",
-                    reason: format!("cannot publish vm_lifecycle action: {error}"),
-                })?;
+            if Instant::now() >= deadline { return Err(workload_integration_gate(desktop, "timed out waiting for state/workloads projection")); }
+            std::thread::sleep(self.poll);
         }
-        wait_for_running_desktop(&persist, &mut cursor, desktop, self.timeout, self.poll)
     }
-}
-
-#[cfg(feature = "async-services")]
-fn authorized_lifecycle_body(
-    action: &crate::workers::vm_lifecycle::LifecycleAction,
-    signer: &LifecycleTokenSigner,
-    nonce: &str,
-    now_ms: i64,
-) -> Result<String, FirstDesktopError> {
-    let (verb, target) =
-        action
-            .authorization_context()
-            .ok_or_else(|| FirstDesktopError::Failed {
-                step: "place-desktop",
-                reason: "first-desktop lifecycle action has no mutation authorization context"
-                    .to_string(),
-            })?;
-    let mut body = serde_json::to_value(action).map_err(|error| FirstDesktopError::Failed {
-        step: "place-desktop",
-        reason: format!("encode vm_lifecycle action: {error}"),
-    })?;
-    let object = body
-        .as_object_mut()
-        .ok_or_else(|| FirstDesktopError::Failed {
-            step: "place-desktop",
-            reason: "vm_lifecycle action did not encode as an object".to_string(),
-        })?;
-    object.remove("armed_token");
-    object.insert(
-        "schema_version".to_string(),
-        serde_json::json!(crate::workers::vm_lifecycle::ACTION_SCHEMA_VERSION),
-    );
-    let unsigned = serde_json::to_string(&body).map_err(|error| FirstDesktopError::Failed {
-        step: "place-desktop",
-        reason: format!("serialize unsigned vm_lifecycle action: {error}"),
-    })?;
-    let digest = mackes_mesh_types::cloud::cloud_request_digest(&unsigned).map_err(|error| {
-        FirstDesktopError::Failed {
-            step: "place-desktop",
-            reason: format!("digest vm_lifecycle action: {error}"),
-        }
-    })?;
-    let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
-        signer,
-        nonce,
-        now_ms.saturating_add(VM_LIFECYCLE_AUTH_TTL_MS),
-        verb,
-        action.host(),
-        target,
-        &digest,
-    )
-    .encode();
-    body.as_object_mut()
-        .expect("body was validated as an object")
-        .insert("armed_token".to_string(), serde_json::Value::String(token));
-    serde_json::to_string(&body).map_err(|error| FirstDesktopError::Failed {
-        step: "place-desktop",
-        reason: format!("serialize armed vm_lifecycle action: {error}"),
-    })
-}
-
-#[cfg(feature = "async-services")]
-fn wait_for_running_desktop(
-    persist: &mde_bus::persist::Persist,
-    cursor: &mut Option<String>,
-    desktop: &CloudDesktopSpec,
-    timeout: Duration,
-    poll: Duration,
-) -> Result<BootedDesktop, FirstDesktopError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let messages = persist
-            .list_since(
-                crate::workers::vm_lifecycle::INSTANCES_TOPIC,
-                cursor.as_deref(),
-            )
-            .map_err(|error| FirstDesktopError::IntegrationGated {
-                step: "place-desktop",
-                reason: format!("cannot read vm_lifecycle roster: {error}"),
-            })?;
-        for message in messages {
-            *cursor = Some(message.ulid.clone());
-            let Some(body) = message.body.as_deref() else {
-                continue;
-            };
-            let Ok(report) =
-                serde_json::from_str::<crate::workers::vm_lifecycle::InstanceReport>(body)
-            else {
-                continue;
-            };
-            if report.host != desktop.placement_peer {
-                continue;
-            }
-            if report.instances.iter().any(|instance| {
-                instance.name == desktop.vm_name
-                    && crate::workers::vm_lifecycle::vm_state_from_str(&instance.state)
-                        == crate::workers::vm_lifecycle::VmState::Running
-            }) {
-                return Ok(BootedDesktop {
-                    vm_id: desktop.vm_name.clone(),
-                    serving_peer: desktop.placement_peer.clone(),
-                });
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(vm_lifecycle_integration_gate(
-                desktop,
-                "timed out waiting for event/vm/instances to show the desktop running",
-            ));
-        }
-        std::thread::sleep(poll);
-    }
-}
-
-#[cfg(feature = "async-services")]
-fn next_lifecycle_nonce(vm_name: &str, index: usize) -> String {
-    format!("first-desktop-{vm_name}-{index}-{}", uuid::Uuid::new_v4())
 }
 
 #[cfg(feature = "async-services")]
@@ -768,11 +564,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn vm_lifecycle_integration_gate(desktop: &CloudDesktopSpec, reason: &str) -> FirstDesktopError {
+fn workload_integration_gate(desktop: &CloudDesktopSpec, reason: &str) -> FirstDesktopError {
     FirstDesktopError::IntegrationGated {
         step: "place-desktop",
         reason: format!(
-            "desktop session `{}` → lifecycle create/start is typed for VM `{}` on `{}`, \
+            "desktop session `{}` → Workload StartAndAttach is typed for VM `{}` on `{}`, \
              but {reason}; no VM id was fabricated",
             desktop.session_id, desktop.vm_name, desktop.placement_peer
         ),
@@ -792,7 +588,7 @@ pub struct BootedDesktop {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstDesktopError {
     /// The live path is not runnable in this build/environment yet — it needs a real
-    /// prerequisite (a live cloud placement path / the Bus).
+    /// prerequisite (the Workload reconciler / the Bus).
     /// Names the step + what is missing. §7-legal: a real method returning a real
     /// typed error, exactly as OW-7's [`crate::onboard::spawn_lighthouse`] seam does.
     IntegrationGated {
@@ -883,28 +679,33 @@ pub struct LiveFirstDesktop {
     ///
     /// [`BusApply`]: crate::onboard::remote_push::BusApply
     remote_push: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
-    /// The VM lifecycle placement seam. Default: signed Bus publisher when
+    /// The Workload placement seam. Default: signed Bus publisher when
     /// compiled with `async-services`, otherwise a typed integration gate.
-    vm_lifecycle: Arc<dyn VmLifecyclePlace + Send + Sync>,
+    workload_place: Arc<dyn WorkloadPlace + Send + Sync>,
 }
 
 impl Default for LiveFirstDesktop {
     fn default() -> Self {
         Self {
             remote_push: std::sync::Arc::new(crate::onboard::remote_push::BusApply),
-            vm_lifecycle: default_vm_lifecycle_place(),
+            workload_place: default_workload_place(),
         }
     }
 }
 
-fn default_vm_lifecycle_place() -> Arc<dyn VmLifecyclePlace + Send + Sync> {
+fn default_workload_place() -> Arc<dyn WorkloadPlace + Send + Sync> {
     #[cfg(feature = "async-services")]
     {
-        Arc::new(BusVmLifecyclePlace::new())
+        Arc::new(BusWorkloadPlace {
+            bus_root: None,
+            signer: None,
+            timeout: WORKLOAD_PLACE_TIMEOUT,
+            poll: WORKLOAD_PLACE_POLL,
+        })
     }
     #[cfg(not(feature = "async-services"))]
     {
-        Arc::new(GatedVmLifecyclePlace)
+        Arc::new(GatedWorkloadPlace)
     }
 }
 
@@ -919,13 +720,13 @@ impl LiveFirstDesktop {
         self
     }
 
-    /// Inject the VM lifecycle placement seam (tests use a recording fake).
+    /// Inject the Workload placement seam (tests use a recording fake).
     #[must_use]
-    pub fn with_vm_lifecycle(
+    pub fn with_workload_place(
         mut self,
-        vm_lifecycle: Arc<dyn VmLifecyclePlace + Send + Sync>,
+        workload_place: Arc<dyn WorkloadPlace + Send + Sync>,
     ) -> Self {
-        self.vm_lifecycle = vm_lifecycle;
+        self.workload_place = workload_place;
         self
     }
 
@@ -933,7 +734,7 @@ impl LiveFirstDesktop {
         &self,
         desktop: &CloudDesktopSpec,
     ) -> Result<BootedDesktop, FirstDesktopError> {
-        self.vm_lifecycle.place(desktop)
+        self.workload_place.place(desktop)
     }
 }
 
@@ -1425,12 +1226,7 @@ mod tests {
         match err {
             FirstDesktopError::IntegrationGated { step, reason } => {
                 assert_eq!(step, "place-desktop");
-                assert!(
-                    reason.contains("action/vm/lifecycle")
-                        || reason.contains("vm_lifecycle")
-                        || reason.contains("Bus"),
-                    "names the lifecycle prerequisite: {reason}"
-                );
+                assert!(reason.contains("Workload") || reason.contains("Bus"), "names the Workload prerequisite: {reason}");
                 assert!(reason.contains("desktop-eagle"), "names the VM: {reason}");
             }
             FirstDesktopError::Failed { .. } => panic!("expected an integration-gated error"),
@@ -1453,22 +1249,22 @@ mod tests {
     }
 
     #[test]
-    fn live_first_desktop_uses_injected_vm_lifecycle_before_remote_push() {
+    fn live_first_desktop_uses_injected_workload_before_remote_push() {
         use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
-        struct RecordingLifecycle {
+        struct RecordingWorkload {
             seen: Mutex<Vec<CloudDesktopSpec>>,
         }
-        impl VmLifecyclePlace for RecordingLifecycle {
+        impl WorkloadPlace for RecordingWorkload {
             fn place(
                 &self,
                 desktop: &CloudDesktopSpec,
             ) -> Result<BootedDesktop, FirstDesktopError> {
                 self.seen
                     .lock()
-                    .expect("lifecycle mutex")
+                    .expect("Workload mutex")
                     .push(desktop.clone());
                 Ok(BootedDesktop {
                     vm_id: "uuid-boot".into(),
@@ -1495,10 +1291,10 @@ mod tests {
             None,
             vec![manifest("win10-gold", "vm", "3.2", Some("workstation"))],
         ));
-        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let workload = Arc::new(RecordingWorkload::default());
         let push = Arc::new(RecordingPush::default());
         let apply = LiveFirstDesktop::default()
-            .with_vm_lifecycle(lifecycle.clone())
+            .with_workload_place(workload.clone())
             .with_remote_push(push.clone());
 
         let outcome = execute(&plan, &apply).expect("live seam with injected adapters");
@@ -1509,9 +1305,9 @@ mod tests {
             }
         );
 
-        let seen_lifecycle = lifecycle.seen.lock().expect("lifecycle mutex");
-        assert_eq!(seen_lifecycle.len(), 1);
-        assert_eq!(seen_lifecycle[0].vm_name, "desktop-eagle");
+        let seen_workload = workload.seen.lock().expect("Workload mutex");
+        assert_eq!(seen_workload.len(), 1);
+        assert_eq!(seen_workload[0].vm_name, "desktop-eagle");
 
         let seen_push = push.seen.lock().expect("push mutex");
         assert_eq!(seen_push.len(), 1);
@@ -1639,110 +1435,12 @@ mod tests {
 
     #[cfg(feature = "async-services")]
     #[test]
-    fn desktop_spec_maps_to_vm_lifecycle_create_then_start_actions() {
-        use crate::workers::vm_lifecycle::{parse_action, LifecycleAction, VmSpec};
-
-        let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
-        let desktop = build_cloud_desktop_spec(
-            "desktop-eagle",
-            "peer:eagle",
-            &image,
-            Path::new("/mnt/mesh-storage"),
-        );
-        let [create, start] = lifecycle_actions(&desktop);
-        assert_eq!(
-            create,
-            LifecycleAction::Create {
-                host: "peer:eagle".into(),
-                spec: VmSpec {
-                    name: "desktop-eagle".into(),
-                    vcpus: DEFAULT_DESKTOP_VCPUS,
-                    ram_mb: DEFAULT_DESKTOP_RAM_MB,
-                    disk_gb: DEFAULT_DESKTOP_DISK_GB,
-                    image_path: Some(
-                        "/mnt/mesh-storage/images/win10-gold/3.2/win10-gold.img".into()
-                    ),
-                    network: Some(DEFAULT_DESKTOP_NETWORK.into()),
-                    pci_passthrough: Vec::new(),
-                },
-            }
-        );
-        assert_eq!(
-            start,
-            LifecycleAction::Start {
-                host: "peer:eagle".into(),
-                name: "desktop-eagle".into(),
-            }
-        );
-
-        let create_json = serde_json::to_string(&create).expect("serialize create");
-        let start_json = serde_json::to_string(&start).expect("serialize start");
-        assert_eq!(
-            parse_action(&create_json).expect("parse create"),
-            create,
-            "the first-desktop adapter must emit the worker's actual create wire shape"
-        );
-        assert_eq!(
-            parse_action(&start_json).expect("parse start"),
-            start,
-            "the first-desktop adapter must emit the worker's actual start wire shape"
-        );
-    }
-
-    #[cfg(feature = "async-services")]
-    #[test]
-    fn authorized_lifecycle_body_is_accepted_by_worker_parser_and_token_gate() {
+    fn bus_workload_place_publishes_one_authorized_start_and_attach_request() {
         use crate::workers::cloud::{verify_token, HmacTokenSigner, TokenVerdict};
-        use crate::workers::vm_lifecycle::{parse_action, LifecycleAction, ACTION_SCHEMA_VERSION};
-
-        let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
-        let desktop = build_cloud_desktop_spec(
-            "desktop-eagle",
-            "peer:eagle",
-            &image,
-            Path::new("/mnt/mesh-storage"),
-        );
-        let [create, _start] = lifecycle_actions(&desktop);
-        let signer = HmacTokenSigner::new(b"first-desktop-lifecycle-test-key".to_vec());
-        let now = 1_700_000_000_000;
-
-        let body = authorized_lifecycle_body(&create, &signer, "firstdesk-create-1", now)
-            .expect("authorized lifecycle body");
-        assert_eq!(
-            parse_action(&body).expect("parse action"),
-            create,
-            "the signed body remains the worker's lifecycle action wire shape"
-        );
-
-        let value: serde_json::Value = serde_json::from_str(&body).expect("action json");
-        assert_eq!(
-            value["schema_version"],
-            serde_json::json!(ACTION_SCHEMA_VERSION)
-        );
-        let token = value["armed_token"].as_str().expect("armed token");
-        let LifecycleAction::Create { spec, host } = &create else {
-            panic!("expected create action")
-        };
-        assert_eq!(
-            verify_token(
-                Some(token),
-                "vm-create",
-                host,
-                &spec.name,
-                &body,
-                now,
-                &signer
-            ),
-            TokenVerdict::Valid
-        );
-    }
-
-    #[cfg(feature = "async-services")]
-    #[test]
-    fn bus_vm_lifecycle_place_publishes_signed_create_start_and_waits_for_running_roster() {
-        use crate::workers::cloud::{verify_token, HmacTokenSigner, TokenVerdict};
-        use crate::workers::vm_lifecycle::{
-            parse_action, Instance, InstanceReport, LifecycleAction, ACTION_TOPIC, INSTANCES_TOPIC,
+        use mackes_mesh_types::workloads::{
+            WorkloadOperationAction, WorkloadOperationPhase, WorkloadOperationStatus,
+            WorkloadPowerState, WorkloadReadiness, WorkloadRuntimeSignals,
+            WorkloadStateSnapshot, WORKLOAD_CONTRACT_SCHEMA_VERSION,
         };
         use mde_bus::hooks::config::Priority;
         use std::sync::Arc;
@@ -1757,79 +1455,99 @@ mod tests {
             &image,
             Path::new("/mnt/mesh-storage"),
         );
-        let signer: Arc<LifecycleTokenSigner> = Arc::new(HmacTokenSigner::new(
-            b"first-desktop-lifecycle-bus-test-key".to_vec(),
+        let signer: Arc<WorkloadTokenSigner> = Arc::new(HmacTokenSigner::new(
+            b"first-desktop-workload-bus-test-key".to_vec(),
         ));
         let reader_root = bus_root.clone();
-        let report_host = desktop.placement_peer.clone();
-        let report_name = desktop.vm_name.clone();
+        let report_node = desktop.placement_peer.clone();
         let _initialized_bus =
             mde_bus::persist::Persist::open(bus_root.clone()).expect("initialize temp bus");
         let observer = std::thread::spawn(move || {
             let persist = mde_bus::persist::Persist::open(reader_root).expect("open bus");
-            let verifier = HmacTokenSigner::new(b"first-desktop-lifecycle-bus-test-key".to_vec());
             let deadline = Instant::now() + Duration::from_secs(2);
-            let mut cursor: Option<String> = None;
-            let mut seen = Vec::new();
-            while seen.len() < 2 && Instant::now() < deadline {
+            loop {
                 let messages = persist
-                    .list_since(ACTION_TOPIC, cursor.as_deref())
-                    .expect("list lifecycle actions");
-                for message in messages {
-                    cursor = Some(message.ulid.clone());
-                    let Some(body) = message.body else {
-                        continue;
-                    };
-                    let action = parse_action(&body).expect("parse lifecycle action");
-                    let value: serde_json::Value = serde_json::from_str(&body).expect("json body");
-                    let token = value["armed_token"].as_str().expect("armed token");
-                    let (verb, target) = action.authorization_context().expect("mutation action");
+                    .list_since(WORKLOAD_OPERATION_TOPIC, None)
+                    .expect("list Workload operations");
+                if let Some(message) = messages.into_iter().next() {
+                    let body = message.body.expect("Workload request body");
+                    let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
+                        &body,
+                        u64::try_from(now_ms()).unwrap_or(0),
+                    )
+                    .expect("valid Workload request");
+                    assert_eq!(request.action, WorkloadOperationAction::StartAndAttach);
+                    assert_eq!(request.target_node, report_node);
+                    let token = request.armed_token.as_deref().expect("armed token");
+                    let verifier = HmacTokenSigner::new(
+                        b"first-desktop-workload-bus-test-key".to_vec(),
+                    );
                     assert_eq!(
                         verify_token(
                             Some(token),
-                            verb,
-                            action.host(),
-                            target,
+                            "workload-operation",
+                            &request.target_node,
+                            &format!("workload:{}", request.workload_id.as_str()),
                             &body,
                             now_ms(),
-                            &verifier
+                            &verifier,
                         ),
                         TokenVerdict::Valid
                     );
-                    seen.push(action);
+                    let status = WorkloadOperationStatus {
+                        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+                        request_id: request.request_id,
+                        workload_id: request.workload_id,
+                        backend: request.backend,
+                        resources: request.resources,
+                        image_ref: request.image_ref.clone(),
+                        generation: 1,
+                        phase: WorkloadOperationPhase::Completed,
+                        power: WorkloadPowerState::Running,
+                        readiness: WorkloadReadiness::Ready,
+                        signals: WorkloadRuntimeSignals::from_readiness(
+                            WorkloadOperationPhase::Completed,
+                            WorkloadReadiness::Ready,
+                        ),
+                        retryable: false,
+                        attempt: 1,
+                        next_retry_at_ms: 0,
+                        reason: None,
+                        remediation: None,
+                        attachment: None,
+                    };
+                    let snapshot = WorkloadStateSnapshot {
+                        schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+                        node: report_node.clone(),
+                        observed_at_ms: u64::try_from(now_ms()).unwrap_or(1),
+                        workloads: vec![status],
+                    };
+                    persist
+                        .write(
+                            &mackes_mesh_types::workloads::workload_state_topic(&report_node),
+                            Priority::Default,
+                            None,
+                            Some(&serde_json::to_string(&snapshot).expect("snapshot json")),
+                        )
+                        .expect("write Workload projection");
+                    return;
                 }
-                if seen.len() < 2 {
-                    std::thread::sleep(Duration::from_millis(10));
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for Workload operation");
                 }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(seen.len(), 2, "saw create and start lifecycle actions");
-            let report = InstanceReport {
-                host: report_host,
-                instances: vec![Instance {
-                    id: "1".into(),
-                    name: report_name,
-                    state: "running".into(),
-                }],
-                published_at_ms: u64::try_from(now_ms()).unwrap_or(u64::MAX),
-            };
-            persist
-                .write(
-                    INSTANCES_TOPIC,
-                    Priority::Default,
-                    None,
-                    Some(&serde_json::to_string(&report).expect("report json")),
-                )
-                .expect("write running roster");
-            seen
         });
 
-        let placed = BusVmLifecyclePlace::new()
-            .with_bus_root(bus_root)
-            .with_signer(signer)
-            .with_timeout(Duration::from_secs(2))
-            .with_poll(Duration::from_millis(10))
-            .place(&desktop)
-            .expect("desktop placement via bus roster");
+        let placement = BusWorkloadPlace {
+            bus_root: Some(bus_root),
+            signer: Some(signer),
+            timeout: Duration::from_secs(2),
+            poll: Duration::from_millis(10),
+        }
+        .place(&desktop);
+        observer.join().expect("observer thread");
+        let placed = placement.expect("desktop placement via Workload projection");
         assert_eq!(
             placed,
             BootedDesktop {
@@ -1837,8 +1555,5 @@ mod tests {
                 serving_peer: "peer:eagle".into(),
             }
         );
-        let seen = observer.join().expect("observer thread");
-        assert!(matches!(seen[0], LifecycleAction::Create { .. }));
-        assert!(matches!(seen[1], LifecycleAction::Start { .. }));
     }
 }

@@ -26,6 +26,8 @@
 //!   of the log, with deterministic canonical [`signing_bytes`] and content-
 //!   addressed ([`PayloadRef`]) large-payload references.
 //! * [`command`] — [`CollabCommand`], the typed operations the surface requests.
+//! * [`transfer_v2`] — the strict endpoint/operation-separated `TransferJobV2`
+//!   contract and its bounded executor/lifecycle types.
 //! * [`read_model`] — [`CollabReadModel`] and its projection structs, the
 //!   read-side shapes the surface renders.
 //! * [`topics`] — the `action/collab/*`, `state/collab/*`, and
@@ -43,6 +45,8 @@
 
 #![forbid(unsafe_code)]
 
+/// WL-FUNC-016/WL-FUNC-011 strict rich clipboard transport contracts.
+pub mod clipboard_v2;
 pub mod clock;
 pub mod command;
 pub mod envelope;
@@ -51,11 +55,25 @@ pub mod ids;
 pub mod read_model;
 pub mod space;
 pub mod topics;
+/// WL-FUNC-011 — the bounded adapter into the existing Files transfer view.
+pub mod transfer;
+/// WL-FUNC-011 — strict endpoint/operation-separated TransferJob V2 contracts.
+pub mod transfer_v2;
 pub mod value;
 
 #[cfg(test)]
 mod tests;
 
+pub use clipboard_v2::{
+    ClipboardClipId, ClipboardEchoGuardV2, ClipboardEnvelopeV2, ClipboardEnvelopeV2DecodeError,
+    ClipboardEnvelopeV2ValidationError, ClipboardIdentityValidationError, ClipboardMimeKind,
+    ClipboardMimeOfferV2, ClipboardNodeId, ClipboardPayloadV2, ClipboardSeatId, ClipboardSessionId,
+    ClipboardSignedAttributionV2, ClipboardSourceV2, ClipboardTargetV2, ClipboardUnavailableReason,
+    ClipboardUnsupportedReason, CLIPBOARD_ENVELOPE_V2_SCHEMA_VERSION, MAX_CLIPBOARD_ECHO_HOPS,
+    MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES, MAX_CLIPBOARD_ID_BYTES, MAX_CLIPBOARD_INLINE_TEXT_BYTES,
+    MAX_CLIPBOARD_OFFERS, MAX_CLIPBOARD_PAYLOAD_BYTES, MAX_CLIPBOARD_PREVIEW_BYTES,
+    MAX_CLIPBOARD_TTL_MS,
+};
 pub use clock::{ActorClock, ActorId};
 pub use command::{
     CollabCommand, TaskAction, TaskActionValidationError, TransferControl, MAX_TASK_TITLE_BYTES,
@@ -77,6 +95,19 @@ pub use read_model::{
     TransferJobView, TransferJobs,
 };
 pub use space::{SpaceKind, SpaceRole};
+pub use transfer::{admit_v2_job, TransferLedgerAdmissionError};
+pub use transfer_v2::{
+    ChecksumMode, ChecksumPolicy, OpaqueNodeRef, OpaqueProfileRef, OpaqueResourceRef,
+    RecurringSchedule, ScrapeOutputKind, TransferAction, TransferControlV2, TransferEndpoint,
+    TransferError, TransferErrorCode, TransferJobV2, TransferJobV2DecodeError,
+    TransferJobV2ValidationError, TransferKind, TransferLocation, TransferLocationFamily,
+    TransferOperation, TransferPhase, TransferProgress, TransferRefValidationError,
+    MAX_TRANSFER_ATTEMPTS, MAX_TRANSFER_BANDWIDTH_BYTES_PER_SECOND, MAX_TRANSFER_CONTENT_BYTES,
+    MAX_TRANSFER_CONTENT_TYPE_BYTES, MAX_TRANSFER_ERROR_DETAIL_BYTES,
+    MAX_TRANSFER_JOB_V2_JSON_BYTES, MAX_TRANSFER_OPAQUE_REF_BYTES,
+    MAX_TRANSFER_RATE_BYTES_PER_SECOND, MAX_TRANSFER_RECURRENCE_RUNS,
+    MAX_TRANSFER_RECURRENCE_SECONDS, TRANSFER_JOB_V2_SCHEMA_VERSION,
+};
 pub use value::{
     clipboard_clip_id, sha256_hex, AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind,
     AlertPayload, CallKind, CallParticipantState, ClipItemKind, ClipboardClipBody,

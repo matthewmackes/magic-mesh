@@ -44,7 +44,7 @@ const SPOTLIGHT_MOTION_KEY: &str = "shell-front-door-spotlight-presence";
 const EXPANSION_BUTTON_W: f32 = INPUT_H;
 const EXPANDED_MIN_H: f32 = 320.0;
 const PANEL_MIN_W: f32 = 320.0;
-const ROW_ICON: f32 = 18.0;
+const ROW_ICON: f32 = Style::ICON_M;
 const DOMAIN_W: f32 = 82.0;
 const DOMAIN_MIN_W: f32 = 44.0;
 const RESULT_TEXT_MIN_W: f32 = 72.0;
@@ -643,12 +643,12 @@ impl FrontDoorInstanceLifecycleOp {
         }
     }
 
-    const fn cloud_verb(self) -> &'static str {
+    const fn workload_action(self) -> mackes_mesh_types::workloads::WorkloadOperationAction {
         match self {
-            Self::Start => "instance-start",
-            Self::Stop => "instance-stop",
-            Self::Reboot => "instance-reboot",
-            Self::Delete => "instance-delete",
+            Self::Start => mackes_mesh_types::workloads::WorkloadOperationAction::Start,
+            Self::Stop => mackes_mesh_types::workloads::WorkloadOperationAction::Stop,
+            Self::Reboot => mackes_mesh_types::workloads::WorkloadOperationAction::Restart,
+            Self::Delete => mackes_mesh_types::workloads::WorkloadOperationAction::Destroy,
         }
     }
 
@@ -795,7 +795,7 @@ const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 3] = [
 const SERVICE_CARDS: [FrontDoorWorkflowCard; 3] = [
     FrontDoorWorkflowCard {
         kind: FrontDoorWorkflowKind::Service,
-        surface: Surface::ThisNode,
+        surface: Surface::Workers,
         workbench_plane: None,
         execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "System and Mesh Health",
@@ -814,7 +814,7 @@ const SERVICE_CARDS: [FrontDoorWorkflowCard; 3] = [
     },
     FrontDoorWorkflowCard {
         kind: FrontDoorWorkflowKind::Service,
-        surface: Surface::Workbench,
+        surface: Surface::Workers,
         workbench_plane: Some(Plane::Provisioning),
         execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "Mesh services",
@@ -1305,8 +1305,12 @@ fn app_search_item(surface: Surface, idx: usize) -> SearchItem<FrontDoorTarget> 
 
 const fn app_surface_keywords(surface: Surface) -> &'static str {
     match surface {
-        Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
-            "fleet mesh workbench map explorer services provisioning control"
+        Surface::Workers
+        | Surface::FleetMesh
+        | Surface::Workbench
+        | Surface::MeshView
+        | Surface::Explorer => {
+            "workers fleet mesh workbench map explorer discovery network node services provisioning control"
         }
         Surface::InfraCode => "workloads services iaas cloud catalog",
         Surface::Desktop => "workloads sessions vdi virtual machines remote desktop",
@@ -1920,8 +1924,9 @@ fn expansion_toggle_button(ui: &mut egui::Ui, expanded: bool) -> bool {
     } else {
         Style::TEXT_DIM
     };
-    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(16.0, 16.0));
-    if let Some(tex) = icon_texture(ui.ctx(), icon, 16.0, tint) {
+    let icon_rect =
+        egui::Rect::from_center_size(rect.center(), egui::vec2(Style::ICON_M, Style::ICON_M));
+    if let Some(tex) = icon_texture(ui.ctx(), icon, Style::ICON_M, tint) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         ui.painter()
             .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
@@ -2119,7 +2124,9 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
             egui::pos2(x, row_rect.top()),
             egui::vec2(chip_w, FILTER_CHIP_H),
         );
-        let response = ui.interact(rect, filter_chip_id(filter), egui::Sense::click());
+        let response = ui
+            .interact(rect, filter_chip_id(filter), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         if crate::surfaces::response_activated(ui, &response) && *active != filter {
             *active = filter;
             changed = true;
@@ -2243,7 +2250,7 @@ fn source_status_note(ui: &mut egui::Ui, note: FrontDoorSourceNote) {
         egui::StrokeKind::Inside,
     );
 
-    let icon_size = 16.0;
+    let icon_size = Style::ICON_M;
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(
             row_rect.left() + Style::SP_S + icon_size / 2.0,
@@ -2296,6 +2303,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
     let row_width = bounded_available_width(ui).max(1.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(row_width, ROW_H), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     // Q15 — the armed command row wears the shared selection plate.
     ui.painter().rect_filled(
         rect.shrink2(egui::vec2(0.0, 2.0)),
@@ -2373,6 +2381,7 @@ fn option_row(
     let row_width = bounded_available_width(ui).max(1.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(row_width, ROW_H), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     // PLATFORM-INTERFACES Q15 — RADIUS_M row plates on the shared selection
     // idiom (nav_chrome): the selected row carries the accent selection fill,
     // hover the lighter selection wash.
@@ -2607,29 +2616,58 @@ fn cloud_instance_lifecycle_wire_with(
     authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
 ) -> Result<(String, String), String> {
     let instance = cloud_instance_id(unit_id)
-        .ok_or_else(|| "Cloud lifecycle target is not an instance.".to_string())?;
+        .ok_or_else(|| "Workload lifecycle target is not an instance.".to_string())?;
     let node = node.trim();
     if node.is_empty() {
-        return Err("Cloud lifecycle requires an explicit placement node.".to_string());
+        return Err("Workload lifecycle requires an explicit placement node.".to_string());
     }
-    let topic = format!("action/cloud/{}", op.cloud_verb());
-    let mut body = serde_json::json!({
-        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
-        "node": node,
-        "instance": instance,
-    });
-    if op == FrontDoorInstanceLifecycleOp::Delete {
-        body["typed_name"] = serde_json::Value::String(instance.to_string());
-    }
-    let body = body.to_string();
-    let body = authorize(&body, op.cloud_verb(), node, instance)?;
-    Ok((topic, body))
+    let workload_id = mackes_mesh_types::workloads::WorkloadId::new(format!(
+        "vm:{node}:{instance}"
+    ))
+    .map_err(|error| format!("invalid Workload identity: {error}"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let request = mackes_mesh_types::workloads::WorkloadOperationRequest {
+        schema_version: EXEC_ACTION_SCHEMA_VERSION,
+        request_id: format!("front-door-workload-{}", uuid::Uuid::new_v4().simple()),
+        workload_id,
+        backend: mackes_mesh_types::workloads::WorkloadBackend::LibvirtVirtqemud,
+        resources: mackes_mesh_types::workloads::WorkloadProfile::Small.resources(),
+        image_ref: None,
+        target_node: node.to_owned(),
+        // Front Door has a placement record but not the authoritative Workload
+        // projection here. Zero requests the reconciler's initial-generation
+        // path; callers with a projection-bound generation use workload_api.
+        expected_generation: 0,
+        action: op.workload_action(),
+        target_request_id: None,
+        deadline_at_ms: now_ms.saturating_add(20_000),
+        preferred_attachment: None,
+        armed_token: None,
+    };
+    request
+        .validate(now_ms)
+        .map_err(|error| format!("invalid Workload request: {error}"))?;
+    let capability_target = format!("workload:{}", request.workload_id.as_str());
+    let body = serde_json::to_string(&request)
+        .map_err(|error| format!("serialize Workload request: {error}"))?;
+    let body = authorize(&body, EXEC_AUTH_VERB, node, &capability_target)?;
+    let request = mackes_mesh_types::workloads::WorkloadOperationRequest::from_json(
+        &body, now_ms,
+    )
+    .map_err(|error| format!("authorized Workload request was rejected: {error}"))?;
+    let body = serde_json::to_string(&request)
+        .map_err(|error| format!("serialize authorized Workload request: {error}"))?;
+    Ok((EXEC_ACTION_TOPIC.to_owned(), body))
 }
 
-const EXEC_ACTION_TOPIC: &str = "action/exec/request";
-const EXEC_ACTION_SCHEMA_VERSION: u32 = 1;
-const EXEC_AUTH_VERB: &str = "exec-request";
-const EXEC_AUTH_NODE: &str = "fleet-control";
+const EXEC_ACTION_TOPIC: &str = mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC;
+const EXEC_ACTION_SCHEMA_VERSION: u16 =
+    mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION;
+const EXEC_AUTH_VERB: &str = "workload-operation";
 
 fn service_lifecycle_component<'a>(label: &str, raw: &'a str) -> Result<&'a str, String> {
     let value = raw.trim();
@@ -2655,17 +2693,58 @@ fn unsigned_service_lifecycle_request(
     let service_kind = service_lifecycle_component("service kind", target.kind.label())?;
     let name = service_lifecycle_component("service name", &target.name)?;
     let operation = service_lifecycle_component("operation", op.wire())?;
-    let capability_target = format!("service:{host}:{service_kind}:{name}:{operation}");
-    service_lifecycle_component("capability target", &capability_target)?;
-    let body = serde_json::json!({
-        "schema_version": EXEC_ACTION_SCHEMA_VERSION,
-        "kind": "service_lifecycle",
-        "target_host": host,
-        "service_kind": service_kind,
-        "name": name,
-        "op": operation,
-    })
-    .to_string();
+    let target_node = if host.starts_with("peer:") {
+        host.to_owned()
+    } else {
+        format!("peer:{host}")
+    };
+    let (backend, kind_prefix) = match service_kind {
+        "container" => (
+            mackes_mesh_types::workloads::WorkloadBackend::QuadletSystemd,
+            "container",
+        ),
+        "vm" => (
+            mackes_mesh_types::workloads::WorkloadBackend::LibvirtVirtqemud,
+            "vm",
+        ),
+        _ => return Err(format!("unsupported service kind `{service_kind}`")),
+    };
+    let action = match operation {
+        "start" => mackes_mesh_types::workloads::WorkloadOperationAction::Start,
+        "stop" => mackes_mesh_types::workloads::WorkloadOperationAction::Stop,
+        "restart" => mackes_mesh_types::workloads::WorkloadOperationAction::Restart,
+        _ => return Err(format!("unsupported lifecycle operation `{operation}`")),
+    };
+    let workload_id = mackes_mesh_types::workloads::WorkloadId::new(format!(
+        "{kind_prefix}:{target_node}:{name}"
+    ))
+    .map_err(|error| format!("invalid Workload identity: {error}"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let request = mackes_mesh_types::workloads::WorkloadOperationRequest {
+        schema_version: EXEC_ACTION_SCHEMA_VERSION,
+        request_id: format!("front-door-workload-{}", uuid::Uuid::new_v4().simple()),
+        workload_id,
+        backend,
+        resources: mackes_mesh_types::workloads::WorkloadProfile::Small.resources(),
+        image_ref: None,
+        target_node,
+        expected_generation: 0,
+        action,
+        target_request_id: None,
+        deadline_at_ms: now_ms.saturating_add(20_000),
+        preferred_attachment: None,
+        armed_token: None,
+    };
+    request
+        .validate(now_ms)
+        .map_err(|error| format!("invalid Workload request: {error}"))?;
+    let capability_target = format!("workload:{}", request.workload_id.as_str());
+    let body = serde_json::to_string(&request)
+        .map_err(|error| format!("serialize Workload request: {error}"))?;
     Ok((body, capability_target))
 }
 
@@ -2682,7 +2761,14 @@ fn service_lifecycle_wire_with(
     authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
 ) -> Result<(String, String), String> {
     let (body, capability_target) = unsigned_service_lifecycle_request(target, op)?;
-    let body = authorize(&body, EXEC_AUTH_VERB, EXEC_AUTH_NODE, &capability_target)?;
+    let request: mackes_mesh_types::workloads::WorkloadOperationRequest =
+        serde_json::from_str(&body).map_err(|error| format!("invalid Workload body: {error}"))?;
+    let body = authorize(
+        &body,
+        EXEC_AUTH_VERB,
+        &request.target_node,
+        &capability_target,
+    )?;
     Ok((EXEC_ACTION_TOPIC.to_owned(), body))
 }
 
@@ -2906,9 +2992,9 @@ fn install_instance_lifecycle_action_accessibility(
         } else {
             format!("{} instance {}", op.label(), hit.item.title)
         });
-        let topic = format!("action/cloud/{}", op.cloud_verb());
         node.set_value(format!(
-            "Cloud lifecycle: {topic}; instance {}",
+            "Workload lifecycle: {}; instance {}",
+            EXEC_ACTION_TOPIC,
             target.instance
         ));
         node.set_bounds(accesskit_rect(rect));
@@ -3043,7 +3129,7 @@ fn workflow_quick_action_for_card(
                 icon: IconId::Desktop,
             })
         }
-        (FrontDoorWorkflowKind::Service, Surface::Workbench, Some(Plane::Provisioning)) => {
+        (FrontDoorWorkflowKind::Service, Surface::Workers, Some(Plane::Provisioning)) => {
             Some(FrontDoorWorkflowQuickAction {
                 label: "Fleet",
                 plane: Plane::Fleet,
@@ -3126,6 +3212,11 @@ fn action_button(
             egui::Sense::hover()
         },
     );
+    let response = if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
     let show_label = action_button_label_visible(rect.width());
     let button_fill = if !enabled {
         Style::SURFACE_HI
@@ -3151,7 +3242,7 @@ fn action_button(
         egui::StrokeKind::Inside,
     );
 
-    let icon_size = 13.0;
+    let icon_size = Style::ICON_M;
     let icon_center = if show_label {
         egui::pos2(rect.left() + 10.0 + icon_size / 2.0, rect.center().y)
     } else {
@@ -3496,7 +3587,9 @@ fn result_context_item_id(hit: &SearchHit<FrontDoorTarget>, item: ResultContextI
 fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
     let width = ui.available_width().max(Style::SP_XL * 4.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, Style::SP_L), egui::Sense::hover());
-    let response = ui.interact(rect, id, egui::Sense::click());
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.hovered() {
         ui.painter().rect_filled(rect, 5.0, Style::SURFACE_HI);
     }
@@ -3708,11 +3801,13 @@ fn run_command_action_panel(ui: &mut egui::Ui, command: &str) -> egui::Response 
         ),
         egui::vec2(button_w, 26.0),
     );
-    let response = ui.interact(
-        button_rect,
-        run_command_primary_action_id(command),
-        egui::Sense::click(),
-    );
+    let response = ui
+        .interact(
+            button_rect,
+            run_command_primary_action_id(command),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     let button_fill = if response.hovered() {
         Style::ACCENT.linear_multiply(0.28)
     } else {
@@ -4628,7 +4723,7 @@ mod tests {
         let items = app_search_items();
         assert_eq!(
             items.len(),
-            Surface::ALL.len() - crate::surfaces::TOOL_TRAY_SURFACES.len()
+            Surface::ALL.len() - crate::surfaces::TOOL_TRAY_SURFACES.len() - 1
         );
         assert!(!items.iter().any(|item| {
             matches!(
@@ -4756,7 +4851,7 @@ mod tests {
                     item.payload,
                     FrontDoorTarget::Workflow(FrontDoorWorkflowCard {
                         kind: FrontDoorWorkflowKind::Service,
-                        surface: Surface::Workbench,
+                        surface: Surface::Workers,
                         workbench_plane: Some(Plane::Provisioning),
                         ..
                     })
@@ -5224,7 +5319,7 @@ mod tests {
                 &hit.item.payload,
                 FrontDoorTarget::Workflow(card)
                     if card.kind == FrontDoorWorkflowKind::Service
-                        && card.surface == Surface::Workbench
+                        && card.surface == Surface::Workers
             )
         }));
         assert!(service_hits.iter().any(|hit| {
@@ -5238,53 +5333,44 @@ mod tests {
     }
 
     #[test]
-    fn front_door_cloud_instance_lifecycle_uses_the_explorer_cloud_contract() {
+    fn front_door_instance_lifecycle_uses_the_typed_workload_contract() {
         let (topic, body) = cloud_instance_lifecycle_wire(
             "cloud:instance:i-9",
             "bigboy",
             FrontDoorInstanceLifecycleOp::Reboot,
         )
-        .expect("cloud instance lifecycle wire");
+        .expect("Workload instance lifecycle wire");
 
-        assert_eq!(topic, "action/cloud/instance-reboot");
-        let body: serde_json::Value = serde_json::from_str(&body).expect("authorized JSON body");
+        assert_eq!(topic, mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("authorized Workload body");
         assert_eq!(
             body["schema_version"],
-            mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+            mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
         );
-        assert_eq!(body["node"], "bigboy");
-        assert_eq!(body["instance"], "i-9");
-        assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
-            body["armed_token"].as_str().expect("armed token")
+        assert_eq!(body["workload_id"], "vm:bigboy:i-9");
+        assert_eq!(body["target_node"], "bigboy");
+        assert_eq!(body["backend"], "libvirt_virtqemud");
+        assert_eq!(body["action"], "restart");
+        let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+            body["armed_token"].as_str().expect("armed token"),
         )
-        .is_some());
+        .expect("parsed Workload capability");
+        assert_eq!(token.verb, EXEC_AUTH_VERB);
+        assert_eq!(token.node, "bigboy");
+        assert_eq!(token.target, "workload:vm:bigboy:i-9");
+        assert_eq!(body["expected_generation"], 0);
 
         let (_, delete) = cloud_instance_lifecycle_wire(
             "cloud:instance:i-9",
             "bigboy",
             FrontDoorInstanceLifecycleOp::Delete,
         )
-        .expect("authorized delete wire");
+        .expect("authorized Workload destroy wire");
         let delete: serde_json::Value = serde_json::from_str(&delete).expect("delete JSON");
-        assert_eq!(delete["typed_name"], "i-9");
-        let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
-            delete["armed_token"].as_str().expect("delete armed token"),
-        )
-        .expect("parsed delete capability");
-        assert_eq!(token.verb, "instance-delete");
-        assert_eq!(token.node, "bigboy");
-        assert_eq!(token.target, "i-9");
-        assert_eq!(
-            token.request_sha256,
-            mackes_mesh_types::cloud::cloud_request_digest(&delete.to_string())
-                .expect("delete request digest"),
-            "typed_name and schema_version must be inside the signed request digest",
-        );
-        let signer = mackes_mesh_types::cloud::CloudArmSigner::new(
-            b"0123456789abcdef0123456789abcdef".to_vec(),
-        )
-        .expect("test signer");
-        assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
+        assert_eq!(delete["workload_id"], "vm:bigboy:i-9");
+        assert_eq!(delete["action"], "destroy");
+        assert_eq!(delete["target_node"], "bigboy");
+        assert!(delete["armed_token"].as_str().is_some());
         assert!(
             cloud_instance_lifecycle_wire(
                 "peer:browser-node",
@@ -5292,7 +5378,7 @@ mod tests {
                 FrontDoorInstanceLifecycleOp::Start
             )
             .is_err(),
-            "Front Door must not mint lifecycle actions for non-instance mesh ids"
+            "Front Door must not mint Workload lifecycle actions for non-instance mesh ids"
         );
     }
 
@@ -5308,7 +5394,12 @@ mod tests {
             "cloud:instance:i-9",
             "bigboy",
             FrontDoorInstanceLifecycleOp::Start,
-            |_body, _verb, _node, _target| Err("credential unavailable".to_string()),
+            |_body, verb, node, target| {
+                assert_eq!(verb, EXEC_AUTH_VERB);
+                assert_eq!(node, "bigboy");
+                assert_eq!(target, "workload:vm:bigboy:i-9");
+                Err("credential unavailable".to_string())
+            },
         )
         .expect_err("missing authority must suppress publication");
         assert!(error.contains("credential unavailable"));
@@ -5354,7 +5445,7 @@ mod tests {
     }
 
     #[test]
-    fn front_door_service_lifecycle_uses_the_typed_audited_exec_contract() {
+    fn front_door_service_lifecycle_uses_the_typed_workload_contract() {
         let item = fixture_service_lifecycle_item(
             "mesh-api",
             FrontDoorLifecycleKind::Container,
@@ -5368,20 +5459,25 @@ mod tests {
             .expect("authorized service lifecycle wire");
         let body: serde_json::Value = serde_json::from_str(&body).expect("json lifecycle body");
 
-        assert_eq!(topic, "action/exec/request");
-        assert_eq!(body["schema_version"], 1);
-        assert_eq!(body["kind"], "service_lifecycle");
-        assert_eq!(body["target_host"], "oak");
-        assert_eq!(body["service_kind"], "container");
-        assert_eq!(body["name"], "mesh-api");
-        assert_eq!(body["op"], "restart");
+        assert_eq!(
+            topic,
+            mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC
+        );
+        assert_eq!(
+            body["schema_version"],
+            mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(body["workload_id"], "container:peer:oak:mesh-api");
+        assert_eq!(body["target_node"], "peer:oak");
+        assert_eq!(body["backend"], "quadlet_systemd");
+        assert_eq!(body["action"], "restart");
         let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
             body["armed_token"].as_str().expect("armed capability"),
         )
         .expect("parsed capability");
-        assert_eq!(token.verb, "exec-request");
-        assert_eq!(token.node, "fleet-control");
-        assert_eq!(token.target, "service:oak:container:mesh-api:restart");
+        assert_eq!(token.verb, "workload-operation");
+        assert_eq!(token.node, "peer:oak");
+        assert_eq!(token.target, "workload:container:peer:oak:mesh-api");
         assert_eq!(
             token.request_sha256,
             mackes_mesh_types::cloud::cloud_request_digest(&body.to_string())
@@ -7068,18 +7164,21 @@ mod tests {
         );
         let nodes = accesskit_nodes(&out);
 
-        for (label, topic) in [
-            ("Start instance web", "action/cloud/instance-start"),
-            ("Stop instance web", "action/cloud/instance-stop"),
-            ("Reboot instance web", "action/cloud/instance-reboot"),
-            ("Delete instance web", "action/cloud/instance-delete"),
+        for label in [
+            "Start instance web",
+            "Stop instance web",
+            "Reboot instance web",
+            "Delete instance web",
         ] {
             let action = nodes
                 .iter()
                 .map(|(_, node)| node)
                 .find(|node| node.label() == Some(label))
                 .unwrap_or_else(|| panic!("missing {label} lifecycle action: {nodes:?}"));
-            let expected = format!("Cloud lifecycle: {topic}; instance i-9");
+            let expected = format!(
+                "Workload lifecycle: {}; instance i-9",
+                mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC
+            );
             assert_eq!(action.role(), egui::accesskit::Role::Button);
             assert_eq!(action.value(), Some(expected.as_str()));
             assert!(
@@ -7119,12 +7218,23 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {label} lifecycle action: {nodes:?}"));
             let value = action.value().unwrap_or_default();
             assert_eq!(action.role(), egui::accesskit::Role::Button);
-            assert!(value.contains("Service lifecycle: action/exec/request"));
+            assert!(value.contains("Service lifecycle: action/workload/operation"));
             assert!(value.contains(r#""schema_version":1"#), "{value}");
-            assert!(value.contains(r#""kind":"service_lifecycle""#), "{value}");
-            assert!(value.contains(r#""target_host":"oak""#), "{value}");
-            assert!(value.contains(r#""service_kind":"container""#), "{value}");
-            assert!(value.contains(r#""name":"mesh-api""#), "{value}");
+            assert!(
+                value.contains(r#""workload_id":"container:peer:oak:mesh-api""#),
+                "{value}"
+            );
+            assert!(value.contains(r#""target_node":"peer:oak""#), "{value}");
+            assert!(value.contains(r#""backend":"quadlet_systemd""#), "{value}");
+            assert!(
+                value.contains(r#""action":"stop""#)
+                    || value.contains(r#""action":"restart""#),
+                "{value}"
+            );
+            assert!(
+                !value.contains(r#""target_host""#),
+                "retired service metadata leaked: {value}"
+            );
             assert!(
                 action.supports_action(egui::accesskit::Action::Click),
                 "Front Door service lifecycle controls must be clickable"

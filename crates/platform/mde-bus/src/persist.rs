@@ -649,6 +649,56 @@ impl Persist {
         Ok(out)
     }
 
+    /// Return at most `limit` messages after `since_ulid`, in oldest-first
+    /// order. Unlike [`Self::list_since`], the limit is enforced by SQLite
+    /// before rows are decoded, so a stalled consumer cannot materialize an
+    /// unbounded retained backlog just to process its first page.
+    ///
+    /// `limit == 0` returns an empty vector. The cursor remains exclusive and
+    /// therefore composes with the next poll without skipping rows.
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on query or row-decode failure.
+    pub fn list_since_limit(
+        &self,
+        topic: &str,
+        since_ulid: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, PersistError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut out = Vec::new();
+        if let Some(since_ulid) = since_ulid {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                     FROM messages WHERE topic = ?1 AND ulid > ?2 ORDER BY ulid LIMIT ?3",
+                )
+                .map_err(|e| PersistError::Sql(format!("prepare list_since_limit: {e}")))?;
+            let rows = stmt
+                .query_map(params![topic, since_ulid, limit], row_to_message)
+                .map_err(|e| PersistError::Sql(format!("query list_since_limit: {e}")))?;
+            for row in rows {
+                out.push(row.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT ulid, topic, priority, title, body, ts_unix_ms, file_path \
+                     FROM messages WHERE topic = ?1 ORDER BY ulid LIMIT ?2",
+                )
+                .map_err(|e| PersistError::Sql(format!("prepare list_limit: {e}")))?;
+            let rows = stmt
+                .query_map(params![topic, limit], row_to_message)
+                .map_err(|e| PersistError::Sql(format!("query list_limit: {e}")))?;
+            for row in rows {
+                out.push(row.map_err(|e| PersistError::Sql(format!("decode: {e}")))?);
+            }
+        }
+        Ok(out)
+    }
+
     /// perf-4 — the newest message on `topic`, or `None` when the topic has no
     /// messages. Returns the SAME row that `list_since(topic, None).last()`
     /// would (ULID order == write order), but as a bounded `ORDER BY ulid DESC
@@ -1549,6 +1599,32 @@ mod tests {
         assert_eq!(p.list_since("a", None).unwrap().len(), 2);
         assert_eq!(p.list_since("b", None).unwrap().len(), 1);
         assert_eq!(p.list_since("nonexistent", None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_since_limit_bounds_rows_and_preserves_cursor_order() {
+        let (_tmp, p) = open_tmp();
+        let mut ulids = Vec::new();
+        for i in 0..5 {
+            let message = p
+                .write("t/limited", Priority::Default, None, Some(&format!("{i}")))
+                .unwrap();
+            ulids.push(message.ulid);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(p.list_since_limit("t/limited", None, 0).unwrap().is_empty());
+        let first = p.list_since_limit("t/limited", None, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].ulid, ulids[0]);
+        assert_eq!(first[1].ulid, ulids[1]);
+
+        let tail = p
+            .list_since_limit("t/limited", Some(&first[1].ulid), 2)
+            .unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].ulid, ulids[2]);
+        assert_eq!(tail[1].ulid, ulids[3]);
     }
 
     #[test]
