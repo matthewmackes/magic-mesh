@@ -804,28 +804,20 @@ fn drm_modifiers(alt: bool, ctrl: bool, shift: bool) -> egui::Modifiers {
     }
 }
 
-fn drm_clipboard_text_for_paste(text: &str) -> Option<String> {
-    let text = crate::clipboard::normalize_and_bound_text(
-        text,
-        crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES,
-    );
-    (!text.is_empty()).then_some(text)
-}
-
-fn refresh_drm_clipboard_text(clipboard: &mut dyn crate::TextClipboard, cached_text: &mut String) {
-    // A failed/empty provider read is authoritative: retaining the previous
-    // value would paste stale mesh or guest text after the clipboard was cleared.
-    *cached_text = clipboard
-        .read_text()
-        .and_then(|text| drm_clipboard_text_for_paste(&text))
-        .unwrap_or_default();
+fn refresh_drm_clipboard_offer(
+    authority: &mut crate::LocalClipboardAuthority,
+    client: &mut dyn crate::RichClipboardClient,
+) {
+    // The client contract is try-only: Bus/guest/filesystem work completed on
+    // another thread and this frame performs bounded in-memory admission only.
+    let _ = authority.apply_client_poll(client.poll_offer());
 }
 
 fn push_drm_clipboard_shortcut(
     events: &mut Vec<egui::Event>,
     modifiers: egui::Modifiers,
     key: egui::Key,
-    clipboard_text: &str,
+    authority: &crate::LocalClipboardAuthority,
 ) -> bool {
     if !modifiers.command {
         return false;
@@ -840,8 +832,8 @@ fn push_drm_clipboard_shortcut(
             true
         }
         egui::Key::V => {
-            if let Some(text) = drm_clipboard_text_for_paste(clipboard_text) {
-                events.push(egui::Event::Paste(text));
+            if let Ok(text) = authority.select_text() {
+                events.push(egui::Event::Paste(text.to_owned()));
             }
             true
         }
@@ -879,21 +871,21 @@ fn drm_clipboard_output_text(output: &egui::PlatformOutput) -> Option<String> {
 /// intentionally ignored: this seam advertises text support only and must not
 /// claim that image/rich-text clipboard integration exists.
 fn store_drm_clipboard_output(
-    clipboard: &mut dyn crate::TextClipboard,
-    cached_text: &mut String,
+    authority: &mut crate::LocalClipboardAuthority,
+    client: &mut dyn crate::RichClipboardClient,
     output: &egui::PlatformOutput,
 ) -> bool {
     let Some(text) = drm_clipboard_output_text(output) else {
         return false;
     };
-    clipboard.write_text(&text);
-    // Do not promote the egui command directly into the paste cache. The trait's
-    // write callback is intentionally infallible, so an unsupported/no-op
-    // provider could otherwise make Ctrl+V appear to work without any native,
-    // mesh, or guest clipboard accepting the text. Ctrl+V refreshes from the
-    // provider before synthesizing Paste, making the provider the only source of
-    // truth for a successful write.
-    cached_text.clear();
+    let Some(offer) = crate::clipboard::text_offer(&text) else {
+        authority.clear();
+        client.clear_offer();
+        return true;
+    };
+    if let Ok(current) = authority.replace(vec![offer]).cloned() {
+        client.publish_offer(&current);
+    }
     true
 }
 
@@ -1408,22 +1400,21 @@ fn paint_software_cursor(painter: &egui::Painter, position: egui::Pos2, cursor: 
 /// caller can fall back to [`crate::run_client`]; the other variants on a seat that
 /// can't be driven / presented.
 pub fn run_drm(app_id: &str, ui: impl FnMut(&egui::Context)) -> Result<(), DrmError> {
-    let mut clipboard = crate::MemoryTextClipboard::new();
+    let mut clipboard = crate::MemoryRichClipboardClient::default();
     run_drm_with_clipboard(app_id, &mut clipboard, ui)
 }
 
-/// Run an MCNF egui surface with an injected text clipboard provider.
+/// Run an MCNF egui surface with an injected rich clipboard client.
 ///
-/// The provider is refreshed when Ctrl+V is pressed and receives every egui
-/// [`egui::OutputCommand::CopyText`]. This keeps the direct-DRM input/output loop
-/// compositor-free while allowing the owning shell to connect clipboard state to
-/// the mesh Bus.
+/// The direct-seat runner owns bounded offer generations and exact Clipboard V2
+/// selection. The injected client only exchanges completed provider updates and
+/// publication requests; its methods are nonblocking by contract.
 ///
 /// # Errors
 /// The same seat acquisition and presentation failures as [`run_drm`].
 pub fn run_drm_with_clipboard(
     app_id: &str,
-    clipboard: &mut dyn crate::TextClipboard,
+    clipboard: &mut dyn crate::RichClipboardClient,
     ui: impl FnMut(&egui::Context),
 ) -> Result<(), DrmError> {
     run_drm_with_clipboard_and_display1(app_id, clipboard, None, ui)
@@ -1436,11 +1427,10 @@ pub fn run_drm_with_clipboard(
 /// native framebuffer before the normal GBM/SPICE recovery path resumes.
 pub fn run_drm_with_clipboard_and_display1(
     app_id: &str,
-    clipboard: &mut dyn crate::TextClipboard,
+    clipboard: &mut dyn crate::RichClipboardClient,
     mut display1: Option<&mut dyn Display1FrameSource>,
     mut ui: impl FnMut(&egui::Context),
 ) -> Result<(), DrmError> {
-    let _ = app_id;
     let (_node, file) = open_primary_node()?;
     let card = Card(file);
     // Enumerate every connected head (E12-18 multi-CRTC). The primary drives the
@@ -1723,7 +1713,9 @@ pub fn run_drm_with_clipboard_and_display1(
     let mut shift = false;
     let mut ctrl = false;
     let mut alt = false;
-    let mut clipboard_text = String::new();
+    let mut clipboard_authority = crate::LocalClipboardAuthority::new();
+    let _ = clipboard_authority.focus(app_id);
+    let mut clipboard_paste_pending = false;
 
     // SURFACE-8 (lock 13): the touchscreen shares this one input pipeline. The
     // translator maps libinput's normalized multitouch contacts through the active
@@ -1810,11 +1802,14 @@ pub fn run_drm_with_clipboard_and_display1(
             .as_ref()
             .map(|_| ACCEL_SAMPLE_INTERVAL.saturating_sub(last_accel.elapsed()));
         let until_touch = (touch_active > 0).then_some(GESTURE_TICK_INTERVAL);
+        // A paste whose provider update is still on the shell worker gets a
+        // short poll wake without forcing a rendered frame or spinning.
+        let until_clipboard = clipboard_paste_pending.then_some(Duration::from_millis(10));
         // Display1 has no mde-bus wakeup and its local socket is deliberately
         // hidden behind the source trait. A bounded 60 Hz poll keeps native
         // frames flowing without allowing an attachment to spin the shell.
         let until_display1 = display1.as_ref().map(|_| Duration::from_millis(16));
-        let until_periodic = [until_accel, until_touch, until_display1]
+        let until_periodic = [until_accel, until_touch, until_display1, until_clipboard]
             .into_iter()
             .flatten()
             .min();
@@ -2019,16 +2014,20 @@ pub fn run_drm_with_clipboard_and_display1(
                     let modifiers = drm_modifiers(alt, ctrl, shift);
                     if let Some(key) = drm_key(code) {
                         if pressed && modifiers.command && key == egui::Key::V {
-                            refresh_drm_clipboard_text(clipboard, &mut clipboard_text);
+                            clipboard_paste_pending = true;
+                            refresh_drm_clipboard_offer(&mut clipboard_authority, clipboard);
                         }
                         if pressed
                             && push_drm_clipboard_shortcut(
                                 &mut events,
                                 modifiers,
                                 key,
-                                &clipboard_text,
+                                &clipboard_authority,
                             )
                         {
+                            if key == egui::Key::V && clipboard_authority.select_text().is_ok() {
+                                clipboard_paste_pending = false;
+                            }
                             continue;
                         }
                         events.push(egui::Event::Key {
@@ -2142,6 +2141,16 @@ pub fn run_drm_with_clipboard_and_display1(
         }
         gesture_out.clear();
 
+        // Complete the original Ctrl+V asynchronously once the transport
+        // worker has an admitted offer. No second key press is required.
+        if clipboard_paste_pending {
+            refresh_drm_clipboard_offer(&mut clipboard_authority, clipboard);
+            if let Ok(text) = clipboard_authority.select_text() {
+                events.push(egui::Event::Paste(text.to_owned()));
+                clipboard_paste_pending = false;
+            }
+        }
+
         // SURFACE-9 (lock 15): drain the shell's rotation commands (Config tab /
         // hotkey) — a lock freezes auto-rotate, a manual override forces + holds an
         // orientation, applied to BOTH scanout + touch immediately.
@@ -2228,14 +2237,25 @@ pub fn run_drm_with_clipboard_and_display1(
             ));
             paint_software_cursor(&layer, cur, ctx.output(|output| output.cursor_icon));
         });
+        if let Some(owner) = crate::clipboard::take_drm_clipboard_owner(&egui_ctx) {
+            match owner {
+                Some(owner) => {
+                    let _ = clipboard_authority.focus(&owner);
+                }
+                None => {
+                    clipboard_authority.lose_focus();
+                    clipboard.clear_offer();
+                }
+            }
+        }
         // a11y-01: hand this frame's AccessKit tree to the consumer seam (a no-op unless
         // AccessKit is enabled). Done before `shapes` / `textures_delta` are consumed
         // below; it only takes `platform_output.accesskit_update`, leaving the rest of
         // `full_output` intact.
         a11y.drain(&mut full_output);
         let _ = store_drm_clipboard_output(
+            &mut clipboard_authority,
             clipboard,
-            &mut clipboard_text,
             &full_output.platform_output,
         );
         // eframe's contract: egui reports how long until it next needs to paint via the
@@ -2992,12 +3012,12 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_rgba, drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers,
-        drm_screen_for_scale, explicit_modifier, open_primary_node, probe_prime_import_liveness,
-        push_drm_clipboard_shortcut, refresh_drm_clipboard_text, store_drm_clipboard_output,
+        clear_rgba, drm_clipboard_output_text, drm_modifiers, drm_screen_for_scale,
+        explicit_modifier, open_primary_node, probe_prime_import_liveness,
+        push_drm_clipboard_shortcut, refresh_drm_clipboard_offer, store_drm_clipboard_output,
         DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
     };
-    use crate::{MemoryTextClipboard, TextClipboard};
+    use crate::{LocalClipboardAuthority, MemoryRichClipboardClient};
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
 
     #[test]
@@ -3080,15 +3100,22 @@ mod tests {
     }
 
     #[test]
-    fn drm_clipboard_shortcuts_synthesize_egui_events() {
+    fn drm_clipboard_shortcuts_synthesize_egui_events_from_exact_selection() {
         let modifiers = drm_modifiers(false, true, false);
         let mut events = Vec::new();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        authority
+            .replace(vec![
+                crate::clipboard::text_offer("first\r\nsecond").expect("offer")
+            ])
+            .expect("replace offer");
 
         assert!(push_drm_clipboard_shortcut(
             &mut events,
             modifiers,
             egui::Key::C,
-            "ignored",
+            &authority,
         ));
         assert_eq!(events, vec![egui::Event::Copy]);
 
@@ -3097,7 +3124,7 @@ mod tests {
             &mut events,
             modifiers,
             egui::Key::X,
-            "ignored",
+            &authority,
         ));
         assert_eq!(events, vec![egui::Event::Cut]);
 
@@ -3106,49 +3133,32 @@ mod tests {
             &mut events,
             modifiers,
             egui::Key::V,
-            "first\r\nsecond",
+            &authority,
         ));
         assert_eq!(events, vec![egui::Event::Paste("first\nsecond".to_owned())]);
-
-        events.clear();
-        assert!(push_drm_clipboard_shortcut(
-            &mut events,
-            modifiers,
-            egui::Key::V,
-            "",
-        ));
-        assert!(events.is_empty());
 
         let no_command = drm_modifiers(false, false, false);
         assert!(!push_drm_clipboard_shortcut(
             &mut events,
             no_command,
             egui::Key::C,
-            "ignored",
+            &authority,
         ));
     }
 
     #[test]
-    fn drm_clipboard_paste_normalizes_crlf_and_skips_empty_text() {
-        assert_eq!(
-            drm_clipboard_text_for_paste("one\r\ntwo\rthree"),
-            Some("one\ntwo\nthree".to_owned())
-        );
-        assert!(drm_clipboard_text_for_paste("").is_none());
-    }
+    fn drm_clipboard_client_poll_admits_without_backend_wait_or_second_store() {
+        let mut client = MemoryRichClipboardClient::default();
+        client.queue_offer(vec![
+            crate::clipboard::text_offer("remote text").expect("offer")
+        ]);
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
 
-    #[test]
-    fn drm_clipboard_provider_clear_drops_the_cached_paste_value() {
-        let mut provider = MemoryTextClipboard::new();
-        let mut cached = String::new();
-
-        provider.write_text("remote text");
-        refresh_drm_clipboard_text(&mut provider, &mut cached);
-        assert_eq!(cached, "remote text");
-
-        provider.write_text("");
-        refresh_drm_clipboard_text(&mut provider, &mut cached);
-        assert!(cached.is_empty());
+        refresh_drm_clipboard_offer(&mut authority, &mut client);
+        assert_eq!(authority.select_text(), Ok("remote text"));
+        refresh_drm_clipboard_offer(&mut authority, &mut client);
+        assert_eq!(authority.select_text(), Ok("remote text"));
     }
 
     #[test]
@@ -3190,42 +3200,47 @@ mod tests {
             .push(egui::OutputCommand::CopyText(String::new()));
         output.copied_text = "stale legacy text".to_owned();
 
-        let mut provider = MemoryTextClipboard::new();
-        provider.write_text("old local text");
-        let mut cached = String::from("old local text");
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        authority
+            .replace(vec![
+                crate::clipboard::text_offer("old local text").expect("offer")
+            ])
+            .expect("replace offer");
 
         assert_eq!(drm_clipboard_output_text(&output), Some(String::new()));
         assert!(store_drm_clipboard_output(
-            &mut provider,
-            &mut cached,
+            &mut authority,
+            &mut client,
             &output
         ));
-        assert!(cached.is_empty());
-        assert!(provider.read_text().is_none());
+        assert!(authority.current().is_none());
+        assert!(client.published().is_none());
     }
 
     #[test]
     fn drm_clipboard_copy_output_round_trips_into_native_paste_event() {
-        let mut provider = MemoryTextClipboard::new();
-        let mut cached = String::new();
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
         let mut output = egui::PlatformOutput::default();
         output
             .commands
             .push(egui::OutputCommand::CopyText("copied\r\ntext é".to_owned()));
 
         assert!(store_drm_clipboard_output(
-            &mut provider,
-            &mut cached,
+            &mut authority,
+            &mut client,
             &output
         ));
-        refresh_drm_clipboard_text(&mut provider, &mut cached);
 
         let mut events = Vec::new();
         assert!(push_drm_clipboard_shortcut(
             &mut events,
             drm_modifiers(false, true, false),
             egui::Key::V,
-            &cached,
+            &authority,
         ));
         assert_eq!(
             events,
@@ -3234,9 +3249,10 @@ mod tests {
     }
 
     #[test]
-    fn drm_clipboard_output_is_bounded_before_provider_and_not_cached_as_success() {
-        let mut provider = MemoryTextClipboard::new();
-        let mut cached = String::new();
+    fn drm_clipboard_output_is_bounded_before_client_publication() {
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
         let mut output = egui::PlatformOutput::default();
         output.commands.push(egui::OutputCommand::CopyText(format!(
             "{}é",
@@ -3244,12 +3260,11 @@ mod tests {
         )));
 
         assert!(store_drm_clipboard_output(
-            &mut provider,
-            &mut cached,
+            &mut authority,
+            &mut client,
             &output
         ));
-        assert!(cached.is_empty());
-        let provider_text = provider.read_text().expect("bounded provider text");
+        let provider_text = authority.select_text().expect("bounded provider text");
         assert_eq!(
             provider_text.len(),
             crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES - 1
@@ -3257,49 +3272,40 @@ mod tests {
     }
 
     #[test]
-    fn drm_clipboard_empty_output_clears_provider_and_cache() {
-        let mut provider = MemoryTextClipboard::new();
-        provider.write_text("stale");
-        let mut cached = String::from("stale");
+    fn drm_clipboard_empty_output_clears_authority_and_client() {
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        authority
+            .replace(vec![crate::clipboard::text_offer("stale").expect("offer")])
+            .expect("replace offer");
         let mut output = egui::PlatformOutput::default();
         output
             .commands
             .push(egui::OutputCommand::CopyText(String::new()));
 
         assert!(store_drm_clipboard_output(
-            &mut provider,
-            &mut cached,
+            &mut authority,
+            &mut client,
             &output
         ));
-        assert!(cached.is_empty());
-        assert!(provider.read_text().is_none());
+        assert!(authority.current().is_none());
+        assert!(client.published().is_none());
     }
 
     #[test]
-    fn drm_clipboard_unavailable_provider_does_not_get_a_fake_paste_or_output() {
-        #[derive(Default)]
-        struct UnsupportedClipboard;
-
-        impl TextClipboard for UnsupportedClipboard {
-            fn read_text(&mut self) -> Option<String> {
-                None
-            }
-
-            fn write_text(&mut self, _text: &str) {}
-        }
-
-        let mut provider = UnsupportedClipboard;
-        let mut cached = String::from("stale");
-        refresh_drm_clipboard_text(&mut provider, &mut cached);
-        assert!(cached.is_empty());
-
+    fn drm_clipboard_unavailable_client_does_not_fabricate_paste() {
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        refresh_drm_clipboard_offer(&mut authority, &mut client);
         let modifiers = drm_modifiers(false, true, false);
         let mut events = Vec::new();
         assert!(push_drm_clipboard_shortcut(
             &mut events,
             modifiers,
             egui::Key::V,
-            &cached
+            &authority
         ));
         assert!(
             events.is_empty(),
@@ -3308,52 +3314,11 @@ mod tests {
 
         let output = egui::PlatformOutput::default();
         assert!(!store_drm_clipboard_output(
-            &mut provider,
-            &mut cached,
+            &mut authority,
+            &mut client,
             &output
         ));
-        assert!(cached.is_empty());
-    }
-
-    #[test]
-    fn drm_clipboard_unsupported_write_cannot_seed_a_fake_paste() {
-        #[derive(Default)]
-        struct UnsupportedClipboard;
-
-        impl TextClipboard for UnsupportedClipboard {
-            fn read_text(&mut self) -> Option<String> {
-                None
-            }
-
-            fn write_text(&mut self, _text: &str) {}
-        }
-
-        let mut provider = UnsupportedClipboard;
-        let mut cached = String::from("stale");
-        let mut output = egui::PlatformOutput::default();
-        output
-            .commands
-            .push(egui::OutputCommand::CopyText("unsupported".to_owned()));
-
-        assert!(store_drm_clipboard_output(
-            &mut provider,
-            &mut cached,
-            &output
-        ));
-        assert!(cached.is_empty());
-
-        refresh_drm_clipboard_text(&mut provider, &mut cached);
-        let mut events = Vec::new();
-        assert!(push_drm_clipboard_shortcut(
-            &mut events,
-            drm_modifiers(false, true, false),
-            egui::Key::V,
-            &cached,
-        ));
-        assert!(
-            events.is_empty(),
-            "unsupported write must not fabricate paste"
-        );
+        assert!(authority.current().is_none());
     }
 
     // ── QC-23 Tier 1: PRIME-import liveness ──

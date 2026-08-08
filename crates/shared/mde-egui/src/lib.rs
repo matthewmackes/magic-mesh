@@ -61,7 +61,10 @@ pub use carbon::{
     carbon_icon, carbon_names, carbon_raster, carbon_svg_bytes, carbon_texture, paint_carbon,
     CarbonRaster,
 };
-pub use clipboard::{MemoryTextClipboard, TextClipboard};
+pub use clipboard::{
+    ClipboardClientPoll, LocalClipboardAuthority, LocalClipboardError, LocalClipboardOffer,
+    MemoryRichClipboardClient, MemoryTextClipboard, RichClipboardClient, TextClipboard,
+};
 pub use code::CodeToken;
 pub use display::{
     build_mode_list, fractional_scale, panel_dpi, parse_edid, scale_for_panel, select_mode,

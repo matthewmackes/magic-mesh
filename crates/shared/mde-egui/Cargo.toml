@@ -35,6 +35,7 @@ pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 egui   = "0.31"
 serde  = { workspace = true }
+mde-collab-types = { path = "../mde-collab-types" }
 
 # Mackes-Carbon SVG icon loader (`carbon`): SVG → raster for the canonical
 # platform icon set. `resvg` re-exports its `usvg` parser + `tiny-skia`

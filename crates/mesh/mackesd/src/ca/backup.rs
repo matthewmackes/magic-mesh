@@ -366,48 +366,40 @@ pub fn restore_to_store(
     bundle: &BundlePlaintext,
 ) -> Result<(), CaError> {
     validate_restore_bundle(bundle)?;
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|e| CaError::Sql(format!("begin CA backup restore: {e}")))?;
-    let result = (|| {
-        for ca in &bundle.ca_certs {
-            conn.execute(
-                "INSERT OR REPLACE INTO nebula_ca \
-             (mesh_id, epoch, ca_cert_pem, created_at, retired_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    bundle.mesh_id,
-                    ca.epoch,
-                    ca.ca_cert_pem,
-                    ca.created_at,
-                    ca.retired_at
-                ],
-            )
-            .map_err(|e| CaError::Sql(e.to_string()))?;
-        }
-        for p in &bundle.peer_certs {
-            conn.execute(
-                "INSERT OR REPLACE INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, public_key_pem, created_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    p.node_id,
-                    p.epoch,
-                    p.cert_pem,
-                    p.overlay_ip,
-                    p.public_key_pem,
-                    p.created_at,
-                    p.expires_at,
-                ],
-            )
-            .map_err(|e| CaError::Sql(e.to_string()))?;
-        }
-        conn.execute_batch("COMMIT")
-            .map_err(|e| CaError::Sql(format!("commit CA backup restore: {e}")))
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-    }
-    result
+    let ca_certs = bundle
+        .ca_certs
+        .iter()
+        .map(|ca| crate::store::writer::CaCertWrite {
+            epoch: ca.epoch,
+            ca_cert_pem: ca.ca_cert_pem.clone(),
+            created_at: ca.created_at,
+            retired_at: ca.retired_at,
+        })
+        .collect();
+    let peer_certs = bundle
+        .peer_certs
+        .iter()
+        .map(|peer| crate::store::writer::CaPeerCertWrite {
+            node_id: peer.node_id.clone(),
+            epoch: peer.epoch,
+            cert_pem: peer.cert_pem.clone(),
+            overlay_ip: peer.overlay_ip.clone(),
+            public_key_pem: peer.public_key_pem.clone(),
+            created_at: Some(peer.created_at),
+            expires_at: peer.expires_at,
+        })
+        .collect();
+    crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::RestoreCaBackup {
+            mesh_id: bundle.mesh_id.clone(),
+            ca_certs,
+            peer_certs,
+        },
+    )
+    .and_then(crate::store::writer::WriteResponse::into_count)
+    .map(|_| ())
+    .map_err(|error| CaError::Sql(format!("restore CA backup: {error}")))
 }
 
 /// Validate all archive-controlled identifiers and cross-row issuer

@@ -70,13 +70,15 @@ pub fn revoke_peer(
         })
         .unwrap_or_default();
 
-    let rows = conn
-        .execute(
-            "UPDATE nebula_peer_certs SET revoked_at = ?1 \
-             WHERE node_id = ?2 AND revoked_at IS NULL",
-            rusqlite::params![now_ms, node_id],
-        )
-        .context("revoke: update nebula_peer_certs")?;
+    let rows = crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::RevokePeerCert {
+            node_id: node_id.to_owned(),
+            revoked_at: now_ms,
+        },
+    )
+    .and_then(crate::store::writer::WriteResponse::into_count)
+    .context("revoke: update nebula_peer_certs")?;
 
     crate::ca::ban_list::add_banned(workgroup_root, self_node_id, node_id)
         .map_err(|e| anyhow::anyhow!("revoke: ban-list write failed: {e}"))?;

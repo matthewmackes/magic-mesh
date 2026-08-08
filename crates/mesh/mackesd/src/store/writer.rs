@@ -21,7 +21,10 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 
 pub const SCHEMA_VERSION: u16 = 1;
-pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Maximum writer request/response frame. CA disaster-recovery archives are
+/// independently capped at one MiB before they reach this boundary, so leave
+/// finite JSON framing headroom without admitting an unbounded request.
+pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_SOCKET: &str = "/run/mackesd/store-writer.sock";
@@ -89,6 +92,52 @@ pub enum WriteOp {
         public_key: String,
         region: Option<String>,
     },
+    MintCa {
+        mesh_id: String,
+        ca_cert_pem: String,
+    },
+    UpsertPeerCert {
+        mesh_id: String,
+        expected_epoch: i64,
+        peer: CaPeerCertWrite,
+    },
+    RevokePeerCert {
+        node_id: String,
+        revoked_at: i64,
+    },
+    RestoreCaBackup {
+        mesh_id: String,
+        ca_certs: Vec<CaCertWrite>,
+        peer_certs: Vec<CaPeerCertWrite>,
+    },
+    RotateCa {
+        mesh_id: String,
+        expected_active_epoch: Option<i64>,
+        new_epoch: i64,
+        ca_cert_pem: String,
+        peer_certs: Vec<CaPeerCertWrite>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaCertWrite {
+    pub epoch: i64,
+    pub ca_cert_pem: String,
+    pub created_at: i64,
+    pub retired_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaPeerCertWrite {
+    pub node_id: String,
+    pub epoch: i64,
+    pub cert_pem: String,
+    pub overlay_ip: String,
+    pub public_key_pem: Option<String>,
+    pub created_at: Option<i64>,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +187,15 @@ pub fn request_if_serving(operation: WriteOp) -> Result<Option<WriteResponse>> {
         return Ok(None);
     };
     request(socket, operation).map(Some)
+}
+
+/// Send a typed mutation to the split-process owner, or execute it through the
+/// same finite dispatcher when this process is the standalone store owner.
+pub fn request_or_execute(conn: &Connection, operation: WriteOp) -> Result<WriteResponse> {
+    match request_if_serving(operation.clone())? {
+        Some(response) => Ok(response),
+        None => execute(conn, operation),
+    }
 }
 
 fn request(socket: &Path, operation: WriteOp) -> Result<WriteResponse> {
@@ -359,7 +417,313 @@ fn execute(conn: &Connection, operation: WriteOp) -> Result<WriteResponse> {
             "INSERT INTO nodes (node_id, name, public_key, enrolled_at, region) VALUES (?, ?, ?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET name = excluded.name, public_key = excluded.public_key, region = excluded.region",
             (node_id, name, public_key, chrono::Utc::now().to_rfc3339(), region),
         )?)),
+        WriteOp::MintCa {
+            mesh_id,
+            ca_cert_pem,
+        } => mint_ca(conn, &mesh_id, &ca_cert_pem),
+        WriteOp::UpsertPeerCert {
+            mesh_id,
+            expected_epoch,
+            peer,
+        } => upsert_peer_cert(conn, &mesh_id, expected_epoch, &peer),
+        WriteOp::RevokePeerCert {
+            node_id,
+            revoked_at,
+        } => Ok(WriteResponse::Count(conn.execute(
+            "UPDATE nebula_peer_certs SET revoked_at = ?1 WHERE node_id = ?2 AND revoked_at IS NULL",
+            (revoked_at, node_id),
+        )?)),
+        WriteOp::RestoreCaBackup {
+            mesh_id,
+            ca_certs,
+            peer_certs,
+        } => restore_ca_backup(conn, &mesh_id, &ca_certs, &peer_certs),
+        WriteOp::RotateCa {
+            mesh_id,
+            expected_active_epoch,
+            new_epoch,
+            ca_cert_pem,
+            peer_certs,
+        } => rotate_ca(
+            conn,
+            &mesh_id,
+            expected_active_epoch,
+            new_epoch,
+            &ca_cert_pem,
+            &peer_certs,
+        ),
     }
+}
+
+fn active_ca(conn: &Connection, mesh_id: &str) -> Result<Option<(i64, String)>> {
+    conn.query_row(
+        "SELECT epoch, ca_cert_pem FROM nebula_ca WHERE mesh_id = ?1 AND retired_at IS NULL ORDER BY epoch DESC LIMIT 1",
+        [mesh_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn mint_ca(conn: &Connection, mesh_id: &str, ca_cert_pem: &str) -> Result<WriteResponse> {
+    validate_identity(mesh_id, "mesh id")?;
+    validate_nonempty(ca_cert_pem, "CA certificate")?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if let Some((epoch, existing)) = active_ca(conn, mesh_id)? {
+            if epoch == 0 && existing == ca_cert_pem {
+                return Ok(WriteResponse::Count(0));
+            }
+            bail!("active CA changed while minting mesh {mesh_id}");
+        }
+        Ok(WriteResponse::Count(conn.execute(
+            "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) VALUES (?1, 0, ?2, NULL)",
+            (mesh_id, ca_cert_pem),
+        )?))
+    })();
+    finish_transaction(conn, result)
+}
+
+fn upsert_peer_cert(
+    conn: &Connection,
+    mesh_id: &str,
+    expected_epoch: i64,
+    peer: &CaPeerCertWrite,
+) -> Result<WriteResponse> {
+    validate_identity(mesh_id, "mesh id")?;
+    validate_peer(peer, Some(expected_epoch))?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let active = active_ca(conn, mesh_id)?.map(|(epoch, _)| epoch);
+        if active != Some(expected_epoch) {
+            bail!(
+                "active CA epoch changed while signing for mesh {mesh_id}: expected {expected_epoch}, found {active:?}"
+            );
+        }
+        let count = conn.execute(
+            "INSERT INTO nebula_peer_certs (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(node_id, epoch) DO UPDATE SET cert_pem = excluded.cert_pem, \
+             overlay_ip = excluded.overlay_ip, expires_at = excluded.expires_at, \
+             public_key_pem = COALESCE(excluded.public_key_pem, nebula_peer_certs.public_key_pem), revoked_at = NULL",
+            rusqlite::params![
+                peer.node_id,
+                peer.epoch,
+                peer.cert_pem,
+                peer.overlay_ip,
+                peer.expires_at,
+                peer.public_key_pem,
+            ],
+        )?;
+        Ok(WriteResponse::Count(count))
+    })();
+    finish_transaction(conn, result)
+}
+
+fn restore_ca_backup(
+    conn: &Connection,
+    mesh_id: &str,
+    ca_certs: &[CaCertWrite],
+    peer_certs: &[CaPeerCertWrite],
+) -> Result<WriteResponse> {
+    validate_ca_bundle(mesh_id, ca_certs, peer_certs)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if let Some(incoming_active) = ca_certs
+            .iter()
+            .find(|certificate| certificate.retired_at.is_none())
+        {
+            let conflicting: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM nebula_ca WHERE mesh_id = ?1 AND retired_at IS NULL AND epoch != ?2",
+                rusqlite::params![mesh_id, incoming_active.epoch],
+                |row| row.get(0),
+            )?;
+            if conflicting > 0 {
+                bail!("CA restore would create multiple active issuers");
+            }
+        }
+        let mut count = 0;
+        for ca in ca_certs {
+            count += conn.execute(
+                "INSERT OR REPLACE INTO nebula_ca (mesh_id, epoch, ca_cert_pem, created_at, retired_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![mesh_id, ca.epoch, ca.ca_cert_pem, ca.created_at, ca.retired_at],
+            )?;
+        }
+        for peer in peer_certs {
+            count += conn.execute(
+                "INSERT OR REPLACE INTO nebula_peer_certs (node_id, epoch, cert_pem, overlay_ip, public_key_pem, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![peer.node_id, peer.epoch, peer.cert_pem, peer.overlay_ip, peer.public_key_pem, peer.created_at, peer.expires_at],
+            )?;
+        }
+        Ok(WriteResponse::Count(count))
+    })();
+    finish_transaction(conn, result)
+}
+
+fn rotate_ca(
+    conn: &Connection,
+    mesh_id: &str,
+    expected_active_epoch: Option<i64>,
+    new_epoch: i64,
+    ca_cert_pem: &str,
+    peer_certs: &[CaPeerCertWrite],
+) -> Result<WriteResponse> {
+    validate_identity(mesh_id, "mesh id")?;
+    validate_nonempty(ca_cert_pem, "CA certificate")?;
+    if new_epoch < 0 || expected_active_epoch.is_some_and(|epoch| epoch >= new_epoch) {
+        bail!("invalid CA rotation epoch transition");
+    }
+    validate_rotation_peers(peer_certs, new_epoch)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let active = active_ca(conn, mesh_id)?;
+        if active.as_ref().map(|(epoch, _)| *epoch) == Some(new_epoch) {
+            if active.as_ref().is_some_and(|(_, pem)| pem == ca_cert_pem)
+                && rotation_rows_match(conn, new_epoch, peer_certs)?
+            {
+                return Ok(WriteResponse::Count(0));
+            }
+            bail!("CA rotation retry does not match durable epoch {new_epoch}");
+        }
+        let actual = active.as_ref().map(|(epoch, _)| *epoch);
+        if actual != expected_active_epoch {
+            bail!(
+                "active CA changed during rotation: expected {expected_active_epoch:?}, found {actual:?}"
+            );
+        }
+        if actual.is_some() {
+            conn.execute(
+                "UPDATE nebula_ca SET retired_at = unixepoch() WHERE mesh_id = ?1 AND retired_at IS NULL",
+                [mesh_id],
+            )?;
+        }
+        let mut count = conn.execute(
+            "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) VALUES (?1, ?2, ?3, NULL)",
+            rusqlite::params![mesh_id, new_epoch, ca_cert_pem],
+        )?;
+        for peer in peer_certs {
+            count += conn.execute(
+                "INSERT INTO nebula_peer_certs (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![peer.node_id, peer.epoch, peer.cert_pem, peer.overlay_ip, peer.expires_at, peer.public_key_pem],
+            )?;
+        }
+        Ok(WriteResponse::Count(count))
+    })();
+    finish_transaction(conn, result)
+}
+
+fn rotation_rows_match(conn: &Connection, epoch: i64, peers: &[CaPeerCertWrite]) -> Result<bool> {
+    let durable_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nebula_peer_certs WHERE epoch = ?1",
+        [epoch],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(durable_count).ok() != Some(peers.len()) {
+        return Ok(false);
+    }
+    for peer in peers {
+        let row: Option<(String, String, Option<String>, i64)> = conn
+            .query_row(
+                "SELECT cert_pem, overlay_ip, public_key_pem, expires_at FROM nebula_peer_certs WHERE node_id = ?1 AND epoch = ?2",
+                rusqlite::params![peer.node_id, peer.epoch],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if row
+            != Some((
+                peer.cert_pem.clone(),
+                peer.overlay_ip.clone(),
+                peer.public_key_pem.clone(),
+                peer.expires_at,
+            ))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_ca_bundle(
+    mesh_id: &str,
+    ca_certs: &[CaCertWrite],
+    peer_certs: &[CaPeerCertWrite],
+) -> Result<()> {
+    validate_identity(mesh_id, "mesh id")?;
+    if ca_certs.is_empty() || ca_certs.len() > 1024 || peer_certs.len() > 4096 {
+        bail!("CA restore row count is outside the finite writer envelope");
+    }
+    let mut epochs = std::collections::HashSet::new();
+    let mut active = 0_usize;
+    for ca in ca_certs {
+        validate_nonempty(&ca.ca_cert_pem, "CA certificate")?;
+        if ca.epoch < 0 || !epochs.insert(ca.epoch) {
+            bail!("CA restore contains an invalid or duplicate issuer epoch");
+        }
+        active += usize::from(ca.retired_at.is_none());
+    }
+    if active > 1 {
+        bail!("CA restore contains more than one active issuer");
+    }
+    let mut peer_keys = std::collections::HashSet::new();
+    let mut overlay_keys = std::collections::HashSet::new();
+    for peer in peer_certs {
+        validate_peer(peer, None)?;
+        if !epochs.contains(&peer.epoch)
+            || !peer_keys.insert((peer.node_id.clone(), peer.epoch))
+            || !overlay_keys.insert((peer.overlay_ip.clone(), peer.epoch))
+        {
+            bail!("CA restore contains a duplicate peer or missing issuer");
+        }
+    }
+    Ok(())
+}
+
+fn validate_rotation_peers(peers: &[CaPeerCertWrite], epoch: i64) -> Result<()> {
+    if peers.len() > 4096 {
+        bail!("CA rotation peer count exceeds the finite writer envelope");
+    }
+    let mut nodes = std::collections::HashSet::new();
+    let mut overlays = std::collections::HashSet::new();
+    for peer in peers {
+        validate_peer(peer, Some(epoch))?;
+        if !nodes.insert(&peer.node_id) || !overlays.insert(&peer.overlay_ip) {
+            bail!("CA rotation contains duplicate peer identity or overlay IP");
+        }
+    }
+    Ok(())
+}
+
+fn validate_peer(peer: &CaPeerCertWrite, expected_epoch: Option<i64>) -> Result<()> {
+    validate_identity(&peer.node_id, "peer node id")?;
+    validate_nonempty(&peer.cert_pem, "peer certificate")?;
+    if peer.epoch < 0
+        || expected_epoch.is_some_and(|epoch| peer.epoch != epoch)
+        || peer.overlay_ip.parse::<std::net::Ipv4Addr>().is_err()
+    {
+        bail!("invalid CA peer certificate row");
+    }
+    Ok(())
+}
+
+fn validate_identity(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 255
+        || value.trim() != value
+        || matches!(value, "." | "..")
+        || value
+            .chars()
+            .any(|character| matches!(character, '/' | '\\') || character.is_control())
+    {
+        bail!("invalid {label}");
+    }
+    Ok(())
+}
+
+fn validate_nonempty(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("empty {label}");
+    }
+    Ok(())
 }
 
 fn finish_transaction(conn: &Connection, result: Result<WriteResponse>) -> Result<WriteResponse> {
@@ -501,5 +865,173 @@ mod tests {
         assert!(error.to_string().contains("unavailable"));
         assert!(started.elapsed() >= Duration::from_millis(75));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    fn peer(node_id: &str, epoch: i64, overlay_ip: &str) -> CaPeerCertWrite {
+        CaPeerCertWrite {
+            node_id: node_id.into(),
+            epoch,
+            cert_pem: format!("cert:{node_id}:{epoch}"),
+            overlay_ip: overlay_ip.into(),
+            public_key_pem: Some(format!("public:{node_id}")),
+            created_at: None,
+            expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn ca_compare_and_swap_rejects_stale_signing_and_survives_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("mackesd.db");
+        let socket = temp.path().join("writer.sock");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = start(&db, &socket, Arc::clone(&shutdown)).expect("start writer");
+
+        request(
+            &socket,
+            WriteOp::MintCa {
+                mesh_id: "mesh-a".into(),
+                ca_cert_pem: "ca:0".into(),
+            },
+        )
+        .expect("mint request")
+        .into_count()
+        .expect("mint accepted");
+        let stale = request(
+            &socket,
+            WriteOp::UpsertPeerCert {
+                mesh_id: "mesh-a".into(),
+                expected_epoch: 1,
+                peer: peer("peer:stale", 1, "10.42.0.2"),
+            },
+        )
+        .expect("stale response");
+        assert!(
+            matches!(stale, WriteResponse::Error(error) if error.contains("active CA epoch changed"))
+        );
+        request(
+            &socket,
+            WriteOp::UpsertPeerCert {
+                mesh_id: "mesh-a".into(),
+                expected_epoch: 0,
+                peer: peer("peer:a", 0, "10.42.0.1"),
+            },
+        )
+        .expect("sign response")
+        .into_count()
+        .expect("sign accepted");
+        stop(server, &shutdown);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = start(&db, &socket, Arc::clone(&shutdown)).expect("restart writer");
+        let generation = vec![peer("peer:a", 1, "10.42.0.1")];
+        request(
+            &socket,
+            WriteOp::RotateCa {
+                mesh_id: "mesh-a".into(),
+                expected_active_epoch: Some(0),
+                new_epoch: 1,
+                ca_cert_pem: "ca:1".into(),
+                peer_certs: generation.clone(),
+            },
+        )
+        .expect("rotation response")
+        .into_count()
+        .expect("rotation accepted");
+        stop(server, &shutdown);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = start(&db, &socket, Arc::clone(&shutdown)).expect("second restart");
+        let retried = request(
+            &socket,
+            WriteOp::RotateCa {
+                mesh_id: "mesh-a".into(),
+                expected_active_epoch: Some(0),
+                new_epoch: 1,
+                ca_cert_pem: "ca:1".into(),
+                peer_certs: generation,
+            },
+        )
+        .expect("retry response")
+        .into_count()
+        .expect("identical retry accepted");
+        assert_eq!(retried, 0, "durable generation is idempotent after restart");
+        let reader = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("reader");
+        let active: i64 = reader
+            .query_row(
+                "SELECT epoch FROM nebula_ca WHERE mesh_id = 'mesh-a' AND retired_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("active epoch");
+        let stale_rows: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = 'peer:stale'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stale count");
+        assert_eq!(active, 1);
+        assert_eq!(stale_rows, 0, "stale signer must be a no-op");
+        stop(server, &shutdown);
+    }
+
+    #[test]
+    fn hostile_ca_restore_rolls_back_prefix_before_owner_accepts_next_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("mackesd.db");
+        let socket = temp.path().join("writer.sock");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = start(&db, &socket, Arc::clone(&shutdown)).expect("start writer");
+        let fault = Connection::open(&db).expect("open fault fixture");
+        fault
+            .execute_batch(
+                "CREATE TRIGGER reject_peer_restore BEFORE INSERT ON nebula_peer_certs \
+                 BEGIN SELECT RAISE(ABORT, 'injected peer restore failure'); END;",
+            )
+            .expect("install peer restore fault");
+        let hostile = request(
+            &socket,
+            WriteOp::RestoreCaBackup {
+                mesh_id: "mesh-a".into(),
+                ca_certs: vec![CaCertWrite {
+                    epoch: 0,
+                    ca_cert_pem: "ca:0".into(),
+                    created_at: 1,
+                    retired_at: None,
+                }],
+                peer_certs: vec![CaPeerCertWrite {
+                    created_at: Some(1),
+                    ..peer("peer:a", 0, "10.42.0.1")
+                }],
+            },
+        )
+        .expect("hostile response");
+        assert!(
+            matches!(hostile, WriteResponse::Error(_)),
+            "hostile partial restore must return a typed error"
+        );
+        fault
+            .execute_batch("DROP TRIGGER reject_peer_restore")
+            .expect("remove peer restore fault");
+
+        request(
+            &socket,
+            WriteOp::MintCa {
+                mesh_id: "mesh-a".into(),
+                ca_cert_pem: "ca:healthy".into(),
+            },
+        )
+        .expect("healthy response")
+        .into_count()
+        .expect("owner remains healthy");
+        let reader = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("reader");
+        let rows: i64 = reader
+            .query_row("SELECT COUNT(*) FROM nebula_ca", [], |row| row.get(0))
+            .expect("count CA rows");
+        assert_eq!(rows, 1, "hostile restore must not commit a prefix");
+        stop(server, &shutdown);
     }
 }

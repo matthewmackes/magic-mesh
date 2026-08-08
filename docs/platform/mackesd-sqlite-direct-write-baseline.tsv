@@ -1,8 +1,7 @@
-crates/mesh/mackesd/src/ca/backup.rs	10
-crates/mesh/mackesd/src/ca/epoch.rs	9
-crates/mesh/mackesd/src/ca/mint.rs	1
-crates/mesh/mackesd/src/ca/revoke.rs	5
-crates/mesh/mackesd/src/ca/sign.rs	5
+crates/mesh/mackesd/src/ca/backup.rs	5
+crates/mesh/mackesd/src/ca/epoch.rs	5
+crates/mesh/mackesd/src/ca/revoke.rs	4
+crates/mesh/mackesd/src/ca/sign.rs	3
 crates/mesh/mackesd/src/cli/revisions.rs	2
 crates/mesh/mackesd/src/events.rs	2
 crates/mesh/mackesd/src/fleet.rs	3

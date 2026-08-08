@@ -4505,6 +4505,7 @@ dependencies = [
  "input",
  "khronos-egl",
  "libc",
+ "mde-collab-types",
  "pollster",
  "resvg",
  "serde",

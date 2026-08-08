@@ -153,18 +153,16 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     // replaces the node's row in place (fresh cert PEM, same reused IP) and
     // clears any prior revocation — instead of failing the whole sign on a
     // PK collision.
-    conn.execute(
-        "INSERT INTO nebula_peer_certs \
-         (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(node_id, epoch) DO UPDATE SET \
-           cert_pem = excluded.cert_pem, \
-           overlay_ip = excluded.overlay_ip, \
-           expires_at = excluded.expires_at, \
-           revoked_at = NULL",
-        rusqlite::params![node_id, active_epoch, cert_pem, allocated_ip, expires_at],
-    )
-    .map_err(|e| CaError::Sql(e.to_string()))?;
+    persist_peer_cert(
+        conn,
+        mesh_id,
+        node_id,
+        active_epoch,
+        &cert_pem,
+        &allocated_ip,
+        expires_at,
+        None,
+    )?;
 
     tracing::info!(
         node_id, overlay_ip = %allocated_ip, epoch = active_epoch,
@@ -222,26 +220,16 @@ pub fn sign_peer_cert_with_public_key<B: NebulaCertBackend + ?Sized>(
         public_key_pem,
     )?;
     let expires_at: i64 = 0;
-    conn.execute(
-        "INSERT INTO nebula_peer_certs \
-         (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(node_id, epoch) DO UPDATE SET \
-           cert_pem = excluded.cert_pem, \
-           overlay_ip = excluded.overlay_ip, \
-           expires_at = excluded.expires_at, \
-           public_key_pem = excluded.public_key_pem, \
-           revoked_at = NULL",
-        rusqlite::params![
-            node_id,
-            active_epoch,
-            cert_pem,
-            allocated_ip,
-            expires_at,
-            public_key_pem
-        ],
-    )
-    .map_err(|e| CaError::Sql(e.to_string()))?;
+    persist_peer_cert(
+        conn,
+        mesh_id,
+        node_id,
+        active_epoch,
+        &cert_pem,
+        &allocated_ip,
+        expires_at,
+        Some(public_key_pem),
+    )?;
     tracing::info!(
         node_id,
         overlay_ip = %allocated_ip,
@@ -254,6 +242,38 @@ pub fn sign_peer_cert_with_public_key<B: NebulaCertBackend + ?Sized>(
         cert_pem,
         cert_path: crt_out.to_path_buf(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_peer_cert(
+    conn: &Connection,
+    mesh_id: &str,
+    node_id: &str,
+    epoch: i64,
+    cert_pem: &str,
+    overlay_ip: &str,
+    expires_at: i64,
+    public_key_pem: Option<&str>,
+) -> Result<(), CaError> {
+    crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::UpsertPeerCert {
+            mesh_id: mesh_id.to_owned(),
+            expected_epoch: epoch,
+            peer: crate::store::writer::CaPeerCertWrite {
+                node_id: node_id.to_owned(),
+                epoch,
+                cert_pem: cert_pem.to_owned(),
+                overlay_ip: overlay_ip.to_owned(),
+                public_key_pem: public_key_pem.map(str::to_owned),
+                created_at: None,
+                expires_at,
+            },
+        },
+    )
+    .and_then(crate::store::writer::WriteResponse::into_count)
+    .map(|_| ())
+    .map_err(|error| CaError::Sql(error.to_string()))
 }
 
 /// Validate the canonical Nebula X25519 public-key PEM shape and require the

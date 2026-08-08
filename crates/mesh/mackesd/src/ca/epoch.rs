@@ -8,11 +8,12 @@
 //!   1. Preflight every active peer's requester-owned public key and exact
 //!      overlay-IP allocation. Any legacy/malformed peer aborts with no change.
 //!   2. Mint the new CA and sign the complete roster in private staging.
-//!   3. Prepare all new CA/peer rows in one SQLite transaction.
-//!   4. Atomically switch the CA cert/key generation and durable peer outputs,
+//!   3. Atomically switch the CA cert/key generation and durable peer outputs,
 //!      retaining old CA roots in the runtime trust bundle during reconnect.
-//!   5. Commit the database transaction and emit the audit event. A failed
-//!      activation or commit restores the prior on-disk material.
+//!   4. Ask the sole typed store writer to compare-and-swap the complete
+//!      CA/peer generation in one SQLite transaction.
+//!   5. Emit the audit event. Failed activation or a rejected writer mutation
+//!      restores the prior on-disk material; an identical retry is idempotent.
 //!
 //! The old-root overlap keeps already-connected peers trusted across rollout.
 //! Removing that overlap is a separate live reconnect/prune operation and must
@@ -237,39 +238,10 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
     } else {
         None
     };
-    let tx = conn
-        .transaction()
-        .map_err(|e| CaError::Sql(format!("begin rotation transaction: {e}")))?;
-    let actual_retired = retire_active_ca(&tx, mesh_id)?;
-    if actual_retired != retired_epoch {
-        return Err(CaError::Sql(
-            "active CA changed during rotation preflight; retry".into(),
-        ));
-    }
-    tx.execute(
-        "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) VALUES (?1, ?2, ?3, NULL)",
-        rusqlite::params![mesh_id, new_epoch, new_cert_pem],
-    )
-    .map_err(|e| CaError::Sql(format!("insert new CA: {e}")))?;
-    for peer in &planned {
-        tx.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-            rusqlite::params![
-                peer.node_id,
-                new_epoch,
-                peer.cert_pem,
-                peer.overlay_ip,
-                peer.public_key_pem
-            ],
-        )
-        .map_err(|e| CaError::Sql(format!("stage peer {} row: {e}", peer.node_id)))?;
-    }
-
-    // Activate files only after every subprocess and SQL statement has
-    // succeeded. A commit failure restores the old complete CA pair. Old roots
-    // remain in the trust bundle throughout, so rollout cannot strand peers.
+    // Activate the complete file generation before asking the sole SQLite
+    // owner to compare-and-swap the durable epoch. Any file failure leaves the
+    // store untouched; any rejected/failed typed mutation restores the prior
+    // files. Old roots remain in the trust bundle throughout rollout.
     super::seal::write_atomic_pair(crt, trust_bundle.as_bytes(), key, &new_key)?;
     let mut installed_peer_files = Vec::new();
     for peer in &planned {
@@ -285,13 +257,38 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
         }
         installed_peer_files.push((output, prior));
     }
-    if let Err(error) = tx.commit() {
-        rollback_peer_files(&installed_peer_files);
-        if let Some((old_cert, old_key)) = &old_ca_pair {
-            let _ = super::seal::write_atomic_pair(crt, old_cert, key, old_key);
+    let peer_writes: Vec<_> = planned
+        .iter()
+        .map(|peer| crate::store::writer::CaPeerCertWrite {
+            node_id: peer.node_id.clone(),
+            epoch: new_epoch,
+            cert_pem: peer.cert_pem.clone(),
+            overlay_ip: peer.overlay_ip.clone(),
+            public_key_pem: Some(peer.public_key_pem.clone()),
+            created_at: None,
+            expires_at: 0,
+        })
+        .collect();
+    let write_result = crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::RotateCa {
+            mesh_id: mesh_id.to_owned(),
+            expected_active_epoch: retired_epoch,
+            new_epoch,
+            ca_cert_pem: new_cert_pem.clone(),
+            peer_certs: peer_writes.clone(),
+        },
+    )
+    .and_then(crate::store::writer::WriteResponse::into_count);
+    if let Err(error) = write_result {
+        if !rotation_is_durable(conn, mesh_id, new_epoch, &new_cert_pem, &peer_writes)? {
+            rollback_peer_files(&installed_peer_files);
+            if let Some((old_cert, old_key)) = &old_ca_pair {
+                let _ = super::seal::write_atomic_pair(crt, old_cert, key, old_key);
+            }
+            let _ = std::fs::remove_dir_all(&rotation_dir);
+            return Err(CaError::Sql(format!("commit typed CA rotation: {error}")));
         }
-        let _ = std::fs::remove_dir_all(&rotation_dir);
-        return Err(CaError::Sql(format!("commit CA rotation: {error}")));
     }
     let _ = std::fs::remove_dir_all(&rotation_dir);
     let re_signed = planned.len();
@@ -309,7 +306,7 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
     );
 
     Ok(RotationOutcome {
-        retired_epoch: actual_retired,
+        retired_epoch,
         new_epoch,
         re_signed,
     })
@@ -361,28 +358,44 @@ impl Drop for DirectoryCleanup {
     }
 }
 
-/// Mark every non-retired row as retired_at = now(). Returns
-/// the epoch of the row that was retired, or None when none
-/// existed.
-fn retire_active_ca(tx: &rusqlite::Transaction<'_>, mesh_id: &str) -> Result<Option<i64>, CaError> {
-    let mut stmt = tx
-        .prepare(
-            "SELECT epoch FROM nebula_ca \
-             WHERE mesh_id = ?1 AND retired_at IS NULL \
-             ORDER BY epoch DESC LIMIT 1",
-        )
-        .map_err(|e| CaError::Sql(format!("prepare active query: {e}")))?;
-    let prev: Option<i64> = stmt.query_row([mesh_id], |r| r.get(0)).ok();
-    drop(stmt);
-    if prev.is_some() {
-        tx.execute(
-            "UPDATE nebula_ca SET retired_at = unixepoch() \
-             WHERE mesh_id = ?1 AND retired_at IS NULL",
+fn rotation_is_durable(
+    conn: &Connection,
+    mesh_id: &str,
+    new_epoch: i64,
+    ca_cert_pem: &str,
+    peers: &[crate::store::writer::CaPeerCertWrite],
+) -> Result<bool, CaError> {
+    let active: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT epoch, ca_cert_pem FROM nebula_ca WHERE mesh_id = ?1 AND retired_at IS NULL ORDER BY epoch DESC LIMIT 1",
             [mesh_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|e| CaError::Sql(format!("retire CA: {e}")))?;
+        .ok();
+    if active.as_ref().map(|(epoch, pem)| (*epoch, pem.as_str())) != Some((new_epoch, ca_cert_pem))
+    {
+        return Ok(false);
     }
-    Ok(prev)
+    for peer in peers {
+        let row: Option<(String, String, Option<String>, i64)> = conn
+            .query_row(
+                "SELECT cert_pem, overlay_ip, public_key_pem, expires_at FROM nebula_peer_certs WHERE node_id = ?1 AND epoch = ?2",
+                rusqlite::params![peer.node_id, peer.epoch],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .ok();
+        if row
+            != Some((
+                peer.cert_pem.clone(),
+                peer.overlay_ip.clone(),
+                peer.public_key_pem.clone(),
+                peer.expires_at,
+            ))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Pull the active peer-cert roster at the soon-to-be-old

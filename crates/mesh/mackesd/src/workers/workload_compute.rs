@@ -9,21 +9,24 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mackes_mesh_types::workloads::{
-    admit_workload_for_backend, workload_state_topic, HostCapacity, WorkloadAdmission,
-    WorkloadAttachmentLease, WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction,
-    WorkloadOperationErrorCode, WorkloadOperationPhase, WorkloadOperationReply,
-    WorkloadOperationRequest, WorkloadOperationStatus, WorkloadPowerState, WorkloadReadiness,
-    WorkloadRuntimeSignals, WorkloadStateSnapshot, WorkloadStorageCapacity,
+    admit_workload_for_backend, reject_duplicate_json_keys, workload_state_topic, HostCapacity,
+    WorkloadAdmission, WorkloadAttachmentLease, WorkloadAttachmentProtocol, WorkloadBackend,
+    WorkloadOperationAction, WorkloadOperationErrorCode, WorkloadOperationPhase,
+    WorkloadOperationReply, WorkloadOperationRequest, WorkloadOperationStatus, WorkloadPowerState,
+    WorkloadReadiness, WorkloadRuntimeSignals, WorkloadStateSnapshot, WorkloadStorageCapacity,
     MAX_WORKLOAD_WIRE_BYTES, WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
@@ -71,6 +74,11 @@ const MAX_OPERATION_MESSAGES_PER_TICK: usize = 64;
 /// the same filesystem.
 const CONTAINER_STORAGE_PATH: &str = "/var/lib/mde-vms/containers";
 const VM_STORAGE_PATH: &str = "/var/lib/mde-vms";
+const MIGRATION_COMMAND_JOURNAL_DIR: &str = "migration-commands";
+const MAX_PENDING_MIGRATION_COMMANDS: usize = 32;
+const MAX_MIGRATION_VM_ID_BYTES: usize = 256;
+const MAX_MIGRATION_DOMAIN_XML_BYTES: usize = 1024 * 1024;
+const MAX_MIGRATION_COMMAND_RECORD_BYTES: u64 = (MAX_MIGRATION_DOMAIN_XML_BYTES + 4096) as u64;
 
 /// Workload placement is intentionally an exact role check, not a rank floor.
 /// A Lighthouse is rank 0 today, but accepting every nonzero rank would turn a
@@ -208,6 +216,8 @@ pub trait WorkloadActuator: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum WorkloadMigrationCommand {
     CaptureDefinition { vm_id: String },
     RequestStop { vm_id: String },
@@ -223,15 +233,201 @@ enum WorkloadMigrationReply {
 }
 
 struct WorkloadMigrationEnvelope {
+    command_id: String,
     command: WorkloadMigrationCommand,
     reply: SyncSender<Result<WorkloadMigrationReply, WorkloadActuatorError>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkloadMigrationJournalPhase {
+    Pending,
+    Applied,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkloadMigrationJournalRecord {
+    schema_version: u8,
+    command_id: String,
+    phase: WorkloadMigrationJournalPhase,
+    command: WorkloadMigrationCommand,
+}
+
+struct WorkloadMigrationJournal {
+    root: PathBuf,
+}
+
+impl WorkloadMigrationCommand {
+    fn validate(&self) -> Result<(), String> {
+        let (vm_id, domain_xml) = match self {
+            Self::CaptureDefinition { vm_id }
+            | Self::RequestStop { vm_id }
+            | Self::ObserveStopped { vm_id }
+            | Self::RelinquishDefinition { vm_id } => (vm_id, None),
+            Self::DefineAndStart { vm_id, domain_xml } => (vm_id, Some(domain_xml)),
+        };
+        if vm_id.trim().is_empty()
+            || vm_id.len() > MAX_MIGRATION_VM_ID_BYTES
+            || vm_id.contains('\0')
+        {
+            return Err("migration command has an invalid VM identity".into());
+        }
+        if let Some(domain_xml) = domain_xml {
+            if domain_xml.trim().is_empty() || domain_xml.len() > MAX_MIGRATION_DOMAIN_XML_BYTES {
+                return Err("migration command has an invalid retained domain definition".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WorkloadMigrationJournal {
+    fn open(state_root: &Path) -> Result<Self, String> {
+        fs::create_dir_all(state_root)
+            .map_err(|error| format!("create Workload state root: {error}"))?;
+        let root = state_root.join(MIGRATION_COMMAND_JOURNAL_DIR);
+        fs::create_dir_all(&root)
+            .map_err(|error| format!("create migration command journal: {error}"))?;
+        let metadata = fs::symlink_metadata(&root)
+            .map_err(|error| format!("inspect migration command journal: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("migration command journal is not a regular directory".into());
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure migration command journal: {error}"))?;
+        Ok(Self { root })
+    }
+
+    fn record_path(&self, command_id: &str) -> PathBuf {
+        self.root.join(format!("{command_id}.json"))
+    }
+
+    fn store(&self, record: &WorkloadMigrationJournalRecord) -> Result<(), String> {
+        if record.schema_version != 1
+            || record.command_id.is_empty()
+            || record.command_id.len() > 96
+            || !record
+                .command_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            return Err("migration command journal identity is invalid".into());
+        }
+        record.command.validate()?;
+        let destination = self.record_path(&record.command_id);
+        if !destination.exists() {
+            let retained = fs::read_dir(&self.root)
+                .map_err(|error| format!("list migration command journal: {error}"))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|value| value == "json")
+                })
+                .count();
+            if retained >= MAX_PENDING_MIGRATION_COMMANDS {
+                return Err("migration command journal is at capacity".into());
+            }
+        }
+        let body = serde_json::to_vec(record)
+            .map_err(|error| format!("encode migration command journal record: {error}"))?;
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_MIGRATION_COMMAND_RECORD_BYTES {
+            return Err("migration command journal record is oversized".into());
+        }
+        let temporary =
+            self.root
+                .join(format!(".{}.{}.tmp", record.command_id, std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("create migration command journal record: {error}"))?;
+        if let Err(error) = file.write_all(&body).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("persist migration command journal record: {error}"));
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("commit migration command journal record: {error}"));
+        }
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync migration command journal directory: {error}"))?;
+        Ok(())
+    }
+
+    fn pending(&self) -> Result<Vec<WorkloadMigrationJournalRecord>, String> {
+        let mut paths = fs::read_dir(&self.root)
+            .map_err(|error| format!("list migration command journal: {error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|value| value == "json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.len() > MAX_PENDING_MIGRATION_COMMANDS {
+            return Err("migration command journal exceeds its bounded capacity".into());
+        }
+        let mut records = Vec::with_capacity(paths.len());
+        for path in paths {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("inspect migration command journal record: {error}"))?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > MAX_MIGRATION_COMMAND_RECORD_BYTES
+            {
+                return Err("migration command journal contains an unsafe record".into());
+            }
+            let body = fs::read(&path)
+                .map_err(|error| format!("read migration command journal record: {error}"))?;
+            let text = std::str::from_utf8(&body)
+                .map_err(|_| "migration command journal record is not UTF-8".to_string())?;
+            reject_duplicate_json_keys(text)
+                .map_err(|_| "migration command journal record has duplicate keys".to_string())?;
+            let record: WorkloadMigrationJournalRecord = serde_json::from_slice(&body)
+                .map_err(|error| format!("decode migration command journal record: {error}"))?;
+            if record.schema_version != 1
+                || self.record_path(&record.command_id) != path
+                || record.command.validate().is_err()
+            {
+                return Err("migration command journal record failed validation".into());
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn remove(&self, command_id: &str) -> Result<(), String> {
+        match fs::remove_file(self.record_path(command_id)) {
+            Ok(()) => fs::File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync migration command journal cleanup: {error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove migration command journal record: {error}")),
+        }
+    }
+}
+
 static WORKLOAD_MIGRATION_EXECUTOR: OnceLock<Mutex<Option<SyncSender<WorkloadMigrationEnvelope>>>> =
     OnceLock::new();
+static WORKLOAD_MIGRATION_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn migration_executor_registry() -> &'static Mutex<Option<SyncSender<WorkloadMigrationEnvelope>>> {
     WORKLOAD_MIGRATION_EXECUTOR.get_or_init(|| Mutex::new(None))
+}
+
+fn next_migration_command_id() -> String {
+    let epoch_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = WORKLOAD_MIGRATION_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{epoch_nanos:032x}-{:08x}-{sequence:016x}",
+        std::process::id()
+    )
 }
 
 /// Command-side handle for cold migration. It has no actuator and cannot
@@ -244,8 +440,12 @@ impl WorkloadMigrationClient {
         self,
         command: WorkloadMigrationCommand,
     ) -> Result<WorkloadMigrationReply, WorkloadActuatorError> {
+        command
+            .validate()
+            .map_err(WorkloadActuatorError::Permanent)?;
         let (reply_tx, reply_rx) = sync_channel(1);
         let mut envelope = WorkloadMigrationEnvelope {
+            command_id: next_migration_command_id(),
             command,
             reply: reply_tx,
         };
@@ -1255,11 +1455,23 @@ impl SystemWorkloadActuator {
     }
 
     fn migration_request_stop_impl(&self, vm_id: &str) -> Result<(), WorkloadActuatorError> {
-        Self::require_success(Self::virsh_output(vm_id, "shutdown")?, "shutdown").map(|_| ())
+        let output = Self::virsh_output(vm_id, "shutdown")?;
+        if output.status.success()
+            || libvirt_domain_absent_or_stopped(&String::from_utf8_lossy(&output.stderr))
+        {
+            return Ok(());
+        }
+        Self::require_success(output, "shutdown").map(|_| ())
     }
 
     fn migration_is_stopped_impl(&self, vm_id: &str) -> Result<bool, WorkloadActuatorError> {
-        let output = Self::require_success(Self::virsh_output(vm_id, "domstate")?, "domstate")?;
+        let output = Self::virsh_output(vm_id, "domstate")?;
+        if !output.status.success()
+            && libvirt_domain_absent_or_stopped(&String::from_utf8_lossy(&output.stderr))
+        {
+            return Ok(true);
+        }
+        let output = Self::require_success(output, "domstate")?;
         Ok(String::from_utf8_lossy(&output.stdout)
             .trim()
             .eq_ignore_ascii_case("shut off"))
@@ -1275,6 +1487,14 @@ impl SystemWorkloadActuator {
             return Err(WorkloadActuatorError::Permanent(
                 "migration definition is empty".into(),
             ));
+        }
+        let existing = Self::virsh_output(&domain, "domstate")?;
+        if existing.status.success()
+            && !String::from_utf8_lossy(&existing.stdout)
+                .trim()
+                .eq_ignore_ascii_case("shut off")
+        {
+            return Ok(());
         }
         let xml_path = std::env::temp_dir().join(format!(
             "mde-workload-migrate-{domain}-{}-{}.xml",
@@ -1298,22 +1518,46 @@ impl SystemWorkloadActuator {
         });
         let _ = fs::remove_file(&xml_path);
         Self::require_success(define_result?, "define")?;
-        Self::require_success(Self::virsh_output(&domain, "start")?, "start").map(|_| ())
+        let start = Self::virsh_output(&domain, "start")?;
+        if start.status.success()
+            || libvirt_domain_already_running(&String::from_utf8_lossy(&start.stderr))
+        {
+            Ok(())
+        } else {
+            Self::require_success(start, "start").map(|_| ())
+        }
     }
 
     fn migration_relinquish_definition_impl(
         &self,
         vm_id: &str,
     ) -> Result<(), WorkloadActuatorError> {
-        Self::require_success(Self::virsh_output(vm_id, "undefine")?, "undefine").map(|_| ())
+        let output = Self::virsh_output(vm_id, "undefine")?;
+        if output.status.success()
+            || libvirt_domain_absent(&String::from_utf8_lossy(&output.stderr))
+        {
+            Ok(())
+        } else {
+            Self::require_success(output, "undefine").map(|_| ())
+        }
     }
 }
 
 fn libvirt_domain_absent_or_stopped(detail: &str) -> bool {
     let normalized = detail.to_ascii_lowercase();
-    normalized.contains("domain not found")
-        || normalized.contains("failed to get domain")
-        || normalized.contains("domain is not running")
+    libvirt_domain_absent(&normalized) || normalized.contains("domain is not running")
+}
+
+fn libvirt_domain_absent(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    normalized.contains("domain not found") || normalized.contains("failed to get domain")
+}
+
+fn libvirt_domain_already_running(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    normalized.contains("domain is already active")
+        || normalized.contains("domain is already running")
+        || normalized.contains("already active")
 }
 
 impl WorkloadActuator for SystemWorkloadActuator {
@@ -1774,6 +2018,7 @@ pub struct WorkloadComputeWorker {
     last_projection: Option<Vec<WorkloadOperationStatus>>,
     migration_sender: SyncSender<WorkloadMigrationEnvelope>,
     migration_commands: Receiver<WorkloadMigrationEnvelope>,
+    migration_replay_due_ms: AtomicU64,
 }
 
 impl WorkloadComputeWorker {
@@ -1811,6 +2056,7 @@ impl WorkloadComputeWorker {
             last_projection: None,
             migration_sender: migration_tx,
             migration_commands,
+            migration_replay_due_ms: AtomicU64::new(0),
         }
     }
 
@@ -1820,34 +2066,123 @@ impl WorkloadComputeWorker {
         }
     }
 
+    fn execute_migration_command(
+        &self,
+        command: &WorkloadMigrationCommand,
+    ) -> Result<WorkloadMigrationReply, WorkloadActuatorError> {
+        match command {
+            WorkloadMigrationCommand::CaptureDefinition { vm_id } => self
+                .actuator
+                .migration_capture_definition(vm_id)
+                .map(WorkloadMigrationReply::Definition),
+            WorkloadMigrationCommand::RequestStop { vm_id } => self
+                .actuator
+                .migration_request_stop(vm_id)
+                .map(|()| WorkloadMigrationReply::Complete),
+            WorkloadMigrationCommand::ObserveStopped { vm_id } => self
+                .actuator
+                .migration_is_stopped(vm_id)
+                .map(WorkloadMigrationReply::Stopped),
+            WorkloadMigrationCommand::DefineAndStart { vm_id, domain_xml } => self
+                .actuator
+                .migration_define_and_start(vm_id, domain_xml)
+                .map(|()| WorkloadMigrationReply::Complete),
+            WorkloadMigrationCommand::RelinquishDefinition { vm_id } => self
+                .actuator
+                .migration_relinquish_definition(vm_id)
+                .map(|()| WorkloadMigrationReply::Complete),
+        }
+    }
+
+    fn replay_migration_commands(&self, journal: &WorkloadMigrationJournal) {
+        let records = match journal.pending() {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::error!(%error, "migration command journal recovery refused");
+                return;
+            }
+        };
+        for mut record in records {
+            if record.phase == WorkloadMigrationJournalPhase::Applied {
+                if let Err(error) = journal.remove(&record.command_id) {
+                    tracing::warn!(%error, command_id = %record.command_id, "applied migration journal cleanup failed");
+                }
+                continue;
+            }
+            match self.execute_migration_command(&record.command) {
+                Ok(_) | Err(WorkloadActuatorError::Permanent(_)) => {
+                    record.phase = WorkloadMigrationJournalPhase::Applied;
+                    if let Err(error) = journal.store(&record) {
+                        tracing::error!(%error, command_id = %record.command_id, "migration recovery completion could not be journaled");
+                        continue;
+                    }
+                    if let Err(error) = journal.remove(&record.command_id) {
+                        tracing::warn!(%error, command_id = %record.command_id, "migration recovery journal cleanup failed");
+                    }
+                }
+                Err(WorkloadActuatorError::Retryable(error)) => {
+                    tracing::warn!(%error, command_id = %record.command_id, "migration recovery remains retryable");
+                }
+            }
+        }
+    }
+
     fn drain_migration_commands(&self) {
+        let journal = match WorkloadMigrationJournal::open(&self.state_root) {
+            Ok(journal) => journal,
+            Err(error) => {
+                tracing::error!(%error, "migration command journal unavailable");
+                while let Ok(envelope) = self.migration_commands.try_recv() {
+                    let _ = envelope
+                        .reply
+                        .send(Err(WorkloadActuatorError::Retryable(format!(
+                            "Workload migration journal unavailable: {error}"
+                        ))));
+                }
+                return;
+            }
+        };
+        // Recovery retries are durable, but deliberately paced. A broken
+        // libvirt backend must not turn the one-second worker tick into a
+        // command storm across every retained migration record.
+        let replay_now_ms = now_ms();
+        if replay_now_ms >= self.migration_replay_due_ms.load(Ordering::Acquire) {
+            self.migration_replay_due_ms.store(
+                replay_now_ms.saturating_add(MAX_RETRY_BACKOFF_MS),
+                Ordering::Release,
+            );
+            self.replay_migration_commands(&journal);
+        }
         loop {
             let envelope = match self.migration_commands.try_recv() {
                 Ok(envelope) => envelope,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
-            let result = match envelope.command {
-                WorkloadMigrationCommand::CaptureDefinition { vm_id } => self
-                    .actuator
-                    .migration_capture_definition(&vm_id)
-                    .map(WorkloadMigrationReply::Definition),
-                WorkloadMigrationCommand::RequestStop { vm_id } => self
-                    .actuator
-                    .migration_request_stop(&vm_id)
-                    .map(|()| WorkloadMigrationReply::Complete),
-                WorkloadMigrationCommand::ObserveStopped { vm_id } => self
-                    .actuator
-                    .migration_is_stopped(&vm_id)
-                    .map(WorkloadMigrationReply::Stopped),
-                WorkloadMigrationCommand::DefineAndStart { vm_id, domain_xml } => self
-                    .actuator
-                    .migration_define_and_start(&vm_id, &domain_xml)
-                    .map(|()| WorkloadMigrationReply::Complete),
-                WorkloadMigrationCommand::RelinquishDefinition { vm_id } => self
-                    .actuator
-                    .migration_relinquish_definition(&vm_id)
-                    .map(|()| WorkloadMigrationReply::Complete),
+            let mut record = WorkloadMigrationJournalRecord {
+                schema_version: 1,
+                command_id: envelope.command_id,
+                phase: WorkloadMigrationJournalPhase::Pending,
+                command: envelope.command,
             };
+            if let Err(error) = journal.store(&record) {
+                let _ = envelope
+                    .reply
+                    .send(Err(WorkloadActuatorError::Retryable(format!(
+                        "Workload migration command was not journaled: {error}"
+                    ))));
+                continue;
+            }
+            let mut result = self.execute_migration_command(&record.command);
+            if result.is_ok() || matches!(&result, Err(WorkloadActuatorError::Permanent(_))) {
+                record.phase = WorkloadMigrationJournalPhase::Applied;
+                if let Err(error) = journal.store(&record) {
+                    result = Err(WorkloadActuatorError::Retryable(format!(
+                        "Workload migration effect completed but journal finalization failed: {error}"
+                    )));
+                } else if let Err(error) = journal.remove(&record.command_id) {
+                    tracing::warn!(%error, command_id = %record.command_id, "applied migration journal cleanup failed");
+                }
+            }
             let _ = envelope.reply.send(result);
         }
     }
@@ -2949,12 +3284,67 @@ mod tests {
         }
     }
 
+    struct JournalObservingMigrationActuator {
+        calls: Arc<Mutex<u32>>,
+        state_root: PathBuf,
+        saw_pending_journal: Arc<AtomicBool>,
+    }
+
+    impl WorkloadActuator for JournalObservingMigrationActuator {
+        fn migration_request_stop(&self, _: &str) -> Result<(), WorkloadActuatorError> {
+            let pending = WorkloadMigrationJournal::open(&self.state_root)
+                .and_then(|journal| journal.pending())
+                .map(|records| {
+                    records.iter().any(|record| {
+                        record.phase == WorkloadMigrationJournalPhase::Pending
+                            && matches!(
+                                &record.command,
+                                WorkloadMigrationCommand::RequestStop { vm_id }
+                                    if vm_id == "vm-reconciler-owned"
+                            )
+                    })
+                })
+                .unwrap_or(false);
+            self.saw_pending_journal.store(pending, Ordering::Release);
+            *self.calls.lock().expect("calls") += 1;
+            Ok(())
+        }
+
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("migration journal test does not apply a Workload operation")
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("migration journal test does not cancel a Workload operation")
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            Ok(None)
+        }
+    }
+
     #[test]
     fn migration_command_executes_only_when_workload_reconciler_drains() {
+        let state = tempfile::tempdir().expect("migration state");
         let calls = Arc::new(Mutex::new(0));
-        let worker =
-            WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(FakeActuator {
+        let saw_pending_journal = Arc::new(AtomicBool::new(false));
+        let worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(state.path().to_path_buf())
+            .with_actuator(Box::new(JournalObservingMigrationActuator {
                 calls: Arc::clone(&calls),
+                state_root: state.path().to_path_buf(),
+                saw_pending_journal: Arc::clone(&saw_pending_journal),
             }));
         worker.register_migration_executor();
         let request = std::thread::spawn(|| {
@@ -2967,6 +3357,103 @@ mod tests {
         worker.drain_migration_commands();
         request.join().expect("client join");
         assert_eq!(*calls.lock().expect("calls"), 1);
+        assert!(saw_pending_journal.load(Ordering::Acquire));
+        assert!(WorkloadMigrationJournal::open(state.path())
+            .expect("journal")
+            .pending()
+            .expect("pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_migration_command_replays_after_worker_restart_without_a_client() {
+        let state = tempfile::tempdir().expect("migration state");
+        let journal = WorkloadMigrationJournal::open(state.path()).expect("journal");
+        journal
+            .store(&WorkloadMigrationJournalRecord {
+                schema_version: 1,
+                command_id: "00000000000000000000000000000001-00000001-0000000000000001".into(),
+                phase: WorkloadMigrationJournalPhase::Pending,
+                command: WorkloadMigrationCommand::RequestStop {
+                    vm_id: "vm-recovered".into(),
+                },
+            })
+            .expect("seed pending command");
+
+        let calls = Arc::new(Mutex::new(0));
+        let worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(state.path().to_path_buf())
+            .with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }));
+        worker.drain_migration_commands();
+
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert!(journal
+            .pending()
+            .expect("pending after recovery")
+            .is_empty());
+    }
+
+    #[test]
+    fn applied_migration_record_is_cleaned_without_repeating_its_effect() {
+        let state = tempfile::tempdir().expect("migration state");
+        let journal = WorkloadMigrationJournal::open(state.path()).expect("journal");
+        journal
+            .store(&WorkloadMigrationJournalRecord {
+                schema_version: 1,
+                command_id: "00000000000000000000000000000002-00000001-0000000000000002".into(),
+                phase: WorkloadMigrationJournalPhase::Applied,
+                command: WorkloadMigrationCommand::RequestStop {
+                    vm_id: "vm-already-applied".into(),
+                },
+            })
+            .expect("seed applied command");
+
+        let calls = Arc::new(Mutex::new(0));
+        let worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(state.path().to_path_buf())
+            .with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }));
+        worker.drain_migration_commands();
+
+        assert_eq!(*calls.lock().expect("calls"), 0);
+        assert!(journal.pending().expect("pending after cleanup").is_empty());
+    }
+
+    #[test]
+    fn migration_journal_rejects_oversized_definition_and_symlink_root() {
+        let state = tempfile::tempdir().expect("migration state");
+        let journal = WorkloadMigrationJournal::open(state.path()).expect("journal");
+        let oversized = WorkloadMigrationJournalRecord {
+            schema_version: 1,
+            command_id: "00000000000000000000000000000003-00000001-0000000000000003".into(),
+            phase: WorkloadMigrationJournalPhase::Pending,
+            command: WorkloadMigrationCommand::DefineAndStart {
+                vm_id: "vm-oversized".into(),
+                domain_xml: "x".repeat(MAX_MIGRATION_DOMAIN_XML_BYTES + 1),
+            },
+        };
+        assert!(journal.store(&oversized).is_err());
+
+        let duplicate_id = "00000000000000000000000000000004-00000001-0000000000000004";
+        fs::write(
+            journal.record_path(duplicate_id),
+            format!(
+                r#"{{"schema_version":1,"schema_version":1,"command_id":"{duplicate_id}","phase":"pending","command":{{"kind":"request_stop","vm_id":"vm-duplicate"}}}}"#
+            ),
+        )
+        .expect("write hostile duplicate record");
+        assert!(journal.pending().is_err());
+
+        let hostile = tempfile::tempdir().expect("hostile state");
+        std::os::unix::fs::symlink(
+            state.path(),
+            hostile.path().join(MIGRATION_COMMAND_JOURNAL_DIR),
+        )
+        .expect("symlink journal root");
+        assert!(WorkloadMigrationJournal::open(hostile.path()).is_err());
     }
 
     struct RetryOnObserveActuator {
@@ -3182,6 +3669,16 @@ mod tests {
             "failed to get domain 'browser'"
         ));
         assert!(!libvirt_domain_absent_or_stopped(
+            "permission denied while contacting virtqemud"
+        ));
+        assert!(libvirt_domain_absent("error: Domain not found"));
+        assert!(!libvirt_domain_absent(
+            "Requested operation is not valid: domain is not running"
+        ));
+        assert!(libvirt_domain_already_running(
+            "Requested operation is not valid: domain is already active"
+        ));
+        assert!(!libvirt_domain_already_running(
             "permission denied while contacting virtqemud"
         ));
     }

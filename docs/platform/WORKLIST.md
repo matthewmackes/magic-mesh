@@ -104,6 +104,12 @@ behavioral evidence is not completion.
   reconciler execute cold-migration VM effects; restart journaling remains.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
+- **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
+  migration commands are atomically journaled before effects, replay pending
+  records after restart, clean applied records without repeating effects, and
+  pace retryable recovery. Distributed migration cursors and pending commit/
+  rollback state remain memory-backed. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON
   admission rejects duplicate top-level and nested keys; `.50` passed 9/9.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
@@ -337,18 +343,13 @@ behavioral evidence is not completion.
 - Problem: mackesd remains monolithic, worker ownership and resource budgets are incomplete, and duplicate This Node/Fleet/State surfaces obscure runtime truth.
 - Required outcome: six independently supervised mackesd groups publish bounded typed runtime snapshots; one Surface::Workers owns worker tree, graph, inspector, Network
   Operations, and staged Action Console; old surfaces and health duplication are removed.
-- Current state: all 145 production starts are registered and sampled with bounded generations; the shared runtime contract rejects unknown schema versions at
-  every versioned boundary. Process split, complete ownership, providers, UI
-  cutover, and fleet evidence remain.
-- **Process-group cutover checkpoint (2026-08-08):** `serve --group` is
-  mandatory; RPM/bootc ship six budgeted services under `mackesd.target`, no
-  monolith, and the package validator passes. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-required-process-group-r1.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-grouped-systemd-cutover-r1.md`.
-- **SQLite-owner checkpoint (2026-08-08):** control now hosts a bounded typed
-  writer for seven mutations; five groups order behind its readiness and a gate
-  freezes 61 residual direct-write sites. Full enforcement/live proof remain:
+- Current state: all 145 production starts have bounded runtime contracts; six grouped services ship, but complete ownership, providers, UI cutover, and fleet proof remain.
+- **Process cutover (2026-08-08):** mandatory `serve --group`, six budgeted services, no packaged monolith. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-required-process-group-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-08-grouped-systemd-cutover-r1.md`.
+- **SQLite owner (2026-08-08):** control owns the typed writer and other groups order behind it; full enforcement/live proof remain. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-writer-boundary-r1.md`.
+- **CA writer (2026-08-08):** typed transactional mint/sign/revoke/restore/rotation cut residual syntax from 61 to 48; BigBoy passed 6/6. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-ca-sqlite-writer-r2.md`.
 - Remaining work:
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
@@ -534,16 +535,14 @@ behavioral evidence is not completion.
   with explicit permission, limits, and cleanup.
 - Current state: text shortcuts, direct DRM copy/cut/paste, bounded rich contracts, authenticated mesh adapters, and transfer scaffolding exist; live DRM/mesh,
   guest adapters, permissions, CAS cleanup, and proof remain.
-- **JSON-admission checkpoint (2026-08-06):** nested duplicate object keys are
-  rejected before rich clipboard admission; the signed-envelope hostile test
-  passed 1/1 on `.50`. Evidence:
+- **JSON admission (2026-08-06):** recursive duplicate keys fail closed; `.50` passed 1/1. Evidence:
   `docs/platform/evidence/WL-FUNC-016-2026-08-06-clipboard-json-admission-r1.md`.
-- **S1 rich-contract checkpoint (2026-08-08):** canonical V2 rich offers,
-  exact-generation selection, limits, secret policy, and typed denials passed 72/72 on `.50`. Evidence:
+- **S1 rich contract (2026-08-08):** V2 offers, exact generations, limits, secret policy, and typed denials passed 72/72 on `.50`. Evidence:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
-- **S3 mesh-transport checkpoint (2026-08-08):** target-specific signed frames
-  passed 7/7 hostile/restart checks on `.50`; physical cross-node and Files CAS proof remain. Evidence:
+- **S3 mesh transport (2026-08-08):** signed target frames passed 7/7 on `.50`; cross-node/CAS proof remains. Evidence:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
+- **S2 DRM authority (2026-08-08):** one bounded seat authority revokes stale focus generations and keeps Bus I/O off-render; DRM passed 19/19 on `.50`, shell/Bus 1/1 each.
+  Live-seat and rich mesh/VDI proof remain: `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`.
 - Remaining work:
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
@@ -610,6 +609,13 @@ behavioral evidence is not completion.
   summaries, nowCOAST temperature/wind/cloud layers, clock-adjacent launcher, offline map cache, route execution, radio recovery, and complete live proof remain.
 - **Geocoder boundary checkpoint (2026-08-06):** hostile rows with invalid coordinates/control-bearing or oversized labels are rejected before navigation; BigBoy passed 1/1.
   Evidence: `docs/platform/evidence/WL-FUNC-017-2026-08-06-geocoder-boundary-r1.md`.
+- **Location/weather contract checkpoint (2026-08-08):** versioned bounded
+  Auto/Manual preference, effective-location, current-condition, 120-hour, and
+  five-day contracts now expose the required weather topics without changing
+  the Car drive-ahead topic. BigBoy passed the full mesh-types crate 454/454,
+  including location 7/7 and weather 8/8. The daemon resolver and providers
+  remain. Evidence:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-08-location-weather-contracts-s1-r1.md`.
 - Remaining work:
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with

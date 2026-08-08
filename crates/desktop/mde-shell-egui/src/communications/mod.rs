@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "drm")]
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
@@ -38,6 +40,8 @@ use mackes_mesh_types::vdi_clipboard::{
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_egui::{egui, TextClipboard};
+#[cfg(feature = "drm")]
+use mde_egui::{ClipboardClientPoll, LocalClipboardOffer, RichClipboardClient};
 use serde::de::DeserializeOwned;
 
 use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface, Mode};
@@ -48,6 +52,8 @@ use mde_collab_types::{
     EventId, FileReferences, MessagePins, SavedMessages, SpaceDirectory, SpaceId, ThreadId,
     ThreadTimeline, TransferJobs, MAX_CLIPBOARD_TEXT_BYTES,
 };
+#[cfg(feature = "drm")]
+use mde_collab_types::{ClipboardMimeKind, ClipboardMimeOfferV2, ClipboardPayloadV2};
 
 use crate::bus_reader::BusReader;
 
@@ -483,6 +489,146 @@ impl TextClipboard for BusTextClipboard {
             Ok(_) => self.last_error = None,
             Err(error) => self.last_error = Some(error),
         }
+    }
+}
+
+#[cfg(feature = "drm")]
+enum AsyncClipboardCommand {
+    Poll,
+    Publish(String),
+    Clear,
+}
+
+#[cfg(feature = "drm")]
+enum AsyncClipboardResult {
+    Poll(Result<Option<String>, String>),
+}
+
+/// Nonblocking direct-DRM client for the canonical Bus clipboard lane.
+///
+/// The worker owns all `Persist` access. Render frames only use bounded
+/// `try_send`/`try_recv`, and the newest pending copy replaces an older pending
+/// copy because clipboard ownership itself is latest-wins.
+#[cfg(feature = "drm")]
+pub(crate) struct AsyncBusClipboardClient {
+    commands: SyncSender<AsyncClipboardCommand>,
+    results: Receiver<AsyncClipboardResult>,
+    poll_inflight: bool,
+    observed_text: Option<Option<String>>,
+    pending_publish: Option<Option<String>>,
+}
+
+#[cfg(feature = "drm")]
+impl AsyncBusClipboardClient {
+    pub(crate) fn for_shell(bus_root: Option<PathBuf>) -> Self {
+        let (command_tx, command_rx) = sync_channel(1);
+        let (result_tx, result_rx) = sync_channel(2);
+        let mut provider = BusTextClipboard::for_shell(bus_root);
+        let _ = std::thread::Builder::new()
+            .name("mde-drm-clipboard".to_owned())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    match command {
+                        AsyncClipboardCommand::Poll => {
+                            let _ = result_tx
+                                .try_send(AsyncClipboardResult::Poll(provider.read_text_checked()));
+                        }
+                        AsyncClipboardCommand::Publish(text) => {
+                            let _ = provider.write_text_checked(&text);
+                        }
+                        AsyncClipboardCommand::Clear => {
+                            let _ = provider.write_text_checked("");
+                        }
+                    }
+                }
+            });
+        Self {
+            commands: command_tx,
+            results: result_rx,
+            poll_inflight: false,
+            observed_text: None,
+            pending_publish: None,
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        let Some(pending) = self.pending_publish.take() else {
+            return;
+        };
+        let command = match pending.as_ref() {
+            Some(text) => AsyncClipboardCommand::Publish(text.clone()),
+            None => AsyncClipboardCommand::Clear,
+        };
+        if let Err(TrySendError::Full(command)) = self.commands.try_send(command) {
+            self.pending_publish = Some(match command {
+                AsyncClipboardCommand::Publish(text) => Some(text),
+                AsyncClipboardCommand::Clear => None,
+                AsyncClipboardCommand::Poll => return,
+            });
+        }
+    }
+
+    fn plain_text(offer: &LocalClipboardOffer) -> Option<String> {
+        offer
+            .offers()
+            .iter()
+            .find(|candidate| candidate.mime == ClipboardMimeKind::TextPlain)
+            .and_then(|candidate| match &candidate.payload {
+                ClipboardPayloadV2::InlineText { text } => Some(text.clone()),
+                _ => None,
+            })
+    }
+}
+
+#[cfg(feature = "drm")]
+impl RichClipboardClient for AsyncBusClipboardClient {
+    fn poll_offer(&mut self) -> ClipboardClientPoll {
+        self.flush_pending();
+        let mut completed = None;
+        loop {
+            match self.results.try_recv() {
+                Ok(AsyncClipboardResult::Poll(result)) => {
+                    self.poll_inflight = false;
+                    if let Ok(text) = result {
+                        completed = Some(text);
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if !self.poll_inflight && self.pending_publish.is_none() {
+            match self.commands.try_send(AsyncClipboardCommand::Poll) {
+                Ok(()) => self.poll_inflight = true,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+            }
+        }
+        let Some(text) = completed else {
+            return ClipboardClientPoll::Unchanged;
+        };
+        if self.observed_text.as_ref() == Some(&text) {
+            return ClipboardClientPoll::Unchanged;
+        }
+        self.observed_text = Some(text.clone());
+        match text.and_then(|text| {
+            ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextPlain, text).ok()
+        }) {
+            Some(offer) => ClipboardClientPoll::Offer(vec![offer]),
+            None => ClipboardClientPoll::Cleared,
+        }
+    }
+
+    fn publish_offer(&mut self, offer: &LocalClipboardOffer) {
+        if let Some(text) = Self::plain_text(offer) {
+            self.observed_text = Some(Some(text.clone()));
+            self.pending_publish = Some(Some(text));
+            self.flush_pending();
+        }
+    }
+
+    fn clear_offer(&mut self) {
+        self.observed_text = Some(None);
+        self.pending_publish = Some(None);
+        self.flush_pending();
     }
 }
 
@@ -1264,6 +1410,28 @@ mod tests {
             kind_tag: "message_posted".to_owned(),
             summary: "posted a message".to_owned(),
         }
+    }
+
+    #[cfg(feature = "drm")]
+    #[test]
+    fn drm_bus_client_selects_exact_plain_text_without_mutating_rich_mime_offer() {
+        let mut authority = mde_egui::LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        let html =
+            ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextHtml, "<strong>rich</strong>")
+                .expect("html offer");
+        let plain = ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextPlain, "rich")
+            .expect("plain offer");
+        authority
+            .replace(vec![html.clone(), plain.clone()])
+            .expect("rich offer");
+        let current = authority.current().expect("current offer");
+
+        assert_eq!(
+            AsyncBusClipboardClient::plain_text(current).as_deref(),
+            Some("rich")
+        );
+        assert_eq!(current.offers(), &[html, plain]);
     }
 
     #[test]

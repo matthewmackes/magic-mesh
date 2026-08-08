@@ -81,11 +81,14 @@ pub fn mint_ca<B: NebulaCertBackend>(
         ))
     })?;
 
-    conn.execute(
-        "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) \
-         VALUES (?1, 0, ?2, NULL)",
-        rusqlite::params![mesh_id, cert_pem],
+    crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::MintCa {
+            mesh_id: mesh_id.to_owned(),
+            ca_cert_pem: cert_pem.clone(),
+        },
     )
+    .and_then(crate::store::writer::WriteResponse::into_count)
     .map_err(|e| CaError::Sql(e.to_string()))?;
 
     tracing::info!(mesh_id, "nebula CA minted at epoch 0");

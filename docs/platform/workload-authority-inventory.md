@@ -54,8 +54,11 @@ not automatically lifecycle authorities. Each is classified by effect:
   `rsync` disk transfer, but has no libvirt adapter. Capture, shutdown,
   observation, define/start, rollback, and relinquish commands cross an
   in-process bounded command/reply channel and execute only when
-  `WorkloadComputeWorker` drains them through its owned actuator.
+  `WorkloadComputeWorker` drains them through its owned actuator. Each command
+  is atomically journaled as `Pending` before the actuator, then `Applied`
+  before cleanup; restart recovery replays only pending idempotent commands.
 
-The migration command queue is fail-closed and co-located in the Compute
-process group, but is not itself journaled. Restart-safe migration recovery and
-the broader live adapter/attachment proof therefore remain ARCH-010 work.
+The command boundary is now fail-closed, bounded, duplicate-key-safe, and
+restart-recoverable. The distributed protocol's source/target cursors and
+pending commit/rollback fold are still memory-backed, so full crash recovery
+and broader live adapter/attachment proof remain ARCH-010 work.

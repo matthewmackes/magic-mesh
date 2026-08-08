@@ -73,6 +73,8 @@ pub mod lighthouse;
 // The replicated directory carries only binary health; these live operational
 // facts need a per-lighthouse probe lane (LIGHTHOUSE follow-on, now filled).
 pub mod lighthouse_probe;
+/// WL-FUNC-017 — bounded weather-location preference and effective-location contracts.
+pub mod location;
 /// WL-FUNC-015 — shared `state/media/sources` wire records published by
 /// `mackesd` and consumed by the Media Workspace without a daemon dependency.
 pub mod media_sources;
@@ -154,6 +156,8 @@ pub mod vpn_egress;
 /// VPN-GW-5 — first-class provider adapters (Mullvad/Proton/IVPN/Nord/Surfshark)
 /// + the generic "paste WG config" / "import .ovpn" config-generation paths.
 pub mod vpn_providers;
+/// WL-FUNC-017 — bounded current conditions and general 120-hour/five-day forecast contracts.
+pub mod weather;
 /// WL-ARCH-010 — the sole versioned workload operation/state contract.
 pub mod workloads;
 

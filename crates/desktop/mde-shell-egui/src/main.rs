@@ -2986,6 +2986,11 @@ impl Shell {
         self.normalize_surface_aliases();
         self.enforce_drm_proof_route();
         self.observe_nav_location(ctx);
+        // WL-FUNC-016 S2: the direct DRM runner owns the one local rich
+        // clipboard authority. The shell contributes only the focused app
+        // identity; changing surfaces revokes the previous owner's generation.
+        let clipboard_owner = (!self.curtain.engaged()).then(|| self.nav.surface.label());
+        mde_egui::clipboard::set_drm_clipboard_owner(ctx, clipboard_owner);
         // SURFACE-10: flush any key the OSK queued last frame into THIS frame's input,
         // before the focused field draws, so it consumes them exactly like a hardware
         // key (a no-op when nothing is queued).
@@ -4655,7 +4660,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // CopyText/Paste event reaches the canonical mesh lane. The windowed
         // fallback retains eframe's platform adapter; only this direct-seat
         // path must not regress to the process-local compatibility provider.
-        let mut clipboard = communications::BusTextClipboard::for_shell(mde_bus::client_data_dir());
+        let mut clipboard =
+            communications::AsyncBusClipboardClient::for_shell(mde_bus::client_data_dir());
         let mut display1 = display1_client_from_environment();
         let display1_source = &mut display1 as &mut dyn mde_egui::drm::Display1FrameSource;
         match mde_egui::run_drm_with_clipboard_and_display1(

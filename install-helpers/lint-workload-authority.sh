@@ -53,6 +53,14 @@ production_contains_literal() {
   awk '/#\[cfg\(test\)\]/{exit} {print}' "$file" | grep -Fq -- "$needle"
 }
 
+has_durable_migration_boundary() {
+  local file="$1"
+  contains_literal 'drain_migration_commands' "$file" \
+    && contains_literal 'WorkloadMigrationJournal' "$file" \
+    && contains_literal 'WorkloadMigrationJournalPhase::Pending' "$file" \
+    && contains_literal 'replay_migration_commands' "$file"
+}
+
 has_retired_spawn() {
   # Keep this check multiline-aware without making the farm image depend on
   # ripgrep or PCRE: an actuator call ends at the first `});` after its start.
@@ -109,6 +117,20 @@ EOF
   printf '%s\n' 'let mut command = Command::new("virsh");' >"$fixture/compute_migrate.rs"
   if ! production_contains_literal 'Command::new("virsh")' "$fixture/compute_migrate.rs"; then
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — direct migration actuator fixture was not detected' >&2
+    return 1
+  fi
+  printf '%s\n' 'fn drain_migration_commands() {}' >"$fixture/workload_compute.rs"
+  if has_durable_migration_boundary "$fixture/workload_compute.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — volatile migration fixture was accepted' >&2
+    return 1
+  fi
+  cat >"$fixture/workload_compute.rs" <<'EOF'
+struct WorkloadMigrationJournal;
+fn drain_migration_commands() { let _ = WorkloadMigrationJournalPhase::Pending; }
+fn replay_migration_commands() {}
+EOF
+  if ! has_durable_migration_boundary "$fixture/workload_compute.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — durable migration fixture was rejected' >&2
     return 1
   fi
   printf '%s\n' 'lint-workload-authority.sh: self-test passed — lifecycle and presentation guards are fail-closed'
@@ -179,8 +201,8 @@ if production_contains_literal 'Command::new("virsh")' "$compute_migrate" \
   exit 1
 fi
 if ! contains_literal 'WorkloadMigrationClient' "$compute_migrate" \
-  || ! contains_literal 'drain_migration_commands' "$workload_compute"; then
-  printf '%s\n' 'lint-workload-authority.sh: migration commands do not terminate at the Workload reconciler' >&2
+  || ! has_durable_migration_boundary "$workload_compute"; then
+  printf '%s\n' 'lint-workload-authority.sh: migration commands are not durably reconciler-owned' >&2
   exit 1
 fi
 
