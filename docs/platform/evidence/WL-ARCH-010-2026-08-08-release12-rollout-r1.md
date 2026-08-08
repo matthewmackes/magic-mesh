@@ -38,9 +38,13 @@ and no RPM error was logged.
 
 Both slow lighthouses received the narrow runtime correction
 `/etc/systemd/system/mackesd.service.d/40-startup-timeout.conf` with
-`TimeoutStartSec=300`; the existing watchdog and stop policy were unchanged.
-Final active-state confirmation remains required before this rollout can be
-called complete.
+`TimeoutStartSec=0`; the existing 180-second watchdog and stop policy were
+unchanged. The first lighthouse was rebooted and its persisted etcd member was
+restarted after Nebula returned. The third lighthouse had a full `/run` tmpfs
+from stale JSON bus spool files; `mackesd` was stopped, only those disposable
+`/run/mde-bus/**/*.json*` files were removed, and the daemon was started again.
+All three lighthouses then reported release 5 with `mackesd`, `nebula`, and
+`etcd` active, and the three-member etcd health check passed.
 
 ## Farm cleanup
 
