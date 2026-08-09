@@ -15,6 +15,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+static TEXTFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// One Prometheus counter — monotonically increasing, never resets
 /// (except on process restart).
 #[derive(Debug, Clone, Default)]
@@ -315,8 +317,32 @@ pub fn write_textfile(
     counters: &[Counter],
     histograms: &[Histogram],
 ) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "metrics textfile path is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            let metadata = std::fs::symlink_metadata(dir)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "metrics textfile path became non-directory during creation",
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
     let final_path = dir.join("mackesd.prom");
-    let tmp_path = dir.join("mackesd.prom.tmp");
+    let tmp_path = dir.join(format!(
+        ".mackesd.prom.{}.{}.tmp",
+        std::process::id(),
+        TEXTFILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
 
     let mut body = String::new();
     // Emit each counter's `# HELP`/`# TYPE` header exactly once per
@@ -337,10 +363,19 @@ pub fn write_textfile(
         render_histogram(&mut body, h);
     }
 
-    let mut f = std::fs::File::create(&tmp_path)?;
-    f.write_all(body.as_bytes())?;
-    f.sync_data()?;
-    std::fs::rename(&tmp_path, &final_path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    if let Err(error) = f.write_all(body.as_bytes()).and_then(|()| f.sync_data()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(f);
+    if let Err(error) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
     Ok(final_path)
 }
 
@@ -521,8 +556,38 @@ mod tests {
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("x_total 1"));
-        // No `.tmp` leftover.
-        assert!(!dir.path().join("mackesd.prom.tmp").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the final snapshot remains after atomic publication"
+        );
+    }
+
+    #[test]
+    fn write_textfile_creates_missing_collector_dir_and_refuses_symlink_substitution() {
+        let root = tempfile::tempdir().unwrap();
+        let collector = root.path().join("node_exporter/textfile_collector");
+        let counters = vec![Counter {
+            name: "mesh_up",
+            help: "Mesh up",
+            value: 1,
+            labels: BTreeMap::new(),
+        }];
+
+        let path = write_textfile(&collector, &counters, &[]).unwrap();
+        assert_eq!(path, collector.join("mackesd.prom"));
+        assert!(path.is_file());
+
+        let hostile = root.path().join("hostile-collector");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&collector, &hostile).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            write_textfile(&hostile, &counters, &[])
+                .expect_err("collector symlink must fail closed")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

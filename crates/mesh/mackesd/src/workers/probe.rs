@@ -95,6 +95,10 @@ impl ProbeWorker {
     }
 }
 
+fn next_tick_delay(elapsed: Duration, cadence: Duration) -> Duration {
+    cadence.saturating_sub(elapsed)
+}
+
 #[async_trait]
 impl Worker for ProbeWorker {
     fn name(&self) -> &'static str {
@@ -109,11 +113,15 @@ impl Worker for ProbeWorker {
         // deep timer so the first cycle is the quick liveness scan.
         let _ = self.deep_due();
         self.tick_once();
+        let mut next_delay = self.fast_tick;
         loop {
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
-                _ = tokio::time::sleep(self.fast_tick) => self.tick_once(),
+                _ = tokio::time::sleep(next_delay) => {}
             }
+            let tick_started = std::time::Instant::now();
+            self.tick_once();
+            next_delay = next_tick_delay(tick_started.elapsed(), self.fast_tick);
         }
     }
 }
@@ -134,6 +142,18 @@ mod tests {
         assert_eq!(
             ProbeWorker::new(PathBuf::from("/x"), "n".into()).name(),
             "probe"
+        );
+    }
+
+    #[test]
+    fn slow_probe_does_not_add_an_extra_cadence_delay() {
+        assert_eq!(
+            next_tick_delay(Duration::from_secs(240), Duration::from_secs(60)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            next_tick_delay(Duration::from_secs(20), Duration::from_secs(60)),
+            Duration::from_secs(40)
         );
     }
 }

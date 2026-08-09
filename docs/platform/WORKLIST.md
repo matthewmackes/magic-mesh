@@ -92,14 +92,14 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
 - **Native attachment route checkpoint (2026-08-09):** invalid container/protocol attachment fails before effects and live headless Service VMs emit no attachment;
   BigBoy passed 38/38 plus the reachable shell regression: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
-- **Console authority removal checkpoint (2026-08-08):** the raw console relay,
-  cloud console dispatch, shell endpoint reader, obsolete Browser attach
-  envelope, and matching live verifier were deleted. Typed Workload Open plus
-  authenticated Display1 leases remain; fail-closed lint and focused BigBoy/
-  `.90` gates pass. A follow-up bounded channel now lets only the Workload
-  reconciler executes cold-migration VM effects; Restart persists Stop/Starting
-  before effects and replays active starts once. Restart evidence: docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md.
-  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
+- **Console authority removal checkpoint (2026-08-08):** the raw console relay, cloud console dispatch,
+  shell endpoint reader, obsolete Browser attach envelope, and matching live verifier were deleted.
+  Typed Workload Open plus authenticated Display1 leases remain; focused BigBoy/`.90` gates pass.
+  A bounded channel lets only the Workload reconciler execute cold-migration VM effects; Restart
+  persists Stop/Starting before effects and replays active starts once. Recovered cancellation owns its
+  exact Restart target through cleanup. Restart evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`. Other evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
 - **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and
   libvirt inventory shortcuts and Datacenter's retired Nova-name heuristic were
@@ -418,6 +418,11 @@ behavioral evidence is not completion.
   the canonical registry. Exact/hostile argv and bidirectional registry guards
   passed 4/4 focused farm tests. Live package/cgroup census remains. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-responder-group-isolation-r5.md`.
+- **Metrics collector recovery checkpoint (2026-08-09):** a missing
+  node-exporter textfile directory is recreated, while symlink substitution
+  fails closed and atomic temporary files are cleaned on failure. Machine 194
+  passed 3/3 focused tests; Dell deployment proof remains:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
@@ -866,6 +871,11 @@ behavioral evidence is not completion.
 - **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
   machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
+- **Catalog side-effect retry checkpoint (2026-08-09):** import cursors advance
+  only after governed projection/status effects succeed, and expiry retains
+  authority until its retraction publishes. Machine 194 passed the exact
+  failure/retry regression:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-09-catalog-side-effect-retry-s1-r5.md`.
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
      - Inputs: catalog projection and trust policy.
@@ -978,6 +988,13 @@ behavioral evidence is not completion.
 - **Live Windows authority checkpoints (2026-08-09):** seat 15 detects RDP; signed Open/revocation passed on `.196`, and the formerly absent shared publisher key is sealed.
   Installed credential activation/live login remain: `evidence/WL-FUNC-019-2026-08-09-rdp-authority-handoff-r8.md`,
   `evidence/WL-FUNC-019-2026-08-09-resource-publisher-key-r9.md`.
+- **RDP scan freshness checkpoint (2026-08-09):** live seat 15 proof found
+  `172.20.146.54:3389` disappearing because a four-minute scan consumed its
+  five-minute lease before publication. Snapshots now stamp completion and
+  slow cycles skip the extra cadence delay. Focused machine-194 tests pass;
+  Release 23 still lacks the typed Desktop/RDP projection and needs corrected
+  deployment:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-rdp-scan-completion-freshness-r18.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.

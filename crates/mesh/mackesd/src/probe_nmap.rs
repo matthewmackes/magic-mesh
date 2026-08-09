@@ -325,6 +325,28 @@ fn backfill_empty_deep_services(deep_cards: &mut [Card], fast_cards: &[Card]) {
     }
 }
 
+/// Stamp a completed probe snapshot at the time its observations become
+/// available. A bounded scan can take minutes; retaining the scan-start time
+/// would spend most (or all) of the service aggregator's freshness lease while
+/// nmap is still running and make healthy endpoints disappear between cycles.
+fn stamp_probe_completion(cards: &mut [Card], completed_at: u64) {
+    for host in cards {
+        host.created_ts = completed_at;
+        host.updated_ts = completed_at;
+        if let Some(mut facts) = host_facts(host) {
+            facts.last_seen = completed_at;
+            if let Ok(value) = serde_json::to_value(facts) {
+                host.metadata
+                    .insert(crate::card::probe::PROBE_KEY.to_owned(), value);
+            }
+        }
+        for service in &mut host.children {
+            service.created_ts = completed_at;
+            service.updated_ts = completed_at;
+        }
+    }
+}
+
 // ── Probe cycle orchestration (MESH-PROBE-4) ─────────────────────────
 //
 // Sync (no tokio), so the `mackesd probe scan/refresh` CLI reaches it
@@ -1093,6 +1115,11 @@ pub fn run_probe_cycle_with(
         );
         backfill_empty_deep_services(&mut cards, &fast_cards);
     }
+    let completed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(now);
+    stamp_probe_completion(&mut cards, completed_at);
     let payload = serialize_inventory(&cards);
     let path = inventory_path(workgroup_root, self_node_id);
     if write_inventory_if_changed(&path, &payload) {
@@ -1302,6 +1329,36 @@ mod tests {
             service_facts(&deep[0].children[0]).map(|service| service.service_kind),
             Some("airsonic".into())
         );
+    }
+
+    #[test]
+    fn completed_probe_owns_the_snapshot_freshness_timestamp() {
+        let facts = HostFacts {
+            ip: "192.0.2.44".into(),
+            hostname: "windows-seat".into(),
+            source: HostSource::Lan,
+            trust_state: String::new(),
+            last_seen: 10,
+        };
+        let service = service_card(
+            &ServiceFacts {
+                port: 3389,
+                service_kind: "ms-wbt-server".into(),
+                product: String::new(),
+                version: String::new(),
+                fingerprint: String::new(),
+            },
+            10,
+        );
+        let mut cards = vec![host_card(&facts, vec![service], 10)];
+
+        stamp_probe_completion(&mut cards, 310);
+
+        assert_eq!(host_facts(&cards[0]).unwrap().last_seen, 310);
+        assert_eq!(cards[0].created_ts, 310);
+        assert_eq!(cards[0].updated_ts, 310);
+        assert_eq!(cards[0].children[0].created_ts, 310);
+        assert_eq!(cards[0].children[0].updated_ts, 310);
     }
 
     #[test]

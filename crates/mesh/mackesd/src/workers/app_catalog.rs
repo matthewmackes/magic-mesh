@@ -191,8 +191,8 @@ impl AppCatalogWorker {
             .as_ref()
             .is_some_and(|catalog| now_ms >= catalog.payload.expires_at_unix_ms)
         {
-            let expired = current.take().expect("expired catalog exists");
-            publish_empty_projection(persist, &self.host, &expired)?;
+            let expired = current.as_ref().expect("expired catalog exists");
+            publish_empty_projection(persist, &self.host, expired)?;
             publish_status_if_changed(
                 persist,
                 &status_for(
@@ -205,6 +205,9 @@ impl AppCatalogWorker {
                 ),
                 last_status,
             )?;
+            // Retain the in-memory authority until both Bus effects succeed so
+            // a transient write failure retries the expiry retraction.
+            *current = None;
         }
         let Some(config) = self.config.as_ref() else {
             publish_status_if_changed(
@@ -231,7 +234,7 @@ impl AppCatalogWorker {
             .map_err(io_other)?;
         let mut tally = ImportTally::default();
         for row in rows {
-            *cursor = Some(row.ulid);
+            let row_ulid = row.ulid;
             let Some(body) = row.body else {
                 tally.refused += 1;
                 publish_status_if_changed(
@@ -246,6 +249,7 @@ impl AppCatalogWorker {
                     ),
                     last_status,
                 )?;
+                *cursor = Some(row_ulid);
                 continue;
             };
 
@@ -271,6 +275,7 @@ impl AppCatalogWorker {
                         ),
                         last_status,
                     )?;
+                    *cursor = Some(row_ulid);
                     continue;
                 }
             };
@@ -291,6 +296,7 @@ impl AppCatalogWorker {
                         ),
                         last_status,
                     )?;
+                    *cursor = Some(row_ulid);
                     continue;
                 }
                 if candidate.payload.revision < existing.revision {
@@ -307,6 +313,7 @@ impl AppCatalogWorker {
                         ),
                         last_status,
                     )?;
+                    *cursor = Some(row_ulid);
                     continue;
                 }
                 if candidate.payload.revision == existing.revision {
@@ -339,6 +346,7 @@ impl AppCatalogWorker {
                             last_status,
                         )?;
                     }
+                    *cursor = Some(row_ulid);
                     continue;
                 }
             }
@@ -358,12 +366,14 @@ impl AppCatalogWorker {
                     ),
                     last_status,
                 )?;
+                *cursor = Some(row_ulid);
                 continue;
             }
 
-            *watermark = Some(CatalogWatermark::from_catalog(&candidate)?);
+            let admitted_watermark = CatalogWatermark::from_catalog(&candidate)?;
+            publish_projection(persist, &self.host, &candidate)?;
+            *watermark = Some(admitted_watermark);
             *current = Some(candidate);
-            publish_projection(persist, &self.host, current.as_ref().expect("catalog set"))?;
             publish_status_if_changed(
                 persist,
                 &status_for(
@@ -376,6 +386,7 @@ impl AppCatalogWorker {
                 ),
                 last_status,
             )?;
+            *cursor = Some(row_ulid);
             tally.admitted += 1;
         }
         Ok(tally)
@@ -761,11 +772,20 @@ fn project_entry(entry: &SignedFlatpakCatalogEntry) -> AdmittedFlatpakAppProject
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_PROJECTION_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn publish_projection(
     persist: &mut Persist,
     host: &str,
     catalog: &SignedFlatpakAppCatalog,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_PROJECTION_WRITE.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other("injected projection write failure"));
+    }
     let projection = projection_from(host, catalog, true)?;
     let body = serde_json::to_string(&projection).map_err(io_other)?;
     persist
@@ -1142,6 +1162,73 @@ mod tests {
                 .watermark
                 .revision,
             7
+        );
+    }
+
+    #[test]
+    fn projection_failure_does_not_acknowledge_import_and_retry_admits_once() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let mut persist = Persist::open(temp.path().join("bus")).unwrap();
+        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        let mut cursor = None;
+        let mut current = None;
+        let mut watermark = None;
+        let mut last_status = None;
+
+        FAIL_NEXT_PROJECTION_WRITE.with(|fail| fail.set(true));
+        assert!(worker
+            .process_once(
+                &mut persist,
+                &mut cursor,
+                &mut current,
+                &mut watermark,
+                &mut last_status,
+                NOW,
+            )
+            .is_err());
+        assert!(
+            cursor.is_none(),
+            "a failed side effect must not consume the row"
+        );
+        assert!(current.is_none());
+        assert!(watermark.is_none());
+        assert_eq!(
+            recover_last_good(worker.config.as_ref().unwrap(), NOW)
+                .unwrap()
+                .unwrap()
+                .watermark
+                .revision,
+            7,
+            "the crash window starts after durable last-good persistence"
+        );
+        assert!(persist
+            .list_since(&app_catalog_projection_topic("node-01").unwrap(), None)
+            .unwrap()
+            .is_empty());
+
+        let tally = worker
+            .process_once(
+                &mut persist,
+                &mut cursor,
+                &mut current,
+                &mut watermark,
+                &mut last_status,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(tally.admitted, 1);
+        assert!(cursor.is_some());
+        assert_eq!(current.as_ref().unwrap().payload.revision, 7);
+        assert_eq!(watermark.as_ref().unwrap().revision, 7);
+        assert_eq!(
+            persist
+                .list_since(&app_catalog_projection_topic("node-01").unwrap(), None)
+                .unwrap()
+                .len(),
+            1,
+            "retry publishes exactly one admitted projection"
         );
     }
 

@@ -7,7 +7,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -2596,18 +2596,6 @@ impl WorkloadComputeWorker {
         if status.phase.is_terminal() || now_ms < status.next_retry_at_ms {
             return;
         }
-        if request.deadline_at_ms <= now_ms {
-            self.fail(
-                ledger,
-                &request,
-                status,
-                "workload operation deadline expired before reconciliation",
-                "issue a new operation from the current Workload projection",
-                false,
-                now_ms,
-            );
-            return;
-        }
         if !workload_placement_allowed(self.role_rank) {
             self.fail(
                 ledger,
@@ -2620,13 +2608,24 @@ impl WorkloadComputeWorker {
             );
             return;
         }
-        // Cancellation is a journal operation, not a backend lifecycle verb.
-        // Resolve it after deadline and placement policy, then use the
-        // explicit target operation to either cancel before side effects or
-        // invoke the adapter cleanup path for an operation already past the
-        // defining boundary.
+        // Once accepted, cancellation owns cleanup of its exact journaled
+        // target even if the request's client-facing deadline passes. Falling
+        // through generic expiry here would cancel the cancellation record
+        // itself and strand (or even restart) the target operation.
         if request.action == WorkloadOperationAction::Cancel {
             self.drive_cancel(ledger, request, status, now_ms);
+            return;
+        }
+        if request.deadline_at_ms <= now_ms {
+            self.fail(
+                ledger,
+                &request,
+                status,
+                "workload operation deadline expired before reconciliation",
+                "issue a new operation from the current Workload projection",
+                false,
+                now_ms,
+            );
             return;
         }
         if status.phase == WorkloadOperationPhase::Queued {
@@ -3094,10 +3093,29 @@ impl WorkloadComputeWorker {
             })
             .cloned()
             .collect();
+        // A nonterminal cancellation is the sole owner of its target's next
+        // adapter effect. In particular, a restart target journaled as
+        // Stopping must not independently recover into Starting while its
+        // cancellation is waiting on durable backoff.
+        let cancellation_targets: BTreeSet<_> = pending
+            .iter()
+            .filter_map(|status| ledger.request(&status.request_id))
+            .filter(|request| request.action == WorkloadOperationAction::Cancel)
+            .filter_map(|request| request.target_request_id.clone())
+            .collect();
         for status in pending {
             let Some(request) = ledger.request(&status.request_id).cloned() else {
                 continue;
             };
+            if request.action != WorkloadOperationAction::Cancel
+                && cancellation_targets.contains(&request.request_id)
+            {
+                continue;
+            }
+            if request.action == WorkloadOperationAction::Cancel {
+                self.drive_accepted(ledger, request, status, now_ms);
+                continue;
+            }
             if request.deadline_at_ms <= now_ms {
                 self.cleanup_expired_operation(ledger, &request, status, now_ms);
                 continue;
@@ -3107,10 +3125,6 @@ impl WorkloadComputeWorker {
             // queued/defining path, otherwise every poll tick can turn one
             // transient adapter error into an unbounded restart storm.
             if now_ms < status.next_retry_at_ms {
-                continue;
-            }
-            if request.action == WorkloadOperationAction::Cancel {
-                self.drive_accepted(ledger, request, status, now_ms);
                 continue;
             }
             if matches!(
@@ -3971,6 +3985,136 @@ mod tests {
                 "replaying the advanced journal repeated the start effect"
             );
         }
+    }
+
+    struct RestartCancellationActuator {
+        cancel_actions: Arc<Mutex<Vec<WorkloadOperationAction>>>,
+        observe_calls: Arc<AtomicU64>,
+    }
+
+    impl WorkloadActuator for RestartCancellationActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("restart cancellation recovery must not apply")
+        }
+
+        fn cancel(
+            &self,
+            request: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            let mut actions = self.cancel_actions.lock().expect("cancel actions");
+            actions.push(request.action);
+            let complete = actions.len() > 1;
+            Ok(WorkloadActuatorOutcome {
+                phase: if complete {
+                    WorkloadOperationPhase::Cancelled
+                } else {
+                    WorkloadOperationPhase::Stopping
+                },
+                power: if complete {
+                    WorkloadPowerState::Stopped
+                } else {
+                    WorkloadPowerState::Stopping
+                },
+                readiness: WorkloadReadiness::Unavailable,
+                retryable: !complete,
+                reason: Some(
+                    if complete {
+                        "restart target cleanup completed"
+                    } else {
+                        "restart target is still stopping"
+                    }
+                    .into(),
+                ),
+                remediation: None,
+                attachment: None,
+            })
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            self.observe_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn reopened_expired_cancel_owns_restart_target_until_cleanup_completes() {
+        let state = tempfile::tempdir().expect("cancellation state");
+        let started_at = now_ms();
+        seed_restart_starting(state.path(), started_at);
+        let cancel_actions = Arc::new(Mutex::new(Vec::new()));
+        let observe_calls = Arc::new(AtomicU64::new(0));
+        let actuator = || RestartCancellationActuator {
+            cancel_actions: Arc::clone(&cancel_actions),
+            observe_calls: Arc::clone(&observe_calls),
+        };
+
+        let retry_at = {
+            let mut ledger = WorkloadOperationLedger::open(state.path()).expect("restart ledger");
+            let target = ledger.request("op-1").expect("restart request").clone();
+            let target_status = ledger.status("op-1").expect("restart status").clone();
+            let mut cancel = target.clone();
+            cancel.request_id = "cancel-restart".into();
+            cancel.action = WorkloadOperationAction::Cancel;
+            cancel.expected_generation = target_status.generation;
+            cancel.target_request_id = Some(target.request_id.clone());
+            cancel.deadline_at_ms = started_at.saturating_add(500);
+            cancel.preferred_attachment = None;
+            let raw = serde_json::to_string(&cancel).expect("cancel wire");
+            let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+                .with_authorizer(Box::new(AllowAuthorizer))
+                .with_capacity(test_capacity())
+                .with_actuator(Box::new(actuator()));
+
+            worker.handle_request(&mut ledger, &raw, cancel, started_at);
+            assert_eq!(
+                ledger.status("op-1").expect("stopping target").phase,
+                WorkloadOperationPhase::Stopping
+            );
+            ledger
+                .status("cancel-restart")
+                .expect("waiting cancellation")
+                .next_retry_at_ms
+        };
+        assert!(retry_at > started_at.saturating_add(500));
+
+        // Reopen after the cancellation deadline and at its durable retry.
+        // The cancellation must keep ownership: the restart target cannot be
+        // observed into Starting and cleanup must receive the target request,
+        // never the cancellation request itself.
+        let mut ledger = WorkloadOperationLedger::open(state.path()).expect("reopened ledger");
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(actuator()));
+        worker.reconcile_inflight(&mut ledger, retry_at);
+
+        assert_eq!(observe_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            cancel_actions.lock().expect("cancel actions").as_slice(),
+            &[
+                WorkloadOperationAction::Restart,
+                WorkloadOperationAction::Restart
+            ]
+        );
+        assert_eq!(
+            ledger.status("op-1").expect("cancelled target").phase,
+            WorkloadOperationPhase::Cancelled
+        );
+        assert_eq!(
+            ledger
+                .status("cancel-restart")
+                .expect("completed cancellation")
+                .phase,
+            WorkloadOperationPhase::Completed
+        );
     }
 
     struct TimeoutCleanupActuator {
