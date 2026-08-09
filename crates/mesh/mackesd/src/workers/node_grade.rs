@@ -1802,6 +1802,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_evidence_produces_e_for_compounded_distinct_warnings() {
+        let mut sample = observations("workstation");
+        sample.services.insert("workbench".into(), false);
+        sample.audio = None;
+        let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.id == "node:required-service-workbench")
+        );
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition.id == "node:workstation-audio")
+        );
+        assert_eq!(
+            NodeGrade::evaluate("node", 99, factors(&sample), &conditions, 100).grade,
+            mackes_mesh_types::health::GradeLetter::E
+        );
+    }
+
+    #[test]
     fn pipewire_capture_uses_a_real_source_instead_of_a_default_alias() {
         let dump = br#"[
             {"id":73,"info":{"props":{"media.class":"Audio/Source","node.name":"usb-input"}}},

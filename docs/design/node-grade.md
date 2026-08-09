@@ -37,12 +37,19 @@ of oscillating healthy/stale during ordinary replication.
 
 ## Grade invariant
 
-A–F remains the sole overall grade vocabulary, but it is condition-backed:
+A–F is the sole overall grade vocabulary and is condition-backed. The shared
+health type applies this policy for both node publications and mesh folds:
 
 - any active critical condition produces F;
-- otherwise any active warning produces D;
+- otherwise two or more distinct active required warning identities produce E;
+- otherwise one active required warning produces D;
 - with no active actionable condition, headroom/capability distinguishes A, B,
-  and C only; a condition-free node can never grade D or F.
+  and C only; a condition-free node can never grade D, E, or F.
+
+Optional, informational, resolved, wrong-node, and duplicate condition
+identities do not contribute to escalation. For a repeated identity, the
+strongest admitted severity wins. This is the only E production policy;
+renderers carry the authority's exact grade and never regrade presentation.
 
 CPU, memory, disk, system, mesh, and device factors are evidence fields, not a
 second severity score. CPU and memory require three consecutive threshold

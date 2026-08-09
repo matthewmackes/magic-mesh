@@ -1840,6 +1840,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-2026-08-09-projection-freshness-r2.md`.
 - **Recovery target checkpoint (2026-08-09):** a condition cannot authorize remediation on another node; machine 194 passed 13/13:
   `docs/platform/evidence/WL-UX-013-2026-08-09-recovery-target-binding-r3.md`.
+- **Grade E authority checkpoint (2026-08-09):** two distinct active required warnings produce E without duplicate-delivery inflation; machines 9 and 194 passed the
+  shared and worker suites: `docs/platform/evidence/WL-UX-013-WL-UX-014-2026-08-09-grade-e-authority-r5.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.
@@ -1900,12 +1902,13 @@ behavioral evidence is not completion.
 - Problem: KIRON has generic typed toasts but no governed A-F payload, authored scenes, audio, ticker, fallback ladder, or bounded health interaction.
 - Required outcome: one ToastHost renders six license-clean A-F health scenes and recovery transitions from UX-013 authority, with exact dwell/audio, grouping/ticker,
   safe deep links, live-3D/pre-rendered/static fallback, and no second renderer or sound owner.
-- Current state: ToastHost queue, sound bridge, motion, and DRM/GLES seams exist; A-F schema, assets, renderer, fallback, ticker, and live proof remain.
+- Current state: ToastHost queue, A-F health schema/mapping, sound bridge, motion, and DRM/GLES seams exist; assets, renderer, fallback, ticker, and live proof remain.
 - **F-grade backlog checkpoint (2026-08-09):** the hold-until-ack queue is capped at 64 waiters without displacing admitted critical FIFO; BigBoy passed 34/34:
   `docs/platform/evidence/WL-UX-014-2026-08-09-f-grade-backlog-bound-r1.md`.
-- **Shared KIRON contract (2026-08-09):** canonical UX-013 grade/generation/timing metadata now maps into one ToastHost with safe Workers routing; machine 9 passed contract,
-  refusal, mapping, and headless-render gates. Grade E remains fail-closed because the sole authority currently defines A/B/C/D/F:
-  `docs/platform/evidence/WL-UX-014-2026-08-09-shared-health-kiron-contract-r4.md`.
+- **Shared KIRON contract (2026-08-09):** canonical UX-013 grade/generation/timing metadata maps into one ToastHost with safe Workers routing. Grade E now has sole-policy
+  production and exact 15-second critical dwell; unknown grades fail closed. Machines 9, 194, and 196 passed focused gates:
+  `docs/platform/evidence/WL-UX-014-2026-08-09-shared-health-kiron-contract-r4.md`,
+  `docs/platform/evidence/WL-UX-013-WL-UX-014-2026-08-09-grade-e-authority-r5.md`.
 - Remaining work:
   1. S1 Freeze authority, payload, and queue.
      - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.

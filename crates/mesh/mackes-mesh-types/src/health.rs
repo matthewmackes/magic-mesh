@@ -731,6 +731,7 @@ pub enum GradeLetter {
     B,
     C,
     D,
+    E,
     F,
 }
 
@@ -742,6 +743,7 @@ impl GradeLetter {
             Self::B => "B",
             Self::C => "C",
             Self::D => "D",
+            Self::E => "E",
             Self::F => "F",
         }
     }
@@ -772,9 +774,8 @@ pub enum HealthKironDwell {
 /// One validated UX-013 health transition projected into UX-014 KIRON.
 ///
 /// The record carries the existing [`GradeLetter`] unchanged. It does not
-/// evaluate health, and deliberately cannot encode grade E because UX-013 has
-/// no E production state: A-C are capability grades, D is warning, and F is
-/// critical.
+/// evaluate health: UX-013 remains the sole authority for A-F production
+/// state, while this contract only projects the admitted grade into KIRON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthKironAlert {
@@ -841,7 +842,7 @@ impl HealthKironAlert {
         match self.grade {
             GradeLetter::A | GradeLetter::B => HealthKironAttention::Informational,
             GradeLetter::C | GradeLetter::D => HealthKironAttention::Warning,
-            GradeLetter::F => HealthKironAttention::Critical,
+            GradeLetter::E | GradeLetter::F => HealthKironAttention::Critical,
         }
     }
 
@@ -853,6 +854,7 @@ impl HealthKironAlert {
             GradeLetter::B => HealthKironDwell::TimedMs(5_000),
             GradeLetter::C => HealthKironDwell::TimedMs(6_000),
             GradeLetter::D => HealthKironDwell::TimedMs(10_000),
+            GradeLetter::E => HealthKironDwell::TimedMs(15_000),
             GradeLetter::F => HealthKironDwell::UntilAcknowledged,
         }
     }
@@ -882,14 +884,15 @@ pub struct GradeFactors {
 pub struct NodeGrade {
     pub node: String,
     pub grade: GradeLetter,
-    /// A–C capability/headroom score. D/F are selected by active conditions.
+    /// A–C capability/headroom score. D/E/F are selected by active conditions.
     pub capability_score: u8,
     pub factors: GradeFactors,
     pub evaluated_at_ms: u64,
 }
 
 impl NodeGrade {
-    /// Grade invariant: critical => F; else warning => D; otherwise A–C only.
+    /// Grade invariant: critical => F; at least two distinct warnings => E;
+    /// one warning => D; otherwise A–C only.
     #[must_use]
     pub fn evaluate(
         node: impl Into<String>,
@@ -899,33 +902,65 @@ impl NodeGrade {
         evaluated_at_ms: u64,
     ) -> Self {
         let node = node.into();
-        let active = conditions.iter().filter(|condition| {
-            condition.is_active_for_node(&node)
-                && condition.requirement == RequirementClass::Required
-        });
-        let mut has_warning = false;
-        let mut has_critical = false;
-        for condition in active {
-            has_warning |= condition.severity == HealthSeverity::Warning;
-            has_critical |= condition.severity == HealthSeverity::Critical;
-        }
-        let grade = if has_critical {
-            GradeLetter::F
-        } else if has_warning {
-            GradeLetter::D
-        } else {
-            match capability_score {
-                90..=u8::MAX => GradeLetter::A,
-                80..=89 => GradeLetter::B,
-                _ => GradeLetter::C,
-            }
-        };
+        let (active_warnings, active_critical) =
+            actionable_condition_counts(conditions, Some(&node));
+        let grade = grade_from_evidence(capability_score, active_warnings, active_critical);
         Self {
             node,
             grade,
             capability_score,
             factors,
             evaluated_at_ms,
+        }
+    }
+}
+
+/// Count distinct active required condition identities, retaining the strongest
+/// severity for a repeated identity. This makes the grade policy insensitive to
+/// duplicate delivery and keeps optional, informational, resolved, and
+/// wrong-node records from escalating a node.
+fn actionable_condition_counts(
+    conditions: &[HealthCondition],
+    node: Option<&str>,
+) -> (usize, usize) {
+    let mut strongest_by_id = BTreeMap::new();
+    for condition in conditions.iter().filter(|condition| {
+        condition.is_active()
+            && condition.requirement == RequirementClass::Required
+            && node.is_none_or(|node| condition.scope.applies_to(node))
+    }) {
+        strongest_by_id
+            .entry((condition.scope.clone(), condition.id.as_str()))
+            .and_modify(|severity: &mut HealthSeverity| {
+                *severity = (*severity).max(condition.severity);
+            })
+            .or_insert(condition.severity);
+    }
+    strongest_by_id
+        .values()
+        .fold((0, 0), |(warnings, critical), severity| match severity {
+            HealthSeverity::Warning => (warnings + 1, critical),
+            HealthSeverity::Critical => (warnings, critical + 1),
+        })
+}
+
+/// The sole A-F production policy used for both node rows and mesh folds.
+const fn grade_from_evidence(
+    capability_score: u8,
+    active_warnings: usize,
+    active_critical: usize,
+) -> GradeLetter {
+    if active_critical > 0 {
+        GradeLetter::F
+    } else if active_warnings >= 2 {
+        GradeLetter::E
+    } else if active_warnings == 1 {
+        GradeLetter::D
+    } else {
+        match capability_score {
+            90..=u8::MAX => GradeLetter::A,
+            80..=89 => GradeLetter::B,
+            _ => GradeLetter::C,
         }
     }
 }
@@ -1570,35 +1605,17 @@ pub fn fold_snapshot(
             )
         })
         .collect();
-    let active_warnings = active_conditions
-        .iter()
-        .filter(|condition| {
-            condition.requirement == RequirementClass::Required
-                && condition.severity == HealthSeverity::Warning
-        })
-        .count();
-    let active_critical = active_conditions
-        .iter()
-        .filter(|condition| {
-            condition.requirement == RequirementClass::Required
-                && condition.severity == HealthSeverity::Critical
-        })
-        .count();
+    let (active_warnings, active_critical) = actionable_condition_counts(&active_conditions, None);
     let unacknowledged_actionable = active_conditions
         .iter()
         .filter(|condition| condition.counts_for_badge(now_ms))
         .count();
-    let grade = if active_critical > 0 {
-        GradeLetter::F
-    } else if active_warnings > 0 {
-        GradeLetter::D
-    } else {
-        current_node_grades
-            .iter()
-            .map(|grade| grade.grade)
-            .max()
-            .unwrap_or(GradeLetter::C)
-    };
+    let mesh_capability_score = current_node_grades
+        .iter()
+        .map(|grade| grade.capability_score)
+        .min()
+        .unwrap_or(70);
+    let grade = grade_from_evidence(mesh_capability_score, active_warnings, active_critical);
     // A roster fold is a projection of admitted publications, not a new
     // observation that can extend their lifetime. Bound an empty/synthetic
     // fold to the contract maximum, and never let a populated projection
@@ -2000,24 +2017,104 @@ mod tests {
     }
 
     #[test]
-    fn grades_below_c_require_active_conditions() {
+    fn condition_backed_grades_cover_d_e_f_without_duplicate_escalation() {
         let c = NodeGrade::evaluate("n", 1, GradeFactors::default(), &[], 100);
         assert_eq!(c.grade, GradeLetter::C);
         let warning = condition("n", HealthSeverity::Warning);
-        let d = NodeGrade::evaluate("n", 99, GradeFactors::default(), &[warning], 100);
+        let d = NodeGrade::evaluate("n", 99, GradeFactors::default(), &[warning.clone()], 100);
         assert_eq!(d.grade, GradeLetter::D);
+        let duplicate = NodeGrade::evaluate(
+            "n",
+            99,
+            GradeFactors::default(),
+            &[warning.clone(), warning.clone()],
+            100,
+        );
+        assert_eq!(
+            duplicate.grade,
+            GradeLetter::D,
+            "duplicate delivery of one condition identity cannot fabricate E"
+        );
+        let first_warning = warning;
+        let mut second_warning = first_warning.clone();
+        second_warning.id = "n:memory".into();
+        let e = NodeGrade::evaluate(
+            "n",
+            99,
+            GradeFactors::default(),
+            &[first_warning, second_warning],
+            100,
+        );
+        assert_eq!(e.grade, GradeLetter::E);
         let critical = condition("n", HealthSeverity::Critical);
         let f = NodeGrade::evaluate("n", 99, GradeFactors::default(), &[critical], 100);
         assert_eq!(f.grade, GradeLetter::F);
 
         let mut informational = condition("n", HealthSeverity::Critical);
         informational.requirement = RequirementClass::Informational;
-        let a = NodeGrade::evaluate("n", 99, GradeFactors::default(), &[informational], 100);
+        let mut optional = condition("n", HealthSeverity::Warning);
+        optional.requirement = RequirementClass::Optional;
+        let wrong_node = condition("other", HealthSeverity::Warning);
+        let mut resolved = condition("n", HealthSeverity::Warning);
+        resolved.resolved_at_ms = Some(100);
+        let a = NodeGrade::evaluate(
+            "n",
+            99,
+            GradeFactors::default(),
+            &[informational, optional, wrong_node, resolved],
+            100,
+        );
         assert_eq!(
             a.grade,
             GradeLetter::A,
-            "non-actionable information cannot lower the authoritative grade"
+            "non-actionable, resolved, and wrong-node records cannot lower the grade"
         );
+    }
+
+    #[test]
+    fn mesh_fold_uses_the_same_compounded_warning_policy() {
+        let roster = BTreeSet::from(["node".to_string()]);
+        let mut node = state("node", 1, 100);
+        let first = condition("node", HealthSeverity::Warning);
+        let mut second = first.clone();
+        second.id = "node:memory".into();
+        node.active_conditions = vec![first, second];
+        node.grade = NodeGrade::evaluate(
+            "node",
+            node.grade.capability_score,
+            node.grade.factors,
+            &node.active_conditions,
+            100,
+        );
+
+        let snapshot = fold_snapshot("node", "r1", &roster, vec![node], 2, 100, 100, 1);
+        assert_eq!(snapshot.current_node_grades[0].grade, GradeLetter::E);
+        assert_eq!(snapshot.mesh_summary.active_warnings, 2);
+        assert_eq!(snapshot.mesh_summary.grade, GradeLetter::E);
+    }
+
+    #[test]
+    fn mesh_fold_keeps_equal_condition_ids_distinct_across_node_scopes() {
+        let roster = BTreeSet::from(["node-a".to_string(), "node-b".to_string()]);
+        let mut states = Vec::new();
+        for node in ["node-a", "node-b"] {
+            let mut state = state(node, 1, 100);
+            let mut warning = condition(node, HealthSeverity::Warning);
+            warning.id = "disk-pressure".into();
+            state.active_conditions.push(warning);
+            state.grade = NodeGrade::evaluate(
+                node,
+                state.grade.capability_score,
+                state.grade.factors,
+                &state.active_conditions,
+                100,
+            );
+            states.push(state);
+        }
+
+        let snapshot = fold_snapshot("node-a", "r1", &roster, states, 2, 100, 100, 1);
+        assert_eq!(snapshot.mesh_summary.active_warnings, 2);
+        assert_eq!(snapshot.mesh_summary.grade, GradeLetter::E);
     }
 
     #[test]
@@ -2282,6 +2379,11 @@ mod tests {
                 HealthKironDwell::TimedMs(10_000),
             ),
             (
+                GradeLetter::E,
+                HealthKironAttention::Critical,
+                HealthKironDwell::TimedMs(15_000),
+            ),
+            (
                 GradeLetter::F,
                 HealthKironAttention::Critical,
                 HealthKironDwell::UntilAcknowledged,
@@ -2299,14 +2401,6 @@ mod tests {
                 serde_json::from_slice(&body).expect("deserialize typed alert");
             assert_eq!(decoded, alert);
         }
-
-        let unsupported = serde_json::to_string(&kiron_alert(GradeLetter::D))
-            .expect("serialize fixture")
-            .replace(r#""grade":"D""#, r#""grade":"E""#);
-        assert!(
-            serde_json::from_str::<HealthKironAlert>(&unsupported).is_err(),
-            "grade E must remain unrepresentable until UX-013 defines it"
-        );
     }
 
     #[test]

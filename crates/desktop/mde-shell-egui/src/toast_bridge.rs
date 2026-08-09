@@ -39,7 +39,7 @@ use serde::Deserialize;
 use crate::notification_center::NotificationRing;
 use crate::surfaces::Surface;
 use crate::timers::{
-    clock_banner_projection, request_clock_banner_action, ClockBannerKind, ClockBannerProjection,
+    ClockBannerKind, ClockBannerProjection, clock_banner_projection, request_clock_banner_action,
 };
 use crate::workbench::Plane;
 
@@ -1016,13 +1016,14 @@ mod tests {
 
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
-    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::egui::{self, Rect, pos2, vec2};
     use mde_egui::{Style, Tier, Toast};
 
     use super::{
+        Chime, ChimeBackend, Navigate, Severity, Suppress, TOAST_TOPIC, ToastBridge,
         alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
         pulse_server_from_runtime_dir, resolve_action, surface_by_name, try_chime_backends,
-        unread_count, Chime, ChimeBackend, Navigate, Severity, Suppress, ToastBridge, TOAST_TOPIC,
+        unread_count,
     };
     use crate::surfaces::Surface;
     use crate::workbench::Plane;
@@ -1365,15 +1366,23 @@ mod tests {
             Some("shell/goto/workers")
         );
 
+        let grade_e = decode(&health_kiron_body(GradeLetter::E)).expect("grade E admitted");
+        assert_eq!(grade_e.tier, Tier::Alert(Severity::Critical));
+        assert_eq!(
+            grade_e.dwell,
+            mde_egui::Dwell::For(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(grade_e.flag, "HEALTH · GRADE E · 1m 10s · nvme0n1");
+
         let grade_f = decode(&health_kiron_body(GradeLetter::F)).expect("grade F admitted");
         assert_eq!(grade_f.tier, Tier::Alert(Severity::Critical));
         assert_eq!(grade_f.dwell, mde_egui::Dwell::UntilAck);
     }
 
     #[test]
-    fn typed_health_marker_fails_closed_for_unsupported_grade_e() {
-        let unsupported = health_kiron_body(mackes_mesh_types::health::GradeLetter::D)
-            .replace(r#""grade":"D""#, r#""grade":"E""#);
+    fn typed_health_marker_fails_closed_for_unknown_grade() {
+        let unsupported = health_kiron_body(mackes_mesh_types::health::GradeLetter::E)
+            .replace(r#""grade":"E""#, r#""grade":"G""#);
         assert!(
             decode(&unsupported).is_none(),
             "typed health must not fall back to generic severity decoding"
