@@ -376,6 +376,12 @@ behavioral evidence is not completion.
   target, mesh-health, and RPM verification stayed healthy. Dell was offline
   for corrected-package deployment. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`.
+- **Live cgroup-enforcement checkpoint (2026-08-08):** Release 23 on seat 15
+  placed all six active groups in distinct cgroup-v2 paths whose effective
+  memory, CPU, task, and I/O values matched the package. A bounded transient
+  128 MiB allocation under a 16 MiB/no-swap boundary was OOM-killed exactly at
+  16 MiB; cleanup left the target and every group active. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-live-cgroup-enforcement-r3.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
