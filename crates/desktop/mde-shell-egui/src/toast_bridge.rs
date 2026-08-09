@@ -30,9 +30,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::health::{HealthKironAlert, HealthKironAttention, HealthKironDwell};
 use mde_bus::persist::Persist;
 use mde_egui::egui;
-use mde_egui::{OsdLevel, Severity, Style, Tier, Toast, ToastHost};
+use mde_egui::{Dwell, OsdLevel, Severity, Style, Tier, Toast, ToastHost};
 use serde::Deserialize;
 
 use crate::notification_center::NotificationRing;
@@ -117,11 +118,44 @@ impl ToastMsg {
     }
 }
 
+/// Map one already-validated health-authority record into KIRON presentation.
+/// Grade interpretation, duration derivation, and dwell policy stay in the
+/// shared health contract; this boundary only selects ToastHost primitives.
+fn health_kiron_toast(alert: HealthKironAlert) -> Toast {
+    let severity = match alert.attention() {
+        HealthKironAttention::Informational => Severity::Info,
+        HealthKironAttention::Warning => Severity::Warning,
+        HealthKironAttention::Critical => Severity::Critical,
+    };
+    let dwell = match alert.dwell() {
+        HealthKironDwell::TimedMs(milliseconds) => Dwell::For(Duration::from_millis(milliseconds)),
+        HealthKironDwell::UntilAcknowledged => Dwell::UntilAck,
+    };
+    let mut flag = format!(
+        "HEALTH · GRADE {} · {}",
+        alert.grade.as_str(),
+        alert.duration_label()
+    );
+    if let Some(device) = &alert.device {
+        flag.push_str(" · ");
+        flag.push_str(device);
+    }
+    Toast::alert(severity, alert.node, flag, alert.headline)
+        .with_dwell(dwell)
+        .with_action("Open Workers", "shell/goto/workers")
+}
+
 /// Decode a raw `event/toast/show` body into an alert [`Toast`]. `None` on a
 /// malformed body — a bad emitter never crashes the shell (it's silently dropped,
 /// same as the Clipboard / Notifications tails).
 fn decode(body: &str) -> Option<Toast> {
-    serde_json::from_str::<ToastMsg>(body)
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some("health_kiron") {
+        let alert: HealthKironAlert = serde_json::from_value(value).ok()?;
+        alert.validate().ok()?;
+        return Some(health_kiron_toast(alert));
+    }
+    serde_json::from_value::<ToastMsg>(value)
         .ok()
         .map(ToastMsg::into_toast)
 }
@@ -983,7 +1017,7 @@ mod tests {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::{Style, Toast};
+    use mde_egui::{Style, Tier, Toast};
 
     use super::{
         alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
@@ -1298,6 +1332,54 @@ mod tests {
         assert_eq!(action.verb, "shell/goto/chat");
     }
 
+    fn health_kiron_body(grade: mackes_mesh_types::health::GradeLetter) -> String {
+        let alert = mackes_mesh_types::health::HealthKironAlert {
+            kind: mackes_mesh_types::health::HealthKironKind::HealthKiron,
+            schema_version: mackes_mesh_types::health::HEALTH_KIRON_SCHEMA_VERSION,
+            snapshot_generation: 42,
+            condition_id: "disk-pressure".into(),
+            node: "node-9".into(),
+            device: Some("nvme0n1".into()),
+            grade,
+            headline: "Storage pressure remains active".into(),
+            active_since_ms: 10_000,
+            observed_at_ms: 80_000,
+        };
+        serde_json::to_string(&alert).expect("serialize shared health contract")
+    }
+
+    #[test]
+    fn shared_health_contract_maps_into_toast_host_without_regrading() {
+        use mackes_mesh_types::health::GradeLetter;
+
+        let grade_d = decode(&health_kiron_body(GradeLetter::D)).expect("grade D admitted");
+        assert_eq!(grade_d.tier, Tier::Alert(Severity::Warning));
+        assert_eq!(
+            grade_d.dwell,
+            mde_egui::Dwell::For(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(grade_d.source_host, "node-9");
+        assert_eq!(grade_d.flag, "HEALTH · GRADE D · 1m 10s · nvme0n1");
+        assert_eq!(
+            grade_d.action.as_ref().map(|action| action.verb.as_str()),
+            Some("shell/goto/workers")
+        );
+
+        let grade_f = decode(&health_kiron_body(GradeLetter::F)).expect("grade F admitted");
+        assert_eq!(grade_f.tier, Tier::Alert(Severity::Critical));
+        assert_eq!(grade_f.dwell, mde_egui::Dwell::UntilAck);
+    }
+
+    #[test]
+    fn typed_health_marker_fails_closed_for_unsupported_grade_e() {
+        let unsupported = health_kiron_body(mackes_mesh_types::health::GradeLetter::D)
+            .replace(r#""grade":"D""#, r#""grade":"E""#);
+        assert!(
+            decode(&unsupported).is_none(),
+            "typed health must not fall back to generic severity decoding"
+        );
+    }
+
     #[test]
     fn decode_rejects_a_malformed_body() {
         assert!(decode("not json").is_none());
@@ -1559,6 +1641,42 @@ mod tests {
         assert!(!prims.is_empty(), "the alert popup produced no geometry");
         assert_eq!(*rec.0.borrow(), vec![Severity::Info]);
         assert!(!b.host.is_idle());
+    }
+
+    #[test]
+    fn shared_health_contract_tessellates_grade_metadata_through_the_bridge() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let rec = Recorder::default();
+        let mut bridge = bridge_with(&rec);
+        bridge.admit(
+            decode(&health_kiron_body(
+                mackes_mesh_types::health::GradeLetter::D,
+            ))
+            .expect("typed health alert admitted"),
+        );
+
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            let _ = bridge.drive(ctx);
+        });
+        let output = ctx.run(input(), |ctx| {
+            let navigation = bridge.drive(ctx);
+            assert!(navigation.is_none(), "headless frame cannot click Workers");
+        });
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        assert!(
+            !primitives.is_empty(),
+            "the grade-bound lower third produced no geometry"
+        );
+        assert_eq!(*rec.0.borrow(), vec![Severity::Warning]);
+        assert_eq!(
+            bridge.host.current().map(|toast| toast.flag.as_str()),
+            Some("HEALTH · GRADE D · 1m 10s · nvme0n1")
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ use std::fmt;
 
 /// Current wire schema.
 pub const HEALTH_SCHEMA_VERSION: u16 = 1;
+/// Current typed KIRON health-alert wire schema.
+pub const HEALTH_KIRON_SCHEMA_VERSION: u16 = 1;
 /// The only schema currently admitted for node availability intent records.
 pub const NODE_AVAILABILITY_INTENT_SCHEMA_VERSION: u16 = 1;
 /// The only schema currently admitted for an expected-return declaration.
@@ -742,6 +744,123 @@ impl GradeLetter {
             Self::D => "D",
             Self::F => "F",
         }
+    }
+}
+
+/// Wire discriminator for the one typed health lower-third contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthKironKind {
+    HealthKiron,
+}
+
+/// Presentation urgency admitted by the health authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthKironAttention {
+    Informational,
+    Warning,
+    Critical,
+}
+
+/// Grade-bound KIRON dwell behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthKironDwell {
+    TimedMs(u64),
+    UntilAcknowledged,
+}
+
+/// One validated UX-013 health transition projected into UX-014 KIRON.
+///
+/// The record carries the existing [`GradeLetter`] unchanged. It does not
+/// evaluate health, and deliberately cannot encode grade E because UX-013 has
+/// no E production state: A-C are capability grades, D is warning, and F is
+/// critical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthKironAlert {
+    pub kind: HealthKironKind,
+    pub schema_version: u16,
+    pub snapshot_generation: u64,
+    pub condition_id: String,
+    pub node: String,
+    pub device: Option<String>,
+    pub grade: GradeLetter,
+    pub headline: String,
+    pub active_since_ms: u64,
+    pub observed_at_ms: u64,
+}
+
+impl HealthKironAlert {
+    /// Reject malformed, stale-shaped, oversized, or secret-bearing display
+    /// payloads before the shell can admit them to ToastHost.
+    pub fn validate(&self) -> Result<(), NodeHealthValidationError> {
+        if self.schema_version != HEALTH_KIRON_SCHEMA_VERSION {
+            return Err(NodeHealthValidationError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        if self.snapshot_generation == 0 {
+            return Err(NodeHealthValidationError::InvalidGeneration);
+        }
+        validate_health_identifier("condition_id", &self.condition_id)?;
+        validate_health_identifier("node", &self.node)?;
+        if let Some(device) = &self.device {
+            validate_health_label("device", device)?;
+            if contains_secret_material(device) {
+                return Err(NodeHealthValidationError::SecretBearing("device"));
+            }
+        }
+        validate_health_text("headline", &self.headline)?;
+        if contains_secret_material(&self.headline) {
+            return Err(NodeHealthValidationError::SecretBearing("headline"));
+        }
+        if self.observed_at_ms == 0 || self.active_since_ms > self.observed_at_ms {
+            return Err(NodeHealthValidationError::InvalidTimestamp(
+                "kiron.lifecycle",
+            ));
+        }
+        if self.active_duration_ms() > MAX_HEALTH_DURATION_MS {
+            return Err(NodeHealthValidationError::InvalidTimestamp(
+                "kiron.duration",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Duration derived from authority timestamps, never supplied separately by
+    /// a presentation client.
+    #[must_use]
+    pub const fn active_duration_ms(&self) -> u64 {
+        self.observed_at_ms.saturating_sub(self.active_since_ms)
+    }
+
+    /// Grade-bound attention policy consumed by the shell sound/suppression
+    /// seam. No shell-local grade interpretation is required.
+    #[must_use]
+    pub const fn attention(&self) -> HealthKironAttention {
+        match self.grade {
+            GradeLetter::A | GradeLetter::B => HealthKironAttention::Informational,
+            GradeLetter::C | GradeLetter::D => HealthKironAttention::Warning,
+            GradeLetter::F => HealthKironAttention::Critical,
+        }
+    }
+
+    /// Exact dwell for every grade UX-013 can currently produce.
+    #[must_use]
+    pub const fn dwell(&self) -> HealthKironDwell {
+        match self.grade {
+            GradeLetter::A => HealthKironDwell::TimedMs(3_000),
+            GradeLetter::B => HealthKironDwell::TimedMs(5_000),
+            GradeLetter::C => HealthKironDwell::TimedMs(6_000),
+            GradeLetter::D => HealthKironDwell::TimedMs(10_000),
+            GradeLetter::F => HealthKironDwell::UntilAcknowledged,
+        }
+    }
+
+    /// Bounded duration text used in the lower-third metadata lane.
+    #[must_use]
+    pub fn duration_label(&self) -> String {
+        format_health_duration_ms(self.active_duration_ms())
     }
 }
 
@@ -2122,5 +2241,104 @@ mod tests {
             contradictory_grade.validate_at(100),
             Err(NodeHealthValidationError::Contradictory(_))
         ));
+    }
+
+    fn kiron_alert(grade: GradeLetter) -> HealthKironAlert {
+        HealthKironAlert {
+            kind: HealthKironKind::HealthKiron,
+            schema_version: HEALTH_KIRON_SCHEMA_VERSION,
+            snapshot_generation: 42,
+            condition_id: "disk-pressure".into(),
+            node: "node-9".into(),
+            device: Some("nvme0n1".into()),
+            grade,
+            headline: "Storage pressure remains active".into(),
+            active_since_ms: 10_000,
+            observed_at_ms: 80_000,
+        }
+    }
+
+    #[test]
+    fn health_kiron_contract_round_trips_only_authoritative_grades() {
+        let cases = [
+            (
+                GradeLetter::A,
+                HealthKironAttention::Informational,
+                HealthKironDwell::TimedMs(3_000),
+            ),
+            (
+                GradeLetter::B,
+                HealthKironAttention::Informational,
+                HealthKironDwell::TimedMs(5_000),
+            ),
+            (
+                GradeLetter::C,
+                HealthKironAttention::Warning,
+                HealthKironDwell::TimedMs(6_000),
+            ),
+            (
+                GradeLetter::D,
+                HealthKironAttention::Warning,
+                HealthKironDwell::TimedMs(10_000),
+            ),
+            (
+                GradeLetter::F,
+                HealthKironAttention::Critical,
+                HealthKironDwell::UntilAcknowledged,
+            ),
+        ];
+
+        for (grade, attention, dwell) in cases {
+            let alert = kiron_alert(grade);
+            alert.validate().expect("authoritative alert validates");
+            assert_eq!(alert.attention(), attention);
+            assert_eq!(alert.dwell(), dwell);
+            assert_eq!(alert.duration_label(), "1m 10s");
+            let body = serde_json::to_vec(&alert).expect("serialize typed alert");
+            let decoded: HealthKironAlert =
+                serde_json::from_slice(&body).expect("deserialize typed alert");
+            assert_eq!(decoded, alert);
+        }
+
+        let unsupported = serde_json::to_string(&kiron_alert(GradeLetter::D))
+            .expect("serialize fixture")
+            .replace(r#""grade":"D""#, r#""grade":"E""#);
+        assert!(
+            serde_json::from_str::<HealthKironAlert>(&unsupported).is_err(),
+            "grade E must remain unrepresentable until UX-013 defines it"
+        );
+    }
+
+    #[test]
+    fn health_kiron_contract_rejects_unbound_or_secret_bearing_payloads() {
+        let mut zero_generation = kiron_alert(GradeLetter::F);
+        zero_generation.snapshot_generation = 0;
+        assert_eq!(
+            zero_generation.validate(),
+            Err(NodeHealthValidationError::InvalidGeneration)
+        );
+
+        let mut reversed_time = kiron_alert(GradeLetter::D);
+        reversed_time.active_since_ms = reversed_time.observed_at_ms + 1;
+        assert_eq!(
+            reversed_time.validate(),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "kiron.lifecycle"
+            ))
+        );
+
+        let mut secret = kiron_alert(GradeLetter::F);
+        secret.headline = "authorization: bearer should-not-render".into();
+        assert_eq!(
+            secret.validate(),
+            Err(NodeHealthValidationError::SecretBearing("headline"))
+        );
+
+        let mut secret_device = kiron_alert(GradeLetter::D);
+        secret_device.device = Some("token=must-not-render".into());
+        assert_eq!(
+            secret_device.validate(),
+            Err(NodeHealthValidationError::SecretBearing("device"))
+        );
     }
 }

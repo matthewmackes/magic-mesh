@@ -1899,6 +1899,9 @@ behavioral evidence is not completion.
 - Current state: ToastHost queue, sound bridge, motion, and DRM/GLES seams exist; A-F schema, assets, renderer, fallback, ticker, and live proof remain.
 - **F-grade backlog checkpoint (2026-08-09):** the hold-until-ack queue is capped at 64 waiters without displacing admitted critical FIFO; BigBoy passed 34/34:
   `docs/platform/evidence/WL-UX-014-2026-08-09-f-grade-backlog-bound-r1.md`.
+- **Shared KIRON contract (2026-08-09):** canonical UX-013 grade/generation/timing metadata now maps into one ToastHost with safe Workers routing; machine 9 passed contract,
+  refusal, mapping, and headless-render gates. Grade E remains fail-closed because the sole authority currently defines A/B/C/D/F:
+  `docs/platform/evidence/WL-UX-014-2026-08-09-shared-health-kiron-contract-r4.md`.
 - Remaining work:
   1. S1 Freeze authority, payload, and queue.
      - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.
