@@ -1982,10 +1982,19 @@ impl ClipboardSyncWorker {
             let result = mesh::send_envelope(
                 persist,
                 self.mesh_peer_directory.as_ref(),
+                &self.workgroup_root.join("collab/content"),
                 &self.target_node,
                 body.as_bytes(),
                 now_ms,
             );
+            if result == Err(mesh::ClipboardMeshRefusal::CasUnavailable) {
+                debug!(
+                    target: "clipboard_sync",
+                    ulid = %message.ulid,
+                    "clipboard mesh send deferred until canonical CAS bytes arrive"
+                );
+                break;
+            }
             if let Err(reason) = result {
                 let (source_peer, target_peer) =
                     CollabClipboardEnvelopeV2::from_json_bytes(body.as_bytes())
@@ -2049,6 +2058,7 @@ impl ClipboardSyncWorker {
             match mesh::receive_frame(
                 persist,
                 self.mesh_peer_directory.as_ref(),
+                &self.workgroup_root.join("collab/content"),
                 &self.target_node,
                 body.as_bytes(),
                 ledger,
@@ -2059,6 +2069,14 @@ impl ClipboardSyncWorker {
                     admitted += 1;
                 }
                 Err(reason) => {
+                    if reason == mesh::ClipboardMeshRefusal::CasUnavailable {
+                        debug!(
+                            target: "clipboard_sync",
+                            ulid = %message.ulid,
+                            "clipboard mesh receive deferred until canonical CAS bytes arrive"
+                        );
+                        break;
+                    }
                     let (source_peer, target_peer) =
                         mesh::ClipboardMeshFrameV1::from_json_bytes(body.as_bytes())
                             .map(|frame| (frame.source_peer, frame.target_peer))

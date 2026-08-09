@@ -611,13 +611,13 @@ behavioral evidence is not completion.
 - **S3 mesh transport (2026-08-08):** signed target frames passed 7/7; cross-node/CAS proof remains: `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
 - **S2 DRM authority (2026-08-08):** bounded seat authority passed DRM 19/19 on `.50`, shell/Bus 1/1; live proof remains:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`.
-- **S4 VDI transport (2026-08-08):** bounded VNC/RDP/SPICE text with one-use/replay gates passed; live proof remains:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-08-vdi-clipboard-transport-s4-r1.md`.
-- **S5 permission UI (2026-08-08):** modal, VNC/RDP/SPICE one-use gating, revocation, replay, and redacted audit passed; live guest proof remains:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-08-permission-audit-model-s5-r1.md`.
+- **VDI transport/permission checkpoints (2026-08-08):** bounded VNC/RDP/SPICE text, one-use/replay/revocation, modal, and redacted audit passed; live guest proof remains:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-08-vdi-clipboard-transport-s4-r1.md`, `docs/platform/evidence/WL-FUNC-016-2026-08-08-permission-audit-model-s5-r1.md`.
 - **VDI admission checkpoints (2026-08-09):** metadata bounds passed 31/31, lease-capped permission passed 12/12, and post-materialization cancellation passed 13/13:
   `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-metadata-admission-r6.md`; `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-lease-expiry-r7.md`;
   `docs/platform/evidence/WL-FUNC-016-2026-08-09-materialization-cancellation-r8.md`.
+- **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
+  Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.

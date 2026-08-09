@@ -12,7 +12,9 @@
 //! by the shared contract; images and file lists cross only as opaque Files CAS
 //! references plus finite metadata and digests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use mde_bus::hooks::config::Priority;
@@ -20,10 +22,11 @@ use mde_bus::persist::Persist;
 use mde_collab_types::{
     reject_duplicate_json_keys, ClipboardDenialReasonV2, ClipboardEnvelopeV2,
     ClipboardEnvelopeV2DecodeError, ClipboardEnvelopeV2ValidationError, ClipboardPayloadV2,
-    MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES,
+    FileReferences, MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC;
 
@@ -45,6 +48,12 @@ pub const MAX_MESH_CLIP_LOGICAL_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_MESH_FRAMES_PER_TICK: usize = 32;
 /// Maximum source/session replay lanes retained by one worker.
 pub const MAX_MESH_REPLAY_LANES: usize = 256;
+/// Bound the retained Files projections inspected for one CAS identity.
+const MAX_FILES_IDENTITY_TOPICS: usize = 256;
+/// Bound one retained Files projection before JSON decode.
+const MAX_FILES_IDENTITY_BODY_BYTES: usize = 1024 * 1024;
+/// Canonical collaboration Files projection prefix.
+const FILE_REFERENCES_TOPIC_PREFIX: &str = "state/collab/file-references/";
 
 /// One enrolled node usable by clipboard transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +217,10 @@ pub enum ClipboardMeshRefusal {
     FloodLimited,
     /// Frame, signature, source/session binding, digest, or target was invalid.
     InvalidPayload,
+    /// A Files-backed offer is valid but its canonical CAS bytes have not arrived.
+    CasUnavailable,
+    /// A Files projection or canonical object disagreed with the signed size/hash.
+    CasMismatch,
 }
 
 impl ClipboardMeshRefusal {
@@ -271,6 +284,9 @@ pub enum ClipboardMeshResultV1 {
 struct ReplayMarker {
     generation: u64,
     expires_unix_ms: u64,
+    /// Transport leases only. Canonical CAS objects remain owned by the Files
+    /// purge gate and must never be deleted by clipboard expiry cleanup.
+    cas_digests: BTreeSet<String>,
 }
 
 /// Bounded receiver replay/expiry state. Cleanup drops expired generations and
@@ -306,6 +322,7 @@ impl ClipboardMeshReplayLedger {
             let marker = ReplayMarker {
                 generation: envelope.sequence,
                 expires_unix_ms: envelope.expires_unix_ms,
+                cas_digests: cas_digests(&envelope),
             };
             if self
                 .latest
@@ -347,6 +364,7 @@ impl ClipboardMeshReplayLedger {
             ReplayMarker {
                 generation: frame.envelope.sequence,
                 expires_unix_ms: frame.envelope.expires_unix_ms,
+                cas_digests: cas_digests(&frame.envelope),
             },
         );
         Ok(())
@@ -357,6 +375,7 @@ impl ClipboardMeshReplayLedger {
 pub fn send_envelope(
     persist: &Persist,
     directory: &dyn MeshClipboardPeerDirectory,
+    content_root: &Path,
     local_node: &str,
     envelope_body: &[u8],
     now_ms: u64,
@@ -386,6 +405,7 @@ pub fn send_envelope(
         .validate_at(now_ms, None)
         .map_err(|error| ClipboardMeshRefusal::from_validation(&error))?;
     validate_payload_budget(&envelope)?;
+    validate_cas_offers(persist, content_root, local_node, &envelope)?;
     let frame = ClipboardMeshFrameV1::new(envelope)?;
     let body = serde_json::to_string(&frame).map_err(|_| ClipboardMeshRefusal::InvalidPayload)?;
     if body.len() > MAX_MESH_FRAME_BYTES {
@@ -407,6 +427,7 @@ pub fn send_envelope(
 pub fn receive_frame(
     persist: &Persist,
     directory: &dyn MeshClipboardPeerDirectory,
+    content_root: &Path,
     local_node: &str,
     frame_body: &[u8],
     ledger: &mut ClipboardMeshReplayLedger,
@@ -428,6 +449,7 @@ pub fn receive_frame(
         .validate_at(now_ms, previous)
         .map_err(|error| ClipboardMeshRefusal::from_validation(&error))?;
     validate_payload_budget(&frame.envelope)?;
+    validate_cas_offers(persist, content_root, &frame.source_peer, &frame.envelope)?;
     ledger.cleanup(now_ms);
     if ledger.previous(&frame).is_none() && ledger.latest.len() >= MAX_MESH_REPLAY_LANES {
         return Err(ClipboardMeshRefusal::FloodLimited);
@@ -505,6 +527,148 @@ fn validate_payload_budget(envelope: &ClipboardEnvelopeV2) -> Result<(), Clipboa
     Ok(())
 }
 
+fn cas_digests(envelope: &ClipboardEnvelopeV2) -> BTreeSet<String> {
+    envelope
+        .offers
+        .iter()
+        .filter_map(|offer| match offer.payload {
+            ClipboardPayloadV2::FilesReference { .. } => offer.content_sha256_hex.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Bind every Files-backed offer to the real collaboration Files projection
+/// and exact canonical bytes. No caller-controlled path participates: the
+/// object path is derived solely from the admitted lower-case SHA-256 digest.
+fn validate_cas_offers(
+    persist: &Persist,
+    content_root: &Path,
+    source_peer: &str,
+    envelope: &ClipboardEnvelopeV2,
+) -> Result<(), ClipboardMeshRefusal> {
+    let files_offers: Vec<_> = envelope
+        .offers
+        .iter()
+        .filter_map(|offer| match &offer.payload {
+            ClipboardPayloadV2::FilesReference { file_ref } => Some((offer, file_ref)),
+            _ => None,
+        })
+        .collect();
+    if files_offers.is_empty() {
+        return Ok(());
+    }
+
+    let topics = persist
+        .list_topics()
+        .map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
+    let files_topics: Vec<_> = topics
+        .into_iter()
+        .filter(|topic| topic.starts_with(FILE_REFERENCES_TOPIC_PREFIX))
+        .take(MAX_FILES_IDENTITY_TOPICS + 1)
+        .collect();
+    if files_topics.len() > MAX_FILES_IDENTITY_TOPICS {
+        return Err(ClipboardMeshRefusal::FloodLimited);
+    }
+    for (offer, file_ref) in files_offers {
+        let expected_digest = offer
+            .content_sha256_hex
+            .as_deref()
+            .ok_or(ClipboardMeshRefusal::CasMismatch)?;
+        let mut matched = false;
+        for topic in &files_topics {
+            let Some(message) = persist
+                .read_latest(topic)
+                .map_err(|_| ClipboardMeshRefusal::CasUnavailable)?
+            else {
+                continue;
+            };
+            let Some(body) = message.body.as_deref() else {
+                continue;
+            };
+            if body.len() > MAX_FILES_IDENTITY_BODY_BYTES {
+                return Err(ClipboardMeshRefusal::CasMismatch);
+            }
+            reject_duplicate_json_keys(body.as_bytes())
+                .map_err(|_| ClipboardMeshRefusal::CasMismatch)?;
+            let references: FileReferences =
+                serde_json::from_str(body).map_err(|_| ClipboardMeshRefusal::CasMismatch)?;
+            for row in references.files.iter().filter(|row| {
+                row.file == *file_ref && row.linked_by.as_str() == source_peer
+            }) {
+                if row.reference.sha256_hex != expected_digest
+                    || row.reference.size != offer.byte_count
+                {
+                    return Err(ClipboardMeshRefusal::CasMismatch);
+                }
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(ClipboardMeshRefusal::CasUnavailable);
+        }
+        verify_canonical_object(content_root, expected_digest, offer.byte_count)?;
+    }
+    Ok(())
+}
+
+fn verify_canonical_object(
+    content_root: &Path,
+    digest: &str,
+    expected_size: u64,
+) -> Result<(), ClipboardMeshRefusal> {
+    if !lower_hex(digest, 64) {
+        return Err(ClipboardMeshRefusal::CasMismatch);
+    }
+    let shard = content_root.join(&digest[..2]);
+    let path = shard.join(digest);
+    for directory in [content_root, shard.as_path()] {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ClipboardMeshRefusal::CasMismatch);
+        }
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_size {
+        return Err(ClipboardMeshRefusal::CasMismatch);
+    }
+    #[cfg(target_os = "linux")]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(0o400000)
+            .open(&path)
+            .map_err(|_| ClipboardMeshRefusal::CasMismatch)?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut file = std::fs::File::open(&path).map_err(|_| ClipboardMeshRefusal::CasMismatch)?;
+    let mut hash = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| ClipboardMeshRefusal::CasMismatch)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(read as u64)
+            .ok_or(ClipboardMeshRefusal::CasMismatch)?;
+        if observed > expected_size {
+            return Err(ClipboardMeshRefusal::CasMismatch);
+        }
+        hash.update(&buffer[..read]);
+    }
+    if observed != expected_size || format!("{:x}", hash.finalize()) != digest {
+        return Err(ClipboardMeshRefusal::CasMismatch);
+    }
+    Ok(())
+}
+
 fn safe_node(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -553,8 +717,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use mde_collab_types::{
-        ClipboardClipId, ClipboardMimeKind, ClipboardMimeOfferV2, ClipboardNodeId,
-        ClipboardSessionId, ClipboardSourceV2, ClipboardTargetV2,
+        value::sha256_hex, ActorId, ClipboardClipId, ClipboardMimeKind,
+        ClipboardMimeOfferV2, ClipboardNodeId, ClipboardSessionId, ClipboardSourceV2,
+        ClipboardTargetV2, FileRef, FileRefId, FileReferenceView, SpaceId,
     };
 
     #[derive(Default)]
@@ -626,11 +791,82 @@ mod tests {
         (root, persist, directory, source, envelope)
     }
 
+    fn publish_cas_fixture(
+        root: &Path,
+        persist: &Persist,
+        bytes: &[u8],
+    ) -> (PathBuf, FileRefId, String) {
+        let digest = sha256_hex(bytes);
+        let content_root = root.join("collab/content");
+        let shard = content_root.join(&digest[..2]);
+        fs::create_dir_all(&shard).unwrap();
+        let object = shard.join(&digest);
+        fs::write(&object, bytes).unwrap();
+        let file = FileRefId::from_uuid(uuid::Uuid::from_u128(0xcafe));
+        let space = SpaceId::from_uuid(uuid::Uuid::from_u128(0xbeef));
+        let references = FileReferences {
+            space,
+            files: vec![FileReferenceView {
+                file,
+                reference: FileRef {
+                    name: "bounded-rich.png".to_owned(),
+                    size: bytes.len() as u64,
+                    sha256_hex: digest.clone(),
+                    mime: Some("image/png".to_owned()),
+                },
+                linked_by: ActorId::new("source"),
+                linked_unix_ms: 900,
+            }],
+        };
+        persist
+            .write(
+                &format!("{FILE_REFERENCES_TOPIC_PREFIX}{space}"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&references).unwrap()),
+            )
+            .unwrap();
+        (content_root, file, digest)
+    }
+
+    fn cas_envelope(
+        key: &SigningKey,
+        file: FileRefId,
+        digest: &str,
+        byte_count: u64,
+        sequence: u64,
+    ) -> ClipboardEnvelopeV2 {
+        ClipboardEnvelopeV2::new(
+            ClipboardClipId::new(),
+            ClipboardSourceV2::new(
+                ClipboardNodeId::new("source").unwrap(),
+                mde_collab_types::ClipboardSeatId::new("seat0").unwrap(),
+            ),
+            ClipboardTargetV2::new(
+                ClipboardNodeId::new("target").unwrap(),
+                mde_collab_types::ClipboardSeatId::new("seat0").unwrap(),
+            ),
+            ClipboardSessionId::from_uuid(uuid::Uuid::from_u128(0x1234)),
+            sequence,
+            1_000,
+            11_000,
+            vec![ClipboardMimeOfferV2::files_reference(
+                ClipboardMimeKind::ImagePng,
+                file,
+                byte_count,
+                digest,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .signed(key)
+    }
+
     #[test]
     fn authenticated_sender_receiver_preserves_exact_canonical_bytes() {
-        let (_root, persist, directory, _source, envelope) = fixture();
+        let (root, persist, directory, _source, envelope) = fixture();
         let body = serde_json::to_vec(&envelope).unwrap();
-        send_envelope(&persist, &directory, "source", &body, 1_001).unwrap();
+        send_envelope(&persist, &directory, root.path(), "source", &body, 1_001).unwrap();
         let frame_row = persist
             .read_latest(&mesh_frame_topic("target"))
             .unwrap()
@@ -639,6 +875,7 @@ mod tests {
         let result = receive_frame(
             &persist,
             &directory,
+            root.path(),
             "target",
             frame_row.body.unwrap().as_bytes(),
             &mut ledger,
@@ -662,13 +899,140 @@ mod tests {
     }
 
     #[test]
+    fn files_cas_bytes_identity_dedupe_denial_and_lease_cleanup_are_bound() {
+        let (root, persist, directory, source, _inline) = fixture();
+        let bytes = b"\x89PNG\r\n\x1a\nnon-secret bounded rich clipboard fixture";
+        let (content_root, file, digest) = publish_cas_fixture(root.path(), &persist, bytes);
+        for index in 0..=MAX_FILES_IDENTITY_TOPICS {
+            persist
+                .write(
+                    &format!("state/unrelated/busy-bus/{index}"),
+                    Priority::Min,
+                    None,
+                    Some("unrelated"),
+                )
+                .unwrap();
+        }
+        let envelope = cas_envelope(&source, file, &digest, bytes.len() as u64, 1);
+        let body = serde_json::to_vec(&envelope).unwrap();
+
+        send_envelope(
+            &persist,
+            &directory,
+            &content_root,
+            "source",
+            &body,
+            1_001,
+        )
+        .unwrap();
+        let frame = persist
+            .read_latest(&mesh_frame_topic("target"))
+            .unwrap()
+            .unwrap()
+            .body
+            .unwrap();
+        let mut ledger = ClipboardMeshReplayLedger::default();
+        receive_frame(
+            &persist,
+            &directory,
+            &content_root,
+            "target",
+            frame.as_bytes(),
+            &mut ledger,
+            1_002,
+        )
+        .unwrap();
+        let marker = ledger.latest.values().next().unwrap();
+        assert_eq!(marker.cas_digests, BTreeSet::from([digest.clone()]));
+        assert_eq!(
+            receive_frame(
+                &persist,
+                &directory,
+                &content_root,
+                "target",
+                frame.as_bytes(),
+                &mut ledger,
+                1_003,
+            ),
+            Err(ClipboardMeshRefusal::Replayed)
+        );
+
+        let object = content_root.join(&digest[..2]).join(&digest);
+        fs::write(&object, vec![b'x'; bytes.len()]).unwrap();
+        let changed = cas_envelope(&source, file, &digest, bytes.len() as u64, 2);
+        assert_eq!(
+            send_envelope(
+                &persist,
+                &directory,
+                &content_root,
+                "source",
+                &serde_json::to_vec(&changed).unwrap(),
+                1_004,
+            ),
+            Err(ClipboardMeshRefusal::CasMismatch)
+        );
+        fs::write(&object, bytes).unwrap();
+        fs::remove_file(&object).unwrap();
+        assert_eq!(
+            send_envelope(
+                &persist,
+                &directory,
+                &content_root,
+                "source",
+                &serde_json::to_vec(&changed).unwrap(),
+                1_005,
+            ),
+            Err(ClipboardMeshRefusal::CasUnavailable)
+        );
+        fs::write(&object, bytes).unwrap();
+        assert_eq!(ledger.cleanup(11_000), 1);
+        assert!(ledger.latest.is_empty());
+        assert_eq!(fs::read(object).unwrap(), bytes);
+    }
+
+    #[test]
+    fn files_cas_projection_with_duplicate_field_is_refused_before_authority_use() {
+        let (root, persist, directory, source, _inline) = fixture();
+        let bytes = b"bounded duplicate-key CAS projection fixture";
+        let (content_root, file, digest) = publish_cas_fixture(root.path(), &persist, bytes);
+        let topic = persist
+            .list_topics()
+            .unwrap()
+            .into_iter()
+            .find(|topic| topic.starts_with(FILE_REFERENCES_TOPIC_PREFIX))
+            .unwrap();
+        let body = persist.read_latest(&topic).unwrap().unwrap().body.unwrap();
+        let duplicate = body.replacen("{", "{\"space\":\"duplicate-authority\",", 1);
+        persist
+            .write(&topic, Priority::Default, None, Some(&duplicate))
+            .unwrap();
+        let envelope = cas_envelope(&source, file, &digest, bytes.len() as u64, 1);
+        assert_eq!(
+            send_envelope(
+                &persist,
+                &directory,
+                &content_root,
+                "source",
+                &serde_json::to_vec(&envelope).unwrap(),
+                1_001,
+            ),
+            Err(ClipboardMeshRefusal::CasMismatch)
+        );
+        assert!(persist
+            .read_latest(&mesh_frame_topic("target"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn hostile_unauthorized_peer_and_source_key_mismatch_fail_closed() {
-        let (_root, persist, mut directory, _source, envelope) = fixture();
+        let (root, persist, mut directory, _source, envelope) = fixture();
         directory.0.remove("source");
         assert_eq!(
             send_envelope(
                 &persist,
                 &directory,
+                root.path(),
                 "source",
                 &serde_json::to_vec(&envelope).unwrap(),
                 1_001,
@@ -681,6 +1045,7 @@ mod tests {
             send_envelope(
                 &persist,
                 &directory,
+                root.path(),
                 "source",
                 &serde_json::to_vec(&envelope).unwrap(),
                 1_001,
@@ -691,13 +1056,22 @@ mod tests {
 
     #[test]
     fn hostile_replay_is_typed_and_never_forwards_twice() {
-        let (_root, persist, directory, _source, admitted_envelope) = fixture();
+        let (root, persist, directory, _source, admitted_envelope) = fixture();
         let frame = ClipboardMeshFrameV1::new(admitted_envelope).unwrap();
         let body = serde_json::to_vec(&frame).unwrap();
         let mut ledger = ClipboardMeshReplayLedger::default();
-        receive_frame(&persist, &directory, "target", &body, &mut ledger, 1_001).unwrap();
+        receive_frame(&persist, &directory, root.path(), "target", &body, &mut ledger, 1_001)
+            .unwrap();
         assert_eq!(
-            receive_frame(&persist, &directory, "target", &body, &mut ledger, 1_002),
+            receive_frame(
+                &persist,
+                &directory,
+                root.path(),
+                "target",
+                &body,
+                &mut ledger,
+                1_002,
+            ),
             Err(ClipboardMeshRefusal::Replayed)
         );
         assert_eq!(
@@ -749,6 +1123,7 @@ mod tests {
                 ReplayMarker {
                     generation: 1,
                     expires_unix_ms: 20_000,
+                    cas_digests: BTreeSet::new(),
                 },
             );
         }
@@ -767,15 +1142,15 @@ mod tests {
 
     #[test]
     fn hostile_stale_and_unavailable_peer_are_distinct() {
-        let (_root, persist, mut directory, _source, envelope) = fixture();
+        let (root, persist, mut directory, _source, envelope) = fixture();
         let body = serde_json::to_vec(&envelope).unwrap();
         assert_eq!(
-            send_envelope(&persist, &directory, "source", &body, 11_000),
+            send_envelope(&persist, &directory, root.path(), "source", &body, 11_000),
             Err(ClipboardMeshRefusal::Stale)
         );
         directory.0.get_mut("target").unwrap().available = false;
         assert_eq!(
-            send_envelope(&persist, &directory, "source", &body, 1_001),
+            send_envelope(&persist, &directory, root.path(), "source", &body, 1_001),
             Err(ClipboardMeshRefusal::UnavailablePeer)
         );
     }
@@ -788,6 +1163,7 @@ mod tests {
             ReplayMarker {
                 generation: 7,
                 expires_unix_ms: 1_000,
+                cas_digests: BTreeSet::new(),
             },
         );
         ledger.latest.insert(
@@ -795,6 +1171,7 @@ mod tests {
             ReplayMarker {
                 generation: 8,
                 expires_unix_ms: 2_000,
+                cas_digests: BTreeSet::new(),
             },
         );
         assert_eq!(ledger.cleanup(1_000), 1);
@@ -806,7 +1183,7 @@ mod tests {
 
     #[test]
     fn restart_seed_rejects_a_generation_already_forwarded_to_canonical_authority() {
-        let (_root, persist, directory, _source, envelope) = fixture();
+        let (root, persist, directory, _source, envelope) = fixture();
         persist
             .write(
                 COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
@@ -822,6 +1199,7 @@ mod tests {
             receive_frame(
                 &persist,
                 &directory,
+                root.path(),
                 "target",
                 &serde_json::to_vec(&frame).unwrap(),
                 &mut ledger,
