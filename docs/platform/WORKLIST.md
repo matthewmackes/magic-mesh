@@ -440,8 +440,8 @@ behavioral evidence is not completion.
 - **Media-source Bus recovery checkpoint (2026-08-09):** discovery survives late and same-path-replaced storage and republishes the complete roster without restart.
   Exact machine-193/196 gates passed: `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`,
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-replacement-r81.md`.
-- **Media-server Bus recovery checkpoint (2026-08-09):** shares, serving, aggregation, and publication recover late Bus startup; machine 193 passed two tests:
-  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-recovery-r28.md`.
+- **Media-server Bus recovery checkpoint (2026-08-09):** bounded manifest folds recover late/replaced Bus without partial projection; machine 9 passed eight exact gates:
+  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`.
 - **Notification/transfer Bus recovery checkpoint (2026-08-09):** monitoring and transfer effects survive late/replaced storage; complete registry reads and durable
   identity-bound result receipts prevent lost acknowledgements or repeated transfer effects. Focused farm gates:
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`,
@@ -1341,8 +1341,8 @@ behavioral evidence is not completion.
 - Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
 - Required outcome: a near-Spotify workspace uses daemon-owned typed catalog, queue, playback, bookmarks, cache, and source authority; mde-media-core provides real mpv
   frame/audio playback; Media UI covers local/Jellyfin/library flows; discovery, DLNA/cast, peer handoff, and live visual/audio proof pass.
-- Current state: daemon catalog/queue/cache, typed playback, artwork, browse/detail, signed radio, and release 11 run on five seats; one daemon owns each seat.
-  Dell named-detail, CPU/NWS, and provider-loss proofs pass; live renderer, audible continuity, casting, and handoff proof remain.
+- Current state: daemon authority and release 11 run on five seats; Dell named-detail, CPU/NWS, and provider-loss proofs pass.
+  Media-server Bus fold: `evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-transaction-recovery-r82.md`; renderer/audio/cast/handoff remain.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.

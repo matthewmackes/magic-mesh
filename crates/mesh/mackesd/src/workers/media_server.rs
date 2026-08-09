@@ -39,6 +39,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::{self, Read as _};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -94,6 +95,12 @@ const MAX_SCAN_DEPTH: usize = 8;
 /// Bound the manifest item count — a runaway share never balloons the manifest
 /// past a size the plane + Bus can carry.
 const MAX_ITEMS_PER_MANIFEST: usize = 20_000;
+
+/// Replicated manifests are untrusted peer input. Bound both the directory
+/// census and each file before allocation so a hostile/sick peer cannot turn a
+/// library fold into unbounded memory or an authoritative partial roster.
+const MAX_MANIFEST_HOSTS: usize = 4_096;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The SSDP multicast group + port a LAN UPnP control point listens on.
 const SSDP_MULTICAST: &str = "239.255.255.250:1900";
@@ -467,31 +474,31 @@ pub fn build_manifest(
 /// missing mount / write error is logged, never fatal (mirrors
 /// `media_registry::write_shared_registration`).
 pub fn write_manifest(mount: &Path, host: &str, manifest: &ShareManifest) {
+    if let Err(e) = write_manifest_complete(mount, host, manifest) {
+        tracing::warn!(target: "mackesd::media_server", error = %e, "manifest write failed");
+    }
+}
+
+fn write_manifest_complete(mount: &Path, host: &str, manifest: &ShareManifest) -> io::Result<()> {
     if host.is_empty() {
-        return;
+        return Ok(());
     }
     let dir = mount.join(host);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(target: "mackesd::media_server", "mkdir {} failed: {e}", dir.display());
-        return;
-    }
-    let Ok(body) = serde_json::to_string(manifest) else {
-        return;
-    };
+    std::fs::create_dir_all(&dir)?;
+    let body = serde_json::to_string(manifest).map_err(io::Error::other)?;
     let tmp = dir.join(".media-library.json.tmp");
     let final_path = dir.join(MESH_LIBRARY_MANIFEST_FILE);
     if let Ok(existing) = std::fs::read(&final_path) {
         if existing == body.as_bytes() {
-            return;
+            return Ok(());
         }
     }
-    if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
-        tracing::warn!(target: "mackesd::media_server", "write {} failed: {e}", tmp.display());
-        return;
+    std::fs::write(&tmp, body.as_bytes())?;
+    if let Err(error) = std::fs::rename(&tmp, &final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    if let Err(e) = std::fs::rename(&tmp, &final_path) {
-        tracing::warn!(target: "mackesd::media_server", "rename manifest failed: {e}");
-    }
+    Ok(())
 }
 
 /// Read every peer's share manifest off the replicated plane
@@ -501,21 +508,94 @@ pub fn write_manifest(mount: &Path, host: &str, manifest: &ShareManifest) {
 /// share discipline `mesh_media::read_shared_account_from_plane` uses.
 #[must_use]
 pub fn read_manifests(mount: &Path) -> Vec<ShareManifest> {
+    read_manifests_complete(mount).unwrap_or_else(|error| {
+        tracing::warn!(target: "mackesd::media_server", %error, "manifest fold deferred");
+        Vec::new()
+    })
+}
+
+fn read_manifests_complete(mount: &Path) -> io::Result<Vec<ShareManifest>> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(mount) else {
-        return out;
-    };
-    for ent in entries.flatten() {
-        let path = ent.path().join(MESH_LIBRARY_MANIFEST_FILE);
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Ok(m) = serde_json::from_str::<ShareManifest>(&body) {
-            out.push(m);
+    let entries = std::fs::read_dir(mount)?;
+    let mut entry_count = 0usize;
+    for ent in entries {
+        let ent = ent?;
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > MAX_MANIFEST_HOSTS {
+            return Err(io::Error::other(format!(
+                "media manifest plane exceeds {MAX_MANIFEST_HOSTS} entries"
+            )));
         }
+        if !ent.file_type()?.is_dir() {
+            continue;
+        }
+        let path = ent.path().join(MESH_LIBRARY_MANIFEST_FILE);
+        let before = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if before.file_type().is_symlink()
+            || !before.is_file()
+            || before.len() > MAX_MANIFEST_BYTES
+        {
+            return Err(io::Error::other(format!(
+                "unsafe or oversized media manifest {}",
+                path.display()
+            )));
+        }
+        let file = std::fs::File::open(&path)?;
+        let opened = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if opened.dev() != before.dev() || opened.ino() != before.ino() {
+                return Err(io::Error::other(format!(
+                    "media manifest changed while opening {}",
+                    path.display()
+                )));
+            }
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+        file.take(MAX_MANIFEST_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+            return Err(io::Error::other(format!(
+                "media manifest grew oversized {}",
+                path.display()
+            )));
+        }
+        let after = std::fs::symlink_metadata(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if after.dev() != before.dev() || after.ino() != before.ino() {
+                return Err(io::Error::other(format!(
+                    "media manifest changed during read {}",
+                    path.display()
+                )));
+            }
+        }
+        let manifest: ShareManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decode media manifest {}: {error}", path.display()),
+            )
+        })?;
+        let directory_host = ent.file_name();
+        if manifest.host.is_empty()
+            || manifest.items.len() > MAX_ITEMS_PER_MANIFEST
+            || directory_host.to_str() != Some(manifest.host.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid media manifest identity/bounds {}", path.display()),
+            ));
+        }
+        out.push(manifest);
     }
     out.sort_by(|a, b| a.host.cmp(&b.host));
-    out
+    Ok(out)
 }
 
 // ───────────────────────────── the merge fold ─────────────────────────────
@@ -832,6 +912,60 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ServeSt
 
 // ───────────────────────────── the worker ─────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaServerBusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+type MediaServerBusHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+struct MediaServerBusTransaction {
+    root: PathBuf,
+    persist: Persist,
+    identity: MediaServerBusIdentity,
+}
+
+impl MediaServerBusTransaction {
+    fn open(root: PathBuf, after_open: Option<&MediaServerBusHook>) -> io::Result<Self> {
+        let before = media_server_bus_identity(&root).ok();
+        let mut persist =
+            Persist::open(root.clone()).map_err(|error| io::Error::other(error.to_string()))?;
+        persist.reopen_if_index_changed();
+        if let Some(hook) = after_open {
+            hook(&root);
+        }
+        let identity = media_server_bus_identity(&root)?;
+        #[cfg(unix)]
+        let handle_is_current = persist.index_inode() == Some(identity.inode);
+        #[cfg(not(unix))]
+        let handle_is_current = true;
+        if before.is_some_and(|before| before != identity) || !handle_is_current {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "media-server Bus changed while opening a transaction",
+            ));
+        }
+        Ok(Self {
+            root,
+            persist,
+            identity,
+        })
+    }
+
+    fn verify_current(&self) -> io::Result<()> {
+        if media_server_bus_identity(&self.root)? != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "media-server Bus changed during a transaction",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// MEDIA-15 — the mesh media server + DLNA + aggregation worker.
 pub struct MediaServerWorker {
     /// This node's id (the publish stamp).
@@ -856,6 +990,10 @@ pub struct MediaServerWorker {
     live_status: Arc<Mutex<(String, String)>>,
     /// Fingerprint of the last published fold (publish-on-change gate).
     last_fingerprint: Option<String>,
+    #[cfg(test)]
+    after_bus_open: Option<MediaServerBusHook>,
+    #[cfg(test)]
+    after_publish: Option<MediaServerBusHook>,
 }
 
 impl MediaServerWorker {
@@ -875,6 +1013,10 @@ impl MediaServerWorker {
             live: true,
             live_status: Arc::new(Mutex::new(("idle".to_string(), "idle".to_string()))),
             last_fingerprint: None,
+            #[cfg(test)]
+            after_bus_open: None,
+            #[cfg(test)]
+            after_publish: None,
         }
     }
 
@@ -907,9 +1049,31 @@ impl MediaServerWorker {
         self
     }
 
+    #[cfg(test)]
+    fn with_after_bus_open(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_bus_open = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_publish(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_publish = Some(Arc::new(hook));
+        self
+    }
+
     /// Resolve the chosen shared folders for this run.
     fn share_dirs(&self) -> Vec<PathBuf> {
         self.share_dirs.clone().unwrap_or_else(load_share_dirs)
+    }
+
+    fn open_bus_transaction(&self) -> io::Result<MediaServerBusTransaction> {
+        MediaServerBusTransaction::open(
+            media_server_bus_root(self.bus_root_override.clone()),
+            #[cfg(test)]
+            self.after_bus_open.as_ref(),
+            #[cfg(not(test))]
+            None,
+        )
     }
 
     /// Rescan this node's shared folders into a manifest + the serve map.
@@ -920,8 +1084,8 @@ impl MediaServerWorker {
     /// Read every peer's manifest off the plane + fold them into the mesh
     /// library. This node's own freshly-written manifest is included (it lives
     /// on the same plane under its host dir).
-    fn aggregate(&self) -> MeshLibrary {
-        merge_libraries(&read_manifests(&self.mount))
+    fn aggregate(&self) -> io::Result<MeshLibrary> {
+        read_manifests_complete(&self.mount).map(|manifests| merge_libraries(&manifests))
     }
 
     /// Build this node's serving status from the current manifest + live-leg
@@ -947,15 +1111,16 @@ impl MediaServerWorker {
     /// Returns whether a record was written.
     fn publish(
         &mut self,
-        persist: &Persist,
+        transaction: &MediaServerBusTransaction,
         manifest: &ShareManifest,
         library: MeshLibrary,
         force: bool,
-    ) -> bool {
+    ) -> io::Result<bool> {
         let server = self.server_status(manifest);
-        let fingerprint = serde_json::to_string(&(&server, &library)).unwrap_or_default();
+        let fingerprint = serde_json::to_string(&(&server, &library)).map_err(io::Error::other)?;
         if !force && self.last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-            return false;
+            transaction.verify_current()?;
+            return Ok(false);
         }
         let state = MeshLibraryState {
             node: self.node_id.clone(),
@@ -963,27 +1128,32 @@ impl MediaServerWorker {
             library,
             published_at_ms: now_ms(),
         };
-        let Ok(body) = serde_json::to_string(&state) else {
-            return false;
-        };
-        if let Err(e) = persist.write(MESH_LIBRARY_TOPIC, Priority::Default, None, Some(&body)) {
-            tracing::warn!(target: "mackesd::media_server", error = %e, "library publish failed");
-            return false;
+        let body = serde_json::to_string(&state).map_err(io::Error::other)?;
+        transaction
+            .persist
+            .write(MESH_LIBRARY_TOPIC, Priority::Default, None, Some(&body))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        #[cfg(test)]
+        if let Some(hook) = &self.after_publish {
+            hook(&transaction.root);
         }
+        transaction.verify_current()?;
         self.last_fingerprint = Some(fingerprint);
-        true
+        Ok(true)
     }
 
     /// One rescan→write-manifest→aggregate→publish cycle. Split out so the
     /// tick body is unit-tested without the run loop.
     fn tick_once(
         &mut self,
-        persist: &Persist,
+        transaction: &MediaServerBusTransaction,
         serve: Option<&Arc<Mutex<ServeState>>>,
         force: bool,
-    ) -> bool {
+    ) -> io::Result<bool> {
         let (manifest, abs) = self.rescan();
-        write_manifest(&self.mount, &self.hostname, &manifest);
+        write_manifest_complete(&self.mount, &self.hostname, &manifest)?;
+        let library = self.aggregate()?;
+        let published = self.publish(transaction, &manifest, library, force)?;
         if let Some(serve) = serve {
             let mut g = serve
                 .lock()
@@ -999,8 +1169,7 @@ impl MediaServerWorker {
                 Err(e) => self.set_ssdp(format!("gated: {e}")),
             }
         }
-        let library = self.aggregate();
-        self.publish(persist, &manifest, library, force)
+        Ok(published)
     }
 
     fn set_http(&self, s: String) {
@@ -1054,13 +1223,12 @@ impl Worker for MediaServerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = media_server_bus_root(self.bus_root_override.clone());
         let retry_interval = self
             .tick
             .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
-        let persist = loop {
-            match Persist::open(bus_root.clone()) {
-                Ok(persist) => break persist,
+        let first_transaction = loop {
+            match self.open_bus_transaction() {
+                Ok(transaction) => break transaction,
                 Err(error) => tracing::debug!(
                     target: "mackesd::media_server",
                     %error,
@@ -1088,17 +1256,45 @@ impl Worker for MediaServerWorker {
         }
 
         // Immediate first cycle so a subscriber doesn't wait a tick.
-        self.tick_once(&persist, Some(&serve), true);
-        let mut last_pub = Instant::now();
+        let mut active_bus = None;
+        let mut last_pub = None;
+        match self.tick_once(&first_transaction, Some(&serve), true) {
+            Ok(published) => {
+                active_bus = Some((first_transaction.root.clone(), first_transaction.identity));
+                if published {
+                    last_pub = Some(Instant::now());
+                }
+            }
+            Err(error) => tracing::debug!(
+                target: "mackesd::media_server",
+                %error,
+                "initial media-server transaction deferred"
+            ),
+        }
 
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await; // burn the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let due = last_pub.elapsed() >= self.heartbeat;
-                    if self.tick_once(&persist, Some(&serve), due) {
-                        last_pub = Instant::now();
+                    let transaction = match self.open_bus_transaction() {
+                        Ok(transaction) => transaction,
+                        Err(error) => {
+                            tracing::debug!(target: "mackesd::media_server", %error, "media-server Bus transaction deferred");
+                            continue;
+                        }
+                    };
+                    let current_bus = (transaction.root.clone(), transaction.identity);
+                    let bus_changed = active_bus.as_ref() != Some(&current_bus);
+                    let due = last_pub.is_none_or(|last| last.elapsed() >= self.heartbeat);
+                    match self.tick_once(&transaction, Some(&serve), due || bus_changed) {
+                        Ok(published) => {
+                            active_bus = Some(current_bus);
+                            if published {
+                                last_pub = Some(Instant::now());
+                            }
+                        }
+                        Err(error) => tracing::debug!(target: "mackesd::media_server", %error, "media-server transaction deferred"),
                     }
                 }
                 () = shutdown.wait() => break,
@@ -1116,6 +1312,29 @@ fn media_server_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
+fn media_server_bus_identity(root: &Path) -> io::Result<MediaServerBusIdentity> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "media-server Bus index is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(MediaServerBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(MediaServerBusIdentity {})
+    }
+}
+
 /// Wall-clock epoch millis for a published record.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -1127,6 +1346,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // ── kind + mime classification ──
 
@@ -1606,10 +1826,19 @@ mod tests {
         serde_json::from_str(&body).unwrap()
     }
 
+    fn replace_bus_index(root: &Path) -> MediaServerBusIdentity {
+        let index = root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        Persist::open(root.to_path_buf()).expect("create replacement Bus index");
+        media_server_bus_identity(root).expect("replacement Bus identity")
+    }
+
     #[test]
     fn worker_writes_manifest_aggregates_and_publishes() {
         let bus = tempfile::tempdir().unwrap();
-        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let transaction = MediaServerBusTransaction::open(bus.path().to_path_buf(), None).unwrap();
         let mount = tempfile::tempdir().unwrap();
         // A peer oak already published a manifest onto the plane.
         write_manifest(
@@ -1628,12 +1857,12 @@ mod tests {
                 .without_live_server();
 
         // First cycle writes elm's manifest + aggregates oak + elm + publishes.
-        assert!(w.tick_once(&persist, None, true));
+        assert!(w.tick_once(&transaction, None, true).unwrap());
         // An unchanged fold doesn't republish; a forced (heartbeat) one does.
-        assert!(!w.tick_once(&persist, None, false));
-        assert!(w.tick_once(&persist, None, true));
+        assert!(!w.tick_once(&transaction, None, false).unwrap());
+        assert!(w.tick_once(&transaction, None, true).unwrap());
 
-        let state = latest_state(&persist);
+        let state = latest_state(&transaction.persist);
         assert_eq!(state.node, "peer:elm");
         assert_eq!(state.server.shared_item_count, 1);
         assert_eq!(state.server.http, "idle"); // live server disabled in the test
@@ -1649,6 +1878,190 @@ mod tests {
         // elm's own manifest landed on the plane for peers to aggregate.
         let planed = read_manifests(mount.path());
         assert!(planed.iter().any(|m| m.host == "elm"));
+    }
+
+    #[tokio::test]
+    async fn open_race_and_same_path_replacement_recover_without_worker_restart() {
+        let holder = tempfile::tempdir().expect("media-server Bus fixture");
+        let bus = holder.path().join("bus");
+        Persist::open(bus.clone()).expect("initial Bus");
+        let original_identity = media_server_bus_identity(&bus).unwrap();
+        let mount = tempfile::tempdir().expect("media-server mount");
+        let replaced_during_open = Arc::new(AtomicBool::new(false));
+        let replace_once = Arc::clone(&replaced_during_open);
+        let mut worker = MediaServerWorker::new(
+            "peer:identity".to_string(),
+            "identity".to_string(),
+            mount.path().to_path_buf(),
+        )
+        .with_share_dirs(Vec::new())
+        .with_bus_root(bus.clone())
+        .with_tick(Duration::from_millis(10))
+        .without_live_server()
+        .with_after_bus_open(move |root| {
+            if !replace_once.swap(true, Ordering::SeqCst) {
+                replace_bus_index(root);
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if Persist::open(bus.clone())
+                    .and_then(|persist| persist.read_latest(MESH_LIBRARY_TOPIC))
+                    .is_ok_and(|message| message.is_some())
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "open race terminated the worker");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("open-race replacement receives initial library");
+        assert!(replaced_during_open.load(Ordering::SeqCst));
+        assert_ne!(original_identity, media_server_bus_identity(&bus).unwrap());
+
+        let active_identity = media_server_bus_identity(&bus).unwrap();
+        let replacement_identity = replace_bus_index(&bus);
+        assert_ne!(active_identity, replacement_identity);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if Persist::open(bus.clone())
+                    .and_then(|persist| persist.read_latest(MESH_LIBRARY_TOPIC))
+                    .is_ok_and(|message| message.is_some())
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "replacement restarted the worker");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same-path replacement receives current library");
+        assert!(!task.is_finished());
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt replacement polling")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[test]
+    fn publication_replacement_defers_state_and_corrects_forward() {
+        let bus = tempfile::tempdir().unwrap();
+        Persist::open(bus.path().to_path_buf()).unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        let replaced = Arc::new(AtomicBool::new(false));
+        let replace_once = Arc::clone(&replaced);
+        let mut worker =
+            MediaServerWorker::new("peer:elm".into(), "elm".into(), mount.path().to_path_buf())
+                .with_share_dirs(Vec::new())
+                .without_live_server()
+                .with_after_publish(move |root| {
+                    if !replace_once.swap(true, Ordering::SeqCst) {
+                        replace_bus_index(root);
+                    }
+                });
+        let serve = Arc::new(Mutex::new(ServeState {
+            manifest: manifest_with("sentinel", &[]),
+            ..ServeState::default()
+        }));
+        let retired = MediaServerBusTransaction::open(bus.path().to_path_buf(), None).unwrap();
+
+        assert!(worker.tick_once(&retired, Some(&serve), true).is_err());
+        assert!(replaced.load(Ordering::SeqCst));
+        assert!(worker.last_fingerprint.is_none());
+        assert_eq!(
+            serve.lock().unwrap().manifest.host,
+            "sentinel",
+            "retired publication must not commit serving state"
+        );
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .read_latest(MESH_LIBRARY_TOPIC)
+            .unwrap()
+            .is_none());
+
+        let current = MediaServerBusTransaction::open(bus.path().to_path_buf(), None).unwrap();
+        assert!(worker.tick_once(&current, Some(&serve), true).unwrap());
+        assert!(worker.last_fingerprint.is_some());
+        assert_eq!(serve.lock().unwrap().manifest.host, "elm");
+        assert_eq!(latest_state(&current.persist).node, "peer:elm");
+    }
+
+    #[test]
+    fn unreadable_manifest_lane_defers_projection_and_serving_state() {
+        let bus = tempfile::tempdir().unwrap();
+        let transaction = MediaServerBusTransaction::open(bus.path().to_path_buf(), None).unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            mount
+                .path()
+                .join("unreadable-peer")
+                .join(MESH_LIBRARY_MANIFEST_FILE),
+        )
+        .unwrap();
+        let mut worker =
+            MediaServerWorker::new("peer:elm".into(), "elm".into(), mount.path().to_path_buf())
+                .with_share_dirs(Vec::new())
+                .without_live_server();
+        let serve = Arc::new(Mutex::new(ServeState {
+            manifest: manifest_with("sentinel", &[]),
+            ..ServeState::default()
+        }));
+
+        assert!(worker.tick_once(&transaction, Some(&serve), true).is_err());
+        assert!(worker.last_fingerprint.is_none());
+        assert_eq!(serve.lock().unwrap().manifest.host, "sentinel");
+        assert!(transaction
+            .persist
+            .read_latest(MESH_LIBRARY_TOPIC)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn hostile_manifest_files_fail_the_complete_fold() {
+        let mount = tempfile::tempdir().unwrap();
+        let peer = mount.path().join("oak");
+        std::fs::create_dir_all(&peer).unwrap();
+        let path = peer.join(MESH_LIBRARY_MANIFEST_FILE);
+
+        std::fs::write(&path, b"{malformed").unwrap();
+        assert_eq!(
+            read_manifests_complete(mount.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let foreign = manifest_with("elm", &[]);
+        std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        assert_eq!(
+            read_manifests_complete(mount.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "directory and manifest host identities must agree"
+        );
+
+        let oversized = std::fs::File::create(&path).unwrap();
+        oversized.set_len(MAX_MANIFEST_BYTES + 1).unwrap();
+        assert!(read_manifests_complete(mount.path()).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::remove_file(&path).unwrap();
+            let outside = mount.path().join("outside.json");
+            std::fs::write(&outside, serde_json::to_vec(&manifest_with("oak", &[])).unwrap())
+                .unwrap();
+            symlink(&outside, &path).unwrap();
+            assert!(read_manifests_complete(mount.path()).is_err());
+        }
     }
 
     #[test]
