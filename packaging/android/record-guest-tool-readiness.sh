@@ -11,7 +11,7 @@ set -euo pipefail
 umask 077
 
 readonly RECEIPT_KIND="cuttlefish_guest_tool_readiness"
-readonly SCHEMA_VERSION=2
+readonly SCHEMA_VERSION=3
 readonly MAX_ID_BYTES=128
 readonly MAX_VERSION_BYTES=128
 readonly MAX_PATH_BYTES=512

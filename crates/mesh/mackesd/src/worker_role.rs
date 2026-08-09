@@ -497,6 +497,9 @@ pub enum SpawnBinding {
     /// Started as a named responder/maintenance thread rather than a
     /// `Supervisor` worker.
     ResponderThread,
+    /// Process-local startup/retry/watchdog infrastructure which is not a
+    /// `Supervisor` worker but still has exactly one governed group owner.
+    ProcessInfrastructure,
     /// Registered by a supervisor helper that returns the worker's runtime
     /// name instead of containing a string-literal spawn call.
     DynamicSupervisor,
@@ -643,6 +646,19 @@ impl WorkerSpec {
         let mut spec = Self::tier(name, 0, RestartPolicy::Never, group);
         spec.spawn_binding = SpawnBinding::ResponderThread;
         spec.cadence = CadencePolicy::Continuous;
+        spec
+    }
+
+    /// A canonical registration for bounded process-local infrastructure.
+    #[must_use]
+    const fn infrastructure(
+        name: &'static str,
+        group: WorkerGroup,
+        cadence: CadencePolicy,
+    ) -> Self {
+        let mut spec = Self::tier(name, 0, RestartPolicy::Never, group);
+        spec.spawn_binding = SpawnBinding::ProcessInfrastructure;
+        spec.cadence = cadence;
         spec
     }
 
@@ -1560,6 +1576,51 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     WorkerSpec::responder(
         "worker_runtime_status_aggregate_publisher",
         WorkerGroup::Observation,
+    ),
+    // WL-ARCH-009 — process-local infrastructure is censused and admitted by
+    // one group before it can touch identity state, the network, or systemd.
+    WorkerSpec::infrastructure(
+        "mesh_service_key_reconciler",
+        WorkerGroup::Control,
+        CadencePolicy::Periodic {
+            min_interval_secs: 30,
+            max_interval_secs: 30,
+        },
+    ),
+    WorkerSpec::infrastructure(
+        "etcd_startup_probe",
+        WorkerGroup::Observation,
+        CadencePolicy::OnDemand,
+    ),
+    WorkerSpec::infrastructure(
+        "process_watchdog_control",
+        WorkerGroup::Control,
+        CadencePolicy::Continuous,
+    ),
+    WorkerSpec::infrastructure(
+        "process_watchdog_observation",
+        WorkerGroup::Observation,
+        CadencePolicy::Continuous,
+    ),
+    WorkerSpec::infrastructure(
+        "process_watchdog_actions",
+        WorkerGroup::Actions,
+        CadencePolicy::Continuous,
+    ),
+    WorkerSpec::infrastructure(
+        "process_watchdog_data",
+        WorkerGroup::Data,
+        CadencePolicy::Continuous,
+    ),
+    WorkerSpec::infrastructure(
+        "process_watchdog_compute",
+        WorkerGroup::Compute,
+        CadencePolicy::Continuous,
+    ),
+    WorkerSpec::infrastructure(
+        "process_watchdog_integrations",
+        WorkerGroup::Integrations,
+        CadencePolicy::Continuous,
     ),
     WorkerSpec::direct(
         "nebula_ca_backup",
@@ -2740,6 +2801,7 @@ mod tests {
         let direct_registry = registered(SpawnBinding::DirectSupervisor);
         let responder_registry = registered(SpawnBinding::ResponderThread);
         let dynamic_registry = registered(SpawnBinding::DynamicSupervisor);
+        let infrastructure_registry = registered(SpawnBinding::ProcessInfrastructure);
 
         // WL-ARCH-004 — the registry names are unique.
         assert_eq!(
@@ -2778,6 +2840,10 @@ mod tests {
             "WL-ARCH-009: ansible-pull startup configuration escaped the canonical registry"
         );
         let tiered: BTreeSet<String> = scan_call_names(&bin, "spawn_tiered(").into_iter().collect();
+        let infrastructure: BTreeSet<String> =
+            scan_call_names(&bin, "register_process_infrastructure(")
+                .into_iter()
+                .collect();
         let pushed: BTreeSet<String> = scan_names(&bin, ".push(\"").into_iter().collect();
         let literal_policies = scan_literal_spawn_policies(&bin);
         assert!(
@@ -2816,6 +2882,29 @@ mod tests {
             "WL-ARCH-004 DRIFT: these workers are spawned via spawn_tiered but are MISSING from \
              WORKER_REGISTRY, so spawn_tiered would panic on the unknown restart policy. Add each \
              to WORKER_REGISTRY with a deliberate tier: {tiered_unregistered:?}"
+        );
+
+        let mut infrastructure_unspawned: Vec<&str> = infrastructure_registry
+            .iter()
+            .copied()
+            .filter(|name| !infrastructure.contains(*name))
+            .collect();
+        infrastructure_unspawned.sort_unstable();
+        assert!(
+            infrastructure_unspawned.is_empty(),
+            "WL-ARCH-009 DRIFT: registered process infrastructure has no production start: \
+             {infrastructure_unspawned:?}"
+        );
+        let mut infrastructure_unregistered: Vec<&str> = infrastructure
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !infrastructure_registry.contains(name))
+            .collect();
+        infrastructure_unregistered.sort_unstable();
+        assert!(
+            infrastructure_unregistered.is_empty(),
+            "WL-ARCH-009 DRIFT: uncensused process infrastructure start: \
+             {infrastructure_unregistered:?}"
         );
 
         // (2) Literal runtime names are exactly the directly supervised and
@@ -2880,7 +2969,9 @@ mod tests {
                     "WL-ARCH-009: responder acquired or lost a supervisor policy for {}",
                     worker.name
                 ),
-                SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor => {}
+                SpawnBinding::Tiered
+                | SpawnBinding::DynamicSupervisor
+                | SpawnBinding::ProcessInfrastructure => {}
             }
         }
 
@@ -2907,7 +2998,7 @@ mod tests {
     fn canonical_registry_inventory_hash_covers_every_runtime_field() {
         let hash = registry_inventory_sha256(WORKER_REGISTRY);
         assert_eq!(
-            hash, "160560f2ca1712cdc685ab2a646892c38267b0ba83e17cd5fe47b36dc85b77a6",
+            hash, "a1665a1cfd364133b5adcf9f0b4003913bd5972aa5bca9c827628a05d56dde79",
             "WL-ARCH-009: canonical registration inventory drifted"
         );
 
@@ -3077,7 +3168,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 152);
+        assert_eq!(WORKER_REGISTRY.len(), 160);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3395,10 +3486,12 @@ mod tests {
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
         // gateway proxies brought the real pre-cutover count to 90. The current
-        // canonical roster contains 82 tiered/dynamic registrations plus 63
-        // direct supervisors/responders; all retired VM authorities are absent.
-        assert_eq!(lh.len(), 114);
-        assert_eq!(ws.len(), 152);
+        // canonical roster contains 82 tiered/dynamic registrations, 70 direct
+        // supervisors/responders, and eight process-infrastructure rows. The
+        // latter are universal census entries but still have one exact group
+        // owner at runtime; all retired VM authorities are absent.
+        assert_eq!(lh.len(), 122);
+        assert_eq!(ws.len(), 160);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

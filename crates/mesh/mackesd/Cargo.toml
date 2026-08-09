@@ -442,7 +442,11 @@ payload_compress = "xz"
 # -27 (2026-08-09): retain slow probed-RDP resources for the full scan window,
 # route Cloud drift through typed Workloads, isolate Nebula signal dispatchers
 # by process group, and preserve target-addressed Music handoff completions.
-release = "27"
+# -28 (2026-08-09): unify Cloud/Cuttlefish/storage runtime projections under
+# typed Workloads, publish one complete six-process runtime aggregate, recover
+# orphaned VDI clipboard gates, authenticate Android release artifacts, and
+# keep truthful boot status across RPM and bootc installs.
+release = "28"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -1037,6 +1041,11 @@ alsa-lib = "*"
 # declare both so the enabled provisioning service cannot fail on a fresh seat.
 openssl = "*"
 curl = "*"
+# WL-FUNC-020 — Android release admission dearmors the installed project key
+# and verifies one detached guest-artifact signature before provisioning.
+# Fedora splits those commands, so both are hard runtime requirements.
+gnupg2 = "*"
+gnupg2-verify = "*"
 # RCLICK-4 (2026-06-19) — the Win+X right-click power menu launches these: btop
 # (its "Task Manager", run in cosmic-term) + Midnight Commander (`mc`). Both are
 # small + in the base Fedora repos, and the menu entries dead-end without them,
@@ -1589,6 +1598,10 @@ nebula = "*"
 age = "*"
 nmap = "*"
 alsa-lib = "*"
+# The Server variant can host governed Android compute and ships the same
+# detached-signature readiness verifier as the Workstation package.
+gnupg2 = "*"
+gnupg2-verify = "*"
 # E12-23 — the storage worker is universal (any node has disks), and a Server
 # hosts compute, so the headless variant carries the same fs-tooling matrix as the
 # base (lock 6). See the base requires block for the per-tool rationale.

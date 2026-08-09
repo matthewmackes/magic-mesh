@@ -2706,38 +2706,48 @@ fn run_serve(
         // replicated secret store. A founding Lighthouse may mint the key;
         // Workstations only install an already-sealed mesh key and never race to
         // create a second identity during concurrent enrollment.
-        let account_outcome = mackesd_core::ipc::mesh_service_account::ensure_mesh_service_account()
-            .map_err(|error| anyhow::anyhow!("mesh service identity unavailable: {error}"))?;
-        tracing::info!(
-            user = mackesd_core::ipc::mesh_service_account::MESH_SERVICE_USER,
-            ?account_outcome,
-            "joined-mesh service account ready"
-        );
-        match install_mesh_service_key(role_rank, &workgroup_root) {
-            Ok(outcome) => log_mesh_service_key_outcome(&outcome),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "mesh service key is not available yet; background reconciliation is active"
-                );
-                let retry_root = workgroup_root.clone();
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-                    tick.tick().await;
-                    loop {
-                        tick.tick().await;
-                        match install_mesh_service_key(role_rank, &retry_root) {
-                            Ok(outcome) => {
-                                log_mesh_service_key_outcome(&outcome);
-                                break;
+        if register_process_infrastructure(&worker_names, "mesh_service_key_reconciler") {
+            let account_outcome =
+                mackesd_core::ipc::mesh_service_account::ensure_mesh_service_account()
+                    .map_err(|error| anyhow::anyhow!("mesh service identity unavailable: {error}"))?;
+            tracing::info!(
+                user = mackesd_core::ipc::mesh_service_account::MESH_SERVICE_USER,
+                ?account_outcome,
+                "joined-mesh service account ready"
+            );
+            match install_mesh_service_key(role_rank, &workgroup_root) {
+                Ok(outcome) => log_mesh_service_key_outcome(&outcome),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "mesh service key is not available yet; background reconciliation is active"
+                    );
+                    let retry_root = workgroup_root.clone();
+                    let retry_shutdown = Arc::clone(&shutdown);
+                    tokio::spawn(async move {
+                        loop {
+                            for _ in 0..120 {
+                                if retry_shutdown.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             }
-                            Err(error) => tracing::warn!(
-                                %error,
-                                "mesh service key reconciliation is still pending"
-                            ),
+                            if retry_shutdown.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            match install_mesh_service_key(role_rank, &retry_root) {
+                                Ok(outcome) => {
+                                    log_mesh_service_key_outcome(&outcome);
+                                    break;
+                                }
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "mesh service key reconciliation is still pending"
+                                ),
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
         tracing::info!(
@@ -2763,7 +2773,9 @@ fn run_serve(
         // is the rest of SUBSTRATE-V2; this proves the client + endpoints contract.
         {
             let eps = mackesd_core::substrate::etcd::default_endpoints();
-            if !eps.is_empty() {
+            if !eps.is_empty()
+                && register_process_infrastructure(&worker_names, "etcd_startup_probe")
+            {
                 tokio::spawn(async move {
                     if mackesd_core::substrate::etcd::probe(&eps).await {
                         tracing::info!(endpoints = ?eps, "SUBSTRATE-2: etcd coordination plane reachable");
@@ -3234,6 +3246,22 @@ fn run_serve(
         let wd_base = std::time::Instant::now();
         let wd_beat = Arc::new(std::sync::atomic::AtomicU64::new(0));
         if let Some(iv) = watchdog_interval {
+            let watchdog_registered = register_process_infrastructure(
+                &worker_names,
+                "process_watchdog_control",
+            ) || register_process_infrastructure(
+                &worker_names,
+                "process_watchdog_observation",
+            ) || register_process_infrastructure(&worker_names, "process_watchdog_actions")
+                || register_process_infrastructure(&worker_names, "process_watchdog_data")
+                || register_process_infrastructure(&worker_names, "process_watchdog_compute")
+                || register_process_infrastructure(
+                    &worker_names,
+                    "process_watchdog_integrations",
+                );
+            if !watchdog_registered {
+                anyhow::bail!("systemd watchdog has no canonical process-group owner");
+            }
             tracing::info!(
                 secs = iv.as_secs(),
                 "systemd watchdog armed (dedicated thread + liveness beacon)"

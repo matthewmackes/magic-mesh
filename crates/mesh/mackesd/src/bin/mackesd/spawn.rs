@@ -73,6 +73,35 @@ fn responders_admitted(names: &[&str]) -> bool {
     admitted
 }
 
+/// Admit and census process-local infrastructure before any side effect.
+/// Unknown names, wrong bindings, missing/hostile argv, and non-owner groups
+/// all fail closed.
+pub(crate) fn register_process_infrastructure(
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    name: &'static str,
+) -> bool {
+    let group = match process_group_from_args(std::env::args_os()) {
+        Ok(group) => group,
+        Err(error) => {
+            tracing::error!(%error, name, "refusing process infrastructure without an exact process group");
+            return false;
+        }
+    };
+    let admitted = mackesd_core::worker_role::spec(name).is_some_and(|worker| {
+        worker.spawn_binding == mackesd_core::worker_role::SpawnBinding::ProcessInfrastructure
+            && worker.group == group
+    });
+    if !admitted {
+        tracing::debug!(%group, name, "process infrastructure belongs to another group");
+        return false;
+    }
+    worker_names
+        .lock()
+        .expect("worker_names mutex")
+        .push(name.into());
+    true
+}
+
 /// WL-ARCH-004 — register one role-tiered worker from the single
 /// [`mackesd_core::worker_role::WORKER_REGISTRY`] table.
 ///
@@ -3773,5 +3802,48 @@ mod process_group_thread_admission_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn process_infrastructure_is_admitted_only_by_its_registered_group() {
+        use mackesd_core::worker_role::{SpawnBinding, WorkerGroup};
+
+        let expected = [
+            ("mesh_service_key_reconciler", WorkerGroup::Control),
+            ("etcd_startup_probe", WorkerGroup::Observation),
+            ("process_watchdog_control", WorkerGroup::Control),
+            (
+                "process_watchdog_observation",
+                WorkerGroup::Observation,
+            ),
+            ("process_watchdog_actions", WorkerGroup::Actions),
+            ("process_watchdog_data", WorkerGroup::Data),
+            ("process_watchdog_compute", WorkerGroup::Compute),
+            (
+                "process_watchdog_integrations",
+                WorkerGroup::Integrations,
+            ),
+        ];
+        let registered: BTreeSet<(&str, WorkerGroup)> =
+            mackesd_core::worker_role::worker_specs()
+                .iter()
+                .filter(|worker| worker.spawn_binding == SpawnBinding::ProcessInfrastructure)
+                .map(|worker| (worker.name, worker.group))
+                .collect();
+        assert_eq!(registered, BTreeSet::from(expected));
+
+        for (name, owner) in expected {
+            for group in WorkerGroup::ALL {
+                assert_eq!(
+                    mackesd_core::worker_role::belongs_to_group(name, group),
+                    group == owner,
+                    "{name} escaped from {owner} into {group}"
+                );
+            }
+        }
+        assert!(!mackesd_core::worker_role::belongs_to_group(
+            "uncensused_process_infrastructure",
+            WorkerGroup::Control,
+        ));
     }
 }

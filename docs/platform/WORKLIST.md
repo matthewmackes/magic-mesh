@@ -125,12 +125,12 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`.
-- **Runtime-authority checkpoints (2026-08-09):** Cloud drift consumes typed Workloads and reports missing authority as unknown (machine 9: 19/19); new direct inventory outside
-  `workload_compute` is rejected (`.90`: hostile/repository lint). Cuttlefish and virtual-storage now consume bounded typed projections; their direct libvirt/runtime
-  rosters were deleted, while physical `storage.rs` reads remain. Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-drift-workload-authority-r96.md`,
+- **Runtime-authority checkpoints (2026-08-09):** direct inventory outside `workload_compute` is rejected. Cloud, Cuttlefish, and both storage walls now consume bounded
+  typed Workloads projections; their direct libvirt/Podman runtime rosters and obsolete helpers are deleted. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-runtime-inventory-authority-scanner-r97.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-virtual-storage-workloads-authority-r98.md`.
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-virtual-storage-workloads-authority-r98.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-physical-storage-workloads-authority-r102.md`.
 - **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
   repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
@@ -383,10 +383,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
 - **Action Console checkpoints (2026-08-08/09):** authenticated generation-bound Preview/Commit/Cancel and canonical digest recomputation fail closed; `.50`/`.90` passed:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
-- **Runtime census/aggregate checkpoints (2026-08-09):** uncensused workers fail closed; all starts have one stable registry row. Six group-local maps now publish through
-  distinct owners, and Observation replaces the global projection only after a complete fold; machine 9 passed 50/50. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-unregistered-runtime-refusal-r4.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-registry-census-r9.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-runtime-status-aggregate-ownership-r100.md`.
+- **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts have stable registry rows; uncensused starts fail closed. Six group maps feed one Observation-owned
+  aggregate, while service-key retry, etcd startup probe, and all watchdogs now have exact process owners. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-runtime-status-aggregate-ownership-r100.md`,
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-process-infrastructure-ownership-r103.md`.
 - Remaining work:
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
@@ -1292,6 +1292,9 @@ behavioral evidence is not completion.
 - Remaining work:
   - **Outer-VM runtime authority (2026-08-09):** Cuttlefish consumes one validated Workloads row; unavailable authority and same-ID containers fail closed, and direct
     libvirt roster is deleted. Machine 9 passed 13/13: `docs/platform/evidence/WL-ARCH-010-WL-FUNC-020-2026-08-09-cuttlefish-workload-authority-r101.md`.
+  - **Signed release-artifact admission (2026-08-09):** schema v3 requires one bounded detached signature from the pinned installed MCNF key before provisioning; missing,
+    invalid, substituted, or changed artifacts fail closed. BigBoy passed the real GPG/dearmor package gate:
+    `docs/platform/evidence/WL-FUNC-020-2026-08-09-signed-release-artifact-admission-r102.md`.
   - **S1 importer retry boundary (2026-08-09):** transient persistence/publication failure no longer acknowledges a signed catalog row; terminal refusals still
     advance and the repaired retry publishes exactly once. Machine 9 exact regression passed 1/1:
     `docs/platform/evidence/WL-FUNC-020-2026-08-09-android-import-side-effect-retry-s1-r6.md`.

@@ -150,30 +150,6 @@ is_reviewed_runtime_inventory_candidate() {
       [ "$ordinal" -le 1 ] ;;
     'crates/mesh/mackesd/src/workers/cloud/runner.rs|TOOL_LIBVIRT => ("virsh", vec!["-c", uri.as_str(), "version"], uri.as_str()),')
       [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(uuids) = virsh_output(&["list", "--state-running", "--uuid"]) {')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(blk) = virsh_output(&["domblklist", "--details", &uuid]) {')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|let name = virsh_output(&["domname", &uuid])')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(json) = podman_output(&["ps", "--format", "json", "--filter", "status=running"])')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(mounts) = podman_output(&[')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|bounded_stdout("virsh", args)')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|bounded_stdout("podman", args)')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|fn virsh_output(args: &[&str]) -> Option<String> {')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/storage.rs|fn podman_output(args: &[&str]) -> Option<String> {')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/virtual_storage.rs|if let Some(uuids) = bounded_stdout("virsh", &["list", "--state-running", "--uuid"]) {')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/virtual_storage.rs|if let Some(blk) = bounded_stdout("virsh", &["domblklist", "--details", &uuid]) {')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/virtual_storage.rs|let name = bounded_stdout("virsh", &["domname", &uuid])')
-      [ "$ordinal" -le 1 ] ;;
     'crates/mesh/mackesd/src/workers/virtual_storage.rs|"podman",')
       [ "$ordinal" -le 2 ] ;;
     'crates/mesh/mackesd/src/workers/virtual_storage.rs|let mut cmd = Command::new("podman");')

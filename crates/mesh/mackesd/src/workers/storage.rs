@@ -34,9 +34,10 @@
 //!   node's root/boot/EFI chain, the `/mnt/mesh-storage` backing device, or a
 //!   device backing a running VM/container is [`WallRefusal`]-refused (typed, not
 //!   a confirm). The protected set is read from `/proc/self/mountinfo`
-//!   ([`protected_from_mountinfo`], real); the in-use set is probed from the same
-//!   sources the Instances panel uses (virsh/podman) with an **assume-in-use safe
-//!   default** ([`InUseStatus::Unknown`]) when the probe can't determine.
+//!   ([`protected_from_mountinfo`], real); the in-use wall consumes the sole typed
+//!   Workloads projection and uses an **assume-in-use safe default**
+//!   ([`InUseStatus::Unknown`]) whenever that authority cannot prove all compute
+//!   stopped.
 //! - **Typed arming** (lock 8): the Apply verb carries the operator-typed device
 //!   name; [`check_arming`] refuses on mismatch before a single op runs.
 //! - **Stage-vs-apply drift**: the Apply verb carries the topology the queue was
@@ -61,12 +62,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::workloads::{
+    reject_duplicate_json_keys, workload_state_topic, WorkloadBackend, WorkloadPowerState,
+    WorkloadStateSnapshot, MAX_WORKLOAD_WIRE_BYTES,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use thiserror::Error;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
-use crate::workers::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
+use crate::workers::proc::{status_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 use super::fs_tools::{
     self, CapabilityRefusal, FsToolRunner, LiveFsTools, ResizeDirection, ResizeTarget,
@@ -100,6 +105,10 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Slow heartbeat for the topology mirror republish (between action-triggered
 /// republishes) — keeps the `UDisks2` enumerate off the hot path.
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// A Workloads projection older than two publication heartbeats cannot prove a
+/// destructive physical-storage target is free.
+const WORKLOAD_PROJECTION_MAX_AGE_MS: u64 = 120_000;
 
 // ───────────────────────────── op model ─────────────────────────────
 
@@ -1375,7 +1384,7 @@ pub enum InUseStatus {
     InUseByVm(String),
     /// Backs a running container (a volume/mount).
     InUseByContainer(String),
-    /// The probe could not determine in-use state (no virsh/podman) — treated as
+    /// Typed Workloads authority could not prove the device free — treated as
     /// **in-use** by the wall (the assume-in-use safe default, lock 7).
     Unknown,
 }
@@ -1409,7 +1418,7 @@ pub enum WallRefusal {
     },
     /// In-use state couldn't be verified — refused under the assume-in-use safe
     /// default.
-    #[error("refused: cannot verify {device} is free (no virsh/podman) — assuming in-use")]
+    #[error("refused: cannot verify {device} is free (Workloads authority unavailable or active) — assuming in-use")]
     InUseUnknown {
         /// The device.
         device: String,
@@ -1424,9 +1433,9 @@ pub trait ProtectedDevices: Send + Sync {
     fn protected(&self) -> BTreeMap<String, ProtectedReason>;
 }
 
-/// The "does a running VM/container back this device" probe. Production
-/// [`ComputeInUseProbe`] queries virsh/podman (the same sources the Instances
-/// panel uses); tests inject a snapshot.
+/// The "can typed Workloads authority prove this device free" probe. Production
+/// [`ComputeInUseProbe`] consumes the bounded per-node projection; tests inject
+/// a fixed status.
 pub trait InUseProbe: Send + Sync {
     /// The in-use status of whole-disk device `device`.
     fn status(&self, device: &str) -> InUseStatus;
@@ -1449,12 +1458,12 @@ impl Interlocks {
     }
 
     /// The production interlocks: `/proc/self/mountinfo` protected set + the
-    /// virsh/podman in-use probe.
+    /// typed Workloads in-use probe.
     #[must_use]
-    pub fn production() -> Self {
+    pub fn production(node_id: String) -> Self {
         Self::new(
             Arc::new(MountProtectedDevices::new()),
-            Arc::new(ComputeInUseProbe::new()),
+            Arc::new(ComputeInUseProbe::new(node_id)),
         )
     }
 
@@ -1614,146 +1623,108 @@ pub fn protected_from_mountinfo(text: &str) -> BTreeMap<String, ProtectedReason>
     out
 }
 
-/// A snapshot of which whole disks back running VMs/containers — the pure core of
-/// the in-use wall.
+/// A conservative fold of the typed Workloads projection for the physical-disk
+/// in-use wall.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InUseSnapshot {
-    /// whole-disk device → the VM that backs it.
-    pub vm_backed: BTreeMap<String, String>,
-    /// whole-disk device → the container that backs it.
-    pub container_backed: BTreeMap<String, String>,
+    /// Whether a current, bounded, same-node Workloads snapshot was admitted.
+    pub authority: bool,
+    /// One active VM identity; its adapter path is deliberately not projected.
+    pub active_vm: Option<String>,
+    /// One active container identity; its mount path is deliberately not projected.
+    pub active_container: Option<String>,
 }
 
 impl InUseSnapshot {
-    /// The in-use status of `device` from this snapshot (VM wins over container).
+    /// The in-use status of `device` from this snapshot.
+    ///
+    /// Workloads deliberately omits host backing paths. Therefore any active
+    /// compute unit makes every physical disk unverifiable; only a current
+    /// projection with no active VM/container proves the disk free.
     #[must_use]
-    pub fn status_of(&self, device: &str) -> InUseStatus {
-        if let Some(vm) = self.vm_backed.get(device) {
-            return InUseStatus::InUseByVm(vm.clone());
+    pub fn status_of(&self, _device: &str) -> InUseStatus {
+        if self.authority && self.active_vm.is_none() && self.active_container.is_none() {
+            InUseStatus::Free
+        } else {
+            InUseStatus::Unknown
         }
-        if let Some(c) = self.container_backed.get(device) {
-            return InUseStatus::InUseByContainer(c.clone());
-        }
-        InUseStatus::Free
     }
 }
 
-/// Build an [`InUseSnapshot`] from raw backing paths: each `(vm, source_path)` / `(container, source_path)` pair's source is reduced to its parent whole disk.
+/// Production [`InUseProbe`] over the sole typed Workloads projection.
 ///
-/// Non-block sources (an image file under a filesystem, a named podman volume) map to no
-/// disk and are skipped — the disk-level wall only fires on a device-backed unit; image-
-/// file-at-rest ops are E12-22's concern. Pure.
-#[must_use]
-pub fn in_use_snapshot_from(
-    vm_disks: &[(String, String)],
-    container_mounts: &[(String, String)],
-) -> InUseSnapshot {
-    let mut snap = InUseSnapshot::default();
-    for (vm, source) in vm_disks {
-        if source.starts_with("/dev/") {
-            snap.vm_backed.insert(parent_disk(source), vm.clone());
-        }
-    }
-    for (container, source) in container_mounts {
-        if source.starts_with("/dev/") {
-            snap.container_backed
-                .insert(parent_disk(source), container.clone());
-        }
-    }
-    snap
+/// Workloads does not expose adapter block paths. A current projection therefore
+/// proves a physical disk free only when every VM and container is stopped or
+/// merely defined. Missing, malformed, stale, future, or wrong-node authority
+/// returns [`InUseStatus::Unknown`].
+#[derive(Debug, Clone)]
+pub struct ComputeInUseProbe {
+    node_id: String,
 }
-
-/// Production [`InUseProbe`]: query virsh + podman for the block devices backing running VMs/containers (the same sources the Instances panel uses).
-///
-/// When the tooling is absent the snapshot is `None` and every device probes
-/// [`InUseStatus::Unknown`] — the assume-in-use safe default (lock 7).
-#[derive(Debug, Clone, Default)]
-pub struct ComputeInUseProbe;
 
 impl ComputeInUseProbe {
     /// The production probe.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new(node_id: String) -> Self {
+        Self { node_id }
     }
 
-    /// Snapshot the in-use disks via virsh/podman, or `None` when neither tool is
-    /// usable (⇒ assume-in-use). Reuses [`super::runtime_probe`]'s parsers so
-    /// there's no parallel model. Best-effort + bounded (EFF-20 timeout).
-    fn snapshot(&self) -> Option<InUseSnapshot> {
-        let _ = self;
-        let mut any_tool = false;
-        let mut vm_disks: Vec<(String, String)> = Vec::new();
-        let mut container_mounts: Vec<(String, String)> = Vec::new();
-
-        // ── virsh: running domains → their first disk source path ──
-        if let Some(uuids) = virsh_output(&["list", "--state-running", "--uuid"]) {
-            any_tool = true;
-            for uuid in super::runtime_probe::parse_virsh_uuid_list(&uuids) {
-                if let Some(blk) = virsh_output(&["domblklist", "--details", &uuid]) {
-                    if let Some(src) = super::runtime_probe::parse_virsh_domblklist(&blk) {
-                        let name = virsh_output(&["domname", &uuid])
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(uuid);
-                        vm_disks.push((name, src));
-                    }
-                }
-            }
+    fn snapshot_at(&self, bus_root: Option<&Path>, observed_now: u64) -> InUseSnapshot {
+        let Some(root) = bus_root.map(Path::to_path_buf).or_else(default_bus_root) else {
+            return InUseSnapshot::default();
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return InUseSnapshot::default();
+        };
+        let Ok(Some(message)) = persist.read_latest(&workload_state_topic(&self.node_id)) else {
+            return InUseSnapshot::default();
+        };
+        let Some(body) = message.body.as_deref() else {
+            return InUseSnapshot::default();
+        };
+        if body.len() > MAX_WORKLOAD_WIRE_BYTES || reject_duplicate_json_keys(body).is_err() {
+            return InUseSnapshot::default();
         }
-
-        // ── podman: running containers → their device-backed mounts ──
-        if let Some(json) = podman_output(&["ps", "--format", "json", "--filter", "status=running"])
+        let Ok(snapshot) = serde_json::from_str::<WorkloadStateSnapshot>(body) else {
+            return InUseSnapshot::default();
+        };
+        if snapshot.node != self.node_id
+            || snapshot.validate(observed_now).is_err()
+            || snapshot.observed_at_ms > observed_now
+            || observed_now.saturating_sub(snapshot.observed_at_ms) > WORKLOAD_PROJECTION_MAX_AGE_MS
         {
-            any_tool = true;
-            for c in super::runtime_probe::parse_podman_ps_json(&json) {
-                if let Some(mounts) = podman_output(&[
-                    "inspect",
-                    "--format",
-                    "{{range .Mounts}}{{.Source}}\n{{end}}",
-                    &c.name,
-                ]) {
-                    for src in mounts.lines().map(str::trim).filter(|s| !s.is_empty()) {
-                        container_mounts.push((c.name.clone(), src.to_string()));
-                    }
-                }
-            }
+            return InUseSnapshot::default();
         }
 
-        if any_tool {
-            Some(in_use_snapshot_from(&vm_disks, &container_mounts))
-        } else {
-            None
+        let mut result = InUseSnapshot {
+            authority: true,
+            ..InUseSnapshot::default()
+        };
+        for workload in snapshot.workloads {
+            if matches!(
+                workload.power,
+                WorkloadPowerState::Defined | WorkloadPowerState::Stopped
+            ) {
+                continue;
+            }
+            let identity = workload.workload_id.into_string();
+            match workload.backend {
+                WorkloadBackend::LibvirtVirtqemud if result.active_vm.is_none() => {
+                    result.active_vm = Some(identity);
+                }
+                WorkloadBackend::QuadletSystemd if result.active_container.is_none() => {
+                    result.active_container = Some(identity);
+                }
+                _ => {}
+            }
         }
+        result
     }
 }
 
 impl InUseProbe for ComputeInUseProbe {
     fn status(&self, device: &str) -> InUseStatus {
-        self.snapshot()
-            .map_or(InUseStatus::Unknown, |snap| snap.status_of(device))
-    }
-}
-
-fn virsh_output(args: &[&str]) -> Option<String> {
-    bounded_stdout("virsh", args)
-}
-
-fn podman_output(args: &[&str]) -> Option<String> {
-    bounded_stdout("podman", args)
-}
-
-/// Run `<program> <args>` bounded (EFF-20 timeout), returning stdout on success or
-/// `None` when the tool is absent / errors — so a missing tool degrades to the
-/// assume-in-use default rather than a crash.
-fn bounded_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    let out = output_with_timeout(cmd, DEFAULT_CMD_TIMEOUT).ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        None
+        self.snapshot_at(None, now_ms()).status_of(device)
     }
 }
 
@@ -3137,10 +3108,10 @@ impl StorageWorker {
         Self {
             virtual_storage: super::virtual_storage::VirtualStorage::production(node_id.clone()),
             virtual_enabled: true,
-            node_id,
+            node_id: node_id.clone(),
             udisks: Arc::new(ZbusUDisks2Client::new()),
             executor: Arc::new(UDisks2Executor::new()),
-            interlocks: Arc::new(Interlocks::production()),
+            interlocks: Arc::new(Interlocks::production(node_id.clone())),
             authorizer: Arc::new(ActionAuthorizer::production()),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
@@ -4243,24 +4214,146 @@ mod tests {
         assert_eq!(got.get("/dev/sda"), Some(&ProtectedReason::RootBootEfi));
     }
 
+    fn workload_projection_body(
+        node: &str,
+        observed_at_ms: u64,
+        rows: &[(&str, WorkloadBackend, WorkloadPowerState)],
+    ) -> String {
+        let workloads = rows
+            .iter()
+            .map(|(id, backend, power)| {
+                let failed = matches!(power, WorkloadPowerState::Failed);
+                serde_json::json!({
+                    "schema_version": 1,
+                    "request_id": format!("request-{id}"),
+                    "workload_id": id,
+                    "backend": backend,
+                    "resources": {"vcpu": 1, "memory_mb": 512, "disk_gb": 1},
+                    "generation": 1,
+                    "phase": if failed { "failed" } else { "completed" },
+                    "power": power,
+                    "readiness": "unavailable",
+                    "retryable": false,
+                    "reason": if failed { Some("adapter state uncertain") } else { None },
+                    "remediation": null,
+                    "attachment": null
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema_version": 1,
+            "node": node,
+            "observed_at_ms": observed_at_ms,
+            "workloads": workloads
+        })
+        .to_string()
+    }
+
+    fn publish_workload_body(root: &Path, body: &str) {
+        let persist = Persist::open(root.to_path_buf()).expect("test Bus");
+        persist
+            .write(
+                &workload_state_topic("seat15"),
+                Priority::Default,
+                None,
+                Some(body),
+            )
+            .expect("publish Workloads projection");
+    }
+
     #[test]
-    fn in_use_snapshot_reduces_and_skips_non_block() {
-        let snap = in_use_snapshot_from(
-            &[
-                ("vm-a".into(), "/dev/sdb".into()),
-                ("vm-b".into(), "/var/lib/libvirt/images/x.qcow2".into()), // file → skipped
-            ],
-            &[("ctr".into(), "/dev/sdc1".into())],
+    fn physical_storage_uses_typed_workloads_authority_and_fails_closed() {
+        const NOW: u64 = 1_700_000_000_000;
+        let root = tempfile::tempdir().expect("Bus root");
+        let probe = ComputeInUseProbe::new("seat15".into());
+        let disk = "/dev/sdb";
+
+        assert_eq!(
+            probe.snapshot_at(Some(root.path()), NOW).status_of(disk),
+            InUseStatus::Unknown
+        );
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body(
+                "seat15",
+                NOW,
+                &[
+                    (
+                        "browser-vm",
+                        WorkloadBackend::LibvirtVirtqemud,
+                        WorkloadPowerState::Running,
+                    ),
+                    (
+                        "database-container",
+                        WorkloadBackend::QuadletSystemd,
+                        WorkloadPowerState::Failed,
+                    ),
+                ],
+            ),
+        );
+        let active = probe.snapshot_at(Some(root.path()), NOW);
+        assert_eq!(active.active_vm.as_deref(), Some("browser-vm"));
+        assert_eq!(
+            active.active_container.as_deref(),
+            Some("database-container")
+        );
+        assert_eq!(active.status_of(disk), InUseStatus::Unknown);
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body(
+                "seat15",
+                NOW,
+                &[
+                    (
+                        "browser-vm",
+                        WorkloadBackend::LibvirtVirtqemud,
+                        WorkloadPowerState::Stopped,
+                    ),
+                    (
+                        "database-container",
+                        WorkloadBackend::QuadletSystemd,
+                        WorkloadPowerState::Defined,
+                    ),
+                ],
+            ),
         );
         assert_eq!(
-            snap.status_of("/dev/sdb"),
-            InUseStatus::InUseByVm("vm-a".into())
+            probe.snapshot_at(Some(root.path()), NOW).status_of(disk),
+            InUseStatus::Free
+        );
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body("other-node", NOW, &[]),
         );
         assert_eq!(
-            snap.status_of("/dev/sdc"),
-            InUseStatus::InUseByContainer("ctr".into())
+            probe.snapshot_at(Some(root.path()), NOW).status_of(disk),
+            InUseStatus::Unknown
         );
-        assert_eq!(snap.status_of("/dev/sdd"), InUseStatus::Free);
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body(
+                "seat15",
+                NOW.saturating_sub(WORKLOAD_PROJECTION_MAX_AGE_MS + 1),
+                &[],
+            ),
+        );
+        assert_eq!(
+            probe.snapshot_at(Some(root.path()), NOW).status_of(disk),
+            InUseStatus::Unknown
+        );
+
+        publish_workload_body(
+            root.path(),
+            r#"{"schema_version":1,"schema_version":1,"node":"seat15","observed_at_ms":1700000000000,"workloads":[]}"#,
+        );
+        assert_eq!(
+            probe.snapshot_at(Some(root.path()), NOW).status_of(disk),
+            InUseStatus::Unknown
+        );
     }
 
     // ── arming ──
