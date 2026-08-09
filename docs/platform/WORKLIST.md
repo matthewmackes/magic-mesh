@@ -715,6 +715,11 @@ behavioral evidence is not completion.
   admitting old bytes; future schemas remain untouched and non-regular paths
   still fail closed. Machine 193 passed the exact hostile fixture:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
+- **Weather cache identity checkpoint (2026-08-09):** restart recovery now
+  binds nested current/forecast snapshots to exact host, location generation,
+  point, and timezone; mismatches publish typed unavailable state. Machine 194
+  passed the exact hostile-cache test:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

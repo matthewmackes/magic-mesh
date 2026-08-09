@@ -1053,6 +1053,12 @@ fn cached_current(
         return None;
     }
     let mut snapshot = cache.current.clone()?;
+    if snapshot.host != host
+        || snapshot.location_generation != generation
+        || snapshot.location_point.as_ref() != Some(&location.point)
+    {
+        return None;
+    }
     let observed_at_ms = snapshot.conditions.as_ref()?.observed_at_ms;
     let age = now_ms.saturating_sub(observed_at_ms).max(0);
     if age > MAX_CACHE_AGE_MS {
@@ -1080,6 +1086,13 @@ fn cached_forecast(
         return None;
     }
     let mut snapshot = cache.forecast.clone()?;
+    if snapshot.host != host
+        || snapshot.location_generation != generation
+        || snapshot.location_point.as_ref() != Some(&location.point)
+        || snapshot.time_zone != location.time_zone
+    {
+        return None;
+    }
     let age = now_ms.saturating_sub(snapshot.producer_at_ms).max(0);
     if age > MAX_CACHE_AGE_MS {
         return None;
@@ -1881,6 +1894,57 @@ mod tests {
             expired_forecast.availability,
             WeatherAvailability::Unavailable { .. }
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_refuses_hostile_nested_cache_identity_even_when_envelope_matches() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        let authority = location(7, -71.0589);
+        write_location(&root, &authority);
+
+        let initial = worker(&temp, fixture_probe(24));
+        initial
+            .refresh_once(authority.clone(), true, true)
+            .await
+            .expect("initial refresh");
+        let mut cache = load_cache(&initial.cache_path)
+            .expect("load cache")
+            .expect("cache exists");
+        cache
+            .current
+            .as_mut()
+            .expect("cached current")
+            .location_generation = 6;
+        cache.forecast.as_mut().expect("cached forecast").time_zone = "America/Chicago".into();
+        store_cache(&initial.cache_path, &cache).expect("store hostile cache");
+
+        // At this age the fixture provider is intentionally stale, forcing the
+        // restarted worker through cache recovery without crossing authority.
+        let restarted = worker_at(&temp, fixture_probe(24), NOW + 91 * 60 * 1_000);
+        let outcome = restarted
+            .refresh_once(authority, true, true)
+            .await
+            .expect("hostile cache is rejected without stopping refresh");
+        assert_eq!(outcome.current_fresh, Some(false));
+        assert_eq!(outcome.forecast_fresh, Some(false));
+
+        let current: CurrentWeatherSnapshot =
+            latest(&root, &weather_current_state_topic("workstation-1"));
+        let forecast: WeatherForecastSnapshot =
+            latest(&root, &weather_forecast_state_topic("workstation-1"));
+        assert_eq!(current.location_generation, 7);
+        assert_eq!(forecast.location_generation, 7);
+        assert!(matches!(
+            current.availability,
+            WeatherAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
+            forecast.availability,
+            WeatherAvailability::Unavailable { .. }
+        ));
+        assert!(current.conditions.is_none());
+        assert!(forecast.hourly.is_empty() && forecast.daily.is_empty());
     }
 
     #[cfg(unix)]
