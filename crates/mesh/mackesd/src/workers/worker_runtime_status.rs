@@ -1110,31 +1110,39 @@ mod tests {
     }
 
     fn change_set_request() -> runtime::WorkerChangeSetRequest {
+        let target = runtime::WorkerChangeSetTarget {
+            node_id: "node-a".to_owned(),
+            worker_id: Some("host-state".to_owned()),
+        };
+        let items = vec![
+            runtime::WorkerChangeSetItem {
+                item_id: "item-b".to_owned(),
+                worker_id: "host-state".to_owned(),
+                action: runtime::WorkerAction::Refresh,
+            },
+            runtime::WorkerChangeSetItem {
+                item_id: "item-a".to_owned(),
+                worker_id: "host-state".to_owned(),
+                action: runtime::WorkerAction::Restart,
+            },
+        ];
+        let impact = "refreshes the host observation".to_owned();
+        let recovery = "the worker remains restartable".to_owned();
+        let arming = runtime::WorkerArmingRequirement::Confirmation;
+        let digest =
+            runtime::worker_change_set_digest(&target, 3, &items, &impact, &recovery, arming)
+                .expect("canonical change-set digest");
         runtime::WorkerChangeSetRequest {
             schema_version: runtime::WORKER_RUNTIME_SCHEMA_VERSION,
             request_id: "request-1".to_owned(),
             operation: runtime::WorkerChangeSetOperation::Preview,
-            target: runtime::WorkerChangeSetTarget {
-                node_id: "node-a".to_owned(),
-                worker_id: Some("host-state".to_owned()),
-            },
+            target,
             expected_generation: 3,
-            items: vec![
-                runtime::WorkerChangeSetItem {
-                    item_id: "item-b".to_owned(),
-                    worker_id: "host-state".to_owned(),
-                    action: runtime::WorkerAction::Refresh,
-                },
-                runtime::WorkerChangeSetItem {
-                    item_id: "item-a".to_owned(),
-                    worker_id: "host-state".to_owned(),
-                    action: runtime::WorkerAction::Restart,
-                },
-            ],
-            impact: "refreshes the host observation".to_owned(),
-            recovery: "the worker remains restartable".to_owned(),
-            arming: runtime::WorkerArmingRequirement::Confirmation,
-            digest: format!("sha256:{}", "a".repeat(64)),
+            items,
+            impact,
+            recovery,
+            arming,
+            digest,
             requested_at_ms: 2_000,
             expires_at_ms: 3_000,
             armed_token: None,
@@ -1348,6 +1356,15 @@ mod tests {
         let status = project_status(&contract(), snapshot(), 2_500).expect("status");
         let mut request = change_set_request();
         request.expected_generation = 2;
+        request.digest = runtime::worker_change_set_digest(
+            &request.target,
+            request.expected_generation,
+            &request.items,
+            &request.impact,
+            &request.recovery,
+            request.arming,
+        )
+        .expect("generation-mismatch request remains internally bound");
         assert!(matches!(
             status.admit_change_set(WorkerRuntimeChangeSet::Request(request), 2_500),
             Err(WorkerRuntimeStatusError::ContractSnapshotMismatch(

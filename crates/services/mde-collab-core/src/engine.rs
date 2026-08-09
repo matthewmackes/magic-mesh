@@ -156,8 +156,8 @@ impl CollabEngine {
             ids,
         };
         let events = apply_command(&self.state, cmd, &mut ctx)?;
-        self.clock = ctx.clock;
         self.ingest(&events)?;
+        self.clock = ctx.clock;
         Ok(events)
     }
 
@@ -186,8 +186,8 @@ impl CollabEngine {
             ids,
         };
         let env = ctx.author(space, kind);
-        self.clock = ctx.clock;
         self.ingest(std::slice::from_ref(&env))?;
+        self.clock = ctx.clock;
         Ok(env)
     }
 
@@ -201,6 +201,7 @@ impl CollabEngine {
         }
         let mut outcome = MergeOutcome::default();
         let mut accept: Vec<CollabEventEnvelope> = Vec::new();
+        let mut merged_clock = self.clock;
         for env in incoming {
             if env.schema_version != SCHEMA_VERSION {
                 outcome.dropped_invalid += 1;
@@ -224,12 +225,13 @@ impl CollabEngine {
             }
             // Advance our own clock past the observed one (HLC receive rule) so a
             // subsequent local event still dominates everything we have seen.
-            self.clock = self.clock.merge(env.clock, self.clock.wall_ms);
+            merged_clock = merged_clock.merge(env.clock, merged_clock.wall_ms);
             accept.push(env);
         }
         outcome.accepted = accept.len();
         if !accept.is_empty() {
             self.ingest(&accept)?;
+            self.clock = merged_clock;
         }
         Ok(outcome)
     }
@@ -237,6 +239,11 @@ impl CollabEngine {
     /// Add already-validated events to the in-memory set, refold the domain
     /// aggregate, project them, and advance each author's purge-ack high-water.
     fn ingest(&mut self, events: &[CollabEventEnvelope]) -> Result<()> {
+        // The durable projection is the commit point for both local authoring
+        // and replicated offline replay. Project first: if SQLite rejects the
+        // batch, the live engine must not expose events/state/purge acks that a
+        // restarted engine cannot recover. Everything below is infallible.
+        self.projection.project(events)?;
         for env in events {
             self.events.insert(env.event_id, env.clone());
             self.purge.note_ack(&env.actor, env.clock);
@@ -246,7 +253,6 @@ impl CollabEngine {
         // incrementally per touched space.
         let all: Vec<_> = self.events.values().cloned().collect();
         self.state = DomainState::from_events(&all);
-        self.projection.project(events)?;
         Ok(())
     }
 

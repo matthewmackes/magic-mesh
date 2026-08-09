@@ -114,6 +114,58 @@ fn create_space_makes_the_creator_an_owner() {
 }
 
 #[test]
+fn projection_failure_keeps_local_and_replicated_engine_state_atomic() {
+    let signer = sig(1);
+    let mut ids = SeqIds::new(1);
+    let mut source = engine("alice");
+    let replicated = source
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "offline recovery".into(),
+            },
+            &signer,
+            &mut ids,
+            1_000,
+        )
+        .expect("source creates signed replay corpus");
+
+    let mut local = engine("local");
+    local
+        .projection()
+        .connection()
+        .execute_batch("DROP TABLE members")
+        .expect("inject projection failure");
+    let local_clock = local.clock();
+    local
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "must not leak".into(),
+            },
+            &sig(2),
+            &mut SeqIds::new(100),
+            2_000,
+        )
+        .expect_err("failed durable projection must reject local apply");
+    assert_eq!(local.clock(), local_clock);
+    assert!(local.all_events().is_empty());
+    assert!(local.state().spaces.is_empty());
+
+    let mut peer = engine("peer");
+    peer.projection()
+        .connection()
+        .execute_batch("DROP TABLE members")
+        .expect("inject peer projection failure");
+    let peer_clock = peer.clock();
+    peer.merge(replicated)
+        .expect_err("failed durable projection must reject replicated replay");
+    assert_eq!(peer.clock(), peer_clock);
+    assert!(peer.all_events().is_empty());
+    assert!(peer.state().spaces.is_empty());
+}
+
+#[test]
 fn ai_suggestion_requests_are_scoped_and_cancelable_sidecar_intents() {
     // WL-FUNC-011 DigitalOcean boundary: AI requests produce no signed event
     // until the daemon/provider sidecar offers a suggestion, but the core still

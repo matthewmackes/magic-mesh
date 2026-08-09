@@ -384,6 +384,8 @@ behavioral evidence is not completion.
   requests and renders typed audit and partial-failure results; focused `.50`
   gates passed 4/4. Live daemon round-trip and responsive captures remain.
   Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`.
+- **Action digest checkpoint (2026-08-09):** staged intent is canonically recomputed and tampering fails before routing; `.90` passed 9 contract and 15 daemon tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - Remaining work:
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
@@ -515,6 +517,8 @@ behavioral evidence is not completion.
   Editor, Code, Teams, and Mesh Teams navigation contracts now fail closed;
   canonical Collaboration routes remain. BigBoy passed 25/25 bridge tests:
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-legacy-route-admission-r2.md`.
+- **Projection atomicity checkpoint (2026-08-09):** failed SQLite projection leaves local and replicated clocks/state unchanged; `.50` passed 98/98:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-collab-projection-atomicity-r3.md`.
 - Remaining work:
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.

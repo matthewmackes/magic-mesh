@@ -1426,9 +1426,17 @@ pub fn worker_change_set_digest(
         MAX_WORKER_TEXT_BYTES,
         false,
     )?;
-    let canonical =
-        serde_json::to_vec(&(target, expected_generation, items, impact, recovery, arming))
-            .map_err(|_| WorkerRuntimeContractError::MalformedWire)?;
+    let mut canonical_items = items.to_vec();
+    canonical_items.sort_by(|left, right| left.item_id.cmp(&right.item_id));
+    let canonical = serde_json::to_vec(&(
+        target,
+        expected_generation,
+        canonical_items,
+        impact,
+        recovery,
+        arming,
+    ))
+    .map_err(|_| WorkerRuntimeContractError::MalformedWire)?;
     let digest = Sha256::digest(canonical);
     Ok(format!("sha256:{digest:x}"))
 }
@@ -1591,6 +1599,19 @@ impl WorkerChangeSetRequest {
             false,
         )?;
         validate_digest("change_set_request.digest", &self.digest)?;
+        let expected_digest = worker_change_set_digest(
+            &self.target,
+            self.expected_generation,
+            &self.items,
+            &self.impact,
+            &self.recovery,
+            self.arming,
+        )?;
+        if self.digest != expected_digest {
+            return Err(WorkerRuntimeContractError::InvalidDigest(
+                "change_set_request.digest_mismatch",
+            ));
+        }
         validate_timestamp("change_set_request.requested_at_ms", self.requested_at_ms)?;
         validate_timestamp("change_set_request.expires_at_ms", self.expires_at_ms)?;
         if self.expires_at_ms <= self.requested_at_ms
@@ -2128,23 +2149,30 @@ mod tests {
     }
 
     fn request() -> WorkerChangeSetRequest {
+        let target = WorkerChangeSetTarget {
+            node_id: "seat-15".to_owned(),
+            worker_id: Some("host-state".to_owned()),
+        };
+        let items = vec![WorkerChangeSetItem {
+            item_id: "item-1".to_owned(),
+            worker_id: "host-state".to_owned(),
+            action: WorkerAction::Refresh,
+        }];
+        let impact = "refresh one bounded observation";
+        let recovery = "retain the previous admitted snapshot";
+        let arming = WorkerArmingRequirement::None;
+        let digest = worker_change_set_digest(&target, 1, &items, impact, recovery, arming)
+            .expect("canonical digest");
         WorkerChangeSetRequest::new(
             "request-1",
             WorkerChangeSetOperation::Preview,
-            WorkerChangeSetTarget {
-                node_id: "seat-15".to_owned(),
-                worker_id: Some("host-state".to_owned()),
-            },
+            target,
             1,
-            vec![WorkerChangeSetItem {
-                item_id: "item-1".to_owned(),
-                worker_id: "host-state".to_owned(),
-                action: WorkerAction::Refresh,
-            }],
-            "refresh one bounded observation",
-            "retain the previous admitted snapshot",
-            WorkerArmingRequirement::None,
-            format!("sha256:{}", "a".repeat(64)),
+            items,
+            impact,
+            recovery,
+            arming,
+            digest,
             10_000,
             20_000,
         )
@@ -2419,6 +2447,44 @@ mod tests {
                 request.arming,
             )
             .expect("changed digest")
+        );
+
+        let mut tampered = request.clone();
+        tampered.items[0].action = WorkerAction::Stop;
+        assert_eq!(
+            tampered.validate(),
+            Err(WorkerRuntimeContractError::InvalidDigest(
+                "change_set_request.digest_mismatch"
+            ))
+        );
+
+        let mut first = request.items.clone();
+        first.push(WorkerChangeSetItem {
+            item_id: "item-0".to_owned(),
+            worker_id: "host-state".to_owned(),
+            action: WorkerAction::Restart,
+        });
+        let mut reversed = first.clone();
+        reversed.reverse();
+        assert_eq!(
+            worker_change_set_digest(
+                &request.target,
+                request.expected_generation,
+                &first,
+                &request.impact,
+                &request.recovery,
+                request.arming,
+            )
+            .expect("first order digest"),
+            worker_change_set_digest(
+                &request.target,
+                request.expected_generation,
+                &reversed,
+                &request.impact,
+                &request.recovery,
+                request.arming,
+            )
+            .expect("reversed order digest")
         );
     }
 
