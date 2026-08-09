@@ -553,6 +553,20 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Resolve the daemon's Bus spool even when it starts without a user home.
+///
+/// `mde_bus::default_data_dir` intentionally returns `None` in that service
+/// context and documents the system spool as the fallback.  Keeping that
+/// fallback here prevents the readiness authority from disappearing for the
+/// lifetime of mackesd merely because HOME/XDG were absent at process start.
+fn default_bus_root() -> PathBuf {
+    bus_root_or_system(mde_bus::default_data_dir())
+}
+
+fn bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 #[async_trait::async_trait]
 impl Worker for BootReadinessWorker {
     fn name(&self) -> &'static str {
@@ -560,10 +574,7 @@ impl Worker for BootReadinessWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = mde_bus::default_data_dir() else {
-            tracing::debug!("boot_readiness: no bus data dir; worker idle");
-            return Ok(());
-        };
+        let bus_root = default_bus_root();
         let mut probe_backoff = FailureBackoff::default();
         let mut ping_backoff = FailureBackoff::default();
         let mut service_backoff = FailureBackoff::default();
@@ -662,6 +673,18 @@ impl Worker for BootReadinessWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bus_root_has_the_documented_system_fallback() {
+        assert_eq!(
+            bus_root_or_system(None),
+            PathBuf::from("/run/mde-bus")
+        );
+        assert_eq!(
+            bus_root_or_system(Some(PathBuf::from("/tmp/explicit-bus"))),
+            PathBuf::from("/tmp/explicit-bus")
+        );
+    }
 
     fn val(v: &serde_json::Value, i: usize, k: &str) -> String {
         v["steps"][i][k].as_str().unwrap_or("").to_string()

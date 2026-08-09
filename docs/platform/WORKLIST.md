@@ -1650,6 +1650,11 @@ behavioral evidence is not completion.
   recovers from the durable canonical publication floor; machine 193 passed the
   exact rollback fixture:
   `docs/platform/evidence/WL-CRIT-007-WL-UX-013-2026-08-09-health-generation-restart-r17.md`.
+- **Boot Readiness Bus checkpoint (2026-08-09):** service startup without a
+  user data root now selects the documented shared `/run/mde-bus` spool instead
+  of permanently terminating the readiness authority; machine 193 passed the
+  exact fallback test:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-boot-readiness-bus-fallback-r18.md`.
 - **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:
