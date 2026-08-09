@@ -1504,6 +1504,32 @@ fn session_bus_root(override_root: Option<PathBuf>, default_root: Option<PathBuf
         .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionBusIdentity {
+    root: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+fn session_bus_identity(root: &Path) -> Result<SessionBusIdentity, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let index = root.join("index.sqlite");
+    let metadata = std::fs::metadata(&index)
+        .map_err(|error| format!("session Bus index {} unavailable: {error}", index.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "session Bus index {} is not a regular file",
+            index.display()
+        ));
+    }
+    Ok(SessionBusIdentity {
+        root: root.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1599,6 +1625,34 @@ impl SessionBrokerWorker {
         session_bus_root(self.bus_root_override.clone(), default_bus_root())
     }
 
+    fn open_bus(&self) -> Result<(PathBuf, Persist, SessionBusIdentity), String> {
+        let root = self.bus_root();
+        let persist = Persist::open(root.clone())
+            .map_err(|error| format!("open session Bus {}: {error}", root.display()))?;
+        let identity = session_bus_identity(&root)?;
+        Ok((root, persist, identity))
+    }
+
+    /// A replaced index is a new transient ingress boundary. Capture both tails
+    /// before installing its identity so retained lifecycle and runtime rows can
+    /// never replay against the already-converged roster.
+    fn activate_replacement(
+        &self,
+        persist: &Persist,
+        identity: &SessionBusIdentity,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        let action_tail = persist
+            .latest_ulid(ACTION_TOPIC)
+            .map_err(|error| format!("prime session action tail: {error}"))?;
+        let runtime_tail = persist
+            .latest_ulid(APP_VM_RUNTIME_TOPIC)
+            .map_err(|error| format!("prime App VM runtime tail: {error}"))?;
+        if session_bus_identity(&identity.root)? != *identity {
+            return Err("session Bus changed during replacement activation".to_string());
+        }
+        Ok((action_tail, runtime_tail))
+    }
+
     /// Only the elected node converges the shared plane (no-fixed-center: any
     /// eligible node can be it, the elected one writes). Reuses the shared lock.
     fn is_leader(&self) -> bool {
@@ -1652,10 +1706,10 @@ impl Worker for SessionBrokerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = self.bus_root();
         // Read the FULL action log from the start (unlike `scheduler`, which primes
         // past the backlog): a session's state is a fold of the whole log, so a
         // (re)start must rebuild the complete roster before it converges.
+        let mut active_bus: Option<SessionBusIdentity> = None;
         let mut cursor: Option<String> = None;
         let mut runtime_cursor: Option<String> = None;
         let mut roster: BTreeMap<SessionId, VdiSession> = BTreeMap::new();
@@ -1664,6 +1718,25 @@ impl Worker for SessionBrokerWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
+                    let (bus_root, persist, identity) = match self.open_bus() {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            tracing::debug!(%error, "session_broker: Bus unavailable; convergence deferred");
+                            continue;
+                        }
+                    };
+                    if active_bus.as_ref().is_some_and(|active| active != &identity) {
+                        let (action_tail, evidence_tail) = match self.activate_replacement(&persist, &identity) {
+                            Ok(tails) => tails,
+                            Err(error) => {
+                                tracing::debug!(%error, "session_broker: replacement Bus activation deferred");
+                                continue;
+                            }
+                        };
+                        cursor = action_tail;
+                        runtime_cursor = evidence_tail;
+                    }
+                    active_bus = Some(identity);
                     // Fold the whole session log into the roster, then converge.
                     if let Err(error) = drain(
                         &bus_root,
@@ -3310,5 +3383,135 @@ mod tests {
             .expect("shutdown must interrupt the worker")
             .expect("worker task")
             .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn late_and_replaced_bus_preserves_roster_skips_retained_and_applies_forward() {
+        use mde_bus::hooks::config::Priority;
+
+        let fixture = tempfile::tempdir().expect("session replacement fixture");
+        let bus_root = fixture.path().join("bus");
+        std::fs::write(&bus_root, b"block initial Bus open").expect("block Bus");
+        let workgroup = tempfile::tempdir().expect("session workgroup");
+        let store = FakeStore::default();
+        let rows = Arc::clone(&store.rows);
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            fixture.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let mut worker = SessionBrokerWorker::new(
+            workgroup.path().to_path_buf(),
+            "peer:session-recovery".to_string(),
+        )
+        .with_store(Box::new(store))
+        .with_bus_root(bus_root.clone())
+        .with_authorizer(authorizer)
+        .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        let staged = fixture.path().join("late-bus");
+        let late = Persist::open(staged.clone()).expect("stage late Bus");
+        late.write(
+            ACTION_TOPIC,
+            Priority::Default,
+            None,
+            Some(&signed_body(
+                &SessionRequest::Open {
+                    id: "replacement-session".into(),
+                    serving_peer: "peer:session-recovery".into(),
+                    vm_id: "vm-replacement".into(),
+                    client_peer: "peer:client".into(),
+                    profile: None,
+                },
+                "late-open",
+            )),
+        )
+        .expect("write late open");
+        drop(late);
+        std::fs::remove_file(&bus_root).expect("remove blocker");
+        std::fs::rename(&staged, &bus_root).expect("install late Bus");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rows
+                    .lock()
+                    .expect("rows")
+                    .contains_key("replacement-session")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late Bus action converges");
+
+        let replacement_root = fixture.path().join("replacement-bus");
+        let replacement = Persist::open(replacement_root.clone()).expect("replacement Bus");
+        replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_body(
+                    &SessionRequest::Close {
+                        id: "replacement-session".into(),
+                    },
+                    "retained-close",
+                )),
+            )
+            .expect("retained close");
+        drop(replacement);
+        std::fs::rename(&bus_root, fixture.path().join("retired-bus")).expect("retire prior Bus");
+        std::fs::rename(&replacement_root, &bus_root).expect("install replacement Bus");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            rows.lock()
+                .expect("rows")
+                .contains_key("replacement-session"),
+            "retained replacement action must not close a live session"
+        );
+
+        Persist::open(bus_root.clone())
+            .expect("open replacement")
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_body(
+                    &SessionRequest::Active {
+                        id: "replacement-session".into(),
+                    },
+                    "forward-active",
+                )),
+            )
+            .expect("forward active");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if rows
+                    .lock()
+                    .expect("rows")
+                    .get("replacement-session")
+                    .is_some_and(|session| session.state == SessionState::Active)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forward action converges");
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("join")
+            .expect("worker");
     }
 }

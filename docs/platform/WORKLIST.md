@@ -202,10 +202,9 @@ behavioral evidence is not completion.
 - **Compute firewall outcome checkpoint (2026-08-09):** root-owned result journaling, restart-safe reply recovery, honest partial/failed projections, and exact Mesh
   removal identity passed machine 194:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-firewall-outcome-r18.md`.
-- **PTY Bus recovery checkpoint (2026-08-09):** one broker survives a late or
-  unreadable Bus, atomically skips retained opens, and executes the first request
-  on post-activation peer topics; machine 194 passed the focused recovery gate:
-  `docs/platform/evidence/WL-ARCH-010-WL-UX-012-2026-08-09-pty-bus-recovery-r24.md`.
+- **PTY/session broker recovery checkpoints (2026-08-09):** both survive late/replaced Bus storage, skip retained transient opens/lifecycle rows, and execute forward work:
+  `docs/platform/evidence/WL-ARCH-010-WL-UX-012-2026-08-09-pty-bus-recovery-r24.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`.
   1. S1 Inventory authorities and remove reachability.
      - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
      - Inputs: repository search, CI authority scan, current evidence.
@@ -431,11 +430,10 @@ behavioral evidence is not completion.
   skips retained actions, and executes one forward signed action exactly once.
   BigBoy passed three exact recovery tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
-- **Copilot Bus recovery checkpoint (2026-08-09):** Copilot now survives late
-  Bus availability, treats tail-cursor priming as part of activation, skips
-  retained asks, and answers one forward signed ask exactly once. Machine 196
-  passed three exact recovery tests:
+- **Copilot Bus recovery checkpoint (2026-08-09):** late activation skips retained asks and answers one forward signed ask exactly once; machine 196 passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
+- **Session broker replacement recovery (2026-08-09):** roster-preserving dual-tail activation skips retained lifecycle/runtime rows; machine 196 passed exact gates:
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`.
 - **Media-source Bus recovery checkpoint (2026-08-09):** discovery now waits
   through late shared storage, then starts mDNS and immediately publishes the
   honest merged roster without daemon restart. Machine 193 passed two exact
@@ -1832,10 +1830,9 @@ behavioral evidence is not completion.
   and defers actions when the authorization mirror is unreadable. Machine 193
   passed two exact tests:
   `docs/platform/evidence/WL-ARCH-009-WL-CRIT-007-2026-08-09-host-state-bus-recovery-r33.md`.
-- **Session Bus-loss checkpoint (2026-08-09):** an unreadable action log now
-  defers convergence instead of fabricating an empty roster and deleting live
-  sessions; machine 193 passed two exact safety/fallback tests:
-  `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-bus-loss-r19.md`.
+- **Session Bus recovery checkpoints (2026-08-09):** unreadable storage defers convergence; late/replaced indexes preserve the live roster, skip retained rows, and admit
+  forward actions. Machines 193/196 passed focused gates: `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-bus-loss-r19.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`.
 - **Session-roaming Bus checkpoint (2026-08-09):** roaming now retries late Bus
   startup, folds queued policy after recovery, and defers destructive
   convergence whenever the action log is unreadable. BigBoy passed three exact
