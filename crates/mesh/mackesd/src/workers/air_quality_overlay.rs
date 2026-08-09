@@ -520,6 +520,7 @@ fn io_other(error: impl std::fmt::Display) -> io::Error {
 #[derive(Debug, Clone, Copy)]
 struct ApplyOutcome {
     success: bool,
+    publication_committed: bool,
     retry_after: Option<Duration>,
     reload_key: bool,
 }
@@ -530,7 +531,9 @@ pub struct AirQualityOverlayWorker {
     enabled: bool,
     probe: Option<Arc<dyn AirQualityProbe>>,
     key_source: Arc<dyn ApiKeySource>,
-    bus_root: Option<PathBuf>,
+    /// Explicit override. Without one, each transaction resolves the current
+    /// user Bus root and falls back to the canonical system spool.
+    bus_root_override: Option<PathBuf>,
 }
 
 impl AirQualityOverlayWorker {
@@ -543,7 +546,7 @@ impl AirQualityOverlayWorker {
             enabled: env_default_enabled(ENABLED_ENV),
             probe: None,
             key_source: Arc::new(SealedApiKeySource),
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
         }
     }
 
@@ -555,30 +558,47 @@ impl AirQualityOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override Bus access. `None` restores per-transaction production
+    /// resolution; it no longer freezes this worker in a disabled state.
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_root_override = root;
         self
     }
 
-    fn current_context(&self) -> Option<AirQualityContext> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
-        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
-        validated_vehicle_context(&vehicle, &self.host, now_ms())
+    fn bus_root(&self) -> PathBuf {
+        air_quality_bus_root(self.bus_root_override.clone())
     }
 
-    fn publish(&self, snapshot: &AirQualitySnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
+    /// `Ok(None)` is reserved for a successfully read, genuinely absent,
+    /// stale, or unsupported vehicle fix. Bus/open/read/decode failures defer
+    /// the pass without publishing a false empty status.
+    fn current_context(&self) -> io::Result<Option<AirQualityContext>> {
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
+        let Some(message) = persist.read_latest(&topic).map_err(io_other)? else {
+            return Ok(None);
+        };
+        let body = message
+            .body
+            .ok_or_else(|| io::Error::other("vehicle context message has no body"))?;
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
+        Ok(validated_vehicle_context(&vehicle, &self.host, now_ms()))
+    }
+
+    fn publish(&self, snapshot: &AirQualitySnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        persist
+            .write(
                 &air_quality_state_topic(&self.host),
-                snapshot,
-            );
-        }
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
     }
 
     fn status_snapshot(
@@ -611,15 +631,26 @@ impl AirQualityOverlayWorker {
         last_good: &mut Option<AirQualitySnapshot>,
     ) -> ApplyOutcome {
         match result {
-            Ok(snapshot) => {
-                self.publish(&snapshot);
-                *last_good = Some(snapshot);
-                ApplyOutcome {
-                    success: true,
-                    retry_after: None,
-                    reload_key: false,
+            Ok(snapshot) => match self.publish(&snapshot) {
+                Ok(()) => {
+                    *last_good = Some(snapshot);
+                    ApplyOutcome {
+                        success: true,
+                        publication_committed: true,
+                        retry_after: None,
+                        reload_key: false,
+                    }
                 }
-            }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, %error, "AirNow snapshot publication failed; refresh remains uncommitted");
+                    ApplyOutcome {
+                        success: false,
+                        publication_committed: false,
+                        retry_after: None,
+                        reload_key: false,
+                    }
+                }
+            },
             Err(error) => {
                 // Never expose retained station readings after a failed
                 // refresh: they belong to the previous query context and
@@ -639,15 +670,26 @@ impl AirQualityOverlayWorker {
                 } else {
                     format!("AirNow AQI refresh unavailable; readings withheld: {error}")
                 };
-                self.publish(&self.status_snapshot(
+                match self.publish(&self.status_snapshot(
                     AirNowAvailability::Ready,
                     Some(context),
                     reason,
-                ));
-                ApplyOutcome {
-                    success: false,
-                    retry_after: error.retry_after,
-                    reload_key: error.reload_key,
+                )) {
+                    Ok(()) => ApplyOutcome {
+                        success: false,
+                        publication_committed: true,
+                        retry_after: error.retry_after,
+                        reload_key: error.reload_key,
+                    },
+                    Err(publish_error) => {
+                        tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, error = %publish_error, "AirNow degraded publication failed; provider outcome remains uncommitted");
+                        ApplyOutcome {
+                            success: false,
+                            publication_committed: false,
+                            retry_after: None,
+                            reload_key: false,
+                        }
+                    }
                 }
             }
         }
@@ -720,6 +762,14 @@ fn validated_vehicle_context(
     validate_context(context).ok().map(|()| context)
 }
 
+fn air_quality_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    air_quality_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn air_quality_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 #[async_trait::async_trait]
 impl Worker for AirQualityOverlayWorker {
     fn name(&self) -> &'static str {
@@ -748,49 +798,84 @@ impl Worker for AirQualityOverlayWorker {
                     }
                     Ok(None) => {
                         if !unconfigured_published {
-                            self.publish(&AirQualitySnapshot::unconfigured(&self.host, now_ms()));
-                            unconfigured_published = true;
+                            match self
+                                .publish(&AirQualitySnapshot::unconfigured(&self.host, now_ms()))
+                            {
+                                Ok(()) => {
+                                    unconfigured_published = true;
+                                    retry = POLL;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, %error, "AirNow unconfigured status publication failed");
+                                }
+                            }
                         }
+                        let delay = if unconfigured_published { POLL } else { retry };
                         tokio::select! {
                             () = shutdown.wait() => break,
-                            () = tokio::time::sleep(POLL) => {}
+                            () = tokio::time::sleep(delay) => {}
                         }
                         continue;
                     }
                     Err(error) => {
-                        self.publish(&self.status_snapshot(
-                            AirNowAvailability::SecretStoreError,
-                            None,
-                            error.to_string(),
-                        ));
+                        let published = self
+                            .publish(&self.status_snapshot(
+                                AirNowAvailability::SecretStoreError,
+                                None,
+                                error.to_string(),
+                            ))
+                            .is_ok();
+                        if !published {
+                            tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, "AirNow secret-store status publication failed");
+                        }
+                        let delay = if published { POLL } else { retry };
                         tokio::select! {
                             () = shutdown.wait() => break,
-                            () = tokio::time::sleep(POLL) => {}
+                            () = tokio::time::sleep(delay) => {}
                         }
                         continue;
                     }
                 }
             }
-            let Some(context) = self.current_context() else {
-                if !no_fix_published {
-                    let unavailable =
-                        ProbeFailure::other("fresh same-host US vehicle fix unavailable");
-                    // A missing fix is a hard context boundary. Publish an
-                    // empty status so a prior-location snapshot, including
-                    // one left on the Bus across a worker restart, is
-                    // immediately retracted. `last_good` remains private.
-                    self.publish(&self.status_snapshot(
-                        AirNowAvailability::Ready,
-                        None,
-                        unavailable.to_string(),
-                    ));
-                    no_fix_published = true;
+            let context = match self.current_context() {
+                Ok(Some(context)) => context,
+                Ok(None) => {
+                    if !no_fix_published {
+                        let unavailable =
+                            ProbeFailure::other("fresh same-host US vehicle fix unavailable");
+                        // A successfully read missing/stale fix is a hard
+                        // context boundary. Commit an empty public status
+                        // before advancing the suppression flag or cache.
+                        match self.publish(&self.status_snapshot(
+                            AirNowAvailability::Ready,
+                            None,
+                            unavailable.to_string(),
+                        )) {
+                            Ok(()) => {
+                                no_fix_published = true;
+                                last_good = None;
+                                retry = POLL;
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, %error, "AirNow no-fix status publication failed");
+                            }
+                        }
+                    }
+                    let delay = if no_fix_published { POLL } else { retry };
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(POLL) => {}
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, %error, "vehicle context read failed; AirNow pass deferred");
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(retry) => {}
+                    }
+                    continue;
                 }
-                continue;
             };
             no_fix_published = false;
             let Some(result) = self
@@ -803,7 +888,62 @@ impl Worker for AirQualityOverlayWorker {
             else {
                 break;
             };
-            let outcome = self.apply_result(result, context, &mut last_good);
+            // The provider result is staged only. Fresh-open and decode the
+            // exact context again after the blocking task so movement, loss,
+            // Bus replacement, or a read fault cannot admit stale AQI.
+            let outcome = match self.current_context() {
+                Ok(Some(current)) if current == context => {
+                    self.apply_result(result, current, &mut last_good)
+                }
+                Ok(Some(current)) => self.apply_result(
+                    Err(ProbeFailure::other(
+                        "vehicle context changed while AirNow query was in flight",
+                    )),
+                    current,
+                    &mut last_good,
+                ),
+                Ok(None) => {
+                    let unavailable =
+                        ProbeFailure::other("fresh same-host US vehicle fix unavailable");
+                    match self.publish(&self.status_snapshot(
+                        AirNowAvailability::Ready,
+                        None,
+                        unavailable.to_string(),
+                    )) {
+                        Ok(()) => {
+                            no_fix_published = true;
+                            last_good = None;
+                            ApplyOutcome {
+                                success: false,
+                                publication_committed: true,
+                                retry_after: None,
+                                reload_key: false,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, %error, "post-fetch AirNow no-fix status publication failed");
+                            ApplyOutcome {
+                                success: false,
+                                publication_committed: false,
+                                retry_after: None,
+                                reload_key: false,
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::air_quality_overlay", host = %self.host, %error, "post-fetch vehicle context read failed; AirNow result discarded");
+                    ApplyOutcome {
+                        success: false,
+                        publication_committed: false,
+                        retry_after: None,
+                        reload_key: false,
+                    }
+                }
+            };
+            if outcome.publication_committed {
+                unconfigured_published = false;
+            }
             if outcome.reload_key && self.probe.is_none() {
                 probe = None;
             }
@@ -814,8 +954,10 @@ impl Worker for AirQualityOverlayWorker {
             };
             retry = if outcome.success {
                 POLL
-            } else {
+            } else if outcome.publication_committed {
                 retry.saturating_mul(2).min(RETRY_MAX)
+            } else {
+                retry
             };
             tokio::select! {
                 () = shutdown.wait() => break,
@@ -846,6 +988,8 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use mackes_mesh_types::vehicle::{GpsFix, VehicleState};
     use mde_bus::persist::Persist;
     use serde_json::json;
@@ -859,6 +1003,53 @@ mod tests {
             latitude: 35.78,
             longitude: -78.64,
         }
+    }
+
+    fn vehicle_state(context: AirQualityContext) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude: context.latitude,
+            longitude: context.longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn publish_vehicle(root: PathBuf, vehicle: &VehicleState) {
+        let body = serde_json::to_string(vehicle).expect("vehicle json");
+        Persist::open(root)
+            .expect("bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("vehicle write");
+    }
+
+    fn current_schema_fixture(fetched_at_ms: i64) -> String {
+        let observed = DateTime::<Utc>::from_timestamp_millis(fetched_at_ms)
+            .expect("timestamp")
+            .format("%Y-%m-%dT%H:%M")
+            .to_string();
+        json!([{
+            "Latitude": 35.7829,
+            "Longitude": -78.5742,
+            "UTC": observed,
+            "Parameter": "PM25",
+            "AQI": 92,
+            "Category": 2,
+            "SiteName": "Millbrook School",
+            "AgencyName": "North Carolina DAQ",
+            "FullAQSCode": "840371830014"
+        }])
+        .to_string()
     }
 
     fn official_schema_fixture() -> String {
@@ -998,6 +1189,189 @@ mod tests {
     }
 
     #[test]
+    fn late_and_replaced_bus_are_reopened_per_transaction() {
+        assert_eq!(
+            air_quality_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker =
+            AirQualityOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        assert!(worker.current_context().is_err());
+
+        std::fs::remove_file(&root).expect("remove blocking file");
+        publish_vehicle(root.clone(), &vehicle_state(context()));
+        assert_eq!(worker.current_context().expect("late bus"), Some(context()));
+
+        let retired = temp.path().join("retired-bus");
+        std::fs::rename(&root, &retired).expect("replace bus");
+        let moved = AirQualityContext {
+            latitude: 36.16,
+            longitude: -86.78,
+        };
+        publish_vehicle(root, &vehicle_state(moved));
+        assert_eq!(
+            worker.current_context().expect("replacement bus"),
+            Some(moved)
+        );
+    }
+
+    struct CountingProbe(Arc<AtomicUsize>);
+
+    impl AirQualityProbe for CountingProbe {
+        fn fetch(
+            &self,
+            _context: AirQualityContext,
+            fetched_at_ms: i64,
+        ) -> Result<String, ProbeFailure> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(current_schema_fixture(fetched_at_ms))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_context_read_defers_without_fetch_or_publication() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        Persist::open(root.clone())
+            .expect("bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{malformed"),
+            )
+            .expect("malformed context write");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = AirQualityOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()))
+            .with_probe(Arc::new(CountingProbe(calls.clone())));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(Persist::open(root)
+            .expect("bus")
+            .read_latest(&air_quality_state_topic("rig-1"))
+            .expect("air quality read")
+            .is_none());
+    }
+
+    struct BlockingProbe {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl AirQualityProbe for BlockingProbe {
+        fn fetch(
+            &self,
+            _context: AirQualityContext,
+            fetched_at_ms: i64,
+        ) -> Result<String, ProbeFailure> {
+            self.started.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(current_schema_fixture(fetched_at_ms))
+        }
+    }
+
+    #[tokio::test]
+    async fn post_fetch_context_change_withholds_stale_station_result() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        publish_vehicle(root.clone(), &vehicle_state(context()));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let probe = BlockingProbe {
+            started: started.clone(),
+            release: release.clone(),
+        };
+        let mut worker = AirQualityOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()))
+            .with_probe(Arc::new(probe));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "fetch did not start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let moved = AirQualityContext {
+            latitude: 36.16,
+            longitude: -86.78,
+        };
+        publish_vehicle(root.clone(), &vehicle_state(moved));
+        release.store(true, Ordering::Release);
+
+        let topic = air_quality_state_topic("rig-1");
+        let snapshot = loop {
+            if let Some(body) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+                .and_then(|message| message.body)
+            {
+                break serde_json::from_str::<AirQualitySnapshot>(&body).expect("snapshot");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "post-fetch context result was not published"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+
+        assert!(snapshot.stations.is_empty());
+        assert_eq!(snapshot.fetched_at_ms, None);
+        assert_eq!(snapshot.query_latitude, Some(moved.latitude));
+        assert_eq!(snapshot.query_longitude, Some(moved.longitude));
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("context changed")));
+    }
+
+    #[test]
+    fn write_failure_remains_uncommitted_and_corrects_forward_once() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker =
+            AirQualityOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let snapshot = parse_snapshot("rig-1", context(), &official_schema_fixture(), NOW_MS)
+            .expect("snapshot");
+        let mut last_good = None;
+
+        let failed = worker.apply_result(Ok(snapshot.clone()), context(), &mut last_good);
+        assert!(!failed.success);
+        assert!(!failed.publication_committed);
+        assert!(last_good.is_none());
+
+        std::fs::remove_file(&root).expect("recover bus");
+        let corrected = worker.apply_result(Ok(snapshot), context(), &mut last_good);
+        assert!(corrected.success);
+        assert!(corrected.publication_committed);
+        assert!(last_good.is_some());
+        assert_eq!(
+            Persist::open(root)
+                .expect("bus")
+                .list_since(&air_quality_state_topic("rig-1"), None)
+                .expect("rows")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn failed_refresh_withholds_stations_but_keeps_private_last_good() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
@@ -1132,7 +1506,7 @@ mod tests {
             .with_bus_root(Some(root.clone()));
         let stale = parse_snapshot("rig-1", context(), &official_schema_fixture(), NOW_MS)
             .expect("snapshot");
-        worker.publish(&stale);
+        worker.publish(&stale).expect("seed stale snapshot");
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
