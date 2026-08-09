@@ -389,6 +389,13 @@ impl Worker for AppCatalogWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // No signed catalog can be admitted without the locally provisioned
+        // public trust anchor. Stay fully quiescent instead of opening Bus
+        // state and waking every second to repeat the same unavailable result.
+        if self.config.is_none() {
+            shutdown.wait().await;
+            return Ok(());
+        }
         let mut cursor = None;
         let mut current = None;
         let mut watermark = None;
@@ -1414,6 +1421,37 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("must-not-echo"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_worker_quiesces_without_creating_bus_state() {
+        let temp = TempDir::new().unwrap();
+        let bus_root = temp.path().join("bus");
+        let mut worker = AppCatalogWorker {
+            host: "node-01".into(),
+            bus_root: Some(bus_root.clone()),
+            config: None,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle =
+            tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !bus_root.exists(),
+            "an unconfigured worker must not open Bus state"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the quiescent worker waits for shutdown"
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("quiescent worker exits promptly")
+            .expect("worker task joins")
+            .expect("worker shutdown succeeds");
     }
 
     fn hex(bytes: &[u8]) -> String {

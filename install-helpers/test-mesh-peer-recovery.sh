@@ -102,6 +102,7 @@ case "$1" in
         elif [ "${2:-}" = etcd.service ] || [ "${2:-}" = syncthing.service ]; then
             unit=$2
             printf '%s\n' "$unit" >>"$state/mutations"
+            [ ! -f "$state/fail-start-$unit" ] || exit 1
             : >"$state/active-$unit"
         else
             printf 'trigger:%s\n' "$*" >>"$state/triggers"
@@ -159,6 +160,24 @@ printf '1\n1\n' >"$STATE/expected-sleeps"
 cmp "$STATE/expected-sleeps" "$STATE/sleeps"
 grep -Fq 'status=recovered' "$STATE/notifies"
 echo 'PASS online fixture: bounded TUN readiness wait and dependency order'
+
+# A configured coordination member is an ordering dependency, not an optional
+# best-effort service. If its start fails, recovery must not continue into
+# Syncthing, XDG repair, or grouped workers that could act without coordination.
+rm -f "$STATE"/active-etcd.service "$STATE"/active-syncthing.service \
+    "$STATE"/active-mackesd-*.service
+: >"$STATE/fail-start-etcd.service"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+if run_helper; then
+    echo 'configured etcd failure unexpectedly reported success' >&2
+    exit 1
+fi
+printf '%s\n' etcd.service >"$STATE/expected-mutations"
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=failed-configured-etcd' "$STATE/notifies"
+rm -f "$STATE/fail-start-etcd.service"
+echo 'PASS substrate failure fixture: no downstream mutation after etcd failure'
 
 # A boot-time event can arrive after Syncthing became active but before the
 # grouped workers.  Recovery must preserve that process instead of racing its

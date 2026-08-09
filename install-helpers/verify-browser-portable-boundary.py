@@ -102,7 +102,25 @@ def validate_bundle(module: ModuleType, roots: list[tuple[Path, str]], output: P
     entries = manifest.get("entries")
     if not isinstance(entries, list) or entries != sorted(entries, key=lambda item: (item["category"], item["path"])):
         raise BoundaryError("manifest entries must be deterministic and sorted")
+    identities = [(entry.get("category"), entry.get("path")) for entry in entries]
+    if len(identities) != len(set(identities)):
+        raise BoundaryError("manifest must not contain duplicate source identities")
     imported = [entry for entry in entries if entry.get("status") == "imported"]
+    outputs = [entry.get("output") for entry in imported]
+    if any(not isinstance(output_path, str) or not output_path for output_path in outputs):
+        raise BoundaryError("every imported entry must have a destination identity")
+    if len(outputs) != len(set(outputs)):
+        raise BoundaryError("manifest must not contain duplicate destination identities")
+    failed = [entry for entry in entries if entry.get("status") == "failed"]
+    if failed:
+        raise BoundaryError("migration failures must fail the portable boundary closed")
+    counts = manifest.get("counts")
+    expected_counts = {
+        status: sum(entry.get("status") == status for entry in entries)
+        for status in ("imported", "skipped", "failed")
+    }
+    if counts != expected_counts:
+        raise BoundaryError("manifest counts must exactly match its entries")
     expected = {
         ("bookmarks", "Bookmarks"),
         ("history", "History"),
@@ -133,6 +151,19 @@ def validate_bundle(module: ModuleType, roots: list[tuple[Path, str]], output: P
     return manifest
 
 
+def validate_duplicate_identity_rejection(
+    module: ModuleType, roots: list[tuple[Path, str]], output: Path
+) -> None:
+    duplicate_roots = [*roots, roots[0]]
+    try:
+        validate_bundle(module, duplicate_roots, output)
+    except BoundaryError as exc:
+        if "duplicate source identities" not in str(exc):
+            raise BoundaryError(f"duplicate identity failed for the wrong reason: {exc}") from exc
+    else:
+        raise BoundaryError("duplicate source identities must fail the portable boundary closed")
+
+
 def validate_source(repo_root: Path) -> None:
     module = load_migration(repo_root)
     require_policy(module)
@@ -143,10 +174,12 @@ def validate_source(repo_root: Path) -> None:
         roots = fixture_roots(base)
         first_output = base / "first"
         second_output = base / "second"
+        duplicate_output = base / "duplicate"
         first = validate_bundle(module, roots, first_output)
         second = validate_bundle(module, roots, second_output)
         if first != second or sha256(first_output / "manifest.json") != sha256(second_output / "manifest.json"):
             raise BoundaryError("identical input must yield byte-identical deterministic manifests")
+        validate_duplicate_identity_rejection(module, roots, duplicate_output)
 
 
 def self_test() -> None:

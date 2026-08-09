@@ -101,14 +101,14 @@ pub(crate) fn spawn_tiered<W, F>(
     if !sup.accepts_worker(name) {
         return;
     }
-    if !mackesd_core::worker_role::runs(name, role_rank) {
-        return;
-    }
     let policy = mackesd_core::worker_role::policy_for(name).unwrap_or_else(|| {
         panic!(
             "WL-ARCH-004: worker '{name}' spawned via spawn_tiered but absent from WORKER_REGISTRY"
         )
     });
+    if !mackesd_core::worker_role::runs(name, role_rank) {
+        return;
+    }
     sup.spawn(mackesd_core::workers::Spawn::new(build(), policy));
     worker_names
         .lock()

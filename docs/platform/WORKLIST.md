@@ -299,7 +299,7 @@ behavioral evidence is not completion.
 - **Portable data checkpoint (2026-08-06):** deterministic migration helper and redacted self-test cover allowlisted profile data, downloads, policies, and extensions;
   BigBoy probe passed. Evidence: `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`. Live legacy-profile import remains open.
 - **Portable-boundary checkpoint (2026-08-06):** allowlist/idempotency/symlink/secret validator passed local and `.50` probes:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-boundary-validator-r1.md`.
+  `docs/platform/evidence/WL-ARCH-008-2026-08-09-portable-manifest-identity-r2.md`.
 - **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
 - **Standalone publication checkpoint (2026-08-08):** GitHub `main` is `2b36cedb`; `.170` passed 123/123 worker tests, `.50` warning-denied clippy,
@@ -400,11 +400,11 @@ behavioral evidence is not completion.
   16 MiB; cleanup left the target and every group active. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-live-cgroup-enforcement-r3.md`.
 - **Optional-worker quiescence checkpoint (2026-08-08):** an Android catalog
-  importer without its local trust anchor now sleeps solely on shutdown instead
-  of waking every second. Machine 9 proved no Bus state creation and prompt
-  cancellation; the target-file format gate passed on machine 193. Other
+  importer and Flatpak app catalog without local trust anchors now sleep solely
+  on shutdown instead of waking every second. Machine 9 proved no Bus state
+  creation and prompt cancellation; the target-file format gate passed. Other
   optional providers still require audit. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-android-catalog-quiescence-r4.md`.
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-registry-app-quiescence-r6.md`.
 - **Responder group-isolation checkpoint (2026-08-09):** all 20 raw responder
   and maintenance threads now fail closed outside the process group assigned by
   the canonical registry. Exact/hostile argv and bidirectional registry guards
@@ -1513,10 +1513,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-007-2026-08-08-boot-order-identity-s1-r1.md`.
 - **Peer recovery checkpoint (2026-08-08):** post-resume/network-return recovery
   now refuses offline mutation, coalesces triggers, restores Nebula with bounded
-  backoff, then configured etcd, Syncthing, and grouped mackesd. `.90` fault,
-  systemd, and three-role package checks passed. Live laptop/fleet convergence
+  backoff, then requires configured etcd and Syncthing before XDG/grouped
+  mutation. `.90` fault/systemd checks passed. Live laptop/fleet convergence
   remains. Evidence:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-08-peer-recovery-s2-r1.md`.
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without

@@ -110,7 +110,7 @@ configured_substrate_ready() {
     fi
 }
 
-restore_optional_service() {
+restore_configured_service() {
     local unit="$1" label="$2"
     # A boot-time network-return event can race the unit's ordinary boot
     # activation.  Restarting an already-active Syncthing here asks systemd to
@@ -131,7 +131,7 @@ restore_optional_service() {
 }
 
 main() {
-    local attempt=1 delay=1 degraded=0
+    local attempt=1 delay=1
     [ "$(id -u)" -eq 0 ] || { publish "refused-not-root"; return 1; }
     valid_uint "$MAX_ATTEMPTS" && [ "$MAX_ATTEMPTS" -le 6 ] \
         || { publish "refused-invalid-attempt-bound"; return 2; }
@@ -194,12 +194,18 @@ main() {
     fi
 
     if [ -s "$ETCD_MEMBER_FILE" ]; then
-        restore_optional_service etcd.service etcd || degraded=1
+        if ! restore_configured_service etcd.service etcd; then
+            publish "failed-configured-etcd"
+            return 1
+        fi
     else
         publish "skipped-etcd-client-only"
     fi
     if [ -f "$SYNCTHING_CONFIG" ]; then
-        restore_optional_service syncthing.service syncthing || degraded=1
+        if ! restore_configured_service syncthing.service syncthing; then
+            publish "failed-configured-syncthing"
+            return 1
+        fi
     else
         publish "skipped-syncthing-unconfigured"
     fi
@@ -221,10 +227,6 @@ main() {
     elif ! bounded_systemctl --no-block restart mackesd.target >/dev/null 2>&1 \
         || ! wait_grouped_mackesd_ready; then
         publish "failed-grouped-mackesd"
-        return 1
-    fi
-    if [ "$degraded" -ne 0 ]; then
-        publish "degraded-optional-substrate"
         return 1
     fi
     publish "recovered"
