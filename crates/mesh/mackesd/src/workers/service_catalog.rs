@@ -28,6 +28,11 @@ use super::upnp_sources::{append_upnp_cards, UpnpSourcesState};
 
 const FRESH_MS: u64 = 60_000;
 const CARD_MS: u64 = 120_000;
+// Probe-only service records remain authoritative for the service aggregator's
+// five-minute TTL. Keep RDP promotion on that same boundary: a full bounded LAN
+// scan can take longer than CARD_MS, and dropping the typed card earlier makes
+// it disappear between otherwise healthy inventory publications.
+const PROBED_RDP_MAX_AGE_MS: u64 = 300_000;
 const SERVICE_CONFIG_VERSION: u16 = 1;
 const MAX_CONFIGURATION_BYTES: u64 = 64 * 1024;
 
@@ -633,7 +638,7 @@ fn probed_rdp_card(
     else {
         return Ok(None);
     };
-    if now.saturating_sub(observed_at_ms) > CARD_MS {
+    if now.saturating_sub(observed_at_ms) > PROBED_RDP_MAX_AGE_MS {
         return Ok(None);
     }
     let Some(address) = record
@@ -1404,6 +1409,31 @@ mod tests {
     }
 
     #[test]
+    fn rdp_promotion_survives_the_gap_between_card_and_probe_ttls() {
+        const NOW: i64 = 1_700_000_000_000;
+        let observed = NOW - i64::try_from(CARD_MS).unwrap() - 1;
+        let catalog = catalog_from_services(&ServicesState {
+            host: "seat-15".into(),
+            records: vec![observed_service(
+                "quiet-windows",
+                "ms-wbt-server",
+                "172.20.146.54:3389",
+                vec![ServiceProvenance::Probe],
+                ServiceHealth::Up,
+                observed,
+            )],
+            published_at_ms: NOW,
+        })
+        .expect("probe-fresh RDP observation remains a valid catalog input");
+
+        assert!(catalog
+            .cards
+            .iter()
+            .any(|card| card.identity.canonical_key == "probe-rdp/172.20.146.54"));
+        catalog.validate().expect("validated catalog");
+    }
+
+    #[test]
     fn rdp_promotion_rejects_untrusted_ambiguous_and_stale_records() {
         const NOW: i64 = 1_700_000_000_000;
         let catalog = catalog_from_services(&ServicesState {
@@ -1447,7 +1477,7 @@ mod tests {
                     "192.168.40.24:3389",
                     vec![ServiceProvenance::Probe],
                     ServiceHealth::Up,
-                    NOW - i64::try_from(CARD_MS).unwrap() - 1,
+                    NOW - i64::try_from(PROBED_RDP_MAX_AGE_MS).unwrap() - 1,
                 ),
             ],
             published_at_ms: NOW,

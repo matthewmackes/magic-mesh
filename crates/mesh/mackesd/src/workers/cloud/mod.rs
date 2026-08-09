@@ -60,9 +60,13 @@ use mackes_mesh_types::android_provider::{
     CuttlefishVmId, CuttlefishVmLifecycleState, CuttlefishVmObservation, CuttlefishVmTarget,
 };
 use mackes_mesh_types::cloud::{
-    cloud_state_topic, CloudProviderAdapter, CloudReply, CloudState, DeliveryType, DeploymentRole,
-    DriftSummary, HealthState, NodeCapacity, ServiceHealth, WorkloadRow, CLOUD_ACTION_PREFIX,
-    MAX_ANDROID_INVENTORIES_PER_STATE,
+    cloud_state_topic, CloudInstance, CloudProviderAdapter, CloudReply, CloudState, DeliveryType,
+    DeploymentRole, DriftSummary, HealthState, NodeCapacity, ServiceHealth, WorkloadRow,
+    CLOUD_ACTION_PREFIX, MAX_ANDROID_INVENTORIES_PER_STATE,
+};
+use mackes_mesh_types::workloads::{
+    reject_duplicate_json_keys, workload_state_topic, WorkloadPowerState, WorkloadStateSnapshot,
+    MAX_WORKLOAD_WIRE_BYTES,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -89,6 +93,8 @@ pub(crate) use verbs::{
     LibvirtCuttlefishProviderClient,
 };
 use verbs::{AndroidInventoryLedger, AndroidInventoryLedgerAdmission, CloudActionBody, CloudVerb};
+
+const WORKLOAD_PROJECTION_MAX_AGE_MS: u64 = 120_000;
 
 /// Maximum remaining lifetime accepted for any cloud mutation capability.
 /// Consumers enforce this independently of the root shell's minting policy so
@@ -1074,6 +1080,69 @@ impl CloudWorker {
         }
     }
 
+    /// Read the sole authoritative local runtime roster. Cloud is a desired-state
+    /// and planning surface; it must not rediscover VM power state with `virsh`.
+    fn workload_instances(&self) -> Result<Vec<CloudInstance>, String> {
+        let Some((persist, _)) = self
+            .open_bus()
+            .map_err(|error| format!("Workload projection Bus unavailable: {error}"))?
+        else {
+            return Err("Workload projection Bus is disabled".to_string());
+        };
+        let topic = workload_state_topic(&self.host);
+        let message = persist
+            .read_latest(&topic)
+            .map_err(|error| format!("Workload projection read failed: {error}"))?
+            .ok_or_else(|| format!("authoritative Workload projection is absent: {topic}"))?;
+        let body = message
+            .body
+            .as_deref()
+            .ok_or_else(|| "authoritative Workload projection has no body".to_string())?;
+        if body.len() > MAX_WORKLOAD_WIRE_BYTES {
+            return Err("authoritative Workload projection exceeds its wire bound".to_string());
+        }
+        reject_duplicate_json_keys(body)
+            .map_err(|_| "authoritative Workload projection contains duplicate keys".to_string())?;
+        let snapshot: WorkloadStateSnapshot = serde_json::from_str(body)
+            .map_err(|error| format!("authoritative Workload projection is malformed: {error}"))?;
+        let observed_now = u64::try_from(now_ms()).unwrap_or(0);
+        if snapshot.node != self.host {
+            return Err("authoritative Workload projection belongs to another node".to_string());
+        }
+        snapshot
+            .validate(observed_now)
+            .map_err(|error| format!("authoritative Workload projection is invalid: {error}"))?;
+        if snapshot.observed_at_ms > observed_now
+            || observed_now.saturating_sub(snapshot.observed_at_ms) > WORKLOAD_PROJECTION_MAX_AGE_MS
+        {
+            return Err("authoritative Workload projection is stale or future-dated".to_string());
+        }
+        Ok(snapshot
+            .workloads
+            .into_iter()
+            .filter(|status| status.backend.is_vm())
+            .map(|status| {
+                let state = match status.power {
+                    WorkloadPowerState::Running => "ACTIVE",
+                    WorkloadPowerState::Stopped | WorkloadPowerState::Defined => "SHUTOFF",
+                    WorkloadPowerState::Paused => "PAUSED",
+                    WorkloadPowerState::Starting => "STARTING",
+                    WorkloadPowerState::Stopping => "STOPPING",
+                    WorkloadPowerState::Failed => "FAILED",
+                };
+                let id = status.workload_id.into_string();
+                CloudInstance {
+                    id: id.clone(),
+                    name: id,
+                    status: state.to_string(),
+                    flavor: None,
+                    image: status.image_ref,
+                    networks: None,
+                }
+            })
+            .collect())
+    }
+
     /// Register production Cuttlefish adapters for Android desired rows whose
     /// verified package manifest is present. A missing manifest leaves the
     /// workload on the existing pending projection; it never gets a guessed
@@ -1262,7 +1331,7 @@ impl CloudWorker {
     }
 
     /// Build the current `state/cloud/<node>` mirror: probe each backend tool's
-    /// health + fold the live roster into a resource table (all neutral types), plus
+    /// health + fold the typed Workload roster into a resource table, plus
     /// the latest drift tick's per-workload rows + rollup (U5).
     #[must_use]
     pub fn build_state(&self) -> CloudState {
@@ -1270,7 +1339,7 @@ impl CloudWorker {
             .iter()
             .map(|t| self.runner.probe_tool(t))
             .collect();
-        let resources = match self.runner.list_instances() {
+        let resources = match self.workload_instances() {
             Ok(instances) => vec![instances_table(&instances)],
             Err(_) => Vec::new(),
         };
@@ -1697,45 +1766,180 @@ mod tests {
             .with_bus_root(None)
     }
 
+    fn workload_status(
+        id: &str,
+        backend: mackes_mesh_types::workloads::WorkloadBackend,
+        power: WorkloadPowerState,
+    ) -> mackes_mesh_types::workloads::WorkloadOperationStatus {
+        use mackes_mesh_types::workloads::{
+            WorkloadOperationPhase, WorkloadReadiness, WorkloadResources, WorkloadRuntimeSignals,
+            WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        };
+        mackes_mesh_types::workloads::WorkloadOperationStatus {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            request_id: format!("request-{id}"),
+            workload_id: mackes_mesh_types::workloads::WorkloadId::new(id).unwrap(),
+            backend,
+            resources: WorkloadResources {
+                vcpu: 2,
+                memory_mb: 2_048,
+                disk_gb: 20,
+            },
+            image_ref: Some(format!("image-{id}")),
+            generation: 1,
+            phase: WorkloadOperationPhase::Completed,
+            power,
+            readiness: WorkloadReadiness::Ready,
+            signals: WorkloadRuntimeSignals::default(),
+            retryable: false,
+            attempt: 1,
+            next_retry_at_ms: 0,
+            reason: None,
+            remediation: None,
+            attachment: None,
+        }
+    }
+
+    fn projection_worker(
+        runner: Arc<dyn CloudRunner>,
+        workloads: Vec<mackes_mesh_types::workloads::WorkloadOperationStatus>,
+        observed_at_ms: u64,
+        arm_capable: bool,
+    ) -> (tempfile::TempDir, CloudWorker) {
+        use mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION;
+        let temp = tempfile::tempdir().unwrap();
+        let bus = temp.path().join("bus");
+        let snapshot = WorkloadStateSnapshot {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            node: "me".to_string(),
+            observed_at_ms,
+            workloads,
+        };
+        Persist::open(bus.clone())
+            .unwrap()
+            .write(
+                &workload_state_topic("me"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&snapshot).unwrap()),
+            )
+            .unwrap();
+        let mut worker = CloudWorker::new("me".into(), "peer:me".into(), temp.path().join("state"))
+            .with_runner(runner)
+            .with_android_inventory_path(None)
+            .with_bus_root(Some(bus));
+        if arm_capable {
+            worker = worker
+                .with_signer(Arc::new(signer()))
+                .with_arm_capable(true);
+        }
+        (temp, worker)
+    }
+
     // ── list / status reads ──
     #[test]
-    fn list_returns_the_roster_and_matches_the_kdc_contract() {
+    fn list_returns_the_typed_workload_roster_and_ignores_backend_inventory() {
+        use mackes_mesh_types::workloads::WorkloadBackend;
         let runner = Arc::new(FakeRunner {
-            roster: vec![instance("web", "ACTIVE"), instance("db", "SHUTOFF")],
+            roster: vec![instance("backend-bypass", "ACTIVE")],
             ..Default::default()
         });
-        let w = staged_worker(runner);
+        let (_temp, w) = projection_worker(
+            runner,
+            vec![
+                workload_status(
+                    "web",
+                    WorkloadBackend::LibvirtVirtqemud,
+                    WorkloadPowerState::Running,
+                ),
+                workload_status(
+                    "db",
+                    WorkloadBackend::LibvirtVirtqemud,
+                    WorkloadPowerState::Stopped,
+                ),
+                workload_status(
+                    "container",
+                    WorkloadBackend::QuadletSystemd,
+                    WorkloadPowerState::Running,
+                ),
+            ],
+            u64::try_from(now_ms()).unwrap(),
+            false,
+        );
         for verb in ["list", "list-instances", "status"] {
             let reply = w.handle(verb, "{}");
             assert!(reply.ok, "{verb} ok");
             let instances = reply.instances.expect("roster");
             assert_eq!(instances.len(), 2);
             assert_eq!(instances[0].name, "web");
+            assert_eq!(instances[0].status, "ACTIVE");
+            assert_eq!(instances[1].name, "db");
+            assert_eq!(instances[1].status, "SHUTOFF");
+            assert!(instances.iter().all(|row| row.name != "backend-bypass"));
         }
     }
 
     #[test]
     fn placement_local_list_returns_only_the_handling_workers_roster() {
+        use mackes_mesh_types::workloads::WorkloadBackend;
         let runner = Arc::new(FakeRunner {
-            roster: vec![instance("web", "ACTIVE")],
+            roster: vec![instance("backend-bypass", "ACTIVE")],
             ..Default::default()
         });
-        let reply = staged_worker(runner).handle("list-instances-local", r#"{"node":"me"}"#);
+        let (_temp, worker) = projection_worker(
+            runner,
+            vec![workload_status(
+                "web",
+                WorkloadBackend::LibvirtVirtqemud,
+                WorkloadPowerState::Running,
+            )],
+            u64::try_from(now_ms()).unwrap(),
+            false,
+        );
+        let reply = worker.handle("list-instances-local", r#"{"node":"me"}"#);
         assert!(reply.ok);
         assert_eq!(reply.instances.unwrap()[0].name, "web");
     }
 
     #[test]
-    fn a_read_against_an_unreachable_backend_is_gated_not_faked() {
-        let runner = Arc::new(FakeRunner {
-            roster_err: Some("libvirt unavailable".into()),
+    fn a_read_without_a_workload_projection_is_gated_not_faked() {
+        let w = staged_worker(Arc::new(FakeRunner {
+            roster: vec![instance("backend-bypass", "ACTIVE")],
             ..Default::default()
-        });
-        let w = staged_worker(runner);
+        }));
         let reply = w.handle("list", "{}");
         assert!(!reply.ok);
         assert!(reply.instances.is_none(), "no fabricated empty roster");
-        assert!(reply.gated.unwrap().contains("not ready"));
+        assert!(reply.gated.unwrap().contains("runtime authority not ready"));
+    }
+
+    #[test]
+    fn a_stale_workload_projection_cannot_fall_back_to_backend_inventory() {
+        use mackes_mesh_types::workloads::WorkloadBackend;
+        let runner = Arc::new(FakeRunner {
+            roster: vec![instance("backend-bypass", "ACTIVE")],
+            ..Default::default()
+        });
+        let now = u64::try_from(now_ms()).unwrap();
+        let (_temp, worker) = projection_worker(
+            runner,
+            vec![workload_status(
+                "stale-vm",
+                WorkloadBackend::LibvirtVirtqemud,
+                WorkloadPowerState::Running,
+            )],
+            now.saturating_sub(WORKLOAD_PROJECTION_MAX_AGE_MS + 1),
+            false,
+        );
+
+        let reply = worker.handle("list", "{}");
+
+        assert!(!reply.ok);
+        assert!(reply.instances.is_none());
+        assert!(reply
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("stale or future-dated")));
     }
 
     // ── the armed-token gate: fail closed (no/invalid token) vs armed ──
@@ -2069,14 +2273,24 @@ mod tests {
 
     // ── the state mirror ──
     #[test]
-    fn build_state_reports_the_arming_capability_and_the_roster_table() {
+    fn build_state_reports_the_arming_capability_and_the_workload_roster_table() {
+        use mackes_mesh_types::workloads::WorkloadBackend;
         let runner = Arc::new(FakeRunner {
-            roster: vec![instance("web", "ACTIVE")],
+            roster: vec![instance("backend-bypass", "ACTIVE")],
             tofu_up: true,
             ..Default::default()
         });
         // Arm-capable node ⇒ apply_armed capability true.
-        let w = armed_worker(runner);
+        let (_temp, w) = projection_worker(
+            runner,
+            vec![workload_status(
+                "web",
+                WorkloadBackend::LibvirtVirtqemud,
+                WorkloadPowerState::Running,
+            )],
+            u64::try_from(now_ms()).unwrap(),
+            true,
+        );
         let state = w.build_state();
         assert_eq!(state.host, "me");
         assert_eq!(state.adapter, CloudProviderAdapter::ConstructCloud);
@@ -2094,6 +2308,7 @@ mod tests {
         );
         assert_eq!(state.resources.len(), 1);
         assert_eq!(state.resources[0].rows.len(), 1);
+        assert_eq!(state.resources[0].rows[0].id, "web");
         // A node without an arming key advertises no capability (fails closed).
         let w2 = staged_worker(Arc::new(FakeRunner::default()));
         assert!(!w2.build_state().apply_armed);
@@ -2679,9 +2894,30 @@ mod tests {
 
     #[tokio::test]
     async fn reads_are_served_locally_on_every_node_regardless_of_placement() {
+        use mackes_mesh_types::workloads::{
+            WorkloadBackend, WorkloadStateSnapshot, WORKLOAD_CONTRACT_SCHEMA_VERSION,
+        };
         let tmp = tempfile::tempdir().unwrap();
         let bus = tmp.path().to_path_buf();
         let persist = Persist::open(bus.clone()).unwrap();
+        let snapshot = WorkloadStateSnapshot {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            node: "f".to_string(),
+            observed_at_ms: u64::try_from(now_ms()).unwrap(),
+            workloads: vec![workload_status(
+                "web",
+                WorkloadBackend::LibvirtVirtqemud,
+                WorkloadPowerState::Running,
+            )],
+        };
+        persist
+            .write(
+                &workload_state_topic("f"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&snapshot).unwrap()),
+            )
+            .unwrap();
         let req = persist
             .write(
                 "action/cloud/list-instances",
@@ -2690,10 +2926,10 @@ mod tests {
                 Some("{}"),
             )
             .unwrap();
-        // Any node serves the read from its own roster — no placement gate.
+        // Any node serves the read from its own typed projection — no placement gate.
         let w = CloudWorker::new("f".into(), "peer:f".into(), tmp.path().to_path_buf())
             .with_runner(Arc::new(FakeRunner {
-                roster: vec![instance("web", "ACTIVE")],
+                roster: vec![instance("backend-bypass", "ACTIVE")],
                 ..Default::default()
             }))
             .with_bus_root(Some(bus.clone()))

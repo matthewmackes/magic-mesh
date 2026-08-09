@@ -126,6 +126,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`.
+- **Cloud runtime-roster authority checkpoint (2026-08-09):** generic Cloud list/status/resource mirrors consume typed Workloads only; `.196` passed 208/208.
+  Drift/Cuttlefish remain: `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-workload-roster-authority-r94.md`.
 - **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
   repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
@@ -135,8 +137,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON rejects duplicate keys; `.50` passed 9/9. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
-- **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness,
-  relay state, and stale sockets; BigBoy passed 7/7. Evidence:
+- **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness, relay state, and stale sockets; BigBoy passed 7/7. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
 - **Storage path-boundary checkpoint (2026-08-06):** virtual-storage validation rejects symlinks/outside-root images; `.90` passed:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
@@ -1176,6 +1177,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-rdp-scan-completion-freshness-r18.md`.
 - **Quiet-Windows RDP checkpoint (2026-08-09):** the bounded local `/24` scan now admits ping-silent hosts only after TCP 3389 succeeds, then independently fingerprints RDP.
   BigBoy passed three exact gates: `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
+- **Seat 15 RDP catalog-TTL checkpoint (2026-08-09):** live proof found the typed card expiring at two minutes despite the valid five-minute probe lease.
+  Promotion now shares the five-minute boundary; machine 194 passed 4/4: `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-seat15-rdp-catalog-ttl-r93.md`.
 - **Seat 15 Release 24 checkpoint (2026-08-09):** the clean Fedora 44 artifact
   passed real-RPM gates and a dry-run, then installed after the visible warning.
   All daemon groups and publisher credential activation passed; consecutive
@@ -2195,6 +2198,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-availability-bus-transaction-recovery-r88.md`.
 - **Quiet-Windows discovery checkpoint (2026-08-09):** ping-silent local hosts reach bounded TCP 3389 fingerprinting without widening the `/24`; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
+- **Seat 15 RDP catalog-TTL checkpoint (2026-08-09):** live reachability and inventory stayed healthy while the typed card aged out early; the five-minute fix passed 4/4:
+  `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-seat15-rdp-catalog-ttl-r93.md`.
 - **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
   bounded/redacted support bundle through a private no-follow path and a synced
   atomic transaction, with honest failures and bounded top-N materialization.

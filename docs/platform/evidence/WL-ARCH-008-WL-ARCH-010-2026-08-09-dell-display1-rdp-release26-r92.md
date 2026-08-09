@@ -61,10 +61,11 @@ graphics or `spicevmc` channel. `virsh dominfo` reports the domain running,
 persistent, and autostart-enabled with 4 vCPUs and 8 GiB RAM. The guest acquired
 `192.168.122.58`, and a direct TCP probe passed on port 3389.
 
-This checkpoint proves corrected packaging, domain admission, disk-preserving
-migration, VM launch, DHCP, and RDP transport readiness. It does not claim a
-captured Chromium frame or end-to-end pointer injection; those remain part of
-the Browser/Workloads epic's five-seat presentation proof.
+This initial checkpoint proved corrected packaging, domain admission,
+disk-preserving migration, VM launch, DHCP, and RDP transport readiness. The
+release deployment proof below subsequently adds a real rendered frame, input,
+and reconnect on Dell. The strict Chromium menu-pointer challenge and five-seat
+presentation proof remain open.
 
 ## Native release 26 deployment
 
@@ -96,3 +97,25 @@ upgrade, retained `192.168.122.58`, and passed the TCP 3389 probe again. Its
 live XML still has exactly the D-Bus GL graphics head and no SPICE seam. The
 dedicated F44 builder was then halted and normal BigBoy Fedora 42 farm capacity
 was restored.
+
+## Production RDP frame and input proof
+
+The real `mde-vdi-rdp` live test was farm-built on restored BigBoy from the
+integrated source, then executed on Dell so the host-bound password never left
+the seat. Decryption and password extraction occurred only in a root-only
+`/run` directory with a cleanup trap. The generic production-path acceptance
+passed in 88.61 seconds:
+
+```text
+CONNECTED tier=Full desktop=1024x768
+FRAME OK 1024x768 rects=17 fnv1a64=0x8a176d065c1dea85 distinct_colors=43
+INPUT ECHOED before=0xe5b14aedf830acc3 after=0xde81d67e8c28b705
+RECONNECTED tier=Compressed desktop=1024x768
+TIER FRAME OK 1024x768 rects=1 fnv1a64=0x3624e1ca8b51b089 distinct_colors=665
+test result: ok. 1 passed; 0 failed; finished in 88.61s
+```
+
+This proves the assembled client rendered inbound guest pixels, sent four real
+input events and observed a framebuffer response, then reconnected and rendered
+again at the requested tier. The optional strict Chromium app-menu pointer
+challenge was not requested, so it remains part of the open five-seat proof.

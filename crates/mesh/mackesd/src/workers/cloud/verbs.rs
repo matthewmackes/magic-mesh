@@ -493,10 +493,10 @@ fn authorization_refusal(
     })
 }
 
-/// The list/status read — serve the live roster or an honest gate (never a
-/// fabricated empty roster).
+/// The list/status read — serve the authoritative typed Workload roster or an
+/// honest gate (never a fabricated empty roster or a direct backend probe).
 fn handle_read_roster(w: &CloudWorker, verb_name: &str) -> CloudReply {
-    match w.runner.list_instances() {
+    match w.workload_instances() {
         Ok(instances) => CloudReply {
             ok: true,
             verb: verb_name.to_string(),
@@ -506,7 +506,7 @@ fn handle_read_roster(w: &CloudWorker, verb_name: &str) -> CloudReply {
         Err(e) => CloudReply {
             ok: false,
             verb: verb_name.to_string(),
-            gated: Some(format!("cloud backend not ready: {e}")),
+            gated: Some(format!("Workload runtime authority not ready: {e}")),
             ..Default::default()
         },
     }
