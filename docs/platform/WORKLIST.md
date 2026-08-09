@@ -479,6 +479,9 @@ behavioral evidence is not completion.
 - **Service-catalog projection recovery checkpoint (2026-08-09):** retained
   source reads and all derivations now complete before output; write failure remains immediately retryable. BigBoy passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
+- **CUPS action recovery checkpoint (2026-08-09):** both transient lanes now
+  tail-prime/read atomically; failed replies retain same-process retry without repeating sync, while the crash outbox remains open. Machine 193 passed three exact tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-cups-sync-bus-recovery-r46.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.

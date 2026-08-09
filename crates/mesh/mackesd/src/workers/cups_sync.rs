@@ -46,10 +46,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::hooks::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use mde_bus::rpc::reply_topic;
 use serde_json::{json, Value};
 
@@ -66,11 +67,94 @@ const ACTION_VERBS: [&str; 2] = ["sync-now", "list"];
 /// cannot turn `sync-now` into an unauthenticated CUPS/filesystem effect.
 const CUPS_SYNC_AUTH_VERB: &str = "printers-sync-now";
 
+/// Prompt initial retry for a late or temporarily unopenable Bus.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Maximum retry delay while the Bus remains unavailable.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Bound replies retained after an action effect completed but reply publication
+/// failed. This is an in-memory same-worker barrier, not crash-durable state.
+const MAX_PENDING_REPLIES: usize = 64;
+
 /// Tick cadence — five seconds, matching the other mesh workers.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// IPP port `cupsd` serves on (the host's overlay endpoint).
 pub const IPP_PORT: u16 = 631;
+
+fn action_topic(verb: &str) -> String {
+    format!("action/printers/{verb}")
+}
+
+trait CupsBusFactory: Send + Sync {
+    fn open(&self, root: &std::path::Path) -> Result<Option<Persist>, String>;
+}
+
+struct PersistCupsBusFactory;
+
+impl CupsBusFactory for PersistCupsBusFactory {
+    fn open(&self, root: &std::path::Path) -> Result<Option<Persist>, String> {
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
+trait ActionLaneReader: Send + Sync {
+    fn read(
+        &self,
+        persist: &Persist,
+        topic: &str,
+        since: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, String>;
+}
+
+struct PersistActionLaneReader;
+
+impl ActionLaneReader for PersistActionLaneReader {
+    fn read(
+        &self,
+        persist: &Persist,
+        topic: &str,
+        since: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, String> {
+        persist
+            .list_since(topic, since)
+            .map_err(|error| error.to_string())
+    }
+}
+
+trait ReplyWriter: Send + Sync {
+    fn write(&self, persist: &Persist, request_ulid: &str, body: &str) -> Result<(), String>;
+}
+
+struct PersistReplyWriter;
+
+impl ReplyWriter for PersistReplyWriter {
+    fn write(&self, persist: &Persist, request_ulid: &str, body: &str) -> Result<(), String> {
+        persist
+            .write(
+                &reply_topic(request_ulid),
+                Priority::Default,
+                None,
+                Some(body),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct PendingReply {
+    topic: String,
+    cursor: String,
+    body: String,
+}
+
+struct StagedActions {
+    lanes: Vec<(String, String, Vec<StoredMessage>)>,
+}
 
 /// Whether a queue is a modern IPP-Everywhere printer (no PPD needed)
 /// or a legacy queue whose PPD must replicate (Q4).
@@ -302,13 +386,22 @@ pub struct CupsSyncWorker {
     lpadmin: String,
     lpoptions: String,
     cupsctl: String,
-    /// PRINT-8.b — Bus persist root (`~/.local/share/mde/bus`); `None`
-    /// disables the action-responder (unit tests that don't need Bus).
-    bus_root: Option<PathBuf>,
+    /// Explicit Bus root override. Production resolves this at worker startup
+    /// and falls back to the canonical system spool when user resolution is
+    /// absent; `None` therefore never permanently disables actions.
+    bus_root_override: Option<PathBuf>,
     /// Per-verb read cursors for the `action/printers/<verb>` topics.
     action_cursors: HashMap<String, String>,
+    bus_factory: Arc<dyn CupsBusFactory>,
+    action_reader: Arc<dyn ActionLaneReader>,
+    reply_writer: Arc<dyn ReplyWriter>,
+    /// Completed action replies awaiting publication. This blocks duplicate
+    /// effects only within this process; a crash can lose the barrier.
+    pending_replies: HashMap<String, PendingReply>,
     /// Shared, fail-closed authorization gate for `sync-now`.
-    authorizer: std::sync::Arc<ActionAuthorizer>,
+    authorizer: Arc<ActionAuthorizer>,
+    #[cfg(test)]
+    action_effect: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
 }
 
 impl CupsSyncWorker {
@@ -325,9 +418,15 @@ impl CupsSyncWorker {
             lpadmin: "lpadmin".to_string(),
             lpoptions: "lpoptions".to_string(),
             cupsctl: "cupsctl".to_string(),
-            bus_root: default_bus_root(),
+            bus_root_override: None,
             action_cursors: HashMap::new(),
-            authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
+            bus_factory: Arc::new(PersistCupsBusFactory),
+            action_reader: Arc::new(PersistActionLaneReader),
+            reply_writer: Arc::new(PersistReplyWriter),
+            pending_replies: HashMap::new(),
+            authorizer: Arc::new(ActionAuthorizer::production()),
+            #[cfg(test)]
+            action_effect: None,
         }
     }
 
@@ -335,8 +434,50 @@ impl CupsSyncWorker {
     /// Production always uses the systemd-credential-backed authorizer.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_authorizer(mut self, authorizer: std::sync::Arc<ActionAuthorizer>) -> Self {
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_factory(mut self, factory: Arc<dyn CupsBusFactory>) -> Self {
+        self.bus_factory = factory;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_action_reader(mut self, reader: Arc<dyn ActionLaneReader>) -> Self {
+        self.action_reader = reader;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_reply_writer(mut self, writer: Arc<dyn ReplyWriter>) -> Self {
+        self.reply_writer = writer;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_action_effect(mut self, effect: Arc<dyn Fn(&str) -> String + Send + Sync>) -> Self {
+        self.action_effect = Some(effect);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_tick(mut self, tick: Duration) -> Self {
+        self.tick = tick;
         self
     }
 
@@ -527,34 +668,93 @@ impl CupsSyncWorker {
         }
     }
 
-    /// PRINT-8.b — poll `action/printers/{sync-now,list}` for operator
-    /// commands + reply on `reply/<ulid>`. Silent no-op when Bus isn't set up.
-    fn poll_bus_actions(&mut self) {
-        let Some(bus_root) = self.bus_root.clone() else {
-            return;
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
+    /// Tail-prime both transient action lanes as one activation transaction.
+    /// Candidate cursors are returned only after every full tail read succeeds,
+    /// so retained sync/list commands can never partially replay after restart.
+    fn prime_action_cursors(&self, persist: &Persist) -> Result<HashMap<String, String>, String> {
+        let mut candidate = HashMap::new();
         for verb in ACTION_VERBS {
-            let topic = format!("action/printers/{verb}");
-            let since = self.action_cursors.get(&topic).map(String::as_str);
-            let msgs = match persist.list_since(&topic, since) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            for msg in msgs {
-                self.action_cursors.insert(topic.clone(), msg.ulid.clone());
-                let reply_json = self.handle_bus_action(verb, msg.body.as_deref());
-                let _ = persist.write(
-                    &reply_topic(&msg.ulid),
-                    Priority::Default,
-                    None,
-                    Some(&reply_json),
-                );
+            let topic = action_topic(verb);
+            let messages = self
+                .action_reader
+                .read(persist, &topic, None)
+                .map_err(|error| format!("tail-prime {topic}: {error}"))?;
+            if let Some(last) = messages.last() {
+                candidate.insert(topic, last.ulid.clone());
             }
         }
+        Ok(candidate)
+    }
+
+    /// Read both lanes completely before returning any work. The caller performs
+    /// no effect and changes no cursor when either lane fails.
+    fn stage_actions(&self, persist: &Persist) -> Result<StagedActions, String> {
+        let mut lanes = Vec::with_capacity(ACTION_VERBS.len());
+        for verb in ACTION_VERBS {
+            let topic = action_topic(verb);
+            let since = self.action_cursors.get(&topic).map(String::as_str);
+            let messages = self
+                .action_reader
+                .read(persist, &topic, since)
+                .map_err(|error| format!("read {topic}: {error}"))?;
+            lanes.push((verb.to_string(), topic, messages));
+        }
+        Ok(StagedActions { lanes })
+    }
+
+    /// Process a fully staged sweep. Reply publication is the commit boundary:
+    /// the cursor advances only after the required reply write succeeds.
+    /// Completed replies are held in a bounded in-memory same-worker barrier so
+    /// a transient reply failure does not repeat a sync effect. A process crash
+    /// after the effect but before durable reply publication can still replay it.
+    fn process_staged_actions(
+        &mut self,
+        persist: &Persist,
+        staged: StagedActions,
+    ) -> Result<(), String> {
+        for (verb, topic, messages) in staged.lanes {
+            for message in messages {
+                if let Some(pending) = self.pending_replies.get(&message.ulid).cloned() {
+                    self.reply_writer
+                        .write(persist, &message.ulid, &pending.body)
+                        .map_err(|error| format!("retry reply {}: {error}", message.ulid))?;
+                    self.action_cursors
+                        .insert(pending.topic, pending.cursor.clone());
+                    self.pending_replies.remove(&message.ulid);
+                    continue;
+                }
+
+                if self.pending_replies.len() >= MAX_PENDING_REPLIES {
+                    return Err(format!(
+                        "pending reply barrier reached {MAX_PENDING_REPLIES}; deferring effects"
+                    ));
+                }
+
+                let reply = self.handle_bus_action(&verb, message.body.as_deref());
+                // Install the same-process barrier immediately after dispatch and
+                // before publication. This state is intentionally not crash-safe.
+                self.pending_replies.insert(
+                    message.ulid.clone(),
+                    PendingReply {
+                        topic: topic.clone(),
+                        cursor: message.ulid.clone(),
+                        body: reply.clone(),
+                    },
+                );
+                self.reply_writer
+                    .write(persist, &message.ulid, &reply)
+                    .map_err(|error| format!("write required reply {}: {error}", message.ulid))?;
+                self.action_cursors
+                    .insert(topic.clone(), message.ulid.clone());
+                self.pending_replies.remove(&message.ulid);
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_bus_actions(&mut self, persist: &Persist) -> Result<(), String> {
+        let staged = self.stage_actions(persist)?;
+        self.process_staged_actions(persist, staged)
     }
 
     /// Dispatch one Bus action. Read-only listing stays open; the sync lane
@@ -595,6 +795,11 @@ impl CupsSyncWorker {
     /// authority path and does not consume a Bus capability.
     #[must_use]
     fn handle_action(&self, verb: &str) -> String {
+        #[cfg(test)]
+        if let Some(effect) = &self.action_effect {
+            return effect(verb);
+        }
+
         match verb {
             "sync-now" => {
                 self.tick_once();
@@ -641,15 +846,67 @@ impl Worker for CupsSyncWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        self.tick_once();
-        self.poll_bus_actions();
+        let bus_root = cups_sync_bus_root(self.bus_root_override.clone());
+        // A statically absent optional CUPS stack has no periodic CUPS timer or
+        // filesystem/subprocess convergence. Bus list/actions remain available;
+        // an explicit sync request still performs the existing guarded no-op.
+        let cups_enabled = which(&self.lpstat).is_some() && which(&self.lpadmin).is_some();
+        if cups_enabled {
+            self.tick_once();
+        }
+        let mut cups_tick = tokio::time::interval(self.tick);
+        cups_tick.tick().await; // burn the immediate interval tick
+
+        let mut activated = false;
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
         loop {
+            let bus_ready = match self.bus_factory.open(&bus_root) {
+                Ok(Some(persist)) if activated => match self.poll_bus_actions(&persist) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "cups_sync: complete action sweep deferred"
+                        );
+                        false
+                    }
+                },
+                Ok(Some(persist)) => match self.prime_action_cursors(&persist) {
+                    Ok(cursors) => {
+                        self.action_cursors = cursors;
+                        activated = true;
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "cups_sync: atomic action tail-prime failed; activation will retry"
+                        );
+                        false
+                    }
+                },
+                Ok(None) => {
+                    tracing::debug!("cups_sync: Bus unavailable; action recovery will retry");
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cups_sync: Bus open failed; action recovery will retry");
+                    false
+                }
+            };
+            let bus_delay = if bus_ready {
+                retry_interval = MIN_BUS_RETRY_INTERVAL;
+                self.tick
+            } else {
+                let delay = retry_interval;
+                retry_interval = next_bus_retry_interval(retry_interval);
+                delay
+            };
+
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
-                () = tokio::time::sleep(self.tick) => {
-                    self.tick_once();
-                    self.poll_bus_actions();
-                }
+                () = tokio::time::sleep(bus_delay) => {}
+                _ = cups_tick.tick(), if cups_enabled => self.tick_once(),
             }
         }
     }
@@ -705,17 +962,122 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn cups_sync_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    cups_sync_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn cups_sync_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     const AUTH_KEY: &[u8] = b"cups-sync-action-auth-key";
     const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    struct LateBusFactory {
+        root: PathBuf,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl CupsBusFactory for LateBusFactory {
+        fn open(&self, _root: &std::path::Path) -> Result<Option<Persist>, String> {
+            match self.attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(None),
+                1 => Err("injected unopenable Bus".into()),
+                _ => Persist::open(self.root.clone())
+                    .map(Some)
+                    .map_err(|error| error.to_string()),
+            }
+        }
+    }
+
+    struct UnavailableBusFactory {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl CupsBusFactory for UnavailableBusFactory {
+        fn open(&self, _root: &std::path::Path) -> Result<Option<Persist>, String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct HostileLaneReader {
+        fail_topic: Mutex<Option<String>>,
+        reads: AtomicUsize,
+    }
+
+    impl HostileLaneReader {
+        fn fail_next(&self, topic: &str) {
+            *self.fail_topic.lock().unwrap() = Some(topic.to_string());
+        }
+    }
+
+    impl ActionLaneReader for HostileLaneReader {
+        fn read(
+            &self,
+            persist: &Persist,
+            topic: &str,
+            since: Option<&str>,
+        ) -> Result<Vec<StoredMessage>, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut fail_topic = self.fail_topic.lock().unwrap();
+            if fail_topic.as_deref() == Some(topic) {
+                fail_topic.take();
+                return Err(format!("injected read failure for {topic}"));
+            }
+            drop(fail_topic);
+            PersistActionLaneReader.read(persist, topic, since)
+        }
+    }
+
+    struct GateReplyWriter {
+        allowed: Arc<AtomicBool>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl ReplyWriter for GateReplyWriter {
+        fn write(&self, persist: &Persist, request_ulid: &str, body: &str) -> Result<(), String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if !self.allowed.load(Ordering::SeqCst) {
+                return Err("injected reply publication failure".into());
+            }
+            PersistReplyWriter.write(persist, request_ulid, body)
+        }
+    }
+
+    fn signed_sync_body(nonce: &str) -> String {
+        authorize_test_body(
+            AUTH_KEY,
+            r#"{"schema_version":1,"request":"sync-now"}"#,
+            MutationContext {
+                verb: CUPS_SYNC_AUTH_VERB,
+                node: "testpeer",
+                target: "testpeer",
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    fn write_action(persist: &Persist, verb: &str, body: Option<&str>) -> StoredMessage {
+        persist
+            .write(&action_topic(verb), Priority::Default, None, body)
+            .unwrap()
+    }
 
     #[test]
     fn parse_lpstat_e_lists_queues() {
@@ -851,9 +1213,14 @@ mod tests {
             lpadmin: "lpadmin".to_string(),
             lpoptions: "lpoptions".to_string(),
             cupsctl: "cupsctl".to_string(),
-            bus_root: None, // no Bus in unit tests
+            bus_root_override: None,
             action_cursors: HashMap::new(),
-            authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
+            bus_factory: Arc::new(PersistCupsBusFactory),
+            action_reader: Arc::new(PersistActionLaneReader),
+            reply_writer: Arc::new(PersistReplyWriter),
+            pending_replies: HashMap::new(),
+            authorizer: Arc::new(ActionAuthorizer::production()),
+            action_effect: None,
         }
     }
 
@@ -931,5 +1298,262 @@ mod tests {
         let reply = test_worker().handle_bus_action("list", None);
         let value: serde_json::Value = serde_json::from_str(&reply).expect("valid JSON");
         assert!(value.is_array());
+    }
+
+    #[tokio::test]
+    async fn late_bus_atomic_tail_prime_and_forward_sync_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus_root = dir.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        let retained_sync = write_action(&persist, "sync-now", Some(&signed_sync_body("retained")));
+        let retained_list = write_action(&persist, "list", None);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(HostileLaneReader::default());
+        reader.fail_next(&action_topic("list"));
+        let sync_effects = Arc::new(AtomicUsize::new(0));
+        let list_effects = Arc::new(AtomicUsize::new(0));
+        let sync_effects_for_action = Arc::clone(&sync_effects);
+        let list_effects_for_action = Arc::clone(&list_effects);
+        let auth_root = dir.path().join("auth");
+        let mut worker = test_worker()
+            .with_bus_root(bus_root.clone())
+            .with_tick(Duration::from_millis(5))
+            .with_bus_factory(Arc::new(LateBusFactory {
+                root: bus_root,
+                attempts: Arc::clone(&attempts),
+            }))
+            .with_action_reader(reader.clone())
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY, auth_root, AUTH_NOW,
+            )))
+            .with_action_effect(Arc::new(move |verb| match verb {
+                "sync-now" => {
+                    sync_effects_for_action.fetch_add(1, Ordering::SeqCst);
+                    r#"{"ok":true}"#.to_string()
+                }
+                "list" => {
+                    list_effects_for_action.fetch_add(1, Ordering::SeqCst);
+                    "[]".to_string()
+                }
+                _ => unreachable!(),
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reader.reads.load(Ordering::SeqCst) < 4 {
+                assert!(!task.is_finished(), "worker exited during Bus activation");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("atomic tail-prime recovery");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(sync_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(list_effects.load(Ordering::SeqCst), 0);
+        assert!(persist
+            .list_since(&reply_topic(&retained_sync.ulid), None)
+            .unwrap()
+            .is_empty());
+        assert!(persist
+            .list_since(&reply_topic(&retained_list.ulid), None)
+            .unwrap()
+            .is_empty());
+
+        let forward = write_action(
+            &persist,
+            "sync-now",
+            Some(&signed_sync_body("forward-once")),
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while persist
+                .list_since(&reply_topic(&forward.ulid), None)
+                .unwrap()
+                .is_empty()
+            {
+                assert!(!task.is_finished(), "worker exited before forward sync");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("forward sync reply");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(sync_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(list_effects.load(Ordering::SeqCst), 0);
+        assert!(attempts.load(Ordering::SeqCst) >= 4);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker join")
+            .expect("worker result");
+    }
+
+    #[test]
+    fn final_lane_read_and_reply_failure_are_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().join("bus")).unwrap();
+        let reader = Arc::new(HostileLaneReader::default());
+        let allowed = Arc::new(AtomicBool::new(false));
+        let reply_attempts = Arc::new(AtomicUsize::new(0));
+        let sync_effects = Arc::new(AtomicUsize::new(0));
+        let sync_effects_for_action = Arc::clone(&sync_effects);
+        let mut worker = test_worker()
+            .with_action_reader(reader.clone())
+            .with_reply_writer(Arc::new(GateReplyWriter {
+                allowed: Arc::clone(&allowed),
+                attempts: Arc::clone(&reply_attempts),
+            }))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                dir.path().join("auth"),
+                AUTH_NOW,
+            )))
+            .with_action_effect(Arc::new(move |verb| {
+                assert_eq!(verb, "sync-now");
+                sync_effects_for_action.fetch_add(1, Ordering::SeqCst);
+                r#"{"ok":true}"#.to_string()
+            }));
+        reader.fail_next(&action_topic("list"));
+        assert!(worker.prime_action_cursors(&persist).is_err());
+        assert!(
+            worker.action_cursors.is_empty(),
+            "failed final-lane tail read must install no partial cursor"
+        );
+        worker.action_cursors = worker.prime_action_cursors(&persist).unwrap();
+        let cursors_before = worker.action_cursors.clone();
+        let request = write_action(
+            &persist,
+            "sync-now",
+            Some(&signed_sync_body("hostile-runtime")),
+        );
+
+        reader.fail_next(&action_topic("list"));
+        assert!(worker.stage_actions(&persist).is_err());
+        assert_eq!(worker.action_cursors, cursors_before);
+        assert_eq!(sync_effects.load(Ordering::SeqCst), 0);
+        assert!(worker.pending_replies.is_empty());
+
+        let staged = worker.stage_actions(&persist).unwrap();
+        assert!(worker.process_staged_actions(&persist, staged).is_err());
+        assert_eq!(sync_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.action_cursors, cursors_before);
+        assert!(worker.pending_replies.contains_key(&request.ulid));
+        assert!(persist
+            .list_since(&reply_topic(&request.ulid), None)
+            .unwrap()
+            .is_empty());
+
+        allowed.store(true, Ordering::SeqCst);
+        let staged = worker.stage_actions(&persist).unwrap();
+        worker.process_staged_actions(&persist, staged).unwrap();
+        assert_eq!(sync_effects.load(Ordering::SeqCst), 1);
+        assert!(worker.pending_replies.is_empty());
+        assert_eq!(
+            worker.action_cursors.get(&action_topic("sync-now")),
+            Some(&request.ulid)
+        );
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&request.ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reply_attempts.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn dynamic_first_command_system_fallback_and_retry_shutdown() {
+        assert_eq!(
+            cups_sync_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let explicit = PathBuf::from("/tmp/cups-sync-explicit-bus");
+        assert_eq!(
+            cups_sync_bus_root_or_system(Some(explicit.clone())),
+            explicit
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus_root = dir.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        let reader = Arc::new(HostileLaneReader::default());
+        let list_effects = Arc::new(AtomicUsize::new(0));
+        let list_effects_for_action = Arc::clone(&list_effects);
+        let mut worker = test_worker()
+            .with_bus_root(bus_root)
+            .with_tick(Duration::from_millis(5))
+            .with_action_reader(reader.clone())
+            .with_action_effect(Arc::new(move |verb| {
+                assert_eq!(verb, "list");
+                list_effects_for_action.fetch_add(1, Ordering::SeqCst);
+                "[]".to_string()
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while reader.reads.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("empty-lane activation");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let first = write_action(&persist, "list", None);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while persist
+                .list_since(&reply_topic(&first.ulid), None)
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("first dynamically created list command");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(list_effects.load(Ordering::SeqCst), 1);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("dynamic worker shutdown")
+            .expect("worker join")
+            .expect("worker result");
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut unavailable = test_worker()
+            .with_tick(Duration::from_millis(5))
+            .with_bus_factory(Arc::new(UnavailableBusFactory {
+                attempts: Arc::clone(&attempts),
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            unavailable
+                .run(ShutdownToken::from_receiver(shutdown_rx))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("Bus retry attempts");
+        assert!(!task.is_finished());
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("retry shutdown timeout")
+            .expect("worker join")
+            .expect("worker result");
     }
 }
