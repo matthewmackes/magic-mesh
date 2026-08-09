@@ -1568,6 +1568,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-coordination-admission-r4.md`.
 - **Lighthouse desktop-scope checkpoint (2026-08-09):** healthy peer return skips Workstation-only XDG restoration with zero service mutation; BigBoy and machine 194
   passed the complete fixture: `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-desktop-scope-r5.md`.
+- **Eagle recovery preflight (2026-08-09):** Eagle was resolved and inspected without mutation; its installed package lacks the recovery helper and password-only sudo
+  blocks the governed controller, so no alert or drill was attempted. BigBoy passed the recovery fixtures:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-eagle-recovery-preflight-r6.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
