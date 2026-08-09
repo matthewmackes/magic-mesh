@@ -65,3 +65,34 @@ This checkpoint proves corrected packaging, domain admission, disk-preserving
 migration, VM launch, DHCP, and RDP transport readiness. It does not claim a
 captured Chromium frame or end-to-end pointer injection; those remain part of
 the Browser/Workloads epic's five-seat presentation proof.
+
+## Native release 26 deployment
+
+After source commit `0b437f92`, the dedicated BigBoy Fedora 44 builder produced
+`magic-mesh-12.1.6-26.x86_64.rpm` in slot
+`dell-display1-release26-r93`. The artifact is 90,417,682 bytes (86.2 MiB) with
+SHA-256:
+
+```text
+db7d577a8a7201f2020f29ca49a0a8e6f44b1b3ef10876c176143874b0096cf4
+```
+
+The complete payload gate passed. The RPM header hard-requires
+`qemu-ui-dbus`; its native media requirements are `libavcodec.so.62`,
+`libavformat.so.62`, `libavutil.so.60`, `libswresample.so.6`, and
+`libswscale.so.9`, matching Fedora 44.
+
+Dell's staged hash matched exactly. A visible warning and five-second window
+preceded a successful `rpm -Uvh --test`; a fresh warning preceded the real
+upgrade. The installed state is now `magic-mesh-12.1.6-26.x86_64` with
+`qemu-ui-dbus-10.2.2-1.fc44.x86_64`. The grouped daemon target and Construct
+shell are active; the shell reports `Result=success` and `NRestarts=0`.
+Post-install replacement briefly reset the system bus while optional transient
+jobs were submitted, but convergence checks found no Magic Mesh failed unit.
+The unrelated `fwupd-refresh.service` remains failed.
+
+The Browser VM remained running and autostart-enabled through the package
+upgrade, retained `192.168.122.58`, and passed the TCP 3389 probe again. Its
+live XML still has exactly the D-Bus GL graphics head and no SPICE seam. The
+dedicated F44 builder was then halted and normal BigBoy Fedora 42 farm capacity
+was restored.
