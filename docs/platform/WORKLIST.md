@@ -482,6 +482,10 @@ behavioral evidence is not completion.
 - **CUPS action recovery checkpoint (2026-08-09):** both transient lanes now
   tail-prime/read atomically; failed replies retain same-process retry without repeating sync, while the crash outbox remains open. Machine 193 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-cups-sync-bus-recovery-r46.md`.
+- **Weather-location recovery checkpoint (2026-08-09):** complete action and
+  vehicle-lane reads now precede authority effects; late/replaced Bus storage
+  recovers without treating failed reads as absent fixes. Machine 9 passed seven exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
@@ -825,6 +829,10 @@ behavioral evidence is not completion.
   the applied reboot while returning `audited=false` and a bounded error.
   BigBoy passed both exact fixtures:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-vehicle-audit-truth-r8.md`.
+- **Weather-location Bus recovery checkpoint (2026-08-09):** durable authority
+  survives unavailable storage, and complete weather-action/vehicle-fix reads
+  precede mutation or projection. Machine 9 passed seven exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

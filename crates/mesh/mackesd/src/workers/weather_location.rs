@@ -35,12 +35,14 @@ use mackes_mesh_types::weather::{
     WeatherProvider, WeatherUnavailableReason, WEATHER_CONTRACT_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use serde::{Deserialize, Serialize};
 
 use super::{ShutdownToken, Worker};
 
 const POLL: Duration = Duration::from_secs(2);
+const MIN_BUS_RETRY: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY: Duration = Duration::from_secs(2);
 const HEARTBEAT_MS: i64 = 5 * 60 * 1_000;
 const MAX_ACTION_AGE_MS: i64 = 10 * 60 * 1_000;
 const LIVE_LOCATION_MOVEMENT_METRES: f64 = 1_000.0;
@@ -49,6 +51,9 @@ const STATE_PATH_ENV: &str = "MDE_WEATHER_LOCATION_STATE_PATH";
 const PERSISTED_SCHEMA_VERSION: u16 = 1;
 const MAX_PERSISTED_BYTES: usize = 256 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> io::Result<Option<Persist>> + Send + Sync;
 
 trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -75,27 +80,61 @@ struct LiveLocationFix {
 }
 
 trait FixSource: Send + Sync {
-    fn latest(&self, bus_root: &Path, host: &str, now_ms: i64) -> Option<LiveLocationFix>;
+    fn latest(
+        &self,
+        persist: &Persist,
+        host: &str,
+        now_ms: i64,
+    ) -> io::Result<Option<LiveLocationFix>>;
 }
 
 struct VehicleBusFixSource;
 
 impl FixSource for VehicleBusFixSource {
-    fn latest(&self, bus_root: &Path, host: &str, now_ms: i64) -> Option<LiveLocationFix> {
-        let persist = Persist::open(bus_root.to_path_buf()).ok()?;
+    fn latest(
+        &self,
+        persist: &Persist,
+        host: &str,
+        now_ms: i64,
+    ) -> io::Result<Option<LiveLocationFix>> {
+        self.latest_with(
+            host,
+            now_ms,
+            || persist.list_topics().map_err(io_other),
+            |topic| persist.list_since(topic, None).map_err(io_other),
+        )
+    }
+}
+
+impl VehicleBusFixSource {
+    fn latest_with<L, R>(
+        &self,
+        host: &str,
+        now_ms: i64,
+        mut list_topics: L,
+        mut read_topic: R,
+    ) -> io::Result<Option<LiveLocationFix>>
+    where
+        L: FnMut() -> io::Result<Vec<String>>,
+        R: FnMut(&str) -> io::Result<Vec<StoredMessage>>,
+    {
         let prefix = format!("{VEHICLE_STATE_PREFIX}{host}/");
         let time_zone = local_time_zone();
-        let mut newest: Option<LiveLocationFix> = None;
-        for topic in persist.list_topics().ok()? {
+        let topics = list_topics()?;
+        let mut complete_view = Vec::new();
+        for topic in topics {
             let Some(source_id) = topic.strip_prefix(&prefix) else {
                 continue;
             };
             if source_id.is_empty() || source_id.contains('/') {
                 continue;
             }
-            let Ok(messages) = persist.list_since(&topic, None) else {
-                continue;
-            };
+            let messages = read_topic(&topic)?;
+            complete_view.push((source_id.to_string(), messages));
+        }
+
+        let mut newest: Option<LiveLocationFix> = None;
+        for (source_id, messages) in complete_view {
             let Some(message) = messages.last() else {
                 continue;
             };
@@ -108,7 +147,7 @@ impl FixSource for VehicleBusFixSource {
             let Ok(snapshot) = serde_json::from_str::<VehicleStateV2>(body) else {
                 continue;
             };
-            if !valid_same_host_vehicle_fix(&snapshot, host, source_id, now_ms) {
+            if !valid_same_host_vehicle_fix(&snapshot, host, &source_id, now_ms) {
                 continue;
             }
             let point = GeoPoint {
@@ -131,7 +170,7 @@ impl FixSource for VehicleBusFixSource {
                 newest = Some(candidate);
             }
         }
-        newest
+        Ok(newest)
     }
 }
 
@@ -365,13 +404,15 @@ struct WeatherMapReset<'a> {
 pub struct WeatherLocationWorker {
     host: String,
     state_path: PathBuf,
-    bus_root: Option<PathBuf>,
+    bus_root: PathBuf,
     poll: Duration,
     clock: Arc<dyn Clock>,
     fix_source: Arc<dyn FixSource>,
     authority: Option<PersistedAuthority>,
     last_published_generation: Option<u64>,
     last_published_at_ms: i64,
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
 }
 
 impl WeatherLocationWorker {
@@ -385,14 +426,26 @@ impl WeatherLocationWorker {
         Self {
             host,
             state_path,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root: weather_location_bus_root(crate::bus_publish::default_bus_root()),
             poll: POLL,
             clock: Arc::new(SystemClock),
             fix_source: Arc::new(VehicleBusFixSource),
             authority: None,
             last_published_generation: None,
             last_published_at_ms: 0,
+            #[cfg(test)]
+            bus_open_override: None,
         }
+    }
+
+    fn open_bus(&self) -> io::Result<Option<Persist>> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(&self.bus_root);
+        }
+        Persist::open(self.bus_root.clone())
+            .map(Some)
+            .map_err(io_other)
     }
 
     fn ensure_loaded(&mut self) -> io::Result<()> {
@@ -464,19 +517,22 @@ impl WeatherLocationWorker {
         }
     }
 
-    fn process_actions(
-        &mut self,
-        persist: &Persist,
-        live_fix: Option<&LiveLocationFix>,
-        now_ms: i64,
-    ) -> io::Result<bool> {
+    fn read_action_lane(&self, persist: &Persist) -> io::Result<Vec<StoredMessage>> {
         let cursor = self
             .authority
             .as_ref()
             .and_then(|authority| authority.action_cursor.as_deref());
-        let messages = persist
+        persist
             .list_since(WEATHER_SET_LOCATION_TOPIC, cursor)
-            .map_err(io_other)?;
+            .map_err(io_other)
+    }
+
+    fn process_actions(
+        &mut self,
+        messages: Vec<StoredMessage>,
+        live_fix: Option<&LiveLocationFix>,
+        now_ms: i64,
+    ) -> io::Result<bool> {
         let mut generation_changed = false;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -654,19 +710,16 @@ impl WeatherLocationWorker {
         Ok(())
     }
 
-    fn tick_once(&mut self) -> io::Result<()> {
+    fn tick_with_persist(&mut self, persist: &mut Persist) -> io::Result<()> {
         self.ensure_loaded()?;
+        persist.reopen_if_index_changed();
         let now_ms = self.clock.now_ms();
-        let live_fix = self
-            .bus_root
-            .as_deref()
-            .and_then(|root| self.fix_source.latest(root, &self.host, now_ms));
-        let Some(bus_root) = self.bus_root.clone() else {
-            let _ = self.reconcile_fix(live_fix.as_ref(), now_ms)?;
-            return Ok(());
-        };
-        let persist = Persist::open(bus_root).map_err(io_other)?;
-        let action_changed = self.process_actions(&persist, live_fix.as_ref(), now_ms)?;
+        // Stage both durable inputs before any authority mutation, cursor
+        // advance, projection clear, or publication. Either read failing rejects
+        // the complete pass rather than masquerading as an empty lane.
+        let actions = self.read_action_lane(persist)?;
+        let live_fix = self.fix_source.latest(persist, &self.host, now_ms)?;
+        let action_changed = self.process_actions(actions, live_fix.as_ref(), now_ms)?;
         let fix_changed = self.reconcile_fix(live_fix.as_ref(), now_ms)?;
         let generation = self
             .authority
@@ -676,12 +729,20 @@ impl WeatherLocationWorker {
             .generation;
         let unpublished_generation = self.last_published_generation != Some(generation);
         if action_changed || fix_changed || unpublished_generation {
-            self.clear_projections(&persist, now_ms)?;
-            self.publish_location(&persist, now_ms)?;
+            self.clear_projections(persist, now_ms)?;
+            self.publish_location(persist, now_ms)?;
         } else if now_ms.saturating_sub(self.last_published_at_ms) >= HEARTBEAT_MS {
-            self.publish_location(&persist, now_ms)?;
+            self.publish_location(persist, now_ms)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn tick_once(&mut self) -> io::Result<()> {
+        let mut persist = self
+            .open_bus()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "weather Bus unavailable"))?;
+        self.tick_with_persist(&mut persist)
     }
 }
 
@@ -786,17 +847,57 @@ impl Worker for WeatherLocationWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        self.tick_once()?;
-        let mut tick = tokio::time::interval(self.poll);
-        tick.tick().await;
-        loop {
+        self.ensure_loaded()?;
+        let mut retry = MIN_BUS_RETRY;
+        let mut persist = loop {
+            match self.open_bus() {
+                Ok(Some(persist)) => break persist,
+                Ok(None) => tracing::debug!(
+                    bus_root = %self.bus_root.display(),
+                    "weather_location: Bus unavailable; startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    bus_root = %self.bus_root.display(),
+                    "weather_location: Bus open failed; startup will retry"
+                ),
+            }
             tokio::select! {
-                _ = tick.tick() => self.tick_once()?,
-                () = shutdown.wait() => break,
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry) => {}
+            }
+            retry = next_bus_retry(retry);
+        };
+        retry = MIN_BUS_RETRY;
+        loop {
+            let delay = match self.tick_with_persist(&mut persist) {
+                Ok(()) => {
+                    retry = MIN_BUS_RETRY;
+                    self.poll
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "weather_location: incomplete Bus pass deferred");
+                    let delay = retry;
+                    retry = next_bus_retry(retry);
+                    delay
+                }
+            };
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(delay) => {}
             }
         }
-        Ok(())
     }
+}
+
+fn weather_location_bus_root(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY, MAX_BUS_RETRY)
 }
 
 #[cfg(test)]
@@ -839,8 +940,36 @@ mod tests {
     }
 
     impl FixSource for TestFixSource {
-        fn latest(&self, _bus_root: &Path, _host: &str, _now_ms: i64) -> Option<LiveLocationFix> {
-            self.0.lock().expect("fix lock").clone()
+        fn latest(
+            &self,
+            _persist: &Persist,
+            _host: &str,
+            _now_ms: i64,
+        ) -> io::Result<Option<LiveLocationFix>> {
+            Ok(self.0.lock().expect("fix lock").clone())
+        }
+    }
+
+    struct FinalVehicleLaneFailureFixSource;
+
+    impl FixSource for FinalVehicleLaneFailureFixSource {
+        fn latest(
+            &self,
+            persist: &Persist,
+            host: &str,
+            now_ms: i64,
+        ) -> io::Result<Option<LiveLocationFix>> {
+            VehicleBusFixSource.latest_with(
+                host,
+                now_ms,
+                || persist.list_topics().map_err(io_other),
+                |topic| {
+                    if topic.ends_with("/z-final") {
+                        return Err(io::Error::other("injected final vehicle-lane failure"));
+                    }
+                    persist.list_since(topic, None).map_err(io_other)
+                },
+            )
         }
     }
 
@@ -871,13 +1000,14 @@ mod tests {
             WeatherLocationWorker {
                 host: "workstation-1".to_string(),
                 state_path: self.state.clone(),
-                bus_root: Some(self.bus.clone()),
+                bus_root: self.bus.clone(),
                 poll: Duration::from_millis(5),
                 clock: self.clock.clone(),
                 fix_source: self.fixes.clone(),
                 authority: None,
                 last_published_generation: None,
                 last_published_at_ms: 0,
+                bus_open_override: None,
             }
         }
 
@@ -942,6 +1072,18 @@ mod tests {
             mode,
             manual_place: (mode == WeatherLocationMode::Manual).then(place),
         }
+    }
+
+    #[test]
+    fn weather_location_bus_root_falls_back_to_canonical_system_spool() {
+        assert_eq!(
+            weather_location_bus_root(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            weather_location_bus_root(Some(PathBuf::from("/tmp/weather-location-bus"))),
+            PathBuf::from("/tmp/weather-location-bus")
+        );
     }
 
     #[test]
@@ -1134,17 +1276,224 @@ mod tests {
         outside.gps.latitude = 0.0;
         outside.gps.longitude = 0.0;
         fixture.publish("state/vehicle/workstation-1/outside", &outside);
-        assert!(source.latest(&fixture.bus, "workstation-1", NOW).is_none());
+        let persist = Persist::open(fixture.bus.clone()).expect("vehicle reader");
+        assert!(source
+            .latest(&persist, "workstation-1", NOW)
+            .expect("complete vehicle view")
+            .is_none());
 
         fixture.publish(
             "state/vehicle/workstation-1/local",
             &vehicle_snapshot("workstation-1", "local", NOW),
         );
         let accepted = source
-            .latest(&fixture.bus, "workstation-1", NOW)
+            .latest(&persist, "workstation-1", NOW)
+            .expect("complete vehicle view")
             .expect("fresh same-host fix");
         assert_eq!(accepted.source_id, "local");
         assert_eq!(accepted.point, place().point);
+    }
+
+    #[test]
+    fn final_vehicle_lane_read_failure_defers_action_and_all_projection_changes() {
+        let fixture = Fixture::new();
+        fixture.fixes.set(Some(live_fix(42.36, NOW)));
+        let mut worker = fixture.worker();
+        worker.tick_once().expect("establish live authority");
+        let before = worker.authority.as_ref().unwrap().clone();
+        let before_published_generation = worker.last_published_generation;
+        let before_published_at = worker.last_published_at_ms;
+        fixture.publish(
+            "state/vehicle/workstation-1/a-first",
+            &vehicle_snapshot("workstation-1", "a-first", NOW),
+        );
+        fixture.publish(
+            "state/vehicle/workstation-1/z-final",
+            &vehicle_snapshot("workstation-1", "z-final", NOW),
+        );
+        fixture.publish(
+            WEATHER_SET_LOCATION_TOPIC,
+            &request(
+                "manual-deferred",
+                before.preference.generation,
+                NOW,
+                WeatherLocationMode::Manual,
+            ),
+        );
+        let output_topics = [
+            weather_location_state_topic("workstation-1"),
+            weather_current_state_topic("workstation-1"),
+            weather_forecast_state_topic("workstation-1"),
+            weather_map_state_topic("workstation-1"),
+        ];
+        let reader = Persist::open(fixture.bus.clone()).unwrap();
+        let before_counts = output_topics
+            .iter()
+            .map(|topic| reader.list_since(topic, None).unwrap().len())
+            .collect::<Vec<_>>();
+        worker.fix_source = Arc::new(FinalVehicleLaneFailureFixSource);
+
+        assert!(worker.tick_once().is_err());
+
+        let after = worker.authority.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        let durable = load_record(&fixture.state, "workstation-1", NOW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(durable).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            worker.last_published_generation,
+            before_published_generation
+        );
+        assert_eq!(worker.last_published_at_ms, before_published_at);
+        let after_counts = output_topics
+            .iter()
+            .map(|topic| reader.list_since(topic, None).unwrap().len())
+            .collect::<Vec<_>>();
+        assert_eq!(after_counts, before_counts);
+    }
+
+    #[test]
+    fn failed_projection_publication_repairs_forward_without_false_publish_marker() {
+        let fixture = Fixture::new();
+        let mut worker = fixture.worker();
+        worker.tick_once().expect("initial publication");
+        let previous_generation = worker.last_published_generation;
+        let previous_published_at = worker.last_published_at_ms;
+        fixture.publish(
+            WEATHER_SET_LOCATION_TOPIC,
+            &request("manual-repair", 1, NOW, WeatherLocationMode::Manual),
+        );
+        let hostile_path = fixture
+            .bus
+            .join(weather_current_state_topic("workstation-1"));
+        fs::remove_dir_all(&hostile_path).unwrap();
+        fs::write(&hostile_path, b"hostile non-directory").unwrap();
+
+        assert!(worker.tick_once().is_err());
+        let checkpoint = load_record(&fixture.state, "workstation-1", NOW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.preference.generation, 2);
+        assert!(checkpoint.action_cursor.is_some());
+        assert_eq!(worker.last_published_generation, previous_generation);
+        assert_eq!(worker.last_published_at_ms, previous_published_at);
+
+        fs::remove_file(hostile_path).unwrap();
+        worker.tick_once().expect("repair unpublished generation");
+        assert_eq!(worker.last_published_generation, Some(2));
+        let repaired: EffectiveLocationSnapshot =
+            fixture.latest(&weather_location_state_topic("workstation-1"));
+        assert_eq!(repaired.generation, 2);
+        assert_eq!(repaired.mode, WeatherLocationMode::Manual);
+    }
+
+    #[tokio::test]
+    async fn late_and_replaced_bus_recovers_external_action_and_shutdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let fixture = Fixture::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_open = Arc::clone(&attempts);
+        let bus_for_open = fixture.bus.clone();
+        let mut worker = fixture.worker();
+        worker.fix_source = Arc::new(VehicleBusFixSource);
+        worker.bus_open_override = Some(Arc::new(move |_| {
+            match attempts_for_open.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(None),
+                1 => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected unopenable weather Bus",
+                )),
+                _ => Persist::open(bus_for_open.clone())
+                    .map(Some)
+                    .map_err(io_other),
+            }
+        }));
+        let state_path = fixture.state.clone();
+        let bus_root = fixture.bus.clone();
+        let location_topic = weather_location_state_topic("workstation-1");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited during late-Bus recovery"
+                );
+                let reader = Persist::open(bus_root.clone()).unwrap();
+                if !reader.list_since(&location_topic, None).unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial durable authority must publish after Bus recovery");
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+        assert!(load_record(&state_path, "workstation-1", NOW)
+            .unwrap()
+            .is_some());
+
+        let db = bus_root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+        let replacement = Persist::open(bus_root.clone()).unwrap();
+        replacement
+            .write(
+                WEATHER_SET_LOCATION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&request(
+                        "external-manual",
+                        1,
+                        NOW,
+                        WeatherLocationMode::Manual,
+                    ))
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(!task.is_finished(), "worker exited after Bus replacement");
+                let reached = replacement
+                    .list_since(&location_topic, None)
+                    .unwrap()
+                    .iter()
+                    .filter_map(|message| message.body.as_deref())
+                    .filter_map(|body| serde_json::from_str::<EffectiveLocationSnapshot>(body).ok())
+                    .any(|snapshot| {
+                        snapshot.generation == 2 && snapshot.mode == WeatherLocationMode::Manual
+                    });
+                if reached {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement-index external action must publish corrected authority");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must interrupt weather-location worker")
+            .expect("weather-location task must join")
+            .expect("weather-location worker must stop cleanly");
     }
 
     #[test]
