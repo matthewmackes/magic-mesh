@@ -487,8 +487,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
-- **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority
-  recovers, and cache persistence precedes map publication. Machine 9 passed two exact tests:
+- **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority recovers and cache persistence precedes publication; machine 9 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
 - **Airspace publication recovery checkpoint (2026-08-09):** failed Bus writes retain one MG90 survey for retry without reprobing; machine 196 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
@@ -503,6 +502,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
@@ -870,6 +870,10 @@ behavioral evidence is not completion.
   exact post-I/O context, failed writes, and no-fix transition suppression
   passed eleven focused tests on machine 194:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`.
+- **NWS alert transaction checkpoint (2026-08-09):** provider results remain
+  staged across write faults and exact vehicle context is rechecked before
+  commit. Machine 9 passed seven focused tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

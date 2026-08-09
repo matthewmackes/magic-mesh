@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +20,8 @@ use mackes_mesh_types::nws_alert::{
     nws_alert_state_topic, AlertPolygon, GeoPoint, GeometrySource, NwsAlert, NwsAlertSnapshot,
     NwsSeverity,
 };
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 use reqwest::blocking::Client;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::Deserialize;
@@ -70,9 +72,43 @@ pub enum ProbeResponse {
 
 /// Fully prepared result returned by the blocking seam. Parsing and any
 /// affected-zone HTTP requests happen before this crosses back onto Tokio.
+#[derive(Clone)]
 enum PreparedResponse {
     Modified(NwsAlertSnapshot),
     NotModified,
+}
+
+enum RefreshCommit {
+    Applied(bool),
+    PointChanged,
+    NoPoint,
+}
+
+trait NwsAlertBus {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>>;
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &NwsAlertSnapshot) -> io::Result<()>;
+}
+
+impl NwsAlertBus for Persist {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+        self.reopen_if_index_changed();
+        self.read_latest(topic)
+            .map_err(io_other)?
+            .map(|message| {
+                message
+                    .body
+                    .ok_or_else(|| io::Error::other("NWS alert Bus row has no body"))
+            })
+            .transpose()
+    }
+
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &NwsAlertSnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        self.reopen_if_index_changed();
+        self.write(topic, Priority::Default, None, Some(&body))
+            .map(|_| ())
+            .map_err(io_other)
+    }
 }
 
 /// Injectable raw HTTP seam.
@@ -594,7 +630,7 @@ fn parse_time_ms(raw: &str) -> Option<i64> {
 pub struct NwsAlertOverlayWorker {
     host: String,
     probe: Option<Arc<dyn NwsAlertProbe>>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -622,7 +658,7 @@ impl NwsAlertOverlayWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -634,10 +670,11 @@ impl NwsAlertOverlayWorker {
         self
     }
 
-    /// Override/disable Bus access.
+    /// Override the Bus root. Production resolves the current user/system root
+    /// for every transaction when no override is configured.
     #[must_use]
-    pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+    pub fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
         self
     }
 
@@ -648,36 +685,42 @@ impl NwsAlertOverlayWorker {
         self
     }
 
-    fn current_vehicle_point(&self) -> Option<GeoPoint> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
-        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
-        validated_vehicle_point(&vehicle, &self.host, now_ms())
+    fn open_bus(&self) -> io::Result<Persist> {
+        let root = nws_alert_bus_root(
+            self.bus_root_override.as_deref(),
+            crate::bus_publish::default_bus_root(),
+        );
+        let mut persist = Persist::open(root).map_err(io_other)?;
+        persist.reopen_if_index_changed();
+        Ok(persist)
     }
 
-    fn publish(&self, snapshot: &NwsAlertSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &nws_alert_state_topic(&self.host),
-                snapshot,
-            );
-        }
+    fn current_vehicle_point(&self, bus: &mut impl NwsAlertBus) -> io::Result<Option<GeoPoint>> {
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
+        let Some(body) = bus.read_latest_body(&topic)? else {
+            return Ok(None);
+        };
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
+        Ok(validated_vehicle_point(&vehicle, &self.host, now_ms()))
+    }
+
+    fn publish(&self, bus: &mut impl NwsAlertBus, snapshot: &NwsAlertSnapshot) -> io::Result<()> {
+        bus.publish_snapshot(&nws_alert_state_topic(&self.host), snapshot)
     }
 
     fn apply_result(
         &self,
-        result: io::Result<PreparedResponse>,
+        bus: &mut impl NwsAlertBus,
+        result: Result<PreparedResponse, String>,
         point: GeoPoint,
         last_good: &mut Option<NwsAlertSnapshot>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         match result {
             Ok(PreparedResponse::Modified(snapshot)) => {
-                self.publish(&snapshot);
+                self.publish(bus, &snapshot)?;
                 *last_good = Some(snapshot);
-                true
+                Ok(true)
             }
             Ok(PreparedResponse::NotModified) => {
                 if last_good
@@ -685,58 +728,62 @@ impl NwsAlertOverlayWorker {
                     .is_some_and(|snapshot| snapshot.query_point != Some(point))
                 {
                     self.publish_unavailable(
+                        bus,
                         last_good,
                         Some(point),
                         "304 point does not match last-good snapshot",
-                    );
-                    return false;
+                    )?;
+                    return Ok(false);
                 }
-                if let Some(snapshot) = last_good {
-                    snapshot.fetched_at_ms = now_ms();
-                    snapshot.query_point = Some(point);
-                    snapshot
+                if let Some(snapshot) = last_good.as_ref() {
+                    let mut refreshed = snapshot.clone();
+                    refreshed.fetched_at_ms = now_ms();
+                    refreshed.query_point = Some(point);
+                    refreshed
                         .gaps
                         .retain(|gap| !gap.starts_with("NWS alert overlay paused:"));
-                    self.publish(snapshot);
-                    true
+                    self.publish(bus, &refreshed)?;
+                    *last_good = Some(refreshed);
+                    Ok(true)
                 } else {
                     self.publish_unavailable(
+                        bus,
                         last_good,
                         Some(point),
                         "304 received without a last-good snapshot",
-                    );
-                    false
+                    )?;
+                    Ok(false)
                 }
             }
             Err(error) => {
                 self.publish_unavailable(
+                    bus,
                     last_good,
                     Some(point),
                     &format!("refresh failed: {error}"),
-                );
-                false
+                )?;
+                Ok(false)
             }
         }
     }
 
     fn degraded_snapshot(
         &self,
+        bus: &mut impl NwsAlertBus,
         last_good: Option<&NwsAlertSnapshot>,
         query_point: Option<GeoPoint>,
         reason: &str,
-    ) -> NwsAlertSnapshot {
+    ) -> io::Result<NwsAlertSnapshot> {
         // A restart has no in-memory conditional snapshot, but the Bus may
         // still contain a prior successful record. Read it only as a template
         // for a cleared projection; never republish its prior-location alerts.
-        let persisted = self.bus_root.clone().and_then(|root| {
-            let persist = mde_bus::persist::Persist::open(root).ok()?;
-            let body = persist
-                .read_latest(&nws_alert_state_topic(&self.host))
-                .ok()
-                .flatten()?
-                .body?;
-            serde_json::from_str::<NwsAlertSnapshot>(&body).ok()
-        });
+        let persisted = if last_good.is_some() {
+            None
+        } else {
+            bus.read_latest_body(&nws_alert_state_topic(&self.host))?
+                .map(|body| serde_json::from_str::<NwsAlertSnapshot>(&body).map_err(io_other))
+                .transpose()?
+        };
         let mut degraded = last_good
             .cloned()
             .or(persisted)
@@ -751,23 +798,33 @@ impl NwsAlertOverlayWorker {
         degraded
             .gaps
             .push(format!("NWS alert overlay paused: {reason}"));
-        degraded
+        Ok(degraded)
     }
 
     fn publish_unavailable(
         &self,
-        last_good: &Option<NwsAlertSnapshot>,
+        bus: &mut impl NwsAlertBus,
+        last_good: &mut Option<NwsAlertSnapshot>,
         query_point: Option<GeoPoint>,
         reason: &str,
-    ) {
-        let degraded = self.degraded_snapshot(last_good.as_ref(), query_point, reason);
+    ) -> io::Result<()> {
+        let degraded =
+            self.degraded_snapshot(bus, last_good.as_ref(), query_point.clone(), reason)?;
         tracing::warn!(
             target: "mackesd::nws_alert_overlay",
             host = %self.host,
             error = reason,
             "NWS alert refresh unavailable; publishing an empty degraded snapshot"
         );
-        self.publish(&degraded);
+        self.publish(bus, &degraded)?;
+        if query_point.is_none()
+            || last_good
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.query_point != query_point)
+        {
+            *last_good = None;
+        }
+        Ok(())
     }
 
     async fn fetch_async(
@@ -775,24 +832,36 @@ impl NwsAlertOverlayWorker {
         probe: Arc<dyn NwsAlertProbe>,
         point: GeoPoint,
         shutdown: &mut ShutdownToken,
-    ) -> Option<io::Result<PreparedResponse>> {
+    ) -> Option<Result<PreparedResponse, String>> {
         let host = self.host.clone();
-        let task = tokio::task::spawn_blocking(move || match probe.fetch_alerts(point)? {
-            ProbeResponse::Modified(body) => {
-                build_snapshot(probe.as_ref(), &host, point, &body, now_ms())
-                    .map(PreparedResponse::Modified)
-                    .map_err(|error| io::Error::other(format!("NWS payload invalid: {error}")))
+        let task = tokio::task::spawn_blocking(move || {
+            match probe
+                .fetch_alerts(point)
+                .map_err(|error| error.to_string())?
+            {
+                ProbeResponse::Modified(body) => {
+                    build_snapshot(probe.as_ref(), &host, point, &body, now_ms())
+                        .map(PreparedResponse::Modified)
+                        .map_err(|error| format!("NWS payload invalid: {error}"))
+                }
+                ProbeResponse::NotModified => Ok(PreparedResponse::NotModified),
             }
-            ProbeResponse::NotModified => Ok(PreparedResponse::NotModified),
         });
         tokio::select! {
             () = shutdown.wait() => None,
             joined = task => Some(match joined {
                 Ok(result) => result,
-                Err(error) => Err(io::Error::other(format!("NWS fetch task failed: {error}"))),
+                Err(error) => Err(format!("NWS fetch task failed: {error}")),
             }),
         }
     }
+}
+
+fn nws_alert_bus_root(explicit: Option<&Path>, current: Option<PathBuf>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or(current)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 fn retry_ceiling(poll: Duration) -> Duration {
@@ -875,34 +944,120 @@ impl Worker for NwsAlertOverlayWorker {
         let phase = retry_phase(&self.host);
         let mut phase_pending = true;
         let mut no_fix_published = false;
+        let mut pending: Option<(GeoPoint, Result<PreparedResponse, String>)> = None;
         loop {
-            let Some(point) = self.current_vehicle_point() else {
-                if !no_fix_published {
+            let point = match self.open_bus().and_then(|mut bus| {
+                let point = self.current_vehicle_point(&mut bus)?;
+                if point.is_none() && !no_fix_published {
                     self.publish_unavailable(
-                        &last_good,
+                        &mut bus,
+                        &mut last_good,
                         None,
                         "fresh same-host MG90 vehicle fix unavailable",
-                    );
+                    )?;
+                }
+                Ok(point)
+            }) {
+                Ok(Some(point)) => point,
+                Ok(None) => {
                     no_fix_published = true;
+                    pending = None;
+                    let delay = if phase_pending {
+                        phase_pending = false;
+                        phase_desynchronized_retry_delay(retry, self.poll, phase)
+                    } else {
+                        retry_delay(retry, self.poll)
+                    };
+                    retry = backoff_retry(retry, self.poll);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                let delay = if phase_pending {
-                    phase_pending = false;
-                    phase_desynchronized_retry_delay(retry, self.poll, phase)
-                } else {
-                    retry_delay(retry, self.poll)
-                };
-                retry = backoff_retry(retry, self.poll);
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(delay) => {}
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::nws_alert_overlay", host = %self.host, %error, "NWS vehicle context transaction deferred");
+                    let delay = if phase_pending {
+                        phase_desynchronized_retry_delay(retry, self.poll, phase)
+                    } else {
+                        retry_delay(retry, self.poll)
+                    };
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                continue;
             };
             no_fix_published = false;
-            let Some(result) = self.fetch_async(probe.clone(), point, &mut shutdown).await else {
-                break;
+            if pending
+                .as_ref()
+                .is_some_and(|(pending_point, _)| *pending_point != point)
+            {
+                pending = None;
+            }
+            if pending.is_none() {
+                let Some(result) = self
+                    .fetch_async(probe.clone(), point.clone(), &mut shutdown)
+                    .await
+                else {
+                    break;
+                };
+                pending = Some((point.clone(), result));
+            }
+
+            // NWS and affected-zone I/O runs off-thread without a Bus handle.
+            // Re-open and re-read the exact point before any projection or
+            // private-state commit. Keep the prepared result across storage
+            // failures so a validator-backed response can correct forward.
+            let commit = self.open_bus().and_then(|mut bus| {
+                let latest = self.current_vehicle_point(&mut bus)?;
+                let Some(latest) = latest else {
+                    self.publish_unavailable(
+                        &mut bus,
+                        &mut last_good,
+                        None,
+                        "fresh same-host MG90 vehicle fix unavailable",
+                    )?;
+                    return Ok(RefreshCommit::NoPoint);
+                };
+                if latest != point {
+                    self.publish_unavailable(
+                        &mut bus,
+                        &mut last_good,
+                        Some(latest),
+                        "vehicle point changed during NWS refresh",
+                    )?;
+                    return Ok(RefreshCommit::PointChanged);
+                }
+                let result = pending.as_ref().expect("prepared NWS result").1.clone();
+                self.apply_result(&mut bus, result, point.clone(), &mut last_good)
+                    .map(RefreshCommit::Applied)
+            });
+            let success = match commit {
+                Ok(RefreshCommit::Applied(success)) => {
+                    pending = None;
+                    success
+                }
+                Ok(RefreshCommit::PointChanged) => {
+                    pending = None;
+                    false
+                }
+                Ok(RefreshCommit::NoPoint) => {
+                    pending = None;
+                    no_fix_published = true;
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::nws_alert_overlay", host = %self.host, %error, "NWS refresh transaction deferred");
+                    let delay = retry_delay(retry, self.poll);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
             };
-            let success = self.apply_result(result, point, &mut last_good);
             let delay = if success {
                 phase_pending = true;
                 self.poll
@@ -1000,6 +1155,355 @@ mod tests {
             latitude: 32.2,
             longitude: -95.0,
         }
+    }
+
+    fn vehicle(point: GeoPoint) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude: point.latitude,
+            longitude: point.longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn write_vehicle(root: &Path, point: GeoPoint) {
+        Persist::open(root.to_path_buf())
+            .expect("open vehicle Bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&vehicle(point)).expect("encode vehicle")),
+            )
+            .expect("publish vehicle");
+    }
+
+    #[derive(Default)]
+    struct FixtureBus {
+        body: Option<String>,
+        read_fails: bool,
+        published: Vec<NwsAlertSnapshot>,
+    }
+
+    impl NwsAlertBus for FixtureBus {
+        fn read_latest_body(&mut self, _topic: &str) -> io::Result<Option<String>> {
+            if self.read_fails {
+                Err(io::Error::other("injected NWS Bus read failure"))
+            } else {
+                Ok(self.body.clone())
+            }
+        }
+
+        fn publish_snapshot(
+            &mut self,
+            _topic: &str,
+            snapshot: &NwsAlertSnapshot,
+        ) -> io::Result<()> {
+            self.published.push(snapshot.clone());
+            Ok(())
+        }
+    }
+
+    struct StaticProbe;
+
+    impl NwsAlertProbe for StaticProbe {
+        fn fetch_alerts(&self, _point: GeoPoint) -> io::Result<ProbeResponse> {
+            Ok(ProbeResponse::Modified(CAPTURED_ALERTS.to_string()))
+        }
+
+        fn fetch_zone(&self, _url: &str) -> io::Result<String> {
+            Ok(CAPTURED_ZONE.to_string())
+        }
+    }
+
+    struct CountingProbe(Arc<AtomicUsize>);
+
+    impl NwsAlertProbe for CountingProbe {
+        fn fetch_alerts(&self, _point: GeoPoint) -> io::Result<ProbeResponse> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ProbeResponse::Modified(CAPTURED_ALERTS.to_string()))
+        }
+
+        fn fetch_zone(&self, _url: &str) -> io::Result<String> {
+            Ok(CAPTURED_ZONE.to_string())
+        }
+    }
+
+    struct MovingProbe {
+        root: PathBuf,
+        calls: AtomicUsize,
+        moved: GeoPoint,
+    }
+
+    impl NwsAlertProbe for MovingProbe {
+        fn fetch_alerts(&self, _point: GeoPoint) -> io::Result<ProbeResponse> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(ProbeResponse::Modified(CAPTURED_ALERTS.to_string())),
+                1 => {
+                    write_vehicle(&self.root, self.moved.clone());
+                    Err(io::Error::other("injected NWS failure after movement"))
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(ProbeResponse::Modified(CAPTURED_ALERTS.to_string()))
+                }
+            }
+        }
+
+        fn fetch_zone(&self, _url: &str) -> io::Result<String> {
+            Ok(CAPTURED_ZONE.to_string())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_and_replaced_bus_recovers_external_point_and_shutdown() {
+        assert_eq!(
+            nws_alert_bus_root(Some(Path::new("/explicit")), Some("/current".into())),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            nws_alert_bus_root(None, Some("/current".into())),
+            PathBuf::from("/current")
+        );
+        assert_eq!(
+            nws_alert_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("late-bus");
+        std::fs::write(&root, b"temporarily unopenable Bus root").expect("block Bus root");
+        let mut worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(StaticProbe))
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!task.is_finished(), "late Bus must not terminate worker");
+        std::fs::remove_file(&root).expect("unblock Bus root");
+        write_vehicle(&root, point());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = Persist::open(root.clone())
+                    .expect("open recovered Bus")
+                    .read_latest(&nws_alert_state_topic("rig-1"))
+                    .expect("read recovered projection")
+                    .and_then(|message| message.body)
+                    .and_then(|body| serde_json::from_str::<NwsAlertSnapshot>(&body).ok());
+                if snapshot.is_some_and(|snapshot| snapshot.query_point == Some(point())) {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("late Bus NWS projection");
+
+        let index = root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let replacement_point = GeoPoint {
+            latitude: 32.3,
+            longitude: -95.1,
+        };
+        write_vehicle(&root, replacement_point.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = Persist::open(root.clone())
+                    .expect("open replacement Bus")
+                    .read_latest(&nws_alert_state_topic("rig-1"))
+                    .expect("read replacement projection")
+                    .and_then(|message| message.body)
+                    .and_then(|body| serde_json::from_str::<NwsAlertSnapshot>(&body).ok());
+                if snapshot
+                    .is_some_and(|snapshot| snapshot.query_point == Some(replacement_point.clone()))
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited after Bus replacement");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus NWS projection");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[test]
+    fn failed_vehicle_and_retained_source_reads_are_effect_free() {
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string());
+        let original = build_snapshot(
+            &FakeProbe::captured(),
+            "rig-1",
+            point(),
+            CAPTURED_ALERTS,
+            10,
+        )
+        .expect("snapshot");
+        let last_good = Some(original.clone());
+        let mut bus = FixtureBus {
+            read_fails: true,
+            ..FixtureBus::default()
+        };
+
+        assert!(worker.current_vehicle_point(&mut bus).is_err());
+        assert_eq!(
+            last_good.as_ref().map(|snapshot| snapshot.alerts.len()),
+            Some(2)
+        );
+        assert!(bus.published.is_empty());
+        assert!(worker
+            .degraded_snapshot(&mut bus, None, Some(point()), "provider unavailable")
+            .is_err());
+        assert!(bus.published.is_empty());
+
+        bus.read_fails = false;
+        bus.body = Some("not-json".to_string());
+        assert!(worker.current_vehicle_point(&mut bus).is_err());
+        assert!(worker
+            .degraded_snapshot(&mut bus, None, Some(point()), "provider unavailable")
+            .is_err());
+        assert!(bus.published.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_fetch_movement_retracts_prior_point_alerts_before_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        write_vehicle(&root, point());
+        let moved = GeoPoint {
+            latitude: 32.3,
+            longitude: -95.1,
+        };
+        let probe = Arc::new(MovingProbe {
+            root: root.clone(),
+            calls: AtomicUsize::new(0),
+            moved: moved.clone(),
+        });
+        let mut worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_probe(probe)
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = Persist::open(root.clone())
+                    .expect("open Bus")
+                    .list_since(&nws_alert_state_topic("rig-1"), None)
+                    .expect("list NWS projections");
+                let snapshots: Vec<NwsAlertSnapshot> = rows
+                    .iter()
+                    .filter_map(|row| row.body.as_deref())
+                    .filter_map(|body| serde_json::from_str(body).ok())
+                    .collect();
+                if snapshots.iter().any(|snapshot| {
+                    snapshot.query_point == Some(moved.clone()) && snapshot.alerts.is_empty()
+                }) {
+                    assert!(snapshots.iter().any(|snapshot| {
+                        snapshot.query_point == Some(point()) && !snapshot.alerts.is_empty()
+                    }));
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before movement recheck");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("movement unavailable projection");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_write_retains_prepared_result_and_corrects_forward_without_refetch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        write_vehicle(&root, point());
+        let state_path = root.join(nws_alert_state_topic("rig-1"));
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create state parent");
+        std::fs::write(&state_path, b"block NWS topic directory").expect("block NWS publication");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(CountingProbe(Arc::clone(&calls))))
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                assert!(!task.is_finished(), "worker exited before provider result");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("provider call");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_file(&state_path).expect("unblock NWS publication");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = Persist::open(root.clone())
+                    .expect("open Bus")
+                    .read_latest(&nws_alert_state_topic("rig-1"))
+                    .expect("read NWS")
+                    .and_then(|message| message.body)
+                    .and_then(|body| serde_json::from_str::<NwsAlertSnapshot>(&body).ok());
+                if snapshot.is_some_and(|snapshot| !snapshot.alerts.is_empty()) {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before corrected-forward write"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("corrected-forward NWS publication");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
     }
 
     #[test]
@@ -1139,11 +1643,11 @@ mod tests {
     }
 
     #[test]
-    fn not_modified_cannot_relabel_a_prior_points_snapshot() {
+    fn not_modified_cannot_relabel_or_retain_a_prior_points_snapshot() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
+        let mut bus = Persist::open(root.clone()).expect("bus");
         let old = build_snapshot(
             &FakeProbe::captured(),
             "rig-1",
@@ -1158,11 +1662,19 @@ mod tests {
             latitude: 33.0,
             longitude: -96.0,
         };
-        assert!(!worker.apply_result(Ok(PreparedResponse::NotModified), new_point, &mut last_good));
-        let retained = last_good.expect("old snapshot retained");
-        assert_ne!(retained.query_point, Some(new_point));
-        assert_eq!(retained.fetched_at_ms, 10);
-        assert_eq!(retained.alerts.len(), old_alert_count);
+        assert!(!worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::NotModified),
+                new_point,
+                &mut last_good,
+            )
+            .expect("publish mismatched 304"));
+        assert!(
+            last_good.is_none(),
+            "prior-point alerts must not remain eligible for a later 304"
+        );
+        assert_eq!(old_alert_count, 2);
 
         let body = Persist::open(root)
             .expect("bus")
@@ -1183,8 +1695,8 @@ mod tests {
     fn failed_refresh_publishes_empty_degraded_projection_and_retains_private_cache() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
+        let mut bus = Persist::open(root.clone()).expect("bus");
         let original = build_snapshot(
             &FakeProbe::captured(),
             "rig-1",
@@ -1194,12 +1706,22 @@ mod tests {
         )
         .expect("captured NWS parse");
         let mut last_good = None;
-        assert!(worker.apply_result(
-            Ok(PreparedResponse::Modified(original)),
-            point(),
-            &mut last_good
-        ));
-        assert!(!worker.apply_result(Err(io::Error::other("timeout")), point(), &mut last_good));
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                point(),
+                &mut last_good,
+            )
+            .expect("publish fresh"));
+        assert!(!worker
+            .apply_result(
+                &mut bus,
+                Err("timeout".to_string()),
+                point(),
+                &mut last_good,
+            )
+            .expect("publish degraded"));
 
         let retained = last_good.as_ref().expect("private conditional cache");
         assert_eq!(retained.alerts.len(), 2);
@@ -1226,7 +1748,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let seed_worker =
-            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
+        let mut bus = Persist::open(root.clone()).expect("bus");
         let original = build_snapshot(
             &FakeProbe::captured(),
             "rig-1",
@@ -1236,20 +1759,25 @@ mod tests {
         )
         .expect("captured NWS parse");
         let mut seed_cache = None;
-        assert!(seed_worker.apply_result(
-            Ok(PreparedResponse::Modified(original)),
-            point(),
-            &mut seed_cache
-        ));
+        assert!(seed_worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                point(),
+                &mut seed_cache,
+            )
+            .expect("seed fresh"));
 
-        let restarted =
-            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
-        let restart_cache = None;
-        restarted.publish_unavailable(
-            &restart_cache,
-            None,
-            "fresh same-host MG90 vehicle fix unavailable",
-        );
+        let restarted = NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
+        let mut restart_cache = None;
+        restarted
+            .publish_unavailable(
+                &mut bus,
+                &mut restart_cache,
+                None,
+                "fresh same-host MG90 vehicle fix unavailable",
+            )
+            .expect("publish unavailable");
 
         let body = Persist::open(root)
             .expect("bus")
@@ -1337,9 +1865,12 @@ mod tests {
                 Some(&serde_json::to_string(&vehicle).expect("json")),
             )
             .expect("write");
-        let worker =
-            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
-        assert_eq!(worker.current_vehicle_point(), Some(point()));
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        assert_eq!(
+            worker.current_vehicle_point(&mut bus).unwrap(),
+            Some(point())
+        );
 
         vehicle.published_at_ms = now_ms() - VEHICLE_FIX_MAX_AGE_MS - 1;
         persist
@@ -1350,7 +1881,7 @@ mod tests {
                 Some(&serde_json::to_string(&vehicle).expect("json")),
             )
             .expect("write stale");
-        assert!(worker.current_vehicle_point().is_none());
+        assert!(worker.current_vehicle_point(&mut bus).unwrap().is_none());
     }
 
     #[test]
@@ -1447,7 +1978,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_fetch_does_not_delay_shutdown() {
-        let worker = NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut token = ShutdownToken::from_receiver(rx);
         let task = tokio::spawn(async move {
@@ -1467,7 +1998,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         let mut worker = NwsAlertOverlayWorker::new("rig-1".to_string())
             .with_probe(Arc::new(FakeProbe::captured()))
-            .with_bus_root(Some(root.clone()))
+            .with_bus_root(root.clone())
             .with_poll(Duration::from_millis(50));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
