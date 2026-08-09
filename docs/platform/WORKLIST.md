@@ -93,9 +93,7 @@ behavioral evidence is not completion.
   refused because mackesd, role pin, and Bus were absent. Live HostCapacity,
   restart/crash, native attachment, and Dell/seat proof remain open.
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`.
-- **Typed live-proof checkpoint (2026-08-06):** the read-only verifier now
-  consumes only `action/workload/operation` and typed Workload projections;
-  self-test passed. Evidence:
+- **Typed live-proof checkpoint (2026-08-06):** the verifier consumes only typed Workload operations/projections; self-test passed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-live-proof-typed-operation-r1.md`.
 - **Console authority removal checkpoint (2026-08-08):** the raw console relay,
   cloud console dispatch, shell endpoint reader, obsolete Browser attach
@@ -121,9 +119,10 @@ behavioral evidence is not completion.
   discovery scope. ADR-0007 and a fail-closed authority guard bind runtime
   identity to typed Workloads; focused resolver and lint gates pass. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-compute-inventory-hard-cut-r6.md`.
-- **Datacenter/XCP hard cut (2026-08-09):** VM actions/roster, both XCP workers/
-  crate/topics, and Server/Hypervisor profiles were deleted; retained rows fail closed. Evidence:
+- **Datacenter/XCP hard cut (2026-08-09):** VM actions/roster, both XCP workers/crate/topics, and Server/Hypervisor profiles were deleted; retained rows fail closed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-datacenter-xcp-authority-hard-cut-r7.md`.
+- **Legacy compute-create hard cut (2026-08-09):** the orphan `compute/create/*` worker and direct `virt-install` path were deleted; typed Workloads owns create. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-provision-hard-cut-r8.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and

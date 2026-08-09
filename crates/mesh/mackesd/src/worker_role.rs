@@ -1454,11 +1454,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         RestartPolicy::Always,
         WorkerGroup::Compute,
     ),
-    WorkerSpec::direct(
-        "compute_provision",
-        RestartPolicy::Always,
-        WorkerGroup::Compute,
-    ),
     WorkerSpec::responder("connect_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct(
         "connect_firewall",
@@ -2966,7 +2961,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 145);
+        assert_eq!(WORKER_REGISTRY.len(), 144);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3287,8 +3282,8 @@ mod tests {
         // role-gated registrations. WL-ARCH-009 adds the 66 directly bound
         // supervisor/responders to the same canonical diagnostic roster. The
         // retired XCP capacity and provisioning authorities are absent.
-        assert_eq!(lh.len(), 107);
-        assert_eq!(ws.len(), 145);
+        assert_eq!(lh.len(), 106);
+        assert_eq!(ws.len(), 144);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

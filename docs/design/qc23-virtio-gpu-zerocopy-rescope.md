@@ -1,5 +1,9 @@
 # QC-23 re-scope — the QEMU virtio-gpu→egui zero-copy fast path
 
+> **HISTORICAL / SUPERSEDED (2026-08-09):** This design references the retired
+> `compute_provision` VM path. Typed Workloads is the current lifecycle and
+> attachment authority; use `docs/platform/workload-authority-inventory.md`.
+
 **Status:** DESIGN — options + recommendation, 2026-07-10. Written against QC-23's
 own honest "Still open" admission (`docs/WORKLIST.md`): the landed QC-23 progress
 (Nova/libvirt SPICE preference, Glance virtio-video image properties, live SPICE

@@ -16,7 +16,7 @@ worklist. Repository paths are the durable owner identifiers.
 | Native presentation lease | `workload_compute` Display1 attachment runtime | shell `display1_client` consumes one-use local leases | lease metadata may be projected; descriptors stay on the authenticated Unix socket and never enter the Bus |
 | Session semantics | `session_broker` | chooser/session rail publish session intent; roaming reads session state | owns user/session focus only; cannot actuate a VM/container or mint a console endpoint |
 | Placement proposals | `scheduler` | publishes placement events | cannot publish Workload operations or invoke a runtime adapter |
-| Storage observation/provisioning | storage and compute-provision workers | read-only runtime probes and host storage-pool setup | cannot change an individual Workload power state |
+| Storage observation/provisioning | `storage` | read-only runtime probes and managed host virtual-storage setup | cannot change an individual Workload power state |
 
 ## Typed caller inventory
 
@@ -46,6 +46,7 @@ worklist. Repository paths are the durable owner identifiers.
 | Replicated `compute-inventory.json` VM roster used as probe targets | enrolled peer identity bundles plus bounded LAN/operator targets | production resolver and legacy reader were deleted; authority lint rejects the retired file/symbol |
 | Datacenter `action/dc/vm-*` responders and `event/dc/vm/*` roster | typed Workload operations and `state/workloads/<node>` | VM verbs and XAPI VM sampling were deleted; retained VM topics are ignored and cannot be republished |
 | XCP `action/provision/*`, `compute/xcp-host/*`, `xcp_provision`, and `xcp_host` | typed Workload operations and backend-specific HostCapacity admission | both workers and the runtime `mackes-xcp` crate were deleted; authority lint rejects their files, modules, registrations, and topics |
+| `compute/create/*`, `compute/create-ack/*`, and `compute_provision` | typed Workload create operations and `state/workloads/<node>` status | the orphan worker had no production publisher and directly ran `virt-install`; its module, spawn, registry entry, topics, and artifact were deleted and are rejected by authority lint |
 
 ## Known non-lifecycle runtime tools
 

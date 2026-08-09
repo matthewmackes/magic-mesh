@@ -1,5 +1,9 @@
 # E12-9 / E12-10 re-scope — audio, VFIO/USB passthrough, and live migration on libvirt/QEMU-KVM
 
+> **HISTORICAL / SUPERSEDED (2026-08-09):** This design describes retired
+> `compute_provision` and `vm_lifecycle` authorities. Typed Workloads now owns
+> VM creation/lifecycle; use `docs/platform/workload-authority-inventory.md`.
+
 **Status:** DESIGN — options + recommendation, 2026-07-10. Written after QC-15 deleted
 `crates/services/mde-kvm` (the cloud-hypervisor broker) outright, which reopened two
 WORKLIST gaps that were still described against that now-deleted stack. This doc

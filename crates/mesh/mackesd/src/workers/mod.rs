@@ -400,12 +400,12 @@ pub mod transit_overlay;
 // `compute/exposed/<own-peer-addr>` for the Workbench display.
 // Silent no-op when firewall-cmd is absent.
 pub mod compute_expose;
-// VIRT-8.a (v5.0.0) — cold VM migration source-side worker.
+// VIRT-8.a (v5.0.0) — cold VM migration worker.
 // Each peer drains `action/compute/migrate`; when own nebula
 // IP == request.source_peer, runs virsh shutdown + 120s SHUTOFF
 // poll + rsync --compress over Nebula + publishes
-// `event/compute/migrate-ready` + virsh undefine. VIRT-8.b
-// (target-side compute_provision handler) ships with VIRT-6.
+// `event/compute/migrate-ready` + virsh undefine. The worker also owns the
+// target-side handoff through its bounded actuator seam.
 pub mod compute_migrate;
 // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects the 9
 // items from docs/design/v6.0-mde-portal.md §7.1 (wifi / arp /
@@ -425,15 +425,6 @@ pub mod voip_rtt_worker;
 // MESH-A-5.2 (v5.0.0) — mesh_firewall. Reconciles firewalld source-DROP
 // rich-rules against the mesh-synced Blocked-host consensus every minute.
 pub mod mesh_firewall;
-// VIRT-6 (v5.0.0) — compute_provision. Drains
-// `compute/create/<own-addr>`: ensures the mde-vms pool (VIRT-3),
-// allocates a per-peer /24 VM IP, requester-side nebula-cert keygen
-// + cert-sign RPC (VIRT-5), builds the NoCloud cloud-init seed,
-// virt-installs (libvirt-managed virtiofs when share_meshfs +
-// mounted), acks on compute/create-ack/<ulid>, fires an immediate
-// compute/inventory publish. Guest config via
-// nebula_supervisor::render_guest_config_yaml.
-pub mod compute_provision;
 // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
 // worker. Runs on every peer: watches signed `<mesh-home>/upgrade-
 // intent/*.json` (written by `mde-update --coordinate`), runs

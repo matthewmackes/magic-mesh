@@ -7,9 +7,9 @@
 //! to `reply/<request-ulid>` per the Bus RPC convention
 //! (`crates/mde-bus/src/rpc.rs`). On **non-CA peers** the same
 //! topic is still drained but the handler short-circuits to a log
-//! line so the cursor advances and no reply is written — `compute_
-//! provision` (VIRT-6) gets its reply from the actual CA peer and
-//! never confuses a "not the CA" silence with a slow signer.
+//! line so the cursor advances and no reply is written. There is no shipped
+//! production publisher after the legacy compute-provision path was retired;
+//! the authenticated responder remains available to operator/API callers.
 //!
 //! ## Topic-shape lock
 //!
@@ -37,9 +37,8 @@
 //!   on rpc::DEFAULT_RPC_TIMEOUT (30 s).
 //! - **`nebula-cert` failure** — reply body is `{"error": "..."}`
 //!   with the subprocess exit description.
-//! - **Non-CA peer** — no reply; the requester's `await_reply`
-//!   times out per the rpc convention and `compute_provision`
-//!   (VIRT-6) handles the timeout-retry-fail logic on its end.
+//! - **Non-CA peer** — no reply; an operator/API requester's `await_reply`
+//!   times out per the RPC convention.
 //!
 //! Cert temp files are written under `std::env::temp_dir()/
 //! mde-cert-sign/<sanitized-cn>.{crt,key}` and removed after the
@@ -98,8 +97,7 @@ pub struct CertSignRequest {
     /// Optional groups (defaults to `["mde-vms"]` when empty).
     #[serde(default)]
     pub groups: Vec<String>,
-    /// VIRT-6 requester-side keygen (operator lock 2026-05-30): when
-    /// present, the requester (`compute_provision`) generated the
+    /// Requester-side keygen: when present, the caller generated the
     /// keypair locally via `nebula-cert keygen` and sends only the
     /// PUBLIC key here. The CA signs it with `-in-pub` and produces
     /// no private key — the key never crosses the Bus. When absent
@@ -742,11 +740,8 @@ mod tests {
         assert!(!v.as_object().unwrap().contains_key("ca_pem"));
     }
 
-    // ── Required scenario 3: timeout handled (the compute_provision
-    //    requester uses rpc::await_reply with rpc::DEFAULT_RPC_TIMEOUT
-    //    = 30 s; this worker's contract is to publish under the
-    //    `action/` prefix so the requester's rpc::publish_request
-    //    accepts the topic). ──
+    // ── Required scenario 3: RPC callers require an `action/` topic so
+    //    rpc::publish_request accepts it and can apply its bounded timeout. ──
 
     #[test]
     fn action_topic_under_action_prefix() {

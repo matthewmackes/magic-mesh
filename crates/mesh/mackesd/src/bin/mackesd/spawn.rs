@@ -2762,11 +2762,9 @@ pub(crate) fn spawn_fleet_compute_workers(
     // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
     // spawns the worker; only the CA peer (presence of
     // ~/.config/mde/nebula/ca.key) actually signs + replies, the
-    // others advance the cursor silently. compute_provision
-    // (VIRT-6) publishes to `action/compute/cert-sign-request`
-    // and awaits the reply via rpc::await_reply with the 30 s
-    // rpc::DEFAULT_RPC_TIMEOUT, retrying once before marking VM
-    // creation failed (per VIRT-5 acceptance bullet 4).
+    // others advance the cursor silently. No shipped publisher remains after
+    // the legacy VM-provision path was retired; authenticated operator/API
+    // requests can still use the responder.
     sup.spawn(Spawn::new(
         mackesd_core::workers::cert_authority::CertAuthorityWorker::new(),
         RestartPolicy::Always,
@@ -2793,13 +2791,12 @@ pub(crate) fn spawn_fleet_compute_workers(
         .expect("worker_names mutex")
         .push("compute_expose".into());
 
-    // VIRT-8.a (v5.0.0) — cold VM migration source-side. Each
+    // VIRT-8.a (v5.0.0) — cold VM migration. Each
     // peer drains `action/compute/migrate`; when own nebula IP
     // == request.source_peer, runs the shutdown→rsync→publish
     // migrate-ready→undefine flow over the Nebula overlay.
-    // Target-side handler (VIRT-8.b) ships with VIRT-6
-    // compute_provision and subscribes to
-    // `event/compute/migrate-ready`.
+    // The same worker owns the target-side `event/compute/migrate-ready`
+    // handoff through its bounded actuator seam.
     sup.spawn(Spawn::new(
         mackesd_core::workers::compute_migrate::ComputeMigrateWorker::new(),
         RestartPolicy::Always,
@@ -2808,28 +2805,6 @@ pub(crate) fn spawn_fleet_compute_workers(
         .lock()
         .expect("worker_names mutex")
         .push("compute_migrate".into());
-
-    // VIRT-6 (v5.0.0) — compute_provision. Drains this peer's
-    // `compute/create/<addr>` topic: ensures the mde-vms pool,
-    // allocates a per-peer /24 VM IP, runs requester-side
-    // nebula-cert keygen + the cert-sign RPC, builds the NoCloud
-    // seed, virt-installs the VM (with virtiofs MeshFS share when
-    // requested + mounted), acks on compute/create-ack/<ulid>, and
-    // reports completion only through its typed acknowledgement. workgroup_root + node_id
-    // locate this peer's nebula-bundle.json for the guest
-    // lighthouse roster.
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::compute_provision::ComputeProvisionWorker::new(
-            fw_host.clone(),
-            workgroup_root.clone(),
-            node_id.clone(),
-        ),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("compute_provision".into());
 
     // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects
     // the 9 items (docs/design/v6.0-mde-portal.md §7.1) hourly +

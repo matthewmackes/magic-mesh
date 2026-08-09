@@ -17,6 +17,7 @@ mackesd_manifest="$repo_root/crates/mesh/mackesd/Cargo.toml"
 shell_root="$repo_root/crates/desktop/mde-shell-egui/src"
 spawn_file="$repo_root/crates/mesh/mackesd/src/bin/mackesd/spawn.rs"
 workers_mod="$repo_root/crates/mesh/mackesd/src/workers/mod.rs"
+worker_role="$repo_root/crates/mesh/mackesd/src/worker_role.rs"
 cloud_verbs="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs.rs"
 compute_migrate="$repo_root/crates/mesh/mackesd/src/workers/compute_migrate.rs"
 workload_compute="$repo_root/crates/mesh/mackesd/src/workers/workload_compute.rs"
@@ -35,6 +36,7 @@ retired_attach_verifier="$repo_root/packaging/browser-vm/verify-transport-attach
 retired_xcp_provision="$repo_root/crates/mesh/mackesd/src/workers/xcp_provision.rs"
 retired_xcp_host="$repo_root/crates/mesh/mackesd/src/workers/xcp_host.rs"
 retired_xcp_crate="$repo_root/crates/mesh/mackes-xcp/Cargo.toml"
+retired_compute_provision="$repo_root/crates/mesh/mackesd/src/workers/compute_provision.rs"
 live_mirror_verifier="$repo_root/install-helpers/verify-live-mirrors.py"
 
 scan_shell() {
@@ -270,7 +272,8 @@ for retired_file in \
   "$retired_attach_verifier" \
   "$retired_xcp_provision" \
   "$retired_xcp_host" \
-  "$retired_xcp_crate"; do
+  "$retired_xcp_crate" \
+  "$retired_compute_provision"; do
   if [ -e "$retired_file" ]; then
     printf 'lint-workload-authority.sh: retired authority artifact is reachable: %s\n' "$retired_file" >&2
     exit 1
@@ -288,6 +291,14 @@ if contains_literal 'xcp_provision' "$spawn_file" \
   || production_contains_literal '"vm-list"' "$datacenter_orchestrator" \
   || production_contains_literal 'DcResource::new("vm"' "$datacenter_orchestrator"; then
   printf '%s\n' 'lint-workload-authority.sh: retired Datacenter/XCP VM authority is registered or sampled' >&2
+  exit 1
+fi
+
+if contains_literal 'compute_provision' "$spawn_file" \
+  || contains_literal 'pub mod compute_provision' "$workers_mod" \
+  || contains_literal '"compute_provision"' "$worker_role" \
+  || contains_literal 'compute/create/' "$spawn_file"; then
+  printf '%s\n' 'lint-workload-authority.sh: retired compute-provision VM authority is registered' >&2
   exit 1
 fi
 

@@ -8,9 +8,8 @@
 //!    120 s timeout.
 //! 3. `rsync --compress --progress <disk_path> <target>:<target_dir>`
 //!    over the Nebula overlay.
-//! 4. Publishes `event/compute/migrate-ready` so the target peer's
-//!    `compute_provision` (VIRT-8.b, ships with VIRT-6) defines the
-//!    VM with the migrated disk + starts it. The source domain is left
+//! 4. Publishes `event/compute/migrate-ready`; this worker's target-side
+//!    adapter handoff defines the VM with the migrated disk + starts it. The source domain is left
 //!    DEFINED-BUT-SHUTOFF as a rollback anchor.
 //! 5. Waits for the target's `event/compute/migrate-committed` ack
 //!    (correlated by request ULID, bounded by

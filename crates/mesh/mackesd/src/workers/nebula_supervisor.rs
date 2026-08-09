@@ -1278,10 +1278,8 @@ fn materialize_config_inner(
 /// `10.42.0.0/16` mesh between the peer subnet (`10.42.0.0/17`,
 /// existing enrollment) and this VM subnet.
 ///
-/// Exposed at module scope so VIRT-4.b (`nebula_enroll` dynamic
-/// re-render), VIRT-5 (cert sign-request CN/ip allocation), and
-/// VIRT-6 (`compute_provision` cert request payload) all reference
-/// the single source of truth.
+/// Exposed at module scope so dynamic re-rendering and VM certificate/IP
+/// allocation reference one source of truth.
 pub const VM_SUBNET_CIDR: &str = "10.42.128.0/17";
 
 /// Pure helper — build the regular peer-role config YAML.
@@ -1323,10 +1321,8 @@ pub fn render_config_yaml_with_routes(
 /// VM-subnet route lives only on the **host** peers (they advertise
 /// reachability of the VM subnet on the operator's behalf).
 ///
-/// `compute_provision` writes this into the guest at
-/// `/etc/nebula/config.yml` via cloud-init `write_files`, alongside
-/// the VM's `host.key` (requester-side keygen), `host.crt` + `ca.crt`
-/// (from the cert_authority reply).
+/// Guest-enrollment callers can write this to `/etc/nebula/config.yml`
+/// alongside the VM's key and certificate material.
 #[must_use]
 pub fn render_guest_config_yaml(bundle: &crate::ca::bundle::NebulaBundle) -> String {
     render_config_yaml_inner(bundle, ConfigRole::Peer, false, &[], &[])
@@ -1592,7 +1588,7 @@ fn render_config_yaml_inner(
     // since a leaf node must not route the VM subnet to itself.
     // The overlay interface MUST be named `nebula1` — mackesd's workers
     // and the per-service overlay bindings resolve the interface by that
-    // name (compute_provision::DEFAULT_NEBULA_INTERFACE). Without an
+    // name used throughout the daemon. Without an
     // explicit `tun.dev`, nebula auto-names it `tun0` and every
     // overlay-bound lookup fails ("Failed to resolve interface nebula1").
     // The `tun:` block is therefore ALWAYS emitted (was: only when an

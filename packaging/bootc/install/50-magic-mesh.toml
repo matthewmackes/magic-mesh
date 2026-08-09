@@ -18,7 +18,7 @@
 # ── Why XFS ──────────────────────────────────────────────────────────────────
 # XFS is chosen for large-file throughput AND reflink (copy-on-write clones,
 # mkfs.xfs default on F44): `qemu-img create -b … -F qcow2`, virt-clone and the
-# mesh VM lifecycle (compute_provision / vm_lifecycle) reflink-clone a golden image
+# typed Workload VM lifecycle reflink-clones a golden image
 # into a new desktop instantly instead of a full copy — the fast-spawn path the
 # VDI cockpit depends on. XFS also grows online (`xfs_growfs`), so expanding the
 # underlying disk/LV grows the VM store with no downtime.
