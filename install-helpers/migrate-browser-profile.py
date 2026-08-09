@@ -60,12 +60,63 @@ class MigrationError(RuntimeError):
     pass
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def source_snapshot(path: Path) -> tuple[int, str, tuple[int, int, int, int, int]]:
+    """Hash one regular source without following a last-moment symlink swap."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise MigrationError(f"source is not a regular file: {path}")
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    if identity != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns):
+        raise MigrationError(f"source changed while it was read: {path}")
+    current = path.lstat()
+    if identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns):
+        raise MigrationError(f"source identity changed while it was read: {path}")
+    return after.st_size, digest.hexdigest(), identity
+
+
+def copy_verified(
+    source: Path,
+    destination: Path,
+    expected_size: int,
+    expected_sha256: str,
+    expected_identity: tuple[int, int, int, int, int],
+) -> None:
+    """Copy the exact bytes inventoried above or refuse the whole bundle."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        before = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        if not stat.S_ISREG(before.st_mode) or identity != expected_identity:
+            raise MigrationError(f"source changed before copy: {source}")
+        digest = hashlib.sha256()
+        copied = 0
+        with os.fdopen(os.dup(descriptor), "rb") as source_handle, destination.open("xb") as output_handle:
+            for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                output_handle.write(chunk)
+                digest.update(chunk)
+                copied += len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    final_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    if final_identity != expected_identity or copied != expected_size or digest.hexdigest() != expected_sha256:
+        raise MigrationError(f"source changed during copy: {source}")
+    current = source.lstat()
+    if expected_identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns):
+        raise MigrationError(f"source identity changed during copy: {source}")
 
 
 def relative_safe(path: Path, root: Path) -> str:
@@ -176,7 +227,7 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
     else:
         previous = None
 
-    entries: list[dict] = []
+    entries: list[dict | tuple[Path, dict, tuple[int, int, int, int, int]]] = []
     seen_outputs: set[str] = set()
     total_bytes = 0
     candidates = 0
@@ -205,11 +256,23 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
                 entries.append(record)
                 continue
             try:
-                size = path.stat().st_size
+                metadata = path.lstat()
             except OSError as error:
                 record.update(status="failed", reason=f"stat-failed:{error.__class__.__name__}")
                 entries.append(record)
                 continue
+            if not stat.S_ISREG(metadata.st_mode):
+                record.update(status="failed", reason="not-regular-file")
+                entries.append(record)
+                continue
+            size = metadata.st_size
+            initial_identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
             if size > MAX_FILE_BYTES:
                 record.update(status="failed", reason="file-too-large", bytes=size)
                 entries.append(record)
@@ -224,14 +287,24 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
                 entries.append(record)
                 continue
             seen_outputs.add(destination_relative)
+            try:
+                size, source_sha256, source_identity = source_snapshot(path)
+            except (OSError, MigrationError) as error:
+                record.update(status="failed", reason=f"source-read-failed:{error.__class__.__name__}")
+                entries.append(record)
+                continue
+            if source_identity != initial_identity:
+                record.update(status="failed", reason="source-changed-during-inventory")
+                entries.append(record)
+                continue
             record.update(
                 status="imported",
                 bytes=size,
-                sha256=sha256(path),
+                sha256=source_sha256,
                 output=destination_relative,
             )
             total_bytes += size
-            entries.append((path, record))
+            entries.append((path, record, source_identity))
 
     if candidates > MAX_FILES:
         raise MigrationError(f"source contains too many files: {candidates}")
@@ -252,6 +325,9 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
     }
     encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
 
+    if counts["failed"]:
+        raise MigrationError(f"migration refused {counts['failed']} failed source entries")
+
     if previous is not None and previous != manifest:
         raise MigrationError("existing bundle differs; rerun with --replace after review")
     if previous is not None:
@@ -265,10 +341,19 @@ def migrate(roots: list[tuple[Path, str]], output: Path, replace: bool = False) 
         for item in entries:
             if not isinstance(item, tuple):
                 continue
-            source, record = item
+            source, record, source_identity = item
             destination = staging / record["output"]
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copyfile(source, destination)
+            try:
+                copy_verified(
+                    source,
+                    destination,
+                    record["bytes"],
+                    record["sha256"],
+                    source_identity,
+                )
+            except (OSError, MigrationError) as error:
+                raise MigrationError(f"source could not be copied safely: {source}") from error
             os.chmod(destination, stat.S_IRUSR | stat.S_IWUSR)
         (staging / "manifest.json").write_text(encoded, encoding="utf-8")
         os.chmod(staging / "manifest.json", stat.S_IRUSR | stat.S_IWUSR)

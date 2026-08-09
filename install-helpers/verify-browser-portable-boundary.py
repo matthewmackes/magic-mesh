@@ -73,6 +73,9 @@ def fixture_roots(base: Path) -> list[tuple[Path, str]]:
     (policies / "managed.json").write_text('{"BrowserSignin":0}\n', encoding="utf-8")
     (profile / "Cookies").write_text("COOKIE_SECRET", encoding="utf-8")
     (profile / "Login Data").write_text("PASSWORD_SECRET", encoding="utf-8")
+    (profile / "Passkeys").mkdir()
+    (profile / "Passkeys" / "records.db").write_text("PASSKEY_SECRET", encoding="utf-8")
+    (profile / "sealed-credentials.json").write_text("SEALED_SECRET", encoding="utf-8")
     (profile / "Local Storage").mkdir()
     (profile / "Local Storage" / "token.txt").write_text("TOKEN_SECRET", encoding="utf-8")
     (profile / "unlisted.txt").write_text("not portable", encoding="utf-8")
@@ -84,12 +87,22 @@ def fixture_roots(base: Path) -> list[tuple[Path, str]]:
 
 
 def validate_bundle(module: ModuleType, roots: list[tuple[Path, str]], output: Path) -> dict:
+    protected = [
+        roots[0][0] / "Cookies",
+        roots[0][0] / "Login Data",
+        roots[0][0] / "Passkeys" / "records.db",
+        roots[0][0] / "sealed-credentials.json",
+    ]
+    protected_before = {path: (path.read_bytes(), path.stat().st_mode) for path in protected}
     first = module.migrate(roots, output)
     encoded_first = (output / "manifest.json").read_bytes()
     second = module.migrate(roots, output)
     encoded_second = (output / "manifest.json").read_bytes()
     if first != second or encoded_first != encoded_second:
         raise BoundaryError("existing identical bundle must be explicitly idempotent")
+    protected_after = {path: (path.read_bytes(), path.stat().st_mode) for path in protected}
+    if protected_after != protected_before:
+        raise BoundaryError("migration changed a cookie, password, passkey, or sealed credential source")
     try:
         manifest = json.loads(encoded_first)
     except json.JSONDecodeError as exc:
@@ -136,6 +149,8 @@ def validate_bundle(module: ModuleType, roots: list[tuple[Path, str]], output: P
     required_skips = {
         ("Cookies", "credential-bearing-store"),
         ("Login Data", "credential-bearing-store"),
+        ("Passkeys/records.db", "credential-bearing-store"),
+        ("sealed-credentials.json", "credential-bearing-name"),
         ("Local Storage/token.txt", "credential-bearing-store"),
         ("Bookmarks-link", "symlink-rejected"),
         ("unlisted.txt", "unsupported-profile-entry"),
@@ -157,11 +172,64 @@ def validate_duplicate_identity_rejection(
     duplicate_roots = [*roots, roots[0]]
     try:
         validate_bundle(module, duplicate_roots, output)
-    except BoundaryError as exc:
-        if "duplicate source identities" not in str(exc):
+    except (BoundaryError, module.MigrationError) as exc:
+        if "failed source entries" not in str(exc) and "duplicate source identities" not in str(exc):
             raise BoundaryError(f"duplicate identity failed for the wrong reason: {exc}") from exc
     else:
         raise BoundaryError("duplicate source identities must fail the portable boundary closed")
+
+
+def validate_live_source_race_refusal(module: ModuleType, base: Path) -> None:
+    roots = fixture_roots(base)
+    output = base / "race-output"
+    cookie_store = roots[0][0] / "Cookies"
+    cookie_before = cookie_store.read_bytes()
+    original_copy = module.copy_verified
+    mutated = False
+
+    def mutate_before_copy(source, destination, expected_size, expected_sha256, expected_identity):
+        nonlocal mutated
+        if not mutated and source.name == "Bookmarks":
+            source.write_text('{"roots":{"changed":true}}\n', encoding="utf-8")
+            mutated = True
+        return original_copy(source, destination, expected_size, expected_sha256, expected_identity)
+
+    module.copy_verified = mutate_before_copy
+    try:
+        try:
+            module.migrate(roots, output)
+        except module.MigrationError as exc:
+            if "copied safely" not in str(exc):
+                raise BoundaryError(f"live source race failed for the wrong reason: {exc}") from exc
+        else:
+            raise BoundaryError("a profile mutation during copy must refuse publication")
+    finally:
+        module.copy_verified = original_copy
+    if output.exists():
+        raise BoundaryError("a raced profile must not leave a partial bundle")
+    if cookie_store.read_bytes() != cookie_before:
+        raise BoundaryError("migration changed a credential-bearing source store")
+
+
+def validate_partial_bundle_refusal(module: ModuleType, base: Path) -> None:
+    profile = base / "oversized-profile"
+    profile.mkdir()
+    (profile / "Bookmarks").write_bytes(b"too-large")
+    output = base / "partial-output"
+    original_limit = module.MAX_FILE_BYTES
+    module.MAX_FILE_BYTES = 4
+    try:
+        try:
+            module.migrate([(profile, "profile")], output)
+        except module.MigrationError as exc:
+            if "failed source entries" not in str(exc):
+                raise BoundaryError(f"partial migration failed for the wrong reason: {exc}") from exc
+        else:
+            raise BoundaryError("failed source entries must refuse bundle publication")
+    finally:
+        module.MAX_FILE_BYTES = original_limit
+    if output.exists():
+        raise BoundaryError("failed source entries must not leave a partial bundle")
 
 
 def validate_source(repo_root: Path) -> None:
@@ -180,6 +248,10 @@ def validate_source(repo_root: Path) -> None:
         if first != second or sha256(first_output / "manifest.json") != sha256(second_output / "manifest.json"):
             raise BoundaryError("identical input must yield byte-identical deterministic manifests")
         validate_duplicate_identity_rejection(module, roots, duplicate_output)
+    with tempfile.TemporaryDirectory(prefix="browser-portable-race-") as raw:
+        validate_live_source_race_refusal(module, Path(raw))
+    with tempfile.TemporaryDirectory(prefix="browser-portable-partial-") as raw:
+        validate_partial_bundle_refusal(module, Path(raw))
 
 
 def self_test() -> None:
