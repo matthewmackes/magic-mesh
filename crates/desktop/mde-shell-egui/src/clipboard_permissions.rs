@@ -347,6 +347,10 @@ struct ReplayMark {
     source_seat: String,
     source_session: String,
     sequence: u64,
+    /// The high-water mark is useful only while the authority that admitted
+    /// its sequence could still be live. Keeping it longer can permanently
+    /// strand a restarted source/session that legitimately resets sequencing.
+    expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -509,7 +513,7 @@ impl ClipboardPermissionModel {
             .any(|offer| offer.eq_ignore_ascii_case(&metadata.selected_mime))
         {
             Some(ClipboardPermissionError::UnsupportedMime)
-        } else if self.is_metadata_replay(&metadata) {
+        } else if self.is_metadata_replay(&metadata, now_ms) {
             Some(ClipboardPermissionError::StaleOrReplay)
         } else {
             None
@@ -534,6 +538,7 @@ impl ClipboardPermissionModel {
             source_seat: metadata.source_seat.clone(),
             source_session: metadata.source_session.clone(),
             sequence: metadata.sequence,
+            expires_at_ms: metadata.expires_at_ms,
         };
         let requires_approval = (metadata.cross_boundary
             || summary.target.kind != ClipboardTargetKind::LocalSeat)
@@ -733,7 +738,13 @@ impl ClipboardPermissionModel {
         ClipboardApprovalToken(self.next_token)
     }
 
-    fn is_metadata_replay(&self, metadata: &ClipboardGateMetadata) -> bool {
+    fn is_metadata_replay(&mut self, metadata: &ClipboardGateMetadata, now_ms: u64) -> bool {
+        // Count-bounding alone leaves recently active sources vulnerable to
+        // arbitrary eviction while quiet sources can remain blocked forever.
+        // Expire marks at their admitting envelope/lease boundary before
+        // comparing sequence high-water marks.
+        self.replay_marks
+            .retain(|mark| now_ms < mark.expires_at_ms);
         self.replay_marks.iter().any(|mark| {
             mark.source_node == metadata.source_node
                 && mark.source_seat == metadata.source_seat
@@ -752,6 +763,7 @@ impl ClipboardPermissionModel {
                 && existing.source_session == mark.source_session
         }) {
             existing.sequence = existing.sequence.max(mark.sequence);
+            existing.expires_at_ms = existing.expires_at_ms.max(mark.expires_at_ms);
             return;
         }
         push_bounded(&mut self.replay_marks, mark, MAX_REPLAY_MARKS);
@@ -1692,6 +1704,107 @@ mod tests {
             model.approve(first, &context(), NOW + 4),
             Err(ClipboardPermissionError::ApprovalReplay)
         );
+    }
+
+    #[test]
+    fn replay_mark_expires_at_its_authority_boundary() {
+        let mut model = ClipboardPermissionModel::default();
+        let mut first = envelope(40, "text/html");
+        first.expires_at_ms = NOW + 10;
+        model
+            .request(
+                &first,
+                "text/html",
+                VdiClipboardDisclosureV2::Shareable,
+                target(ClipboardTargetKind::Peer),
+                context(),
+                NOW,
+            )
+            .expect("first authority window")
+            .expect("approval token");
+        model.deny(NOW + 1).expect("terminal decision records replay");
+
+        let renewed = envelope(40, "text/html");
+        assert_eq!(
+            model.request(
+                &renewed,
+                "text/html",
+                VdiClipboardDisclosureV2::Shareable,
+                target(ClipboardTargetKind::Peer),
+                context(),
+                NOW + 9,
+            ),
+            Err(ClipboardPermissionError::StaleOrReplay),
+            "same source/session sequence remains hostile before authority expiry"
+        );
+
+        assert!(
+            model
+                .request(
+                    &renewed,
+                    "text/html",
+                    VdiClipboardDisclosureV2::Shareable,
+                    target(ClipboardTargetKind::Peer),
+                    context(),
+                    NOW + 10,
+                )
+                .expect("expired replay mark must not strand renewed authority")
+                .is_some(),
+            "renewed rich transfer still requires approval"
+        );
+        assert_eq!(model.replay_marks.len(), 0);
+    }
+
+    #[test]
+    fn replay_mark_newer_terminal_extends_retention_without_sequence_rewind() {
+        let mut model = ClipboardPermissionModel::default();
+        let mut first = envelope(50, "text/html");
+        first.expires_at_ms = NOW + 20;
+        model
+            .request(
+                &first,
+                "text/html",
+                VdiClipboardDisclosureV2::Shareable,
+                target(ClipboardTargetKind::Peer),
+                context(),
+                NOW,
+            )
+            .expect("first request");
+        model
+            .fail(ClipboardFailure::Transport, NOW + 1)
+            .expect("failed transfer records replay");
+
+        let mut newer = envelope(51, "text/html");
+        newer.expires_at_ms = NOW + 40;
+        model
+            .request(
+                &newer,
+                "text/html",
+                VdiClipboardDisclosureV2::Shareable,
+                target(ClipboardTargetKind::Peer),
+                context(),
+                NOW + 2,
+            )
+            .expect("newer sequence")
+            .expect("approval token");
+        model.deny(NOW + 3).expect("newer terminal decision");
+
+        let renewed_old_sequence = envelope(50, "text/html");
+        assert_eq!(
+            model.request(
+                &renewed_old_sequence,
+                "text/html",
+                VdiClipboardDisclosureV2::Shareable,
+                target(ClipboardTargetKind::Peer),
+                context(),
+                NOW + 20,
+            ),
+            Err(ClipboardPermissionError::StaleOrReplay),
+            "older sequence must remain blocked through the newer authority window"
+        );
+        assert_eq!(model.replay_marks.len(), 1);
+        assert_eq!(model.replay_marks[0].sequence, 51);
+        assert_eq!(model.replay_marks[0].expires_at_ms, NOW + 40);
     }
 
     #[test]

@@ -621,6 +621,12 @@ behavioral evidence is not completion.
 - **Mesh CAS admission (2026-08-09):** Files-backed offers bind source projection and exact canonical bytes; missing bytes defer, while mismatch, duplicate JSON, replay, and
   Files-topic floods fail closed. BigBoy passed 8/8 plus 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cas-admission-s3-r9.md`.
 - Remaining work:
+- **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks
+  now expire at their admitting envelope/lease boundary; newer terminal
+  sequences extend both high-water and retention monotonically, while renewed
+  signed authority can reuse sequencing at exact expiry. Machine 9 passed both
+  focused boundary tests:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-09-replay-mark-expiry-s5-r16.md`.
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
      - Inputs: collab types and existing clipboard v2.
