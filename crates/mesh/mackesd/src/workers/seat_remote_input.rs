@@ -57,6 +57,12 @@ pub const ARM_AUTH_TARGET: &str = "seat";
 /// control-poller cadence while still using the Bus as the handoff contract.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(40);
 
+/// Bounds for late-Bus startup recovery. The lower bound prevents a bad test
+/// cadence from spinning; the upper bound keeps a service-context mount race
+/// recoverable without restarting the daemon.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 const MAX_PHONE_CHARS: usize = 128;
 const MAX_TEXT_CHARS: usize = 16;
 const MAX_DELTA: f64 = 4096.0;
@@ -794,21 +800,48 @@ impl Worker for SeatRemoteInputWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::seat_remote_input", "no bus root; worker idle");
-            return Ok(());
-        };
-        let mut persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::seat_remote_input", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let bus_root = seat_remote_input_bus_root(self.bus_root_override.clone());
+        let retry_interval = self
+            .tick
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let (mut persist, request_cursor, arm_cursor) = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => {
+                    let request_cursor = persist.latest_ulid(ACTION_TOPIC);
+                    let arm_cursor = persist.latest_ulid(ARM_TOPIC);
+                    match (request_cursor, arm_cursor) {
+                        (Ok(request_cursor), Ok(arm_cursor)) => {
+                            break (persist, request_cursor, arm_cursor);
+                        }
+                        (request, arm) => {
+                            tracing::warn!(
+                                target: "mackesd::seat_remote_input",
+                                request_error = ?request.err(),
+                                arm_error = ?arm.err(),
+                                "cursor priming failed; remote-input activation will retry"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target: "mackesd::seat_remote_input",
+                        %error,
+                        "Bus open failed; remote-input activation will retry"
+                    );
+                }
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
+        // Remote-input and arm controls are transient capabilities, not desired
+        // state. Start disarmed at both successfully-read tails so retained
+        // commands can never re-arm or inject after a daemon restart.
+        self.cursor = request_cursor;
+        self.arm_cursor = arm_cursor;
+        self.arm = None;
         self.publish_status(&persist);
         // Publish the initial (disarmed) indicator so a shell overlay has a
         // baseline "not being driven" state to render from.
@@ -830,6 +863,14 @@ impl Worker for SeatRemoteInputWorker {
         self.publish_status(&persist);
         Ok(())
     }
+}
+
+fn seat_remote_input_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    seat_remote_input_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn seat_remote_input_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 fn parse_request(body: &str, id: &str) -> Result<RemoteInputRequest, String> {
@@ -1171,6 +1212,145 @@ mod tests {
 
     fn signed_move_body(node: &str, nonce: &str) -> String {
         signed_body(node, &move_body(), nonce, AUTH_NOW + 30_000)
+    }
+
+    #[test]
+    fn remote_input_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/seat-remote-input-bus");
+        assert_eq!(seat_remote_input_bus_root(Some(explicit.clone())), explicit);
+        assert_eq!(
+            seat_remote_input_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovery_skips_retained_controls_and_applies_forward_input_once() {
+        let holder = tempfile::tempdir().expect("remote-input recovery root");
+        let bus = holder.path().join("bus");
+        let retained = bus.with_extension("retained");
+        let persist = Persist::open(bus.clone()).expect("seed retained Bus");
+        persist
+            .write(
+                ARM_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_arm_body(
+                    "node-recovery",
+                    60_000,
+                    "shell:stale",
+                    None,
+                    "remote-input-stale-arm",
+                )),
+            )
+            .expect("write retained arm");
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_move_body(
+                    "node-recovery",
+                    "remote-input-stale-move",
+                )),
+            )
+            .expect("write retained input");
+        drop(persist);
+        std::fs::rename(&bus, &retained).expect("hide retained Bus");
+        std::fs::write(&bus, b"block Persist::open").expect("install Bus blocker");
+
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker =
+            SeatRemoteInputWorker::with_injector("node-recovery".into(), injector.clone())
+                .with_bus_root(bus.clone())
+                .with_tick(Duration::from_millis(10))
+                .with_now_fn(Arc::new(|| 1_000))
+                .with_authorizer(test_authorizer(&bus));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(!task.is_finished(), "late Bus must not end the worker");
+        assert!(
+            injector.calls.lock().expect("calls mutex").is_empty(),
+            "no input may run while the Bus is unavailable"
+        );
+
+        std::fs::remove_file(&bus).expect("remove Bus blocker");
+        std::fs::rename(&retained, &bus).expect("restore retained Bus");
+        let state_topic = format!("{STATE_PREFIX}node-recovery");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let activated = Persist::open(bus.clone())
+                    .and_then(|persist| persist.list_since(&state_topic, None))
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(false);
+                if activated {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must activate after the Bus returns");
+        assert!(
+            injector.calls.lock().expect("calls mutex").is_empty(),
+            "retained arm and input controls must be skipped on activation"
+        );
+
+        let persist = Persist::open(bus.clone()).expect("open recovered Bus");
+        persist
+            .write(
+                ARM_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_arm_body(
+                    "node-recovery",
+                    60_000,
+                    "shell:fresh",
+                    None,
+                    "remote-input-forward-arm",
+                )),
+            )
+            .expect("write forward arm");
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_move_body(
+                    "node-recovery",
+                    "remote-input-forward-move",
+                )),
+            )
+            .expect("write forward input");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if injector.calls.lock().expect("calls mutex").len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh consent and input must run after recovery");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            injector.calls.lock().expect("calls mutex").len(),
+            1,
+            "one forward input must be injected exactly once"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt active polling")
+            .expect("worker task")
+            .expect("clean worker shutdown");
     }
 
     #[test]

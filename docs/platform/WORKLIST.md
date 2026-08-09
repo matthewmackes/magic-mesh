@@ -1051,6 +1051,11 @@ behavioral evidence is not completion.
   cursors once, skip stale actions, and publish forward without restart.
   Machine 9 passed three exact tests:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-desktop-bus-recovery-r21.md`.
+- **Seat remote-input recovery checkpoint (2026-08-09):** Bus open and both
+  transient control tails now activate atomically after late storage; retained
+  arm/input controls are skipped and one forward consented input runs exactly
+  once. Machine 196 passed two exact tests:
+  `docs/platform/evidence/WL-FUNC-019-WL-CRIT-007-2026-08-09-seat-remote-input-bus-recovery-r23.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
