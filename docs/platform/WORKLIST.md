@@ -304,10 +304,10 @@ behavioral evidence is not completion.
 - **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
 - **Standalone publication checkpoint (2026-08-08):** GitHub, farm, and Actions passed: `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
-- **Live-profile inventory checkpoint (2026-08-09):** raced/failed sources refuse partial publication; BigBoy passed:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-09-live-profile-inventory-r4.md`.
+- **Live-profile inventory checkpoint (2026-08-09):** fail-closed inventory passed: `docs/platform/evidence/WL-ARCH-008-2026-08-09-live-profile-inventory-r4.md`.
 - **Browser VM artifact-identity checkpoint (2026-08-09):** exact 4/8192/64 profile and bounded qcow2/raw manifests reject stale, hostile, or unsupported artifacts;
   machine 194 passed the focused contract gates: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-image-contract-r72.md`.
+  A real admitted 64-GiB qcow2 then passed `qemu-img` integrity: `docs/platform/evidence/WL-ARCH-008-2026-08-09-browser-vm-real-image-r77.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.

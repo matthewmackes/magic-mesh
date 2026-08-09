@@ -1,7 +1,7 @@
 # WL-ARCH-008 — immutable Chromium Browser VM guest image.
 # The image owns Chromium, Wayland, GPU/audio/input plumbing, and the runtime.
 
-ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:4d3600c36e461f77af144750fb7c199f8c80f1c987bad492def4215dcf1bbf7f
+ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:b7539a4cf967c22ef076922e03e7264816ffd4d8dfbac47ee252e64e6a1d6d08
 FROM ${BROWSER_VM_BASE} AS browser-vm-controller-builder
 
 COPY install-helpers/browser-vm-production-control/ /tmp/browser-vm-production-control/

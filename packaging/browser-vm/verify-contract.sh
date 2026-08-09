@@ -114,6 +114,9 @@ if grep -Eq '^[[:space:]]*(ADD|COPY)[[:space:]].*controller-secret' "$BROWSER_VM
 fi
 grep -Fq 'BROWSER_VM_DISK_GB' "$IMAGE_BUILD" || fail "image builder does not bind disk size to the profile"
 grep -Fq 'qemu-img resize' "$IMAGE_BUILD" || fail "image builder does not resize the disk output"
+base_image="$(sed -n 's/^ARG BROWSER_VM_BASE=//p' "$BROWSER_VM/Containerfile")"
+[[ "$base_image" =~ ^quay\.io/fedora/fedora-bootc@sha256:[0-9a-f]{64}$ ]] \
+    || fail "Browser VM base is not an immutable Fedora bootc digest"
 grep -Fq 'verify-image-manifest.py' "$IMAGE_BUILD" || fail "image builder omits the cryptographic artifact manifest"
 grep -Fq 'mcnf-manifest.json' "$IMAGE_BUILD" || fail "image builder omits the stable artifact-manifest sidecar"
 set +e
