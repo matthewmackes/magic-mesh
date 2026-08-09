@@ -84,7 +84,7 @@ pub(super) enum AppVmRuntimeAdmission {
     Missing(String),
     /// The latest observation is outside the bounded freshness window.
     Stale(String),
-    /// The observation is well-formed but belongs to another app/session.
+    /// The observation is well-formed but belongs to another VM/app/session.
     Mismatched(String),
     /// The guest reported a terminal failure for this app process.
     Terminal(String),
@@ -131,6 +131,7 @@ impl AppVmRuntimeAdmission {
 pub(super) fn check_runtime_evidence(
     bus_root: Option<&Path>,
     request: &AppVmLaunchRequest,
+    expected_vm_id: &str,
     now_ms: i64,
 ) -> AppVmRuntimeAdmission {
     let Some(bus_root) = bus_root else {
@@ -189,6 +190,12 @@ pub(super) fn check_runtime_evidence(
         }
         if evidence.session_id != request.session_id || evidence.app_id != request.app_id {
             continue;
+        }
+        if evidence.vm_id != expected_vm_id {
+            return AppVmRuntimeAdmission::Mismatched(format!(
+                "matching session/app observation belongs to VM `{}`, not `{expected_vm_id}`",
+                evidence.vm_id
+            ));
         }
         if message.ts_unix_ms > now_ms
             || now_ms.saturating_sub(message.ts_unix_ms) > APP_VM_RUNTIME_STALE_AFTER_MS
@@ -601,6 +608,7 @@ mod tests {
         let result = check_runtime_evidence(
             Some(root.path()),
             &runtime_request("session-1", "org.example.Writer"),
+            "app-vm-1",
             now() as i64,
         );
         assert!(matches!(result, AppVmRuntimeAdmission::Missing(_)));
@@ -620,6 +628,7 @@ mod tests {
         let result = check_runtime_evidence(
             Some(root.path()),
             &runtime_request("session-1", "org.example.Writer"),
+            "app-vm-1",
             message.ts_unix_ms,
         );
         assert_eq!(
@@ -646,6 +655,7 @@ mod tests {
             check_runtime_evidence(
                 Some(root.path()),
                 &runtime_request("session-1", "org.example.Writer"),
+                "app-vm-1",
                 message
                     .ts_unix_ms
                     .saturating_add(APP_VM_RUNTIME_STALE_AFTER_MS + 1),
@@ -656,6 +666,7 @@ mod tests {
             check_runtime_evidence(
                 Some(root.path()),
                 &runtime_request("other-session", "org.example.Writer"),
+                "app-vm-1",
                 message.ts_unix_ms,
             ),
             AppVmRuntimeAdmission::Mismatched(_)
@@ -686,6 +697,7 @@ mod tests {
             check_runtime_evidence(
                 Some(root.path()),
                 &runtime_request("session-1", "org.example.Writer"),
+                "app-vm-1",
                 matching.ts_unix_ms,
             ),
             AppVmRuntimeAdmission::Observed {
@@ -710,6 +722,7 @@ mod tests {
             check_runtime_evidence(
                 Some(root.path()),
                 &runtime_request("session-1", "org.example.Writer"),
+                "app-vm-1",
                 message.ts_unix_ms,
             ),
             AppVmRuntimeAdmission::Terminal(_)
@@ -730,6 +743,7 @@ mod tests {
         let admission = check_runtime_evidence(
             Some(root.path()),
             &runtime_request("session-1", "org.example.Writer"),
+            "app-vm-1",
             message.ts_unix_ms,
         );
 

@@ -142,8 +142,12 @@ fn persist_declaration(
 
     let existing = reconcile::read_desired_doc_strict(state_root, &spec.node, &spec.name)?;
     if let Some(runtime_bus_root) = runtime_bus_root {
-        let runtime =
-            app_image::check_runtime_evidence(Some(runtime_bus_root), requested_app, now_ms);
+        let runtime = app_image::check_runtime_evidence(
+            Some(runtime_bus_root),
+            requested_app,
+            &spec.name,
+            now_ms,
+        );
         let runtime_required = existing.is_some() || requested_app.resume;
         if runtime_required && !runtime.is_usable() {
             return Err(format!(
@@ -427,6 +431,59 @@ mod tests {
             std::fs::read(desired_path).unwrap(),
             before,
             "rejected unavailable evidence mutated Workloads desired state"
+        );
+    }
+
+    #[test]
+    fn runtime_evidence_from_another_vm_cannot_refresh_desired_state() {
+        let tmp = tempdir().unwrap();
+        let bus = tempdir().unwrap();
+        admit_app_image(tmp.path());
+        let mut initial = body("eagle", "writer");
+        initial.resume = false;
+        let first =
+            build_reply_with_runtime_bus(tmp.path(), Some(bus.path()), "app-provision", &initial);
+        assert!(first.ok, "initial declaration failed: {:?}", first.error);
+        let desired_path = reconcile::desired_doc_path(tmp.path(), "eagle", "writer").unwrap();
+        let before = std::fs::read(&desired_path).unwrap();
+
+        let evidence = mackes_mesh_types::vdi_session::AppVmRuntimeEvidence {
+            session_id: "app-session-7".to_owned(),
+            vm_id: "different-app-vm".to_owned(),
+            app_id: "org.example.Writer".to_owned(),
+            generation: 8,
+            state: mackes_mesh_types::vdi_session::AppVmRuntimeState::Connected,
+            reason: None,
+        };
+        mde_bus::persist::Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .write(
+                mackes_mesh_types::vdi_session::APP_VM_RUNTIME_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&evidence).unwrap()),
+            )
+            .unwrap();
+
+        let mut hostile_resume = initial;
+        hostile_resume.resume = true;
+        hostile_resume.catalog_revision = Some("catalog-8".to_owned());
+        let replay = build_reply_with_runtime_bus(
+            tmp.path(),
+            Some(bus.path()),
+            "app-provision",
+            &hostile_resume,
+        );
+
+        assert!(!replay.ok, "another VM's evidence authorized resume");
+        assert!(replay
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("different-app-vm") && error.contains("writer")));
+        assert_eq!(
+            std::fs::read(desired_path).unwrap(),
+            before,
+            "rejected cross-VM evidence mutated Workloads desired state"
         );
     }
 

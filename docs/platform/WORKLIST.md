@@ -851,8 +851,8 @@ behavioral evidence is not completion.
 - **App VM profile checkpoint (2026-08-08):** the immutable Wayland/Flatpak contract, supervisor, readiness/provenance, and hostile fixtures passed on `.170`;
   a current built image/hash and live boot remain:
   `docs/platform/evidence/WL-FUNC-018-2026-08-08-app-vm-profile-s2-r1.md`.
-- **Runtime admission checkpoint (2026-08-09):** unavailable guest evidence cannot authorize resume or mutate desired state; `.90` passed 25/25:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-09-unavailable-runtime-admission-r2.md`.
+- **Runtime admission checkpoints (2026-08-09):** unavailable or cross-VM guest evidence cannot authorize resume or mutate desired state; `.90` passed 25/25 and BigBoy passed
+  26/26: `docs/platform/evidence/WL-FUNC-018-2026-08-09-unavailable-runtime-admission-r2.md`, `docs/platform/evidence/WL-FUNC-018-2026-08-09-runtime-vm-identity-r3.md`.
 - Remaining work:
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
