@@ -30,6 +30,20 @@ python3 -m py_compile "$PLACEMENT_READINESS"
 grep -Fq 'packaging/android/verify-manifest.sh' "$PLACEMENT_READINESS" \
     || fail "placement verifier is not wired to the Android manifest verifier"
 
+# The shipped producer and sole placement consumer must move together. Keep the
+# exact v2 release/payload fields visible here so a partial schema change fails
+# this package contract before reaching a seat.
+grep -Fq 'readonly SCHEMA_VERSION=2' "$TOOL_READINESS" \
+    || fail "guest-tool receipt producer is not on schema v2"
+grep -Fq 'SCHEMA_VERSION = 2' "$PLACEMENT_READINESS" \
+    || fail "placement verifier is not on schema v2"
+for field in release_artifact_digest package_manifest_digest installed_guest_payload_digest compatibility_version; do
+    grep -Fq "\"$field\"" "$TOOL_READINESS" \
+        || fail "guest-tool receipt producer is missing v2 field: $field"
+    grep -Fq "\"$field\"" "$PLACEMENT_READINESS" \
+        || fail "placement verifier is missing v2 field: $field"
+done
+
 "$MANIFEST_VERIFY" --self-test >/dev/null
 "$TOOL_READINESS" --self-test >/dev/null
 "$PLACEMENT_READINESS" --self-test >/dev/null

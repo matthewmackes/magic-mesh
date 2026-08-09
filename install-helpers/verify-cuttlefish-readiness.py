@@ -33,7 +33,7 @@ import sys
 from typing import Any, Callable, NoReturn, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CONFIG_KIND = "cuttlefish_placement_config"
 REPORT_KIND = "cuttlefish_placement_readiness"
 RECEIPT_KIND = "cuttlefish_guest_tool_readiness"
@@ -47,6 +47,7 @@ MAX_RECEIPT_AGE_SECONDS = 24 * 60 * 60
 MAX_FUTURE_SKEW_SECONDS = 300
 MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
 HASH_CHUNK_BYTES = 1024 * 1024
+MAX_RELEASE_ARTIFACT_BYTES = 8 * 1024**3
 
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:/ -]{0,127}$")
@@ -68,16 +69,32 @@ CONFIG_FIELDS = frozenset(
         "pool",
         "network",
         "base_image",
+        "release_artifact",
         "guest_readiness_receipt",
     }
 )
 BASE_IMAGE_FIELDS = frozenset({"path", "manifest_path", "digest"})
+RELEASE_ARTIFACT_FIELDS = frozenset(
+    {
+        "path",
+        "digest",
+        "package_manifest_digest",
+        "installed_guest_payload_digest",
+        "architecture",
+        "compatibility_version",
+    }
+)
 RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
         "kind",
         "workload_id",
         "image_digest",
+        "release_artifact_digest",
+        "package_manifest_digest",
+        "installed_guest_payload_digest",
+        "architecture",
+        "compatibility_version",
         "cvd_version",
         "adb_version",
         "kvm_access",
@@ -176,6 +193,12 @@ class PlacementConfig:
     image_path: Path
     manifest_path: Path
     image_digest: str
+    release_artifact_path: Path
+    release_artifact_digest: str
+    package_manifest_digest: str
+    installed_guest_payload_digest: str
+    architecture: str
+    compatibility_version: str
     guest_readiness_receipt: Path
 
 
@@ -183,6 +206,11 @@ class PlacementConfig:
 class GuestToolReceipt:
     workload_id: str
     image_digest: str
+    release_artifact_digest: str
+    package_manifest_digest: str
+    installed_guest_payload_digest: str
+    architecture: str
+    compatibility_version: str
     cvd_version: str
     adb_version: str
     recorded_at: datetime
@@ -210,6 +238,11 @@ def parse_config(value: dict[str, Any]) -> PlacementConfig:
     manifest_path = bounded_path(base_image["manifest_path"], "base_image.manifest_path")
     image_digest = bounded_digest(base_image["digest"], "base_image.digest")
 
+    release_artifact = value["release_artifact"]
+    if not isinstance(release_artifact, dict):
+        raise ReadinessError("release_artifact must be an object")
+    exact_fields(release_artifact, RELEASE_ARTIFACT_FIELDS, "release_artifact")
+
     return PlacementConfig(
         workload_id=workload_id,
         libvirt_uri=libvirt_uri,
@@ -218,6 +251,28 @@ def parse_config(value: dict[str, Any]) -> PlacementConfig:
         image_path=image_path,
         manifest_path=manifest_path,
         image_digest=image_digest,
+        release_artifact_path=bounded_path(
+            release_artifact["path"], "release_artifact.path"
+        ),
+        release_artifact_digest=bounded_digest(
+            release_artifact["digest"], "release_artifact.digest"
+        ),
+        package_manifest_digest=bounded_digest(
+            release_artifact["package_manifest_digest"],
+            "release_artifact.package_manifest_digest",
+        ),
+        installed_guest_payload_digest=bounded_digest(
+            release_artifact["installed_guest_payload_digest"],
+            "release_artifact.installed_guest_payload_digest",
+        ),
+        architecture=bounded_string(
+            release_artifact["architecture"], "release_artifact.architecture", IDENTITY_RE
+        ),
+        compatibility_version=bounded_string(
+            release_artifact["compatibility_version"],
+            "release_artifact.compatibility_version",
+            VERSION_RE,
+        ),
         guest_readiness_receipt=bounded_path(
             value["guest_readiness_receipt"], "guest_readiness_receipt"
         ),
@@ -247,6 +302,30 @@ def parse_guest_receipt(
     image_digest = bounded_digest(value["image_digest"], "receipt.image_digest")
     if image_digest != config.image_digest:
         raise ReadinessError("guest readiness receipt image digest mismatch")
+    release_artifact_digest = bounded_digest(
+        value["release_artifact_digest"], "receipt.release_artifact_digest"
+    )
+    if release_artifact_digest != config.release_artifact_digest:
+        raise ReadinessError("guest readiness receipt release artifact digest mismatch")
+    package_manifest_digest = bounded_digest(
+        value["package_manifest_digest"], "receipt.package_manifest_digest"
+    )
+    if package_manifest_digest != config.package_manifest_digest:
+        raise ReadinessError("guest readiness receipt package manifest digest mismatch")
+    installed_guest_payload_digest = bounded_digest(
+        value["installed_guest_payload_digest"],
+        "receipt.installed_guest_payload_digest",
+    )
+    if installed_guest_payload_digest != config.installed_guest_payload_digest:
+        raise ReadinessError("guest readiness receipt installed payload digest mismatch")
+    architecture = bounded_string(value["architecture"], "receipt.architecture", IDENTITY_RE)
+    if architecture != config.architecture:
+        raise ReadinessError("guest readiness receipt architecture mismatch")
+    compatibility_version = bounded_string(
+        value["compatibility_version"], "receipt.compatibility_version", VERSION_RE
+    )
+    if compatibility_version != config.compatibility_version:
+        raise ReadinessError("guest readiness receipt compatibility mismatch")
     cvd_version = bounded_string(value["cvd_version"], "receipt.cvd_version", VERSION_RE)
     adb_version = bounded_string(value["adb_version"], "receipt.adb_version", VERSION_RE)
     if value["kvm_access"] is not True:
@@ -258,6 +337,11 @@ def parse_guest_receipt(
     return GuestToolReceipt(
         workload_id=workload_id,
         image_digest=image_digest,
+        release_artifact_digest=release_artifact_digest,
+        package_manifest_digest=package_manifest_digest,
+        installed_guest_payload_digest=installed_guest_payload_digest,
+        architecture=architecture,
+        compatibility_version=compatibility_version,
         cvd_version=cvd_version,
         adb_version=adb_version,
         recorded_at=recorded_at,
@@ -295,6 +379,52 @@ def passed(name: str) -> dict[str, str]:
 
 def unavailable(name: str, reason: str) -> dict[str, str]:
     return {"name": name, "status": "unavailable", "reason": reason}
+
+
+def digest_regular_path(path: Path, maximum: int) -> str:
+    before = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > maximum:
+        raise Unavailable("artifact_not_regular")
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        ):
+            raise Unavailable("artifact_changed_during_verification")
+        for chunk in iter(lambda: stream.read(HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    after = os.stat(path, follow_symlinks=False)
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ):
+        raise Unavailable("artifact_changed_during_verification")
+    return "sha256:" + digest.hexdigest()
+
+
+def check_release_artifact(config: PlacementConfig) -> dict[str, str]:
+    try:
+        artifact_digest = digest_regular_path(
+            config.release_artifact_path, MAX_RELEASE_ARTIFACT_BYTES
+        )
+    except (OSError, Unavailable):
+        return unavailable("release_artifact", "release_artifact_unavailable")
+    if artifact_digest != config.release_artifact_digest:
+        return unavailable("release_artifact", "release_artifact_digest_mismatch")
+    try:
+        manifest_digest = digest_regular_path(config.manifest_path, MAX_CONFIG_BYTES)
+    except (OSError, Unavailable):
+        return unavailable("release_artifact", "package_manifest_unavailable")
+    if manifest_digest != config.package_manifest_digest:
+        return unavailable("release_artifact", "package_manifest_digest_mismatch")
+    return passed("release_artifact")
 
 
 def check_image(config: PlacementConfig, runner: CommandRunner) -> dict[str, str]:
@@ -481,6 +611,7 @@ def readiness_report(
     checks = [
         check_image(config, runner),
         check_manifest(config, runner, verifier or manifest_verifier_path()),
+        check_release_artifact(config),
         check_kvm(kvm_path, kvm_opener),
         *check_libvirt(config, runner),
         check_guest_tools(config, now),
@@ -502,13 +633,18 @@ def self_test() -> None:
 
     image_bytes = b"fixture"
     digest = "sha256:" + hashlib.sha256(image_bytes).hexdigest()
+    release_bytes = b"signed Cuttlefish release artifact fixture"
+    release_digest = "sha256:" + hashlib.sha256(release_bytes).hexdigest()
+    payload_digest = "sha256:" + hashlib.sha256(b"installed cvd and adb payload").hexdigest()
     now = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
     with tempfile.TemporaryDirectory(prefix="cuttlefish-readiness-") as temporary:
         root = Path(temporary)
         image = root / "base.qcow2"
         manifest = root / "manifest.json"
+        release_artifact = root / "cuttlefish-guest-tools.deb"
         receipt = root / "guest-receipt.json"
         image.write_bytes(image_bytes)
+        release_artifact.write_bytes(release_bytes)
 
         starter = [
             ("browser", "com.android.browser"),
@@ -543,13 +679,19 @@ def self_test() -> None:
             ),
             encoding="utf-8",
         )
+        manifest_digest = "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
         receipt.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": SCHEMA_VERSION,
                     "kind": RECEIPT_KIND,
                     "workload_id": "android-seat-15",
                     "image_digest": digest,
+                    "release_artifact_digest": release_digest,
+                    "package_manifest_digest": manifest_digest,
+                    "installed_guest_payload_digest": payload_digest,
+                    "architecture": "x86_64",
+                    "compatibility_version": "debian:13",
                     "cvd_version": "2026.08.1",
                     "adb_version": "1.0.41",
                     "kvm_access": True,
@@ -560,7 +702,7 @@ def self_test() -> None:
         )
         verifier = manifest_verifier_path()
         config_value = {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "kind": CONFIG_KIND,
             "workload_id": "android-seat-15",
             "libvirt_uri": "qemu:///system",
@@ -570,6 +712,14 @@ def self_test() -> None:
                 "path": str(image),
                 "manifest_path": str(manifest),
                 "digest": digest,
+            },
+            "release_artifact": {
+                "path": str(release_artifact),
+                "digest": release_digest,
+                "package_manifest_digest": manifest_digest,
+                "installed_guest_payload_digest": payload_digest,
+                "architecture": "x86_64",
+                "compatibility_version": "debian:13",
             },
             "guest_readiness_receipt": str(receipt),
         }
@@ -609,6 +759,32 @@ def self_test() -> None:
         assert ["virsh", "--connect", "qemu:///system", "net-list", "--name"] in calls
         assert all("shell" not in argument for call in calls for argument in call)
 
+        legacy_config = json.loads(json.dumps(config_value))
+        legacy_config["schema_version"] = 1
+        try:
+            parse_config(legacy_config)
+        except ReadinessError:
+            pass
+        else:
+            raise AssertionError("legacy placement schema was accepted")
+
+        release_artifact.unlink()
+        report = readiness_report(
+            config,
+            runner=fake_runner,
+            verifier=verifier,
+            kvm_path=Path("/dev/null"),
+            now=now,
+        )
+        assert {
+            check["reason"]
+            for check in report["checks"]
+            if check["name"] == "release_artifact"
+        } == {"release_artifact_unavailable"}
+        assert report["status"] == "unavailable"
+        assert report["provisioning_eligible"] is False
+        release_artifact.write_bytes(release_bytes)
+
         image.write_bytes(b"tampered")
         report = readiness_report(
             config,
@@ -621,6 +797,22 @@ def self_test() -> None:
             "image_digest_mismatch"
         }
         image.write_bytes(image_bytes)
+
+        release_artifact.write_bytes(b"substituted release artifact")
+        report = readiness_report(
+            config,
+            runner=fake_runner,
+            verifier=verifier,
+            kvm_path=Path("/dev/null"),
+            now=now,
+        )
+        assert {
+            check["reason"]
+            for check in report["checks"]
+            if check["name"] == "release_artifact"
+        } == {"release_artifact_digest_mismatch"}
+        assert report["provisioning_eligible"] is False
+        release_artifact.write_bytes(release_bytes)
 
         def denied_kvm(_path: Path) -> int:
             raise PermissionError("fixture denies KVM")
@@ -666,6 +858,12 @@ def self_test() -> None:
         assert {
             check["reason"] for check in report["checks"] if check["name"] == "image_manifest"
         } == {"manifest_rejected"}
+        assert {
+            check["reason"]
+            for check in report["checks"]
+            if check["name"] == "release_artifact"
+        } == {"package_manifest_digest_mismatch"}
+        assert report["provisioning_eligible"] is False
 
         mismatched_manifest = json.loads(
             json.dumps(
@@ -723,7 +921,36 @@ def self_test() -> None:
             encoding="utf-8",
         )
 
+        hostile_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+        hostile_receipt["installed_guest_payload_digest"] = "sha256:" + "c" * 64
+        receipt.write_text(json.dumps(hostile_receipt), encoding="utf-8")
+        report = readiness_report(
+            config,
+            runner=fake_runner,
+            verifier=verifier,
+            kvm_path=Path("/dev/null"),
+            now=now,
+        )
+        assert {check["reason"] for check in report["checks"] if check["name"] == "guest_tools"} == {
+            "guest_receipt_invalid"
+        }
+        assert report["provisioning_eligible"] is False
+
+        hostile_receipt["installed_guest_payload_digest"] = payload_digest
+        hostile_receipt["compatibility_version"] = "debian:12"
+        receipt.write_text(json.dumps(hostile_receipt), encoding="utf-8")
+        report = readiness_report(
+            config,
+            runner=fake_runner,
+            verifier=verifier,
+            kvm_path=Path("/dev/null"),
+            now=now,
+        )
+        assert {check["reason"] for check in report["checks"] if check["name"] == "guest_tools"} == {
+            "guest_receipt_invalid"
+        }
         receipt.unlink()
+
         report = readiness_report(
             config,
             runner=fake_runner,

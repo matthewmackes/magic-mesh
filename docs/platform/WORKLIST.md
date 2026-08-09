@@ -1025,15 +1025,15 @@ behavioral evidence is not completion.
   typed start/stop/readiness, VDI presentation, and bounded host isolation.
 - Current state: signed catalog/import, provider preflight, crash-safe lifecycle, bounded guest relay, typed VDI source, and governed Workloads cards/actions exist;
   release artifacts, remote-session attachment, guest packaging, nested-KVM run, and live proof remain.
-- **Signed Android catalog (2026-08-08):** image/package/policy binding passed 465/465; monotonic import/restart/last-good passed 3/3; release key/artifact remain:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`.
-- **Provider preflight (2026-08-08):** image hash/identity, KVM nesting, capacity, disk, and libvirt gate registration; 4/4 passed on BigBoy:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
+- **Catalog/provider checkpoints (2026-08-08):** signed image/package/policy import and image/KVM/capacity/libvirt preflight passed farm gates:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
 - **S3 lifecycle/readiness (2026-08-09):** exact-generation recovery and bounded guest relay passed BigBoy; outer-VM loss now revokes retained VDI sources, with `.90` at 6/6:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-lifecycle-s3-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-09-vdi-readiness-revocation-r4.md`.
 - **S4 governed Workloads UX (2026-08-08):** daemon-cache-bound signed cards, typed lifecycle, responsive rendering, and WebRTC handoff passed 6/6 on `.170`;
   authorized Remote Sessions consumption and fail-closed no-dial refusal passed 2/2; live decoder/captures remain. Evidence:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-governed-android-ux-s4-r1.md`.
+- **Release-artifact admission (2026-08-09):** schema-v2 readiness binds the release, package manifest, architecture/compatibility, and canonical installed tool digest;
+  machine 193 package/verifier gates passed: `docs/platform/evidence/WL-FUNC-020-2026-08-09-release-artifact-admission-s2-s5-r5.md`.
 - Remaining work:
   1. S1 Freeze Android catalog/image contracts.
      - Objective: define signed app identity, package/version, image digest, permissions, capabilities, resource profile, and guest readiness.
