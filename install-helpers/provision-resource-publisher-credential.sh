@@ -48,8 +48,9 @@ self_test() {
     unit="$(cd "$(dirname "$0")/.." && pwd)/packaging/systemd/mcnf-resource-publisher-credential.service"
   fi
   grep -Fxq \
-    'ExecStart=-/usr/bin/timeout --signal=TERM --kill-after=5s 30s /usr/libexec/mackesd/provision-resource-publisher-credential' \
+    'ExecStart=/usr/bin/timeout --signal=TERM --kill-after=5s 30s /usr/libexec/mackesd/provision-resource-publisher-credential' \
     "$unit"
+  ! grep -Eq '^ExecStart=-' "$unit"
   rm -rf -- "$test_dir"
   echo "provision-resource-publisher-credential: self-test passed"
 }

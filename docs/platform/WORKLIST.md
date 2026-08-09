@@ -961,6 +961,8 @@ behavioral evidence is not completion.
   a bounded idempotent oneshot before controlled shell restart. `.90` package
   and unit gates passed; live publisher-key distribution remains:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-activation-r4.md`.
+- **Credential readiness checkpoint (2026-08-09):** the bounded oneshot no longer masks missing/invalid publisher credentials, so systemd reports failed readiness while
+  preserving boot and read-only catalog access; `.90` gates passed: `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-readiness-r4.md`.
 - **Catalog rollback checkpoint (2026-08-09):** same-publisher rollback/equivocation preserves last-good cards and revokes stale actions; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-remote-sessions-catalog-rollback-r5.md`.
   1. S1 Freeze resource schema and identity.
