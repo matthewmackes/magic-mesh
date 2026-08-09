@@ -130,6 +130,15 @@ impl Worker for AndroidCatalogWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        if self.config.is_none() {
+            tracing::info!(
+                target: "mackesd::android_catalog",
+                env = TRUST_KEY_ENV,
+                "Android catalog trust is unavailable; worker quiescent until shutdown"
+            );
+            shutdown.wait().await;
+            return Ok(());
+        }
         let mut cursor = None;
         let mut current = self
             .config
@@ -501,5 +510,36 @@ mod tests {
         );
         fs::write(path, b"not-json").unwrap();
         assert!(load_last_good(worker.config.as_ref().unwrap(), NOW).is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_worker_quiesces_without_creating_bus_state() {
+        let temp = TempDir::new().unwrap();
+        let bus_root = temp.path().join("bus");
+        let mut worker = AndroidCatalogWorker {
+            host: "node-01".into(),
+            bus_root: Some(bus_root.clone()),
+            config: None,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle =
+            tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !bus_root.exists(),
+            "an unconfigured worker must not open Bus state"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the quiescent worker waits for shutdown"
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("quiescent worker exits promptly")
+            .expect("worker task joins")
+            .expect("worker shutdown succeeds");
     }
 }

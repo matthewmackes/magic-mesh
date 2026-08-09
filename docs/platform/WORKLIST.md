@@ -382,6 +382,12 @@ behavioral evidence is not completion.
   128 MiB allocation under a 16 MiB/no-swap boundary was OOM-killed exactly at
   16 MiB; cleanup left the target and every group active. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-live-cgroup-enforcement-r3.md`.
+- **Optional-worker quiescence checkpoint (2026-08-08):** an Android catalog
+  importer without its local trust anchor now sleeps solely on shutdown instead
+  of waking every second. Machine 9 proved no Bus state creation and prompt
+  cancellation; the target-file format gate passed on machine 193. Other
+  optional providers still require audit. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-android-catalog-quiescence-r4.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
