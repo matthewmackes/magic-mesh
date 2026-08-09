@@ -680,17 +680,17 @@ behavioral evidence is not completion.
 - Required outcome: Maps provides production offline maps, turn-by-turn navigation, and a map-first current/1-day/3-day/5-day weather experience. A live weather icon
   and temperature beside the clock deep-link into Maps. Car exposes typed route/vehicle/radio health; MG90 is bounded, reconnectable, multi-manager, and never presents
   fabricated position, weather, forecast, or link state.
-- Current state: Typed weather/location providers, cache, UI, launcher, and navigation authority exist; offline data/routes, radio recovery, and live proof remain.
+- Current state: Typed weather/location providers, catalog-bound cache, UI, launcher, and navigation authority exist; offline data/routes, radio recovery, and live proof remain.
 - **Current/forecast provider (2026-08-08):** generation-bound 5/10-minute NWS refresh, provider freshness, bounded cache/retry, and off-runtime I/O passed 8/8 twice;
   live NWS/Maps proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-weather-provider-s3-r1.md`.
 - **Atmospheric provider (2026-08-08):** exact nowCOAST WMS identity, bounded PNG/cache, and latest-wins dual-generation viewport admission passed ten focused tests;
   GUI publication/live proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-atmospheric-map-provider-s4-r1.md`.
-- **Maps weather UI (2026-08-08):** forecast truth, dual-gen viewport, PNG race refusal, and bounded offline search passed 18 tests; live round-trip remains:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-08-maps-weather-interface-s8-r1.md`.
 - **Clock weather launcher (2026-08-08):** typed icon/temperature deep-link and weather→battery→time geometry passed 5/5; installed live captures remain:
   `docs/platform/evidence/WL-FUNC-017-2026-08-08-clock-weather-launcher-s9-r1.md`.
 - **Navigation authority (2026-08-09):** route/progress/replay/restart passed 9/9; generation-exhaustion atomicity passed 4/4:
   `docs/platform/evidence/WL-FUNC-017-2026-08-08-navigation-authority-s6-r1.md`; `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-generation-atomicity-r2.md`.
+- **Offline catalog binding (2026-08-09):** replacement/expiry revokes tiles and schema-v1 upgrades open empty instead of failing; `.90` passed 7/7:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - Remaining work:
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with

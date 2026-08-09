@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::offline_catalog::{is_sha256_hex, sha256_hex, TileId, VerifiedCatalog, MAX_TILE_BYTES};
 
-const INDEX_SCHEMA: u16 = 1;
+const INDEX_SCHEMA: u16 = 2;
 const INDEX_FILE: &str = "index.json";
 const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
@@ -70,6 +70,7 @@ impl std::error::Error for CacheError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnavailableReason {
     NotIndexed,
+    CatalogRejectedRemoved,
     Expired,
     MissingRemoved,
     CorruptRemoved,
@@ -86,6 +87,7 @@ pub enum OfflineTile {
 #[serde(deny_unknown_fields)]
 struct CacheEntry {
     tile: TileId,
+    catalog_sha256: String,
     sha256: String,
     byte_len: u64,
     verified_at_ms: u64,
@@ -97,6 +99,30 @@ struct CacheEntry {
 struct CacheIndex {
     schema: u16,
     entries: Vec<CacheEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheIndexHeader {
+    schema: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCacheEntry {
+    tile: TileId,
+    sha256: String,
+    byte_len: u64,
+    #[serde(rename = "verified_at_ms")]
+    _verified_at_ms: u64,
+    #[serde(rename = "last_access_ms")]
+    _last_access_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCacheIndex {
+    schema: u16,
+    entries: Vec<LegacyCacheEntry>,
 }
 
 pub struct OfflineTileCache {
@@ -173,6 +199,7 @@ impl OfflineTileCache {
         write_atomic(&path, bytes)?;
         self.entries.push(CacheEntry {
             tile,
+            catalog_sha256: catalog.digest().to_string(),
             sha256: expected_sha256.to_string(),
             byte_len: incoming,
             verified_at_ms: now_ms,
@@ -186,10 +213,20 @@ impl OfflineTileCache {
         Ok(())
     }
 
-    pub fn lookup(&mut self, tile: &TileId, now_ms: u64) -> OfflineTile {
+    pub fn lookup(&mut self, catalog: &VerifiedCatalog, tile: &TileId, now_ms: u64) -> OfflineTile {
         let Some(position) = self.entries.iter().position(|entry| &entry.tile == tile) else {
             return OfflineTile::Unavailable(UnavailableReason::NotIndexed);
         };
+        if self.entries[position].catalog_sha256 != catalog.digest()
+            || !catalog.permits(tile, now_ms)
+        {
+            return match self.remove_position(position) {
+                Ok(()) => OfflineTile::Unavailable(UnavailableReason::CatalogRejectedRemoved),
+                Err(error) => {
+                    OfflineTile::Unavailable(UnavailableReason::CacheFailure(error.to_string()))
+                }
+            };
+        }
         if now_ms.saturating_sub(self.entries[position].verified_at_ms) > self.policy.max_age_ms {
             return match self.remove_position(position) {
                 Ok(()) => OfflineTile::Unavailable(UnavailableReason::Expired),
@@ -364,11 +401,19 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
             "index exceeds its byte bound".to_string(),
         ));
     }
+    let header: CacheIndexHeader =
+        serde_json::from_slice(&bytes).map_err(|error| CacheError::Index(error.to_string()))?;
+    if header.schema == 1 {
+        return invalidate_legacy_index(root, &bytes);
+    }
+    if header.schema != INDEX_SCHEMA {
+        return Err(CacheError::Index("index schema is unsupported".to_string()));
+    }
     let index: CacheIndex =
         serde_json::from_slice(&bytes).map_err(|error| CacheError::Index(error.to_string()))?;
-    if index.schema != INDEX_SCHEMA || index.entries.len() > MAX_ENTRIES {
+    if index.entries.len() > MAX_ENTRIES {
         return Err(CacheError::Index(
-            "index schema or entry count is invalid".to_string(),
+            "index entry count is invalid".to_string(),
         ));
     }
     let mut identities = BTreeSet::new();
@@ -378,7 +423,8 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
             .tile
             .validate()
             .map_err(|error| CacheError::Index(error.to_string()))?;
-        if !is_sha256_hex(&entry.sha256)
+        if !is_sha256_hex(&entry.catalog_sha256)
+            || !is_sha256_hex(&entry.sha256)
             || entry.byte_len == 0
             || entry.byte_len > MAX_TILE_BYTES as u64
             || !identities.insert(entry.tile.clone())
@@ -397,6 +443,30 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
         ));
     }
     Ok(index.entries)
+}
+
+fn invalidate_legacy_index(root: &Path, bytes: &[u8]) -> Result<Vec<CacheEntry>, CacheError> {
+    let legacy = serde_json::from_slice::<LegacyCacheIndex>(bytes).ok();
+    let empty = serde_json::to_vec(&CacheIndex {
+        schema: INDEX_SCHEMA,
+        entries: Vec::new(),
+    })
+    .map_err(|error| CacheError::Index(error.to_string()))?;
+    write_atomic(&root.join(INDEX_FILE), &empty)?;
+    if let Some(legacy) = legacy.filter(|legacy| legacy.schema == 1) {
+        for entry in legacy.entries.into_iter().take(MAX_ENTRIES) {
+            if entry.tile.validate().is_ok()
+                && is_sha256_hex(&entry.sha256)
+                && entry.byte_len > 0
+                && entry.byte_len <= MAX_TILE_BYTES as u64
+            {
+                if let Ok(path) = tile_path(root, &entry.tile, &entry.sha256) {
+                    quarantine_then_remove(&path);
+                }
+            }
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn ensure_root(root: &Path) -> Result<(), CacheError> {
@@ -467,9 +537,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
     ));
     let result = (|| -> std::io::Result<()> {
         let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&temporary)?;
@@ -525,7 +593,7 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            cache.lookup(&tile(0), 3),
+            cache.lookup(&catalog, &tile(0), 3),
             OfflineTile::Verified { .. }
         ));
         cache
@@ -533,11 +601,11 @@ mod tests {
             .unwrap();
         assert!(cache.used_bytes() <= 6);
         assert!(matches!(
-            cache.lookup(&tile(1), 5),
+            cache.lookup(&catalog, &tile(1), 5),
             OfflineTile::Unavailable(UnavailableReason::NotIndexed)
         ));
         assert!(matches!(
-            cache.lookup(&tile(0), 5),
+            cache.lookup(&catalog, &tile(0), 5),
             OfflineTile::Verified { .. }
         ));
     }
@@ -583,18 +651,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            cache.lookup(&id, 11),
+            cache.lookup(&catalog(), &id, 11),
             OfflineTile::Verified {
                 bytes: b"verified".to_vec(),
                 sha256: sha256_hex(b"verified")
             }
         );
         assert!(matches!(
-            cache.lookup(&tile(1), 11),
+            cache.lookup(&catalog(), &tile(1), 11),
             OfflineTile::Unavailable(UnavailableReason::NotIndexed)
         ));
         assert!(matches!(
-            cache.lookup(&id, 111),
+            cache.lookup(&catalog(), &id, 111),
             OfflineTile::Unavailable(UnavailableReason::Expired)
         ));
     }
@@ -611,13 +679,13 @@ mod tests {
             .unwrap();
         std::fs::write(tile_path(dir.path(), &id, &digest).unwrap(), b"evil").unwrap();
         assert!(matches!(
-            cache.lookup(&id, 2),
+            cache.lookup(&catalog(), &id, 2),
             OfflineTile::Unavailable(UnavailableReason::CorruptRemoved)
         ));
         assert!(!tile_path(dir.path(), &id, &digest).unwrap().exists());
         let mut restarted = OfflineTileCache::open(dir.path(), policy).unwrap();
         assert!(matches!(
-            restarted.lookup(&id, 3),
+            restarted.lookup(&catalog(), &id, 3),
             OfflineTile::Unavailable(UnavailableReason::NotIndexed)
         ));
     }
@@ -634,5 +702,109 @@ mod tests {
         let result = cache.store_verified(&catalog(), tile(0), b"good", &sha256_hex(b"good"), 1);
         assert!(matches!(result, Err(CacheError::Policy(_))));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn catalog_replacement_or_expiry_revokes_cached_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CachePolicy::bounded(1024, 10_000).unwrap();
+        let id = tile(0);
+        let bytes = b"verified";
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        let admitted = catalog();
+        cache
+            .store_verified(&admitted, id.clone(), bytes, &sha256_hex(bytes), 1)
+            .unwrap();
+        cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+
+        let replacement_bytes = br#"{"schema":1,"provider":"openstreetmap-derived","regions":[{"region_id":"test-region","revision":"r2","min_zoom":0,"max_zoom":18,"expires_at_ms":999999}]}"#;
+        let replacement =
+            VerifiedCatalog::admit_json(replacement_bytes, &sha256_hex(replacement_bytes)).unwrap();
+        assert!(matches!(
+            cache.lookup(&replacement, &id, 2),
+            OfflineTile::Unavailable(UnavailableReason::CatalogRejectedRemoved)
+        ));
+        assert!(matches!(
+            cache.lookup(&replacement, &id, 2),
+            OfflineTile::Unavailable(UnavailableReason::NotIndexed)
+        ));
+
+        cache
+            .store_verified(&admitted, id.clone(), bytes, &sha256_hex(bytes), 3)
+            .unwrap();
+        assert!(matches!(
+            cache.lookup(&admitted, &id, 1_000_000),
+            OfflineTile::Unavailable(UnavailableReason::CatalogRejectedRemoved)
+        ));
+    }
+
+    #[test]
+    fn schema_one_cache_is_invalidated_without_bricking_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = tile(0);
+        let legacy_bytes = b"legacy";
+        let legacy_digest = sha256_hex(legacy_bytes);
+        ensure_tile_parent(dir.path(), &id).unwrap();
+        let legacy_path = tile_path(dir.path(), &id, &legacy_digest).unwrap();
+        std::fs::write(&legacy_path, legacy_bytes).unwrap();
+        let legacy_index = serde_json::json!({
+            "schema": 1,
+            "entries": [{
+                "tile": id,
+                "sha256": legacy_digest,
+                "byte_len": legacy_bytes.len(),
+                "verified_at_ms": 1,
+                "last_access_ms": 1
+            }]
+        });
+        std::fs::write(
+            dir.path().join(INDEX_FILE),
+            serde_json::to_vec(&legacy_index).unwrap(),
+        )
+        .unwrap();
+
+        let policy = CachePolicy::bounded(4, 10_000).unwrap();
+        let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+        assert!(cache.is_empty());
+        assert!(!legacy_path.exists(), "unbound legacy payload survived");
+        let migrated: CacheIndex =
+            serde_json::from_slice(&std::fs::read(dir.path().join(INDEX_FILE)).unwrap()).unwrap();
+        assert_eq!(migrated.schema, INDEX_SCHEMA);
+        assert!(migrated.entries.is_empty());
+        assert!(matches!(
+            cache.lookup(&catalog(), &tile(0), 2),
+            OfflineTile::Unavailable(UnavailableReason::NotIndexed)
+        ));
+
+        let fresh = b"new";
+        cache
+            .store_verified(&catalog(), tile(0), fresh, &sha256_hex(fresh), 3)
+            .unwrap();
+        assert!(matches!(
+            cache.lookup(&catalog(), &tile(0), 4),
+            OfflineTile::Verified { bytes, .. } if bytes == fresh
+        ));
+
+        let malformed_dir = tempfile::tempdir().unwrap();
+        let malformed_id = tile(1);
+        ensure_tile_parent(malformed_dir.path(), &malformed_id).unwrap();
+        let isolated_path =
+            tile_path(malformed_dir.path(), &malformed_id, &sha256_hex(b"unbound")).unwrap();
+        std::fs::write(&isolated_path, b"unbound").unwrap();
+        std::fs::write(
+            malformed_dir.path().join(INDEX_FILE),
+            br#"{"schema":1,"entries":[{"malformed":true}]}"#,
+        )
+        .unwrap();
+        let mut malformed = OfflineTileCache::open(malformed_dir.path(), policy).unwrap();
+        assert!(malformed.is_empty());
+        assert!(
+            isolated_path.exists(),
+            "unparseable payload should remain isolated, not be followed blindly"
+        );
+        assert!(matches!(
+            malformed.lookup(&catalog(), &malformed_id, 2),
+            OfflineTile::Unavailable(UnavailableReason::NotIndexed)
+        ));
     }
 }
