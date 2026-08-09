@@ -486,6 +486,13 @@ behavioral evidence is not completion.
   vehicle-lane reads now precede authority effects; late/replaced Bus storage
   recovers without treating failed reads as absent fixes. Machine 9 passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
+- **Health/Units/forecast recovery checkpoints (2026-08-09):** complete health
+  and cloud-source reads now precede cursor/seen effects, request replies retry,
+  and weather pairs stage before publication. Machines 194/193 and BigBoy passed
+  the focused gates:
+  `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
+  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
@@ -833,6 +840,10 @@ behavioral evidence is not completion.
   survives unavailable storage, and complete weather-action/vehicle-fix reads
   precede mutation or projection. Machine 9 passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
+- **Weather-forecast transaction checkpoint (2026-08-09):** late/replaced Bus
+  storage recovers, effective location is rechecked after provider I/O, and both
+  requested projections serialize before writes. Machine 193 passed three exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
@@ -1147,6 +1158,10 @@ behavioral evidence is not completion.
 - **Service Aggregator transaction checkpoint (2026-08-09):** desktop,
   SSH/X11, and UPnP inputs plus catalog/discovery/attestation derivation stage before publication; failures do not claim success. BigBoy passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
+- **Unit Aggregator transaction checkpoint (2026-08-09):** strict cloud reads
+  and staged first-seen state precede mirror publication; failed replies retry
+  without cursor advance. BigBoy passed 67 module tests and seven hostile cases:
+  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
@@ -2084,6 +2099,10 @@ behavioral evidence is not completion.
   ingress now rejects replay/rollback and atomically preserves its bounded
   per-observer cursor/ledger across restart; `.170` passed 24/24:
   `docs/platform/evidence/WL-UX-013-2026-08-08-health-ingress-checkpoint-s2-r1.md`.
+- **Health-ingress Bus recovery checkpoint (2026-08-09):** all bounded files
+  and publisher lanes stage before ledger, cursor, projection, or checkpoint
+  effects; failed reads defer the complete candidate. Machine 194 passed five exact tests:
+  `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`.
 - **Producer restart-generation checkpoint (2026-08-09):** a restarted health
   producer now advances from its durable canonical publication floor instead of
   resetting below ingress replay state; machine 193 passed the exact Dell
