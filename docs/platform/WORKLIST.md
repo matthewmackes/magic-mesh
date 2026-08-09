@@ -1017,6 +1017,11 @@ behavioral evidence is not completion.
   scans retained `172.20.146.54:3389` as an available typed Desktop/RDP card
   with an approval-gated connect action. Authenticated login/render remains:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-seat15-release24-r19.md`.
+- **Manual-source transaction checkpoint (2026-08-09):** RDP/VNC additions and
+  removals commit to the live roster only when the strict bounded store agrees,
+  including post-rename sync errors. Machine 9 passed three exact failure and
+  corrected-forward fixtures:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-manual-source-transaction-r20.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.

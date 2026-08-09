@@ -37,7 +37,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1859,10 +1859,13 @@ fn read_bounded_manual_store(path: &Path) -> std::io::Result<String> {
 /// fatal — a half-written file must not kill the worker).
 #[must_use]
 pub fn load_manual_sources(store_root: &Path) -> Vec<ManualSource> {
-    read_bounded_manual_store(&manual_store_path(store_root))
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_default()
+    load_manual_sources_strict(store_root).unwrap_or_default()
+}
+
+fn load_manual_sources_strict(store_root: &Path) -> std::io::Result<Vec<ManualSource>> {
+    let data = read_bounded_manual_store(&manual_store_path(store_root))?;
+    serde_json::from_str(&data)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Persist the manual-source store atomically (temp + rename, the peers-plane
@@ -1871,12 +1874,46 @@ pub fn load_manual_sources(store_root: &Path) -> Vec<ManualSource> {
 /// # Errors
 /// Filesystem/serialization failures.
 pub fn save_manual_sources(store_root: &Path, sources: &[ManualSource]) -> std::io::Result<()> {
+    save_manual_sources_with_rename(store_root, sources, |from, to| std::fs::rename(from, to))
+}
+
+fn save_manual_sources_with_rename(
+    store_root: &Path,
+    sources: &[ManualSource],
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(store_root)?;
     let json = serde_json::to_string_pretty(sources)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if json.len() > MAX_MANUAL_STORE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("manual source store exceeds {MAX_MANUAL_STORE_BYTES}-byte limit"),
+        ));
+    }
     let tmp = store_root.join(format!(".{MANUAL_STORE_FILE}.tmp"));
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, manual_store_path(store_root))
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        rename(&tmp, &manual_store_path(store_root))?;
+        std::fs::File::open(store_root)?.sync_all()
+    })();
+    if result.is_err() {
+        // One known temp path, one bounded cleanup attempt. Never recurse into
+        // or remove a hostile non-file occupying the path.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Resolve the node-local store root for manual sources
@@ -2694,43 +2731,79 @@ impl DesktopSourcesWorker {
         self
     }
 
-    /// Add a manual source (idempotent on the id). Returns whether the set
-    /// changed; a change persists the store.
+    /// Add a manual source (idempotent on the id). Returns whether the durable
+    /// set changed; the in-memory projection commits only after persistence.
     fn handle_add(&mut self, req: ManualSource) -> bool {
+        self.handle_add_with(req, save_manual_sources)
+    }
+
+    fn handle_add_with(
+        &mut self,
+        req: ManualSource,
+        persist: impl FnOnce(&Path, &[ManualSource]) -> std::io::Result<()>,
+    ) -> bool {
         if self.manual.iter().any(|m| m.id() == req.id()) {
             return false;
         }
-        self.manual.push(req);
-        self.persist_manual();
-        true
+        let mut candidate = self.manual.clone();
+        candidate.push(req);
+        self.commit_manual(candidate, persist)
     }
 
     /// Remove a manual source by id. Only manual sources are removable —
     /// discovered sources reappear by discovery, so removing one would be a
     /// lie; a non-manual id is a logged no-op.
     fn handle_remove(&mut self, id: &str) -> bool {
-        let before = self.manual.len();
-        self.manual.retain(|m| m.id() != id);
-        let changed = self.manual.len() != before;
-        if changed {
-            self.persist_manual();
-        } else {
+        self.handle_remove_with(id, save_manual_sources)
+    }
+
+    fn handle_remove_with(
+        &mut self,
+        id: &str,
+        persist: impl FnOnce(&Path, &[ManualSource]) -> std::io::Result<()>,
+    ) -> bool {
+        let mut candidate = self.manual.clone();
+        candidate.retain(|m| m.id() != id);
+        if candidate.len() == self.manual.len() {
             tracing::warn!(
                 target: "mackesd::desktop_sources",
                 id,
                 "remove-source: not a manual source id; ignored",
             );
+            return false;
         }
-        changed
+        self.commit_manual(candidate, persist)
     }
 
-    fn persist_manual(&self) {
-        if let Err(e) = save_manual_sources(&self.store_root, &self.manual) {
-            tracing::warn!(
-                target: "mackesd::desktop_sources",
-                error = %e,
-                "manual-source store write failed",
-            );
+    fn commit_manual(
+        &mut self,
+        candidate: Vec<ManualSource>,
+        persist: impl FnOnce(&Path, &[ManualSource]) -> std::io::Result<()>,
+    ) -> bool {
+        match persist(&self.store_root, &candidate) {
+            Ok(()) => {
+                self.manual = candidate;
+                true
+            }
+            Err(error) => {
+                if load_manual_sources_strict(&self.store_root)
+                    .is_ok_and(|durable| durable == candidate)
+                {
+                    tracing::warn!(
+                        target: "mackesd::desktop_sources",
+                        error = %error,
+                        "manual-source store reported a post-commit error; exact durable candidate is visible",
+                    );
+                    self.manual = candidate;
+                    return true;
+                }
+                tracing::warn!(
+                    target: "mackesd::desktop_sources",
+                    error = %error,
+                    "manual-source store write failed; keeping last-good projection",
+                );
+                false
+            }
         }
     }
 
@@ -4515,6 +4588,113 @@ mod tests {
             .unwrap();
         let (changed, _) = w.drain_actions(&persist);
         assert!(!changed);
+    }
+
+    #[test]
+    fn add_persistence_failure_keeps_last_good_then_corrects_forward() {
+        let wg = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        save_manual_sources(store.path(), &[]).unwrap();
+        let mut w = worker_at(wg.path(), store.path());
+        let add = ManualSource {
+            name: Some("last-good add".into()),
+            host: "10.0.0.19".into(),
+            port: 3389,
+            protocol: DesktopProtocol::Rdp,
+        };
+        let tmp = store.path().join(format!(".{MANUAL_STORE_FILE}.tmp"));
+        std::fs::create_dir(&tmp).unwrap();
+
+        assert!(
+            !w.handle_add(add.clone()),
+            "an unusable temp path must not fabricate a changed roster"
+        );
+        assert!(w.manual.is_empty(), "memory must remain at last-good");
+        assert!(
+            load_manual_sources(store.path()).is_empty(),
+            "reload must remain at last-good"
+        );
+        assert!(tmp.is_dir(), "cleanup must not recurse into a hostile path");
+
+        std::fs::remove_dir(&tmp).unwrap();
+        assert!(w.handle_add(add.clone()), "the corrected path must commit");
+        assert_eq!(w.manual, vec![add.clone()]);
+        assert_eq!(load_manual_sources(store.path()), vec![add.clone()]);
+        assert!(!tmp.exists());
+        assert!(!w.handle_add(add), "the durable duplicate remains a no-op");
+    }
+
+    #[test]
+    fn remove_persistence_failure_keeps_last_good_then_corrects_forward() {
+        let wg = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut w = worker_at(wg.path(), store.path());
+        let existing = ManualSource {
+            name: Some("last-good remove".into()),
+            host: "10.0.0.20".into(),
+            port: 5900,
+            protocol: DesktopProtocol::Vnc,
+        };
+        assert!(w.handle_add(existing.clone()));
+        let id = existing.id();
+        let tmp = store.path().join(format!(".{MANUAL_STORE_FILE}.tmp"));
+
+        let changed = w.handle_remove_with(&id, |root, candidate| {
+            save_manual_sources_with_rename(root, candidate, |_from, _to| {
+                Err(std::io::Error::other("hostile rename failure"))
+            })
+        });
+        assert!(
+            !changed,
+            "a failed rename must not fabricate a changed roster"
+        );
+        assert_eq!(w.manual, vec![existing.clone()]);
+        assert_eq!(
+            load_manual_sources(store.path()),
+            vec![existing],
+            "reload must preserve the last-good source"
+        );
+        assert!(!tmp.exists(), "failed rename temp must be cleaned once");
+
+        assert!(w.handle_remove(&id), "the corrected path must commit");
+        assert!(w.manual.is_empty());
+        assert!(load_manual_sources(store.path()).is_empty());
+        assert!(!w.handle_remove(&id), "the durable absence remains a no-op");
+    }
+
+    #[test]
+    fn post_rename_error_reconciles_exact_visible_removal() {
+        let wg = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut w = worker_at(wg.path(), store.path());
+        let existing = ManualSource {
+            name: Some("post-rename removal".into()),
+            host: "10.0.0.21".into(),
+            port: 3389,
+            protocol: DesktopProtocol::Rdp,
+        };
+        assert!(w.handle_add(existing.clone()));
+        let id = existing.id();
+        let tmp = store.path().join(format!(".{MANUAL_STORE_FILE}.tmp"));
+
+        let changed = w.handle_remove_with(&id, |root, candidate| {
+            save_manual_sources_with_rename(root, candidate, |from, to| {
+                std::fs::rename(from, to)?;
+                Err(std::io::Error::other("injected post-rename sync failure"))
+            })
+        });
+
+        assert!(
+            changed,
+            "the exactly visible candidate must become the live projection"
+        );
+        assert!(w.manual.is_empty());
+        assert_eq!(
+            load_manual_sources_strict(store.path()).unwrap(),
+            Vec::<ManualSource>::new(),
+            "strict reload must observe the same removal-to-empty candidate"
+        );
+        assert!(!tmp.exists());
     }
 
     #[test]
