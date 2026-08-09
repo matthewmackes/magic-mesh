@@ -561,6 +561,29 @@ impl CollabWorker {
                     );
                     continue;
                 }
+                let existing_call_kind = command_call_id(&cmd).and_then(|call| {
+                    state
+                        .engine
+                        .projection()
+                        .call_state(None)
+                        .ok()?
+                        .active
+                        .into_iter()
+                        .find(|active| active.call == call)
+                        .map(|active| active.kind)
+                });
+                if let Err(error) = self
+                    .call_media_providers
+                    .admit_command(&cmd, existing_call_kind)
+                {
+                    tracing::warn!(
+                        target: "mackesd::collab",
+                        verb,
+                        error = %error,
+                        "refused call command without an admitted media provider",
+                    );
+                    continue;
+                }
                 let events = match state.engine.apply(&cmd, &signer, &mut state.ids, now_ms) {
                     Ok(evs) => evs,
                     Err(e) => {
@@ -909,6 +932,16 @@ impl CollabWorker {
         }
 
         if !changed {
+            // Provider health changes independently of signed collaboration
+            // state. Re-probe the retained readiness board on every worker
+            // tick so a revoked/disconnected provider cannot leave a stale
+            // LiveMediaVerified row behind, and a recovered provider can
+            // become usable without manufacturing a call-state mutation.
+            super::collab_media::publish_retained_call_media_verification(
+                persist,
+                &mut state.last_published,
+                &self.call_media_providers,
+            );
             return;
         }
         let directory = state.engine.projection().space_directory(&self.self_actor);
@@ -1006,6 +1039,17 @@ impl CollabWorker {
             }
             _ => {}
         }
+    }
+}
+
+fn command_call_id(command: &CollabCommand) -> Option<mde_collab_types::CallId> {
+    match command {
+        CollabCommand::AnswerCall { call }
+        | CollabCommand::DeclineCall { call }
+        | CollabCommand::HangUpCall { call }
+        | CollabCommand::SendDtmf { call, .. }
+        | CollabCommand::SetCallMuted { call, .. } => Some(*call),
+        _ => None,
     }
 }
 
@@ -1841,8 +1885,8 @@ mod tests {
     use crate::ipc::action_auth::authorize_test_body;
     use ed25519_dalek::SigningKey;
     use mde_collab_types::read_model::{
-        CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaRequirement,
-        CallMediaVerification, CallMediaVerificationStatus,
+        CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaVerification,
+        CallMediaVerificationStatus,
     };
     use mde_collab_types::value::{CallKind, MessageBody};
     use mde_collab_types::{
@@ -2747,11 +2791,10 @@ mod tests {
     }
 
     #[test]
-    fn call_media_readiness_is_published_for_the_local_media_adapter() {
-        // WL-FUNC-011 media boundary: the worker now publishes the core's
-        // adapter-facing signed-state readiness as a retained Bus model. This is
-        // intentionally not a provider probe; with only the local caller connected
-        // the row is degraded as waiting for a peer.
+    fn empty_media_registry_refuses_fake_connected_call_state() {
+        // Production currently has no registered SIP/WebRTC/LiveKit provider.
+        // Starting a call must therefore leave both signed call state and the
+        // provider readiness/verification boards empty.
         let dir = tempfile::tempdir().expect("tempdir");
         let w = worker(dir.path(), "eagle");
         let persist = persist_at(dir.path());
@@ -2791,26 +2834,20 @@ mod tests {
             serde_json::from_str(msg.body.as_deref().expect("body"))
                 .expect("decode media readiness");
         assert_eq!(readiness.local_actor, w.self_actor);
-        assert_eq!(readiness.sessions.len(), 1);
-        let session = &readiness.sessions[0];
-        assert_eq!(session.call, call);
-        assert_eq!(session.space, space);
-        assert_eq!(session.kind, CallKind::Audio);
-        assert_eq!(session.requirements, vec![CallMediaRequirement::Microphone]);
-        assert_eq!(
-            session.candidate_adapters,
-            vec![
-                CallMediaAdapter::WebRtcP2p,
-                CallMediaAdapter::LiveKitSfu,
-                CallMediaAdapter::SipGateway,
-            ]
+        assert!(
+            readiness.sessions.is_empty(),
+            "an empty production provider registry must not mint adapter readiness"
         );
-        assert_eq!(
-            session.admission,
-            CallMediaAdmission::WaitingForConnectedPeer,
-            "single-seat proof must stay degraded until another participant connects"
+        assert!(
+            state
+                .engine
+                .projection()
+                .call_state(Some(space))
+                .expect("call state")
+                .active
+                .is_empty(),
+            "an unavailable provider must not become fake connected call state"
         );
-        assert_eq!(session.connected_participants, vec![w.self_actor.clone()]);
 
         let global_topic = topics::state_topic(proj::CALL_MEDIA_READINESS);
         assert_eq!(global_topic, "state/collab/call-media-readiness");
@@ -2832,21 +2869,7 @@ mod tests {
             serde_json::from_str(verification_msg.body.as_deref().expect("body"))
                 .expect("decode media verification");
         assert_eq!(verification.local_actor, w.self_actor);
-        assert_eq!(
-            verification.rows.len(),
-            session.candidate_adapters.len(),
-            "the verifier emits one honest row per candidate adapter"
-        );
-        assert!(verification.rows.iter().all(|row| {
-            row.call == call
-                && row.space == space
-                && row.status == CallMediaVerificationStatus::WaitingForConnectedPeer
-                && row.evidence.is_none()
-                && row
-                    .detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("connected remote peer"))
-        }));
+        assert!(verification.rows.is_empty());
     }
 
     #[test]

@@ -17,9 +17,9 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
-    CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaReadiness,
+    CallKind, CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaReadiness,
     CallMediaRequirement, CallMediaSession, CallMediaVerification, CallMediaVerificationRow,
-    CallMediaVerificationStatus,
+    CallMediaVerificationStatus, CollabCommand,
 };
 
 const MAX_READINESS_BODY_BYTES: usize = 256 * 1024;
@@ -292,6 +292,51 @@ impl CallMediaProviderRegistry {
         Ok(())
     }
 
+    /// Admit only media-effect commands backed by a provider registered for
+    /// the call kind. Production currently constructs an empty registry, so it
+    /// must refuse to mint connected/muted/DTMF state instead of pretending a
+    /// transport exists. Cleanup commands deliberately bypass this boundary.
+    pub(crate) fn admit_command(
+        &self,
+        command: &CollabCommand,
+        existing_kind: Option<CallKind>,
+    ) -> Result<(), CallMediaCommandAdmissionError> {
+        let kind = match command {
+            CollabCommand::StartCall { kind, .. } => Some(*kind),
+            CollabCommand::AnswerCall { .. }
+            | CollabCommand::SendDtmf { .. }
+            | CollabCommand::SetCallMuted { .. } => existing_kind,
+            // Decline and hang-up are revocation/cleanup paths and remain
+            // available even after every provider has disappeared.
+            _ => return Ok(()),
+        };
+        let Some(kind) = kind else {
+            // Let the core return its authoritative CallNotFound error when an
+            // effect targets no active call.
+            return Ok(());
+        };
+        if self.supports(kind) {
+            Ok(())
+        } else {
+            Err(CallMediaCommandAdmissionError::NoProvider { kind })
+        }
+    }
+
+    fn supports(&self, kind: CallKind) -> bool {
+        match kind {
+            CallKind::Audio => {
+                self.webrtc_p2p.is_some()
+                    || self.livekit_sfu.is_some()
+                    || self.sip_gateway.is_some()
+            }
+            CallKind::Video | CallKind::Screen => {
+                self.webrtc_p2p.is_some() || self.livekit_sfu.is_some()
+            }
+            CallKind::CoEdit => self.document_collab.is_some(),
+            CallKind::RemoteDesktop => self.vdi_remote_desktop.is_some(),
+        }
+    }
+
     fn prove_advancing_frames(
         &self,
         session: &CallMediaSession,
@@ -326,6 +371,24 @@ impl CallMediaProviderRegistry {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallMediaCommandAdmissionError {
+    NoProvider { kind: CallKind },
+}
+
+impl fmt::Display for CallMediaCommandAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoProvider { kind } => write!(
+                formatter,
+                "no admitted call-media provider is registered for {kind:?}"
+            ),
+        }
+    }
+}
+
+impl Error for CallMediaCommandAdmissionError {}
 
 fn missing_provider_error(adapter: CallMediaAdapter) -> CallMediaProviderError {
     match adapter {
@@ -432,6 +495,8 @@ impl Error for CallMediaVerificationError {}
 mod tests {
     use super::*;
     use mde_collab_types::{ActorId, CallId, CallKind, SpaceId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn write_readiness(persist: &Persist, readiness: &CallMediaReadiness) {
         let body = serde_json::to_string(readiness).expect("serialize readiness");
@@ -465,6 +530,92 @@ mod tests {
 
     fn empty_registry() -> CallMediaProviderRegistry {
         CallMediaProviderRegistry::empty()
+    }
+
+    #[test]
+    fn provider_admission_rejects_media_effects_but_never_blocks_cleanup() {
+        let providers = empty_registry();
+        let space = SpaceId::new();
+        let call = CallId::new();
+
+        for (command, existing_kind) in [
+            (
+                CollabCommand::StartCall {
+                    space,
+                    call,
+                    kind: CallKind::Audio,
+                },
+                None,
+            ),
+            (CollabCommand::AnswerCall { call }, Some(CallKind::Audio)),
+            (
+                CollabCommand::SendDtmf { call, digit: '5' },
+                Some(CallKind::Audio),
+            ),
+            (
+                CollabCommand::SetCallMuted { call, muted: true },
+                Some(CallKind::Audio),
+            ),
+        ] {
+            assert_eq!(
+                providers.admit_command(&command, existing_kind),
+                Err(CallMediaCommandAdmissionError::NoProvider {
+                    kind: CallKind::Audio
+                })
+            );
+        }
+
+        assert!(providers
+            .admit_command(&CollabCommand::DeclineCall { call }, Some(CallKind::Audio))
+            .is_ok());
+        assert!(providers
+            .admit_command(&CollabCommand::HangUpCall { call }, Some(CallKind::Audio))
+            .is_ok());
+    }
+
+    #[test]
+    fn provider_admission_is_scoped_to_the_registered_call_kind() {
+        struct DocumentProvider;
+        impl CallMediaFrameVerifier for DocumentProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                _adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                panic!("admission must not probe provider media")
+            }
+        }
+
+        let mut providers = empty_registry();
+        providers
+            .register(CallMediaAdapter::DocumentCollab, DocumentProvider)
+            .expect("register document provider");
+        let space = SpaceId::new();
+        let call = CallId::new();
+
+        assert_eq!(
+            providers.admit_command(
+                &CollabCommand::StartCall {
+                    space,
+                    call,
+                    kind: CallKind::Audio,
+                },
+                None,
+            ),
+            Err(CallMediaCommandAdmissionError::NoProvider {
+                kind: CallKind::Audio
+            })
+        );
+        assert!(providers
+            .admit_command(
+                &CollabCommand::StartCall {
+                    space,
+                    call,
+                    kind: CallKind::CoEdit,
+                },
+                None,
+            )
+            .is_ok());
     }
 
     #[test]
@@ -579,6 +730,104 @@ mod tests {
                 "{adapter:?} must fail honestly when no provider is registered"
             );
         }
+    }
+
+    #[test]
+    fn unchanged_readiness_is_reprobed_across_revocation_and_reconnect() {
+        struct LifecycleProvider {
+            probes: Arc<AtomicUsize>,
+        }
+
+        impl CallMediaFrameVerifier for LifecycleProvider {
+            fn prove_advancing_frames(
+                &self,
+                _session: &CallMediaSession,
+                adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                match self.probes.fetch_add(1, Ordering::SeqCst) {
+                    0 | 2 => Ok(CallMediaFrameEvidence {
+                        audio_frames: 4,
+                        video_frames: 0,
+                        screen_frames: 0,
+                        data_messages: 0,
+                    }),
+                    1 => Err(CallMediaProviderError::TransportUnavailable {
+                        detail: "provider session was revoked".to_string(),
+                    }),
+                    probe => panic!("unexpected provider probe {probe}"),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let mut session = ready_audio_session();
+        session.candidate_adapters = vec![CallMediaAdapter::WebRtcP2p];
+        write_readiness(
+            &persist,
+            &CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: vec![session],
+            },
+        );
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut providers = CallMediaProviderRegistry::empty();
+        providers
+            .register(
+                CallMediaAdapter::WebRtcP2p,
+                LifecycleProvider {
+                    probes: Arc::clone(&probes),
+                },
+            )
+            .expect("register lifecycle provider");
+        let mut last_published = BTreeMap::new();
+
+        let read_status = || {
+            let msg = persist
+                .read_latest(&topics::state_topic(proj::CALL_MEDIA_VERIFICATION))
+                .expect("read verification")
+                .expect("verification published");
+            serde_json::from_str::<CallMediaVerification>(
+                msg.body.as_deref().expect("verification body"),
+            )
+            .expect("decode verification")
+            .rows
+            .into_iter()
+            .next()
+            .expect("verification row")
+        };
+
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+        let live = read_status();
+        assert_eq!(live.status, CallMediaVerificationStatus::LiveMediaVerified);
+        assert!(live.evidence.is_some());
+
+        // The readiness body is deliberately unchanged. A provider-side
+        // revocation must still replace the stale live row and clear evidence.
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+        let revoked = read_status();
+        assert_eq!(
+            revoked.status,
+            CallMediaVerificationStatus::TransportUnavailable
+        );
+        assert!(revoked.evidence.is_none());
+        assert_eq!(
+            revoked.detail.as_deref(),
+            Some("provider session was revoked")
+        );
+
+        // Reconnect also needs no synthetic call mutation: the same retained
+        // readiness is sampled again and advancing frames restore live state.
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+        let reconnected = read_status();
+        assert_eq!(
+            reconnected.status,
+            CallMediaVerificationStatus::LiveMediaVerified
+        );
+        assert!(reconnected.evidence.is_some());
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
     }
 
     #[test]
