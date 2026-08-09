@@ -16,6 +16,7 @@
 //! maintenance entry point that exercises the index end-to-end.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -404,7 +405,46 @@ pub fn write_index(dir: &Path, index: &CacheIndex) -> std::io::Result<()> {
         index: index.clone(),
     })
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(index_path(dir), json)
+    write_index_atomically_with(&index_path(dir), json.as_bytes(), |temporary, target| {
+        std::fs::rename(temporary, target)
+    })
+}
+
+/// Replace the cache index without exposing a truncated or partially written
+/// manifest to playback, pinning, or eviction readers.
+fn write_index_atomically_with<F>(path: &Path, bytes: &[u8], replace: F) -> std::io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "music cache index path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let target_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index.json");
+    let temporary = parent.join(format!(".{target_name}.{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Run eviction against `dir`: compute the plan, delete each evicted
@@ -544,6 +584,35 @@ mod tests {
         let i = idx(&[("a", 100, 1, false), ("s", 200, 2, true)]);
         write_index(dir.path(), &i).unwrap();
         assert_eq!(read_index(dir.path()), i);
+    }
+
+    #[test]
+    fn failed_index_replace_preserves_last_good_cache_authority() {
+        let dir = tempdir().unwrap();
+        let path = index_path(dir.path());
+        let old = idx(&[("cached-old", 100, 1, true)]);
+        write_index(dir.path(), &old).unwrap();
+
+        let replacement = serde_json::to_vec(&CacheFileV1 {
+            schema_version: CACHE_SCHEMA_VERSION,
+            index: idx(&[("cached-new", 200, 2, false)]),
+        })
+        .unwrap();
+        let error = write_index_atomically_with(&path, &replacement, |_temporary, _target| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected cache index replacement failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(read_index(dir.path()), old);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "failed replacement cleans its unique temporary file"
+        );
     }
 
     #[test]

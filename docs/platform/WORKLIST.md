@@ -1116,9 +1116,9 @@ behavioral evidence is not completion.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
 - **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-search-replay-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-source-identity-r1.md`.
-- **Jellyfin cache checkpoint (2026-08-07):** atomic verified cache; zero-byte/truncated entries refused (BigBoy 2/2);
-  mde-jellyfin 114/114 (90 unit/12 browse/2 outage/9 playback/1 doctest), Media UI 104/104; live download/network-loss and package proof remain open.
-  `docs/platform/evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`;
+- **Cache checkpoints (2026-08-07/09):** verified Jellyfin bytes refuse zero/truncated entries; daemon index replacement is synced, atomic, and preserves last-good.
+  BigBoy passed 2/2; mde-jellyfin 114/114 and Media UI 104/104 passed; `.50` cache passed 16/16. Live/package proof remains open.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`.
 - **mpv/recovery (2026-08-06):** BigBoy fixture 1/1 nonblank; media-core 239/239 retry/resume; `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`; live proof remains.
 - **Daemon Album/download/workerless checkpoint (2026-08-06):** Home, Library, and Search open retained albums; detail emits typed play without `LoadAlbum` worker requests.
   Library, Album, and Downloads publish bounded actions; daemon is 168/168 on `.90`, Music UI is 47/47 on `.50`, and embedded construction starts no worker.
