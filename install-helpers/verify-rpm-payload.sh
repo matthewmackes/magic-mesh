@@ -135,11 +135,13 @@ readonly CANDIDATE_CREDENTIAL_ASSETS=(
 readonly BASE_VDI_HOST_REQUIRES=(
   "libvirt"
   "qemu-kvm"
+  "qemu-ui-dbus"
   "libvirt-daemon-kvm"
   "libvirt-daemon-driver-storage"
 )
 readonly BUILT_RPM_KVM_REQUIRES=(
   "qemu-kvm"
+  "qemu-ui-dbus"
   "libvirt-daemon-kvm"
 )
 
@@ -853,6 +855,7 @@ assets = [
 [package.metadata.generate-rpm.requires]
 libvirt = "*"
 qemu-kvm = "*"
+qemu-ui-dbus = "*"
 libvirt-daemon-kvm = "*"
 libvirt-daemon-driver-storage = "*"
 [package.metadata.generate-rpm.variants.server]
@@ -884,7 +887,7 @@ TOML
     fail "self-test: complete Fedora VDI-host hard Requires did not pass"; st_fail=1
   fi
 
-  # A weak dependency is not sufficient: both Fedora KVM packages must remain
+  # A weak dependency is not sufficient: all Fedora KVM/Display1 packages remain
   # in the base RPM's hard-Requires table alongside the existing libvirt pins.
   local bad_requires="$tmp/bad-requires.toml"
   cat >"$bad_requires" <<'TOML'
@@ -893,11 +896,13 @@ libvirt = "*"
 libvirt-daemon-driver-storage = "*"
 [package.metadata.generate-rpm.recommends]
 qemu-kvm = "*"
+qemu-ui-dbus = "*"
 libvirt-daemon-kvm = "*"
 TOML
   out="$(CARGO_TOML="$bad_requires" bash "$0" requirements 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] \
       && grep -q "qemu-kvm MISSING" <<<"$out" \
+      && grep -q "qemu-ui-dbus MISSING" <<<"$out" \
       && grep -q "libvirt-daemon-kvm MISSING" <<<"$out"; then
     ok "self-test: weak-only Fedora KVM dependencies fail the hard-Requires gate"
   else
@@ -906,10 +911,11 @@ TOML
 
   # Source metadata is not release evidence. Exercise the actual Requires-header
   # parser with exact and versioned package expressions, then prove similarly
-  # named capabilities cannot satisfy the two mandatory KVM package names.
+  # named capabilities cannot satisfy the three mandatory KVM package names.
   local good_rpm_requires="$tmp/good-rpm-requires"
   cat >"$good_rpm_requires" <<'REQUIRES'
 qemu-kvm
+qemu-ui-dbus = 2:10.2.2-1.fc44
 libvirt-daemon-kvm >= 10.0
 rpmlib(CompressedFileNames) <= 3.0.4-1
 REQUIRES
@@ -917,8 +923,9 @@ REQUIRES
       bash "$0" requirements "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ] \
       && grep -q "actual-requires qemu-kvm present" <<<"$out" \
+      && grep -q "actual-requires qemu-ui-dbus present" <<<"$out" \
       && grep -q "actual-requires libvirt-daemon-kvm present" <<<"$out"; then
-    ok "self-test: a built RPM header with both mandatory KVM Requires passes"
+    ok "self-test: a built RPM header with all mandatory KVM Requires passes"
   else
     fail "self-test: complete built RPM KVM Requires header did not pass"; st_fail=1
   fi
@@ -926,12 +933,14 @@ REQUIRES
   local bad_rpm_requires="$tmp/bad-rpm-requires"
   cat >"$bad_rpm_requires" <<'REQUIRES'
 qemu-kvm-helper
+qemu-ui-dbus-helper
 libvirt-daemon-kvm-tools
 REQUIRES
   out="$(CARGO_TOML="$good" MCNF_FAKE_RPM_REQUIRES="$bad_rpm_requires" \
       bash "$0" requirements "$tmp/magic-mesh-fixture.rpm" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] \
       && grep -q "actual-requires qemu-kvm MISSING" <<<"$out" \
+      && grep -q "actual-requires qemu-ui-dbus MISSING" <<<"$out" \
       && grep -q "actual-requires libvirt-daemon-kvm MISSING" <<<"$out"; then
     ok "self-test: similarly named capabilities cannot satisfy built RPM KVM Requires"
   else

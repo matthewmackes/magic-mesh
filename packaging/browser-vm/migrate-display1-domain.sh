@@ -22,7 +22,8 @@ usage:
 
 `apply` preserves every disk and only changes the inactive libvirt XML: it
 adds QEMU Display1 (D-Bus P2P), changes the primary video model to virtio with
-3D enabled, and retains the existing SPICE recovery graphics device. A live
+3D enabled, and removes the incompatible legacy SPICE graphics head/channel.
+Guest RDP remains the recovery transport. A live
 guest is asked to shut down normally and is never force-destroyed. The VM is
 left stopped so request-browser-vm-workload can start it through the typed
 StartAndAttach operation.
@@ -93,7 +94,13 @@ def display_state(root):
     # libvirt normalizes a D-Bus graphics device by dropping the inert
     # `<listen type='none'/>` child from a subsequent dumpxml.  `p2p='yes'`
     # is the authoritative Display1 property and must survive that round trip.
-    dbus_ok = len(dbus) == 1 and dbus[0].get("p2p") == "yes"
+    graphics = devices.findall("graphics")
+    spice_channels = [entry for entry in devices.findall("channel")
+                      if entry.get("type") == "spicevmc"]
+    dbus_ok = (len(graphics) == 1 and len(dbus) == 1 and
+               dbus[0].get("p2p") == "yes" and
+               dbus[0].find("gl[@enable='yes']") is not None and
+               not spice_channels)
     video_ok = video is not None and video.get("type") == "virtio" and video.find("acceleration[@accel3d='yes']") is not None
     return dbus_ok, video_ok, len(dbus)
 
@@ -116,7 +123,14 @@ def transform(root):
         graphics = devices.findall("graphics")
         index = list(devices).index(graphics[0]) if graphics else 0
         devices.insert(index, dbus)
+    for graphics in list(devices.findall("graphics")):
+        if graphics is not dbus:
+            devices.remove(graphics)
+    for channel in list(devices.findall("channel")):
+        if channel.get("type") == "spicevmc":
+            devices.remove(channel)
     ET.SubElement(dbus, "listen", {"type": "none"})
+    ET.SubElement(dbus, "gl", {"enable": "yes"})
     video = devices.find("video")
     if video is None:
         video = ET.SubElement(devices, "video")
@@ -222,17 +236,27 @@ self_test() {
   ! valid_user 'bad user'
   python3 - <<'PY'
 import xml.etree.ElementTree as ET
-xml = "<domain><devices><disk type='file' device='disk'><source file='/var/lib/mde-vms/browser.qcow2'/></disk><graphics type='spice'/><video><model type='qxl'/></video></devices></domain>"
+xml = "<domain><devices><disk type='file' device='disk'><source file='/var/lib/mde-vms/browser.qcow2'/></disk><channel type='spicevmc'/><graphics type='spice'/><video><model type='qxl'/></video></devices></domain>"
 root = ET.fromstring(xml)
 devices = root.find("devices")
 dbus = ET.Element("graphics", {"type": "dbus", "p2p": "yes"})
 ET.SubElement(dbus, "listen", {"type": "none"})
+ET.SubElement(dbus, "gl", {"enable": "yes"})
 devices.insert(0, dbus)
+for graphics in list(devices.findall("graphics")):
+    if graphics is not dbus:
+        devices.remove(graphics)
+for channel in list(devices.findall("channel")):
+    if channel.get("type") == "spicevmc":
+        devices.remove(channel)
 model = devices.find("video/model")
 model.attrib.clear(); model.set("type", "virtio")
 ET.SubElement(model, "acceleration", {"accel3d": "yes"})
 assert devices.find("disk/source").get("file") == "/var/lib/mde-vms/browser.qcow2"
 assert len([entry for entry in devices.findall("graphics") if entry.get("type") == "dbus"]) == 1
+assert len(devices.findall("graphics")) == 1
+assert not [entry for entry in devices.findall("channel") if entry.get("type") == "spicevmc"]
+assert devices.find("graphics[@type='dbus']/gl[@enable='yes']") is not None
 assert devices.find("video/model").get("type") == "virtio"
 assert devices.find("video/model/acceleration").get("accel3d") == "yes"
 PY

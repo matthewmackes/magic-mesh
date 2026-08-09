@@ -55,8 +55,8 @@ fn xml_escape(value: &str) -> String {
 /// Build the local Display1-first libvirt domain definition for one Workload.
 ///
 /// The QEMU graphics FD remains local: the reconciler's authenticated Display1
-/// broker receives it over the peer-to-peer libvirt D-Bus connection.  SPICE is
-/// retained as an independent loopback-only recovery path.
+/// broker receives it over the peer-to-peer libvirt D-Bus connection. Guest RDP
+/// is the independent recovery path; QEMU rejects a SPICE head beside D-Bus GL.
 #[must_use]
 pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
     format!(
@@ -85,8 +85,7 @@ pub fn build_domain_xml(spec: &VmDomainSpec, disk_path: &str) -> String {
          \x20   <interface type='network'><source network='{network}'/><model type='virtio'/></interface>\n\
          \x20   <console type='pty'/>\n\
          \x20   <channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>\n\
-         \x20   <graphics type='dbus' p2p='yes'><listen type='none'/></graphics>\n\
-         \x20   <graphics type='spice' autoport='yes'><listen type='address' address='127.0.0.1'/></graphics>\n\
+         \x20   <graphics type='dbus' p2p='yes'><listen type='none'/><gl enable='yes'/></graphics>\n\
          \x20   <video><model type='virtio'><acceleration accel3d='yes'/></model></video>\n\
          \x20   <memballoon model='virtio'/>\n\
          \x20   <sound model='virtio'/>\n\
@@ -117,7 +116,9 @@ mod tests {
             "/var/lib/mde-vms/a'&.qcow2",
         );
         assert!(xml.contains("<graphics type='dbus' p2p='yes'>"));
-        assert!(xml.contains("address='127.0.0.1'"));
+        assert!(xml.contains("<gl enable='yes'/></graphics>"));
+        assert_eq!(xml.matches("<graphics type=").count(), 1);
+        assert!(!xml.contains("type='spice'"));
         assert!(xml.contains("guest&lt;&amp;"));
         assert!(xml.contains("a&apos;&amp;.qcow2"));
     }

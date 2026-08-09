@@ -87,6 +87,8 @@ behavioral evidence is not completion.
   refusing unrelated virtqemud failures. Workload `workload_compute` passed
   23/23 on `.90` in `workload-cleanup-idempotence-20260806-r1`.
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
+- **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
+  `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
 - **Admission/live proof checkpoints (2026-08-06/09):** the strict helper validates typed placement, resources, retry, and lease safety. Dell was unreachable; seat 15 lacked
   a revision receipt, typed projection, operation, and attachment generation, so acceptance refused:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
@@ -299,11 +301,11 @@ behavioral evidence is not completion.
 - **Display1 rollback checkpoint (2026-08-09):** exact XML restoration passed `.90`: `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
 - **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
-- **Standalone publication checkpoint (2026-08-08):** GitHub, farm, and Actions passed: `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
-- **Live-profile inventory checkpoint (2026-08-09):** fail-closed inventory passed: `docs/platform/evidence/WL-ARCH-008-2026-08-09-live-profile-inventory-r4.md`.
 - **Browser VM artifact-identity checkpoint (2026-08-09):** exact 4/8192/64 profile and bounded qcow2/raw manifests reject stale, hostile, or unsupported artifacts;
   machine 194 passed the focused contract gates: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-image-contract-r72.md`.
   A real admitted 64-GiB qcow2 then passed `qemu-img` integrity: `docs/platform/evidence/WL-ARCH-008-2026-08-09-browser-vm-real-image-r77.md`.
+- **Dell Display1/RDP checkpoint (2026-08-09):** the disk-preserving one-head GL migration boots the retained VM and reaches guest RDP:
+  `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
   Catalog/boot boundary: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-catalog-boot-r80.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
