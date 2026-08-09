@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::workers::{ShutdownToken, Worker};
 
 const POLL: Duration = Duration::from_secs(1);
+const SYSTEM_BUS_ROOT: &str = mde_bus::SYSTEM_BUS_ROOT;
 const MAX_TRUST_KEY_BYTES: u64 = 256;
 const MAX_CATALOG_WIRE_BYTES: u64 = 512 * 1024;
 const MAX_IMPORTS_PER_POLL: usize = 32;
@@ -148,6 +149,7 @@ impl CatalogWatermark {
     }
 }
 
+#[derive(Debug)]
 struct RecoveredCatalog {
     watermark: CatalogWatermark,
     catalog: SignedFlatpakAppCatalog,
@@ -157,8 +159,29 @@ struct RecoveredCatalog {
 /// Workstation authority for one node's signed Flatpak catalog.
 pub struct AppCatalogWorker {
     host: String,
+    /// Explicit override for tests/deployments. `None` resolves the user Bus
+    /// root afresh on every pass and then falls back to the system spool.
     bus_root: Option<PathBuf>,
     config: Option<CatalogConfig>,
+    poll: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ImportState {
+    cursor: Option<String>,
+    current: Option<SignedFlatpakAppCatalog>,
+    watermark: Option<CatalogWatermark>,
+    last_status: Option<AppCatalogImportStatus>,
+    recovery_attempted: bool,
+    bus_identity: Option<BusIdentity>,
 }
 
 impl AppCatalogWorker {
@@ -173,12 +196,51 @@ impl AppCatalogWorker {
             .ok();
         Self {
             host,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root: None,
             config,
+            poll: POLL,
         }
     }
 
+    fn resolved_bus_root(&self) -> PathBuf {
+        resolve_bus_root(self.bus_root.clone(), mde_bus::default_data_dir())
+    }
+
+    #[cfg(test)]
+    const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
     fn process_once(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        current: &mut Option<SignedFlatpakAppCatalog>,
+        watermark: &mut Option<CatalogWatermark>,
+        last_status: &mut Option<AppCatalogImportStatus>,
+        now_ms: u64,
+    ) -> io::Result<ImportTally> {
+        let mut staged_cursor = cursor.clone();
+        let mut staged_current = current.clone();
+        let mut staged_watermark = watermark.clone();
+        let mut staged_last_status = last_status.clone();
+        let tally = self.process_once_inner(
+            persist,
+            &mut staged_cursor,
+            &mut staged_current,
+            &mut staged_watermark,
+            &mut staged_last_status,
+            now_ms,
+        )?;
+        *cursor = staged_cursor;
+        *current = staged_current;
+        *watermark = staged_watermark;
+        *last_status = staged_last_status;
+        Ok(tally)
+    }
+
+    fn process_once_inner(
         &self,
         persist: &mut Persist,
         cursor: &mut Option<String>,
@@ -391,6 +453,163 @@ impl AppCatalogWorker {
         }
         Ok(tally)
     }
+
+    fn activate_bus(
+        &self,
+        persist: &mut Persist,
+        state: &mut ImportState,
+        identity: BusIdentity,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        if state.bus_identity == Some(identity) {
+            return Ok(());
+        }
+        let mut staged = state.clone();
+        if !staged.recovery_attempted {
+            self.recover_startup(persist, &mut staged, now_ms)?;
+            staged.recovery_attempted = true;
+        } else {
+            self.republish_after_replacement(persist, &mut staged, now_ms)?;
+        }
+        staged.bus_identity = Some(identity);
+        *state = staged;
+        Ok(())
+    }
+
+    fn recover_startup(
+        &self,
+        persist: &mut Persist,
+        state: &mut ImportState,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        let Some(config) = self.config.as_ref() else {
+            return Ok(());
+        };
+        match recover_last_good(config, now_ms) {
+            Ok(Some(recovered)) => {
+                state.watermark = Some(recovered.watermark);
+                if recovered.is_fresh {
+                    publish_projection(persist, &self.host, &recovered.catalog)?;
+                    state.current = Some(recovered.catalog);
+                    publish_status_if_changed(
+                        persist,
+                        &status_for(
+                            &self.host,
+                            AppCatalogImportOutcome::Recovered,
+                            AppCatalogStatusReason::None,
+                            AppCatalogRemedy::None,
+                            state.watermark.as_ref(),
+                            now_ms,
+                        ),
+                        &mut state.last_status,
+                    )?;
+                } else {
+                    publish_empty_projection(persist, &self.host, &recovered.catalog)?;
+                    state.current = None;
+                    publish_status_if_changed(
+                        persist,
+                        &status_for(
+                            &self.host,
+                            AppCatalogImportOutcome::Unavailable,
+                            AppCatalogStatusReason::RetainedCatalogExpired,
+                            AppCatalogRemedy::PublishNewerRevision,
+                            state.watermark.as_ref(),
+                            now_ms,
+                        ),
+                        &mut state.last_status,
+                    )?;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog last-good recovery refused");
+                publish_status_if_changed(
+                    persist,
+                    &status_for(
+                        &self.host,
+                        AppCatalogImportOutcome::Refused,
+                        AppCatalogStatusReason::StartupRecoveryFailed,
+                        AppCatalogRemedy::PublishValidCatalog,
+                        None,
+                        now_ms,
+                    ),
+                    &mut state.last_status,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn republish_after_replacement(
+        &self,
+        persist: &mut Persist,
+        state: &mut ImportState,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        if let Some(catalog) = state.current.as_ref() {
+            publish_projection(persist, &self.host, catalog)?;
+        } else if let Some(config) = self.config.as_ref() {
+            if let Some(recovered) = recover_last_good(config, now_ms)? {
+                publish_empty_projection(persist, &self.host, &recovered.catalog)?;
+            }
+        }
+        if let Some(status) = state.last_status.clone() {
+            // A replacement index has no prior edge-triggered status row. Force
+            // exactly one re-publication, committing the remembered edge only
+            // after the new Bus accepts it.
+            state.last_status = None;
+            publish_status_if_changed(persist, &status, &mut state.last_status)?;
+        }
+        Ok(())
+    }
+
+    fn process_bus_pass(
+        &self,
+        persist: &mut Persist,
+        bus_root: &Path,
+        state: &mut ImportState,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        let mut staged = state.clone();
+        let identity = bus_identity(bus_root)?;
+        self.activate_bus(persist, &mut staged, identity, now_ms)?;
+        let ImportState {
+            cursor,
+            current,
+            watermark,
+            last_status,
+            ..
+        } = &mut staged;
+        self.process_once(persist, cursor, current, watermark, last_status, now_ms)?;
+        *state = staged;
+        Ok(())
+    }
+}
+
+fn resolve_bus_root(configured: Option<PathBuf>, user: Option<PathBuf>) -> PathBuf {
+    configured
+        .or(user)
+        .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_ROOT))
+}
+
+fn bus_identity(bus_root: &Path) -> io::Result<BusIdentity> {
+    let metadata = fs::metadata(bus_root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("Bus index is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(BusIdentity {})
+    }
 }
 
 #[async_trait::async_trait]
@@ -407,97 +626,25 @@ impl Worker for AppCatalogWorker {
             shutdown.wait().await;
             return Ok(());
         }
-        let mut cursor = None;
-        let mut current = None;
-        let mut watermark = None;
-        let mut last_status = None;
-        let mut recovery_attempted = false;
+        let mut state = ImportState::default();
         loop {
-            if let Some(root) = self.bus_root.as_ref() {
-                match Persist::open(root.clone()) {
-                    Ok(mut persist) => {
-                        if !recovery_attempted {
-                            recovery_attempted = true;
-                            if let Some(config) = self.config.as_ref() {
-                                match recover_last_good(config, now_unix_ms()) {
-                                    Ok(Some(recovered)) => {
-                                        watermark = Some(recovered.watermark);
-                                        if recovered.is_fresh {
-                                            current = Some(recovered.catalog);
-                                        } else {
-                                            publish_empty_projection(
-                                                &mut persist,
-                                                &self.host,
-                                                &recovered.catalog,
-                                            )?;
-                                        }
-                                        if let Some(catalog) = current.as_ref() {
-                                            publish_projection(&mut persist, &self.host, catalog)?;
-                                            publish_status_if_changed(
-                                                &mut persist,
-                                                &status_for(
-                                                    &self.host,
-                                                    AppCatalogImportOutcome::Recovered,
-                                                    AppCatalogStatusReason::None,
-                                                    AppCatalogRemedy::None,
-                                                    watermark.as_ref(),
-                                                    now_unix_ms(),
-                                                ),
-                                                &mut last_status,
-                                            )?;
-                                        } else {
-                                            publish_status_if_changed(
-                                                &mut persist,
-                                                &status_for(
-                                                    &self.host,
-                                                    AppCatalogImportOutcome::Unavailable,
-                                                    AppCatalogStatusReason::RetainedCatalogExpired,
-                                                    AppCatalogRemedy::PublishNewerRevision,
-                                                    watermark.as_ref(),
-                                                    now_unix_ms(),
-                                                ),
-                                                &mut last_status,
-                                            )?;
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog last-good recovery refused");
-                                        publish_status_if_changed(
-                                            &mut persist,
-                                            &status_for(
-                                                &self.host,
-                                                AppCatalogImportOutcome::Refused,
-                                                AppCatalogStatusReason::StartupRecoveryFailed,
-                                                AppCatalogRemedy::PublishValidCatalog,
-                                                None,
-                                                now_unix_ms(),
-                                            ),
-                                            &mut last_status,
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-                        if let Err(error) = self.process_once(
-                            &mut persist,
-                            &mut cursor,
-                            &mut current,
-                            &mut watermark,
-                            &mut last_status,
-                            now_unix_ms(),
-                        ) {
-                            tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog import pass failed");
-                        }
+            let root = self.resolved_bus_root();
+            match Persist::open(root.clone()) {
+                Ok(mut persist) => {
+                    let now_ms = now_unix_ms();
+                    if let Err(error) =
+                        self.process_bus_pass(&mut persist, &root, &mut state, now_ms)
+                    {
+                        tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog Bus pass deferred");
                     }
-                    Err(error) => {
-                        tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog Bus unavailable")
-                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::app_catalog", %error, "Flatpak catalog Bus unavailable; worker will retry")
                 }
             }
             tokio::select! {
                 () = shutdown.wait() => break,
-                () = tokio::time::sleep(POLL) => {}
+                () = tokio::time::sleep(self.poll) => {}
             }
         }
         Ok(())
@@ -775,6 +922,28 @@ fn project_entry(entry: &SignedFlatpakCatalogEntry) -> AdmittedFlatpakAppProject
 #[cfg(test)]
 std::thread_local! {
     static FAIL_NEXT_PROJECTION_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_BUS_WRITE_TOPIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn write_bus(persist: &Persist, topic: &str, body: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_BUS_WRITE_TOPIC.with(|fail| {
+        let mut fail = fail.borrow_mut();
+        if fail.as_deref() == Some(topic) {
+            fail.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::other(format!(
+            "injected Bus write failure for {topic}"
+        )));
+    }
+    persist
+        .write(topic, Priority::Default, None, Some(body))
+        .map_err(io_other)?;
+    Ok(())
 }
 
 fn publish_projection(
@@ -788,15 +957,7 @@ fn publish_projection(
     }
     let projection = projection_from(host, catalog, true)?;
     let body = serde_json::to_string(&projection).map_err(io_other)?;
-    persist
-        .write(
-            &app_catalog_projection_topic(host)?,
-            Priority::Default,
-            None,
-            Some(&body),
-        )
-        .map_err(io_other)?;
-    Ok(())
+    write_bus(persist, &app_catalog_projection_topic(host)?, &body)
 }
 
 fn publish_empty_projection(
@@ -806,15 +967,7 @@ fn publish_empty_projection(
 ) -> io::Result<()> {
     let projection = projection_from(host, catalog, false)?;
     let body = serde_json::to_string(&projection).map_err(io_other)?;
-    persist
-        .write(
-            &app_catalog_projection_topic(host)?,
-            Priority::Default,
-            None,
-            Some(&body),
-        )
-        .map_err(io_other)?;
-    Ok(())
+    write_bus(persist, &app_catalog_projection_topic(host)?, &body)
 }
 
 fn publish_status_if_changed(
@@ -829,14 +982,7 @@ fn publish_status_if_changed(
         return Ok(false);
     }
     let body = serde_json::to_string(status).map_err(io_other)?;
-    persist
-        .write(
-            &app_catalog_status_topic(&status.host)?,
-            Priority::Default,
-            None,
-            Some(&body),
-        )
-        .map_err(io_other)?;
+    write_bus(persist, &app_catalog_status_topic(&status.host)?, &body)?;
     *last_status = Some(status.clone());
     Ok(true)
 }
@@ -1017,6 +1163,7 @@ mod tests {
                 last_good_file: state_dir.join("catalog.json"),
                 required_owner_uid: owner_uid(),
             }),
+            poll: POLL,
         }
     }
 
@@ -1233,6 +1380,50 @@ mod tests {
     }
 
     #[test]
+    fn status_publication_failure_rolls_back_pass_state_and_retries() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let bus_root = temp.path().join("bus");
+        let mut persist = Persist::open(bus_root.clone()).unwrap();
+        import(&persist, &signed_catalog(&key, "flatpak-production", 7));
+        let mut state = ImportState::default();
+        let status_topic = app_catalog_status_topic("node-01").unwrap();
+        FAIL_NEXT_BUS_WRITE_TOPIC.with(|fail| *fail.borrow_mut() = Some(status_topic));
+
+        assert!(worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW,)
+            .is_err());
+        assert!(state.cursor.is_none());
+        assert!(state.current.is_none());
+        assert!(state.watermark.is_none());
+        assert!(state.last_status.is_none());
+        assert!(!state.recovery_attempted);
+        assert!(state.bus_identity.is_none());
+        assert_eq!(
+            persist
+                .list_since(&app_catalog_projection_topic("node-01").unwrap(), None)
+                .unwrap()
+                .len(),
+            1,
+            "projection may precede status, but transaction state stays uncommitted"
+        );
+
+        worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
+            .unwrap();
+        assert!(state.cursor.is_some());
+        assert_eq!(state.current.as_ref().unwrap().payload.revision, 7);
+        assert_eq!(state.watermark.as_ref().unwrap().revision, 7);
+        assert_eq!(
+            state.last_status.as_ref().unwrap().retained_revision,
+            Some(7)
+        );
+        assert!(state.recovery_attempted);
+        assert!(state.bus_identity.is_some());
+    }
+
+    #[test]
     fn hostile_imports_publish_payload_free_status_and_preserve_last_good() {
         let temp = TempDir::new().unwrap();
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -1441,6 +1632,7 @@ mod tests {
             host: "node-01".into(),
             bus_root: Some(temp.path().join("bus")),
             config: None,
+            poll: POLL,
         };
         let mut cursor = None;
         let mut current = None;
@@ -1510,6 +1702,103 @@ mod tests {
             .contains("must-not-echo"));
     }
 
+    async fn wait_for_projection(bus_root: &Path, revision: u64) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(persist) = Persist::open(bus_root.to_path_buf()) {
+                    if let Ok(Some(row)) =
+                        persist.read_latest(&app_catalog_projection_topic("node-01").unwrap())
+                    {
+                        if row.body.as_deref().is_some_and(|body| {
+                            serde_json::from_str::<AdmittedFlatpakCatalogProjection>(body)
+                                .is_ok_and(|projection| projection.revision == revision)
+                        }) {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for app catalog projection");
+    }
+
+    #[tokio::test]
+    async fn same_worker_recovers_late_and_replaced_bus_with_governed_replay() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let bus_root = temp.path().join("late-bus");
+        fs::write(&bus_root, b"temporarily unavailable").unwrap();
+
+        let seeded_root = temp.path().join("seeded-bus");
+        let seeded = Persist::open(seeded_root.clone()).unwrap();
+        let wall_now = now_unix_ms();
+        import(
+            &seeded,
+            &signed_catalog_window(
+                &key,
+                "flatpak-production",
+                7,
+                wall_now.saturating_sub(1_000),
+                wall_now.saturating_add(60_000),
+            ),
+        );
+        drop(seeded);
+
+        let mut worker = worker(&temp, &key).with_poll(Duration::from_millis(10));
+        worker.bus_root = Some(bus_root.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "missing Bus must not terminate worker");
+
+        fs::remove_file(&bus_root).unwrap();
+        fs::rename(&seeded_root, &bus_root).unwrap();
+        wait_for_projection(&bus_root, 7).await;
+        assert_eq!(
+            latest_status(&Persist::open(bus_root.clone()).unwrap()).outcome,
+            AppCatalogImportOutcome::Admitted,
+            "retained signed import remains governed by signature/watermark authority"
+        );
+
+        let replacement_root = temp.path().join("replacement-bus");
+        drop(Persist::open(replacement_root.clone()).unwrap());
+        fs::rename(
+            replacement_root.join("index.sqlite"),
+            bus_root.join("index.sqlite"),
+        )
+        .unwrap();
+        wait_for_projection(&bus_root, 7).await;
+
+        let live = Persist::open(bus_root.clone()).unwrap();
+        import(
+            &live,
+            &signed_catalog_window(
+                &key,
+                "flatpak-production",
+                8,
+                wall_now.saturating_sub(1_000),
+                wall_now.saturating_add(60_000),
+            ),
+        );
+        wait_for_projection(&bus_root, 8).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker shutdown timeout")
+            .expect("worker task joins")
+            .expect("worker shutdown succeeds");
+        assert_eq!(
+            resolve_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
     #[tokio::test]
     async fn unconfigured_worker_quiesces_without_creating_bus_state() {
         let temp = TempDir::new().unwrap();
@@ -1518,6 +1807,7 @@ mod tests {
             host: "node-01".into(),
             bus_root: Some(bus_root.clone()),
             config: None,
+            poll: POLL,
         };
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle =
