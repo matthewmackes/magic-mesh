@@ -47,7 +47,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_collab_types::{
     CollabCommand, FileRef, FileRefId, FileReferences, SpaceId, TransferError, TransferErrorCode,
-    TransferId, TransferJobV2, TransferLocation, TransferPhase, TransferState as V2State,
+    TransferId, TransferJobV2, TransferKind, TransferLocation, TransferOperation, TransferPhase,
+    TransferState as V2State,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -102,6 +103,125 @@ const MAX_V2_LEDGER_RECORD_BYTES: usize = 1024 * 1024;
 const COLLAB_FILES_COMMIT_VERB: &str = "collab-command";
 const FILES_PROJECTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const FILES_PROJECTION_CONFIRM_POLL: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum V2OperationKind {
+    Copy,
+    Sync,
+    Download,
+    Upload,
+    Scrape,
+    Mirror,
+    PublishClipboard,
+}
+
+impl From<&TransferOperation> for V2OperationKind {
+    fn from(operation: &TransferOperation) -> Self {
+        match operation {
+            TransferOperation::Copy { .. } => Self::Copy,
+            TransferOperation::Sync { .. } => Self::Sync,
+            TransferOperation::Download => Self::Download,
+            TransferOperation::Upload => Self::Upload,
+            TransferOperation::Scrape { .. } => Self::Scrape,
+            TransferOperation::Mirror { .. } => Self::Mirror,
+            TransferOperation::PublishClipboard => Self::PublishClipboard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2ExecutorAdmission {
+    LocalFilesCopy,
+    Blocked(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2ExecutorRegistryRow {
+    kind: TransferKind,
+    operation: V2OperationKind,
+    admission: V2ExecutorAdmission,
+}
+
+const V2_EXECUTOR_REGISTRY: [V2ExecutorRegistryRow; 11] = [
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Local,
+        operation: V2OperationKind::Copy,
+        admission: V2ExecutorAdmission::LocalFilesCopy,
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Mesh,
+        operation: V2OperationKind::Copy,
+        admission: V2ExecutorAdmission::Blocked(
+            "authenticated mesh transport and remote acknowledgement provider is unavailable",
+        ),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Rsync,
+        operation: V2OperationKind::Sync,
+        admission: V2ExecutorAdmission::Blocked(
+            "V2 rsync profile executor provider is unavailable",
+        ),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Sftp,
+        operation: V2OperationKind::Copy,
+        admission: V2ExecutorAdmission::Blocked("sealed SFTP executor provider is unavailable"),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Sftp,
+        operation: V2OperationKind::Download,
+        admission: V2ExecutorAdmission::Blocked("sealed SFTP executor provider is unavailable"),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Sftp,
+        operation: V2OperationKind::Upload,
+        admission: V2ExecutorAdmission::Blocked("sealed SFTP executor provider is unavailable"),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Http,
+        operation: V2OperationKind::Download,
+        admission: V2ExecutorAdmission::Blocked("HTTP resource executor provider is unavailable"),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Scrape,
+        operation: V2OperationKind::Scrape,
+        admission: V2ExecutorAdmission::Blocked(
+            "browser scrape materialization provider is unavailable",
+        ),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Multipart,
+        operation: V2OperationKind::Upload,
+        admission: V2ExecutorAdmission::Blocked(
+            "sealed multipart upload executor provider is unavailable",
+        ),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Recurring,
+        operation: V2OperationKind::Mirror,
+        admission: V2ExecutorAdmission::Blocked(
+            "recurring mirror scheduler and executor provider is unavailable",
+        ),
+    },
+    V2ExecutorRegistryRow {
+        kind: TransferKind::Clipboard,
+        operation: V2OperationKind::PublishClipboard,
+        admission: V2ExecutorAdmission::Blocked(
+            "clipboard Files publication executor provider is unavailable",
+        ),
+    },
+];
+
+fn v2_executor_admission(job: &TransferJobV2) -> V2ExecutorAdmission {
+    let operation = V2OperationKind::from(&job.operation);
+    V2_EXECUTOR_REGISTRY
+        .iter()
+        .find(|row| row.kind == job.kind && row.operation == operation)
+        .map_or(
+            V2ExecutorAdmission::Blocked("contract kind and operation pair is not executable"),
+            |row| row.admission,
+        )
+}
 
 /// Wall-clock milliseconds since the epoch (the ledger's timestamps + id seed).
 #[must_use]
@@ -1269,6 +1389,19 @@ fn run_v2_copy_attempt(
 ) -> V2TaskResult {
     let attempt = claimed.progress.attempt;
     let id = claimed.transfer;
+    if let V2ExecutorAdmission::Blocked(provider) = v2_executor_admission(&claimed) {
+        return finish_v2_failed(
+            &ledger,
+            &ledger_lock,
+            id,
+            Some(attempt),
+            typed_transfer_error(TransferErrorCode::Unsupported, false, provider),
+        )
+        .map_or(V2TaskResult::Superseded, |job| V2TaskResult::Terminal {
+            job,
+            checksum_sha256: None,
+        });
+    }
     let admitted = match v2::resolve_for_execution(claimed, resolver.as_ref()) {
         Ok(admitted) => admitted,
         Err(error) => {
@@ -1996,6 +2129,98 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_ok());
+    }
+
+    #[test]
+    fn v2_executor_registry_classifies_every_contract_pair_without_fake_providers() {
+        use std::collections::HashSet;
+
+        let expected = [
+            (TransferKind::Local, V2OperationKind::Copy),
+            (TransferKind::Mesh, V2OperationKind::Copy),
+            (TransferKind::Rsync, V2OperationKind::Sync),
+            (TransferKind::Sftp, V2OperationKind::Copy),
+            (TransferKind::Sftp, V2OperationKind::Download),
+            (TransferKind::Sftp, V2OperationKind::Upload),
+            (TransferKind::Http, V2OperationKind::Download),
+            (TransferKind::Scrape, V2OperationKind::Scrape),
+            (TransferKind::Multipart, V2OperationKind::Upload),
+            (TransferKind::Recurring, V2OperationKind::Mirror),
+            (TransferKind::Clipboard, V2OperationKind::PublishClipboard),
+        ];
+        let actual = V2_EXECUTOR_REGISTRY
+            .iter()
+            .map(|row| (row.kind, row.operation))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(actual.len(), V2_EXECUTOR_REGISTRY.len(), "duplicate row");
+        assert_eq!(actual, expected.into_iter().collect());
+        assert_eq!(
+            V2_EXECUTOR_REGISTRY
+                .iter()
+                .filter(|row| row.admission == V2ExecutorAdmission::LocalFilesCopy)
+                .count(),
+            1,
+            "only the production Local Files copy executor is reachable"
+        );
+        assert!(V2_EXECUTOR_REGISTRY.iter().all(|row| matches!(
+            row.admission,
+            V2ExecutorAdmission::LocalFilesCopy | V2ExecutorAdmission::Blocked(_)
+        )));
+        for row in V2_EXECUTOR_REGISTRY {
+            if let V2ExecutorAdmission::Blocked(provider) = row.admission {
+                assert!(TransferError::new(
+                    TransferErrorCode::Unsupported,
+                    false,
+                    Some(provider.to_string())
+                )
+                .is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_executor_registry_blocks_mesh_without_remote_acknowledgement_provider() {
+        struct MustNotResolveMesh;
+
+        impl FilesEndpointResolver for MustNotResolveMesh {
+            fn resolve(
+                &self,
+                _identity: &TransferLocation,
+                _role: FilesEndpointRole,
+            ) -> Result<ResolvedFilesEndpoint, FilesResolveFailure> {
+                panic!("blocked Mesh executor must not resolve a local cache entry")
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with(tmp.path(), 1, Arc::new(GatedLaneRunner));
+        engine.files_resolver = Arc::new(MustNotResolveMesh);
+        let job = v2_job();
+        let id = job.transfer;
+        write_verb(tmp.path(), &TransferVerb::SubmitV2(job)).unwrap();
+        for _ in 0..100 {
+            engine.tick().await;
+            if engine
+                .v2_ledger
+                .get(id)
+                .is_some_and(|job| job.state == V2State::Failed)
+                && engine.v2_tasks.is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let failed = engine.v2_ledger.get(id).expect("durable blocked row");
+        let error = failed.progress.error.expect("named provider blocker");
+        assert_eq!(error.code, TransferErrorCode::Unsupported);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("authenticated mesh transport and remote acknowledgement provider is unavailable")
+        );
+        assert_eq!(failed.progress.bytes_done, 0);
     }
 
     #[tokio::test]
