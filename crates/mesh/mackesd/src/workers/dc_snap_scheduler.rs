@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::persist::Persist;
@@ -49,6 +50,20 @@ use super::{ShutdownToken, Worker};
 /// keeps the worker responsive to shutdown while the cadence clock is coarse.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Initial Bus recovery backoff. Small enough to recover promptly from startup
+/// ordering without spinning on a missing spool.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Maximum Bus recovery backoff. The supervised worker remains alive and keeps
+/// retrying rather than delegating recovery to a service restart.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Bound in-memory results whose xe effect completed but whose durable
+/// run-history write has not. This is a same-worker duplicate-effect barrier,
+/// not crash-durable state. Once full, new effects defer until publication
+/// makes room.
+const MAX_PENDING_RESULTS: usize = 128;
+
 /// Default snapshot cadence when a schedule record carries no explicit
 /// `interval_secs`/`cadence` — daily. The panel save (today) records retention +
 /// target but not a cadence, so the executor must pick a sane honest default
@@ -58,6 +73,9 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 86_400;
 /// Bus topic PREFIX the schedule config records live under (one per SR):
 /// `event/dc/snap-schedule/<sr>`.
 pub const SCHEDULE_PREFIX: &str = "event/dc/snap-schedule/";
+
+/// Durable history prefix corresponding one-for-one with schedule SRs.
+pub const RUN_PREFIX: &str = "event/dc/snap-schedule-run/";
 
 /// Name-label prefix every scheduler-made snapshot carries. Retention pruning
 /// only ever lists + destroys snapshots with this prefix, so an operator's
@@ -88,7 +106,7 @@ pub fn schedule_topic(sr: &str) -> String {
 /// `event/dc/snap-schedule-run/<sr>`.
 #[must_use]
 pub fn run_topic(sr: &str) -> String {
-    format!("event/dc/snap-schedule-run/{sr}")
+    format!("{RUN_PREFIX}{sr}")
 }
 
 /// First [`DETAIL_LEN`] characters of a string (char-boundary safe).
@@ -424,75 +442,94 @@ fn emit_alert(alerts_dir: &std::path::Path, sr: &str, detail: &str) {
     let _ = std::fs::write(path, alert.to_string());
 }
 
-/// Write a run record to `event/dc/snap-schedule-run/<sr>` (best-effort — a Bus
-/// write failure is logged, never fatal).
-fn write_run(persist: &Persist, rec: &RunRecord) {
-    if let Err(e) = persist.write(
-        &run_topic(&rec.sr),
-        mde_bus::hooks::config::Priority::Default,
-        Some("snap-schedule-run"),
-        Some(&rec.body()),
-    ) {
-        tracing::debug!(sr = %rec.sr, error = %e, "dc_snap_scheduler: run-record write failed");
+/// One complete, effect-free read of durable scheduler authority.
+#[derive(Default)]
+struct StagedPass {
+    schedules: BTreeMap<String, Schedule>,
+    last_runs: BTreeMap<String, u64>,
+}
+
+/// Stage scheduler authority without advancing a cursor or performing an xe
+/// effect. Implemented as a seam so hostile read failures are deterministic.
+trait PassReader: Send + Sync {
+    fn stage(&self, persist: &Persist) -> Result<StagedPass, String>;
+}
+
+struct DurablePassReader;
+
+impl PassReader for DurablePassReader {
+    fn stage(&self, persist: &Persist) -> Result<StagedPass, String> {
+        stage_pass(persist)
     }
 }
 
-/// Read the latest schedule record per SR off the Bus. Walks every
-/// `event/dc/snap-schedule/<sr>` topic, takes the LAST (newest-ulid) record on
-/// each, and parses it; a topic with no parseable schedule is skipped. Returns a
-/// map keyed by SR uuid. Best-effort: a failed list degrades to an empty map.
-fn read_schedules(persist: &Persist) -> BTreeMap<String, Schedule> {
-    let mut out = BTreeMap::new();
-    let topics = match persist.list_topics() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::debug!(error = %e, "dc_snap_scheduler: list_topics failed");
-            return out;
-        }
-    };
-    for topic in topics.iter().filter(|t| t.starts_with(SCHEDULE_PREFIX)) {
-        let msgs = match persist.list_since(topic, None) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(topic = %topic, error = %e, "dc_snap_scheduler: list_since failed");
-                continue;
-            }
-        };
-        // Newest-ulid record wins (the operator's latest save for this SR).
-        if let Some(sched) = msgs
+/// Stage every schedule plus its corresponding run-history lane as one
+/// transaction. All values remain local until every enumeration/read succeeds;
+/// one failed topic therefore defers the whole sweep without a partial fold.
+fn stage_pass(persist: &Persist) -> Result<StagedPass, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("enumerate scheduler topics: {error}"))?;
+    let mut schedules = BTreeMap::new();
+    for topic in topics
+        .iter()
+        .filter(|topic| topic.starts_with(SCHEDULE_PREFIX))
+    {
+        let messages = persist
+            .list_since(topic, None)
+            .map_err(|error| format!("read durable schedule {topic}: {error}"))?;
+        // Preserve the supported durable-config fold: newest parseable save wins.
+        if let Some(schedule) = messages
             .iter()
             .rev()
-            .find_map(|m| m.body.as_deref().and_then(Schedule::parse))
+            .find_map(|message| message.body.as_deref().and_then(Schedule::parse))
         {
-            out.insert(sched.sr.clone(), sched);
+            schedules.insert(schedule.sr.clone(), schedule);
         }
     }
-    out
+
+    let mut last_runs = BTreeMap::new();
+    for sr in schedules.keys() {
+        let topic = run_topic(sr);
+        let messages = persist
+            .list_since(&topic, None)
+            .map_err(|error| format!("read durable run history {topic}: {error}"))?;
+        if let Some(ts) = messages.iter().rev().find_map(|message| {
+            message
+                .body
+                .as_deref()
+                .and_then(RunRecord::last_ts_from_body)
+        }) {
+            last_runs.insert(sr.clone(), ts);
+        }
+    }
+    Ok(StagedPass {
+        schedules,
+        last_runs,
+    })
 }
 
-/// Recover the last-run unix-seconds per SR from the run lane, so a daemon restart
-/// doesn't re-snapshot every SR on the first tick. Best-effort.
-fn read_last_runs(persist: &Persist) -> BTreeMap<String, u64> {
-    const RUN_PREFIX: &str = "event/dc/snap-schedule-run/";
-    let mut out = BTreeMap::new();
-    let Ok(topics) = persist.list_topics() else {
-        return out;
-    };
-    for topic in topics.iter().filter(|t| t.starts_with(RUN_PREFIX)) {
-        let Some(sr) = topic.strip_prefix(RUN_PREFIX) else {
-            continue;
-        };
-        if let Ok(msgs) = persist.list_since(topic, None) {
-            if let Some(ts) = msgs
-                .iter()
-                .rev()
-                .find_map(|m| m.body.as_deref().and_then(RunRecord::last_ts_from_body))
-            {
-                out.insert(sr.to_string(), ts);
-            }
-        }
+/// Run-history publication is a required durability boundary, not a best-effort
+/// log. Errors retain the completed result in the bounded in-memory pending
+/// ledger for the lifetime of this worker process.
+trait RunPublisher: Send + Sync {
+    fn publish(&self, persist: &Persist, record: &RunRecord) -> Result<(), String>;
+}
+
+struct DurableRunPublisher;
+
+impl RunPublisher for DurableRunPublisher {
+    fn publish(&self, persist: &Persist, record: &RunRecord) -> Result<(), String> {
+        persist
+            .write(
+                &run_topic(&record.sr),
+                mde_bus::hooks::config::Priority::Default,
+                Some("snap-schedule-run"),
+                Some(&record.body()),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
-    out
 }
 
 /// Take a snapshot of one SR over SSH and return the run record. The dom0 is
@@ -576,36 +613,132 @@ fn enforce_retention(sched: &Schedule) -> usize {
     destroyed
 }
 
-/// One scheduler pass: read schedules + last-runs, and for each SR that is due,
-/// snapshot it, enforce retention, write the run record, and alert on failure.
-/// Best-effort throughout — one SR's failure never aborts the others.
-fn run_pass(persist: &Persist, alerts_dir: &std::path::Path) {
-    let schedules = read_schedules(persist);
-    if schedules.is_empty() {
-        return;
+/// Xe effect seam. Production delegates to the existing snapshot and retention
+/// paths; tests count effects without touching Xen.
+trait SnapEffects: Send + Sync {
+    fn snapshot(&self, schedule: &Schedule) -> RunRecord;
+    fn prune(&self, schedule: &Schedule) -> usize;
+}
+
+struct ProductionSnapEffects;
+
+impl SnapEffects for ProductionSnapEffects {
+    fn snapshot(&self, schedule: &Schedule) -> RunRecord {
+        run_snapshot(schedule)
     }
-    let last_runs = read_last_runs(persist);
+
+    fn prune(&self, schedule: &Schedule) -> usize {
+        enforce_retention(schedule)
+    }
+}
+
+/// One scheduler pass. The durable read is completed before pending publication
+/// retries or any xe effect. A completed snapshot result enters the in-memory
+/// `pending` barrier before prune/publication, and new effects stop when that
+/// ledger is full. A process crash before publication can still lose this state
+/// and repeat the snapshot after restart.
+fn run_pass(
+    persist: &Persist,
+    alerts_dir: &std::path::Path,
+    reader: &dyn PassReader,
+    effects: &dyn SnapEffects,
+    publisher: &dyn RunPublisher,
+    pending: &mut BTreeMap<String, RunRecord>,
+) -> Result<(), String> {
+    let mut staged = reader.stage(persist)?;
+
+    // Retry completed-but-unpublished results first. A success is folded into
+    // this pass immediately so the stale staged history cannot trigger a repeat.
+    let pending_srs: Vec<String> = pending.keys().cloned().collect();
+    for sr in pending_srs {
+        let Some(record) = pending.get(&sr) else {
+            continue;
+        };
+        match publisher.publish(persist, record) {
+            Ok(()) => {
+                staged.last_runs.insert(sr.clone(), record.ts);
+                pending.remove(&sr);
+            }
+            Err(error) => tracing::warn!(
+                sr,
+                %error,
+                "dc_snap_scheduler: pending run-history publication still unavailable"
+            ),
+        }
+    }
+
     let now = now_secs();
-    for sched in schedules.values() {
-        let last = last_runs.get(&sched.sr).copied();
+    for sched in staged.schedules.values() {
+        if pending.contains_key(&sched.sr) {
+            continue;
+        }
+        let last = staged.last_runs.get(&sched.sr).copied();
         if !due(last, now, sched.interval_secs) {
             continue;
         }
-        let rec = run_snapshot(sched);
+        if pending.len() >= MAX_PENDING_RESULTS {
+            tracing::warn!(
+                limit = MAX_PENDING_RESULTS,
+                "dc_snap_scheduler: pending result ledger full; deferring new effects"
+            );
+            break;
+        }
+
+        let rec = effects.snapshot(sched);
+        // Install the same-worker completion guard before prune or publication.
+        // If the Bus write fails, future passes in this process retry this result
+        // instead of snapshotting. This guard is intentionally not crash-durable.
+        pending.insert(sched.sr.clone(), rec.clone());
         if rec.ok {
-            let n = enforce_retention(sched);
+            let n = effects.prune(sched);
             tracing::info!(sr = %sched.sr, snapshot = %rec.snapshot, pruned = n,
                 "dc_snap_scheduler: snapshot taken + retention enforced");
         } else {
             tracing::warn!(sr = %sched.sr, detail = %rec.detail, "dc_snap_scheduler: snapshot failed");
             emit_alert(alerts_dir, &sched.sr, &rec.detail);
         }
-        write_run(persist, &rec);
+        match publisher.publish(persist, &rec) {
+            Ok(()) => {
+                staged.last_runs.insert(sched.sr.clone(), rec.ts);
+                pending.remove(&sched.sr);
+            }
+            Err(error) => tracing::warn!(
+                sr = %sched.sr,
+                %error,
+                "dc_snap_scheduler: retaining completed result for publication retry"
+            ),
+        }
     }
+    Ok(())
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn scheduler_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    scheduler_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn scheduler_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
+/// Bus open seam shared by startup recovery and per-tick reopening.
+trait BusFactory: Send + Sync {
+    fn open(&self, root: &std::path::Path) -> Result<Option<Persist>, String>;
+}
+
+struct PersistBusFactory;
+
+impl BusFactory for PersistBusFactory {
+    fn open(&self, root: &std::path::Path) -> Result<Option<Persist>, String> {
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// The supervised worker. Leader-gated (only the elected node snapshots +
@@ -617,6 +750,13 @@ pub struct DcSnapSchedulerWorker {
     leader_lock: PathBuf,
     alerts_dir: PathBuf,
     bus_root_override: Option<PathBuf>,
+    bus_factory: Arc<dyn BusFactory>,
+    reader: Arc<dyn PassReader>,
+    effects: Arc<dyn SnapEffects>,
+    publisher: Arc<dyn RunPublisher>,
+    pending_results: BTreeMap<String, RunRecord>,
+    #[cfg(test)]
+    leader_override: Option<bool>,
 }
 
 impl DcSnapSchedulerWorker {
@@ -630,6 +770,13 @@ impl DcSnapSchedulerWorker {
             node_id,
             alerts_dir,
             bus_root_override: None,
+            bus_factory: Arc::new(PersistBusFactory),
+            reader: Arc::new(DurablePassReader),
+            effects: Arc::new(ProductionSnapEffects),
+            publisher: Arc::new(DurableRunPublisher),
+            pending_results: BTreeMap::new(),
+            #[cfg(test)]
+            leader_override: None,
         }
     }
 
@@ -640,10 +787,57 @@ impl DcSnapSchedulerWorker {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_tick_interval(mut self, interval: Duration) -> Self {
+        self.tick_interval = interval;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_factory(mut self, factory: Arc<dyn BusFactory>) -> Self {
+        self.bus_factory = factory;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_reader(mut self, reader: Arc<dyn PassReader>) -> Self {
+        self.reader = reader;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_effects(mut self, effects: Arc<dyn SnapEffects>) -> Self {
+        self.effects = effects;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_publisher(mut self, publisher: Arc<dyn RunPublisher>) -> Self {
+        self.publisher = publisher;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_leader(mut self, leader: bool) -> Self {
+        self.leader_override = Some(leader);
+        self
+    }
+
     /// Only the directory leader runs the snapshots (no-fixed-center: any eligible
     /// node can be it, the elected one runs + publishes). Reuses the shared leader
     /// lock.
     fn is_leader(&self) -> bool {
+        #[cfg(test)]
+        if let Some(leader) = self.leader_override {
+            return leader;
+        }
+
         crate::leader_gate::LeaderGate::from_lock_path(
             self.leader_lock.clone(),
             self.node_id.clone(),
@@ -659,21 +853,26 @@ impl Worker for DcSnapSchedulerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = match self.bus_root_override.clone().or_else(default_bus_root) {
-            Some(r) => r,
-            None => {
-                tracing::debug!("dc_snap_scheduler: no bus root; worker idle");
-                return Ok(());
+        let bus_root = scheduler_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        loop {
+            match self.bus_factory.open(&bus_root) {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    tracing::debug!("dc_snap_scheduler: Bus unavailable; startup will retry")
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "dc_snap_scheduler: Persist open failed; startup will retry"
+                ),
             }
-        };
-        // Validate the bus root once (same "worker idle on a persistent open
-        // failure" behavior as before). Per-tick work reopens its own `Persist`
-        // inside `spawn_blocking` — `Persist` is `!Sync` so it can't cross the
-        // blocking await, and `Persist::open` is cheap (mackesd-02).
-        if let Err(e) = Persist::open(bus_root.clone()) {
-            tracing::debug!(error = %e, "dc_snap_scheduler: persist open failed; worker idle");
-            return Ok(());
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         }
+
         loop {
             if self.is_leader() {
                 // run_pass shells `ssh … xe vdi-snapshot/vdi-destroy` serially
@@ -682,17 +881,52 @@ impl Worker for DcSnapSchedulerWorker {
                 // starve the watchdog beat (mackesd-02 / WATCHDOG-2).
                 let bus_root_tick = bus_root.clone();
                 let alerts_dir = self.alerts_dir.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    match Persist::open(bus_root_tick) {
-                        Ok(persist) => run_pass(&persist, &alerts_dir),
-                        Err(e) => {
-                            tracing::debug!(error = %e, "dc_snap_scheduler: tick persist open failed; skipping");
+                let bus_factory = Arc::clone(&self.bus_factory);
+                let reader = Arc::clone(&self.reader);
+                let effects = Arc::clone(&self.effects);
+                let publisher = Arc::clone(&self.publisher);
+                // Keep a pre-pass fallback outside the blocking task. A panic can
+                // still lose a newly completed effect inside that task, but must
+                // not discard pending results that existed before this pass.
+                let pending_fallback = self.pending_results.clone();
+                let mut pending = std::mem::take(&mut self.pending_results);
+                match tokio::task::spawn_blocking(move || {
+                    match bus_factory.open(&bus_root_tick) {
+                        Ok(Some(persist)) => {
+                            if let Err(error) = run_pass(
+                                &persist,
+                                &alerts_dir,
+                                reader.as_ref(),
+                                effects.as_ref(),
+                                publisher.as_ref(),
+                                &mut pending,
+                            ) {
+                                tracing::warn!(
+                                    %error,
+                                    "dc_snap_scheduler: authority staging failed; sweep deferred"
+                                );
+                            }
                         }
+                        Ok(None) => tracing::debug!(
+                            "dc_snap_scheduler: tick Bus unavailable; sweep deferred"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "dc_snap_scheduler: tick Persist open failed; sweep deferred"
+                        ),
                     }
+                    pending
                 })
                 .await
                 {
-                    tracing::warn!(error = %e, "dc_snap_scheduler: snapshot pass task join failed");
+                    Ok(pending) => self.pending_results = pending,
+                    Err(error) => {
+                        self.pending_results = pending_fallback;
+                        tracing::warn!(
+                            %error,
+                            "dc_snap_scheduler: snapshot pass task join failed; restored pre-pass pending results"
+                        );
+                    }
                 }
             }
             tokio::select! {
@@ -706,6 +940,8 @@ impl Worker for DcSnapSchedulerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     // ---- topics ----
 
@@ -977,5 +1213,412 @@ mod tests {
             destroy_command("5ab1-c0de").unwrap(),
             "vdi-destroy uuid=5ab1-c0de"
         );
+    }
+
+    struct LateBusFactory {
+        root: PathBuf,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl BusFactory for LateBusFactory {
+        fn open(&self, _root: &std::path::Path) -> Result<Option<Persist>, String> {
+            match self.attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(None),
+                1 => Err("injected unopenable Bus".into()),
+                _ => Persist::open(self.root.clone())
+                    .map(Some)
+                    .map_err(|error| error.to_string()),
+            }
+        }
+    }
+
+    struct UnavailableBusFactory {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl BusFactory for UnavailableBusFactory {
+        fn open(&self, _root: &std::path::Path) -> Result<Option<Persist>, String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeEffects {
+        snapshots: Mutex<Vec<String>>,
+        prunes: Mutex<Vec<String>>,
+    }
+
+    impl SnapEffects for FakeEffects {
+        fn snapshot(&self, schedule: &Schedule) -> RunRecord {
+            self.snapshots.lock().unwrap().push(schedule.sr.clone());
+            RunRecord {
+                sr: schedule.sr.clone(),
+                ok: true,
+                ts: now_secs(),
+                snapshot: format!("snapshot-{}", schedule.sr),
+                detail: String::new(),
+            }
+        }
+
+        fn prune(&self, schedule: &Schedule) -> usize {
+            self.prunes.lock().unwrap().push(schedule.sr.clone());
+            0
+        }
+    }
+
+    struct HostileReader {
+        mode: Arc<AtomicUsize>,
+        enumeration_failures: Arc<AtomicUsize>,
+        topic_failures: Arc<AtomicUsize>,
+    }
+
+    impl PassReader for HostileReader {
+        fn stage(&self, persist: &Persist) -> Result<StagedPass, String> {
+            match self.mode.load(Ordering::SeqCst) {
+                0 => {
+                    self.enumeration_failures.fetch_add(1, Ordering::SeqCst);
+                    Err("injected list_topics failure".into())
+                }
+                1 => {
+                    let topics = persist.list_topics().map_err(|error| error.to_string())?;
+                    if let Some(topic) = topics
+                        .iter()
+                        .find(|topic| topic.starts_with(SCHEDULE_PREFIX))
+                    {
+                        persist
+                            .list_since(topic, None)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    self.topic_failures.fetch_add(1, Ordering::SeqCst);
+                    Err("injected later schedule-topic read failure".into())
+                }
+                _ => stage_pass(persist),
+            }
+        }
+    }
+
+    struct PanicOnceReader {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl PassReader for PanicOnceReader {
+        fn stage(&self, _persist: &Persist) -> Result<StagedPass, String> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected blocking-pass panic");
+            }
+            Err("defer after injected panic".into())
+        }
+    }
+
+    struct GatePublisher {
+        allow: Arc<AtomicBool>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl RunPublisher for GatePublisher {
+        fn publish(&self, persist: &Persist, record: &RunRecord) -> Result<(), String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if !self.allow.load(Ordering::SeqCst) {
+                return Err("injected publication failure".into());
+            }
+            DurableRunPublisher.publish(persist, record)
+        }
+    }
+
+    fn write_schedule(persist: &Persist, sr: &str, interval_secs: u64) {
+        let body = serde_json::json!({
+            "kind": "snap-schedule",
+            "sr": sr,
+            "retention": 2,
+            "interval_secs": interval_secs,
+            "dom0": "test-dom0",
+        })
+        .to_string();
+        persist
+            .write(
+                &schedule_topic(sr),
+                mde_bus::hooks::config::Priority::Default,
+                Some("snap-schedule"),
+                Some(&body),
+            )
+            .unwrap();
+    }
+
+    fn write_history(persist: &Persist, sr: &str, ts: u64) {
+        let record = RunRecord {
+            sr: sr.to_string(),
+            ok: true,
+            ts,
+            snapshot: "retained-snapshot".into(),
+            detail: String::new(),
+        };
+        DurableRunPublisher.publish(persist, &record).unwrap();
+    }
+
+    fn worker_for_test(root: &std::path::Path) -> DcSnapSchedulerWorker {
+        DcSnapSchedulerWorker::new(
+            root.join("workgroup"),
+            "test-node".into(),
+            root.join("alerts"),
+        )
+        .with_bus_root(root.join("bus"))
+        .with_tick_interval(Duration::from_millis(5))
+        .with_leader(true)
+    }
+
+    #[tokio::test]
+    async fn late_bus_replays_retained_authority_and_discovers_dynamic_schedules() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus_root = dir.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        write_schedule(&persist, "retained-due", 86_400);
+        write_schedule(&persist, "retained-history", 1);
+        write_history(&persist, "retained-history", u64::MAX);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::new(FakeEffects::default());
+        let mut worker = worker_for_test(dir.path())
+            .with_bus_factory(Arc::new(LateBusFactory {
+                root: bus_root.clone(),
+                attempts: Arc::clone(&attempts),
+            }))
+            .with_effects(effects.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshots = effects.snapshots.lock().unwrap().clone();
+                if snapshots.iter().any(|sr| sr == "retained-due") {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "worker exited during late Bus recovery"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retained due schedule must recover without restart");
+        assert!(attempts.load(Ordering::SeqCst) >= 4);
+        assert!(!effects
+            .snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sr| sr == "retained-history"));
+
+        write_schedule(&persist, "dynamic", 86_400);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !effects
+                .snapshots
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|sr| sr == "dynamic")
+            {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before dynamic discovery"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dynamic schedule topic must be discovered");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snapshots = effects.snapshots.lock().unwrap().clone();
+        assert_eq!(
+            snapshots.iter().filter(|sr| *sr == "retained-due").count(),
+            1
+        );
+        assert_eq!(snapshots.iter().filter(|sr| *sr == "dynamic").count(), 1);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker join")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn partial_reads_and_publication_failure_defer_without_duplicate_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().join("bus")).unwrap();
+        write_schedule(&persist, "read-a", 86_400);
+        write_schedule(&persist, "read-b", 86_400);
+
+        let mode = Arc::new(AtomicUsize::new(0));
+        let enumeration_failures = Arc::new(AtomicUsize::new(0));
+        let topic_failures = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::new(FakeEffects::default());
+        let publish_allowed = Arc::new(AtomicBool::new(false));
+        let publish_attempts = Arc::new(AtomicUsize::new(0));
+        let mut worker = worker_for_test(dir.path())
+            .with_reader(Arc::new(HostileReader {
+                mode: Arc::clone(&mode),
+                enumeration_failures: Arc::clone(&enumeration_failures),
+                topic_failures: Arc::clone(&topic_failures),
+            }))
+            .with_effects(effects.clone())
+            .with_publisher(Arc::new(GatePublisher {
+                allow: Arc::clone(&publish_allowed),
+                attempts: Arc::clone(&publish_attempts),
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while enumeration_failures.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(effects.snapshots.lock().unwrap().is_empty());
+
+        mode.store(1, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while topic_failures.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(effects.snapshots.lock().unwrap().is_empty());
+        assert!(persist
+            .list_since(&run_topic("read-a"), None)
+            .unwrap()
+            .is_empty());
+
+        mode.store(2, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while publish_attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snapshots = effects.snapshots.lock().unwrap().clone();
+        assert_eq!(snapshots.iter().filter(|sr| *sr == "read-a").count(), 1);
+        assert_eq!(snapshots.iter().filter(|sr| *sr == "read-b").count(), 1);
+        assert!(persist
+            .list_since(&run_topic("read-a"), None)
+            .unwrap()
+            .is_empty());
+
+        publish_allowed.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while persist
+                .list_since(&run_topic("read-a"), None)
+                .unwrap()
+                .is_empty()
+                || persist
+                    .list_since(&run_topic("read-b"), None)
+                    .unwrap()
+                    .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snapshots = effects.snapshots.lock().unwrap().clone();
+        assert_eq!(snapshots.iter().filter(|sr| *sr == "read-a").count(), 1);
+        assert_eq!(snapshots.iter().filter(|sr| *sr == "read-b").count(), 1);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker join")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn system_bus_fallback_and_startup_retry_are_shutdown_aware() {
+        assert_eq!(
+            scheduler_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut worker =
+            worker_for_test(dir.path()).with_bus_factory(Arc::new(UnavailableBusFactory {
+                attempts: Arc::clone(&attempts),
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "unavailable Bus must not end the worker"
+        );
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must interrupt Bus retry")
+            .expect("worker join")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn blocking_join_failure_restores_pre_pass_pending_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut worker = worker_for_test(dir.path()).with_reader(Arc::new(PanicOnceReader {
+            attempts: Arc::clone(&attempts),
+        }));
+        worker.pending_results.insert(
+            "already-pending".into(),
+            RunRecord {
+                sr: "already-pending".into(),
+                ok: true,
+                ts: 42,
+                snapshot: "snapshot-before-pass".into(),
+                detail: String::new(),
+            },
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let stop = tokio::spawn(async move {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            shutdown_tx.send(true).unwrap();
+        });
+
+        worker
+            .run(ShutdownToken::from_receiver(shutdown_rx))
+            .await
+            .expect("worker result");
+        stop.await.expect("shutdown task");
+
+        let restored = worker
+            .pending_results
+            .get("already-pending")
+            .expect("pre-pass pending result must survive blocking-task join failure");
+        assert_eq!(restored.snapshot, "snapshot-before-pass");
+        assert_eq!(restored.ts, 42);
     }
 }

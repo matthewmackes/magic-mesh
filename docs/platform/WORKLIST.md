@@ -467,6 +467,9 @@ behavioral evidence is not completion.
 - **Datacenter audit recovery checkpoint (2026-08-09):** complete request/output
   snapshots recover late storage and prevent duplicate projections across restart. Machine 9 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-auditor-bus-recovery-r39.md`.
+- **Scheduled-snapshot recovery checkpoint (2026-08-09):** complete durable
+  schedule/history reads precede effects; same-process failed-result publication cannot repeat effects, while the crash outbox remains open. Machine 193 passed four exact tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-snap-scheduler-bus-recovery-r42.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
