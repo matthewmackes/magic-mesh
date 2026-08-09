@@ -23,6 +23,7 @@ const SEATS: [(&str, &[&str]); 5] = [
 const MESH_SELECTION: &str = "__mesh_wide__";
 const HISTORY_PAGE_SIZE: usize = 8;
 const HISTORY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+const ACTION_ERROR_STATE_ID: &str = "health-action-publication-error";
 
 pub(crate) fn mount(
     ctx: &egui::Context,
@@ -31,11 +32,13 @@ pub(crate) fn mount(
 ) {
     if !chrome.health_modal_open {
         chrome.health_pending_action = None;
+        clear_action_error(ctx);
         return;
     }
     if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
         chrome.health_modal_open = false;
         chrome.health_pending_action = None;
+        clear_action_error(ctx);
         return;
     }
 
@@ -53,6 +56,7 @@ pub(crate) fn mount(
     if shown.should_close() {
         chrome.health_modal_open = false;
         chrome.health_pending_action = None;
+        clear_action_error(ctx);
     }
 }
 
@@ -74,6 +78,7 @@ fn show(
             if ui.button("Close").clicked() {
                 chrome.health_modal_open = false;
                 chrome.health_pending_action = None;
+                clear_action_error(ui.ctx());
             }
             if !compact_header {
                 if let Some(snapshot) = snapshot {
@@ -95,6 +100,10 @@ fn show(
         }
     });
     ui.separator();
+    if let Some(error) = action_error(ui.ctx()) {
+        ui.colored_label(Style::SUPPORT_ERROR, error.presentable());
+        ui.add_space(Style::SP_XS);
+    }
 
     let narrow = ui.available_width() < 760.0;
     if narrow {
@@ -457,10 +466,20 @@ fn condition_card(
             matches!(&condition.scope, HealthScope::Node { node: target } if target == &local);
         ui.horizontal_wrapped(|ui| {
             if actionable_here && ui.small_button("Acknowledge").clicked() {
-                publish_action(snapshot, condition, node, HealthAction::Acknowledge, false);
+                publish_action_for_ui(
+                    ui.ctx(),
+                    chrome,
+                    snapshot,
+                    condition,
+                    node,
+                    HealthAction::Acknowledge,
+                    false,
+                );
             }
             if actionable_here && ui.small_button("Snooze 1 hour").clicked() {
-                publish_action(
+                publish_action_for_ui(
+                    ui.ctx(),
+                    chrome,
                     snapshot,
                     condition,
                     node,
@@ -498,7 +517,15 @@ fn condition_card(
                     chrome.health_pending_action = Some((condition.id.clone(), action.action));
                 }
             } else if ui.button(label).clicked() {
-                publish_action(snapshot, condition, node, action.action, false);
+                publish_action_for_ui(
+                    ui.ctx(),
+                    chrome,
+                    snapshot,
+                    condition,
+                    node,
+                    action.action,
+                    false,
+                );
             }
             if chrome
                 .health_pending_action
@@ -511,8 +538,15 @@ fn condition_card(
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Confirm action").clicked() {
-                        publish_action(snapshot, condition, node, action.action, true);
-                        chrome.health_pending_action = None;
+                        publish_action_for_ui(
+                            ui.ctx(),
+                            chrome,
+                            snapshot,
+                            condition,
+                            node,
+                            action.action,
+                            true,
+                        );
                     }
                     if ui.button("Cancel").clicked() {
                         chrome.health_pending_action = None;
@@ -530,13 +564,113 @@ fn device_route_key(route: &str) -> Option<&str> {
         .filter(|key| !key.is_empty())
 }
 
-fn publish_action(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionPublishFailure {
+    BusRootUnavailable,
+    PersistOpen,
+    Serialization,
+    PersistWrite,
+}
+
+impl ActionPublishFailure {
+    const fn presentable(self) -> &'static str {
+        match self {
+            Self::BusRootUnavailable => {
+                "Couldn’t send the health action because the local Mesh Bus is unavailable. Retry when it returns."
+            }
+            Self::PersistOpen => {
+                "Couldn’t open the local Mesh Bus to send the health action. Retry after the service recovers."
+            }
+            Self::Serialization => {
+                "Couldn’t prepare the health action for publication. The action was not sent."
+            }
+            Self::PersistWrite => {
+                "Couldn’t write the health action to the local Mesh Bus. The action was not sent; retry when storage is writable."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionPublishOutcome {
+    Published,
+    Failed(ActionPublishFailure),
+}
+
+fn action_error_id() -> egui::Id {
+    egui::Id::new(ACTION_ERROR_STATE_ID)
+}
+
+fn action_error(ctx: &egui::Context) -> Option<ActionPublishFailure> {
+    ctx.data(|data| {
+        data.get_temp::<Option<ActionPublishFailure>>(action_error_id())
+            .flatten()
+    })
+}
+
+fn clear_action_error(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.remove_temp::<Option<ActionPublishFailure>>(action_error_id());
+    });
+}
+
+fn apply_action_outcome(
+    ctx: &egui::Context,
+    chrome: &mut ConstructChrome,
+    clear_confirmation_on_success: bool,
+    outcome: ActionPublishOutcome,
+) {
+    match outcome {
+        ActionPublishOutcome::Published => {
+            clear_action_error(ctx);
+            if clear_confirmation_on_success {
+                chrome.health_pending_action = None;
+            }
+        }
+        ActionPublishOutcome::Failed(error) => {
+            ctx.data_mut(|data| data.insert_temp(action_error_id(), Some(error)));
+        }
+    }
+}
+
+fn publish_action_for_ui(
+    ctx: &egui::Context,
+    chrome: &mut ConstructChrome,
     snapshot: &SystemMeshHealthSnapshot,
     condition: &HealthCondition,
     node: &str,
     action: HealthAction,
     confirmed: bool,
 ) {
+    let outcome = publish_action(snapshot, condition, node, action, confirmed);
+    apply_action_outcome(ctx, chrome, confirmed, outcome);
+}
+
+fn publish_action(
+    snapshot: &SystemMeshHealthSnapshot,
+    condition: &HealthCondition,
+    node: &str,
+    action: HealthAction,
+    confirmed: bool,
+) -> ActionPublishOutcome {
+    publish_action_to(
+        mde_bus::client_data_dir(),
+        snapshot,
+        condition,
+        node,
+        action,
+        confirmed,
+    )
+}
+
+fn publish_action_to(
+    root: Option<std::path::PathBuf>,
+    snapshot: &SystemMeshHealthSnapshot,
+    condition: &HealthCondition,
+    node: &str,
+    action: HealthAction,
+    confirmed: bool,
+) -> ActionPublishOutcome {
     let now = now_ms();
     let request = HealthActionRequest {
         schema_version: HEALTH_SCHEMA_VERSION,
@@ -550,14 +684,18 @@ fn publish_action(
         confirmation: confirmed.then(|| "CONFIRM".into()),
         requested_at_ms: now,
     };
-    let Some(root) = mde_bus::client_data_dir() else {
-        return;
+    let Some(root) = root else {
+        return ActionPublishOutcome::Failed(ActionPublishFailure::BusRootUnavailable);
     };
     let Ok(persist) = Persist::open(root) else {
-        return;
+        return ActionPublishOutcome::Failed(ActionPublishFailure::PersistOpen);
     };
-    if let Ok(body) = serde_json::to_string(&request) {
-        let _ = persist.write(ACTION_TOPIC, Priority::Default, None, Some(&body));
+    let Ok(body) = serde_json::to_string(&request) else {
+        return ActionPublishOutcome::Failed(ActionPublishFailure::Serialization);
+    };
+    match persist.write(ACTION_TOPIC, Priority::Default, None, Some(&body)) {
+        Ok(_) => ActionPublishOutcome::Published,
+        Err(_) => ActionPublishOutcome::Failed(ActionPublishFailure::PersistWrite),
     }
 }
 
@@ -1368,6 +1506,87 @@ mod tests {
             ["node:current", "node:at-boundary"],
             "only genuinely resolved records inside the inclusive 24-hour window belong on the page"
         );
+    }
+
+    #[test]
+    fn action_publication_reports_hostile_failures_and_preserves_bound_success() {
+        let snapshot = fixture_snapshot(true, true);
+        let condition = &snapshot.active_conditions[0];
+        let pending = (condition.id.clone(), HealthAction::RefreshProvider);
+        let ctx = egui::Context::default();
+        let mut chrome = ConstructChrome::default();
+        chrome.health_pending_action = Some(pending.clone());
+
+        let unavailable = publish_action_to(
+            None,
+            &snapshot,
+            condition,
+            "bound-target",
+            HealthAction::RefreshProvider,
+            true,
+        );
+        assert_eq!(
+            unavailable,
+            ActionPublishOutcome::Failed(ActionPublishFailure::BusRootUnavailable)
+        );
+        apply_action_outcome(&ctx, &mut chrome, true, unavailable);
+        assert_eq!(chrome.health_pending_action, Some(pending.clone()));
+        assert_eq!(
+            action_error(&ctx),
+            Some(ActionPublishFailure::BusRootUnavailable)
+        );
+
+        let blocked_root = tempfile::tempdir().expect("blocked Bus fixture");
+        Persist::open(blocked_root.path().to_path_buf()).expect("initialize Bus index");
+        std::fs::write(blocked_root.path().join("action"), b"not a directory")
+            .expect("block action topic directory");
+        let write_failed = publish_action_to(
+            Some(blocked_root.path().to_path_buf()),
+            &snapshot,
+            condition,
+            "bound-target",
+            HealthAction::RefreshProvider,
+            true,
+        );
+        assert_eq!(
+            write_failed,
+            ActionPublishOutcome::Failed(ActionPublishFailure::PersistWrite)
+        );
+        apply_action_outcome(&ctx, &mut chrome, true, write_failed);
+        assert_eq!(chrome.health_pending_action, Some(pending.clone()));
+        assert_eq!(action_error(&ctx), Some(ActionPublishFailure::PersistWrite));
+
+        let live_root = tempfile::tempdir().expect("writable Bus fixture");
+        let published = publish_action_to(
+            Some(live_root.path().to_path_buf()),
+            &snapshot,
+            condition,
+            "bound-target",
+            HealthAction::RefreshProvider,
+            true,
+        );
+        assert_eq!(published, ActionPublishOutcome::Published);
+        let persist = Persist::open(live_root.path().to_path_buf()).expect("reopen Bus");
+        let messages = persist
+            .list_since(ACTION_TOPIC, None)
+            .expect("read published action");
+        assert_eq!(messages.len(), 1);
+        let request: HealthActionRequest =
+            serde_json::from_str(messages[0].body.as_deref().expect("action request body"))
+                .expect("decode action request");
+        assert_eq!(
+            request.target,
+            HealthScope::Node {
+                node: "bound-target".into()
+            }
+        );
+        assert_eq!(request.expected_snapshot_generation, snapshot.generation);
+        assert_eq!(request.condition_id, condition.id);
+        assert_eq!(request.confirmation.as_deref(), Some("CONFIRM"));
+
+        apply_action_outcome(&ctx, &mut chrome, true, published);
+        assert_eq!(chrome.health_pending_action, None);
+        assert_eq!(action_error(&ctx), None);
     }
 
     #[test]

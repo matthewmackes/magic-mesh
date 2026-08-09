@@ -1956,6 +1956,12 @@ behavioral evidence is not completion.
   24-hour window; future, unresolved, and older high-severity rows cannot
   displace valid history. BigBoy passed the exact hostile filter test:
   `docs/platform/evidence/WL-UX-013-2026-08-09-history-window-filter-r8.md`.
+- **Health-action publication checkpoint (2026-08-09):** missing, unreadable,
+  or unwritable local Bus state now produces a visible bounded modal error;
+  confirmed recovery intent remains pending until its generation- and
+  target-bound request is durably published. Machine 196 passed the exact
+  hostile publication fixture:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-health-action-publication-r9.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.
