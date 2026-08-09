@@ -112,6 +112,15 @@ pub const STATE_PREFIX: &str = "state/pty/";
 /// overlay RTT dominates either way). Cheap at idle (one `list_topics`).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Lower bound for retrying a Bus that is unresolved, unopenable, or not yet
+/// safe to activate. Keeps startup responsive without a tight failure loop.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Upper bound for startup retry backoff. A recovered system Bus must become
+/// usable by this same worker rather than waiting for service supervision to
+/// restart it.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Default idle window before a live-but-untouched session is reaped (bounded
 /// resource cleanup).
 ///
@@ -906,6 +915,13 @@ impl SessionEntry {
     }
 }
 
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn =
+    dyn Fn(&Persist) -> Result<HashMap<String, Option<String>>, String> + Send + Sync;
+
 /// TERM-7 — the mesh PTY-broker worker.
 pub struct PtyBrokerWorker {
     /// Desktop runtime base (`/run/user/<uid>`) — where the sealed key is
@@ -934,10 +950,19 @@ pub struct PtyBrokerWorker {
     tick: Duration,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus open seam for deterministic startup-race tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    /// Atomic request-topic cursor-prime seam for deterministic failure tests.
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
     /// Per-session live state, keyed by session id.
     sessions: HashMap<String, SessionEntry>,
-    /// Per-topic request cursors (`action/pty/<peer>` → last ULID).
-    cursors: HashMap<String, String>,
+    /// Per-topic request cursors (`action/pty/<peer>` → last ULID). A present
+    /// `None` marks a topic that was safely primed while empty; an absent topic
+    /// appeared after the activation snapshot and drains its first forward
+    /// request from the beginning.
+    cursors: HashMap<String, Option<String>>,
     /// TERM-14 — set when the reattachable-session index needs republishing;
     /// flushed once per tick so a burst of changes is one publish.
     registry_dirty: bool,
@@ -970,6 +995,10 @@ impl PtyBrokerWorker {
             client_grace: DEFAULT_CLIENT_GRACE,
             tick: DEFAULT_TICK_INTERVAL,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
             sessions: HashMap::new(),
             cursors: HashMap::new(),
             registry_dirty: false,
@@ -1002,6 +1031,22 @@ impl PtyBrokerWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Override Bus opening without changing production retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override request-topic tail priming for deterministic fail-closed tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
         self
     }
 
@@ -1045,6 +1090,29 @@ impl PtyBrokerWorker {
     pub fn with_mesh_user(mut self, user: impl Into<String>) -> Self {
         self.mesh_user = user.into();
         self
+    }
+
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_request_cursors(
+        &self,
+        persist: &Persist,
+    ) -> Result<HashMap<String, Option<String>>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_request_cursors(persist)
     }
 
     /// Publish a record for `id` on `state/pty/<id>`: bumps the session's `seq`,
@@ -1210,6 +1278,15 @@ impl PtyBrokerWorker {
         }
     }
 
+    /// Kill every live child without depending on the Bus. Used on every
+    /// shutdown path, including shutdown while startup is still retrying.
+    fn kill_live_sessions(&mut self) {
+        let ids: Vec<String> = self.sessions.keys().cloned().collect();
+        for id in ids {
+            self.do_kill(&id);
+        }
+    }
+
     /// Apply one typed verb to a session.
     fn handle_verb(&mut self, persist: &Persist, peer: &str, verb: PtyVerb) {
         match verb {
@@ -1331,7 +1408,7 @@ impl PtyBrokerWorker {
             .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
         {
             let peer = topic[ACTION_PREFIX.len()..].to_string();
-            let cursor = self.cursors.get(&topic).cloned();
+            let cursor = self.cursors.get(&topic).cloned().flatten();
             let msgs = match persist.list_since(&topic, cursor.as_deref()) {
                 Ok(m) => m,
                 Err(e) => {
@@ -1340,7 +1417,7 @@ impl PtyBrokerWorker {
                 }
             };
             for msg in msgs {
-                self.cursors.insert(topic.clone(), msg.ulid.clone());
+                self.cursors.insert(topic.clone(), Some(msg.ulid.clone()));
                 let body = msg.body.as_deref().unwrap_or_default();
                 let verb = match parse_verb(body) {
                     Ok(v) => v,
@@ -1497,6 +1574,43 @@ impl PtyBrokerWorker {
     }
 }
 
+/// Resolve the production Bus location once per worker invocation. A seated
+/// user spool wins when present; the canonical system spool keeps the daemon
+/// operational when no `HOME`/`XDG_RUNTIME_DIR` can be resolved.
+fn pty_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    pty_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn pty_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+/// Discover and tail-prime every request topic as one activation transaction.
+/// The caller installs this map only after the complete discovery succeeds, so
+/// one unreadable topic cannot leave a partially active broker.
+fn prime_request_cursors(persist: &Persist) -> Result<HashMap<String, Option<String>>, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover PTY request topics: {error}"))?;
+    let mut cursors = HashMap::new();
+    for topic in topics
+        .into_iter()
+        .filter(|topic| topic.starts_with(ACTION_PREFIX) && topic.len() > ACTION_PREFIX.len())
+    {
+        let tail = persist
+            .latest_ulid(&topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?;
+        cursors.insert(topic, tail);
+    }
+    Ok(cursors)
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
 #[async_trait::async_trait]
 impl Worker for PtyBrokerWorker {
     fn name(&self) -> &'static str {
@@ -1504,33 +1618,41 @@ impl Worker for PtyBrokerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::pty_broker", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::pty_broker", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let bus_root = pty_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_request_cursors(&persist) {
+                    Ok(cursors) => {
+                        self.cursors = cursors;
+                        break persist;
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::pty_broker",
+                        %error,
+                        "request-topic activation failed; PTY broker startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::pty_broker",
+                    "Bus root unavailable; PTY broker startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::pty_broker",
+                    %error,
+                    "Persist open failed; PTY broker startup will retry"
+                ),
             }
-        };
-        // Seed each existing request topic's cursor at its tail so a restart
-        // doesn't replay + re-open stale sessions.
-        if let Ok(topics) = persist.list_topics() {
-            for topic in topics
-                .into_iter()
-                .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
-            {
-                if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
-                    self.cursors.insert(topic, ulid);
+
+            tokio::select! {
+                () = shutdown.wait() => {
+                    self.kill_live_sessions();
+                    return Ok(());
                 }
+                () = tokio::time::sleep(retry_interval) => {}
             }
-        }
+            retry_interval = next_bus_retry_interval(retry_interval);
+        };
         // TERM-14: publish an initial (empty) index so the surface's reattach picker
         // sees a topic even before the first session opens.
         self.publish_registry(&persist);
@@ -1544,10 +1666,7 @@ impl Worker for PtyBrokerWorker {
         }
         // Clean shutdown: kill every live session so no orphaned ssh child (and
         // its remote shell) outlives the worker.
-        let ids: Vec<String> = self.sessions.keys().cloned().collect();
-        for id in ids {
-            self.do_kill(&id);
-        }
+        self.kill_live_sessions();
         Ok(())
     }
 }
@@ -1830,6 +1949,7 @@ mod tests {
         output: VecDeque<Vec<u8>>,
         exit: Option<i32>,
         killed: bool,
+        kill_count: usize,
     }
 
     struct FakeBackend {
@@ -1892,7 +2012,9 @@ mod tests {
             self.shared.lock().unwrap().exit
         }
         fn kill(&mut self) {
-            self.shared.lock().unwrap().killed = true;
+            let mut shared = self.shared.lock().unwrap();
+            shared.killed = true;
+            shared.kill_count += 1;
         }
     }
 
@@ -1938,6 +2060,10 @@ mod tests {
     }
 
     fn signed_open_body(id: &str, nonce: &str, expires_at_ms: i64) -> String {
+        signed_open_body_for_peer("oak", id, nonce, expires_at_ms)
+    }
+
+    fn signed_open_body_for_peer(peer: &str, id: &str, nonce: &str, expires_at_ms: i64) -> String {
         let mut unsigned = serde_json::to_value(open_verb(id)).unwrap();
         unsigned
             .as_object_mut()
@@ -1948,12 +2074,227 @@ mod tests {
             &unsigned.to_string(),
             MutationContext {
                 verb: "pty-open",
-                node: "oak",
+                node: peer,
                 target: id,
             },
             nonce,
             expires_at_ms,
         )
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            pty_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            pty_bus_root_or_system(Some(PathBuf::from("/tmp/pty-explicit-bus"))),
+            PathBuf::from("/tmp/pty-explicit-bus")
+        );
+    }
+
+    #[test]
+    fn request_topic_activation_is_atomic_when_a_tail_read_fails() {
+        let (_dir, persist) = temp_persist();
+        persist
+            .write(
+                "action/pty/oak",
+                Priority::Default,
+                None,
+                Some("retained-oak"),
+            )
+            .unwrap();
+        persist
+            .write(
+                "action/pty/birch",
+                Priority::Default,
+                None,
+                Some("retained-birch"),
+            )
+            .unwrap();
+
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_for_prime = Arc::clone(&observed);
+        let worker = worker_with(FakeBackend::ok()).with_cursor_primer(Arc::new(move |persist| {
+            let mut topics = persist.list_topics().map_err(|error| error.to_string())?;
+            topics.sort();
+            let mut candidate = HashMap::new();
+            for (index, topic) in topics
+                .into_iter()
+                .filter(|topic| topic.starts_with(ACTION_PREFIX))
+                .enumerate()
+            {
+                observed_for_prime.lock().unwrap().push(topic.clone());
+                if index == 1 {
+                    return Err("injected second-topic tail failure".into());
+                }
+                candidate.insert(
+                    topic.clone(),
+                    persist
+                        .latest_ulid(&topic)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            Ok(candidate)
+        }));
+
+        assert!(worker.prime_request_cursors(&persist).is_err());
+        assert!(
+            worker.cursors.is_empty(),
+            "a failed activation must not install any candidate cursor"
+        );
+        assert_eq!(observed.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn late_bus_and_new_peer_topics_recover_without_replay_or_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus_root = dir.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        let backend = FakeBackend::ok();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            dir.path().join("auth"),
+            AUTH_NOW,
+        ));
+
+        let startup_stale =
+            signed_open_body("startup-stale", "pty-startup-stale", AUTH_NOW + 30_000);
+        persist
+            .write(
+                "action/pty/oak",
+                Priority::Default,
+                None,
+                Some(&startup_stale),
+            )
+            .expect("write retained startup request");
+
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let mut worker = worker_with(backend.clone())
+            .with_authorizer(authorizer)
+            .with_bus_root(bus_root.clone())
+            .with_tick(Duration::from_millis(5))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected request-topic tail failure".into());
+                }
+                prime_request_cursors(persist)
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must activate after Bus and tail recovery");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
+        assert!(states(&persist, "startup-stale").is_empty());
+
+        let forward = signed_open_body("forward-oak", "pty-forward-oak", AUTH_NOW + 30_000);
+        persist
+            .write("action/pty/oak", Priority::Default, None, Some(&forward))
+            .expect("write forward request");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while backend.opens.load(Ordering::SeqCst) < 1 {
+                assert!(!task.is_finished(), "worker exited before forward request");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forward request must open once");
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
+
+        let first_new_peer_request =
+            signed_open_body_for_peer("birch", "birch-first", "pty-birch-first", AUTH_NOW + 30_000);
+        persist
+            .write(
+                "action/pty/birch",
+                Priority::Default,
+                None,
+                Some(&first_new_peer_request),
+            )
+            .expect("create new peer topic with its first forward request");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while backend.opens.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before the new peer's first request"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("new peer topic's first request must execute");
+        assert!(states(&persist, "birch-first")
+            .last()
+            .is_some_and(|state| state.phase == "open"));
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 2);
+
+        let second_new_peer_request = signed_open_body_for_peer(
+            "birch",
+            "birch-second",
+            "pty-birch-second",
+            AUTH_NOW + 30_000,
+        );
+        persist
+            .write(
+                "action/pty/birch",
+                Priority::Default,
+                None,
+                Some(&second_new_peer_request),
+            )
+            .expect("write second request on the new peer topic");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while backend.opens.load(Ordering::SeqCst) < 3 {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before the new peer's second request"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("new peer topic must process its second request");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            backend.opens.load(Ordering::SeqCst),
+            3,
+            "all three forward requests have exactly one spawn effect"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must complete")
+            .expect("worker task must join")
+            .expect("worker must exit cleanly");
+        let shared = backend.shared.lock().unwrap();
+        assert!(shared.killed);
+        assert_eq!(shared.kill_count, 3, "shutdown kills all live sessions");
     }
 
     #[test]

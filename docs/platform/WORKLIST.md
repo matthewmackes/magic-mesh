@@ -202,6 +202,10 @@ behavioral evidence is not completion.
 - **Compute firewall outcome checkpoint (2026-08-09):** root-owned result journaling, restart-safe reply recovery, honest partial/failed projections, and exact Mesh
   removal identity passed machine 194:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-firewall-outcome-r18.md`.
+- **PTY Bus recovery checkpoint (2026-08-09):** one broker survives a late or
+  unreadable Bus, atomically skips retained opens, and executes the first request
+  on post-activation peer topics; machine 194 passed the focused recovery gate:
+  `docs/platform/evidence/WL-ARCH-010-WL-UX-012-2026-08-09-pty-bus-recovery-r24.md`.
   1. S1 Inventory authorities and remove reachability.
      - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
      - Inputs: repository search, CI authority scan, current evidence.
