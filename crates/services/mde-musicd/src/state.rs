@@ -677,6 +677,7 @@ mod tests {
             queue: Queue {
                 songs: vec!["queue-before".into(), song.into(), "queue-after".into()],
                 current: 1,
+                preferred_source: None,
             },
             position_ms,
             completed_ms,

@@ -3420,7 +3420,7 @@ fn apply_workspace_action_with_clients_and_coordination(
                             | ContentKind::Radio
                     );
                     let mut playback_queue = queue.clone();
-                    let queue_changed =
+                    let mut queue_changed =
                         if playback_queue.current() == Some(content.remote_id.as_str()) {
                             false
                         } else if typed_resume {
@@ -3428,6 +3428,7 @@ fn apply_workspace_action_with_clients_and_coordination(
                         } else {
                             return Err("content_not_current");
                         };
+                    queue_changed |= playback_queue.bind_current_source(content.clone());
                     let upcoming = selected_source_upcoming_candidates(
                         &playback_queue,
                         content,
@@ -4596,7 +4597,8 @@ fn source_aware_upcoming_candidates(
         .songs
         .iter()
         .skip(queue.current)
-        .map(|song_id| {
+        .enumerate()
+        .map(|(offset, song_id)| {
             let retained_item = catalog
                 .songs
                 .iter()
@@ -4662,6 +4664,34 @@ fn source_aware_upcoming_candidates(
                     candidates
                 }
             };
+            let mut candidates = candidates;
+            if offset == 0 {
+                if let Some(selected) = queue
+                    .preferred_current_source()
+                    .filter(|selected| catalog_contains_variant(catalog, selected))
+                {
+                    if let Some(client) = clients
+                        .iter()
+                        .copied()
+                        .find(|client| catalog_source_id(client) == selected.source_id)
+                    {
+                        let preferred_url = if selected.kind == ContentKind::Radio {
+                            direct_radio_stream_url(selected).map(ToOwned::to_owned)
+                        } else {
+                            Some(client.stream_url(&selected.remote_id))
+                        };
+                        if let Some(preferred_url) = preferred_url {
+                            if let Some(index) = candidates
+                                .iter()
+                                .position(|candidate| candidate.0 == preferred_url)
+                            {
+                                let preferred = candidates.remove(index);
+                                candidates.insert(0, preferred);
+                            }
+                        }
+                    }
+                }
+            }
             PlaybackTrack { candidates }
         })
         .collect();
@@ -5163,6 +5193,7 @@ fn governed_clock_playback_tracks(
     let queue = Queue {
         songs: vec![selected.remote_id.clone()],
         current: 0,
+        preferred_source: Some(selected.clone()),
     };
     selected_source_upcoming_candidates(&queue, &selected, clients, catalog, cache_dir)
 }
@@ -6179,6 +6210,7 @@ mod tests {
         let queue = Queue {
             songs: vec!["interrupted-track".to_string(), "next-track".to_string()],
             current: 0,
+            preferred_source: None,
         };
         let before = ControlMarker(vec![(
             "action/music/stop".to_string(),
@@ -6650,6 +6682,7 @@ mod tests {
         let queue = Queue {
             songs: vec!["song-a".into(), "song-b".into()],
             current: 1,
+            preferred_source: None,
         };
         let snapshot = handoff_state(&queue, "anvil", 42_500);
         assert_eq!(snapshot.peer, "anvil");
@@ -6667,6 +6700,7 @@ mod tests {
                 "admitted-after".into(),
             ],
             current: 1,
+            preferred_source: None,
         };
         let intent = state::HandoffIntent {
             intent_id: "two-seat-transfer-1".into(),
@@ -7232,6 +7266,7 @@ mod tests {
         let queue = queue::Queue {
             songs: vec!["song-a".to_string(), "song-b".to_string()],
             current: 0,
+            preferred_source: None,
         };
 
         crate::cache::write_cached_track(dir.path(), "song-a", "flac", b"cached-a", 10, false)
@@ -7252,6 +7287,8 @@ mod tests {
 
     #[test]
     fn source_aware_playback_keeps_two_catalog_candidates_under_one_queue_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("music-queue.json");
         let first = Client::with_salt("http://one.test", "alice", "pw", "one");
         let second = Client::with_salt("http://two.test", "alice", "pw", "two");
         let first_source = catalog_source_id(&first);
@@ -7288,9 +7325,10 @@ mod tests {
             }],
             ..CatalogStoreFile::default()
         };
-        let queue = queue::Queue {
+        let mut queue = queue::Queue {
             songs: vec!["song-7".to_string()],
             current: 0,
+            preferred_source: None,
         };
         let clients = vec![&first, &second];
         let candidates = source_aware_upcoming_candidates(&queue, &clients, &catalog)
@@ -7303,6 +7341,19 @@ mod tests {
         assert!(candidates[0].candidates[1]
             .0
             .starts_with("http://one.test/"));
+
+        let selected = ContentRef::new(&first_source, "song-7", ContentKind::Music).unwrap();
+        assert!(queue.bind_current_source(selected));
+        queue::write_to(&queue_path, &queue).unwrap();
+        let restarted = queue::read_from(&queue_path);
+        let candidates = source_aware_upcoming_candidates(&restarted, &clients, &catalog)
+            .expect("persisted provider preference remains admitted after restart");
+        assert!(candidates[0].candidates[0]
+            .0
+            .starts_with("http://one.test/"));
+        assert!(candidates[0].candidates[1]
+            .0
+            .starts_with("http://two.test/"));
     }
 
     #[test]
@@ -7334,6 +7385,7 @@ mod tests {
         let queue = queue::Queue {
             songs: vec!["song-7".to_string()],
             current: 0,
+            preferred_source: None,
         };
         let clients = vec![&first, &second];
         let tracks = source_aware_upcoming_tracks(&queue, &clients, &catalog)
@@ -7914,6 +7966,7 @@ mod tests {
         let queue = Queue {
             songs: vec!["song-a".into(), "song-b".into()],
             current: 0,
+            preferred_source: None,
         };
         let clients = vec![&first, &second];
         let tracks = selected_source_upcoming_candidates(
@@ -7970,6 +8023,7 @@ mod tests {
         let queue = Queue {
             songs: vec!["episode-a".into()],
             current: 0,
+            preferred_source: None,
         };
         let clients = vec![&first, &second];
         let tracks = selected_source_upcoming_candidates(
@@ -8034,6 +8088,7 @@ mod tests {
         let queue = Queue {
             songs: vec![selected.remote_id.clone()],
             current: 0,
+            preferred_source: None,
         };
 
         let tracks = selected_source_upcoming_candidates(
@@ -8094,6 +8149,7 @@ mod tests {
         let queue = Queue {
             songs: vec![retained.remote_id.clone()],
             current: 0,
+            preferred_source: None,
         };
 
         for rejected in [
@@ -8135,6 +8191,7 @@ mod tests {
             let malformed_queue = Queue {
                 songs: vec![malformed.remote_id.clone()],
                 current: 0,
+                preferred_source: None,
             };
             assert_eq!(
                 selected_source_upcoming_candidates(
@@ -8164,6 +8221,7 @@ mod tests {
         let mut queue = Queue {
             songs: vec!["a".into(), "b".into(), "c".into()],
             current: 0,
+            preferred_source: None,
         };
         let mut move_request = MusicActionRequestV1 {
             schema_version: MUSIC_CONTRACT_VERSION,

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::ContentRef;
+
 /// Version of the durable queue envelope. Legacy bare `Queue` JSON is still
 /// read and rewritten into this envelope without dropping usable entries.
 pub const QUEUE_SCHEMA_VERSION: u16 = 1;
@@ -29,6 +31,14 @@ pub struct Queue {
     /// clamped into range by the accessors.
     #[serde(default)]
     pub current: usize,
+    /// Typed source explicitly selected for the current logical track.
+    ///
+    /// The provider identity is a preference, not a second queue entry: the
+    /// daemon may still use another admitted variant after a real provider
+    /// failure. Persisting it keeps restart from silently changing the first
+    /// provider attempted merely because catalog ordering changed.
+    #[serde(default)]
+    pub preferred_source: Option<ContentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,18 +74,46 @@ impl Queue {
         if let Some(index) = self.songs.iter().position(|entry| entry == &song_id) {
             let changed = self.current != index;
             self.current = index;
+            if changed {
+                self.preferred_source = None;
+            }
             changed
         } else {
             self.songs.push(song_id);
             self.current = self.songs.len() - 1;
+            self.preferred_source = None;
             true
         }
+    }
+
+    /// Bind the current logical track to one admitted typed source.
+    ///
+    /// The caller remains responsible for catalog admission. This seam only
+    /// refuses a source for a different remote id and reports whether durable
+    /// queue authority changed.
+    pub fn bind_current_source(&mut self, source: ContentRef) -> bool {
+        if self.current() != Some(source.remote_id.as_str()) {
+            return false;
+        }
+        let changed = self.preferred_source.as_ref() != Some(&source);
+        self.preferred_source = Some(source);
+        changed
+    }
+
+    /// Return the persisted source preference only while it still describes
+    /// the current queue entry.
+    #[must_use]
+    pub fn preferred_current_source(&self) -> Option<&ContentRef> {
+        self.preferred_source
+            .as_ref()
+            .filter(|source| self.current() == Some(source.remote_id.as_str()))
     }
 
     /// Empty the queue + reset the cursor.
     pub fn clear(&mut self) {
         self.songs.clear();
         self.current = 0;
+        self.preferred_source = None;
     }
 
     /// MUSIC-RFX-1 — move the track at `from` to index `to` (clamped), keeping the
@@ -114,11 +152,15 @@ impl Queue {
         if idx >= self.songs.len() {
             return false;
         }
+        let removed_current = idx == self.current;
         self.songs.remove(idx);
         if idx < self.current {
             self.current -= 1;
         }
         self.current = self.current.min(self.songs.len().saturating_sub(1));
+        if removed_current || self.preferred_current_source().is_none() {
+            self.preferred_source = None;
+        }
         true
     }
 
@@ -172,6 +214,7 @@ impl Queue {
     pub fn next(&mut self) -> Option<&str> {
         if self.current + 1 < self.songs.len() {
             self.current += 1;
+            self.preferred_source = None;
             self.current()
         } else {
             None
@@ -183,6 +226,7 @@ impl Queue {
     pub fn prev(&mut self) -> Option<&str> {
         if self.current > 0 && !self.songs.is_empty() {
             self.current -= 1;
+            self.preferred_source = None;
             self.current()
         } else {
             None
@@ -306,6 +350,12 @@ pub fn revision(queue: &Queue) -> u64 {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
+    if let Some(source) = queue.preferred_current_source() {
+        for byte in serde_json::to_vec(source).unwrap_or_default() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
     hash
 }
 
@@ -318,6 +368,7 @@ mod tests {
         Queue {
             songs: songs.iter().map(|s| (*s).to_string()).collect(),
             current,
+            preferred_source: None,
         }
     }
 
@@ -418,6 +469,7 @@ mod tests {
         let mut queue = Queue {
             songs: vec!["a".into(), "b".into()],
             current: 0,
+            preferred_source: None,
         };
         assert!(queue.select_or_enqueue("b"));
         assert_eq!(queue.current(), Some("b"));
@@ -444,6 +496,7 @@ mod tests {
         let q = Queue {
             songs: vec!["a".into()],
             current: 9,
+            preferred_source: None,
         };
         assert_eq!(q.current(), Some("a"));
     }

@@ -1095,14 +1095,15 @@ behavioral evidence is not completion.
 - Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
 - Required outcome: a near-Spotify workspace uses daemon-owned typed catalog, queue, playback, bookmarks, cache, and source authority; mde-media-core provides real mpv
   frame/audio playback; Media UI covers local/Jellyfin/library flows; discovery, DLNA/cast, peer handoff, and live visual/audio proof pass.
-- Current state: daemon-owned catalog/queue/cache and typed playback, artwork,
-  browse/detail, and signed radio pass. Release 11 executes on all five seats;
+- Current state: daemon-owned catalog/queue/cache, typed playback, artwork, browse/detail, and signed radio pass. Release 11 executes on all five seats;
   named 38 Special, Black Ice, and Podcast details pass on Dell without the old
   stale error; one daemon owns each seat; CPU/NWS and provider loss pass. Live renderer and handoff proof remain.
 - **Daemon projection validation checkpoint (2026-08-06):** invalid newer `MusicWorkspaceSnapshotV1` content is refused and the last valid projection is retained;
   revision zero is rejected; Music UI 4/4 `.50`, daemon validation 1/1 `.90`. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
+- **Provider restart binding (2026-08-09):** the selected typed source now survives queue restart while admitted fallback variants remain available; `.90` passed 14 queue
+  and 2 resolver tests: `docs/platform/evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`.
 - Remaining work:
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
