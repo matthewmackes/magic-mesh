@@ -39,8 +39,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::device_control::{
-    authorization_target, take_requests, write_result, DeviceControlOp, DeviceControlRequest,
-    DeviceControlResult, DeviceTarget, DEVICE_CONTROL_AUTH_VERB,
+    authorization_target, claim_pending_cancellation, take_cancellations, take_requests,
+    write_result, DeviceControlCancellation, DeviceControlOp, DeviceControlRequest,
+    DeviceControlResult, DeviceTarget, DEVICE_CONTROL_AUTH_VERB, DEVICE_CONTROL_CANCEL_AUTH_VERB,
+    DEVICE_CONTROL_SCHEMA_VERSION,
 };
 use mackes_mesh_types::device_inventory;
 use mde_bus::hooks::config::Priority;
@@ -429,6 +431,74 @@ impl DeviceControlExecWorker {
         result
     }
 
+    /// Authorize and atomically claim one exact queued request. Once the normal
+    /// drain has removed a request, this path can only return `NotPending`; it
+    /// never reports cancellation for an effect that may have started.
+    fn process_cancellation(&self, cancel: &DeviceControlCancellation) -> DeviceControlResult {
+        // A refused/late cancellation answers the cancellation id, never the
+        // original id: otherwise an unsigned or late marker could overwrite the
+        // authoritative execution result. Only a successful atomic claim
+        // terminates the original request id as `Cancelled`.
+        let refused = |reason: String| DeviceControlResult::not_pending(&cancel.id, reason);
+        let result = if cancel.schema_version != DEVICE_CONTROL_SCHEMA_VERSION {
+            refused("unsupported device-control cancellation schema".into())
+        } else if cancel.target_host != self.self_hostname {
+            refused(format!(
+                "cancellation targets `{}` but this provider owns `{}`",
+                cancel.target_host, self.self_hostname
+            ))
+        } else {
+            let capability_target = authorization_target(&cancel.id);
+            let body = serde_json::to_string(cancel);
+            match (capability_target, body) {
+                (Ok(target), Ok(body)) => match self.authorizer.authorize(
+                    &body,
+                    MutationContext {
+                        verb: DEVICE_CONTROL_CANCEL_AUTH_VERB,
+                        node: &self.self_hostname,
+                        target: &target,
+                    },
+                ) {
+                    Ok(()) => match claim_pending_cancellation(&self.workgroup_root, cancel) {
+                        Ok(request) => DeviceControlResult::cancelled(
+                            &request.id,
+                            format!(
+                                "cancelled {} on {} before execution",
+                                request.op.as_str(),
+                                request.target.name
+                            ),
+                        ),
+                        Err(reason) => refused(reason.into()),
+                    },
+                    Err(reason) => refused(format!(
+                        "device-control cancellation authorization refused: {reason}"
+                    )),
+                },
+                _ => refused("device-control cancellation could not be authorized".into()),
+            }
+        };
+
+        let detail = serde_json::json!({
+            "action": "device-control-cancel",
+            "cancellation_id": cancel.id,
+            "target_request_id": cancel.target_request_id,
+            "op": cancel.op.as_str(),
+            "target_host": cancel.target_host,
+            "device": cancel.target.name,
+            "from": cancel.from,
+            "outcome": result.outcome,
+            "detail": result.detail,
+            "error": result.error,
+        });
+        crate::events::append_and_alert(
+            &self.db_path,
+            &self.node_id,
+            crate::events::EventKind::AdminAction,
+            detail,
+        );
+        result
+    }
+
     /// Write the hash-chain audit row for one op through the EXISTING audit plane
     /// (best-effort — `append_and_alert` logs + swallows a store fault, so an audit
     /// hiccup never wedges the op lane).
@@ -497,6 +567,13 @@ impl DeviceControlExecWorker {
     /// Drain + execute every request addressed to this host, writing each result
     /// back for the requester to poll.
     async fn execute_pending(&self) {
+        // Cancellations are considered before ordinary claims. The atomic
+        // request rename in `claim_pending_cancellation` is the linearization
+        // point: success proves the effect has not begun.
+        for cancel in take_cancellations(&self.workgroup_root, &self.self_hostname) {
+            let result = self.process_cancellation(&cancel);
+            let _ = write_result(&self.workgroup_root, &self.self_hostname, &result);
+        }
         for req in take_requests(&self.workgroup_root, &self.self_hostname) {
             let result = self.process(&req).await;
             tracing::info!(
@@ -563,7 +640,9 @@ impl Worker for DeviceControlExecWorker {
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
-    use mackes_mesh_types::device_control::write_request;
+    use mackes_mesh_types::device_control::{
+        write_cancellation, write_request, DeviceControlOutcome,
+    };
     use mackes_mesh_types::device_inventory::{
         category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
         ToolAvailability,
@@ -589,6 +668,26 @@ mod tests {
             MutationContext {
                 verb: DEVICE_CONTROL_AUTH_VERB,
                 node: &req.target_host,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        );
+        serde_json::from_str(&armed).unwrap()
+    }
+
+    fn authorize_cancellation(
+        cancel: &DeviceControlCancellation,
+        nonce: &str,
+    ) -> DeviceControlCancellation {
+        let unsigned = serde_json::to_string(cancel).unwrap();
+        let target = authorization_target(&cancel.id).unwrap();
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: DEVICE_CONTROL_CANCEL_AUTH_VERB,
+                node: &cancel.target_host,
                 target: &target,
             },
             nonce,
@@ -1155,6 +1254,57 @@ mod tests {
             take_requests(tmp.path(), "edge-2").is_empty(),
             "the request was consumed"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_exact_cancellation_claims_only_a_still_pending_request_and_is_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = DeviceControlRequest {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: "01CANCELLED".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget::new("Queued NIC", category::NETWORK_ADAPTERS),
+            target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 7,
+            from: "peer:laptop-mm".into(),
+        };
+        write_request(tmp.path(), &request).unwrap();
+        let cancellation = authorize_cancellation(
+            &DeviceControlCancellation {
+                schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+                armed_token: None,
+                id: "01CANCEL".into(),
+                target_request_id: request.id.clone(),
+                op: request.op,
+                target: request.target.clone(),
+                target_host: request.target_host.clone(),
+                expected_inventory_published_at_ms: request.expected_inventory_published_at_ms,
+                from: request.from.clone(),
+            },
+            "exact-cancel",
+        );
+        write_cancellation(tmp.path(), &cancellation).unwrap();
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_authorizer(test_authorizer(tmp.path()))
+        .with_db_path(tmp.path().join("audit.db"));
+
+        worker.execute_pending().await;
+
+        let result =
+            mackes_mesh_types::device_control::take_result(tmp.path(), "edge-2", &request.id)
+                .expect("typed cancellation result");
+        assert_eq!(result.outcome, DeviceControlOutcome::Cancelled);
+        assert!(!result.ok, "cancellation is not execution success");
+        assert!(take_requests(tmp.path(), "edge-2").is_empty());
+        let conn = crate::store::open(&tmp.path().join("audit.db")).unwrap();
+        let rows = crate::store::load_audit_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(String::from_utf8_lossy(&rows[0].payload).contains("device-control-cancel"));
     }
 
     #[tokio::test]

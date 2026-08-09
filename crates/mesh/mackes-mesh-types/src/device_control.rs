@@ -36,13 +36,27 @@ pub const DEVICE_CONTROL_SCHEMA_VERSION: u64 = 1;
 /// Shared privileged-action verb for device controls.
 pub const DEVICE_CONTROL_AUTH_VERB: &str = "device-control";
 
+/// Shared privileged-action verb for cancelling a still-pending device control.
+pub const DEVICE_CONTROL_CANCEL_AUTH_VERB: &str = "device-control-cancel";
+
+fn safe_path_component(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 240
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 /// Build the stable capability target for one device-control request.
 ///
 /// The exact request body additionally binds operation, host, generation, and
 /// device identity; this target keeps the shared nonce ledger request-scoped.
 pub fn authorization_target(request_id: &str) -> Result<String, &'static str> {
     let request_id = request_id.trim();
-    if request_id.is_empty() || request_id.len() > 240 || request_id.contains('|') {
+    if !safe_path_component(request_id) {
         return Err("device-control request id is not capability-safe");
     }
     Ok(format!("request:{request_id}"))
@@ -175,16 +189,75 @@ pub struct DeviceControlRequest {
     pub from: String,
 }
 
+/// Signed request to cancel one exact device-control request before execution.
+///
+/// The original typed identity is repeated deliberately: the executor compares
+/// every field with the queued request before removing it. There is no path or
+/// command field, so cancellation cannot be redirected into an arbitrary file
+/// or shell operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceControlCancellation {
+    /// Shared privileged-action envelope schema.
+    pub schema_version: u64,
+    /// Exact-body, short-lived, single-use cancellation capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_token: Option<String>,
+    /// Unique cancellation request id (and capability scope).
+    pub id: String,
+    /// Exact queued request to cancel.
+    pub target_request_id: String,
+    /// Operation identity copied from the queued request.
+    pub op: DeviceControlOp,
+    /// Device identity copied from the queued request.
+    pub target: DeviceTarget,
+    /// Provider that owns the queue and hardware.
+    pub target_host: String,
+    /// Provider generation copied from the queued request.
+    pub expected_inventory_published_at_ms: u64,
+    /// Requesting seat identity copied from the queued request.
+    pub from: String,
+}
+
+impl DeviceControlCancellation {
+    /// Whether this cancellation repeats the complete identity of `request`.
+    #[must_use]
+    pub fn matches(&self, request: &DeviceControlRequest) -> bool {
+        self.target_request_id == request.id
+            && self.op == request.op
+            && self.target == request.target
+            && self.target_host == request.target_host
+            && self.expected_inventory_published_at_ms == request.expected_inventory_published_at_ms
+            && self.from == request.from
+    }
+}
+
+/// Typed terminal outcome; `Cancelled` is distinct from execution failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceControlOutcome {
+    /// The hardware effect completed successfully.
+    Succeeded,
+    /// The request was refused or its hardware effect failed.
+    Failed,
+    /// The exact pending request was claimed before its effect began.
+    Cancelled,
+    /// The target request had already left the pending queue.
+    NotPending,
+}
+
 /// The typed result the executor writes back for the requester to poll.
 ///
 /// `ok` mirrors the `lifecycle`/`dc/*` reply convention. `detail` carries a
 /// human-readable success note; `error` is the honest failure reason (an
 /// inapplicable op, a refused device, or the real sysfs/`modprobe` stderr) — a
 /// non-empty `error` with `ok == false` is NEVER a fabricated success (§7).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceControlResult {
     /// The request id this answers.
     pub id: String,
+    /// Audited terminal disposition of the request.
+    pub outcome: DeviceControlOutcome,
     /// True once the op executed for real and every step succeeded.
     pub ok: bool,
     /// Human-readable success note (`disabled i915 on 0000:02:00.0`).
@@ -201,6 +274,7 @@ impl DeviceControlResult {
     pub fn ok(id: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            outcome: DeviceControlOutcome::Succeeded,
             ok: true,
             detail: detail.into(),
             error: String::new(),
@@ -212,6 +286,31 @@ impl DeviceControlResult {
     pub fn failed(id: impl Into<String>, error: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            outcome: DeviceControlOutcome::Failed,
+            ok: false,
+            detail: String::new(),
+            error: error.into(),
+        }
+    }
+
+    /// The exact request was atomically removed before execution began.
+    #[must_use]
+    pub fn cancelled(id: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            outcome: DeviceControlOutcome::Cancelled,
+            ok: false,
+            detail: detail.into(),
+            error: String::new(),
+        }
+    }
+
+    /// Cancellation arrived after the request left the pending queue.
+    #[must_use]
+    pub fn not_pending(id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            outcome: DeviceControlOutcome::NotPending,
             ok: false,
             detail: String::new(),
             error: error.into(),
@@ -244,6 +343,29 @@ pub fn write_request(
     let tmp = dir.join(format!(".{}.json.tmp", req.id));
     let body = serde_json::to_string_pretty(req)?;
     std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Publish a signed cancellation for executor-side authorization and claiming.
+pub fn write_cancellation(
+    workgroup_root: &Path,
+    cancellation: &DeviceControlCancellation,
+) -> std::io::Result<PathBuf> {
+    if !safe_path_component(&cancellation.id)
+        || !safe_path_component(&cancellation.target_request_id)
+        || !safe_path_component(&cancellation.target_host)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "device-control cancellation identity is not path-safe",
+        ));
+    }
+    let dir = control_dir(workgroup_root, &cancellation.target_host);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.cancel.json", cancellation.id));
+    let tmp = dir.join(format!(".{}.cancel.tmp", cancellation.id));
+    std::fs::write(&tmp, serde_json::to_string_pretty(cancellation)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
 }
@@ -345,7 +467,11 @@ pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<DeviceContro
     for e in entries.filter_map(Result::ok) {
         let p = e.path();
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if !name.ends_with(".json") || name.ends_with(".result.json") || name.starts_with('.') {
+        if !name.ends_with(".json")
+            || name.ends_with(".result.json")
+            || name.ends_with(".cancel.json")
+            || name.starts_with('.')
+        {
             continue;
         }
         if let Some(raw) = read_bounded_device_control_record(&p) {
@@ -356,6 +482,65 @@ pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<DeviceContro
         }
     }
     out
+}
+
+/// Consume typed cancellation envelopes addressed to `self_host`.
+#[must_use]
+pub fn take_cancellations(
+    workgroup_root: &Path,
+    self_host: &str,
+) -> Vec<DeviceControlCancellation> {
+    let dir = control_dir(workgroup_root, self_host);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !name.ends_with(".cancel.json") || name.starts_with('.') {
+            continue;
+        }
+        if let Some(raw) = read_bounded_device_control_record(&path) {
+            if let Ok(cancel) = serde_json::from_str::<DeviceControlCancellation>(&raw) {
+                let _ = std::fs::remove_file(&path);
+                out.push(cancel);
+            }
+        }
+    }
+    out
+}
+
+/// Atomically claim and remove the exact pending request named by a cancellation.
+/// A missing request means it has already been claimed for execution or completed.
+pub fn claim_pending_cancellation(
+    workgroup_root: &Path,
+    cancellation: &DeviceControlCancellation,
+) -> Result<DeviceControlRequest, &'static str> {
+    if !safe_path_component(&cancellation.target_request_id)
+        || !safe_path_component(&cancellation.target_host)
+    {
+        return Err("cancellation identity is not path-safe");
+    }
+    let dir = control_dir(workgroup_root, &cancellation.target_host);
+    let pending = dir.join(format!("{}.json", cancellation.target_request_id));
+    let claim = dir.join(format!(".{}.cancel-claim", cancellation.target_request_id));
+    std::fs::rename(&pending, &claim).map_err(|_| "target request is no longer pending")?;
+    let parsed = read_bounded_device_control_record(&claim)
+        .and_then(|raw| serde_json::from_str::<DeviceControlRequest>(&raw).ok());
+    let Some(request) = parsed else {
+        let _ = std::fs::rename(&claim, &pending);
+        return Err("pending request record is invalid");
+    };
+    if !cancellation.matches(&request) {
+        let _ = std::fs::rename(&claim, &pending);
+        return Err("cancellation identity does not match pending request");
+    }
+    std::fs::remove_file(&claim).map_err(|_| "could not consume cancellation claim")?;
+    Ok(request)
 }
 
 /// Write the result for a request back into `target_host`'s dir (atomic).
@@ -443,6 +628,7 @@ mod tests {
         assert_eq!(authorization_target(" 01HZX ").unwrap(), "request:01HZX");
         assert!(authorization_target("").is_err());
         assert!(authorization_target("hostile|scope").is_err());
+        assert!(authorization_target("../escape").is_err());
         assert!(authorization_target(&"x".repeat(241)).is_err());
     }
 
@@ -482,6 +668,51 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], "no bound driver/module to reload");
         assert!(!v.as_object().unwrap().contains_key("detail"));
+
+        let cancelled = DeviceControlResult::cancelled("01C", "cancelled before execution");
+        assert_eq!(cancelled.outcome, DeviceControlOutcome::Cancelled);
+        assert!(!cancelled.ok);
+        assert!(cancelled.error.is_empty());
+    }
+
+    #[test]
+    fn cancellation_claim_is_exact_and_only_succeeds_while_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = sample_request();
+        write_request(tmp.path(), &request).unwrap();
+        let mut cancel = DeviceControlCancellation {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: "cancel-01HZX".into(),
+            target_request_id: request.id.clone(),
+            op: request.op,
+            target: request.target.clone(),
+            target_host: request.target_host.clone(),
+            expected_inventory_published_at_ms: request.expected_inventory_published_at_ms,
+            from: request.from.clone(),
+        };
+        let mut hostile_path = cancel.clone();
+        hostile_path.target_request_id = "../../outside".into();
+        assert_eq!(
+            claim_pending_cancellation(tmp.path(), &hostile_path),
+            Err("cancellation identity is not path-safe")
+        );
+        cancel.target.name = "substituted device".into();
+        assert_eq!(
+            claim_pending_cancellation(tmp.path(), &cancel),
+            Err("cancellation identity does not match pending request")
+        );
+        assert_eq!(take_requests(tmp.path(), "edge-2"), vec![request.clone()]);
+        assert_eq!(
+            claim_pending_cancellation(
+                tmp.path(),
+                &DeviceControlCancellation {
+                    target: request.target.clone(),
+                    ..cancel
+                }
+            ),
+            Err("target request is no longer pending")
+        );
     }
 
     #[test]

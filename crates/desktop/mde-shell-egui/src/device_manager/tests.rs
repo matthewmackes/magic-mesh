@@ -82,6 +82,7 @@ fn state_with(inv: Option<DeviceInventory>, seen: bool) -> DeviceManagerState {
         active_tab: DrawerTab::General,
         show_about: false,
         arming: None,
+        pending_control: None,
         router_edit: None,
     }
 }
@@ -1432,6 +1433,140 @@ fn dispatch_to_a_fresh_host_writes_the_request_to_the_targets_replicated_dir() {
     assert_eq!(
         reqs[0].from, "peer:laptop-mm",
         "the requesting seat is recorded"
+    );
+}
+
+#[test]
+fn pending_control_cancel_is_signed_and_bound_to_the_exact_dispatched_request() {
+    let scratch = ScratchRoot::new("cancel-dispatch");
+    scratch.publish("edge-2", now_ms());
+    let mut state = state_with(None, true);
+    state.workgroup_root = scratch.path().to_path_buf();
+    state.local_host = "laptop-mm".into();
+    state.selected_host = "edge-2".into();
+    state.refresh();
+    state.dispatch_control(DeviceArming {
+        op: DeviceControlOp::Disable,
+        target: device_target(category::NETWORK_ADAPTERS, &nic()),
+        target_host: "edge-2".into(),
+        typed: "Intel I219-V".into(),
+    });
+    let original = state
+        .pending_control
+        .as_ref()
+        .expect("dispatch retains exact pending request")
+        .request
+        .clone();
+
+    state.cancel_pending_control();
+
+    let cancellations =
+        mackes_mesh_types::device_control::take_cancellations(scratch.path(), "edge-2");
+    assert_eq!(cancellations.len(), 1);
+    assert!(cancellations[0].matches(&original));
+    assert!(cancellations[0].armed_token.is_some());
+    assert_eq!(
+        state
+            .pending_control
+            .as_ref()
+            .unwrap()
+            .cancellation_request_id
+            .as_deref(),
+        Some(cancellations[0].id.as_str())
+    );
+    assert_eq!(
+        mackes_mesh_types::device_control::take_requests(scratch.path(), "edge-2"),
+        vec![original],
+        "the seat cannot claim cancellation; only the authorized provider may atomically claim"
+    );
+}
+
+#[test]
+fn a_second_device_mutation_cannot_replace_the_retained_pending_identity() {
+    let scratch = ScratchRoot::new("single-pending-control");
+    scratch.publish("edge-2", now_ms());
+    let mut state = state_with(None, true);
+    state.workgroup_root = scratch.path().to_path_buf();
+    state.local_host = "laptop-mm".into();
+    state.selected_host = "edge-2".into();
+    state.refresh();
+    let target = device_target(category::NETWORK_ADAPTERS, &nic());
+    state.dispatch_control(DeviceArming {
+        op: DeviceControlOp::Disable,
+        target: target.clone(),
+        target_host: "edge-2".into(),
+        typed: target.name.clone(),
+    });
+    let retained = state.pending_control.as_ref().unwrap().request.clone();
+
+    state.dispatch_control(DeviceArming {
+        op: DeviceControlOp::Enable,
+        target,
+        target_host: "edge-2".into(),
+        typed: "Intel I219-V".into(),
+    });
+
+    assert_eq!(state.pending_control.as_ref().unwrap().request, retained);
+    assert_eq!(
+        mackes_mesh_types::device_control::take_requests(scratch.path(), "edge-2"),
+        vec![retained],
+        "a second mutation must neither write nor replace the exact retained identity"
+    );
+}
+
+#[test]
+fn cancellation_refusal_clears_only_its_id_then_original_result_terminates_pending() {
+    let scratch = ScratchRoot::new("cancel-result-correlation");
+    scratch.publish("edge-2", now_ms());
+    let mut state = state_with(None, true);
+    state.workgroup_root = scratch.path().to_path_buf();
+    state.local_host = "laptop-mm".into();
+    state.selected_host = "edge-2".into();
+    state.refresh();
+    state.dispatch_control(DeviceArming {
+        op: DeviceControlOp::Disable,
+        target: device_target(category::NETWORK_ADAPTERS, &nic()),
+        target_host: "edge-2".into(),
+        typed: "Intel I219-V".into(),
+    });
+    state.cancel_pending_control();
+    let pending = state.pending_control.as_ref().unwrap();
+    let original_id = pending.request.id.clone();
+    let cancellation_id = pending.cancellation_request_id.clone().unwrap();
+
+    mackes_mesh_types::device_control::write_result(
+        scratch.path(),
+        "edge-2",
+        &mackes_mesh_types::device_control::DeviceControlResult::not_pending(
+            &cancellation_id,
+            "target request is no longer pending",
+        ),
+    )
+    .unwrap();
+    state.poll_control_result();
+    let pending = state
+        .pending_control
+        .as_ref()
+        .expect("cancellation refusal must not clear the original operation");
+    assert_eq!(pending.request.id, original_id);
+    assert!(
+        pending.cancellation_request_id.is_none(),
+        "the cancellation must no longer render as pending"
+    );
+
+    mackes_mesh_types::device_control::write_result(
+        scratch.path(),
+        "edge-2",
+        &mackes_mesh_types::device_control::DeviceControlResult::ok(
+            &original_id,
+            "original effect completed",
+        ),
+    )
+    .unwrap();
+    state.poll_control_result();
+    assert!(
+        state.pending_control.is_none(),
+        "only the original terminal result clears retained identity"
     );
 }
 

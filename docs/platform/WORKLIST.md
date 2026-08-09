@@ -1718,6 +1718,12 @@ behavioral evidence is not completion.
 - **Device-control authorization checkpoint (2026-08-09):** exact-body, short-lived, single-use root-shell capabilities now gate the fixed executor; machine 9 passed
   contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
 - Remaining work:
+- **Device-control cancellation checkpoint (2026-08-09):** a signed cancellation
+  can atomically claim only the exact still-pending request; late/refused
+  cancellation cannot replace its eventual execution result, and the shell
+  refuses a second mutation while retaining that identity. BigBoy passed six
+  exact contract, executor, and shell tests:
+  `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-cancellation-r14.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.

@@ -144,8 +144,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::device_control::{
-    self, authorization_target, DeviceControlOp, DeviceControlRequest, DeviceTarget,
-    DEVICE_CONTROL_AUTH_VERB, DEVICE_CONTROL_SCHEMA_VERSION,
+    self, authorization_target, DeviceControlCancellation, DeviceControlOp, DeviceControlOutcome,
+    DeviceControlRequest, DeviceTarget, DEVICE_CONTROL_AUTH_VERB, DEVICE_CONTROL_CANCEL_AUTH_VERB,
+    DEVICE_CONTROL_SCHEMA_VERSION,
 };
 use mackes_mesh_types::device_inventory::{
     self, category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
@@ -1515,6 +1516,8 @@ pub(crate) struct DeviceManagerState {
     /// if any — the destructive Enable/Disable/Reload/Rescan verbs stage here and
     /// dispatch only once the operator echoes the device name.
     arming: Option<DeviceArming>,
+    /// The exact dispatched request retained until its typed terminal result.
+    pending_control: Option<PendingDeviceControl>,
     /// WL-RUN-006 — the router firewall-edit composer, when a `HostKind::Router` is
     /// selected. (Re)targeted per appliance; a submit writes an `action/router/*`
     /// request behind the typed-confirm + commit-confirm safety layers.
@@ -1541,6 +1544,7 @@ impl Default for DeviceManagerState {
             active_tab: DrawerTab::default(),
             show_about: false,
             arming: None,
+            pending_control: None,
             router_edit: None,
         }
     }
@@ -1638,6 +1642,7 @@ impl DeviceManagerState {
     /// surface is in view, then keep the repaint heartbeat alive so a fresh
     /// publish surfaces without operator input. Cheap — one local file read.
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_control_result();
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());
@@ -1774,6 +1779,7 @@ impl DeviceManagerState {
         // renders as a prominent full-width banner above the rail/tree (#14),
         // honest feedback before any node-side mutation.
         self.render_arming(ui);
+        self.render_pending_control(ui);
 
         // The persistent left host rail (#5): reserved first so it spans the full
         // body height (rail │ tree │ drawer). Switching hosts here re-reads below.
@@ -2399,7 +2405,17 @@ impl DeviceManagerState {
     /// written into the target's replicated `fleet/device-control/<host>/` dir (the
     /// node's `device_control` worker drains + executes + audits it), and a dispatch
     /// toast confirms. A failed write is an honest error toast, never swallowed.
-    fn dispatch_control(&self, arming: DeviceArming) {
+    fn dispatch_control(&mut self, arming: DeviceArming) {
+        if let Some(pending) = self.pending_control.as_ref() {
+            raise_toast(
+                "warning",
+                &format!(
+                    "{} is still pending on {} \u{2014} wait for its terminal result before dispatching another device operation",
+                    pending.request.op.label(), pending.request.target_host
+                ),
+            );
+            return;
+        }
         // Consume the arming into its typed parts (the echo is spent).
         let DeviceArming {
             op,
@@ -2482,7 +2498,10 @@ impl DeviceManagerState {
             Err(error) => {
                 raise_toast(
                     "warning",
-                    &format!("Could not encode {} for {target_host}: {error}", op.as_str()),
+                    &format!(
+                        "Could not encode {} for {target_host}: {error}",
+                        op.as_str()
+                    ),
                 );
                 return;
             }
@@ -2501,24 +2520,167 @@ impl DeviceManagerState {
             Err(error) => {
                 raise_toast(
                     "warning",
-                    &format!("Could not authorize {} for {target_host}: {error}", op.as_str()),
+                    &format!(
+                        "Could not authorize {} for {target_host}: {error}",
+                        op.as_str()
+                    ),
                 );
                 return;
             }
         };
         match device_control::write_request(&self.workgroup_root, &req) {
-            Ok(_) => raise_toast(
-                "info",
-                &format!(
-                    "Dispatched \u{201C}{}\u{201D} for {device_name} to {target_host}",
-                    op.label(),
-                ),
-            ),
+            Ok(_) => {
+                self.pending_control = Some(PendingDeviceControl {
+                    request: req,
+                    cancellation_request_id: None,
+                });
+                raise_toast(
+                    "info",
+                    &format!(
+                        "Dispatched \u{201C}{}\u{201D} for {device_name} to {target_host}",
+                        op.label(),
+                    ),
+                );
+            }
             Err(err) => raise_toast(
                 "warning",
                 &format!("Could not dispatch {} to {target_host}: {err}", op.as_str()),
             ),
         }
+    }
+
+    fn render_pending_control(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = self.pending_control.as_ref() else {
+            return;
+        };
+        let label = if pending.cancellation_request_id.is_some() {
+            format!("Cancellation pending for {}", pending.request.target.name)
+        } else {
+            format!(
+                "{} pending on {}",
+                pending.request.op.label(),
+                pending.request.target_host
+            )
+        };
+        let can_cancel = pending.cancellation_request_id.is_none();
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).color(Style::TEXT_DIM));
+            if ui
+                .add_enabled(can_cancel, egui::Button::new("Cancel pending"))
+                .clicked()
+            {
+                clicked = true;
+            }
+        });
+        if clicked {
+            self.cancel_pending_control();
+        }
+    }
+
+    /// Publish a signed cancellation bound to every identity field of the exact
+    /// retained request. The executor decides whether it is still pending.
+    fn cancel_pending_control(&mut self) {
+        let Some(pending) = self.pending_control.as_ref() else {
+            return;
+        };
+        if pending.cancellation_request_id.is_some() {
+            return;
+        }
+        let request = &pending.request;
+        let cancel = DeviceControlCancellation {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: next_request_id(),
+            target_request_id: request.id.clone(),
+            op: request.op,
+            target: request.target.clone(),
+            target_host: request.target_host.clone(),
+            expected_inventory_published_at_ms: request.expected_inventory_published_at_ms,
+            from: request.from.clone(),
+        };
+        let cancellation_request_id = cancel.id.clone();
+        let capability_target = match authorization_target(&cancel.id) {
+            Ok(target) => target,
+            Err(error) => {
+                raise_toast("warning", error);
+                return;
+            }
+        };
+        let signed = serde_json::to_string(&cancel)
+            .map_err(|error| error.to_string())
+            .and_then(|body| {
+                crate::iac::authorize_root_mutation_body(
+                    &body,
+                    DEVICE_CONTROL_CANCEL_AUTH_VERB,
+                    &cancel.target_host,
+                    &capability_target,
+                )
+            })
+            .and_then(|body| serde_json::from_str(&body).map_err(|error| error.to_string()));
+        match signed.and_then(|signed| {
+            device_control::write_cancellation(&self.workgroup_root, &signed)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(_) => {
+                if let Some(pending) = self.pending_control.as_mut() {
+                    pending.cancellation_request_id = Some(cancellation_request_id);
+                }
+                raise_toast("info", "Cancellation dispatched; awaiting provider result");
+            }
+            Err(error) => raise_toast("warning", &format!("Could not cancel request: {error}")),
+        }
+    }
+
+    fn poll_control_result(&mut self) {
+        let Some((target_host, original_request_id, cancellation_request_id)) =
+            self.pending_control.as_ref().map(|pending| {
+                (
+                    pending.request.target_host.clone(),
+                    pending.request.id.clone(),
+                    pending.cancellation_request_id.clone(),
+                )
+            })
+        else {
+            return;
+        };
+
+        // A refused/late cancellation answers its own id. Surface that warning,
+        // clear only the cancellation-in-flight marker, and retain the original
+        // operation until its independent terminal result arrives.
+        if let Some(cancellation_id) = cancellation_request_id {
+            if let Some(result) =
+                device_control::take_result(&self.workgroup_root, &target_host, &cancellation_id)
+            {
+                let message = if result.error.is_empty() {
+                    format!(
+                        "Cancellation did not terminate {original_request_id}: {}",
+                        result.detail
+                    )
+                } else {
+                    result.error
+                };
+                if let Some(pending) = self.pending_control.as_mut() {
+                    pending.cancellation_request_id = None;
+                }
+                raise_toast("warning", &message);
+            }
+        }
+
+        let Some(result) =
+            device_control::take_result(&self.workgroup_root, &target_host, &original_request_id)
+        else {
+            return;
+        };
+        let (severity, message) = match result.outcome {
+            DeviceControlOutcome::Succeeded => ("info", result.detail),
+            DeviceControlOutcome::Cancelled => ("info", result.detail),
+            DeviceControlOutcome::Failed | DeviceControlOutcome::NotPending => {
+                ("warning", result.error)
+            }
+        };
+        self.pending_control = None;
+        raise_toast(severity, &message);
     }
 
     /// WL-RUN-006 — the **router firewall-edit** mutation panel, shown when a
@@ -3968,6 +4130,12 @@ struct DeviceArming {
     target_host: String,
     /// The operator's live echo — must equal `target.name` to arm.
     typed: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDeviceControl {
+    request: DeviceControlRequest,
+    cancellation_request_id: Option<String>,
 }
 
 /// The typed-arming gate (#14): the trimmed echo must exactly equal the device
