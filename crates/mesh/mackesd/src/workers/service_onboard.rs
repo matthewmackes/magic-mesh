@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::onboard::service_add::{
@@ -67,6 +67,24 @@ pub const SERVICE_ACTION_SCHEMA_VERSION: u64 = 1;
 /// slow, operator-paced event, so the 2 s `session_broker` cadence is responsive
 /// without spinning.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Lower bound for retrying an unresolved, unopenable, or unsafe-to-activate
+/// Bus without turning startup failure into a tight loop.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Upper bound for startup retry backoff. The same worker must recover when the
+/// canonical Bus arrives instead of depending on a supervisor restart.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn = dyn Fn(&Persist) -> Result<Option<String>, String> + Send + Sync;
+
+#[cfg(test)]
+type ActionReadFn =
+    dyn Fn(&Persist, Option<&str>) -> Result<Vec<StoredMessage>, String> + Send + Sync;
 
 // ───────────────────────────── wire contract ─────────────────────────────
 
@@ -242,16 +260,10 @@ pub fn resolve(
 /// open-read-drop (never crosses an `.await`), mirroring `session_broker`. A
 /// malformed action is dropped honestly with a warn. Raw bodies stay attached
 /// until the elected node can authenticate them immediately before resolution.
-fn read_new_actions(
-    bus_root: &Path,
+fn parse_new_actions(
+    msgs: Vec<StoredMessage>,
     cursor: &mut Option<String>,
 ) -> Vec<(String, ServiceAddAction)> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
     let mut out = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
@@ -266,12 +278,12 @@ fn read_new_actions(
     out
 }
 
-/// Seed the cursor to the newest existing message so a (re)start doesn't
-/// re-drive a historical service add. `None` when the topic is empty.
-fn prime_cursor(bus_root: &Path) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(ACTION_TOPIC, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
+/// Tail-prime the one transient service-add command lane as the activation
+/// transaction. A read error is activation failure, never an empty backlog.
+fn prime_cursor(persist: &Persist) -> Result<Option<String>, String> {
+    persist
+        .latest_ulid(ACTION_TOPIC)
+        .map_err(|error| format!("prime {ACTION_TOPIC}: {error}"))
 }
 
 /// Bind a service-add capability to the semantic service target, not merely the
@@ -306,8 +318,18 @@ fn authorize_service_action(
     )
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn service_onboard_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    service_onboard_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn service_onboard_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 /// The Bus-reachable `onboard service-add` worker. Leader-gated + best-effort.
@@ -329,8 +351,18 @@ pub struct ServiceOnboardWorker {
     /// Exact-body capability verifier for the privileged apply lane.
     /// Missing production credentials fail closed.
     authorizer: Arc<ActionAuthorizer>,
-    /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
+    /// Bus root override (tests). `None` resolves the user Bus, then the
+    /// canonical system Bus fallback.
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus open seam for deterministic startup recovery tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    /// Cursor-prime seam for deterministic fail-closed activation tests.
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
+    /// Action read seam for deterministic fail-closed poll tests.
+    #[cfg(test)]
+    action_read_override: Option<Arc<ActionReadFn>>,
 }
 
 impl ServiceOnboardWorker {
@@ -349,6 +381,12 @@ impl ServiceOnboardWorker {
             poll: DEFAULT_POLL_INTERVAL,
             authorizer: Arc::new(ActionAuthorizer::production()),
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
+            #[cfg(test)]
+            action_read_override: None,
         }
     }
 
@@ -380,6 +418,30 @@ impl ServiceOnboardWorker {
         self
     }
 
+    /// Override Bus opening without changing production retry semantics.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override command-tail priming for deterministic activation failures.
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
+    /// Override action reads for deterministic unavailable-state tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_action_reader(mut self, read: Arc<ActionReadFn>) -> Self {
+        self.action_read_override = Some(read);
+        self
+    }
+
     /// Inject an isolated verifier and replay ledger for focused action tests.
     /// Production always uses the root-only systemd-credential-backed verifier.
     #[cfg(test)]
@@ -389,8 +451,39 @@ impl ServiceOnboardWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_cursor(&self, persist: &Persist) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_cursor(persist)
+    }
+
+    fn read_action_messages(
+        &self,
+        persist: &Persist,
+        cursor: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, String> {
+        #[cfg(test)]
+        if let Some(read) = self.action_read_override.as_ref() {
+            return read(persist, cursor);
+        }
+
+        persist
+            .list_since(ACTION_TOPIC, cursor)
+            .map_err(|error| format!("read {ACTION_TOPIC}: {error}"))
     }
 
     /// Only the elected node answers (no-fixed-center: any eligible node can be
@@ -408,10 +501,18 @@ impl ServiceOnboardWorker {
     /// through the reused onboard engine and publish its typed result event.
     /// Non-leaders still advance their cursor (the `scheduler` convention), so
     /// a node that later wins the election answers new requests, not backlog.
-    fn drain_and_publish(&self, bus_root: &Path, cursor: &mut Option<String>) {
-        let actions = read_new_actions(bus_root, cursor);
+    fn drain_and_publish(
+        &self,
+        persist: &Persist,
+        cursor: &mut Option<String>,
+    ) -> Result<(), String> {
+        // Read the complete fixed command lane before moving the cursor or
+        // gathering durable workgroup facts. A failed read defers every effect;
+        // it is never interpreted as an empty command view.
+        let messages = self.read_action_messages(persist, cursor.as_deref())?;
+        let actions = parse_new_actions(messages, cursor);
         if actions.is_empty() || !self.is_leader() {
-            return;
+            return Ok(());
         }
         // Gather once per tick — the replicated roster is the same for every
         // action in this batch.
@@ -441,6 +542,7 @@ impl ServiceOnboardWorker {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -451,18 +553,47 @@ impl Worker for ServiceOnboardWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            tracing::debug!("service_onboard: no bus root; worker idle");
-            return Ok(());
+        let bus_root = service_onboard_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let (persist, mut cursor) = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_cursor(&persist) {
+                    Ok(cursor) => break (persist, cursor),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "service_onboard: command activation failed; startup will retry"
+                    ),
+                },
+                Ok(None) => {
+                    tracing::debug!("service_onboard: Bus root unavailable; startup will retry")
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "service_onboard: Bus open failed; startup will retry"
+                ),
+            }
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
-        // Prime past the backlog: a service add is a one-shot verb — a restart
-        // must not re-drive historical applies (mirrors `scheduler`).
-        let mut cursor = prime_cursor(&bus_root);
+        // Prime past the backlog: service-add is a one-shot command, not a
+        // durable fold. Replicated workgroup facts are gathered only for a
+        // successfully read forward command after activation.
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
-                _ = tick.tick() => self.drain_and_publish(&bus_root, &mut cursor),
+                _ = tick.tick() => {
+                    if let Err(error) = self.drain_and_publish(&persist, &mut cursor) {
+                        tracing::warn!(
+                            %error,
+                            "service_onboard: Bus read failed; command effects deferred"
+                        );
+                    }
+                }
                 () = shutdown.wait() => break,
             }
         }
@@ -811,6 +942,189 @@ mod tests {
     }
 
     #[test]
+    fn service_bus_root_falls_back_to_the_canonical_system_spool() {
+        assert_eq!(
+            service_onboard_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            service_onboard_bus_root_or_system(Some(PathBuf::from(
+                "/tmp/service-onboard-explicit-bus",
+            ))),
+            PathBuf::from("/tmp/service-onboard-explicit-bus")
+        );
+    }
+
+    #[test]
+    fn bus_read_failure_defers_effects_and_retains_the_command_cursor() {
+        let root = tempfile::tempdir().expect("temp root");
+        let bus_root = root.path().join("bus");
+        let persist = Persist::open(bus_root).expect("open Bus");
+        let forward = ServiceAddAction {
+            schema_version: SERVICE_ACTION_SCHEMA_VERSION,
+            id: "svc-read-recovery".into(),
+            kind: ServiceKind::Files,
+            sip: None,
+            dry_run: true,
+        };
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&forward).unwrap()),
+            )
+            .expect("write forward command");
+
+        let fail_read = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_read_for_worker = Arc::clone(&fail_read);
+        let publisher = RecordingPublisher::default();
+        let sent = Arc::clone(&publisher.sent);
+        let worker = ServiceOnboardWorker::new(root.path().join("workgroup"), "peer:a".into())
+            .with_publisher(Box::new(publisher))
+            .with_action_reader(Arc::new(move |persist, cursor| {
+                if fail_read_for_worker.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("injected service-onboard Bus read failure".into());
+                }
+                persist
+                    .list_since(ACTION_TOPIC, cursor)
+                    .map_err(|error| error.to_string())
+            }));
+        std::fs::create_dir_all(root.path().join("workgroup")).unwrap();
+
+        let mut cursor = None;
+        assert!(worker.drain_and_publish(&persist, &mut cursor).is_err());
+        assert!(cursor.is_none(), "failed read must not move the cursor");
+        assert!(sent.lock().unwrap().is_empty(), "failed read has no effect");
+
+        fail_read.store(false, std::sync::atomic::Ordering::SeqCst);
+        worker
+            .drain_and_publish(&persist, &mut cursor)
+            .expect("recovered read");
+        assert!(cursor.is_some());
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let event: ServiceAddEvent = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(event.id, "svc-read-recovery");
+    }
+
+    #[tokio::test]
+    async fn late_bus_retries_activation_skips_history_and_executes_forward_messages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().expect("temp root");
+        let bus_root = root.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        let stale = ServiceAddAction {
+            schema_version: SERVICE_ACTION_SCHEMA_VERSION,
+            id: "svc-startup-stale".into(),
+            kind: ServiceKind::Files,
+            sip: None,
+            dry_run: true,
+        };
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&stale).unwrap()),
+            )
+            .expect("write retained startup command");
+
+        let workgroup = root.path().join("workgroup");
+        std::fs::create_dir_all(&workgroup).unwrap();
+        let publisher = RecordingPublisher::default();
+        let sent = Arc::clone(&publisher.sent);
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let mut worker = ServiceOnboardWorker::new(workgroup, "peer:a".into())
+            .with_publisher(Box::new(publisher))
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(5))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected service-onboard tail read failure".into());
+                }
+                prime_cursor(persist)
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover and activate");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "retained startup command must not replay"
+        );
+
+        for (id, expected_len) in [("svc-forward-one", 1), ("svc-forward-two", 2)] {
+            let forward = ServiceAddAction {
+                schema_version: SERVICE_ACTION_SCHEMA_VERSION,
+                id: id.into(),
+                kind: ServiceKind::Files,
+                sip: None,
+                dry_run: true,
+            };
+            persist
+                .write(
+                    ACTION_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(&forward).unwrap()),
+                )
+                .expect("write forward service command");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while sent.lock().unwrap().len() < expected_len {
+                    assert!(!task.is_finished(), "worker exited before forward command");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("forward command must execute");
+        }
+
+        let sent_guard = sent.lock().unwrap();
+        assert_eq!(sent_guard.len(), 2, "each forward command executes once");
+        let ids = sent_guard
+            .iter()
+            .map(|(_, body)| serde_json::from_str::<ServiceAddEvent>(body).unwrap().id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["svc-forward-one", "svc-forward-two"]);
+        drop(sent_guard);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must interrupt worker promptly")
+            .expect("worker task must join")
+            .expect("worker must exit cleanly");
+    }
+
+    #[test]
     fn worker_drains_the_request_and_publishes_the_matching_event() {
         // A dry-run Files request drained off a real temp bus and answered on
         // EVENT_TOPIC with the echoed id (a fresh temp workgroup ⇒ this node
@@ -829,9 +1143,10 @@ mod tests {
         let w = ServiceOnboardWorker::new(wg.clone(), "peer:a".to_string())
             .with_publisher(Box::new(rec))
             .with_bus_root(bus.clone());
+        let persist = Persist::open(bus.clone()).expect("reopen bus");
 
         let mut cursor = None;
-        w.drain_and_publish(&bus, &mut cursor);
+        w.drain_and_publish(&persist, &mut cursor).unwrap();
 
         let sent = log.lock().expect("recorder mutex");
         assert_eq!(sent.len(), 1, "one request ⇒ one event");
@@ -844,7 +1159,7 @@ mod tests {
         drop(sent);
 
         // The cursor advanced — a second drain re-answers nothing.
-        w.drain_and_publish(&bus, &mut cursor);
+        w.drain_and_publish(&persist, &mut cursor).unwrap();
         assert_eq!(log.lock().expect("recorder mutex").len(), 1);
 
         let _ = std::fs::remove_dir_all(&bus);
@@ -887,9 +1202,10 @@ mod tests {
             .with_publisher(Box::new(rec))
             .with_authorizer(authorizer)
             .with_bus_root(bus.clone());
+        let persist = Persist::open(bus.clone()).expect("reopen bus");
 
         let mut cursor = None;
-        worker.drain_and_publish(&bus, &mut cursor);
+        worker.drain_and_publish(&persist, &mut cursor).unwrap();
 
         assert_eq!(
             calls.lock().expect("calls mutex").as_slice(),

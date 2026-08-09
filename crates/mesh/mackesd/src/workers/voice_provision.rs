@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 
 use super::{ShutdownToken, Worker};
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
@@ -81,6 +81,11 @@ pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 /// shutdown. Shorter than the reconcile interval so the button is responsive
 /// while the full reconcile stays rate-limited.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bounded startup recovery for an unresolved, unopenable, or unreadable Bus.
+/// Every wait is interruptible by the worker shutdown token.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The Bus verb the Voice panel publishes to request a (re-)provision
 /// (lock 8). A message here forces an immediate reconcile pass. Typed verb in
@@ -118,6 +123,15 @@ pub const DIDS_TOPIC: &str = "state/voice-dids";
 /// A message forces an immediate reconcile so the operator sees the config take.
 /// Typed verb in the canonical `action/<domain>/<verb>` namespace (§9).
 pub const SHARED_CONFIG_TOPIC: &str = "action/voice/shared-config";
+
+/// Every privileged mutation lane this worker drains. Activation snapshots all
+/// four tails atomically so no retained provider effect can replay.
+const ACTION_TOPICS: [&str; 4] = [
+    PROVISION_TOPIC,
+    DID_ROUTE_TOPIC,
+    SHARED_CONFIG_TOPIC,
+    FAILOVER_TOPIC,
+];
 
 /// VOIP-GW-7 — the Bus topic the fleet **cutover status** is published to.
 ///
@@ -1143,6 +1157,16 @@ struct MasterCreds {
     api_key: String,
 }
 
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&std::path::Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn =
+    dyn Fn(&Persist) -> Result<HashMap<&'static str, Option<String>>, String> + Send + Sync;
+
+#[cfg(test)]
+type ActionReadGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
+
 /// The VOIP-GW-3 leader-gated worker.
 pub struct VoiceProvisionWorker {
     /// Shared leader lock — the same file every leader-gated worker contends
@@ -1165,6 +1189,15 @@ pub struct VoiceProvisionWorker {
     poll_interval: Duration,
     /// Override the Bus spool root. Tests point this at a tempdir.
     bus_root_override: Option<PathBuf>,
+    /// Atomic per-topic mutation cursors installed only after activation.
+    action_cursors: HashMap<&'static str, Option<String>>,
+    /// Dynamic Bus seams for deterministic recovery/read-failure tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
+    #[cfg(test)]
+    action_read_gate: Option<Arc<ActionReadGateFn>>,
     /// Test seam: an injected client used instead of the live one. Production
     /// leaves this `None` and builds a [`LiveVitelityClient`] from the sealed
     /// master creds each pass.
@@ -1199,6 +1232,13 @@ impl VoiceProvisionWorker {
             reconcile_interval: DEFAULT_RECONCILE_INTERVAL,
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            action_cursors: HashMap::new(),
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
+            #[cfg(test)]
+            action_read_gate: None,
             client_override: None,
             store_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
@@ -1220,6 +1260,27 @@ impl VoiceProvisionWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_action_read_gate(mut self, gate: Arc<ActionReadGateFn>) -> Self {
+        self.action_read_gate = Some(gate);
         self
     }
 
@@ -1265,6 +1326,60 @@ impl VoiceProvisionWorker {
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
         self
+    }
+
+    fn open_bus(&self, root: &std::path::Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_action_cursors(
+        &self,
+        persist: &Persist,
+    ) -> Result<HashMap<&'static str, Option<String>>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_action_cursors(persist)
+    }
+
+    /// Stage one complete mutation read before the caller installs cursors or
+    /// performs any authorization, journal, provider, or publication effect.
+    fn read_action_sweep(
+        &self,
+        persist: &Persist,
+    ) -> Result<
+        (
+            HashMap<&'static str, Option<String>>,
+            Vec<(&'static str, StoredMessage)>,
+        ),
+        String,
+    > {
+        let mut candidate_cursors = self.action_cursors.clone();
+        let mut actions = Vec::new();
+        for (index, topic) in ACTION_TOPICS.into_iter().enumerate() {
+            #[cfg(test)]
+            if let Some(gate) = self.action_read_gate.as_ref() {
+                gate(topic, index)?;
+            }
+            let cursor = self.action_cursors.get(topic).and_then(Option::as_deref);
+            let messages = persist
+                .list_since(topic, cursor)
+                .map_err(|error| format!("read {topic}: {error}"))?;
+            if let Some(tail) = messages.last().map(|message| message.ulid.clone()) {
+                candidate_cursors.insert(topic, Some(tail));
+            }
+            actions.extend(messages.into_iter().map(|message| (topic, message)));
+        }
+        Ok((candidate_cursors, actions))
     }
 
     /// Path for the token-free accepted-intent projection. It sits beside the
@@ -1795,8 +1910,31 @@ pub fn publish_state(persist: &Persist, state: &NodeVoiceState) {
     }
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn prime_action_cursors(
+    persist: &Persist,
+) -> Result<HashMap<&'static str, Option<String>>, String> {
+    let mut cursors = HashMap::new();
+    for topic in ACTION_TOPICS {
+        let tail = persist
+            .latest_ulid(topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?;
+        cursors.insert(topic, tail);
+    }
+    Ok(cursors)
+}
+
+fn voice_provision_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    voice_provision_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn voice_provision_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 #[async_trait::async_trait]
@@ -1810,97 +1948,68 @@ impl Worker for VoiceProvisionWorker {
         // request bodies and spent nonces remain in the shared authorizer's
         // durable replay ledger; restart never re-authorizes a Bus backlog.
         self.load_authorized_intents();
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::warn!(
-                target: "mackesd::voice_provision",
-                "no Bus data dir; voice_provision idle"
-            );
-            // Idle until shutdown rather than busy-loop.
-            shutdown.wait().await;
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
+        let bus_root = voice_provision_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_action_cursors(&persist) {
+                    Ok(cursors) => {
+                        self.action_cursors = cursors;
+                        break persist;
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::voice_provision",
+                        %error,
+                        "Voice action activation failed; startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
                     target: "mackesd::voice_provision",
-                    error = %e,
-                    "persist open failed; worker idle"
-                );
-                shutdown.wait().await;
-                return Ok(());
+                    "Bus root unavailable; startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::voice_provision",
+                    %error,
+                    "persist open failed; startup will retry"
+                ),
             }
+            tokio::select! {
+                _ = shutdown.wait() => return Ok(()),
+                _ = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
-        // Cursors for the panel verbs — start at each tail so we only act on
-        // requests published after we come up. Provision (lock 8), DID-route
-        // (lock 11) and failover (lock 10) all force an immediate reconcile.
-        let mut cursor: Option<String> = persist.latest_ulid(PROVISION_TOPIC).ok().flatten();
-        let mut did_cursor: Option<String> = persist.latest_ulid(DID_ROUTE_TOPIC).ok().flatten();
-        let mut failover_cursor: Option<String> =
-            persist.latest_ulid(FAILOVER_TOPIC).ok().flatten();
-        // VOIP-GW-7 — the "Apply to fleet" shared-outbound verb (lock 13) also
-        // forces an immediate reconcile so the lift + cutover take promptly.
-        let mut shared_cursor: Option<String> =
-            persist.latest_ulid(SHARED_CONFIG_TOPIC).ok().flatten();
 
         loop {
-            // Drain the panel verbs (lock 8/10/11). A follower still advances
-            // the cursors + skips (the leader acts), so failover is seamless.
+            // Read every lane before advancing any cursor or admitting any
+            // mutation. Unavailable Bus state defers the complete effect sweep.
+            let (candidate_cursors, actions) = match self.read_action_sweep(&persist) {
+                Ok(sweep) => sweep,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::voice_provision",
+                        %error,
+                        "Voice action sweep unavailable; deferring reconcile"
+                    );
+                    tokio::select! {
+                        _ = shutdown.wait() => break,
+                        _ = tokio::time::sleep(self.poll_interval) => {}
+                    }
+                    continue;
+                }
+            };
+            self.action_cursors = candidate_cursors;
             let mut button_pressed = false;
-            if let Ok(msgs) = persist.list_since(PROVISION_TOPIC, cursor.as_deref()) {
-                for msg in msgs {
-                    cursor = Some(msg.ulid);
-                    match self.accept_action(PROVISION_TOPIC, msg.body.as_deref()) {
-                        Ok(true) => button_pressed = true,
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            target: "mackesd::voice_provision",
-                            %error,
-                            "refused unauthorized Voice provision action"
-                        ),
-                    }
-                }
-            }
-            if let Ok(msgs) = persist.list_since(DID_ROUTE_TOPIC, did_cursor.as_deref()) {
-                for msg in msgs {
-                    did_cursor = Some(msg.ulid);
-                    match self.accept_action(DID_ROUTE_TOPIC, msg.body.as_deref()) {
-                        Ok(true) => button_pressed = true,
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            target: "mackesd::voice_provision",
-                            %error,
-                            "refused unauthorized Voice DID-route action"
-                        ),
-                    }
-                }
-            }
-            if let Ok(msgs) = persist.list_since(SHARED_CONFIG_TOPIC, shared_cursor.as_deref()) {
-                for msg in msgs {
-                    shared_cursor = Some(msg.ulid);
-                    match self.accept_action(SHARED_CONFIG_TOPIC, msg.body.as_deref()) {
-                        Ok(true) => button_pressed = true,
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            target: "mackesd::voice_provision",
-                            %error,
-                            "refused unauthorized Voice shared-config action"
-                        ),
-                    }
-                }
-            }
-            if let Ok(msgs) = persist.list_since(FAILOVER_TOPIC, failover_cursor.as_deref()) {
-                for msg in msgs {
-                    failover_cursor = Some(msg.ulid);
-                    match self.accept_action(FAILOVER_TOPIC, msg.body.as_deref()) {
-                        Ok(true) => button_pressed = true,
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            target: "mackesd::voice_provision",
-                            %error,
-                            "refused unauthorized Voice failover action"
-                        ),
-                    }
+            for (topic, message) in actions {
+                match self.accept_action(topic, message.body.as_deref()) {
+                    Ok(true) => button_pressed = true,
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::voice_provision",
+                        topic,
+                        %error,
+                        "refused unauthorized Voice action"
+                    ),
                 }
             }
 
@@ -1945,6 +2054,41 @@ mod tests {
 
     const ACTION_KEY: &[u8] = b"voice-action-auth-test-key";
     const ACTION_NOW: i64 = 1_700_000_000_000;
+
+    fn signed_provision_body(nonce: &str) -> String {
+        let unsigned = serde_json::json!({ "schema_version": 1 }).to_string();
+        authorize_test_body(
+            ACTION_KEY,
+            &unsigned,
+            MutationContext {
+                verb: VOICE_PROVISION_AUTH_VERB,
+                node: VOICE_AUTH_NODE,
+                target: "fleet",
+            },
+            nonce,
+            ACTION_NOW + 30_000,
+        )
+    }
+
+    fn signed_did_route_body(did: &str, node_id: &str, nonce: &str) -> String {
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "did": did,
+            "node_id": node_id,
+        })
+        .to_string();
+        authorize_test_body(
+            ACTION_KEY,
+            &unsigned,
+            MutationContext {
+                verb: VOICE_DID_ROUTE_AUTH_VERB,
+                node: VOICE_AUTH_NODE,
+                target: did,
+            },
+            nonce,
+            ACTION_NOW + 30_000,
+        )
+    }
 
     /// A `LocalAead` store with a real mesh age identity (the same round-trip
     /// path production uses), so seal/unseal actually exercises the envelope.
@@ -2858,6 +3002,147 @@ mod tests {
         // And it round-trips back (the panel mirror deserialises the same shape).
         let back: CutoverStatus = serde_json::from_str(&body).unwrap();
         assert_eq!(back, status);
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            voice_provision_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            voice_provision_bus_root_or_system(Some(PathBuf::from(
+                "/tmp/voice-provision-explicit-bus",
+            ))),
+            PathBuf::from("/tmp/voice-provision-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_without_replay_and_failed_reads_defer_full_sweep() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("voice.sqlite");
+        let bus_root = root.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+
+        // Seed an already-authorized durable intent. Startup must load it before
+        // waiting for Bus recovery, then fold later accepted intent into it.
+        let mut seed = VoiceProvisionWorker::new(root.path().to_path_buf(), "peer:leader".into())
+            .with_db_path(db_path.clone());
+        seed.desired_did_routes
+            .insert("15550000001".into(), Some("peer:durable".to_string()));
+        seed.persist_authorized_intents().unwrap();
+
+        let stale = signed_provision_body("voice-startup-stale");
+        persist
+            .write(PROVISION_TOPIC, Priority::Default, None, Some(&stale))
+            .unwrap();
+
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            ACTION_KEY,
+            root.path().join("action-auth"),
+            ACTION_NOW,
+        ));
+        let open_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_reads_for_worker = Arc::clone(&fail_reads);
+
+        let mut worker = VoiceProvisionWorker::new(root.path().to_path_buf(), "peer:leader".into())
+            .with_db_path(db_path.clone())
+            .with_bus_root(bus_root.clone())
+            .with_authorizer(Arc::clone(&authorizer))
+            .with_poll_interval(Duration::from_millis(5))
+            .with_reconcile_interval(Duration::from_secs(60 * 60))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    return Err("injected atomic tail-read failure".into());
+                }
+                prime_action_cursors(persist)
+            }))
+            .with_action_read_gate(Arc::new(move |_, index| {
+                // Fail after the forward DID lane was read, proving that a
+                // later lane failure commits neither that cursor nor effect.
+                if fail_reads_for_worker.load(std::sync::atomic::Ordering::SeqCst) && index == 2 {
+                    Err("injected later-lane Bus read failure".into())
+                } else {
+                    Ok(())
+                }
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover and atomically activate");
+        assert!(open_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The retained provision command was tail-primed, so its capability is
+        // still unused and can be authorized here exactly once.
+        assert!(authorize_voice_action(&authorizer, PROVISION_TOPIC, Some(&stale)).is_ok());
+
+        fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let forward = signed_did_route_body("15550000002", "peer:forward", "voice-forward-route");
+        persist
+            .write(DID_ROUTE_TOPIC, Priority::Default, None, Some(&forward))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let journal_path = db_path.with_file_name(AUTHORIZED_INTENTS_FILE);
+        let deferred: AuthorizedVoiceIntents =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert!(deferred.did_routes.contains_key("15550000001"));
+        assert!(
+            !deferred.did_routes.contains_key("15550000002"),
+            "a later Bus read failure must defer the complete mutation sweep"
+        );
+
+        fail_reads.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state: AuthorizedVoiceIntents =
+                    serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+                if state.did_routes.contains_key("15550000001")
+                    && state.did_routes.get("15550000002")
+                        == Some(&Some("peer:forward".to_string()))
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before forward work");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("post-activation forward intent must fold into durable state");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("worker shutdown timed out")
+            .expect("worker task panicked")
+            .expect("worker returned an error");
     }
 
     #[tokio::test]

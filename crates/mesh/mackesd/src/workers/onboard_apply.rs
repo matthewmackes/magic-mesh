@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +51,7 @@ use crate::onboard::remote_push::{
     process_apply, Applier, JobBundle, LocalApplier, NonceGuard, RemotePushError,
 };
 
-use super::scheduler::{BusPublisher, Publisher};
+use super::scheduler::Publisher;
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains — the `action/<domain>/<verb>` convention
@@ -68,6 +69,12 @@ pub const EVENT_TOPIC: &str = "event/onboard/apply";
 /// Poll cadence — an apply is a slow, operator-paced event; the 2 s `session_broker`
 /// cadence is responsive without spinning.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Lower bound for retrying an unresolved, unopenable, or unsafe Bus.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Upper bound for startup retry backoff.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 // ───────────────────────────── wire contract ─────────────────────────────
 
@@ -307,16 +314,19 @@ pub fn resolve(
 
 // ─────────────────────────── bus + worker ───────────────────────────
 
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<ApplyAction> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
+fn read_new_actions(
+    persist: &Persist,
+    cursor: Option<&str>,
+) -> Result<(Option<String>, Vec<ApplyAction>), String> {
+    let msgs = persist
+        .list_since(ACTION_TOPIC, cursor)
+        .map_err(|error| format!("read {ACTION_TOPIC}: {error}"))?;
+    let next_cursor = msgs
+        .last()
+        .map(|msg| msg.ulid.clone())
+        .or_else(|| cursor.map(str::to_string));
     let mut out = Vec::new();
     for msg in msgs {
-        *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_action(body) {
             Ok(a) => out.push(a),
@@ -325,19 +335,29 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<ApplyAc
             }
         }
     }
-    out
+    Ok((next_cursor, out))
 }
 
 /// Seed the cursor to the newest existing message so a (re)start doesn't re-drive a
 /// historical apply. `None` when the topic is empty.
-fn prime_cursor(bus_root: &Path) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(ACTION_TOPIC, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
+fn prime_cursor(persist: &Persist) -> Result<Option<String>, String> {
+    persist
+        .latest_ulid(ACTION_TOPIC)
+        .map_err(|error| format!("prime {ACTION_TOPIC}: {error}"))
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn onboard_apply_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    onboard_apply_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn onboard_apply_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 fn now_unix() -> i64 {
@@ -347,6 +367,15 @@ fn now_unix() -> i64 {
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn = dyn Fn(&Persist) -> Result<Option<String>, String> + Send + Sync;
+
+#[cfg(test)]
+type ActionReadGateFn = dyn Fn() -> Result<(), String> + Send + Sync;
 
 /// The Bus-reachable target-side apply worker.
 ///
@@ -360,20 +389,27 @@ pub struct OnboardApplyWorker {
     resolver: Box<dyn IssuerResolver + Send + Sync>,
     /// The injectable node-local applier (production: [`LocalApplier`]).
     applier: Box<dyn Applier + Send + Sync>,
-    /// The injectable publish seam (production: [`BusPublisher`]).
-    publisher: Box<dyn Publisher + Send + Sync>,
+    /// Optional injected publish seam. Production writes event history through
+    /// the already-open recovered [`Persist`] handle.
+    publisher: Option<Box<dyn Publisher + Send + Sync>>,
     /// The single-use nonce guard, held across ticks (replay defense).
     nonce_guard: NonceGuard,
     /// Poll cadence.
     poll: Duration,
-    /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
+    /// Bus root override (tests). `None` resolves the user Bus, then system spool.
     bus_root_override: Option<PathBuf>,
+    #[cfg(test)]
+    bus_open_override: Option<std::sync::Arc<BusOpenFn>>,
+    #[cfg(test)]
+    cursor_prime_override: Option<std::sync::Arc<CursorPrimeFn>>,
+    #[cfg(test)]
+    action_read_gate: Option<std::sync::Arc<ActionReadGateFn>>,
 }
 
 impl OnboardApplyWorker {
     /// Construct with production defaults: the store-backed issuer resolver, the
     /// [`LocalApplier`] resolved from the deployed repo + `workgroup_root`, the
-    /// shared [`BusPublisher`], and the default cadence.
+    /// recovered Bus handle for event history, and the default cadence.
     #[must_use]
     pub fn new(workgroup_root: &Path, node_id: String) -> Self {
         let applier = LocalApplier::resolve(&crate::ipc::secret_store::repo_root(), workgroup_root);
@@ -381,10 +417,16 @@ impl OnboardApplyWorker {
             node_id,
             resolver: Box::new(StoreIssuerResolver::new(crate::default_db_path())),
             applier: Box::new(applier),
-            publisher: Box::new(BusPublisher),
+            publisher: None,
             nonce_guard: NonceGuard::new(),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
+            #[cfg(test)]
+            action_read_gate: None,
         }
     }
 
@@ -405,7 +447,7 @@ impl OnboardApplyWorker {
     /// Inject a publisher (tests).
     #[must_use]
     pub fn with_publisher(mut self, publisher: Box<dyn Publisher + Send + Sync>) -> Self {
-        self.publisher = publisher;
+        self.publisher = Some(publisher);
         self
     }
 
@@ -423,16 +465,72 @@ impl OnboardApplyWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: std::sync::Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: std::sync::Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_action_read_gate(mut self, gate: std::sync::Arc<ActionReadGateFn>) -> Self {
+        self.action_read_gate = Some(gate);
+        self
+    }
+
+    fn bus_root(&self) -> PathBuf {
+        onboard_apply_bus_root(self.bus_root_override.clone())
+    }
+
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_action_cursor(&self, persist: &Persist) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_cursor(persist)
     }
 
     /// Drain new apply actions (advancing `cursor`), resolve each through the pure
     /// core, and publish its typed result event. NOT leader-gated: the target
     /// filter is `target_node == self.node_id`, so exactly the addressed node
     /// answers.
-    fn drain_and_publish(&mut self, bus_root: &Path, cursor: &mut Option<String>) {
-        let actions = read_new_actions(bus_root, cursor);
+    fn drain_and_publish(&mut self, persist: &Persist, cursor: &mut Option<String>) -> bool {
+        #[cfg(test)]
+        if let Some(gate) = self.action_read_gate.as_ref() {
+            if let Err(error) = gate() {
+                tracing::debug!(target: "mackesd::onboard_apply", %error, "injected action read failure");
+                return false;
+            }
+        }
+        let (next_cursor, actions) = match read_new_actions(persist, cursor.as_deref()) {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::debug!(target: "mackesd::onboard_apply", %error, "action read failed; effect sweep deferred");
+                return false;
+            }
+        };
+        // Install the staged cursor only after the complete command-lane read.
+        *cursor = next_cursor;
         for action in actions {
             let now = now_unix();
             let event = resolve(
@@ -444,12 +542,21 @@ impl OnboardApplyWorker {
                 self.applier.as_ref(),
             );
             match serde_json::to_string(&event) {
-                Ok(body) => self.publisher.publish(EVENT_TOPIC, &body),
+                Ok(body) => {
+                    if let Some(publisher) = self.publisher.as_ref() {
+                        publisher.publish(EVENT_TOPIC, &body);
+                    } else if let Err(error) =
+                        persist.write(EVENT_TOPIC, Priority::Default, None, Some(&body))
+                    {
+                        tracing::warn!(target: "mackesd::onboard_apply", %error, "event history publish failed");
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(issuer = %event.issuer, error = %e, "onboard_apply: event serialize failed");
                 }
             }
         }
+        true
     }
 }
 
@@ -460,18 +567,39 @@ impl Worker for OnboardApplyWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            tracing::debug!("onboard_apply: no bus root; worker idle");
-            return Ok(());
+        let bus_root = self.bus_root();
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let (persist, mut cursor) = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_action_cursor(&persist) {
+                    Ok(cursor) => break (persist, cursor),
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::onboard_apply",
+                        %error,
+                        "action-tail activation failed; startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::onboard_apply",
+                    "Bus root unavailable; startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::onboard_apply",
+                    %error,
+                    "Persist open failed; startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
-        // Prime past the backlog: an apply is a one-shot verb — a restart must not
-        // re-drive historical applies (mirrors `service_onboard`).
-        let mut cursor = prime_cursor(&bus_root);
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
-                _ = tick.tick() => self.drain_and_publish(&bus_root, &mut cursor),
+                _ = tick.tick() => { self.drain_and_publish(&persist, &mut cursor); }
                 () = shutdown.wait() => break,
             }
         }
@@ -485,6 +613,7 @@ mod tests {
     use crate::onboard::remote_push::Action;
     use ed25519_dalek::SigningKey;
     use mde_bus::hooks::config::Priority;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn key() -> SigningKey {
@@ -765,8 +894,9 @@ mod tests {
             .with_publisher(Box::new(rec))
             .with_bus_root(bus.clone());
 
+        let persist = Persist::open(bus.clone()).expect("reopen bus");
         let mut cursor = None;
-        w.drain_and_publish(&bus, &mut cursor);
+        assert!(w.drain_and_publish(&persist, &mut cursor));
 
         let sent = log.lock().expect("recorder mutex");
         assert_eq!(sent.len(), 1, "one request ⇒ one event");
@@ -779,7 +909,7 @@ mod tests {
         drop(sent);
 
         // The cursor advanced — a second drain re-answers nothing.
-        w.drain_and_publish(&bus, &mut cursor);
+        assert!(w.drain_and_publish(&persist, &mut cursor));
         assert_eq!(log.lock().expect("recorder mutex").len(), 1);
         let _ = std::fs::remove_dir_all(&bus);
     }
@@ -797,14 +927,14 @@ mod tests {
     }
 
     #[test]
-    fn default_bus_root_honors_mde_bus_root() {
+    fn service_bus_root_honors_override_and_falls_back_to_system_spool() {
         let root = tempfile::tempdir().expect("temporary bus root");
         let expected = root.path().to_path_buf();
         let previous = std::env::var_os("MDE_BUS_ROOT");
         let got = {
             std::env::set_var("MDE_BUS_ROOT", &expected);
             let got = (
-                default_bus_root(),
+                onboard_apply_bus_root(None),
                 OnboardApplyWorker::new(&std::env::temp_dir(), "peer:me".to_string()).bus_root(),
             );
             match previous {
@@ -814,8 +944,154 @@ mod tests {
             got
         };
 
-        assert_eq!(got.0, Some(expected.clone()));
-        assert_eq!(got.1, Some(expected));
+        assert_eq!(got.0, expected.clone());
+        assert_eq!(got.1, expected);
+        assert_eq!(
+            onboard_apply_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_without_replay_and_defers_failed_reads() {
+        struct CountingApplier(Arc<AtomicUsize>);
+        impl Applier for CountingApplier {
+            fn apply_one(&self, _action: &Action) -> Result<(), RemotePushError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let bus_root = root.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        let signing_key = key();
+        let now = now_unix();
+
+        let mut stale_bundle = bundle(now);
+        stale_bundle.nonce = "onboard-apply-startup-stale".into();
+        let stale = ApplyAction {
+            issuer: "peer:lh".into(),
+            sig_hex: sig_hex(&signing_key, &stale_bundle),
+            bundle: stale_bundle,
+        };
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&stale).unwrap()),
+            )
+            .expect("write retained apply command");
+
+        let applied = Arc::new(AtomicUsize::new(0));
+        let recorder = RecordingPublisher::default();
+        let published = Arc::clone(&recorder.sent);
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let fail_reads_for_worker = Arc::clone(&fail_reads);
+        let mut worker = OnboardApplyWorker::new(root.path(), "peer:me".into())
+            .with_resolver(Box::new(resolver(&signing_key)))
+            .with_applier(Box::new(CountingApplier(Arc::clone(&applied))))
+            .with_publisher(Box::new(recorder))
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(5))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected action-tail read failure".into());
+                }
+                prime_cursor(persist)
+            }))
+            .with_action_read_gate(Arc::new(move || {
+                if fail_reads_for_worker.load(Ordering::SeqCst) {
+                    Err("injected runtime Bus read failure".into())
+                } else {
+                    Ok(())
+                }
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover and activate");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(applied.load(Ordering::SeqCst), 0);
+        assert!(published.lock().unwrap().is_empty());
+
+        fail_reads.store(true, Ordering::SeqCst);
+        let mut forward_bundle = bundle(now);
+        forward_bundle.nonce = "onboard-apply-forward".into();
+        let forward = ApplyAction {
+            issuer: "peer:lh".into(),
+            sig_hex: sig_hex(&signing_key, &forward_bundle),
+            bundle: forward_bundle,
+        };
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&forward).unwrap()),
+            )
+            .expect("write post-activation command");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            0,
+            "failed command read must defer the complete effect sweep"
+        );
+        assert!(published.lock().unwrap().is_empty());
+
+        fail_reads.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while applied.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited before forward apply");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("post-activation command must execute after a complete read");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(applied.load(Ordering::SeqCst), 2);
+        let events = published.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "outage-delayed command emits one history event"
+        );
+        let event: ApplyResultEvent = serde_json::from_str(&events[0].1).unwrap();
+        assert_eq!(event.nonce, "onboard-apply-forward");
+        drop(events);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown timed out")
+            .expect("worker task panicked")
+            .expect("worker returned an error");
     }
 
     #[tokio::test]
