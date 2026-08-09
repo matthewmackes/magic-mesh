@@ -31,8 +31,8 @@ use mackes_mesh_types::cloud::{
 use super::{row_button, WorkloadsState};
 
 /// The delivery types a golden VM image can be built for. A `ServiceContainer`
-/// workload has no golden VM disk — it ships via `container-deploy` (the Containers
-/// lens), which the backend enforces — so it is omitted here.
+/// workload has no golden VM disk; its Quadlet declaration belongs to the
+/// preview-only Containers lens, so it is omitted here.
 const BUILDABLE: [DeliveryType; 4] = [
     DeliveryType::DesktopVm,
     DeliveryType::ServiceVm,
@@ -320,7 +320,7 @@ fn build_controls(ui: &mut egui::Ui, state: &mut WorkloadsState) -> Option<Image
         );
         ui.add_space(Style::SP_XS);
 
-        // Delivery-type selector (the VM types; containers ship via container-deploy).
+        // Delivery-type selector (VM types only; containers use Quadlet declarations).
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = Style::SP_XS;
             for dt in BUILDABLE {
@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn the_container_type_is_not_buildable_here() {
-        // A ServiceContainer ships via container-deploy, not image-build.
+        // A ServiceContainer uses a Quadlet declaration, not a golden VM disk.
         assert!(!BUILDABLE.contains(&DeliveryType::ServiceContainer));
         assert_eq!(BUILDABLE.len(), 4);
     }

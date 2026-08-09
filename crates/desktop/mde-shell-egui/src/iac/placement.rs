@@ -1,8 +1,8 @@
 //! U14 — the **placement picker**: choose the mesh node (local or a remote peer
 //! over Nebula) a new workload is placed on, with per-node capacity bars driven
 //! by [`mackes_mesh_types::cloud::NodeCapacity`]. Each node card shows its
-//! used/total vCPU + memory as a load-toned bar and whether armed live apply is
-//! available; selecting one returns its host id, which mod.rs stores as the
+//! used/total vCPU + memory as a load-toned bar and whether authorized mutations
+//! are armed; selecting one returns its host id, which mod.rs stores as the
 //! shared placement target for Provision, Run, Images, and Containers.
 
 use mde_egui::egui::{self, Color32, RichText, Sense, Stroke};
@@ -156,7 +156,7 @@ fn selected_node_summary(ui: &mut egui::Ui, cloud: &mackes_mesh_types::cloud::Cl
         let posture = if !fresh {
             "stale mirror"
         } else if cloud.apply_armed {
-            "live apply"
+            "mutations armed"
         } else {
             "plan-only"
         };
@@ -205,7 +205,7 @@ fn node_card(
         let (badge, tone) = if !fresh {
             ("stale mirror", Style::WARN)
         } else if cs.apply_armed {
-            ("live apply", Style::OK)
+            ("mutations armed", Style::OK)
         } else {
             ("plan-only", Style::WARN)
         };

@@ -2,9 +2,9 @@
 //!
 //! Browser is delivered as a normal [`DeliveryType::DesktopVm`] workload. This
 //! verb only declares the stable desired state; it never claims that Chromium or
-//! a VM is already available. The separately armed `provision` action renders the
-//! complete node slice and asks the configured provider to realize it. Provider
-//! or hypervisor failures therefore remain explicit in that existing apply reply.
+//! a VM is already available. The typed Workload row operation realizes the
+//! declaration and reports provider or hypervisor failures through the canonical
+//! Workload status projection.
 //!
 //! The request requires an explicit placement node, workload name, and immutable
 //! guest-image digest. All are validated before the authorization token is

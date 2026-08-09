@@ -1628,12 +1628,8 @@ mod tests {
 
     #[test]
     fn every_workloads_verb_is_wired_no_skeleton_remains() {
-        // All eight Workloads verbs are wired: set-desired/plan (U4), image-build (U6),
-        // container-deploy (U7), inventory/output (U10), and android-provision
-        // (U9). None may still surface the U2 "not yet wired"
-        // skeleton — a verb may honestly gate (armed-token / tool-absent), but the
-        // skeleton message is a regression. Each verb's real behavior is covered by
-        // its own module tests.
+        // Every recognized Workloads verb has a concrete handler or an explicit
+        // retired-path refusal. None may surface the U2 "not yet wired" skeleton.
         let w = staged_worker(Arc::new(FakeRunner::default()));
         for verb in [
             "set-desired",

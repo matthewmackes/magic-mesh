@@ -406,7 +406,6 @@ fn provision_route_renders_ordered_guided_flow_with_one_next_action() {
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.bus_root = Some(tmp.path().join("bus"));
     state.selected_node = Some("eagle".to_string());
-    state.states[0].apply_armed = true;
     state
         .form
         .set_test_draft("seat-1", "construct-desktop", "tags = [\"ops\"]");
@@ -417,15 +416,12 @@ fn provision_route_renders_ordered_guided_flow_with_one_next_action() {
         "Placement & delivery",
         "Placement node",
         "Delivery filter",
-        "Live apply gate",
-        "Armed by current mirror",
         "Identity",
         "Sizing",
         "Guided provisioning",
         "Workload details",
         "Desired state",
         "Dry-run plan",
-        "Typed row operation",
         "Next step",
         "Save desired state",
     ] {
@@ -463,7 +459,6 @@ fn provision_route_renders_ordered_guided_flow_with_one_next_action() {
 fn guided_flow_reveals_only_the_backend_acknowledged_next_step() {
     let mut state = state_on(DeliveryView::AndroidVm, WorkloadsRoute::Provision);
     state.selected_node = Some("eagle".to_string());
-    state.states[0].apply_armed = true;
     state.form.set_test_draft("android-basic", "", "");
     state.provision_draft_key = Some(state.form.workflow_key(DeliveryView::AndroidVm, "eagle"));
 
@@ -502,29 +497,6 @@ fn cloud_request_timeout_allows_real_infrastructure_work() {
     assert!(
         REQUEST_TIMEOUT >= std::time::Duration::from_secs(5 * 60),
         "OpenTofu/image work must not be discarded by a UI-scale timeout"
-    );
-}
-
-#[test]
-fn provision_route_validation_distinguishes_plan_only_nodes() {
-    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
-    state.selected_node = Some("eagle".to_string());
-    state.states[0].apply_armed = false;
-    state.form.set_test_draft("seat-1", "", "");
-
-    let text = rendered_text(|ui| route_body(ui, &mut state));
-
-    assert!(text.contains("Plan-only / not armed"), "{text}");
-    assert!(text.contains("Live apply"), "{text}");
-    assert!(
-        text.contains(
-            "Plan-only node: desired state and dry-run are available; live provision will remain disabled"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains("Save desired state") && !text.contains("Provision live"),
-        "{text}"
     );
 }
 
@@ -823,9 +795,9 @@ fn audit_route_renders_dense_session_table_newest_first() {
         detail: "planned node eagle".to_string(),
     });
     state.audit.push(AuditEntry {
-        verb: "container-deploy".to_string(),
+        verb: "configure".to_string(),
         outcome: AuditOutcome::Applied,
-        detail: "audited container web-1".to_string(),
+        detail: "configured node eagle".to_string(),
     });
 
     let text = rendered_text(|ui| audit_route_panel(ui, &state));
@@ -834,10 +806,10 @@ fn audit_route_renders_dense_session_table_newest_first() {
     assert!(text.contains("Outcome"), "{text}");
     assert!(text.contains("Verb"), "{text}");
     assert!(text.contains("Detail"), "{text}");
-    assert!(text.contains("container-deploy"), "{text}");
-    assert!(text.contains("audited container web-1"), "{text}");
+    assert!(text.contains("configure"), "{text}");
+    assert!(text.contains("configured node eagle"), "{text}");
     assert!(
-        text.find("container-deploy") < text.find("plan"),
+        text.find("configure") < text.find("plan"),
         "newest audit rows must render first: {text}"
     );
 }
@@ -1061,7 +1033,7 @@ fn android_cuttlefish_reply_reads_as_desired_saved_not_live_applied() {
         "{note}"
     );
     assert_eq!(entry.outcome, AuditOutcome::Desired);
-    assert!(entry.detail.contains("separate action"));
+    assert!(entry.detail.contains("typed Workload row"));
 }
 
 #[test]
@@ -1220,14 +1192,14 @@ fn run_and_prepared_route_actions_fail_closed_without_a_selected_node() {
 
     state.note = None;
     state.arm_prepared(
-        mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY,
+        mackes_mesh_types::cloud::VERB_IMAGE_BUILD,
         "  ".to_string(),
         "web".to_string(),
         "{}".to_string(),
-        "container deploy (web)".to_string(),
+        "build service image (web)".to_string(),
         "web".to_string(),
-        "Deploy",
-        "container web".to_string(),
+        "Build",
+        "service image web".to_string(),
     );
 
     assert!(
@@ -1242,37 +1214,38 @@ fn run_and_prepared_route_actions_fail_closed_without_a_selected_node() {
 #[test]
 fn prepared_review_sheet_renders_frozen_mutation_facts_before_confirm() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut state = state_on(DeliveryView::ServiceContainer, WorkloadsRoute::Containers);
+    let mut state = state_on(DeliveryView::ServiceVm, WorkloadsRoute::Images);
     state.bus_root = Some(tmp.path().join("bus"));
     let body = serde_json::json!({
         "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
         "node": "eagle",
+        "action": "build",
+        "delivery_type": "service_vm",
         "name": "web",
-        "image": "registry.example.test/web:1",
-        "rootful": false,
+        "version": "1.0",
     })
     .to_string();
     let digest = cloud_request_digest(&body).expect("fixture body has a stable digest");
 
     state.arm_prepared(
-        mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY,
+        mackes_mesh_types::cloud::VERB_IMAGE_BUILD,
         "eagle".to_string(),
         "web".to_string(),
         body,
-        "container deploy (web)".to_string(),
+        "build service image (web)".to_string(),
         "web".to_string(),
-        "Deploy",
-        "container web".to_string(),
+        "Build",
+        "service image web".to_string(),
     );
 
     let text = rendered_text(|ui| render_review_sheet(ui, &mut state));
 
     assert!(
-        text.contains("Command") && text.contains("action/cloud/container-deploy"),
+        text.contains("Command") && text.contains("action/cloud/image-build"),
         "{text}"
     );
     assert!(
-        text.contains("Subject") && text.contains("container web"),
+        text.contains("Subject") && text.contains("service image web"),
         "{text}"
     );
     assert!(text.contains("Target") && text.contains("web"), "{text}");
@@ -1287,14 +1260,14 @@ fn prepared_review_sheet_renders_frozen_mutation_facts_before_confirm() {
     assert!(
         text.contains("Body summary")
             && text.contains("schema_version")
-            && text.contains("image")
+            && text.contains("delivery_type")
             && text.contains("name"),
         "{text}"
     );
     assert!(
         text.contains("Frozen body")
-            && text.contains("registry.example.test/web:1")
-            && text.contains("\"rootful\":false"),
+            && text.contains("\"action\":\"build\"")
+            && text.contains("\"version\":\"1.0\""),
         "{text}"
     );
     assert!(
@@ -1461,8 +1434,8 @@ fn perform_rechecks_confirmation_and_mints_nothing_on_mismatch() {
 
 #[test]
 fn fold_mutation_maps_the_reply_tri_state_honestly() {
-    // An `ok` reply reads applied.
-    let ok: CloudReply = serde_json::from_str(r#"{"ok":true,"verb":"provision","audited":false}"#)
+    // An `ok` Configure reply reads applied.
+    let ok: CloudReply = serde_json::from_str(r#"{"ok":true,"verb":"configure","audited":false}"#)
         .expect("ok reply parses");
     let (note, entry) = fold_mutation(&ok);
     assert!(note.contains("applied"), "{note}");
@@ -1481,7 +1454,7 @@ fn fold_mutation_maps_the_reply_tri_state_honestly() {
     // A `gated` mutation reply reads STAGED (a dry-run — nothing applied) and
     // carries the staged plan summary honestly.
     let gated: CloudReply = serde_json::from_str(
-        r#"{"ok":false,"verb":"provision","gated":"live apply is capability-gated — tofu plan (staged): 2 to add — nothing applied"}"#,
+        r#"{"ok":false,"verb":"configure","gated":"Ansible apply is capability-gated — check mode staged changes — nothing applied"}"#,
     )
     .expect("gated reply parses");
     let (note, entry) = fold_mutation(&gated);
@@ -1490,7 +1463,10 @@ fn fold_mutation_maps_the_reply_tri_state_honestly() {
         "{note}"
     );
     assert_eq!(entry.outcome, AuditOutcome::Staged);
-    assert!(entry.detail.contains("to add"), "the plan summary is kept");
+    assert!(
+        entry.detail.contains("staged changes"),
+        "the check summary is kept"
+    );
 
     // An `error` reply reads failed.
     let failed: CloudReply =

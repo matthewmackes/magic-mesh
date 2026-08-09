@@ -5,9 +5,9 @@
 //! `cuttlefish_host` Ansible role (a separate unit) runs `cvd start
 //! --start_vnc_server` to boot the Android guest under crosvm. This handler owns
 //! only the FIRST layer's declaration: it constructs an [`DeliveryType::AndroidVm`]
-//! [`WorkloadSpec`] sized for Cuttlefish and routes it through the normal
-//! set-desired / provision path (the L1 VM targets the `modules/android` tofu
-//! module the infra unit creates — this handler writes no tofu). The Android screen
+//! [`WorkloadSpec`] sized for Cuttlefish and persists it as desired state for the
+//! typed Workload reconciler. This handler writes no OpenTofu input or live VM.
+//! The Android screen
 //! lives inside crosvm-inside-the-L1-VM (invisible to `virsh domdisplay`), so its
 //! console is the in-guest VNC/WebRTC endpoint `cvd` serves, not a libvirt display.
 //!
@@ -17,8 +17,8 @@
 //!
 //! Honest routing (§7): the spec is routed through the reconcile/set-desired seam
 //! (shared with `set-desired`) and the reply is explicitly desired-state-only.
-//! The separate armed `provision` action must render this persisted slice before
-//! OpenTofu applies it; `android-provision` itself never claims a live VM.
+//! A typed Workload row operation must realize the persisted declaration;
+//! `android-provision` itself never claims a live VM.
 
 use std::{
     collections::BTreeMap,
@@ -705,7 +705,7 @@ fn build_reply(state_root: &Path, verb_name: &str, body: &CloudActionBody) -> Cl
     let spec = android_spec(node, &name);
 
     // Route the Cuttlefish L1-VM through the normal set-desired path: persist this
-    // node's desired slice; the operator then applies it via the armed `provision`.
+    // node's desired slice for the typed Workload row operation.
     // A persist failure is an honest error — the spec is still echoed, never a fake
     // success.
     match reconcile::write_desired_doc(state_root, &spec) {

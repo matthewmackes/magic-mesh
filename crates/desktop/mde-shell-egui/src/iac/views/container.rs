@@ -1,8 +1,7 @@
 //! U16 — the **Service Container** delivery view: Podman / Quadlet service
-//! containers (rootless by default), installed as systemd units by the
-//! `container-deploy` verb. Unlike the VM views these are **not** libvirt domains,
-//! so the `instance-*` virsh verbs do not apply; per-container lifecycle
-//! (restart / logs / destroy) rides the dedicated Podman/systemd action verbs.
+//! containers (rootless by default), observed as systemd units. Unlike the VM
+//! views these are **not** libvirt domains, so VM lifecycle verbs do not apply;
+//! per-container lifecycle rides typed Workload row operations.
 //! The roster and its actions are real (live status · drift · metrics), with
 //! action outcomes surfaced through the shared Workloads status note.
 
@@ -24,7 +23,7 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         "Container",
         "Podman / Quadlet service containers (rootless), installed as systemd units.",
     );
-    provision_cta(ui, state, "Deploy a container");
+    provision_cta(ui, state, "Draft a container");
 
     let rows: Vec<WorkloadRow> = state
         .workloads_of(DeliveryView::ServiceContainer)
@@ -59,13 +58,31 @@ fn container_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadR
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Restart", false).clicked() {
-                state.issue_workload_direct("container-restart", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "container-restart",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Logs", false).clicked() {
-                state.issue_workload_direct("container-logs", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "container-logs",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct("container-destroy", &row.node, &row.name, row.delivery_type, &row.name);
+                state.issue_workload_direct(
+                    "container-destroy",
+                    &row.node,
+                    &row.name,
+                    row.delivery_type,
+                    &row.name,
+                );
             }
         });
     });
@@ -167,8 +184,8 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.add_space(Style::SP_S);
 }
 
-/// The "deploy a container" affordance — jumps to the Provision route (U14
-/// placement + U15 form, which renders the container-deploy path).
+/// The container-draft affordance opens the guided declaration route. That route
+/// remains preview-only until the typed Workload create API carries the fields.
 fn provision_cta(ui: &mut egui::Ui, state: &mut WorkloadsState, label: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {

@@ -961,8 +961,6 @@ pub(super) enum ProvisionProgress {
     DesiredSaved,
     /// The backend returned a successful dry-run plan.
     Planned,
-    /// The typed Workload row operation completed.
-    Applied,
 }
 
 // ───────────────────────────── mutation review ──────────────────────────────
@@ -985,7 +983,7 @@ pub(super) enum ArmAction {
         name: String,
     },
     /// A route-specific live mutation whose complete body is frozen before the
-    /// simple Yes/No review opens (image build/promote or container deploy).
+    /// simple Yes/No review opens (for example, image build or promote).
     Prepared {
         verb: &'static str,
         node: String,
@@ -1543,8 +1541,8 @@ impl WorkloadsState {
     }
 
     /// Resolve the one in-flight mutation's reply into the note + an audit row
-    /// (never a silent op, §7); on a live apply, re-fold the mirror so the change
-    /// reflects. A no-responder is an honest timeout.
+    /// (never a silent op, §7); on a successful mutation, re-fold the mirror so
+    /// the change reflects. A no-responder is an honest timeout.
     fn resolve_mutation(&mut self) {
         let Some((ulid, sent, pending_verb)) = self
             .mutation_pending
@@ -1574,7 +1572,6 @@ impl WorkloadsState {
                         self.provision_progress = ProvisionProgress::DesiredSaved;
                     }
                     VERB_PLAN => self.provision_progress = ProvisionProgress::Planned,
-                    "provision" => self.provision_progress = ProvisionProgress::Applied,
                     _ => {}
                 }
             }
@@ -1823,7 +1820,7 @@ impl WorkloadsState {
 
     /// Open a simple Yes/No review for the dedicated Cuttlefish Android contract.
     /// `android-provision` persists the correctly sized Android desired slice;
-    /// the separate Provision action is still required for a live VM apply.
+    /// live lifecycle remains a typed operation on the resulting Workload row.
     pub(super) fn arm_android_provision(&mut self, name: &str) {
         let Some(node) = self.require_selected_node("Android provisioning") else {
             return;
@@ -2620,8 +2617,8 @@ impl WorkloadsState {
     }
 
     /// Whether the selected placement node currently reports the armed-token
-    /// capability needed for a live provision. A missing node or a stale
-    /// selection fails closed; plan-only nodes must not open a live-apply arm.
+    /// capability needed for authorized mutations such as Ansible Configure.
+    /// A missing node or stale selection fails closed.
     pub(super) fn selected_node_apply_armed(&self) -> bool {
         let Some(selected) = self.selected_node.as_deref() else {
             return false;
@@ -2640,9 +2637,9 @@ impl WorkloadsState {
     /// Surface the honest apply-gate + audit posture in the action note (Help).
     pub(super) fn set_help_note(&mut self) {
         self.note = Some(
-            "Live apply is capability-gated per node (armed token); provision and configure \
-             stage as dry-runs otherwise. Workload deletion is target-scoped and every \
-             destructive op passes a typed-confirm; performed ops land in the Status audit trail."
+            "Ansible Configure is capability-gated per node (armed token) and stages as a \
+             dry-run otherwise. Workload lifecycle is target-scoped through typed row \
+             operations; performed ops land in the Status audit trail."
                 .to_string(),
         );
     }
@@ -2673,7 +2670,8 @@ fn fold_mutation(reply: &CloudReply) -> (String, AuditEntry) {
     };
     if reply.ok && reply.verb == VERB_PLAN {
         (
-            "Dry-run plan completed; nothing was applied. Continue to live provision when ready."
+            "Dry-run plan completed; nothing was applied. Use the typed Workload row operation \
+             when the declared workload is ready."
                 .to_string(),
             AuditEntry {
                 verb,
@@ -2682,7 +2680,8 @@ fn fold_mutation(reply: &CloudReply) -> (String, AuditEntry) {
             },
         )
     } else if reply.ok && reply.verb == VERB_ANDROID_PROVISION {
-        let detail = "Cuttlefish desired state saved; live VM provision remains a separate action";
+        let detail =
+            "Cuttlefish desired state saved; lifecycle continues through its typed Workload row";
         (
             format!("{verb} saved desired state; no VM was provisioned yet."),
             AuditEntry {
@@ -2751,7 +2750,6 @@ fn verb_label(verb: &str) -> &'static str {
         "instance-stop" => "Stop",
         "instance-reboot" => "Reboot",
         "instance-delete" => "Delete",
-        "provision" => "Provision",
         "configure" => "Configure",
         "destroy" => "Destroy",
         _ => "Run",
@@ -3566,7 +3564,7 @@ fn audit_route_panel(ui: &mut egui::Ui, state: &WorkloadsState) {
         crate::empty_state::show(
             ui,
             "No audit rows this session",
-            "Plan, Run, Provision, and lifecycle actions append here after a backend reply.",
+            "Plans, Ansible Configure, image actions, and typed Workload operations append here.",
         );
         return;
     }
@@ -3787,8 +3785,8 @@ fn render_note(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 }
 
 /// The pending mutation review sheet. Prepared service/image changes present
-/// direct Yes/No controls; live apply and lifecycle actions retain the exact
-/// typed echo. Nothing reaches the Bus until the operator confirms.
+/// direct Yes/No controls; Ansible Configure retains the exact typed echo.
+/// Nothing reaches the Bus until the operator confirms.
 fn render_review_sheet(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let Some(snapshot) = state.arming.as_ref() else {
         return;

@@ -44,7 +44,7 @@ pub(crate) const DEFAULT_LIBVIRT_URI: &str = "qemu:///system";
 pub(crate) const DEFAULT_BROWSER_VM_IMAGE_SOURCE: &str =
     "/var/lib/libvirt/images/browser-vm-chromium.qcow2";
 
-/// The OpenTofu root (provision), relative to the IaC root.
+/// The OpenTofu root used for read-only inventory and dry plans, relative to the IaC root.
 pub(crate) const TOFU_SUBDIR: &str = "infra/tofu/cloud";
 
 /// The Ansible tree (configure), relative to the IaC root.
@@ -148,7 +148,7 @@ fn run_bounded_command(bin: &str, args: &[&str]) -> Result<(bool, String, String
 }
 
 // ── backend tool identifiers (the `service_type` on each health row) ──
-/// OpenTofu (provision leg).
+/// OpenTofu (observation and dry-plan leg).
 pub(crate) const TOOL_TOFU: &str = "opentofu";
 /// Ansible (configure leg).
 pub(crate) const TOOL_ANSIBLE: &str = "ansible";
@@ -211,8 +211,8 @@ impl CloudRunOutcome {
 /// The captured result of one generic backend-tool invocation through the
 /// [`CloudRunner::run_tool`] seam (`bootc-image-builder` / `osbuild` /
 /// `ansible-playbook` / `podman` …). `ok` is the process exit success; the streams
-/// are captured so the image-build (U6) + container-deploy (U7) verbs parse them
-/// (an artifact path, a `PLAY RECAP`) and surface an honest failure detail. A spawn
+/// are captured so the image-build pipeline can parse its artifact path and
+/// surface an honest failure detail. A spawn
 /// failure (the binary is absent) is an `Err` from `run_tool`, never a fabricated
 /// `ToolRun` (§7).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +225,8 @@ pub struct ToolRun {
     pub stderr: String,
 }
 
-/// The backend-execution seam the worker drives: shell OpenTofu / Ansible / virsh.
+/// The backend-execution seam for read-only/dry-run OpenTofu, armed Ansible, and
+/// read-only libvirt inventory.
 ///
 /// Production is [`ShellCloudRunner`]; tests inject a fake so the drain, gate,
 /// reply, audit, and state-publish paths are exercised WITHOUT a live hypervisor
@@ -255,9 +256,8 @@ pub trait CloudRunner: Send + Sync {
     /// absent / plan failed) — never a fabricated empty plan.
     fn plan_json(&self, tfvars_json: &str) -> Result<String, String>;
     /// Run an arbitrary backend tool `bin` with `args`, capturing its output — the
-    /// generic seam the image-build (U6) + container-deploy (U7) verbs drive their
-    /// per-tool pipelines through (`bootc-image-builder`/`osbuild` for a golden disk;
-    /// `ansible-playbook` for the Quadlet install), so those verbs stay fully
+    /// generic seam the image-build verb drives its per-tool pipeline through
+    /// (`bootc-image-builder`/`osbuild` for a golden disk), so the verb stays fully
     /// fake-testable without the real tools installed. `Err` ONLY on a spawn failure
     /// (the binary is absent / unexecutable), so the caller reports an honest "tool
     /// unavailable" gate rather than a fabricated failure (§7). The default shells the
@@ -597,7 +597,7 @@ pub(crate) mod fake {
         /// The tfvars documents `plan_json` was handed — proves the renderer ran.
         pub tfvars_written: Mutex<Vec<String>>,
         /// `run_tool` invocations recorded as `(bin, args)` — proves the image-build
-        /// / container-deploy pipelines drove the right tools.
+        /// pipeline drove the right tools.
         pub tool_calls: Mutex<Vec<(String, Vec<String>)>>,
         /// Make `run_tool` report a spawn failure (binary absent) — the honest
         /// "tool unavailable" gate path.

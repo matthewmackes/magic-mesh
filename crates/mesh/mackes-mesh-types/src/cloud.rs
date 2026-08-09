@@ -21,8 +21,9 @@
 //! - [`ResourceTable`] / [`HeatStackDetail`] / [`HeatPreview`] — the read-only
 //!   resource tables + the stack (IaC) detail/preview shapes.
 //! - [`CloudInstance`] / [`LifecycleAction`] / [`CloudReply`] +
-//!   [`cloud_action_topic`] — the neutral `action/cloud/*` lifecycle command
-//!   contract the fleet command surface rides.
+//!   [`cloud_action_topic`] — compatibility shapes for the `action/cloud/*`
+//!   command namespace. Direct cloud provision and instance lifecycle mutation
+//!   are retired; workload realization belongs to the typed Workload authority.
 //!
 //! The I/O (minting the mirror, issuing probes, converging the backend) belongs to
 //! the mesh-side worker; only these pure types + parsers are shared, so the
@@ -1166,13 +1167,12 @@ fn yaml_scalar(value: &str) -> String {
     }
 }
 
-// ─────────────────────── cloud lifecycle command surface ───────────────────────
+// ─────────────────── cloud command compatibility surface ───────────────────
 //
-// The provider-neutral lifecycle-verb namespace + the typed instance/reply shapes
-// the fleet cloud-lifecycle command surface rides (the `action/cloud/*` request +
-// `reply/<ulid>` lane). These are the §6 wire contract between a lifecycle-command
-// producer (e.g. the KDC-MESH-8 phone command surface) and the cloud backend that
-// answers them; the live backend is provided by a later local-first worker.
+// Provider-neutral compatibility shapes for the `action/cloud/*` request +
+// `reply/<ulid>` lane. The types remain shared so older messages decode cleanly,
+// but direct cloud provision and instance lifecycle mutation are retired; typed
+// Workload operations own realization and lifecycle authority.
 
 /// The Bus topic prefix every cloud action verb rides: `action/cloud/`.
 pub const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
@@ -1190,7 +1190,9 @@ pub const CLOUD_ARM_CREDENTIAL: &str = "cloud-arm-key";
 /// HMAC-SHA256 key size accepted by the production credential loader.
 pub const CLOUD_ARM_KEY_BYTES: usize = 32;
 
-/// Stable capability target for node-wide provision/configure mutations.
+/// Stable capability target for supported node-wide mutations such as configure.
+/// Retained as part of the authenticated wire API; it does not authorize the
+/// retired direct cloud-provision path.
 pub const CLOUD_ARM_NODE_SCOPE: &str = "node-wide";
 
 /// One live-mutation capability. The authenticated wire form is
@@ -1444,7 +1446,9 @@ pub fn cloud_action_topic(verb: &str) -> String {
     format!("{CLOUD_ACTION_PREFIX}{verb}")
 }
 
-/// A cloud-instance lifecycle action a typed verb drives through the backend seam.
+/// A legacy cloud-instance lifecycle action retained for wire compatibility.
+/// Direct execution through the cloud backend is retired; typed Workload
+/// operations own instance lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleAction {
     /// Start a stopped instance.
@@ -1481,8 +1485,8 @@ impl LifecycleAction {
         }
     }
 
-    /// Whether performing this op is destructive (delete/reboot) — the ops that are
-    /// only ever run past the typed-arming gate and are audited when performed (§7).
+    /// Whether this legacy action is destructive (delete/reboot). Consumers may
+    /// use this classification when rejecting or translating old requests.
     #[must_use]
     pub const fn is_destructive(self) -> bool {
         matches!(self, Self::Reboot | Self::Delete)
@@ -1511,7 +1515,7 @@ pub struct CloudInstance {
 }
 
 /// The typed reply published to `reply/<request-ulid>` for an `action/cloud/*`
-/// lifecycle/list verb — the neutral subset the fleet command surface reads.
+/// request — the neutral compatibility subset the fleet command surface reads.
 ///
 /// `ok` mirrors the shared `{"ok":true}` reply convention. A rejected/gated/failed
 /// request carries `error`/`gated` and no payload (§7 — no fabricated answer); a
@@ -1533,7 +1537,8 @@ pub struct CloudReply {
     /// A rejection (malformed request) or a backend seam failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Whether a destructive op (delete/reboot) was performed + audited.
+    /// Legacy audit result retained for compatible decoding of historical
+    /// delete/reboot replies; direct cloud lifecycle execution is retired.
     #[serde(default)]
     pub audited: bool,
     /// `plan` — the pending-change counts (add/change/destroy).
@@ -1542,7 +1547,8 @@ pub struct CloudReply {
     /// `output` — tofu outputs (instance roster / IPs) for a workload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<TofuOutput>>,
-    /// `configure` / `container-deploy` — the Ansible run summary.
+    /// `configure` — the Ansible run summary. The field remains reusable by
+    /// compatibility replies; `container-deploy` no longer performs deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ansible: Option<AnsibleSummary>,
     /// `inventory` — the resolved mesh Ansible inventory.
@@ -1558,7 +1564,7 @@ pub struct CloudReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired: Option<Vec<WorkloadSpec>>,
     /// Raw tool stdout/stderr, surfaced behind the shell's "expandable raw log"
-    /// (the honest failure detail for a tofu/ansible/virsh run).
+    /// (honest detail from planning, configuration, or read-only observation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_log: Option<String>,
 }
@@ -1709,8 +1715,8 @@ pub fn default_resource_collection(service_type: &str) -> Option<&'static str> {
 // ─────────────────── the per-node cloud backend status mirror ───────────────────
 //
 // WL-ARCH-001 Phase B — the provider-neutral `state/cloud/<node>` mirror the
-// mackesd cloud worker (OpenTofu provision + Ansible configure over local
-// libvirt/KVM) publishes and the recreated IaC surface (Phase C) consumes.
+// mackesd cloud worker publishes and the recreated IaC surface (Phase C)
+// consumes. OpenTofu is plan/read-only here; direct apply/provision is retired.
 // Composed ENTIRELY of the neutral shapes above — [`CloudProviderAdapter`] (which
 // backend), [`ServiceHealth`] (per-tool backend health), [`ResourceTable`] (the
 // resource roster) — so the surface renders provider health + a resource table
@@ -1743,8 +1749,9 @@ pub const MAX_ANDROID_VDI_SOURCES_PER_STATE: usize = 128;
 /// (OpenTofu / Ansible / libvirt) is actually present + reachable — an absent
 /// tool reads [`HealthState::Absent`], never a fabricated `up`; `resources`
 /// carries the live roster the READ verbs discovered (an empty table is a real
-/// "no instances", never invented). `apply_armed` mirrors whether the operator
-/// gate (`MDE_CLOUD_APPLY=1`) is set, so the surface shows plan-only vs. live.
+/// "no instances", never invented). `apply_armed` is retained for wire
+/// compatibility and reports whether supported armed cloud mutations are
+/// available; it does not advertise the retired direct apply/provision path.
 ///
 /// The deployment role is part of the mirror so placement cannot accidentally
 /// offer a control-plane lighthouse as a workload host. Older mirrors omit the
@@ -1783,9 +1790,9 @@ pub struct CloudState {
     pub health: Vec<ServiceHealth>,
     /// The resource tables the READ verbs discovered (the instance roster, …).
     pub resources: Vec<ResourceTable>,
-    /// Whether armed-token live mutation is available on this node (capability,
-    /// not the retired `MDE_CLOUD_APPLY` env wall). `false` ⇒ this node cannot
-    /// currently honor an armed provision/configure/destroy.
+    /// Whether supported armed cloud mutations are available on this node.
+    /// Retained under its original field name for wire compatibility; it does
+    /// not indicate that direct cloud provision or apply is available.
     pub apply_armed: bool,
     /// Wall-clock publish time (ms since the Unix epoch).
     pub published_at_ms: i64,
@@ -1890,8 +1897,9 @@ impl CloudState {
     }
 
     /// Whether every backend tool this mirror reports is healthy (`Up`) — the
-    /// honest "the backend is ready to provision" read. `false` when any tool is
-    /// Down/Absent, or when no tool is reported at all.
+    /// honest "the reported backend tools are ready" read. This is health only,
+    /// not authorization or availability of the retired provision path. `false`
+    /// when any tool is Down/Absent, or when no tool is reported at all.
     #[must_use]
     pub fn backend_ready(&self) -> bool {
         !self.health.is_empty() && self.health.iter().all(|h| h.state == HealthState::Up)
@@ -1901,9 +1909,10 @@ impl CloudState {
 // ─────────────────────────── Workloads cockpit contract ───────────────────────────
 //
 // The neutral verb vocabulary + payload shapes the reenvisioned "Workloads" surface
-// and the mackesd cloud worker exchange over `action/cloud/*` + `reply/<ulid>`. These
-// extend the lifecycle/list contract above; the worker answers them, the shell renders
-// them. Provider-neutral by construction (OpenTofu + Ansible + libvirt, no OpenStack).
+// and the mackesd cloud worker exchange over `action/cloud/*` + `reply/<ulid>`. The
+// worker serves supported read/configuration requests and explicitly refuses retired
+// direct mutations. Provider-neutral by construction (OpenTofu plan + Ansible +
+// libvirt observation, no OpenStack).
 
 /// `set-desired` — write a node's desired-state workload doc (`/mcnf/cloud/desired/…`).
 pub const VERB_SET_DESIRED: &str = "set-desired";
@@ -1915,11 +1924,13 @@ pub const VERB_INVENTORY: &str = "inventory";
 pub const VERB_OUTPUT: &str = "output";
 /// `image-build` — drive a bootc/osbuild image build (+ optional promote).
 pub const VERB_IMAGE_BUILD: &str = "image-build";
-/// `container-deploy` — render a Quadlet unit and hand it to the container-host role.
+/// `container-deploy` — legacy wire token retained for compatibility. Direct
+/// container deployment through the cloud worker is retired.
 pub const VERB_CONTAINER_DEPLOY: &str = "container-deploy";
 /// `console-attach` — return a SPICE/VNC/WebRTC console handle for a workload.
 pub const VERB_CONSOLE_ATTACH: &str = "console-attach";
-/// `android-provision` — the two-layer Cuttlefish path (Linux VM then `cvd`).
+/// `android-provision` — declare the desired Android/Cuttlefish workload. Typed
+/// Workload operations own realization of its outer VM.
 pub const VERB_ANDROID_PROVISION: &str = "android-provision";
 /// `android-lifecycle` — generation-checked Cuttlefish VM/app lifecycle.
 pub const VERB_ANDROID_LIFECYCLE: &str = "android-lifecycle";
@@ -1929,7 +1940,8 @@ pub const VERB_BROWSER_PROVISION: &str = "browser-provision";
 pub const VERB_APP_PROVISION: &str = "app-provision";
 
 /// What a workload *delivers* — the cockpit's primary organizing axis (delivery type
-/// × placement). Each maps to a provision + configure recipe under the hood.
+/// × placement). Realization is delegated to the typed Workload authority;
+/// cloud contracts retain desired-state, planning, and configuration metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryType {
@@ -2057,7 +2069,7 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub network_isolation: bool,
     /// The raw-HCL escape hatch: operator-supplied HCL fragment merged into the
-    /// rendered tfvars (validated before `tofu`). `None` = pure form authoring.
+    /// rendered tfvars (validated before `tofu plan`). `None` = pure form authoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_hcl: Option<String>,
     /// Guest-owned App VM identity and policy, present only for `AppVm` rows.
@@ -2300,8 +2312,8 @@ impl AppVmProfile {
 ///
 /// This is a desired-state profile, not a claim that a VM is already running.
 /// The typed `browser-provision` verb persists the resulting [`WorkloadSpec`];
-/// the separately armed `provision` verb is responsible for asking the backend
-/// to realize the node's complete desired slice.
+/// realization is requested through the typed Workload operation contract, not
+/// a separately armed cloud-provision verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrowserVmProfile {
     /// Virtual CPUs allocated to the Browser VM.
@@ -2343,8 +2355,8 @@ impl BrowserVmProfile {
     }
 }
 
-/// The `tofu plan` change counts — the lean, counts-only preview the surface renders
-/// before an armed apply.
+/// The `tofu plan` change counts — the lean, counts-only dry-run preview the
+/// surface renders. This contract does not imply a cloud-side apply operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanCounts {
     /// Resources the plan would create.
@@ -2363,7 +2375,7 @@ impl PlanCounts {
     }
 }
 
-/// The Ansible run tally the configure/container-deploy verbs return (summary +
+/// The Ansible run tally the supported configure path returns (summary +
 /// changed-count, per the lean-output decision).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnsibleSummary {

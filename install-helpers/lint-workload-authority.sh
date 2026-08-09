@@ -41,17 +41,19 @@ retired_xcp_host="$repo_root/crates/mesh/mackesd/src/workers/xcp_host.rs"
 retired_xcp_crate="$repo_root/crates/mesh/mackes-xcp/Cargo.toml"
 retired_compute_provision="$repo_root/crates/mesh/mackesd/src/workers/compute_provision.rs"
 retired_cert_authority="$repo_root/crates/mesh/mackesd/src/workers/cert_authority.rs"
+retired_vm_lifecycle="$repo_root/crates/mesh/mackesd/src/workers/vm_lifecycle.rs"
+retired_container_lifecycle="$repo_root/crates/mesh/mackesd/src/workers/container.rs"
 live_mirror_verifier="$repo_root/install-helpers/verify-live-mirrors.py"
 
 scan_shell() {
   local source_root="$1"
   if command -v rg >/dev/null 2>&1; then
     rg -n --glob '*.rs' --glob '!**/tests.rs' \
-      'action/(vm/lifecycle|container/lifecycle|cloud/provision)|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::Provision|ProvisionApply|arm_provision|issue\("provision"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
+      'action/(vm/lifecycle|container/lifecycle|cloud/(provision|container-deploy))|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::Provision|ProvisionApply|arm_provision|issue\("(provision|container-deploy)"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
       "$source_root"
   else
     grep -RInE --include='*.rs' --exclude='tests.rs' \
-      'action/(vm/lifecycle|container/lifecycle|cloud/provision)|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::Provision|ProvisionApply|arm_provision|issue\("provision"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
+      'action/(vm/lifecycle|container/lifecycle|cloud/(provision|container-deploy))|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::Provision|ProvisionApply|arm_provision|issue\("(provision|container-deploy)"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
       "$source_root"
   fi
 }
@@ -143,7 +145,7 @@ run_self_test() {
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — typed Workloads link was rejected' >&2
     return 1
   fi
-  for retired in 'action/container/lifecycle' 'action/cloud/provision' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest' 'ArmAction::Provision' 'ProvisionApply' 'arm_provision' 'issue("provision"' 'is_nova_managed' 'CLOUD_MANAGED_TOOLTIP' 'Nova-managed'; do
+  for retired in 'action/container/lifecycle' 'action/cloud/provision' 'action/cloud/container-deploy' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest' 'ArmAction::Provision' 'ProvisionApply' 'arm_provision' 'issue("provision"' 'issue("container-deploy"' 'is_nova_managed' 'CLOUD_MANAGED_TOOLTIP' 'Nova-managed'; do
     printf 'const RETIRED: &str = "%s";\n' "$retired" >"$fixture/src/legacy.rs"
     if ! scan_shell "$fixture/src" >/dev/null 2>&1; then
       printf 'lint-workload-authority.sh: self-test failed — retired fixture was not detected: %s\n' "$retired" >&2
@@ -278,7 +280,9 @@ for retired_file in \
   "$retired_xcp_host" \
   "$retired_xcp_crate" \
   "$retired_compute_provision" \
-  "$retired_cert_authority"; do
+  "$retired_cert_authority" \
+  "$retired_vm_lifecycle" \
+  "$retired_container_lifecycle"; do
   if [ -e "$retired_file" ]; then
     printf 'lint-workload-authority.sh: retired authority artifact is reachable: %s\n' "$retired_file" >&2
     exit 1
@@ -326,6 +330,11 @@ fi
 
 if ! production_contains_literal 'cloud provision is retired; use `action/workload/operation`' "$cloud_verbs"; then
   printf '%s\n' 'lint-workload-authority.sh: retained cloud provision requests no longer fail closed' >&2
+  exit 1
+fi
+
+if ! production_contains_literal 'container-deploy is retired; submit a typed Workload operation' "$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs/container.rs"; then
+  printf '%s\n' 'lint-workload-authority.sh: retained cloud container-deploy requests no longer fail closed' >&2
   exit 1
 fi
 

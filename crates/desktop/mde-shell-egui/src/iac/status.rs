@@ -92,7 +92,7 @@ fn node_health_card(ui: &mut egui::Ui, node: &CloudState) {
             ui.label(RichText::new(word).size(Style::SMALL).color(tone).strong());
             ui.add_space(Style::SP_S);
             let (mode, mode_tone) = if !fresh {
-                ("stale — live apply disabled", Style::SUPPORT_ERROR)
+                ("stale — mutations disabled", Style::SUPPORT_ERROR)
             } else if node.apply_armed {
                 ("apply armed", Style::ACCENT)
             } else {

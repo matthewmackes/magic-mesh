@@ -5,8 +5,9 @@
 //! verbs (list/status/configure) keep their behavior; legacy live provision and
 //! workspace-wide destroy are explicitly refused;
 //! the U1a Workloads verbs (set-desired/plan/inventory/output/image-build/
-//! container-deploy/android-provision/browser-provision) land here as
-//! typed handlers or honest gates — recognized + routed, never faked (§7). U4–U10
+//! android-provision/browser-provision) land here as typed handlers or honest
+//! gates. Retired `container-deploy` remains classified only for an explicit
+//! no-effect refusal. U4–U10
 //! each own one handler, so this dispatch is the worker's serialize point.
 //!
 //! The armed-token gate ([`super::gate`]) is applied here at APPLY time for the
@@ -112,7 +113,7 @@ pub(crate) enum CloudVerb {
     SetDesired,
     /// `image-build` — drive a bootc/osbuild image build (MUTATION; skeleton, U7).
     ImageBuild,
-    /// `container-deploy` — render + hand off a Quadlet unit (MUTATION; skeleton, U8).
+    /// Retired `container-deploy` wire verb, classified only for explicit refusal.
     ContainerDeploy,
     /// `android-provision` — the two-layer Cuttlefish path (MUTATION; skeleton, U10).
     AndroidProvision,
@@ -305,8 +306,8 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
             ..Default::default()
         };
     };
-    // `raw` = the untouched wire body the image-build/container-deploy handlers
-    // parse their verb-specific fields from; `body` = the shared gate fields.
+    // `raw` = the untouched wire body verb-specific handlers parse; `body` = the
+    // shared gate fields. Retired handlers receive it only to return a refusal.
     let raw = body_str;
     let body = CloudActionBody::parse(body_str);
     if let Some(error) = body.schema_error_for(verb) {
@@ -356,7 +357,9 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
             desired::handle_set_desired(w, verb_name, body_str)
         }
 
-        // ── wired MUTATIONS — image-build (U6) + container-deploy (U7) ──
+        // Image building remains a governed artifact mutation. Container deploy
+        // is retained only as an explicit refusal; lifecycle/create belongs to
+        // the typed Workload operation lane.
         CloudVerb::ImageBuild => image::handle(w, verb_name, raw),
         CloudVerb::ContainerDeploy => container::handle(w, verb_name, raw),
         // Container and VM day-2 lifecycle is exclusively owned by the typed

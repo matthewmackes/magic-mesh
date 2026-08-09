@@ -145,12 +145,11 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     };
 
     let valid = state.form.is_valid();
-    let live_apply_available = state.selected_node_apply_armed();
     let draft_key = state.form.workflow_key(view, &node);
     state.sync_provision_draft(draft_key);
     let progress = state.provision_progress();
     let request_pending = state.mutation_is_pending();
-    provision_target_summary(ui, view, &node, live_apply_available);
+    provision_target_summary(ui, view, &node);
     ui.add_space(Style::SP_S);
 
     let android_name = state.form.name.trim().to_string();
@@ -163,7 +162,6 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         view,
         &mut state.form,
         valid,
-        live_apply_available,
         progress,
         request_pending,
         &mut set_desired,
@@ -191,7 +189,6 @@ fn provision_workspace(
     view: DeliveryView,
     form: &mut State,
     valid: bool,
-    live_apply_available: bool,
     progress: ProvisionProgress,
     request_pending: bool,
     set_desired: &mut bool,
@@ -205,7 +202,6 @@ fn provision_workspace(
             ui,
             view,
             valid,
-            live_apply_available,
             progress,
             request_pending,
             set_desired,
@@ -218,7 +214,7 @@ fn provision_workspace(
     ui.add_space(Style::SP_S);
     hcl_override_section(ui, form, false);
     ui.add_space(Style::SP_S);
-    validation_section(ui, form, live_apply_available, false);
+    validation_section(ui, form, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,7 +222,6 @@ fn provision_action_controls(
     ui: &mut egui::Ui,
     view: DeliveryView,
     valid: bool,
-    live_apply_available: bool,
     progress: ProvisionProgress,
     request_pending: bool,
     set_desired: &mut bool,
@@ -246,12 +241,12 @@ fn provision_action_controls(
             let (label, detail) = if view == DeliveryView::AndroidVm {
                 (
                     "Prepare Android VM\u{2026}",
-                    "Step 3 of 5 — save the governed Cuttlefish desired state.",
+                    "Step 3 of 4 — save the governed Cuttlefish desired state.",
                 )
             } else {
                 (
                     "Save desired state\u{2026}",
-                    "Step 3 of 5 — save this workload draft before planning it.",
+                    "Step 3 of 4 — save this workload draft before planning it.",
                 )
             };
             mde_egui::muted_note(ui, detail);
@@ -266,7 +261,7 @@ fn provision_action_controls(
         ProvisionProgress::DesiredSaved => {
             mde_egui::muted_note(
                 ui,
-                "Step 4 of 5 — run the required dry-run plan. Nothing is applied.",
+                "Step 4 of 4 — run the required dry-run plan. Nothing is applied.",
             );
             if action_button(ui, valid, "Run dry-run plan", Style::ACCENT).clicked() {
                 *plan = true;
@@ -279,29 +274,10 @@ fn provision_action_controls(
                  Attach operations. OpenTofu live provision is retired.",
             );
         }
-        ProvisionProgress::Applied => {
-            ui.colored_label(
-                Style::ACCENT,
-                RichText::new("✓ Provisioning complete")
-                    .size(Style::BODY)
-                    .strong(),
-            );
-        }
-    }
-    if !live_apply_available && progress < ProvisionProgress::Applied {
-        mde_egui::muted_note(
-            ui,
-            "Plan-only node: desired state and dry-run are available; live provision will remain disabled.",
-        );
     }
 }
 
-fn provision_target_summary(
-    ui: &mut egui::Ui,
-    view: DeliveryView,
-    node: &str,
-    live_apply_available: bool,
-) {
+fn provision_target_summary(ui: &mut egui::Ui, view: DeliveryView, node: &str) {
     let compact = ui.available_width() >= 760.0;
     card().show(ui, |ui| {
         ui.label(
@@ -314,39 +290,11 @@ fn provision_target_summary(
             ui.horizontal_wrapped(|ui| {
                 inline_summary_field(ui, "Placement node", node, Style::ACCENT_WORKLOADS);
                 inline_summary_field(ui, "Delivery filter", view.label(), Style::TEXT);
-                inline_summary_field(
-                    ui,
-                    "Live apply gate",
-                    if live_apply_available {
-                        "Armed by current mirror"
-                    } else {
-                        "Plan-only / not armed"
-                    },
-                    if live_apply_available {
-                        Style::ACCENT
-                    } else {
-                        Style::TEXT_DIM
-                    },
-                );
             });
         } else {
             ui.add_space(Style::SP_XS);
             field(ui, "Placement node", node, Style::ACCENT_WORKLOADS);
             field(ui, "Delivery filter", view.label(), Style::TEXT);
-            field(
-                ui,
-                "Live apply gate",
-                if live_apply_available {
-                    "Armed by current mirror"
-                } else {
-                    "Plan-only / not armed"
-                },
-                if live_apply_available {
-                    Style::ACCENT
-                } else {
-                    Style::TEXT_DIM
-                },
-            );
         }
     });
 }
@@ -486,7 +434,7 @@ fn hcl_override_section(ui: &mut egui::Ui, form: &mut State, compact: bool) {
     });
 }
 
-fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: bool, compact: bool) {
+fn validation_section(ui: &mut egui::Ui, form: &State, compact: bool) {
     card().show(ui, |ui| {
         ui.label(
             RichText::new("Validation")
@@ -494,9 +442,6 @@ fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: boo
                 .strong()
                 .color(Style::TEXT_DIM),
         );
-        if compact {
-            validation_live_apply_row(ui, live_apply_available);
-        }
         validation_row(
             ui,
             form.is_valid(),
@@ -504,7 +449,7 @@ fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: boo
             if form.is_valid() {
                 "ready"
             } else {
-                "required before Set desired, Plan, or Provision"
+                "required before Save desired state or Plan"
             },
         );
         validation_row(
@@ -517,23 +462,7 @@ fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: boo
                 "bounded to the Workloads contract before request emission"
             },
         );
-        if !compact {
-            validation_live_apply_row(ui, live_apply_available);
-        }
     });
-}
-
-fn validation_live_apply_row(ui: &mut egui::Ui, live_apply_available: bool) {
-    validation_row(
-        ui,
-        live_apply_available,
-        "Live apply",
-        if live_apply_available {
-            "selected node reports an armed apply capability"
-        } else {
-            "Plan remains available; live Provision stays disabled"
-        },
-    );
 }
 
 fn validation_row(ui: &mut egui::Ui, ok: bool, label: &str, detail: &str) {
@@ -574,7 +503,6 @@ fn guided_progress(ui: &mut egui::Ui, progress: ProvisionProgress, valid: bool) 
                 ("Workload details", valid),
                 ("Desired state", progress >= ProvisionProgress::DesiredSaved),
                 ("Dry-run plan", progress >= ProvisionProgress::Planned),
-                ("Typed row operation", progress >= ProvisionProgress::Applied),
             ]
             .into_iter()
             .enumerate()
@@ -698,7 +626,6 @@ mod tests {
         assert!(form.is_valid());
     }
 
-    #[test]
     #[test]
     fn set_desired_serializes_the_worker_envelope() {
         let form = State {

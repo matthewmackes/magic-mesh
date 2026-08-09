@@ -303,11 +303,12 @@ fn list(w: &CloudWorker, verb_name: &str) -> CloudReply {
 /// `build` — shell the disk builder, verify + hash the artifact, and record it into
 /// the Syncthing image store (manifest + SHA256 sidecar). Armed-gated.
 fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> CloudReply {
-    // A container workload has no golden VM disk — it ships via container-deploy (U7).
+    // A container workload has no golden VM disk. Its approved OCI reference
+    // belongs in a typed Workload declaration, not this VM image builder.
     if matches!(body.delivery_type, Some(DeliveryType::ServiceContainer)) {
         return gated(
             verb_name,
-            "service_container workloads are shipped via container-deploy (U7), not image-build",
+            "service_container workloads use an approved OCI image in a typed Workload declaration, not image-build",
         );
     }
     let Some(name) = body.resolved_name() else {
@@ -1406,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn service_container_build_is_routed_to_container_deploy() {
+    fn service_container_build_requires_a_typed_workload_declaration() {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
         let raw = armed_request(serde_json::json!({
@@ -1415,7 +1416,7 @@ mod tests {
         }));
         let reply = w.handle("image-build", &raw);
         assert!(!reply.ok);
-        assert!(reply.gated.unwrap().contains("container-deploy"));
+        assert!(reply.gated.unwrap().contains("typed Workload declaration"));
     }
 
     #[test]
