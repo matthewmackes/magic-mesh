@@ -242,6 +242,12 @@ pub const MAX_EVENTS_IN_CONTEXT: usize = 8;
 /// request topic adds no perceptible latency while keeping index-read churn low.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
 
+/// Lower/upper bounds for startup Bus recovery. Tests may shorten the normal
+/// poll cadence, while production must neither spin nor wait indefinitely to
+/// notice that the shared Bus became available.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Hard ceiling on one `codex exec` invocation.
 ///
 /// A model round-trip is normally a few seconds; this bounds a wedged /
@@ -1111,6 +1117,10 @@ pub struct CopilotWorker {
     codex_bin: String,
     /// Override the Bus spool root. Tests point this at a tempdir.
     bus_root_override: Option<PathBuf>,
+    /// Injectable Bus-open seam for startup-recovery tests. Production always
+    /// opens the resolved shared spool directly.
+    #[cfg(test)]
+    bus_opener: Option<Arc<BusOpenFn>>,
     /// The hash-chained store DB path (the `nodes` + `events` tables) read to
     /// assemble the FD-12 grounding context. Defaults to [`crate::default_db_path`];
     /// tests point it at a tempdir. A read-only grounding read — never written.
@@ -1145,6 +1155,8 @@ impl CopilotWorker {
             codex_timeout: DEFAULT_CODEX_TIMEOUT,
             codex_bin: DEFAULT_CODEX_BIN.to_string(),
             bus_root_override: None,
+            #[cfg(test)]
+            bus_opener: None,
             db_path: crate::default_db_path(),
             status_interval: DEFAULT_STATUS_INTERVAL,
             suggestion_interval: DEFAULT_SUGGESTION_INTERVAL,
@@ -1175,6 +1187,24 @@ impl CopilotWorker {
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
         self
+    }
+
+    /// Override Bus opening for deterministic missing-root/open-failure tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, opener: Arc<BusOpenFn>) -> Self {
+        self.bus_opener = Some(opener);
+        self
+    }
+
+    fn open_bus(&self, bus_root: &std::path::Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(opener) = &self.bus_opener {
+            return opener(bus_root);
+        }
+        Persist::open(bus_root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     /// Override the Copilot capability verifier for deterministic hostile
@@ -1713,8 +1743,15 @@ pub fn interpret_codex_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Co
     CodexOutcome::Answer(answer)
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&std::path::Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+fn copilot_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    copilot_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn copilot_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 #[async_trait::async_trait]
@@ -1724,24 +1761,47 @@ impl Worker for CopilotWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::debug!(target: "mackesd::copilot", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(
-                    target: "mackesd::copilot",
-                    error = %e,
-                    "persist open failed; worker idle",
-                );
-                return Ok(());
+        let bus_root = copilot_bus_root(self.bus_root_override.clone());
+        let retry_interval = self
+            .poll_interval
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let (persist, mut cursor) = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match persist.latest_ulid(ACTION_TOPIC) {
+                    Ok(cursor) => break (persist, cursor),
+                    Err(error) => {
+                        // Activating with an unprimed cursor would replay every
+                        // retained ask. Treat the tail read as part of opening
+                        // and retry the whole transition instead.
+                        tracing::warn!(
+                            target: "mackesd::copilot",
+                            %error,
+                            "Bus cursor prime failed; Copilot startup will retry",
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "mackesd::copilot",
+                        "Bus root unavailable; Copilot startup will retry",
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::copilot",
+                        %error,
+                        "Bus open failed; Copilot startup will retry",
+                    );
+                }
+            }
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
-        // Seed the cursor at the tail so a restart doesn't replay stale asks
-        // (an old question answered twice is worse than dropped on a restart).
-        let mut cursor: Option<String> = persist.latest_ulid(ACTION_TOPIC).ok().flatten();
+        // The cursor was seeded exactly once as part of the successful activation
+        // transition, so restart history is never sent to codex or answered twice.
         let mut tick = tokio::time::interval(self.poll_interval);
         // FD-10 — two additional cadences: a CHEAP status heartbeat (§1) and a
         // MODERATE proactive-suggestion timer (§2). Both run on the same `Send`
@@ -2247,6 +2307,216 @@ mod tests {
             .await
             .expect("worker must exit on shutdown");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn copilot_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/copilot-bus-test");
+        assert_eq!(copilot_bus_root(Some(explicit.clone())), explicit);
+        assert_eq!(
+            copilot_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_bus_wait_is_alive_and_shutdown_prompt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_open = Arc::clone(&attempts);
+        let mut worker = CopilotWorker::new(temp.path().join("workgroup"), "n1".into())
+            .with_bus_root(temp.path().join("bus"))
+            .with_poll_interval(Duration::from_secs(30))
+            .with_bus_opener(Arc::new(move |_| {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !task.is_finished(),
+            "an unavailable Bus must not permanently end Copilot"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("shutdown must interrupt the bounded retry wait")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn bus_open_retry_recovers_without_replaying_or_duplicating_asks() {
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus_root = temp.path().join("bus");
+        let workgroup = temp.path().join("workgroup");
+        std::fs::create_dir_all(&workgroup).expect("workgroup");
+        let bus = Persist::open(bus_root.clone()).expect("seed Bus");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            temp.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let mode = Arc::new(AtomicU8::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mode_for_open = Arc::clone(&mode);
+        let attempts_for_open = Arc::clone(&attempts);
+        let root_for_open = bus_root.clone();
+        let mut worker = CopilotWorker::new(workgroup.clone(), "n1".into())
+            .with_bus_root(bus_root.clone())
+            .with_db_path(temp.path().join("audit.db"))
+            .with_authorizer(authorizer)
+            .with_poll_interval(Duration::from_millis(10))
+            .with_status_interval(Duration::from_millis(10))
+            .with_suggestion_interval(Duration::from_secs(30))
+            .with_triage_interval(Duration::from_secs(30))
+            .with_bus_opener(Arc::new(move |resolved| {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                if resolved != root_for_open {
+                    return Err("resolved an unexpected Bus root".to_string());
+                }
+                match mode_for_open.load(Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected Persist::open failure".to_string()),
+                    _ => Persist::open(root_for_open.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }));
+
+        let stale_nonce = format!(
+            "copilot-recovery-stale-{:016x}",
+            NEXT_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let stale_body = authorized_ask_body(
+            &worker,
+            r#"{"prompt":"stale startup history"}"#,
+            &stale_nonce,
+        );
+        let stale = bus
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&stale_body))
+            .expect("seed stale ask");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!task.is_finished(), "missing root must keep Copilot alive");
+
+        mode.store(1, Ordering::SeqCst);
+        let before_open_failure = attempts.load(Ordering::SeqCst);
+        for _ in 0..40 {
+            if attempts.load(Ordering::SeqCst) > before_open_failure {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            attempts.load(Ordering::SeqCst) > before_open_failure,
+            "the worker must retry into the injected open failure"
+        );
+        assert!(!task.is_finished(), "open failure must keep Copilot alive");
+
+        mode.store(2, Ordering::SeqCst);
+        for _ in 0..80 {
+            if bus
+                .read_latest(STATUS_TOPIC)
+                .expect("read status")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            bus.read_latest(STATUS_TOPIC)
+                .expect("read status")
+                .is_some(),
+            "normal status cadence must activate without a worker restart"
+        );
+        assert!(
+            bus.read_latest(&reply_topic(&stale.ulid))
+                .expect("read stale reply")
+                .is_none(),
+            "the one-time cursor prime must suppress retained startup asks"
+        );
+
+        let fresh_nonce = format!(
+            "copilot-recovery-fresh-{:016x}",
+            NEXT_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let unsigned = r#"{"prompt":"fresh forward ask"}"#;
+        let signing_worker = CopilotWorker::new(workgroup, "n1".into());
+        let fresh_body = authorized_ask_body(&signing_worker, unsigned, &fresh_nonce);
+        let fresh = bus
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&fresh_body))
+            .expect("publish fresh ask");
+        let fresh_reply_topic = reply_topic(&fresh.ulid);
+        for _ in 0..80 {
+            if bus
+                .read_latest(&fresh_reply_topic)
+                .expect("read fresh reply")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let replies = bus
+            .list_since(&fresh_reply_topic, None)
+            .expect("list fresh replies");
+        assert_eq!(replies.len(), 1, "one fresh ask gets exactly one reply");
+        assert!(
+            bus.read_latest(&reply_topic(&stale.ulid))
+                .expect("recheck stale reply")
+                .is_none(),
+            "recovery must never process the stale ask later"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            bus.list_since(&fresh_reply_topic, None)
+                .expect("recheck replies")
+                .len(),
+            1,
+            "later sweeps must not duplicate codex/reply work"
+        );
+        assert!(
+            bus.read_latest(PROPOSAL_TOPIC)
+                .expect("read proposals")
+                .is_none(),
+            "startup recovery must not fabricate action proposals"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("shutdown after recovery")
+            .expect("worker task")
+            .expect("clean worker shutdown");
     }
 
     // ===================== FD-12 §1 — grounding =====================

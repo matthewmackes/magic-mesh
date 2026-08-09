@@ -429,6 +429,11 @@ behavioral evidence is not completion.
   skips retained actions, and executes one forward signed action exactly once.
   BigBoy passed three exact recovery tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
+- **Copilot Bus recovery checkpoint (2026-08-09):** Copilot now survives late
+  Bus availability, treats tail-cursor priming as part of activation, skips
+  retained asks, and answers one forward signed ask exactly once. Machine 196
+  passed three exact recovery tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
