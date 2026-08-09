@@ -689,6 +689,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-08-navigation-authority-s6-r1.md`; `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-generation-atomicity-r2.md`.
 - **Offline catalog binding (2026-08-09):** replacement/expiry revokes tiles and schema-v1 upgrades open empty instead of failing; `.90` passed 7/7:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
+- **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
