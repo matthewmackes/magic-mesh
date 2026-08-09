@@ -79,6 +79,35 @@ impl Clock for SystemClock {
     }
 }
 
+trait ProjectionSerializer: Send + Sync {
+    fn current(&self, snapshot: &CurrentWeatherSnapshot) -> io::Result<String>;
+    fn forecast(&self, snapshot: &WeatherForecastSnapshot) -> io::Result<String>;
+}
+
+struct JsonProjectionSerializer;
+
+impl ProjectionSerializer for JsonProjectionSerializer {
+    fn current(&self, snapshot: &CurrentWeatherSnapshot) -> io::Result<String> {
+        serde_json::to_string(snapshot).map_err(io_other)
+    }
+
+    fn forecast(&self, snapshot: &WeatherForecastSnapshot) -> io::Result<String> {
+        serde_json::to_string(snapshot).map_err(io_other)
+    }
+}
+
+trait WeatherCacheWriter: Send + Sync {
+    fn store(&self, path: &Path, cache: &WeatherCache) -> io::Result<()>;
+}
+
+struct DurableWeatherCacheWriter;
+
+impl WeatherCacheWriter for DurableWeatherCacheWriter {
+    fn store(&self, path: &Path, cache: &WeatherCache) -> io::Result<()> {
+        store_cache(path, cache)
+    }
+}
+
 /// Injectable NWS transport. Production validates every returned URL before a
 /// request; fixtures can exercise parsing and generation races without a live
 /// network dependency.
@@ -1115,6 +1144,11 @@ struct ProviderResult {
     cache: Option<WeatherCache>,
 }
 
+struct StagedProjection {
+    topic: String,
+    body: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RefreshOutcome {
     current_fresh: Option<bool>,
@@ -1181,8 +1215,12 @@ pub struct WeatherForecastWorker {
     host: String,
     probe: Option<Arc<dyn WeatherForecastProbe>>,
     clock: Arc<dyn Clock>,
-    bus_root: Option<PathBuf>,
+    /// Explicit test/operator override. Without one, each transaction resolves
+    /// the current user Bus root and falls back to the canonical system spool.
+    bus_root_override: Option<PathBuf>,
     cache_path: PathBuf,
+    projection_serializer: Arc<dyn ProjectionSerializer>,
+    cache_writer: Arc<dyn WeatherCacheWriter>,
 }
 
 impl WeatherForecastWorker {
@@ -1200,18 +1238,22 @@ impl WeatherForecastWorker {
             host,
             probe,
             clock: Arc::new(SystemClock),
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             cache_path: cache_path(),
+            projection_serializer: Arc::new(JsonProjectionSerializer),
+            cache_writer: Arc::new(DurableWeatherCacheWriter),
         }
     }
 
     fn read_location(&self) -> io::Result<EffectiveLocationSnapshot> {
-        let root = self
-            .bus_root
-            .as_ref()
-            .ok_or_else(|| io::Error::other("Bus spool unavailable"))?;
-        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        // Fresh-open every authority transaction so a late mount, resolver
+        // change, or replaced Bus index cannot remain frozen in this worker.
+        let persist = Persist::open(self.bus_root()).map_err(io_other)?;
         read_effective_location(&persist, &self.host, self.clock.now_ms())
+    }
+
+    fn bus_root(&self) -> PathBuf {
+        weather_forecast_bus_root(self.bus_root_override.clone())
     }
 
     async fn refresh_once(
@@ -1243,13 +1285,10 @@ impl WeatherForecastWorker {
         .await
         .map_err(|error| io::Error::other(format!("weather provider task failed: {error}")))??;
 
-        // Persist never crosses the spawn_blocking boundary. Reopen it on the
-        // worker side, then enforce the S2 authority immediately before writes.
-        let root = self
-            .bus_root
-            .as_ref()
-            .ok_or_else(|| io::Error::other("Bus spool unavailable"))?;
-        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        // Persist never crosses the spawn_blocking boundary. Fresh-open the
+        // current/replaced Bus, then enforce S2 authority after provider I/O and
+        // before deriving or publishing either requested projection.
+        let persist = Persist::open(self.bus_root()).map_err(io_other)?;
         let latest = read_effective_location(&persist, &self.host, self.clock.now_ms())?;
         if !same_effective_location(&location_snapshot, &latest) {
             tracing::info!(
@@ -1271,6 +1310,8 @@ impl WeatherForecastWorker {
                 WeatherCache::empty(&self.host, location_snapshot.generation, location)
             });
         let mut outcome = RefreshOutcome::default();
+        let mut staged =
+            Vec::with_capacity(usize::from(fetch_current) + usize::from(fetch_forecast));
         if let Some(result) = provider.current {
             let (snapshot, fresh) = match result {
                 Ok(snapshot) => {
@@ -1304,11 +1345,11 @@ impl WeatherForecastWorker {
             snapshot
                 .validate_at(self.clock.now_ms())
                 .map_err(io_other)?;
-            publish_json(
-                &persist,
-                &weather_current_state_topic(&self.host),
-                &snapshot,
-            )?;
+            let body = self.projection_serializer.current(&snapshot)?;
+            staged.push(StagedProjection {
+                topic: weather_current_state_topic(&self.host),
+                body,
+            });
             outcome.current_fresh = Some(fresh);
         }
         if let Some(result) = provider.forecast {
@@ -1345,21 +1386,31 @@ impl WeatherForecastWorker {
             snapshot
                 .validate_at(self.clock.now_ms())
                 .map_err(io_other)?;
-            publish_json(
-                &persist,
-                &weather_forecast_state_topic(&self.host),
-                &snapshot,
-            )?;
+            let body = self.projection_serializer.forecast(&snapshot)?;
+            staged.push(StagedProjection {
+                topic: weather_forecast_state_topic(&self.host),
+                body,
+            });
             outcome.forecast_fresh = Some(fresh);
+        }
+
+        // All requested derivation, validation, and serialization completed
+        // before this first write. Persist currently has no multi-topic atomic
+        // batch, so a crash between these writes can still expose a partial pair.
+        for projection in staged {
+            publish_body(&persist, &projection.topic, &projection.body)?;
         }
         if outcome.current_fresh == Some(true) || outcome.forecast_fresh == Some(true) {
             let cache_path = self.cache_path.clone();
-            tokio::task::spawn_blocking(move || store_cache(&cache_path, &cache))
+            let cache_writer = Arc::clone(&self.cache_writer);
+            tokio::task::spawn_blocking(move || cache_writer.store(&cache_path, &cache))
                 .await
                 .map_err(|error| {
                     io::Error::other(format!("weather cache task failed: {error}"))
                 })??;
         }
+        // Freshness is committed to the scheduler only after every requested
+        // Bus write and every required fresh-cache persistence has succeeded.
         Ok(outcome)
     }
 }
@@ -1446,10 +1497,22 @@ fn blocking_provider_refresh(
 
 fn publish_json<T: serde::Serialize>(persist: &Persist, topic: &str, value: &T) -> io::Result<()> {
     let body = serde_json::to_string(value).map_err(io_other)?;
+    publish_body(persist, topic, &body)
+}
+
+fn publish_body(persist: &Persist, topic: &str, body: &str) -> io::Result<()> {
     persist
-        .write(topic, Priority::Default, None, Some(&body))
+        .write(topic, Priority::Default, None, Some(body))
         .map_err(io_other)?;
     Ok(())
+}
+
+fn weather_forecast_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    weather_forecast_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn weather_forecast_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 fn io_other(error: impl std::fmt::Display) -> io::Error {
@@ -1523,6 +1586,26 @@ mod tests {
     impl Clock for TestClock {
         fn now_ms(&self) -> i64 {
             self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FailForecastSerializer;
+
+    impl ProjectionSerializer for FailForecastSerializer {
+        fn current(&self, snapshot: &CurrentWeatherSnapshot) -> io::Result<String> {
+            serde_json::to_string(snapshot).map_err(io_other)
+        }
+
+        fn forecast(&self, _snapshot: &WeatherForecastSnapshot) -> io::Result<String> {
+            Err(io::Error::other("injected forecast serialization failure"))
+        }
+    }
+
+    struct FailCacheWriter;
+
+    impl WeatherCacheWriter for FailCacheWriter {
+        fn store(&self, _path: &Path, _cache: &WeatherCache) -> io::Result<()> {
+            Err(io::Error::other("injected cache persistence failure"))
         }
     }
 
@@ -1663,8 +1746,10 @@ mod tests {
             host: "workstation-1".into(),
             probe: Some(probe),
             clock: Arc::new(TestClock(AtomicI64::new(now_ms))),
-            bus_root: Some(temp.path().join("bus")),
+            bus_root_override: Some(temp.path().join("bus")),
             cache_path: temp.path().join("weather-cache.json"),
+            projection_serializer: Arc::new(JsonProjectionSerializer),
+            cache_writer: Arc::new(DurableWeatherCacheWriter),
         }
     }
 
@@ -1751,6 +1836,99 @@ mod tests {
             .read_latest(&weather_forecast_state_topic("workstation-1"))
             .expect("read")
             .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_and_replaced_bus_are_reopened_for_current_transactions() {
+        assert_eq!(
+            weather_forecast_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        fs::write(&root, b"temporarily not a Bus directory").expect("block Bus root");
+        let late_worker = worker(&temp, fixture_probe(24));
+        assert!(late_worker.read_location().is_err());
+        fs::remove_file(&root).expect("remove Bus blocker");
+        write_location(&root, &location(7, -71.0589));
+        assert_eq!(
+            late_worker
+                .read_location()
+                .expect("late Bus recovery")
+                .generation,
+            7
+        );
+
+        let retired_root = temp.path().join("retired-bus");
+        let replacement_root = root.clone();
+        let mut probe = Arc::try_unwrap(fixture_probe(24))
+            .unwrap_or_else(|_| panic!("fixture unexpectedly shared"));
+        probe.on_hourly = Some(Box::new(move || {
+            fs::rename(&replacement_root, &retired_root).expect("retire old Bus");
+            write_location(&replacement_root, &location(7, -71.0589));
+        }));
+        let worker = worker(&temp, Arc::new(probe));
+        let outcome = worker
+            .refresh_once(location(7, -71.0589), true, true)
+            .await
+            .expect("refresh through replaced Bus");
+        assert_eq!(outcome.current_fresh, Some(true));
+        assert_eq!(outcome.forecast_fresh, Some(true));
+        let current: CurrentWeatherSnapshot =
+            latest(&root, &weather_current_state_topic("workstation-1"));
+        let forecast: WeatherForecastSnapshot =
+            latest(&root, &weather_forecast_state_topic("workstation-1"));
+        assert_eq!(current.location_generation, 7);
+        assert_eq!(forecast.location_generation, 7);
+        let retired = Persist::open(temp.path().join("retired-bus")).expect("retired Bus");
+        assert!(retired
+            .read_latest(&weather_current_state_topic("workstation-1"))
+            .expect("retired current read")
+            .is_none());
+        assert!(retired
+            .read_latest(&weather_forecast_state_topic("workstation-1"))
+            .expect("retired forecast read")
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stages_requested_pair_and_requires_fresh_cache_commit() {
+        let serialization_temp = TempDir::new().expect("serialization temp");
+        let serialization_root = serialization_temp.path().join("bus");
+        write_location(&serialization_root, &location(7, -71.0589));
+        let mut serialization_worker = worker(&serialization_temp, fixture_probe(24));
+        serialization_worker.projection_serializer = Arc::new(FailForecastSerializer);
+        let error = serialization_worker
+            .refresh_once(location(7, -71.0589), true, true)
+            .await
+            .expect_err("forecast serialization must fail the staged pair");
+        assert!(error.to_string().contains("serialization failure"));
+        let persist = Persist::open(serialization_root).expect("serialization Bus");
+        assert!(persist
+            .read_latest(&weather_current_state_topic("workstation-1"))
+            .expect("current read")
+            .is_none());
+        assert!(persist
+            .read_latest(&weather_forecast_state_topic("workstation-1"))
+            .expect("forecast read")
+            .is_none());
+        assert!(!serialization_worker.cache_path.exists());
+
+        let cache_temp = TempDir::new().expect("cache temp");
+        let cache_root = cache_temp.path().join("bus");
+        write_location(&cache_root, &location(7, -71.0589));
+        let mut cache_worker = worker(&cache_temp, fixture_probe(24));
+        cache_worker.cache_writer = Arc::new(FailCacheWriter);
+        let error = cache_worker
+            .refresh_once(location(7, -71.0589), true, true)
+            .await
+            .expect_err("fresh cache failure must prevent success");
+        assert!(error.to_string().contains("cache persistence failure"));
+        let _: CurrentWeatherSnapshot =
+            latest(&cache_root, &weather_current_state_topic("workstation-1"));
+        let _: WeatherForecastSnapshot =
+            latest(&cache_root, &weather_forecast_state_topic("workstation-1"));
+        assert!(!cache_worker.cache_path.exists());
     }
 
     #[test]
