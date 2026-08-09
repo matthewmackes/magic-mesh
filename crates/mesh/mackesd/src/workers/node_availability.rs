@@ -463,22 +463,56 @@ pub trait LifecycleIntentSink {
 pub struct PersistLifecycleIntentSink<'a> {
     persist: &'a mut Persist,
     durable_path: &'a Path,
+    bus_root: &'a Path,
+    bus_identity: AvailabilityBusIdentity,
+    #[cfg(test)]
+    replacement_after_write: Option<(PathBuf, PathBuf)>,
 }
 
 impl<'a> PersistLifecycleIntentSink<'a> {
-    /// Borrow the caller's exact Bus handle and durable record path.
-    #[must_use]
-    pub const fn new(persist: &'a mut Persist, durable_path: &'a Path) -> Self {
-        Self {
+    /// Bind the caller's exact Bus connection to its current path generation
+    /// and borrow the exact durable record path.
+    pub(crate) fn new(
+        persist: &'a mut Persist,
+        durable_path: &'a Path,
+        bus_root: &'a Path,
+    ) -> Result<Self, PersistLifecycleIntentError> {
+        let bus_identity = availability_bus_identity(bus_root)
+            .map_err(PersistLifecycleIntentError::BusIdentity)?;
+        if persist.index_inode() != Some(bus_identity.inode) {
+            return Err(PersistLifecycleIntentError::BusIdentity(
+                "Bus connection does not match the current index path".to_string(),
+            ));
+        }
+        Ok(Self {
             persist,
             durable_path,
-        }
+            bus_root,
+            bus_identity,
+            #[cfg(test)]
+            replacement_after_write: None,
+        })
     }
 
     /// Return the exact caller-supplied durable record path.
     #[must_use]
     pub const fn durable_path(&self) -> &Path {
         self.durable_path
+    }
+
+    #[cfg(test)]
+    fn with_replacement_after_write(
+        mut self,
+        replacement_root: PathBuf,
+        retired_root: PathBuf,
+    ) -> Self {
+        self.replacement_after_write = Some((replacement_root, retired_root));
+        self
+    }
+
+    fn verify_bus(&self) -> Result<(), PersistLifecycleIntentError> {
+        verify_availability_bus_identity(self.persist, self.bus_root, self.bus_identity)
+            .map_err(PersistLifecycleIntentError::BusIdentity)
     }
 }
 
@@ -503,13 +537,91 @@ impl LifecycleIntentSink for PersistLifecycleIntentSink<'_> {
             });
         }
 
+        self.verify_bus()?;
         write_lifecycle_intent_record(self.durable_path, body.as_bytes())?;
-        self.persist.reopen_if_index_changed();
+        self.verify_bus()?;
         self.persist
             .write(&topic, Priority::Default, None, Some(&body))
             .map_err(PersistLifecycleIntentError::Bus)?;
+
+        #[cfg(test)]
+        if let Some((replacement_root, retired_root)) = self.replacement_after_write.take() {
+            std::fs::rename(self.bus_root, retired_root)
+                .map_err(|error| PersistLifecycleIntentError::BusIdentity(error.to_string()))?;
+            std::fs::rename(replacement_root, self.bus_root)
+                .map_err(|error| PersistLifecycleIntentError::BusIdentity(error.to_string()))?;
+        }
+
+        self.verify_bus()?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AvailabilityBusIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn availability_bus_identity(root: &Path) -> Result<AvailabilityBusIdentity, String> {
+    let index = root.join("index.sqlite");
+    let metadata = std::fs::metadata(&index)
+        .map_err(|error| format!("inspect Bus index {}: {error}", index.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Bus index {} is not a regular file",
+            index.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(AvailabilityBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(AvailabilityBusIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+}
+
+fn open_current_availability_bus(
+    root: &Path,
+) -> Result<(Persist, AvailabilityBusIdentity), RuntimeAvailabilityError> {
+    let before = match availability_bus_identity(root) {
+        Ok(identity) => identity,
+        Err(_) if !root.join("index.sqlite").exists() => {
+            drop(Persist::open(root.to_path_buf()).map_err(RuntimeAvailabilityError::Bus)?);
+            availability_bus_identity(root).map_err(RuntimeAvailabilityError::BusIdentity)?
+        }
+        Err(error) => return Err(RuntimeAvailabilityError::BusIdentity(error)),
+    };
+    let persist = Persist::open(root.to_path_buf()).map_err(RuntimeAvailabilityError::Bus)?;
+    let after = availability_bus_identity(root).map_err(RuntimeAvailabilityError::BusIdentity)?;
+    if before != after || persist.index_inode() != Some(after.inode) {
+        return Err(RuntimeAvailabilityError::BusIdentity(
+            "Bus connection/path identity changed while opening".to_string(),
+        ));
+    }
+    Ok((persist, after))
+}
+
+fn verify_availability_bus_identity(
+    persist: &Persist,
+    root: &Path,
+    expected: AvailabilityBusIdentity,
+) -> Result<(), String> {
+    let current = availability_bus_identity(root)?;
+    if current != expected || persist.index_inode() != Some(expected.inode) {
+        return Err("Bus connection/path identity changed during transaction".to_string());
+    }
+    Ok(())
 }
 
 /// One runtime producer request. Callers choose a closed lifecycle state and
@@ -632,11 +744,12 @@ impl RuntimeAvailabilityPublisher {
         let _guard = publication_lock
             .lock()
             .map_err(|_| RuntimeAvailabilityError::PublicationLockPoisoned)?;
-        let mut persist =
-            Persist::open(self.bus_root.clone()).map_err(RuntimeAvailabilityError::Bus)?;
+        let (mut persist, bus_identity) = open_current_availability_bus(&self.bus_root)?;
         let current = self.current_intent()?;
+        verify_availability_bus_identity(&persist, &self.bus_root, bus_identity)
+            .map_err(RuntimeAvailabilityError::BusIdentity)?;
         if let Some(intent) = &current {
-            retry_durable_publication(&mut persist, intent)?;
+            retry_durable_publication(&mut persist, &self.bus_root, bus_identity, intent)?;
         }
         Ok(current)
     }
@@ -651,12 +764,13 @@ impl RuntimeAvailabilityPublisher {
         let _guard = publication_lock
             .lock()
             .map_err(|_| RuntimeAvailabilityError::PublicationLockPoisoned)?;
-        let mut persist =
-            Persist::open(self.bus_root.clone()).map_err(RuntimeAvailabilityError::Bus)?;
+        let (mut persist, bus_identity) = open_current_availability_bus(&self.bus_root)?;
         let previous = self.current_intent()?;
+        verify_availability_bus_identity(&persist, &self.bus_root, bus_identity)
+            .map_err(RuntimeAvailabilityError::BusIdentity)?;
 
         if let Some(previous) = &previous {
-            retry_durable_publication(&mut persist, previous)?;
+            retry_durable_publication(&mut persist, &self.bus_root, bus_identity, previous)?;
             if runtime_request_matches(previous, &request) && now_ms <= previous.expires_at_ms {
                 return Ok(previous.clone());
             }
@@ -677,7 +791,9 @@ impl RuntimeAvailabilityPublisher {
                 .map_err(RuntimeAvailabilityError::Admission)?;
         }
         let evidence = runtime_evidence(intent.clone())?;
-        let mut sink = PersistLifecycleIntentSink::new(&mut persist, &self.durable_path);
+        let mut sink =
+            PersistLifecycleIntentSink::new(&mut persist, &self.durable_path, &self.bus_root)
+                .map_err(RuntimeAvailabilityError::DurableFilesystem)?;
         ledger
             .publish_lifecycle_intent(evidence, now_ms, &mut sink)
             .map_err(RuntimeAvailabilityError::Publication)?;
@@ -814,23 +930,67 @@ fn runtime_evidence(
 
 fn retry_durable_publication(
     persist: &mut Persist,
+    bus_root: &Path,
+    bus_identity: AvailabilityBusIdentity,
     intent: &NodeAvailabilityIntent,
 ) -> Result<(), RuntimeAvailabilityError> {
     let body = serde_json::to_string(intent)
         .map_err(|error| RuntimeAvailabilityError::DurableRecord(error.to_string()))?;
+    if body.len() > MAX_LIFECYCLE_INTENT_RECORD_BYTES {
+        return Err(RuntimeAvailabilityError::DurableRecord(
+            "durable lifecycle record exceeds the publication byte bound".to_string(),
+        ));
+    }
     let topic = node_health_topic(&intent.node_id);
-    persist.reopen_if_index_changed();
-    let already_published = persist
-        .list_since(&topic, None)
-        .map_err(RuntimeAvailabilityError::Bus)?
-        .into_iter()
-        .next_back()
-        .and_then(|message| message.body)
-        .is_some_and(|published| published == body);
+    if topic.len() > MAX_LIFECYCLE_INTENT_TOPIC_BYTES {
+        return Err(RuntimeAvailabilityError::DurableRecord(
+            "durable lifecycle topic exceeds the publication byte bound".to_string(),
+        ));
+    }
+    verify_availability_bus_identity(persist, bus_root, bus_identity)
+        .map_err(RuntimeAvailabilityError::BusIdentity)?;
+    let latest = persist
+        .read_latest(&topic)
+        .map_err(RuntimeAvailabilityError::Bus)?;
+    verify_availability_bus_identity(persist, bus_root, bus_identity)
+        .map_err(RuntimeAvailabilityError::BusIdentity)?;
+    let already_published = match latest.and_then(|message| message.body) {
+        None => false,
+        Some(published) if published == body => true,
+        Some(published) => {
+            if published.len() > MAX_LIFECYCLE_INTENT_RECORD_BYTES {
+                return Err(RuntimeAvailabilityError::BusProjection(
+                    "latest Bus availability row exceeds the byte bound".to_string(),
+                ));
+            }
+            let retained: NodeAvailabilityIntent =
+                serde_json::from_str(&published).map_err(|error| {
+                    RuntimeAvailabilityError::BusProjection(format!(
+                        "latest Bus availability row is malformed: {error}"
+                    ))
+                })?;
+            retained
+                .validate()
+                .map_err(|error| RuntimeAvailabilityError::BusProjection(error.to_string()))?;
+            if retained.node_id != intent.node_id || retained.device_id != intent.device_id {
+                return Err(RuntimeAvailabilityError::BusProjection(
+                    "latest Bus availability row carries another identity".to_string(),
+                ));
+            }
+            if retained.generation >= intent.generation {
+                return Err(RuntimeAvailabilityError::BusProjection(
+                    "latest Bus availability row conflicts with retained durable truth".to_string(),
+                ));
+            }
+            false
+        }
+    };
     if !already_published {
         persist
             .write(&topic, Priority::Default, None, Some(&body))
             .map_err(RuntimeAvailabilityError::Bus)?;
+        verify_availability_bus_identity(persist, bus_root, bus_identity)
+            .map_err(RuntimeAvailabilityError::BusIdentity)?;
     }
     Ok(())
 }
@@ -855,6 +1015,12 @@ pub enum RuntimeAvailabilityError {
     Publication(LifecycleIntentPublicationError<PersistLifecycleIntentError>),
     /// Opening or inspecting the Bus failed.
     Bus(PersistError),
+    /// The live Bus index path and opened SQLite connection were not one
+    /// stable storage generation for the complete transaction.
+    BusIdentity(String),
+    /// The bounded retained availability projection was malformed or
+    /// contradicted the durable publication outbox.
+    BusProjection(String),
     /// The durable record was malformed or carried another identity.
     DurableRecord(String),
     /// The generation counter cannot advance safely.
@@ -874,6 +1040,10 @@ impl fmt::Display for RuntimeAvailabilityError {
             Self::Admission(error) => write!(formatter, "availability admission: {error}"),
             Self::Publication(error) => write!(formatter, "availability publication: {error}"),
             Self::Bus(error) => write!(formatter, "availability Bus: {error}"),
+            Self::BusIdentity(error) => write!(formatter, "availability Bus identity: {error}"),
+            Self::BusProjection(error) => {
+                write!(formatter, "availability Bus projection: {error}")
+            }
             Self::DurableRecord(error) => write!(formatter, "availability durable record: {error}"),
             Self::GenerationExhausted => formatter.write_str("availability generation exhausted"),
             Self::PublicationLockPoisoned => {
@@ -927,6 +1097,9 @@ pub enum PersistLifecycleIntentError {
     },
     /// The canonical Bus write failed after durable retention.
     Bus(PersistError),
+    /// The opened SQLite connection and canonical index path did not remain
+    /// bound to one storage generation through publication verification.
+    BusIdentity(String),
 }
 
 impl fmt::Display for PersistLifecycleIntentError {
@@ -955,6 +1128,9 @@ impl fmt::Display for PersistLifecycleIntentError {
                 write!(formatter, "lifecycle intent {operation} failed: {detail}")
             }
             Self::Bus(error) => write!(formatter, "lifecycle intent Bus publish failed: {error}"),
+            Self::BusIdentity(error) => {
+                write!(formatter, "lifecycle intent Bus identity failed: {error}")
+            }
         }
     }
 }
@@ -968,6 +1144,7 @@ impl std::error::Error for PersistLifecycleIntentError {
             | Self::TopicTooLong { .. }
             | Self::InvalidDurablePath(_)
             | Self::SymlinkRejected
+            | Self::BusIdentity(_)
             | Self::Filesystem { .. } => None,
         }
     }
@@ -1628,7 +1805,9 @@ mod tests {
         let sleeping_body = serde_json::to_vec(&sleeping).expect("encode sleep");
 
         {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable_path);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &durable_path, bus_root.path())
+                    .expect("bind Bus generation");
             assert_eq!(sink.durable_path(), durable_path.as_path());
             ledger
                 .publish_lifecycle_intent(
@@ -1661,7 +1840,9 @@ mod tests {
         );
         let returned_body = serde_json::to_vec(&returned).expect("encode returned");
         {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable_path);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &durable_path, bus_root.path())
+                    .expect("bind Bus generation");
             ledger
                 .publish_lifecycle_intent(
                     LifecycleIntentEvidence::Returned(returned.clone()),
@@ -1714,7 +1895,9 @@ mod tests {
         let sleeping = sleep_intent();
 
         let result = {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable_path);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &durable_path, bus_root.path())
+                    .expect("bind Bus generation");
             ledger.publish_lifecycle_intent(
                 LifecycleIntentEvidence::Sleep(sleeping),
                 NOW_MS,
@@ -1753,7 +1936,9 @@ mod tests {
         let sleeping = sleep_intent();
 
         let final_result = {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable_path);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &durable_path, bus_root.path())
+                    .expect("bind Bus generation");
             ledger.publish_lifecycle_intent(
                 LifecycleIntentEvidence::Sleep(sleeping.clone()),
                 NOW_MS,
@@ -1778,7 +1963,9 @@ mod tests {
         symlink(&real_parent, &linked_parent).expect("create parent symlink");
         let through_parent = linked_parent.join("node-a-intent.json");
         let parent_result = {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &through_parent);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &through_parent, bus_root.path())
+                    .expect("bind Bus generation");
             ledger.publish_lifecycle_intent(
                 LifecycleIntentEvidence::Sleep(sleeping),
                 NOW_MS,
@@ -1816,7 +2003,9 @@ mod tests {
         let expected_body = serde_json::to_vec(&sleeping).expect("encode expected record");
 
         let failed = {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable_path);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &durable_path, bus_root.path())
+                    .expect("bind Bus generation");
             ledger.publish_lifecycle_intent(
                 LifecycleIntentEvidence::Sleep(sleeping.clone()),
                 NOW_MS,
@@ -1837,7 +2026,9 @@ mod tests {
 
         std::fs::remove_file(&bus_blocker).expect("unblock Bus topic");
         {
-            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable_path);
+            let mut sink =
+                PersistLifecycleIntentSink::new(&mut persist, &durable_path, bus_root.path())
+                    .expect("bind Bus generation");
             ledger
                 .publish_lifecycle_intent(
                     LifecycleIntentEvidence::Sleep(sleeping.clone()),
@@ -1876,6 +2067,15 @@ mod tests {
             "host-state-power",
             "managed suspend",
             Some(Duration::from_secs(60)),
+        )
+    }
+
+    fn runtime_returned_request() -> RuntimeAvailabilityRequest {
+        RuntimeAvailabilityRequest::lifecycle(
+            NodeAvailabilityState::Returned,
+            "host-state-power",
+            "resume stabilized",
+            None,
         )
     }
 
@@ -1949,6 +2149,218 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let expected = serde_json::to_string(&durable_only).unwrap();
         assert_eq!(rows[0].body.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn bus_transaction_recovers_late_storage_with_same_long_running_owner() {
+        let holder = tempfile::tempdir().expect("holder");
+        let blocked_parent = holder.path().join("blocked-parent");
+        std::fs::write(&blocked_parent, b"not a directory").expect("block Bus parent");
+        let bus = blocked_parent.join("bus");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(&bus, &durable);
+
+        assert!(publisher
+            .publish_at(runtime_sleep_request(), 40_000)
+            .is_err());
+        assert!(!durable.exists(), "failed input staging cannot mint truth");
+
+        std::fs::remove_file(&blocked_parent).expect("remove blocker");
+        std::fs::create_dir(&blocked_parent).expect("create Bus parent");
+        let sleep = publisher
+            .publish_at(runtime_sleep_request(), 41_000)
+            .expect("the same owner consumes the late Bus");
+        assert_eq!(sleep.generation, 1);
+        let persist = Persist::open(bus).expect("late Bus");
+        assert_eq!(
+            persist
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("late projection")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bus_transaction_unreadable_replacement_preserves_truth_then_corrects_forward() {
+        let holder = tempfile::tempdir().expect("holder");
+        let bus = holder.path().join("bus");
+        let retired = holder.path().join("retired");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(&bus, &durable);
+        let sleep = publisher
+            .publish_at(runtime_sleep_request(), 50_000)
+            .expect("initial sleep");
+
+        std::fs::rename(&bus, &retired).expect("retire initial Bus");
+        std::fs::create_dir(&bus).expect("replacement root");
+        std::fs::create_dir(bus.join("index.sqlite")).expect("unreadable index shape");
+        assert!(matches!(
+            publisher.publish_at(runtime_returned_request(), 51_000),
+            Err(RuntimeAvailabilityError::BusIdentity(_))
+        ));
+        assert_eq!(
+            publisher.current_intent().expect("retained truth"),
+            Some(sleep.clone())
+        );
+
+        std::fs::remove_dir_all(&bus).expect("remove unreadable replacement");
+        let replacement = Persist::open(bus.clone()).expect("readable replacement");
+        let returned = publisher
+            .publish_at(runtime_returned_request(), 52_000)
+            .expect("correct retained truth and forward state");
+        assert_eq!(returned.generation, 2);
+        let rows = replacement
+            .list_since(&node_health_topic("node-a"), None)
+            .expect("replacement projection");
+        assert_eq!(rows.len(), 2, "sleep outbox precedes returned state");
+        let projected = rows
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<NodeAvailabilityIntent>(
+                    row.body.as_deref().expect("projection body"),
+                )
+                .expect("typed projection")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected, vec![sleep, returned]);
+    }
+
+    #[test]
+    fn bus_transaction_same_path_replacement_reaches_long_running_worker_without_restart() {
+        let holder = tempfile::tempdir().expect("holder");
+        let bus = holder.path().join("bus");
+        let retired = holder.path().join("retired");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let publisher = runtime_publisher(&bus, &durable);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Ok((request, now_ms)) = request_rx.recv() {
+                if result_tx
+                    .send(publisher.publish_at(request, now_ms))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        request_tx
+            .send((runtime_sleep_request(), 60_000))
+            .expect("queue initial sleep");
+        let sleep = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker sleep reply")
+            .expect("initial sleep");
+
+        std::fs::rename(&bus, &retired).expect("retire Bus at the same path");
+        let replacement = Persist::open(bus.clone()).expect("replacement Bus");
+        request_tx
+            .send((runtime_returned_request(), 61_000))
+            .expect("queue forward return");
+        let returned = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker forward reply")
+            .expect("same long-running worker corrects and publishes forward");
+        assert!(
+            !worker.is_finished(),
+            "worker must remain live after recovery"
+        );
+
+        let replacement_rows = replacement
+            .list_since(&node_health_topic("node-a"), None)
+            .expect("replacement rows");
+        assert_eq!(replacement_rows.len(), 2);
+        let replacement_generations = replacement_rows
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<NodeAvailabilityIntent>(row.body.as_deref().expect("body"))
+                    .expect("intent")
+                    .generation
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replacement_generations,
+            vec![sleep.generation, returned.generation]
+        );
+        let retired = Persist::open(retired).expect("retired Bus");
+        assert_eq!(
+            retired
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("retired rows")
+                .len(),
+            1,
+            "forward generation must not leak back into the retired Bus"
+        );
+        drop(request_tx);
+        worker.join().expect("clean worker shutdown");
+    }
+
+    #[test]
+    fn bus_transaction_replacement_after_write_does_not_commit_and_outbox_recovers() {
+        let holder = tempfile::tempdir().expect("holder");
+        let bus = holder.path().join("bus");
+        let replacement_root = holder.path().join("replacement");
+        let retired_root = holder.path().join("retired");
+        let state = tempfile::tempdir().expect("state");
+        let durable = state.path().join("availability/current.json");
+        let mut persist = Persist::open(bus.clone()).expect("initial Bus");
+        drop(Persist::open(replacement_root.clone()).expect("replacement Bus"));
+        let (mut ledger, awake) = awake_ledger();
+        let sleeping = sleep_intent();
+        let failed = {
+            let mut sink = PersistLifecycleIntentSink::new(&mut persist, &durable, &bus)
+                .expect("bind initial Bus")
+                .with_replacement_after_write(replacement_root, retired_root.clone());
+            ledger.publish_lifecycle_intent(
+                LifecycleIntentEvidence::Sleep(sleeping.clone()),
+                NOW_MS,
+                &mut sink,
+            )
+        };
+        assert!(matches!(
+            failed,
+            Err(LifecycleIntentPublicationError::Output(
+                PersistLifecycleIntentError::BusIdentity(_)
+            ))
+        ));
+        assert_eq!(ledger.current("node-a"), Some(&awake));
+        assert_eq!(
+            std::fs::read(&durable).expect("durable outbox"),
+            serde_json::to_vec(&sleeping).expect("sleep bytes")
+        );
+        let current = Persist::open(bus.clone()).expect("current Bus");
+        assert!(current
+            .read_latest(&node_health_topic("node-a"))
+            .expect("current projection")
+            .is_none());
+
+        let publisher = runtime_publisher(&bus, &durable);
+        assert_eq!(
+            publisher.correct_forward().expect("recover outbox"),
+            Some(sleeping.clone())
+        );
+        let recovered: NodeAvailabilityIntent = serde_json::from_str(
+            current
+                .read_latest(&node_health_topic("node-a"))
+                .expect("recovered projection")
+                .and_then(|message| message.body)
+                .as_deref()
+                .expect("recovered body"),
+        )
+        .expect("recovered typed intent");
+        assert_eq!(recovered, sleeping);
+        assert_eq!(
+            Persist::open(retired_root)
+                .expect("retired Bus")
+                .list_since(&node_health_topic("node-a"), None)
+                .expect("retired projection")
+                .len(),
+            1
+        );
     }
 
     #[test]

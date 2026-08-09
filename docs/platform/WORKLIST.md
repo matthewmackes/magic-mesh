@@ -475,7 +475,7 @@ behavioral evidence is not completion.
 - **Health/Units/forecast recovery checkpoints (2026-08-09):** reads stage before effects and failed replies retry; machines 194/193 and BigBoy passed focused gates:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`,
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-kvm-health-bus-recovery-r73.md`,
+  `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-availability-bus-transaction-recovery-r88.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
 - **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority recovers and cache persistence precedes publication; machine 9 passed two exact tests:
@@ -2187,6 +2187,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-2026-08-09-health-result-durability-r10.md`.
 - **Node-grade transaction checkpoint (2026-08-09):** late/replaced Bus recovery, durable remediation results, and strictly forward canonical/Bus generations passed
   five focused machine-194 gates: `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`.
+- **Node-availability recovery (2026-08-09):** durable truth corrects forward across late/replaced Bus storage without committing partial ledger state. Machine 193 passed 4/4:
+  `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-availability-bus-transaction-recovery-r88.md`.
 - **Quiet-Windows discovery checkpoint (2026-08-09):** ping-silent local hosts reach bounded TCP 3389 fingerprinting without widening the `/24`; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
 - **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
