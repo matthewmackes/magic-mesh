@@ -656,9 +656,7 @@ impl ClockWorker {
             })
             .map(|occurrence| occurrence.occurrence_id.clone())
             .collect::<Vec<_>>();
-        if due.is_empty() && scheduled_occurrences.is_empty() {
-            return Ok(false);
-        }
+        let mut changed = !due.is_empty() || !scheduled_occurrences.is_empty();
         for (schedule_id, due_at) in due {
             let Some(index) = snapshot
                 .schedules
@@ -692,7 +690,34 @@ impl ClockWorker {
                 }
             }
         }
-        Ok(true)
+        let alarm_schedule_ids = snapshot
+            .schedules
+            .iter()
+            .filter(|schedule| matches!(schedule.schedule, ClockScheduleKindV1::Alarm(_)))
+            .map(|schedule| schedule.schedule_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let auto_silence_ms = i64::from(snapshot.settings.auto_silence_minutes)
+            .checked_mul(60_000)
+            .ok_or_else(|| anyhow::anyhow!("Clock auto-silence duration overflow"))?;
+        for occurrence in &mut snapshot.occurrences {
+            if occurrence.phase != ClockOccurrencePhase::Ringing
+                || !alarm_schedule_ids.contains(occurrence.schedule_id.as_str())
+                || occurrence
+                    .due_at_utc_ms
+                    .checked_add(auto_silence_ms)
+                    .is_none_or(|deadline| deadline > now_ms)
+            {
+                continue;
+            }
+            occurrence.phase = ClockOccurrencePhase::Missed;
+            for target in &mut occurrence.targets {
+                if target.disposition == ClockTargetDisposition::Ringing {
+                    target.disposition = ClockTargetDisposition::Missed;
+                }
+            }
+            changed = true;
+        }
+        Ok(changed)
     }
 
     fn tick_once(&mut self) -> anyhow::Result<()> {
@@ -1633,6 +1658,17 @@ fn clock_audio_transitions(
                     },
                 ))
             }
+            (Some(ClockOccurrencePhase::Ringing), ClockOccurrencePhase::Missed)
+                if previous_local_disposition == Some(ClockTargetDisposition::Ringing) =>
+            {
+                Some((
+                    previous.expect("matched Ringing occurrence").revision,
+                    "auto-silence",
+                    ClockAudioActionV1::Stop {
+                        acknowledgement_id: auto_silence_acknowledgement_id(occurrence),
+                    },
+                ))
+            }
             (Some(ClockOccurrencePhase::Ringing), ClockOccurrencePhase::Snoozed)
                 if previous_local_disposition == Some(ClockTargetDisposition::Ringing) =>
             {
@@ -1736,6 +1772,18 @@ fn clock_audio_request_id(
     digest.update(action.as_bytes());
     format!(
         "clock-audio-{}-{action}",
+        &hex_bytes(&digest.finalize())[..32]
+    )
+}
+
+fn auto_silence_acknowledgement_id(occurrence: &ClockOccurrenceV1) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"magic-mesh:clock-auto-silence:v1\0");
+    digest.update(occurrence.occurrence_id.as_bytes());
+    digest.update([0]);
+    digest.update(occurrence.global_event_id.as_bytes());
+    format!(
+        "clock-auto-silence-{}",
         &hex_bytes(&digest.finalize())[..32]
     )
 }
@@ -2359,6 +2407,97 @@ mod tests {
             fixture.worker.snapshot.as_ref().unwrap().occurrences.len(),
             2,
             "the next selected civil Sunday must create exactly one new occurrence"
+        );
+    }
+
+    #[test]
+    fn restart_auto_silences_elapsed_alarm_and_durably_stops_audio() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let due_at = NOW + 5_000;
+        fixture.publish(&fixture.alarm_command("auto-silence", 1, due_at));
+        fixture.worker.tick_once().unwrap();
+
+        fixture.clock.0.store(due_at, Ordering::Relaxed);
+        fixture.worker.tick_once().unwrap();
+        let ringing = fixture.worker.snapshot.as_ref().unwrap().occurrences[0].clone();
+        assert_eq!(ringing.phase, ClockOccurrencePhase::Ringing);
+
+        let auto_silence_at = due_at
+            + i64::from(
+                fixture
+                    .worker
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .auto_silence_minutes,
+            ) * 60_000;
+        fixture.clock.0.store(auto_silence_at, Ordering::Relaxed);
+        let mut restarted = ClockWorker {
+            node_id: "seat-1".into(),
+            bus_root: Some(fixture.bus.clone()),
+            poll: POLL,
+            clock: fixture.clock.clone(),
+            store: Arc::new(SqliteClockStore {
+                db_path: fixture.db.clone(),
+            }),
+            signer: fixture.worker.signer.clone(),
+            command_signing_key: fixture.worker.command_signing_key.clone(),
+            approved_peer_ids: fixture.worker.approved_peer_ids.clone(),
+            blocked_origin_ids: fixture.worker.blocked_origin_ids.clone(),
+            disabled_schedule_ids: fixture.worker.disabled_schedule_ids.clone(),
+            music_signing_seed: fixture.worker.music_signing_seed,
+            snapshot: None,
+            action_cursor: None,
+            published_once: false,
+            audio_status_cursor: None,
+            audio_last_sent_ms: BTreeMap::new(),
+            peer_last_sent_ms: BTreeMap::new(),
+        };
+        restarted.tick_once().unwrap();
+
+        let snapshot = restarted.snapshot.as_ref().unwrap();
+        let missed = &snapshot.occurrences[0];
+        assert_eq!(missed.phase, ClockOccurrencePhase::Missed);
+        assert_eq!(missed.acknowledgement, None);
+        assert!(missed
+            .targets
+            .iter()
+            .all(|target| target.disposition == ClockTargetDisposition::Missed));
+        let durable: String = Connection::open(&fixture.db)
+            .unwrap()
+            .query_row(
+                "SELECT snapshot_json FROM clock_authority WHERE node_id = 'seat-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClockSnapshotV1>(&durable).unwrap(),
+            *snapshot
+        );
+
+        let stops = fixture
+            .audio_messages()
+            .into_iter()
+            .map(|body| serde_json::from_str::<ClockAudioRequestV1>(&body).unwrap())
+            .filter_map(|request| match request.body {
+                ClockAudioActionV1::Stop { acknowledgement_id } => Some((
+                    request.occurrence_id,
+                    request.occurrence_generation,
+                    acknowledgement_id,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stops,
+            vec![(
+                ringing.occurrence_id.clone(),
+                ringing.revision,
+                auto_silence_acknowledgement_id(&ringing),
+            )]
         );
     }
 

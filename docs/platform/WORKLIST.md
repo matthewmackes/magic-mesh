@@ -1321,13 +1321,13 @@ behavioral evidence is not completion.
 - Current state: Signed contracts, durable scheduling/convergence, governed audio, and Clock/bell chrome exist; multi-process/UI/package/live proof remains.
 - **Clock contract checkpoint (2026-08-08):** 5/5 focused and 473/473 complete tests passed on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`.
-- **Scheduler checkpoint (2026-08-09):** persistence/recovery plus weekday/DST execution passed the 6/6 Clock suite on BigBoy:
-  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-scheduler-s2-r1.md`; `docs/platform/evidence/WL-FUNC-022-2026-08-09-weekday-alarm-dst-r2.md`.
+- **Scheduler/restart checkpoint (2026-08-09):** weekday/DST execution and durable alarm auto-silence/audio stop passed the 7/7 Clock suite:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-scheduler-s2-r1.md`; `docs/platform/evidence/WL-FUNC-022-2026-08-09-weekday-alarm-dst-r2.md`;
+  `docs/platform/evidence/WL-FUNC-022-2026-08-09-auto-silence-restart-r4.md`.
 - **Peer convergence checkpoint (2026-08-08):** delivery/loss/rejoin, replay/reordering, local removal, global Stop, and missed-late passed 3/3 on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
 - **Clock audio checkpoint (2026-08-08):** durable signed Start/Stop/Snooze replay and the 3,000 ms audibility fallback passed 7/7 on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-audio-s3-r1.md`.
-- **Clock NPR checkpoint:** News Now `500005` and live-station resolution passed 12 tests on `.196`; `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-npr-s3-r1.md`.
 - **Clock UI checkpoint (2026-08-08):** projection, Jiff/IANA time, actions, and fail-closed behavior passed 5/5 on `.50`; evidence:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-ui-s4-r1.md`.
 - Remaining work:
