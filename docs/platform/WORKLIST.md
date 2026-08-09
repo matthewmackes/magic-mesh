@@ -1100,8 +1100,7 @@ behavioral evidence is not completion.
   revision zero is rejected; Music UI 4/4 `.50`, daemon validation 1/1 `.90`. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
-- **Provider restart binding (2026-08-09):** the selected typed source now survives queue restart while admitted fallback variants remain available; `.90` passed 14 queue
-  and 2 resolver tests: `docs/platform/evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`.
+- **Provider restart (2026-08-09):** selected source survives restart with fallbacks; `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`.
 - Remaining work:
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
@@ -1151,7 +1150,8 @@ behavioral evidence is not completion.
 - **Roaming admission (2026-08-06):** 11/11; live two-seat proof open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`.
 - **Two-seat handoff checkpoints (2026-08-08/09):** fixtures prove exact-once queue/playhead transfer; physical preflight refused Eagle's release mismatch and stale peer
   without mutation (`.50`/`.90` passed): `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-09-physical-two-seat-handoff-preflight-r5.md`.
+  `docs/platform/evidence/WL-FUNC-021-2026-08-09-physical-two-seat-handoff-preflight-r5.md`,
+  `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`.
 - **Cast runtime audit checkpoint (2026-08-06):** read-only seat inspection
   found no physical UPnP renderer, usable Chromecast discovery path, target
   cast-receiver unit, or second admitted peer. Typed mesh transfer and the
@@ -1562,9 +1562,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-coordination-admission-r4.md`.
 - **Lighthouse desktop-scope checkpoint (2026-08-09):** healthy peer return skips Workstation-only XDG restoration with zero service mutation; BigBoy and machine 194
   passed the complete fixture: `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-desktop-scope-r5.md`.
-- **Eagle recovery preflight (2026-08-09):** Eagle was resolved and inspected without mutation; its installed package lacks the recovery helper and password-only sudo
-  blocks the governed controller, so no alert or drill was attempted. BigBoy passed the recovery fixtures:
-  `docs/platform/evidence/WL-CRIT-007-2026-08-09-eagle-recovery-preflight-r6.md`.
+- **Eagle rollout preflights (2026-08-09):** Eagle was inspected without mutation; release 12 lacks recovery, while the available release-23 bytes are unsigned,
+  source-unbound, and incomplete, so no warning or rollout ran: `docs/platform/evidence/WL-CRIT-007-2026-08-09-eagle-recovery-preflight-r6.md`,
+  `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
