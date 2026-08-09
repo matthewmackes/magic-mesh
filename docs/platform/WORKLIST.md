@@ -477,6 +477,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
 - **Health/Units/forecast recovery checkpoints (2026-08-09):** reads stage before effects and failed replies retry; machines 194/193 and BigBoy passed focused gates:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
+  `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
 - **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority recovers and cache persistence precedes publication; machine 9 passed two exact tests:
@@ -2172,6 +2173,8 @@ behavioral evidence is not completion.
   replies across store, Bus, or restart faults. Machine 193 passed five focused
   durability/security fixtures:
   `docs/platform/evidence/WL-UX-013-2026-08-09-health-result-durability-r10.md`.
+- **Node-grade transaction checkpoint (2026-08-09):** late/replaced Bus recovery, durable remediation results, and strictly forward canonical/Bus generations passed
+  five focused machine-194 gates: `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`.
 - **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
   bounded/redacted support bundle through a private no-follow path and a synced
   atomic transaction, with honest failures and bounded top-N materialization.

@@ -7,6 +7,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -83,6 +84,21 @@ fn initial_phase_for(hostname: &str) -> Duration {
         hash.wrapping_mul(16_777_619) ^ u32::from(byte)
     });
     Duration::from_millis(u64::from(hash) % (MAX_INITIAL_PHASE_MS + 1))
+}
+
+fn node_grade_bus_roots(explicit: Option<&Path>, current: Option<PathBuf>) -> Vec<PathBuf> {
+    if let Some(root) = explicit {
+        return vec![root.to_path_buf()];
+    }
+    let mut roots = Vec::new();
+    if let Some(root) = current {
+        roots.push(root);
+    }
+    let system = PathBuf::from(mde_bus::SYSTEM_BUS_ROOT);
+    if !roots.contains(&system) {
+        roots.push(system);
+    }
+    roots
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -405,7 +421,7 @@ fn parse_df_used_pct(body: &str) -> Option<f32> {
         .ok()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct PressureWindow {
     cpu: VecDeque<f32>,
     memory: VecDeque<f32>,
@@ -942,6 +958,24 @@ enum DurableHealthAction {
     },
 }
 
+#[derive(Debug, Clone)]
+struct StagedActionResult {
+    source_ulid: String,
+    result: HealthActionResult,
+    complete: Option<DurableHealthAction>,
+    already_published: bool,
+}
+
+#[derive(Debug, Clone)]
+enum StagedActionMessage {
+    Terminal(String),
+    Request {
+        source_ulid: String,
+        request: HealthActionRequest,
+        result_already_published: bool,
+    },
+}
+
 fn validate_action_state_root(state_root: &Path, trusted_uid: u32) -> Result<bool, String> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -1274,13 +1308,20 @@ fn merge_lifecycle(
     resolved
 }
 
-fn emit_json<T: Serialize>(persist: &Persist, topic: &str, value: &T) {
-    if let Ok(body) = serde_json::to_string(value) {
-        let _ = persist.write(topic, Priority::Default, None, Some(&body));
-    }
+fn emit_json<T: Serialize>(persist: &mut Persist, topic: &str, value: &T) -> Result<(), String> {
+    let body = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    persist.reopen_if_index_changed();
+    persist
+        .write(topic, Priority::Default, None, Some(&body))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-fn emit_critical(persist: &Persist, condition: &HealthCondition, host: &str) {
+fn emit_critical(
+    persist: &mut Persist,
+    condition: &HealthCondition,
+    host: &str,
+) -> Result<(), String> {
     let body = serde_json::json!({
         "severity": "critical",
         "source": "system-mesh-health",
@@ -1289,12 +1330,16 @@ fn emit_critical(persist: &Persist, condition: &HealthCondition, host: &str) {
         "host": host,
         "ts_unix_ms": condition.last_observed_ms,
     });
-    let _ = persist.write(
-        CRITICAL_NOTIFY_TOPIC,
-        Priority::Default,
-        None,
-        Some(&body.to_string()),
-    );
+    persist.reopen_if_index_changed();
+    persist
+        .write(
+            CRITICAL_NOTIFY_TOPIC,
+            Priority::Default,
+            None,
+            Some(&body.to_string()),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1641,11 +1686,19 @@ fn expand_seat15_root(host: &str) -> Result<String, String> {
 }
 
 /// Universal worker that publishes the condition-backed health authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BusIdentity {
+    root: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
 pub struct NodeGradeWorker {
     host: String,
     workgroup_root: PathBuf,
     sampler: Box<dyn HealthSampler>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
+    active_bus: Option<BusIdentity>,
     action_state_root: PathBuf,
     poll: Duration,
     generation: u64,
@@ -1654,6 +1707,8 @@ pub struct NodeGradeWorker {
     last_snapshot: Option<SystemMeshHealthSnapshot>,
     #[cfg(test)]
     fail_terminal_result_writes: usize,
+    #[cfg(test)]
+    fail_snapshot_file_writes: usize,
     #[cfg(test)]
     action_execution_count: usize,
     #[cfg(test)]
@@ -1672,7 +1727,8 @@ impl NodeGradeWorker {
             )),
             host,
             workgroup_root,
-            bus_root: mde_bus::default_data_dir(),
+            bus_root_override: None,
+            active_bus: None,
             action_state_root: PathBuf::from(DEFAULT_ACTION_STATE_ROOT),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
@@ -1682,10 +1738,20 @@ impl NodeGradeWorker {
             #[cfg(test)]
             fail_terminal_result_writes: 0,
             #[cfg(test)]
+            fail_snapshot_file_writes: 0,
+            #[cfg(test)]
             action_execution_count: 0,
             #[cfg(test)]
             trusted_action_owner_uid: 0,
         }
+    }
+
+    /// Override the Bus root. Production resolves current user/service storage
+    /// and canonical system storage for each transaction.
+    #[must_use]
+    pub fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
+        self
     }
 
     fn trusted_action_owner_uid(&self) -> u32 {
@@ -1697,6 +1763,45 @@ impl NodeGradeWorker {
         {
             0
         }
+    }
+
+    fn open_bus(&self) -> Result<(Persist, BusIdentity), String> {
+        let roots = node_grade_bus_roots(
+            self.bus_root_override.as_deref(),
+            mde_bus::default_data_dir(),
+        );
+        let mut last_error = "no Bus roots resolved".to_string();
+        for root in roots {
+            let mut persist = match Persist::open(root.clone()) {
+                Ok(persist) => persist,
+                Err(error) => {
+                    last_error = format!("Bus {} open failed: {error}", root.display());
+                    continue;
+                }
+            };
+            persist.reopen_if_index_changed();
+            let index = root.join("index.sqlite");
+            let metadata = match std::fs::metadata(&index) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => {
+                    last_error = format!("Bus index {} is not a file", index.display());
+                    continue;
+                }
+                Err(error) => {
+                    last_error = format!("Bus index {} metadata failed: {error}", index.display());
+                    continue;
+                }
+            };
+            return Ok((
+                persist,
+                BusIdentity {
+                    root,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
+            ));
+        }
+        Err(last_error)
     }
 
     fn store_action_journal(
@@ -1719,40 +1824,43 @@ impl NodeGradeWorker {
         )
     }
 
-    fn publish_action_result(
-        &self,
-        persist: &Persist,
-        source_ulid: &str,
+    fn action_result_published(
+        persist: &mut Persist,
         result: &HealthActionResult,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let topic = action_result_topic(&result.request_id);
-        let already_published = persist
+        persist.reopen_if_index_changed();
+        let messages = persist
             .list_since(&topic, None)
-            .ok()
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message
-                        .body
-                        .as_deref()
-                        .and_then(|body| serde_json::from_str::<HealthActionResult>(body).ok())
-                        .is_some_and(|published| published.audit_id == result.audit_id)
-                })
-            });
-        if !already_published {
-            let Ok(body) = serde_json::to_string(result) else {
-                return false;
-            };
-            if let Err(error) = persist.write(&topic, Priority::Default, None, Some(&body)) {
-                tracing::warn!(
-                    request_id = %result.request_id,
-                    source_ulid,
-                    error = %error,
-                    "node_grade: durable health action result publication deferred"
-                );
-                return false;
+            .map_err(|error| format!("action result lane {topic} unreadable: {error}"))?;
+        for message in messages {
+            let body = message
+                .body
+                .as_deref()
+                .ok_or_else(|| format!("action result lane {topic} contains an empty row"))?;
+            let published: HealthActionResult = serde_json::from_str(body)
+                .map_err(|error| format!("action result lane {topic} is invalid: {error}"))?;
+            if published.audit_id == result.audit_id {
+                return Ok(true);
             }
         }
-        let path = action_journal_path(&self.action_state_root, source_ulid);
+        Ok(false)
+    }
+
+    fn publish_action_result(
+        &self,
+        persist: &mut Persist,
+        staged: &StagedActionResult,
+    ) -> Result<(), String> {
+        if !staged.already_published {
+            let topic = action_result_topic(&staged.result.request_id);
+            let body = serde_json::to_string(&staged.result).map_err(|error| error.to_string())?;
+            persist.reopen_if_index_changed();
+            persist
+                .write(&topic, Priority::Default, None, Some(&body))
+                .map_err(|error| format!("action result publication failed: {error}"))?;
+        }
+        let path = action_journal_path(&self.action_state_root, &staged.source_ulid);
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 if let Err(error) = sync_action_state_root(&self.action_state_root) {
@@ -1770,7 +1878,7 @@ impl NodeGradeWorker {
                 "node_grade: published action journal cleanup deferred"
             ),
         }
-        true
+        Ok(())
     }
 
     fn interrupted_action_result(
@@ -1793,35 +1901,27 @@ impl NodeGradeWorker {
         }
     }
 
-    fn flush_action_results(&mut self, persist: &Persist) -> Option<String> {
-        let mut terminal_cursor: Option<String> = None;
+    fn stage_action_results(
+        &self,
+        persist: &mut Persist,
+    ) -> Result<Vec<StagedActionResult>, String> {
         let paths =
-            match pending_action_journals(&self.action_state_root, self.trusted_action_owner_uid())
-            {
-                Ok(paths) => paths,
-                Err(error) => {
-                    tracing::error!(error, "node_grade: local action state authority rejected");
-                    return None;
-                }
-            };
+            pending_action_journals(&self.action_state_root, self.trusted_action_owner_uid())?;
+        let mut staged = Vec::new();
         for path in paths {
-            let record = match read_action_journal(
+            let Some(record) = read_action_journal(
                 &self.action_state_root,
                 &path,
                 self.trusted_action_owner_uid(),
-            ) {
-                Ok(Some(record)) => record,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), error, "node_grade: invalid action journal retained");
-                    continue;
-                }
+            )?
+            else {
+                continue;
             };
-            let (source_ulid, result) = match record {
+            let (source_ulid, result, complete) = match record {
                 DurableHealthAction::Complete {
                     source_ulid,
                     result,
-                } => (source_ulid, result),
+                } => (source_ulid, result, None),
                 DurableHealthAction::Claimed {
                     source_ulid,
                     request,
@@ -1834,29 +1934,79 @@ impl NodeGradeWorker {
                         source_ulid: source_ulid.clone(),
                         result: result.clone(),
                     };
-                    if let Err(error) = self.store_action_journal(&source_ulid, &complete) {
-                        tracing::warn!(
-                            source_ulid,
-                            error,
-                            "node_grade: interrupted action remains durably claimed"
-                        );
-                        continue;
-                    }
-                    (source_ulid, result)
+                    (source_ulid, result, Some(complete))
                 }
             };
-            self.publish_action_result(persist, &source_ulid, &result);
-            if terminal_cursor
-                .as_ref()
-                .is_none_or(|cursor| source_ulid > *cursor)
-            {
-                terminal_cursor = Some(source_ulid);
-            }
+            let already_published = Self::action_result_published(persist, &result)?;
+            staged.push(StagedActionResult {
+                source_ulid,
+                result,
+                complete,
+                already_published,
+            });
         }
-        terminal_cursor
+        Ok(staged)
     }
 
-    fn cycle(&mut self, persist: Option<&Persist>) -> SystemMeshHealthSnapshot {
+    fn flush_staged_action_results(
+        &mut self,
+        persist: &mut Persist,
+        staged: &[StagedActionResult],
+    ) -> Result<(), String> {
+        for result in staged {
+            if let Some(complete) = result.complete.as_ref() {
+                self.store_action_journal(&result.source_ulid, complete)?;
+            }
+            self.publish_action_result(persist, result)?;
+            if self
+                .action_cursor
+                .as_ref()
+                .is_none_or(|cursor| result.source_ulid > *cursor)
+            {
+                self.action_cursor = Some(result.source_ulid.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_bus(
+        &mut self,
+        persist: &mut Persist,
+        identity: &BusIdentity,
+    ) -> Result<(), String> {
+        if self.active_bus.as_ref() == Some(identity) {
+            return Ok(());
+        }
+        // Capture the destructive-lane boundary before flushing the durable
+        // terminal outbox. Activation is committed only if every result lane
+        // can be read and every pending result can be made durable on this Bus.
+        persist.reopen_if_index_changed();
+        let tail = persist
+            .latest_ulid(ACTION_TOPIC)
+            .map_err(|error| format!("health action activation tail failed: {error}"))?;
+        let pending = self.stage_action_results(persist)?;
+        self.flush_staged_action_results(persist, &pending)?;
+        self.action_cursor = tail;
+        self.active_bus = Some(identity.clone());
+        Ok(())
+    }
+
+    fn action_transaction(&mut self) -> Result<(), String> {
+        let (mut persist, identity) = self.open_bus()?;
+        self.activate_bus(&mut persist, &identity)?;
+        self.drain_actions(&mut persist)
+    }
+
+    fn projection_transaction(&mut self) -> Result<SystemMeshHealthSnapshot, String> {
+        let (mut persist, identity) = self.open_bus()?;
+        self.activate_bus(&mut persist, &identity)?;
+        self.cycle(Some(&mut persist))
+    }
+
+    fn cycle(
+        &mut self,
+        mut persist: Option<&mut Persist>,
+    ) -> Result<SystemMeshHealthSnapshot, String> {
         let now = now_ms();
         let path = node_dir(&self.workgroup_root).join(format!("{}.json", self.host));
         let previous = read_state(&path);
@@ -1867,23 +2017,20 @@ impl NodeGradeWorker {
         // publication time; either is a safe monotonic floor when capped at the
         // current clock. This also repairs nodes whose first broken restart
         // already overwrote the row with a low counter but a fresh timestamp.
-        let durable_floor = previous.as_ref().map_or(0, |state| {
+        let durable_restart_floor = previous.as_ref().map_or(0, |state| {
             state.generation.max(state.published_at_ms).min(now)
         });
-        self.generation = if self.generation == 0 {
-            durable_floor.saturating_add(1)
+        let generation_floor = if self.generation == 0 {
+            durable_restart_floor
         } else {
-            self.generation.saturating_add(1)
+            self.generation
+                .max(previous.as_ref().map_or(0, |state| state.generation))
         };
+        let generation = generation_floor.saturating_add(1);
         let observations = self.sampler.sample();
-        self.pressure.observe(observations.resources);
-        let mut active = evaluate_conditions(
-            &self.host,
-            &observations,
-            &self.pressure,
-            self.generation,
-            now,
-        );
+        let mut pressure = self.pressure.clone();
+        pressure.observe(observations.resources);
+        let mut active = evaluate_conditions(&self.host, &observations, &pressure, generation, now);
         let resolved = merge_lifecycle(previous.as_ref(), &mut active, now);
         let grade_factors = factors(&observations);
         let grade = NodeGrade::evaluate(
@@ -1897,7 +2044,7 @@ impl NodeGradeWorker {
             schema_version: HEALTH_SCHEMA_VERSION,
             publisher: self.host.clone(),
             roster_revision: observations.roster_revision.clone(),
-            generation: self.generation,
+            generation,
             published_at_ms: now,
             valid_until_ms: now.saturating_add(PUBLICATION_VALIDITY_MS),
             grade,
@@ -1913,114 +2060,185 @@ impl NodeGradeWorker {
             })
             .map(|condition| condition.id.as_str())
             .collect();
-        let _ = write_json_atomic(&path, &state);
-        if let Some(persist) = persist {
-            emit_json(persist, &node_health_topic(&self.host), &state);
+        let mut publications = read_canonical_states(&self.workgroup_root);
+        publications.retain(|published| published.publisher != self.host);
+        publications.push(state.clone());
+        let snapshot = fold_snapshot(
+            &self.host,
+            observations.roster_revision,
+            &observations.canonical_nodes,
+            publications,
+            generation,
+            now,
+            SNAPSHOT_VALIDITY_MS,
+            observations.reachable_lighthouses,
+        );
+        write_json_atomic(&path, &state)
+            .map_err(|error| format!("node health state publication failed: {error}"))?;
+        #[cfg(test)]
+        if self.fail_snapshot_file_writes > 0 {
+            self.fail_snapshot_file_writes -= 1;
+            return Err("injected canonical snapshot publication failure".into());
+        }
+        write_json_atomic(&snapshot_path(&self.workgroup_root, &self.host), &snapshot)
+            .map_err(|error| format!("health snapshot publication failed: {error}"))?;
+        if let Some(bus) = persist.as_deref_mut() {
+            emit_json(bus, &node_health_topic(&self.host), &state)?;
+            emit_json(bus, SNAPSHOT_TOPIC, &snapshot)?;
             for condition in &active {
                 if condition.requirement == RequirementClass::Required
                     && condition.severity == HealthSeverity::Critical
                     && !previous_critical.contains(condition.id.as_str())
                 {
-                    emit_critical(persist, condition, &self.host);
+                    if let Err(error) = emit_critical(bus, condition, &self.host) {
+                        tracing::warn!(error, "node_grade: critical notification deferred");
+                    }
                 }
             }
         }
-        let snapshot = fold_snapshot(
-            &self.host,
-            observations.roster_revision,
-            &observations.canonical_nodes,
-            read_canonical_states(&self.workgroup_root),
-            self.generation,
-            now,
-            SNAPSHOT_VALIDITY_MS,
-            observations.reachable_lighthouses,
-        );
-        let _ = write_json_atomic(&snapshot_path(&self.workgroup_root, &self.host), &snapshot);
-        if let Some(persist) = persist {
-            emit_json(persist, SNAPSHOT_TOPIC, &snapshot);
-        }
+        self.generation = generation;
+        self.pressure = pressure;
         self.last_snapshot = Some(snapshot.clone());
-        snapshot
+        Ok(snapshot)
     }
 
-    fn drain_actions(&mut self, persist: &Persist) {
-        if let Some(cursor) = self.flush_action_results(persist) {
-            if self
-                .action_cursor
-                .as_ref()
-                .is_none_or(|current| cursor > *current)
-            {
-                self.action_cursor = Some(cursor);
-            }
-        }
-        if self.last_snapshot.is_none() {
-            return;
-        }
-        let Ok(messages) = persist.list_since(ACTION_TOPIC, self.action_cursor.as_deref()) else {
-            return;
-        };
+    fn stage_actions(&self, persist: &mut Persist) -> Result<Vec<StagedActionMessage>, String> {
+        persist.reopen_if_index_changed();
+        let messages = persist
+            .list_since(ACTION_TOPIC, self.action_cursor.as_deref())
+            .map_err(|error| format!("health action lane unreadable: {error}"))?;
+        let mut staged = Vec::new();
         for message in messages {
             if !valid_action_source_ulid(&message.ulid) {
-                tracing::error!(source_ulid = %message.ulid, "node_grade: invalid action ULID refused");
-                self.action_cursor = Some(message.ulid);
+                staged.push(StagedActionMessage::Terminal(message.ulid));
                 continue;
             }
             let Some(body) = message.body.as_deref() else {
-                self.action_cursor = Some(message.ulid);
+                staged.push(StagedActionMessage::Terminal(message.ulid));
                 continue;
             };
             let Ok(request) = serde_json::from_str::<HealthActionRequest>(body) else {
-                self.action_cursor = Some(message.ulid);
+                staged.push(StagedActionMessage::Terminal(message.ulid));
                 continue;
             };
-            let journal_path = action_journal_path(&self.action_state_root, &message.ulid);
+            let audit_id = format!("health:{}:{}", self.host, message.ulid);
+            let topic = action_result_topic(&request.request_id);
+            persist.reopen_if_index_changed();
+            let rows = persist
+                .list_since(&topic, None)
+                .map_err(|error| format!("action result lane {topic} unreadable: {error}"))?;
+            let mut result_already_published = false;
+            for row in rows {
+                let body = row
+                    .body
+                    .as_deref()
+                    .ok_or_else(|| format!("action result lane {topic} contains an empty row"))?;
+                let result: HealthActionResult = serde_json::from_str(body)
+                    .map_err(|error| format!("action result lane {topic} is invalid: {error}"))?;
+                result_already_published |= result.audit_id == audit_id;
+            }
+            staged.push(StagedActionMessage::Request {
+                source_ulid: message.ulid,
+                request,
+                result_already_published,
+            });
+        }
+        Ok(staged)
+    }
+
+    fn drain_actions(&mut self, persist: &mut Persist) -> Result<(), String> {
+        if self.last_snapshot.is_none() {
+            return Ok(());
+        }
+        // Complete every required ingress read before claims, remediations, or
+        // cursor changes. One unreadable action/result lane defers the sweep.
+        let pending_results = self.stage_action_results(persist)?;
+        let messages = self.stage_actions(persist)?;
+        self.flush_staged_action_results(persist, &pending_results)?;
+        for message in messages {
+            let StagedActionMessage::Request {
+                source_ulid,
+                request,
+                result_already_published,
+            } = message
+            else {
+                let StagedActionMessage::Terminal(source_ulid) = message else {
+                    unreachable!()
+                };
+                self.action_cursor = Some(source_ulid);
+                continue;
+            };
+            if self
+                .action_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor >= &source_ulid)
+            {
+                continue;
+            }
+            if result_already_published {
+                self.action_cursor = Some(source_ulid);
+                continue;
+            }
+            let journal_path = action_journal_path(&self.action_state_root, &source_ulid);
             match read_action_journal(
                 &self.action_state_root,
                 &journal_path,
                 self.trusted_action_owner_uid(),
             ) {
                 Ok(Some(DurableHealthAction::Complete {
-                    source_ulid,
+                    source_ulid: record_source,
                     result,
-                })) if source_ulid == message.ulid
+                })) if record_source == source_ulid
                     && result.request_id == request.request_id
                     && result.condition_id == request.condition_id
                     && result.action == request.action =>
                 {
-                    self.publish_action_result(persist, &source_ulid, &result);
-                    self.action_cursor = Some(message.ulid);
+                    let staged = StagedActionResult {
+                        source_ulid: record_source,
+                        result,
+                        complete: None,
+                        already_published: false,
+                    };
+                    self.publish_action_result(persist, &staged)?;
+                    self.action_cursor = Some(source_ulid);
                     continue;
                 }
                 Ok(Some(DurableHealthAction::Claimed {
-                    source_ulid,
+                    source_ulid: record_source,
                     request: claimed_request,
                     snapshot_generation,
                     ..
-                })) if source_ulid == message.ulid && claimed_request == request => {
+                })) if record_source == source_ulid && claimed_request == request => {
                     let result = self.interrupted_action_result(
-                        &source_ulid,
+                        &record_source,
                         claimed_request,
                         snapshot_generation,
                     );
                     let complete = DurableHealthAction::Complete {
-                        source_ulid: source_ulid.clone(),
+                        source_ulid: record_source.clone(),
                         result: result.clone(),
                     };
-                    if let Err(error) = self.store_action_journal(&source_ulid, &complete) {
+                    if let Err(error) = self.store_action_journal(&record_source, &complete) {
                         tracing::warn!(
-                            source_ulid,
+                            source_ulid = record_source,
                             error,
                             "node_grade: interrupted action remains recoverable"
                         );
                         break;
                     }
-                    self.publish_action_result(persist, &source_ulid, &result);
-                    self.action_cursor = Some(message.ulid);
+                    let staged = StagedActionResult {
+                        source_ulid: record_source,
+                        result,
+                        complete: None,
+                        already_published: false,
+                    };
+                    self.publish_action_result(persist, &staged)?;
+                    self.action_cursor = Some(source_ulid);
                     continue;
                 }
                 Ok(Some(_)) => {
                     tracing::error!(
-                        source_ulid = %message.ulid,
+                        source_ulid,
                         "node_grade: action journal identity mismatch; refusing execution"
                     );
                     break;
@@ -2028,7 +2246,7 @@ impl NodeGradeWorker {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::error!(
-                        source_ulid = %message.ulid,
+                        source_ulid,
                         error,
                         "node_grade: unreadable action journal; refusing execution"
                     );
@@ -2046,14 +2264,14 @@ impl NodeGradeWorker {
                 .map_or("", |condition| condition.source.as_str());
             if decision == ActionDecision::Apply {
                 let claim = DurableHealthAction::Claimed {
-                    source_ulid: message.ulid.clone(),
+                    source_ulid: source_ulid.clone(),
                     request: request.clone(),
                     snapshot_generation: snapshot.generation,
                     claimed_at_ms: now_ms(),
                 };
-                if let Err(error) = self.store_action_journal(&message.ulid, &claim) {
+                if let Err(error) = self.store_action_journal(&source_ulid, &claim) {
                     tracing::warn!(
-                        source_ulid = %message.ulid,
+                        source_ulid,
                         error,
                         "node_grade: action execution deferred until its claim is durable"
                     );
@@ -2075,7 +2293,7 @@ impl NodeGradeWorker {
                         request.action,
                         HealthAction::Acknowledge | HealthAction::SnoozeOneHour
                     ) {
-                        self.update_condition_state(&request, now_ms());
+                        self.update_condition_state(&request, now_ms())?;
                     }
                     match execute_action(
                         request.action,
@@ -2088,8 +2306,11 @@ impl NodeGradeWorker {
                     }
                 }
             };
-            let refreshed_snapshot =
-                (outcome == HealthActionOutcome::Applied).then(|| self.cycle(Some(persist)));
+            let refreshed_snapshot = if outcome == HealthActionOutcome::Applied {
+                Some(self.cycle(Some(persist))?)
+            } else {
+                None
+            };
             let result_generation = refreshed_snapshot
                 .as_ref()
                 .map_or(snapshot.generation, |snapshot| snapshot.generation);
@@ -2108,32 +2329,43 @@ impl NodeGradeWorker {
                 action: request.action,
                 outcome,
                 detail,
-                audit_id: format!("health:{}:{}", self.host, message.ulid),
+                audit_id: format!("health:{}:{}", self.host, source_ulid),
                 completed_at_ms: now_ms(),
                 snapshot_generation: result_generation,
                 refreshed_evidence,
             };
             let complete = DurableHealthAction::Complete {
-                source_ulid: message.ulid.clone(),
+                source_ulid: source_ulid.clone(),
                 result: result.clone(),
             };
-            if let Err(error) = self.store_action_journal(&message.ulid, &complete) {
+            if let Err(error) = self.store_action_journal(&source_ulid, &complete) {
                 tracing::warn!(
-                    source_ulid = %message.ulid,
+                    source_ulid,
                     error,
                     "node_grade: terminal result storage failed; durable claim retained"
                 );
                 break;
             }
-            self.publish_action_result(persist, &message.ulid, &result);
-            self.action_cursor = Some(message.ulid);
+            let staged = StagedActionResult {
+                source_ulid: source_ulid.clone(),
+                result,
+                complete: None,
+                already_published: false,
+            };
+            self.publish_action_result(persist, &staged)?;
+            self.action_cursor = Some(source_ulid);
         }
+        Ok(())
     }
 
-    fn update_condition_state(&self, request: &HealthActionRequest, now: u64) {
+    fn update_condition_state(
+        &self,
+        request: &HealthActionRequest,
+        now: u64,
+    ) -> Result<(), String> {
         let path = node_dir(&self.workgroup_root).join(format!("{}.json", self.host));
         let Some(mut state) = read_state(&path) else {
-            return;
+            return Err("canonical node health state is unavailable".into());
         };
         if let Some(condition) = state
             .active_conditions
@@ -2147,8 +2379,10 @@ impl NodeGradeWorker {
                 }
                 _ => {}
             }
-            let _ = write_json_atomic(&path, &state);
+            write_json_atomic(&path, &state)
+                .map_err(|error| format!("condition state publication failed: {error}"))?;
         }
+        Ok(())
     }
 }
 
@@ -2159,21 +2393,6 @@ impl Worker for NodeGradeWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let persist = self
-            .bus_root
-            .clone()
-            .and_then(|root| Persist::open(root).ok());
-        if let Some(persist) = persist.as_ref() {
-            // Finish exact results already made durable before skipping the
-            // retained action backlog. This preserves start-at-tail while a
-            // restart still corrects publication forward without re-executing.
-            self.flush_action_results(persist);
-            // Health remediations are mutations, not replayable events. Begin at
-            // the current tail so a daemon restart can never reapply a retained
-            // confirmation from an earlier boot.
-            self.action_cursor = persist.latest_ulid(ACTION_TOPIC).ok().flatten();
-        }
-
         // Anchor the existing 10-second interval at a deterministic per-host
         // phase. Shutdown remains prompt while the initial offset is pending;
         // every later cycle retains the original freshness and action cadence.
@@ -2181,14 +2400,20 @@ impl Worker for NodeGradeWorker {
             () = tokio::time::sleep(initial_phase_for(&self.host)) => {}
             () = shutdown.wait() => return Ok(()),
         }
-        self.cycle(persist.as_ref());
+        if let Err(error) = self.projection_transaction() {
+            tracing::warn!(error, "node_grade: initial Bus projection deferred");
+        }
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Some(persist) = persist.as_ref() { self.drain_actions(persist); }
-                    self.cycle(persist.as_ref());
+                    if let Err(error) = self.action_transaction() {
+                        tracing::warn!(error, "node_grade: action transaction deferred");
+                    }
+                    if let Err(error) = self.projection_transaction() {
+                        tracing::warn!(error, "node_grade: Bus projection deferred");
+                    }
                 }
                 () = shutdown.wait() => break,
             }
@@ -2595,7 +2820,8 @@ mod tests {
             host: "node".into(),
             workgroup_root: workgroup.path().to_path_buf(),
             sampler: Box::new(FixtureSampler(sample)),
-            bus_root: None,
+            bus_root_override: None,
+            active_bus: None,
             action_state_root: workgroup.path().join("local-action-state"),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
@@ -2603,11 +2829,12 @@ mod tests {
             action_cursor: None,
             last_snapshot: None,
             fail_terminal_result_writes: 0,
+            fail_snapshot_file_writes: 0,
             action_execution_count: 0,
             trusted_action_owner_uid: rustix::process::geteuid().as_raw(),
         };
 
-        worker.cycle(None);
+        worker.cycle(None).unwrap();
 
         let recovered = read_state(&nodes.join("node.json")).unwrap();
         assert!(
@@ -2618,10 +2845,71 @@ mod tests {
     }
 
     #[test]
+    fn partial_canonical_publication_retries_forward_before_bus_projection() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = action_test_worker(workgroup.path(), bus.path());
+
+        let first = worker.cycle(Some(&mut persist)).unwrap();
+        worker.fail_snapshot_file_writes = 1;
+        assert!(worker.cycle(Some(&mut persist)).is_err());
+
+        let partial = read_state(&node_dir(workgroup.path()).join("node.json")).unwrap();
+        let retained_snapshot: SystemMeshHealthSnapshot = serde_json::from_slice(
+            &std::fs::read(snapshot_path(workgroup.path(), "node")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(partial.generation, first.generation.saturating_add(1));
+        assert_eq!(retained_snapshot.generation, first.generation);
+        assert_eq!(worker.generation, first.generation);
+
+        let bus_node_before = persist
+            .list_since(&node_health_topic("node"), None)
+            .unwrap();
+        let bus_snapshot_before = persist.list_since(SNAPSHOT_TOPIC, None).unwrap();
+        assert_eq!(bus_node_before.len(), 1);
+        assert_eq!(bus_snapshot_before.len(), 1);
+
+        let repaired = worker.cycle(Some(&mut persist)).unwrap();
+        assert_eq!(
+            repaired.generation,
+            partial.generation.saturating_add(1),
+            "retry must advance beyond the partially durable generation"
+        );
+        let bus_node_generations: Vec<u64> = persist
+            .list_since(&node_health_topic("node"), None)
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                serde_json::from_str::<NodeHealthState>(message.body.as_deref().unwrap())
+                    .unwrap()
+                    .generation
+            })
+            .collect();
+        let bus_snapshot_generations: Vec<u64> = persist
+            .list_since(SNAPSHOT_TOPIC, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                serde_json::from_str::<SystemMeshHealthSnapshot>(message.body.as_deref().unwrap())
+                    .unwrap()
+                    .generation
+            })
+            .collect();
+        assert_eq!(
+            bus_node_generations,
+            vec![first.generation, repaired.generation]
+        );
+        assert_eq!(bus_snapshot_generations, bus_node_generations);
+        assert!(!bus_node_generations.contains(&partial.generation));
+    }
+
+    #[test]
     fn applied_actions_emit_audited_results_with_refreshed_evidence() {
         let workgroup = tempfile::tempdir().unwrap();
         let bus = tempfile::tempdir().unwrap();
-        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
         let mut sample = observations("workstation");
         sample.services.insert("workbench".into(), false);
         sample.device_inventory.as_mut().unwrap().published_at_ms = now_ms();
@@ -2629,7 +2917,8 @@ mod tests {
             host: "node".into(),
             workgroup_root: workgroup.path().to_path_buf(),
             sampler: Box::new(FixtureSampler(sample)),
-            bus_root: Some(bus.path().to_path_buf()),
+            bus_root_override: Some(bus.path().to_path_buf()),
+            active_bus: None,
             action_state_root: workgroup.path().join("local-action-state"),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
@@ -2637,10 +2926,11 @@ mod tests {
             action_cursor: None,
             last_snapshot: None,
             fail_terminal_result_writes: 0,
+            fail_snapshot_file_writes: 0,
             action_execution_count: 0,
             trusted_action_owner_uid: rustix::process::geteuid().as_raw(),
         };
-        let snapshot = worker.cycle(Some(&persist));
+        let snapshot = worker.cycle(Some(&mut persist)).unwrap();
         let condition = snapshot
             .active_conditions
             .iter()
@@ -2679,7 +2969,7 @@ mod tests {
             )
             .unwrap();
 
-        worker.drain_actions(&persist);
+        worker.drain_actions(&mut persist).unwrap();
 
         let messages = persist
             .list_since(&action_result_topic("audit-request"), None)
@@ -2718,7 +3008,8 @@ mod tests {
             host: "node".into(),
             workgroup_root: workgroup_root.to_path_buf(),
             sampler: Box::new(FixtureSampler(sample)),
-            bus_root: Some(bus_root.to_path_buf()),
+            bus_root_override: Some(bus_root.to_path_buf()),
+            active_bus: None,
             action_state_root: workgroup_root.join("local-action-state"),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
@@ -2726,9 +3017,124 @@ mod tests {
             action_cursor: None,
             last_snapshot: None,
             fail_terminal_result_writes: 0,
+            fail_snapshot_file_writes: 0,
             action_execution_count: 0,
             trusted_action_owner_uid: rustix::process::geteuid().as_raw(),
         }
+    }
+
+    #[test]
+    fn bus_roots_use_current_then_canonical_system_fallback() {
+        let current = PathBuf::from("/tmp/current-node-grade-bus");
+        assert_eq!(
+            node_grade_bus_roots(None, Some(current.clone())),
+            vec![current, PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)]
+        );
+        assert_eq!(
+            node_grade_bus_roots(Some(Path::new("/tmp/explicit-node-grade-bus")), None),
+            vec![PathBuf::from("/tmp/explicit-node-grade-bus")]
+        );
+    }
+
+    #[test]
+    fn late_and_replaced_bus_activation_skips_retained_and_executes_forward_once() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus_parent = tempfile::tempdir().unwrap();
+        let bus_root = bus_parent.path().join("bus");
+        std::fs::write(&bus_root, b"temporarily unopenable").unwrap();
+        let mut worker = action_test_worker(workgroup.path(), &bus_root);
+
+        assert!(worker.action_transaction().is_err());
+        assert!(worker.active_bus.is_none());
+
+        std::fs::remove_file(&bus_root).unwrap();
+        let retained_bus = Persist::open(bus_root.clone()).unwrap();
+        let retained = request(HealthAction::Acknowledge);
+        retained_bus
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&retained).unwrap()),
+            )
+            .unwrap();
+        worker.action_transaction().unwrap();
+        worker.projection_transaction().unwrap();
+        assert!(retained_bus
+            .list_since(&action_result_topic(&retained.request_id), None)
+            .unwrap()
+            .is_empty());
+
+        let forward = acknowledge_request(worker.last_snapshot.as_ref().unwrap(), "forward-one");
+        retained_bus
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&forward).unwrap()),
+            )
+            .unwrap();
+        worker.action_transaction().unwrap();
+        worker.action_transaction().unwrap();
+        assert_eq!(worker.action_execution_count, 1);
+        assert_eq!(
+            retained_bus
+                .list_since(&action_result_topic(&forward.request_id), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(retained_bus);
+
+        let replacement_root = bus_parent.path().join("replacement");
+        let replacement = Persist::open(replacement_root.clone()).unwrap();
+        let retained_replacement = acknowledge_request(
+            worker.last_snapshot.as_ref().unwrap(),
+            "retained-replacement",
+        );
+        replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&retained_replacement).unwrap()),
+            )
+            .unwrap();
+        drop(replacement);
+        std::fs::rename(&bus_root, bus_parent.path().join("old-bus")).unwrap();
+        std::fs::rename(&replacement_root, &bus_root).unwrap();
+
+        worker.action_transaction().unwrap();
+        assert_eq!(worker.action_execution_count, 1);
+        let replacement = Persist::open(bus_root.clone()).unwrap();
+        assert!(replacement
+            .list_since(&action_result_topic(&retained_replacement.request_id), None)
+            .unwrap()
+            .is_empty());
+
+        worker.projection_transaction().unwrap();
+        let forward_replacement = acknowledge_request(
+            worker.last_snapshot.as_ref().unwrap(),
+            "forward-replacement",
+        );
+        replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&forward_replacement).unwrap()),
+            )
+            .unwrap();
+        worker.action_transaction().unwrap();
+        worker.action_transaction().unwrap();
+        assert_eq!(worker.action_execution_count, 2);
+        assert_eq!(
+            replacement
+                .list_since(&action_result_topic(&forward_replacement.request_id), None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     fn acknowledge_request(
@@ -2760,9 +3166,9 @@ mod tests {
     fn terminal_result_storage_failure_recovers_without_repeating_mutation() {
         let workgroup = tempfile::tempdir().unwrap();
         let bus = tempfile::tempdir().unwrap();
-        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
         let mut worker = action_test_worker(workgroup.path(), bus.path());
-        let snapshot = worker.cycle(Some(&persist));
+        let snapshot = worker.cycle(Some(&mut persist)).unwrap();
         let request = acknowledge_request(&snapshot, "storage-failure-request");
         let message = persist
             .write(
@@ -2776,7 +3182,7 @@ mod tests {
         let journal_path = action_journal_path(&worker.action_state_root, &message.ulid);
         let trusted_uid = worker.trusted_action_owner_uid();
 
-        worker.drain_actions(&persist);
+        worker.drain_actions(&mut persist).unwrap();
 
         assert_eq!(worker.action_execution_count, 1);
         assert_eq!(worker.action_cursor, None);
@@ -2789,7 +3195,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        worker.drain_actions(&persist);
+        worker.drain_actions(&mut persist).unwrap();
 
         assert_eq!(worker.action_execution_count, 1);
         assert_eq!(worker.action_cursor.as_deref(), Some(message.ulid.as_str()));
@@ -2808,9 +3214,9 @@ mod tests {
     fn result_publication_failure_replays_durable_result_without_repeating_mutation() {
         let workgroup = tempfile::tempdir().unwrap();
         let bus = tempfile::tempdir().unwrap();
-        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
         let mut worker = action_test_worker(workgroup.path(), bus.path());
-        let snapshot = worker.cycle(Some(&persist));
+        let snapshot = worker.cycle(Some(&mut persist)).unwrap();
         let request = acknowledge_request(&snapshot, "publication-failure-request");
         let message = persist
             .write(
@@ -2826,10 +3232,10 @@ mod tests {
         let journal_path = action_journal_path(&worker.action_state_root, &message.ulid);
         let trusted_uid = worker.trusted_action_owner_uid();
 
-        worker.drain_actions(&persist);
+        assert!(worker.drain_actions(&mut persist).is_err());
 
         assert_eq!(worker.action_execution_count, 1);
-        assert_eq!(worker.action_cursor.as_deref(), Some(message.ulid.as_str()));
+        assert_eq!(worker.action_cursor, None);
         assert!(matches!(
             read_action_journal(&worker.action_state_root, &journal_path, trusted_uid),
             Ok(Some(DurableHealthAction::Complete { .. }))
@@ -2840,7 +3246,7 @@ mod tests {
             .is_empty());
 
         std::fs::remove_file(&blocked_topic).unwrap();
-        worker.drain_actions(&persist);
+        worker.drain_actions(&mut persist).unwrap();
 
         assert_eq!(worker.action_execution_count, 1);
         let results = persist
