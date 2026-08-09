@@ -720,6 +720,11 @@ behavioral evidence is not completion.
   point, and timezone; mismatches publish typed unavailable state. Machine 194
   passed the exact hostile-cache test:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
+- **Navigation action retry checkpoint (2026-08-09):** route, progress, and
+  cancellation cursors now acknowledge only after governed effects succeed;
+  interrupted calculations roll back their replay reservation so the original
+  generation can retry. Machine 193 passed the exact hostile publication test:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-action-retry-r7.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

@@ -127,6 +127,12 @@ impl PersistedNavigation {
     fn saw(&self, request_id: &str) -> bool {
         self.seen_request_ids.iter().any(|seen| seen == request_id)
     }
+
+    fn forget(&mut self, request_id: &str) -> bool {
+        let before = self.seen_request_ids.len();
+        self.seen_request_ids.retain(|seen| seen != request_id);
+        self.seen_request_ids.len() != before
+    }
 }
 
 enum ActionKind {
@@ -184,17 +190,28 @@ impl NavigationWorker {
             NavigationPhase::Calculating { .. }
         ) {
             let request_id = match &authority.snapshot.phase {
-                NavigationPhase::Calculating { request_id, .. } => Some(request_id.clone()),
-                _ => None,
+                NavigationPhase::Calculating { request_id, .. } => request_id.clone(),
+                _ => return Err(io_invalid_data("navigation phase changed during recovery")),
             };
-            authority.snapshot.generation = authority
+            let previous_generation = authority
                 .snapshot
                 .generation
-                .checked_add(1)
-                .ok_or_else(|| io_invalid_data("navigation generation exhausted"))?;
+                .checked_sub(1)
+                .ok_or_else(|| io_invalid_data("calculating navigation has no prior generation"))?;
+            if !authority.forget(&request_id) {
+                return Err(io_invalid_data(
+                    "calculating navigation is missing its replay reservation",
+                ));
+            }
+            // A calculating snapshot is only an in-flight reservation. If the
+            // worker stopped before the final state and cursor committed, roll
+            // that reservation back so the still-unacknowledged Bus action can
+            // be retried instead of being stranded behind a synthetic restart
+            // generation.
+            authority.snapshot.generation = previous_generation;
             authority.snapshot.produced_at_ms = now_ms;
             authority.snapshot.phase = NavigationPhase::Unavailable {
-                request_id,
+                request_id: Some(request_id),
                 reason: NavigationUnavailableReason::InterruptedByRestart,
             };
         }
@@ -452,7 +469,6 @@ impl NavigationWorker {
         }
         for action in actions {
             let now_ms = self.clock.now_ms();
-            self.advance_cursor(&action.kind, action.ulid);
             match action.kind {
                 ActionKind::Route => {
                     self.process_route(&persist, action.body.as_bytes(), now_ms)?
@@ -460,6 +476,10 @@ impl NavigationWorker {
                 ActionKind::Progress => self.process_progress(action.body.as_bytes(), now_ms),
                 ActionKind::Cancel => self.process_cancel(action.body.as_bytes(), now_ms),
             }
+            // The cursor is the acknowledgement boundary. Commit it only after
+            // every governed effect above succeeds; otherwise a restart must
+            // replay the same action.
+            self.advance_cursor(&action.kind, action.ulid);
             self.persist_and_publish(&persist)?;
         }
         Ok(())
@@ -806,20 +826,65 @@ mod tests {
         ));
         {
             let authority = fixture.worker.authority.as_mut().unwrap();
+            authority.snapshot.generation = 1;
             authority.snapshot.phase = NavigationPhase::Calculating {
                 request_id: "req-crash".into(),
                 reroute: false,
             };
+            authority.remember("req-crash".into());
             store_record(&fixture.worker.state_path, authority).unwrap();
         }
         fixture.worker.authority = None;
         fixture.worker.ensure_loaded().unwrap();
+        assert_eq!(
+            fixture
+                .worker
+                .authority
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .generation,
+            0
+        );
         assert!(matches!(
             fixture.worker.authority.as_ref().unwrap().snapshot.phase,
             NavigationPhase::Unavailable {
                 reason: NavigationUnavailableReason::InterruptedByRestart,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn failed_calculating_publication_keeps_route_action_retryable() {
+        let mut fixture = Fixture::new(Arc::new(FixtureProvider));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-retry"),
+        );
+
+        let state_topic_path = fixture.bus.join(navigation_state_topic("seat-1"));
+        fs::create_dir_all(state_topic_path.parent().unwrap()).unwrap();
+        fs::write(&state_topic_path, b"hostile non-directory").unwrap();
+        assert!(fixture.worker.tick_once().is_err());
+        let interrupted = load_record(&fixture.worker.state_path).unwrap().unwrap();
+        assert_eq!(interrupted.route_cursor, None);
+        assert!(matches!(
+            interrupted.snapshot.phase,
+            NavigationPhase::Calculating { .. }
+        ));
+
+        fs::remove_file(state_topic_path).unwrap();
+        fixture.worker.authority = None;
+        fixture.worker.published_once = false;
+        fixture.worker.tick_once().unwrap();
+
+        let recovered = fixture.worker.authority.as_ref().unwrap();
+        assert_eq!(recovered.snapshot.generation, 1);
+        assert!(recovered.route_cursor.is_some());
+        assert!(matches!(
+            recovered.snapshot.phase,
+            NavigationPhase::Active { .. }
         ));
     }
 
