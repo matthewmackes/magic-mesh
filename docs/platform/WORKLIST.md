@@ -1178,8 +1178,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-rdp-scan-completion-freshness-r18.md`.
 - **Quiet-Windows RDP checkpoint (2026-08-09):** the bounded local `/24` scan now admits ping-silent hosts only after TCP 3389 succeeds, then independently fingerprints RDP.
   BigBoy passed three exact gates: `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
-- **Seat 15 RDP catalog-TTL checkpoint (2026-08-09):** live proof found the typed card expiring at two minutes despite the valid five-minute probe lease.
-  Promotion now shares the five-minute boundary; machine 194 passed 4/4: `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-seat15-rdp-catalog-ttl-r93.md`.
+- **Seat 15 RDP catalog-TTL closure (2026-08-09):** release 27 kept the typed card available at 149.777 seconds, then renewed it across two scans; Dell was also upgraded.
+  `docs/platform/evidence/WL-FUNC-019-WL-UX-013-WL-ARCH-009-2026-08-09-release27-rdp-continuity-r100.md`.
 - **Seat 15 Release 24 checkpoint (2026-08-09):** the clean Fedora 44 artifact
   passed real-RPM gates and a dry-run, then installed after the visible warning.
   All daemon groups and publisher credential activation passed; consecutive
@@ -2198,8 +2198,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-availability-bus-transaction-recovery-r88.md`.
 - **Quiet-Windows discovery checkpoint (2026-08-09):** ping-silent local hosts reach bounded TCP 3389 fingerprinting without widening the `/24`; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
-- **Seat 15 RDP catalog-TTL checkpoint (2026-08-09):** live reachability and inventory stayed healthy while the typed card aged out early; the five-minute fix passed 4/4:
-  `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-seat15-rdp-catalog-ttl-r93.md`.
+- **Seat 15 RDP catalog-TTL closure (2026-08-09):** release 27 kept the card available beyond the old two-minute cutoff and renewed it across two scans:
+  `docs/platform/evidence/WL-FUNC-019-WL-UX-013-WL-ARCH-009-2026-08-09-release27-rdp-continuity-r100.md`.
 - **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
   bounded/redacted support bundle through a private no-follow path and a synced
   atomic transaction, with honest failures and bounded top-N materialization.
