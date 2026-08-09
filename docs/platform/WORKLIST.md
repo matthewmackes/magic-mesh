@@ -388,6 +388,8 @@ behavioral evidence is not completion.
   Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`.
 - **Action digest checkpoint (2026-08-09):** staged intent is canonically recomputed and tampering fails before routing; `.90` passed 9 contract and 15 daemon tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
+- **Runtime census checkpoint (2026-08-09):** any uncensused supervisor worker now refuses the unified projection without advancing generation; BigBoy passed 15/15:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-unregistered-runtime-refusal-r4.md`.
 - Remaining work:
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
@@ -1756,6 +1758,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-012-2026-08-08-live-battery-left-clock-r1.md`.
 - **Taskbar identity checkpoint (2026-08-09):** connected sessions and pinned desktops now have disjoint typed egui identities and hit regions; BigBoy passed 49/49:
   `docs/platform/evidence/WL-UX-012-2026-08-09-taskbar-control-identity-r2.md`.
+- **Narrow geometry checkpoint (2026-08-09):** center controls are admitted only when a physical 40px slot exists, preserving More at 480px and preventing Home overlap at
+  320px; `.50` passed 50/50: `docs/platform/evidence/WL-UX-012-2026-08-09-narrow-center-geometry-r3.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.

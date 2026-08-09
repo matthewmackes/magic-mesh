@@ -402,8 +402,8 @@ struct RuntimeTrack {
 
 /// Stateful adapter from the supervisor's explicit lifecycle map to the shared
 /// worker-runtime contract. It never probes a PID or turns a missing row into a
-/// healthy worker. Unknown supervisor rows are excluded from the published
-/// aggregate so registry drift cannot suppress valid registered rows.
+/// healthy worker. Unknown supervisor rows refuse the complete publication so
+/// registry drift cannot be hidden behind an apparently complete aggregate.
 #[derive(Debug, Default)]
 pub struct WorkerRuntimeSampler {
     tracks: BTreeMap<String, RuntimeTrack>,
@@ -433,12 +433,7 @@ impl WorkerRuntimeSampler {
                 .map_err(WorkerRuntimeStatusError::Contract)?
             {
                 Some(contract) => admitted_rows.push((row, contract)),
-                None => {
-                    // The status map is shared with transitional/optional
-                    // workers. Unknown rows are never published, but they must
-                    // not suppress valid registered rows in this sample.
-                    tracing::debug!(worker = row.name, "ignoring unregistered worker status row");
-                }
+                None => return Err(WorkerRuntimeStatusError::UnregisteredWorker),
             }
         }
         if admitted_rows.len() > MAX_NODE_STATUS_WORKERS {
@@ -1687,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_ignores_unregistered_rows_and_rejects_duplicate_rows() {
+    fn aggregate_refuses_unregistered_rows_and_rejects_duplicate_rows() {
         let statuses = crate::workers::new_status_map();
         statuses.lock().expect("status map").insert(
             "not-registered",
@@ -1704,11 +1699,22 @@ mod tests {
             .lock()
             .expect("status map")
             .insert("cloud", supervisor_row(true, 0, false, None));
-        let node = WorkerRuntimeSampler::default()
-            .sample(&statuses, "node-a", 10_000)
-            .expect("registered rows remain publishable");
+        let mut sampler = WorkerRuntimeSampler::default();
+        assert_eq!(
+            sampler.sample(&statuses, "node-a", 10_000),
+            Err(WorkerRuntimeStatusError::UnregisteredWorker),
+            "an uncensused process must refuse the unified runtime projection"
+        );
+        statuses
+            .lock()
+            .expect("status map")
+            .remove("not-registered");
+        let node = sampler
+            .sample(&statuses, "node-a", 10_001)
+            .expect("registered rows remain publishable after drift is corrected");
         assert_eq!(node.workers.len(), 1);
         assert_eq!(node.workers[0].contract.worker_id, "cloud");
+        assert_eq!(node.workers[0].snapshot.generation, 1);
 
         let mut duplicate_node = WorkerRuntimeNodeStatus {
             schema_version: runtime::WORKER_RUNTIME_SCHEMA_VERSION,
