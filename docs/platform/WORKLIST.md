@@ -204,6 +204,8 @@ behavioral evidence is not completion.
   the Small profile and is covered by one focused farm test. A larger-seat
   successful first frame and the remaining lifecycle matrix remain. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-dell-capacity-refusal-r1.md`.
+- **Startup readiness checkpoint (2026-08-09):** a not-running VM awaiting guest readiness retries instead of falsely completing stopped; BigBoy passed 37/37:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-startup-readiness-fail-closed-r13.md`.
   1. S1 Inventory authorities and remove reachability.
      - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
      - Inputs: repository search, CI authority scan, current evidence.
@@ -1622,6 +1624,8 @@ behavioral evidence is not completion.
 - Required outcome: every Construct-owned egui surface uses the shared Quazar Style/Visuals, approved fonts/icons, Dark/Light appearances, responsive geometry, semantic
   state language, and bounded motion with no hand-rolled surface styling.
 - Current state: shared style and many primitives exist; adoption gaps, icon audit, responsive outliers, and integrated visual proof remain.
+- **Workspace-state checkpoint (2026-08-09):** shared panels stay bounded and use active Light tokens at narrow touch geometry; `.50` passed 12/12:
+  `docs/platform/evidence/WL-UX-009-2026-08-09-workspace-state-responsive-light-r1.md`.
 - Remaining work:
   1. S1 Freeze tokens, fonts, and icon registry.
      - Objective: define the shared Style/Visuals values, licensed fonts, icon semantics, and state colors in one module/registry.

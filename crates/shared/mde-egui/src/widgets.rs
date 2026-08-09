@@ -288,32 +288,46 @@ impl<'a> WorkspaceStatePanel<'a> {
 
     /// Render the panel and the caller-owned action area.
     pub fn show<R>(self, ui: &mut Ui, add_actions: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
-        let width = ui.available_width().min(Style::SP_XL * 16.0);
+        // `card()` adds SP_M on both sides.  Budget those insets before sizing
+        // the content lane; otherwise the shared empty/offline/error surface is
+        // wider than its viewport on narrow and largest-text layouts.
+        let outer_width = ui.available_width().min(Style::SP_XL * 16.0);
+        let content_width =
+            (outer_width - 2.0 * Style::SP_M - 2.0 * Style::STROKE_HAIRLINE).max(1.0);
+        let surface = Style::resolve_color(ui.ctx(), Style::SURFACE);
+        let border = Style::resolve_color(ui.ctx(), Style::BORDER);
+        let title_tone = Style::resolve_color(ui.ctx(), Style::TEXT_STRONG);
+        let detail_tone = Style::resolve_color(ui.ctx(), Style::TEXT_DIM);
+        let state_tone = Style::resolve_color(ui.ctx(), self.state.tone());
         ui.vertical_centered(|ui| {
             ui.add_space(Style::SP_XL);
             card()
+                .fill(surface)
+                .stroke(Stroke::new(Style::STROKE_HAIRLINE, border))
                 .show(ui, |ui| {
-                    ui.set_max_width(width);
+                    ui.set_width(content_width);
                     ui.vertical_centered(|ui| {
                         let (icon_rect, _) = ui.allocate_exact_size(
                             egui::vec2(Style::ICON_XL, Style::ICON_XL),
                             Sense::hover(),
                         );
-                        let _ = paint_carbon(
-                            ui.painter(),
-                            icon_rect,
-                            self.state.icon(),
-                            self.state.tone(),
-                        );
+                        let _ =
+                            paint_carbon(ui.painter(), icon_rect, self.state.icon(), state_tone);
                         ui.add_space(Style::SP_S);
-                        ui.label(
-                            Style::typography_text(self.title, TypographyRole::Headline)
-                                .color(Style::TEXT_STRONG),
+                        ui.add(
+                            egui::Label::new(
+                                Style::typography_text(self.title, TypographyRole::Headline)
+                                    .color(title_tone),
+                            )
+                            .wrap(),
                         );
                         ui.add_space(Style::SP_XS);
-                        ui.label(
-                            Style::typography_text(self.detail, TypographyRole::Body)
-                                .color(Style::TEXT_DIM),
+                        ui.add(
+                            egui::Label::new(
+                                Style::typography_text(self.detail, TypographyRole::Body)
+                                    .color(detail_tone),
+                            )
+                            .wrap(),
                         );
                         ui.add_space(Style::SP_M);
                         add_actions(ui)
@@ -567,6 +581,70 @@ mod tests {
         assert!(
             !out.shapes.is_empty(),
             "state panels must paint in a headless frame"
+        );
+    }
+
+    #[test]
+    fn workspace_state_panel_stays_bounded_and_uses_light_palette_when_narrow() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            crate::StyleColorScheme::Light,
+            crate::Density::Touch,
+        );
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(112.0, 480.0));
+        let mut panel_rect = egui::Rect::NOTHING;
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let available = ui.max_rect();
+                    let response = WorkspaceStatePanel::new(
+                        WorkspaceState::Offline,
+                        "Connection unavailable",
+                        "The source is offline; reconnect when it becomes available.",
+                    )
+                    .show(ui, |ui| ui.button("Reconnect"));
+                    panel_rect = response.response.rect;
+                    assert!(
+                        panel_rect.left() >= available.left()
+                            && panel_rect.right() <= available.right(),
+                        "shared state panel escaped its narrow viewport: panel={panel_rect:?}, available={available:?}"
+                    );
+                });
+            },
+        );
+
+        assert!(
+            panel_rect.is_positive(),
+            "state panel must allocate real geometry"
+        );
+        assert!(
+            out.shapes.iter().any(|clipped| {
+                matches!(
+                    &clipped.shape,
+                    egui::Shape::Rect(rect)
+                        if rect.fill == Style::QUAZAR_LIGHT_SURFACE
+                )
+            }),
+            "windowed Light mode must paint the shared Quazar Light card before any DRM remap"
+        );
+        let text = painted_text(&out.shapes);
+        assert!(
+            text.iter().any(|(value, color)| {
+                value == "Connection unavailable" && *color == Style::QUAZAR_LIGHT_TEXT_STRONG
+            }),
+            "state title must use the installed Light palette: {text:?}"
+        );
+        assert!(
+            text.iter().any(|(value, color)| {
+                value == "The source is offline; reconnect when it becomes available."
+                    && *color == Style::QUAZAR_LIGHT_TEXT_DIM
+            }),
+            "state detail must use the installed Light palette: {text:?}"
         );
     }
 

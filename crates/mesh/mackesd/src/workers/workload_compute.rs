@@ -948,6 +948,20 @@ impl SystemWorkloadActuator {
         }
     }
 
+    fn observe_not_running(
+        &self,
+        request: &WorkloadOperationRequest,
+        status: &WorkloadOperationStatus,
+    ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+        match status.phase {
+            WorkloadOperationPhase::Stopping => Ok(Some(self.stopped_outcome(request))),
+            WorkloadOperationPhase::WaitingForGuest => Err(WorkloadActuatorError::Retryable(
+                "the workload is not yet observed running while waiting for guest readiness".into(),
+            )),
+            _ => Ok(None),
+        }
+    }
+
     fn qemu_display1_address(
         request: &WorkloadOperationRequest,
     ) -> Result<String, WorkloadActuatorError> {
@@ -2084,13 +2098,8 @@ impl WorkloadActuator for SystemWorkloadActuator {
                 },
                 _ => return Ok(None),
             }
-        } else if matches!(
-            status.phase,
-            WorkloadOperationPhase::Stopping | WorkloadOperationPhase::WaitingForGuest
-        ) {
-            self.stopped_outcome(request)
         } else {
-            return Ok(None);
+            return self.observe_not_running(request, status);
         };
         Ok(Some(outcome))
     }
@@ -4058,6 +4067,33 @@ mod tests {
             SystemWorkloadActuator::vm_overlay_path(&request),
             Path::new("/var/lib/mde-vms/browser.qcow2")
         );
+    }
+
+    #[test]
+    fn startup_not_running_observation_cannot_complete_as_stopped() {
+        let temp = tempfile::tempdir().expect("temp");
+        let actuator = SystemWorkloadActuator::new(temp.path().to_path_buf());
+        let request = request();
+        let mut status = queued_status(&request);
+        status.phase = WorkloadOperationPhase::WaitingForGuest;
+        status.power = WorkloadPowerState::Starting;
+        status.readiness = WorkloadReadiness::WaitingForGuest;
+
+        let error = actuator
+            .observe_not_running(&request, &status)
+            .expect_err("startup absence must remain a retryable readiness failure");
+        assert!(matches!(error, WorkloadActuatorError::Retryable(_)));
+
+        status.phase = WorkloadOperationPhase::Stopping;
+        status.power = WorkloadPowerState::Stopping;
+        status.readiness = WorkloadReadiness::Unavailable;
+        let stopped = actuator
+            .observe_not_running(&request, &status)
+            .expect("stop observation")
+            .expect("terminal stop outcome");
+        assert_eq!(stopped.phase, WorkloadOperationPhase::Completed);
+        assert_eq!(stopped.power, WorkloadPowerState::Stopped);
+        assert_eq!(stopped.readiness, WorkloadReadiness::Unavailable);
     }
 
     #[test]
