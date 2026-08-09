@@ -425,19 +425,19 @@ behavioral evidence is not completion.
 - **Compute/Cloud Bus recovery checkpoints (2026-08-09):** firewall exposure and Cloud transactions survive late/replaced storage; Cloud stages reads and durably
   recovers mutation replies without repeating effects. Machines 194/193 passed focused gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`.
-- **Action Bus recovery checkpoint (2026-08-09):** privileged action startup
-  now retries Bus open and tail-cursor priming as one fail-closed activation,
-  skips retained actions, and executes one forward signed action exactly once.
+- **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open and tail priming as one fail-closed activation, skips retained actions, and executes one
+  forward signed action exactly once.
   BigBoy passed three exact recovery tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
 - **Copilot Bus recovery checkpoint (2026-08-09):** late activation skips retained asks and answers one forward signed ask exactly once; machine 196 passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
 - **Session broker replacement recovery (2026-08-09):** roster-preserving dual-tail activation skips retained lifecycle/runtime rows; machine 196 passed exact gates:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`.
-- **Media-source Bus recovery checkpoint (2026-08-09):** discovery now waits
-  through late shared storage, then starts mDNS and immediately publishes the
-  honest merged roster without daemon restart. Machine 193 passed two exact
-  recovery/fallback tests:
+- **Vehicle transaction recovery (2026-08-09):** late/replaced Bus storage preserves staged state; a privileged-reboot journal prevents repeated effects.
+  BigBoy passed four exact gates:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-vehicle-bus-transaction-recovery-r67.md`.
+- **Media-source Bus recovery checkpoint (2026-08-09):** discovery waits through late storage, then starts mDNS and publishes the honest merged roster without restart.
+  Machine 193 passed two exact recovery/fallback tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`.
 - **Media-server Bus recovery checkpoint (2026-08-09):** share manifests,
   serving, aggregation, and publication remain behind recoverable Bus startup;
@@ -837,6 +837,11 @@ behavioral evidence is not completion.
   the applied reboot while returning `audited=false` and a bounded error.
   BigBoy passed both exact fixtures:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-vehicle-audit-truth-r8.md`.
+- **Vehicle crash/Bus transaction checkpoint (2026-08-09):** durable reboot
+  claims/results prevent duplicate gateway and audit effects, while staged
+  roster/publication state recovers late or replaced storage. BigBoy passed
+  four exact gates:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-vehicle-bus-transaction-recovery-r67.md`.
 - **Weather-location Bus recovery checkpoint (2026-08-09):** durable authority
   survives unavailable storage, and complete weather-action/vehicle-fix reads
   precede mutation or projection. Machine 9 passed seven exact tests:

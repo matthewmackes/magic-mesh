@@ -63,6 +63,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -80,10 +81,14 @@ use mackes_mesh_types::vehicle::{
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{ShutdownToken, Worker};
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
 
 /// Env: the gateway endpoint (an IP or `ip:sshport`). Unset ⇒ the worker is a no-op.
 pub const GATEWAY_ENV: &str = "MDE_VEHICLE_GATEWAY";
@@ -109,6 +114,15 @@ pub const ROOT_PW_FILE_DEFAULT: &str = "/etc/mackesd/mg90-root-password";
 /// Password files contain one short line. Refuse unexpectedly large files before
 /// converting their contents into a `String`.
 const ROOT_PASSWORD_MAX_BYTES: usize = 4 * 1024;
+
+/// The privileged-action journal is deliberately much smaller than the Bus. It
+/// only bridges the claim/result/reply crash boundaries for in-flight reboots.
+const ACTION_JOURNAL_SCHEMA_VERSION: u16 = 1;
+const ACTION_JOURNAL_MAX_BYTES: u64 = 256 * 1024;
+const ACTION_JOURNAL_MAX_ENTRIES: usize = 32;
+const ACTION_JOURNAL_MAX_REPLY_BYTES: usize = 64 * 1024;
+const ACTION_JOURNAL_NOFOLLOW_FLAG: i32 = 0o400000;
+static ACTION_JOURNAL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Linux's `O_NOFOLLOW`: the final password-file path component must not be a
 /// symlink. This worker is a Linux system service; keep the flag local rather
@@ -183,6 +197,7 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// Slow GNSS/WAN/application enrichment cadence for the production adapter.
 pub const ENRICHMENT_POLL: Duration = Duration::from_secs(10);
 const FAILURE_RETRY_MAX: Duration = Duration::from_secs(60);
+const BUS_RETRY_MIN: Duration = Duration::from_millis(100);
 const MAX_INITIAL_PHASE: Duration = Duration::from_millis(250);
 
 /// Spread the first gateway status batch across a small deterministic window.
@@ -1429,12 +1444,14 @@ pub struct VehicleRosterPublication {
     pub snapshot: VehicleStateV2,
 }
 
+#[derive(Clone)]
 struct VehiclePublishedState {
     snapshot: VehicleRosterSnapshot,
     published_at: Instant,
 }
 
 /// A configured source/manager assignment in the opt-in roster.
+#[derive(Clone)]
 pub struct VehicleRosterSource {
     source_id: VehicleSourceId,
     manager_id: String,
@@ -1482,6 +1499,7 @@ impl VehicleRosterSource {
     }
 }
 
+#[derive(Clone)]
 struct VehicleRosterAssignment {
     source: VehicleRosterSource,
     next_status: Instant,
@@ -1501,6 +1519,7 @@ struct VehicleRosterAssignment {
 /// and ingest already-typed remote-manager snapshots through [`Self::ingest`].
 /// It retains at most one accepted snapshot per assignment and selects the
 /// freshest valid one for an MG90 without inventing an offline state.
+#[derive(Clone)]
 pub struct VehicleRoster {
     assignments: BTreeMap<(VehicleSourceId, String), VehicleRosterAssignment>,
     published: BTreeMap<VehicleSourceId, VehiclePublishedState>,
@@ -2319,15 +2338,232 @@ fn cell_link_has_observation(link: &CellLink) -> bool {
 
 // ─────────────────────────── the worker ───────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VehicleBusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone)]
+enum VehicleBusRoot {
+    Dynamic,
+    Explicit(PathBuf),
+    Disabled,
+}
+
+#[derive(Debug, Clone)]
+struct PendingVehicleReply {
+    source_index: VehicleBusIdentity,
+    request_topic: String,
+    request_ulid: String,
+    body: String,
+    privileged_journal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VehicleActionTxnPhase {
+    Claimed,
+    Completed,
+    Delivered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VehicleActionTxn {
+    request_ulid: String,
+    request_topic: String,
+    verb: String,
+    phase: VehicleActionTxnPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VehicleActionJournal {
+    schema_version: u16,
+    host: String,
+    entries: Vec<VehicleActionTxn>,
+}
+
+impl VehicleActionJournal {
+    fn empty(host: &str) -> Self {
+        Self {
+            schema_version: ACTION_JOURNAL_SCHEMA_VERSION,
+            host: host.to_string(),
+            entries: Vec::new(),
+        }
+    }
+}
+
+fn vehicle_action_journal_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("vehicle-action-journal.json")
+}
+
+#[cfg(unix)]
+fn validate_action_journal_parent(path: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("vehicle action journal has no parent"))?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::other(
+            "vehicle action journal parent is not a trusted directory",
+        ));
+    }
+    Ok(metadata.uid())
+}
+
+#[cfg(not(unix))]
+fn validate_action_journal_parent(path: &Path) -> io::Result<u32> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("vehicle action journal has no parent"))?;
+    if !fs::symlink_metadata(parent)?.is_dir() {
+        return Err(io::Error::other(
+            "vehicle action journal parent is not a directory",
+        ));
+    }
+    Ok(0)
+}
+
+fn validate_action_journal_file(file: &File, owner_uid: u32) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > ACTION_JOURNAL_MAX_BYTES {
+        return Err(io::Error::other(
+            "vehicle action journal is not a bounded regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != owner_uid || metadata.mode() & 0o777 != 0o600 {
+            return Err(io::Error::other(
+                "vehicle action journal ownership or mode is not trusted",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_action_journal(path: &Path, owner_uid: u32) -> io::Result<File> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::other("vehicle action journal is a symlink"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(ACTION_JOURNAL_NOFOLLOW_FLAG);
+    }
+    let file = options.open(path)?;
+    validate_action_journal_file(&file, owner_uid)?;
+    Ok(file)
+}
+
+fn validate_action_journal(journal: &VehicleActionJournal, host: &str) -> io::Result<()> {
+    if journal.schema_version != ACTION_JOURNAL_SCHEMA_VERSION || journal.host != host {
+        return Err(io::Error::other(
+            "vehicle action journal authority does not match this worker",
+        ));
+    }
+    if journal.entries.len() > ACTION_JOURNAL_MAX_ENTRIES {
+        return Err(io::Error::other(
+            "vehicle action journal entry bound exceeded",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in &journal.entries {
+        if entry.request_ulid.is_empty()
+            || entry.request_ulid.len() > 128
+            || entry.request_topic.len() > 256
+            || entry.request_topic != "action/vehicle/reboot"
+            || entry.verb != "reboot"
+            || !seen.insert(entry.request_ulid.as_str())
+        {
+            return Err(io::Error::other("invalid vehicle action journal entry"));
+        }
+        match (entry.phase, entry.reply.as_deref()) {
+            (VehicleActionTxnPhase::Claimed, None)
+            | (VehicleActionTxnPhase::Completed | VehicleActionTxnPhase::Delivered, Some(_)) => {}
+            _ => return Err(io::Error::other("invalid vehicle action journal phase")),
+        }
+        if let Some(reply) = entry.reply.as_deref() {
+            if reply.len() > ACTION_JOURNAL_MAX_REPLY_BYTES
+                || serde_json::from_str::<VehicleReply>(reply).is_err()
+            {
+                return Err(io::Error::other(
+                    "vehicle action journal contains an invalid typed reply",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct VehicleActionDrainState {
+    active_index: Option<VehicleBusIdentity>,
+    cursors: HashMap<String, String>,
+    pending_reply: Option<PendingVehicleReply>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VehiclePendingCommitKind {
+    Current { healthy: bool, was_online: bool },
+    Enrichment,
+}
+
+#[derive(Clone)]
+struct VehiclePendingCommit {
+    runtime: VehicleRuntimeSnapshot,
+    cached: VehicleState,
+    roster: VehicleRuntimeRoster,
+    kind: VehiclePendingCommitKind,
+    publish_roster: bool,
+    publish_unavailable: bool,
+}
+
+fn vehicle_bus_identity(root: &Path) -> io::Result<VehicleBusIdentity> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("vehicle Bus index is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(VehicleBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(VehicleBusIdentity {})
+    }
+}
+
 /// Sole runtime owner of manager registration, accepted snapshots, manager
 /// selection, and publication clocks. `VehicleWorker::run` feeds every local and
 /// remote observation through this object; there is no second v2 cache.
+#[derive(Clone)]
 struct VehicleRuntimeRoster {
     roster: VehicleRoster,
     local_manager: String,
     managers: Vec<String>,
     source_id: Option<VehicleSourceId>,
     remote_cursors: HashMap<String, String>,
+    remote_index: Option<VehicleBusIdentity>,
     plan: VehiclePollPlan,
 }
 
@@ -2374,6 +2610,7 @@ impl VehicleRuntimeRoster {
             managers,
             source_id: None,
             remote_cursors: HashMap::new(),
+            remote_index: None,
             plan,
         };
         if let Some(source_id) = source_id {
@@ -2417,7 +2654,11 @@ impl VehicleRuntimeRoster {
         }
         let source_id = VehicleSourceId::new(reported.to_string())?;
         self.register_source(source_id.clone())?;
-        let mut snapshot = worker.snapshot_v2_with_interval(state, ROSTER_HEARTBEAT);
+        let mut snapshot = worker.snapshot_v2_with_interval_and_sequence(
+            state,
+            ROSTER_HEARTBEAT,
+            worker.sequence.load(Ordering::Relaxed).saturating_add(1),
+        );
         snapshot.approval = ApprovalState::Approved;
         snapshot.managers = ManagerSet::approved(self.managers.clone())
             .map_err(|error| VehicleRosterError::InvalidManagerId(error.to_string()))?;
@@ -2434,28 +2675,49 @@ impl VehicleRuntimeRoster {
         }
     }
 
-    fn ingest_remote(&mut self, bus_root: Option<PathBuf>, received_at: Instant) {
+    fn ingest_remote(&mut self, worker: &VehicleWorker, received_at: Instant) -> io::Result<()> {
         let Some(source_id) = self.source_id.clone() else {
-            return;
+            return Ok(());
         };
-        let Some(root) = bus_root else {
-            return;
+        let Some((root, index, persist)) = worker.open_bus_transaction()? else {
+            return Ok(());
         };
-        let Ok(persist) = Persist::open(root) else {
-            return;
-        };
-        for manager in self
+        let mut staged = self.clone();
+        let managers = staged
             .managers
             .iter()
             .filter(|manager| *manager != &self.local_manager)
-        {
-            let topic = vehicle_state_v2_topic(manager, source_id.as_str());
-            let cursor = self.remote_cursors.get(&topic).map(String::as_str);
-            let Ok(messages) = persist.list_since(&topic, cursor) else {
-                continue;
-            };
+            .cloned()
+            .collect::<Vec<_>>();
+        if staged.remote_index != Some(index) {
+            staged.remote_cursors.clear();
+            for manager in &managers {
+                staged
+                    .roster
+                    .mark_unavailable(&source_id, manager)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            staged.remote_index = Some(index);
+        }
+        for manager in managers {
+            let topic = vehicle_state_v2_topic(&manager, source_id.as_str());
+            #[cfg(test)]
+            if worker
+                .remote_read_failure
+                .lock()
+                .expect("remote read failure lock")
+                .as_deref()
+                == Some(topic.as_str())
+            {
+                return Err(io::Error::other("injected remote roster read failure"));
+            }
+            let cursor = staged.remote_cursors.get(&topic).map(String::as_str);
+            let messages = persist
+                .list_since(&topic, cursor)
+                .map_err(|error| io::Error::other(error.to_string()))?;
             for message in messages {
-                self.remote_cursors
+                staged
+                    .remote_cursors
                     .insert(topic.clone(), message.ulid.clone());
                 let Some(body) = message.body.as_deref() else {
                     continue;
@@ -2471,7 +2733,10 @@ impl VehicleRuntimeRoster {
                 };
                 match VehicleRosterSnapshot::from_v2(source_id.clone(), manager.clone(), snapshot) {
                     Ok(admitted) => {
-                        let _ = self.roster.ingest_at(admitted, received_at);
+                        staged
+                            .roster
+                            .ingest_at(admitted, received_at)
+                            .map_err(|error| io::Error::other(error.to_string()))?;
                     }
                     Err(error) => tracing::warn!(
                         target: "mackesd::vehicle",
@@ -2483,6 +2748,9 @@ impl VehicleRuntimeRoster {
                 }
             }
         }
+        worker.verify_bus_identity(&root, index)?;
+        *self = staged;
+        Ok(())
     }
 
     fn take_publications(&mut self, now: Instant) -> Vec<VehicleRosterPublication> {
@@ -2519,12 +2787,14 @@ pub struct VehicleWorker {
     /// The transport seam (production [`SshHttpProbe`]). `None` ⇒ no
     /// `MDE_VEHICLE_GATEWAY` configured ⇒ the worker idles (publishes nothing).
     probe: Option<Arc<dyn VehicleProbe>>,
-    /// The Bus root the mirror publish targets + the `action/vehicle/*` drain reads
-    /// (`None` ⇒ publish/drain is a swallowed no-op — a pre-RPM dev box / a test).
-    bus_root: Option<PathBuf>,
+    /// Dynamic production resolver, an explicit test root, or an explicit
+    /// test-only disable selected through `with_bus_root(None)`.
+    bus_root: VehicleBusRoot,
     /// The hash-chain audit DB (a performed `reboot` audits here — mirrors the
     /// `cloud` worker's destructive-op audit).
     db_path: PathBuf,
+    /// Host-local crash journal for privileged action claim/result delivery.
+    action_journal_path: PathBuf,
     /// Poll + heartbeat cadence.
     poll: Duration,
     heartbeat: Duration,
@@ -2533,6 +2803,10 @@ pub struct VehicleWorker {
     sequence: AtomicU64,
     /// Shared, fail-closed authorization gate for destructive Bus mutations.
     authorizer: Arc<ActionAuthorizer>,
+    /// Hostile-test reply fault budget; production always leaves this at zero.
+    reply_failures: AtomicU64,
+    #[cfg(test)]
+    remote_read_failure: std::sync::Mutex<Option<String>>,
 }
 
 impl VehicleWorker {
@@ -2545,16 +2819,21 @@ impl VehicleWorker {
             Ok(g) if !g.trim().is_empty() => Some(Arc::new(SshHttpProbe::from_env(g.trim()))),
             _ => None,
         };
+        let db_path = crate::default_db_path();
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
-            db_path: crate::default_db_path(),
+            bus_root: VehicleBusRoot::Dynamic,
+            action_journal_path: vehicle_action_journal_path(&db_path),
+            db_path,
             poll: POLL,
             heartbeat: ROSTER_HEARTBEAT,
             current_timeout: CURRENT_STATUS_TIMEOUT,
             sequence: AtomicU64::new(0),
             authorizer: Arc::new(ActionAuthorizer::production()),
+            reply_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_read_failure: std::sync::Mutex::new(None),
         }
     }
 
@@ -2569,13 +2848,14 @@ impl VehicleWorker {
     /// Override the Bus root (tests point it at a tempdir; `None` disables publish).
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_root = root.map_or(VehicleBusRoot::Disabled, VehicleBusRoot::Explicit);
         self
     }
 
     /// Override the audit DB path (tests point it at a tempdir).
     #[must_use]
     pub fn with_db_path(mut self, p: PathBuf) -> Self {
+        self.action_journal_path = vehicle_action_journal_path(&p);
         self.db_path = p;
         self
     }
@@ -2600,6 +2880,67 @@ impl VehicleWorker {
         self
     }
 
+    fn bus_roots(&self) -> Option<Vec<PathBuf>> {
+        match &self.bus_root {
+            VehicleBusRoot::Disabled => None,
+            VehicleBusRoot::Explicit(root) => Some(vec![root.clone()]),
+            VehicleBusRoot::Dynamic => {
+                let system = PathBuf::from(mde_bus::SYSTEM_BUS_ROOT);
+                let mut roots = Vec::with_capacity(2);
+                if let Some(current) = mde_bus::default_data_dir() {
+                    roots.push(current);
+                }
+                if !roots.iter().any(|root| root == &system) {
+                    roots.push(system);
+                }
+                Some(roots)
+            }
+        }
+    }
+
+    fn open_bus_transaction(&self) -> io::Result<Option<(PathBuf, VehicleBusIdentity, Persist)>> {
+        let Some(roots) = self.bus_roots() else {
+            return Ok(None);
+        };
+        let mut last_error = None;
+        for root in roots {
+            let before_open = match vehicle_bus_identity(&root) {
+                Ok(identity) => Some(identity),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let persist = match Persist::open(root.clone()) {
+                Ok(persist) => persist,
+                Err(error) => {
+                    last_error = Some(io::Error::other(error.to_string()));
+                    continue;
+                }
+            };
+            let opened = vehicle_bus_identity(&root)?;
+            if before_open.is_some_and(|before| before != opened) {
+                last_error = Some(io::Error::other(
+                    "vehicle Bus index changed while opening transaction",
+                ));
+                continue;
+            }
+            return Ok(Some((root, opened, persist)));
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("vehicle Bus root unresolved")))
+    }
+
+    fn verify_bus_identity(&self, root: &Path, expected: VehicleBusIdentity) -> io::Result<()> {
+        if vehicle_bus_identity(root).is_ok_and(|identity| identity == expected) {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "vehicle Bus index changed during transaction",
+            ))
+        }
+    }
+
     fn spawn_current_status(
         &self,
         probe: Arc<dyn VehicleProbe>,
@@ -2621,6 +2962,20 @@ impl VehicleWorker {
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
         self
+    }
+
+    #[cfg(test)]
+    fn with_reply_failures(self, failures: u64) -> Self {
+        self.reply_failures.store(failures, Ordering::Relaxed);
+        self
+    }
+
+    #[cfg(test)]
+    fn set_remote_read_failure(&self, topic: Option<String>) {
+        *self
+            .remote_read_failure
+            .lock()
+            .expect("remote read failure lock") = topic;
     }
 
     /// Build the current `state/vehicle/<host>` mirror from the probe's three raw
@@ -3022,11 +3377,21 @@ impl VehicleWorker {
         state: &VehicleState,
         expected_interval: Duration,
     ) -> VehicleStateV2 {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        self.snapshot_v2_with_interval_and_sequence(state, expected_interval, sequence)
+    }
+
+    fn snapshot_v2_with_interval_and_sequence(
+        &self,
+        state: &VehicleState,
+        expected_interval: Duration,
+        sequence: u64,
+    ) -> VehicleStateV2 {
         let published_at_ms = now_ms();
         VehicleStateV2::from_v1(
             state,
             self.host.clone(),
-            self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
+            sequence,
             expected_interval.as_millis().try_into().unwrap_or(u64::MAX),
             published_at_ms,
             SnapshotProvenance {
@@ -3046,27 +3411,24 @@ impl VehicleWorker {
     /// replaced with a synthetic topic segment.
     #[cfg(test)]
     fn publish_pair(&self, legacy: &VehicleState, observed: &VehicleState, interval: Duration) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &vehicle_state_topic(&self.host),
-                legacy,
+        let mut rows = vec![(
+            vehicle_state_topic(&self.host),
+            serde_json::to_string(legacy).expect("serialize legacy vehicle state"),
+        )];
+        let v2 = self.snapshot_v2_with_interval(observed, interval);
+        if !v2.mg90.id.is_empty() {
+            rows.push((
+                vehicle_state_v2_topic(&v2.management_node_id, &v2.mg90.id),
+                serde_json::to_string(&v2).expect("serialize v2 vehicle state"),
+            ));
+        } else {
+            tracing::debug!(
+                target: "mackesd::vehicle",
+                host = %self.host,
+                "v2 vehicle snapshot withheld until MG90 ESN is confirmed"
             );
-            let v2 = self.snapshot_v2_with_interval(observed, interval);
-            if !v2.mg90.id.is_empty() {
-                crate::bus_publish::publish_json(
-                    &mut persist,
-                    &vehicle_state_v2_topic(&v2.management_node_id, &v2.mg90.id),
-                    &v2,
-                );
-            } else {
-                tracing::debug!(
-                    target: "mackesd::vehicle",
-                    host = %self.host,
-                    "v2 vehicle snapshot withheld until MG90 ESN is confirmed"
-                );
-            }
         }
+        self.publish_rows(&rows).expect("publish vehicle pair");
     }
 
     #[cfg(test)]
@@ -3079,11 +3441,11 @@ impl VehicleWorker {
         roster: &mut VehicleRuntimeRoster,
         local_state: &VehicleState,
         now: Instant,
-    ) {
-        let publications = roster.take_publications(now);
-        let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) else {
-            return;
-        };
+    ) -> io::Result<()> {
+        let mut staged = roster.clone();
+        let publications = staged.take_publications(now);
+        let mut rows = Vec::new();
+        let mut committed_sequence = None;
         for publication in publications {
             // A remote manager's accepted row is already present on its exact Bus
             // lane. Re-emitting it here would create an amplification loop. The
@@ -3092,37 +3454,68 @@ impl VehicleWorker {
             if publication.manager_id != self.host {
                 continue;
             }
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &vehicle_state_v2_topic(&publication.manager_id, publication.source_id.as_str()),
-                &publication.snapshot,
+            rows.push((
+                vehicle_state_v2_topic(&publication.manager_id, publication.source_id.as_str()),
+                serde_json::to_string(&publication.snapshot).map_err(io_other)?,
+            ));
+            committed_sequence = Some(
+                committed_sequence
+                    .unwrap_or(0)
+                    .max(publication.snapshot.sequence),
             );
             if local_state.online && local_state.esn == publication.source_id.as_str() {
                 let mut legacy = local_state.clone();
                 legacy.published_at_ms = now_ms();
-                crate::bus_publish::publish_json(
-                    &mut persist,
-                    &vehicle_state_topic(&self.host),
-                    &legacy,
-                );
+                rows.push((
+                    vehicle_state_topic(&self.host),
+                    serde_json::to_string(&legacy).map_err(io_other)?,
+                ));
             }
         }
+        self.publish_rows(&rows)?;
+        if let Some(sequence) = committed_sequence {
+            self.sequence.store(sequence, Ordering::Relaxed);
+        }
+        *roster = staged;
+        Ok(())
     }
 
     /// Preserve the one-release legacy availability signal without creating a
     /// v2 source or manager claim. Callers may use this only for explicit
     /// pending/unavailable state.
-    fn publish_legacy_unavailable(&self, state: &VehicleState) {
+    fn publish_legacy_unavailable(&self, state: &VehicleState) -> io::Result<()> {
         debug_assert!(!state.online);
         let mut state = state.clone();
         state.published_at_ms = now_ms();
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &vehicle_state_topic(&self.host),
-                &state,
-            );
+        self.publish_rows(&[(
+            vehicle_state_topic(&self.host),
+            serde_json::to_string(&state).map_err(io_other)?,
+        )])
+    }
+
+    fn publish_rows(&self, rows: &[(String, String)]) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
         }
+        let Some((root, index, persist)) = self.open_bus_transaction()? else {
+            return Ok(());
+        };
+        for (topic, body) in rows {
+            persist
+                .write(topic, Priority::Default, None, Some(body))
+                .map_err(io_other)?;
+        }
+        self.verify_bus_identity(&root, index)
+    }
+
+    fn publish_pending_commit(&self, pending: &mut VehiclePendingCommit) -> io::Result<()> {
+        if pending.publish_roster {
+            self.publish_roster_updates(&mut pending.roster, &pending.cached, Instant::now())?;
+        }
+        if pending.publish_unavailable {
+            self.publish_legacy_unavailable(&pending.cached)?;
+        }
+        Ok(())
     }
 
     // ─────────────────────── Phase 4 · action/vehicle/* control drain ───────────────────────
@@ -3305,74 +3698,388 @@ impl VehicleWorker {
         )
     }
 
-    /// Drain every new `action/vehicle/*` request, advance the per-topic cursors, and
-    /// answer each on `reply/<ulid>` with a typed [`VehicleReply`]. Returns `true`
-    /// when any request was handled. A no-bus worker is a swallowed no-op.
-    fn drain_actions(&self, cursors: &mut HashMap<String, String>) -> bool {
-        let Some(root) = self.bus_root.clone() else {
-            return false;
+    fn load_action_journal(&self) -> io::Result<VehicleActionJournal> {
+        if matches!(
+            fs::symlink_metadata(&self.action_journal_path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        ) {
+            return Ok(VehicleActionJournal::empty(&self.host));
+        }
+        let owner_uid = validate_action_journal_parent(&self.action_journal_path)?;
+        let file = match open_action_journal(&self.action_journal_path, owner_uid) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(VehicleActionJournal::empty(&self.host));
+            }
+            Err(error) => return Err(error),
         };
-        let Ok(persist) = Persist::open(root) else {
-            return false;
+        let mut body = Vec::new();
+        file.take(ACTION_JOURNAL_MAX_BYTES + 1)
+            .read_to_end(&mut body)?;
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > ACTION_JOURNAL_MAX_BYTES {
+            return Err(io::Error::other(
+                "vehicle action journal size bound exceeded",
+            ));
+        }
+        let journal: VehicleActionJournal = serde_json::from_slice(&body).map_err(io_other)?;
+        validate_action_journal(&journal, &self.host)?;
+        Ok(journal)
+    }
+
+    fn save_action_journal(&self, journal: &VehicleActionJournal) -> io::Result<()> {
+        validate_action_journal(journal, &self.host)?;
+        let owner_uid = validate_action_journal_parent(&self.action_journal_path)?;
+        match open_action_journal(&self.action_journal_path, owner_uid) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let body = serde_json::to_vec(journal).map_err(io_other)?;
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > ACTION_JOURNAL_MAX_BYTES {
+            return Err(io::Error::other(
+                "vehicle action journal size bound exceeded",
+            ));
+        }
+        let parent = self
+            .action_journal_path
+            .parent()
+            .ok_or_else(|| io::Error::other("vehicle action journal has no parent"))?;
+        let sequence = ACTION_JOURNAL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".vehicle-action-journal-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            #[cfg(target_os = "linux")]
+            options.custom_flags(ACTION_JOURNAL_NOFOLLOW_FLAG);
+        }
+        let mut file = options.open(&temp)?;
+        let result = (|| {
+            file.write_all(&body)?;
+            file.sync_all()?;
+            validate_action_journal_file(&file, owner_uid)?;
+            fs::rename(&temp, &self.action_journal_path)?;
+            let persisted = open_action_journal(&self.action_journal_path, owner_uid)?;
+            persisted.sync_all()?;
+            File::open(parent)?.sync_all()
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn claim_privileged_action(
+        &self,
+        request_ulid: &str,
+        request_topic: &str,
+    ) -> io::Result<VehicleActionTxn> {
+        let mut journal = self.load_action_journal()?;
+        if let Some(existing) = journal
+            .entries
+            .iter()
+            .find(|entry| entry.request_ulid == request_ulid)
+        {
+            if existing.request_topic != request_topic || existing.verb != "reboot" {
+                return Err(io::Error::other(
+                    "vehicle action journal request identity collision",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        if journal.entries.len() >= ACTION_JOURNAL_MAX_ENTRIES {
+            return Err(io::Error::other("vehicle action journal is full"));
+        }
+        let entry = VehicleActionTxn {
+            request_ulid: request_ulid.to_string(),
+            request_topic: request_topic.to_string(),
+            verb: "reboot".to_string(),
+            phase: VehicleActionTxnPhase::Claimed,
+            reply: None,
         };
-        let Ok(topics) = persist.list_topics() else {
-            return false;
+        journal.entries.push(entry.clone());
+        self.save_action_journal(&journal)?;
+        Ok(entry)
+    }
+
+    fn complete_privileged_action(&self, request_ulid: &str, body: &str) -> io::Result<()> {
+        if body.len() > ACTION_JOURNAL_MAX_REPLY_BYTES {
+            return Err(io::Error::other(
+                "vehicle action reply exceeds journal bound",
+            ));
+        }
+        serde_json::from_str::<VehicleReply>(body).map_err(io_other)?;
+        let mut journal = self.load_action_journal()?;
+        let entry = journal
+            .entries
+            .iter_mut()
+            .find(|entry| entry.request_ulid == request_ulid)
+            .ok_or_else(|| io::Error::other("vehicle action journal claim is missing"))?;
+        match entry.phase {
+            VehicleActionTxnPhase::Claimed => {
+                entry.phase = VehicleActionTxnPhase::Completed;
+                entry.reply = Some(body.to_string());
+            }
+            VehicleActionTxnPhase::Completed if entry.reply.as_deref() == Some(body) => {
+                return Ok(())
+            }
+            VehicleActionTxnPhase::Delivered if entry.reply.as_deref() == Some(body) => {
+                return Ok(())
+            }
+            _ => return Err(io::Error::other("vehicle action journal result mismatch")),
+        }
+        self.save_action_journal(&journal)
+    }
+
+    fn deliver_privileged_action(&self, request_ulid: &str, body: &str) -> io::Result<()> {
+        let mut journal = self.load_action_journal()?;
+        let entry = journal
+            .entries
+            .iter_mut()
+            .find(|entry| entry.request_ulid == request_ulid)
+            .ok_or_else(|| io::Error::other("vehicle action journal result is missing"))?;
+        if entry.reply.as_deref() != Some(body) {
+            return Err(io::Error::other("vehicle action journal delivery mismatch"));
+        }
+        entry.phase = VehicleActionTxnPhase::Delivered;
+        self.save_action_journal(&journal)?;
+        journal
+            .entries
+            .retain(|entry| entry.request_ulid != request_ulid);
+        if journal.entries.is_empty() {
+            let owner_uid = validate_action_journal_parent(&self.action_journal_path)?;
+            open_action_journal(&self.action_journal_path, owner_uid)?;
+            fs::remove_file(&self.action_journal_path)?;
+            File::open(
+                self.action_journal_path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("vehicle action journal has no parent"))?,
+            )?
+            .sync_all()
+        } else {
+            self.save_action_journal(&journal)
+        }
+    }
+
+    fn indeterminate_reboot_reply() -> io::Result<String> {
+        serde_json::to_string(&VehicleReply {
+            ok: false,
+            verb: "reboot".to_string(),
+            gated: Some(
+                "privileged reboot outcome is indeterminate after process recovery; the effect was not repeated"
+                    .to_string(),
+            ),
+            error: Some(
+                "a durable claim existed without a completed result; inspect the gateway and audit before retrying"
+                    .to_string(),
+            ),
+            ..Default::default()
+        })
+        .map_err(io_other)
+    }
+
+    fn reply_body_exists(
+        &self,
+        persist: &Persist,
+        request_ulid: &str,
+        body: &str,
+    ) -> io::Result<bool> {
+        Ok(persist
+            .list_since(&reply_topic(request_ulid), None)
+            .map_err(io_other)?
+            .iter()
+            .any(|message| message.body.as_deref() == Some(body)))
+    }
+
+    fn recover_privileged_actions(
+        &self,
+        root: &Path,
+        index: VehicleBusIdentity,
+        persist: &Persist,
+    ) -> io::Result<bool> {
+        let entries = self.load_action_journal()?.entries;
+        let mut recovered = false;
+        for entry in entries {
+            if entry.phase == VehicleActionTxnPhase::Delivered {
+                let body = entry.reply.as_deref().ok_or_else(|| {
+                    io::Error::other("delivered vehicle action journal reply is missing")
+                })?;
+                self.deliver_privileged_action(&entry.request_ulid, body)?;
+                continue;
+            }
+            let body = match entry.phase {
+                VehicleActionTxnPhase::Claimed => {
+                    let body = Self::indeterminate_reboot_reply()?;
+                    self.complete_privileged_action(&entry.request_ulid, &body)?;
+                    body
+                }
+                VehicleActionTxnPhase::Completed => entry.reply.ok_or_else(|| {
+                    io::Error::other("completed vehicle action journal reply is missing")
+                })?,
+                VehicleActionTxnPhase::Delivered => unreachable!(),
+            };
+            if !self.reply_body_exists(persist, &entry.request_ulid, &body)? {
+                self.write_reply(persist, &entry.request_ulid, &body)?;
+            }
+            self.verify_bus_identity(root, index)?;
+            self.deliver_privileged_action(&entry.request_ulid, &body)?;
+            recovered = true;
+        }
+        Ok(recovered)
+    }
+
+    /// Atomically tail-prime every action lane on a newly observed Bus index.
+    /// No activation state changes unless all topic/tail reads and the final
+    /// index-stability check succeed.
+    fn activate_actions(&self, state: &mut VehicleActionDrainState) -> io::Result<()> {
+        let Some((root, index, persist)) = self.open_bus_transaction()? else {
+            return Ok(());
         };
-        let mut acted = false;
+        if state.active_index == Some(index) {
+            return Ok(());
+        }
+        let topics = persist.list_topics().map_err(io_other)?;
+        let mut staged_cursors = HashMap::new();
+        for topic in topics {
+            if !topic.starts_with(VEHICLE_ACTION_PREFIX) {
+                continue;
+            }
+            if let Some(ulid) = persist.latest_ulid(&topic).map_err(io_other)? {
+                staged_cursors.insert(topic, ulid);
+            }
+        }
+        self.verify_bus_identity(&root, index)?;
+        state.active_index = Some(index);
+        state.cursors = staged_cursors;
+        Ok(())
+    }
+
+    /// Drain new transient actions only after complete lane reads. Privileged
+    /// reboot claims and exact results cross the process-crash boundary in the
+    /// trusted local journal before their corresponding effect/reply boundaries.
+    fn drain_actions(&self, state: &mut VehicleActionDrainState) -> io::Result<bool> {
+        self.activate_actions(state)?;
+        let Some((mut root, mut index, mut persist)) = self.open_bus_transaction()? else {
+            return Ok(false);
+        };
+        if state.active_index != Some(index) {
+            self.activate_actions(state)?;
+            let Some(reopened) = self.open_bus_transaction()? else {
+                return Ok(false);
+            };
+            (root, index, persist) = reopened;
+            if state.active_index != Some(index) {
+                return Err(io::Error::other(
+                    "vehicle action Bus changed repeatedly during activation",
+                ));
+            }
+        }
+
+        if let Some(pending) = state.pending_reply.clone() {
+            if pending.privileged_journal {
+                self.complete_privileged_action(&pending.request_ulid, &pending.body)?;
+            }
+            if !self.reply_body_exists(&persist, &pending.request_ulid, &pending.body)? {
+                self.write_reply(&persist, &pending.request_ulid, &pending.body)?;
+            }
+            self.verify_bus_identity(&root, index)?;
+            if pending.privileged_journal {
+                self.deliver_privileged_action(&pending.request_ulid, &pending.body)?;
+            }
+            if pending.source_index == index {
+                state
+                    .cursors
+                    .insert(pending.request_topic, pending.request_ulid);
+            }
+            state.pending_reply = None;
+        }
+
+        let mut acted = self.recover_privileged_actions(&root, index, &persist)?;
+
+        let topics = persist.list_topics().map_err(io_other)?;
+        let mut batches = Vec::new();
         for topic in topics {
             let Some(verb_name) = topic.strip_prefix(VEHICLE_ACTION_PREFIX) else {
                 continue;
             };
             let verb_name = verb_name.to_string();
-            let cursor = cursors.get(&topic).cloned();
-            let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
-                continue;
-            };
-            for msg in msgs {
-                cursors.insert(topic.clone(), msg.ulid.clone());
+            let cursor = state.cursors.get(&topic).map(String::as_str);
+            let messages = persist.list_since(&topic, cursor).map_err(io_other)?;
+            batches.push((topic, verb_name, messages));
+        }
+        self.verify_bus_identity(&root, index)?;
+
+        for (topic, verb_name, messages) in batches {
+            for msg in messages {
                 let body = msg.body.as_deref().unwrap_or("{}");
-                let reply = self.handle(&verb_name, body);
+                let privileged_journal = verb_name == "reboot";
+                let reply_body = if privileged_journal {
+                    let claimed = self.claim_privileged_action(&msg.ulid, &topic)?;
+                    match claimed.phase {
+                        VehicleActionTxnPhase::Claimed => {
+                            let reply = self.handle(&verb_name, body);
+                            serde_json::to_string(&reply).map_err(io_other)?
+                        }
+                        VehicleActionTxnPhase::Completed | VehicleActionTxnPhase::Delivered => {
+                            claimed.reply.ok_or_else(|| {
+                                io::Error::other("vehicle action journal reply is missing")
+                            })?
+                        }
+                    }
+                } else {
+                    serde_json::to_string(&self.handle(&verb_name, body)).map_err(io_other)?
+                };
+                let reply: VehicleReply = serde_json::from_str(&reply_body).map_err(io_other)?;
                 tracing::info!(
                     target: "mackesd::vehicle",
                     ulid = %msg.ulid, verb = %verb_name, ok = reply.ok,
                     audited = reply.audited, "vehicle action handled"
                 );
-                self.write_reply(&persist, &msg.ulid, &reply);
+                state.pending_reply = Some(PendingVehicleReply {
+                    source_index: index,
+                    request_topic: topic.clone(),
+                    request_ulid: msg.ulid.clone(),
+                    body: reply_body,
+                    privileged_journal,
+                });
+                let pending = state.pending_reply.as_ref().expect("pending reply staged");
+                if pending.privileged_journal {
+                    self.complete_privileged_action(&pending.request_ulid, &pending.body)?;
+                }
+                if !self.reply_body_exists(&persist, &pending.request_ulid, &pending.body)? {
+                    self.write_reply(&persist, &pending.request_ulid, &pending.body)?;
+                }
+                self.verify_bus_identity(&root, index)?;
+                if pending.privileged_journal {
+                    self.deliver_privileged_action(&pending.request_ulid, &pending.body)?;
+                }
+                state.cursors.insert(topic.clone(), msg.ulid);
+                state.pending_reply = None;
                 acted = true;
             }
         }
-        acted
+        Ok(acted)
     }
 
-    /// Seed each existing `action/vehicle/*` topic's cursor to its newest message so
-    /// a (re)start doesn't replay a backlog of verbs.
-    fn prime_cursors(&self, cursors: &mut HashMap<String, String>) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
-            return;
-        };
-        let Ok(topics) = persist.list_topics() else {
-            return;
-        };
-        for topic in topics {
-            if !topic.starts_with(VEHICLE_ACTION_PREFIX) {
-                continue;
-            }
-            if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
-                cursors.insert(topic, ulid);
-            }
-        }
-    }
-
-    /// Write a typed reply to `reply/<request-ulid>` (best-effort).
-    fn write_reply(&self, persist: &Persist, req_ulid: &str, reply: &VehicleReply) {
-        let body = serde_json::to_string(reply).unwrap_or_default();
-        if let Err(e) = persist.write(&reply_topic(req_ulid), Priority::Default, None, Some(&body))
+    fn write_reply(&self, persist: &Persist, req_ulid: &str, body: &str) -> io::Result<()> {
+        if self
+            .reply_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
         {
-            tracing::warn!(target: "mackesd::vehicle", ulid = %req_ulid, error = %e, "vehicle reply write failed");
+            return Err(io::Error::other("injected vehicle reply write failure"));
         }
+        persist
+            .write(&reply_topic(req_ulid), Priority::Default, None, Some(body))
+            .map(|_| ())
+            .map_err(io_other)
     }
 }
 
@@ -3456,15 +4163,36 @@ impl Worker for VehicleWorker {
         };
         let mut roster = VehicleRuntimeRoster::from_env(&self.host, Instant::now(), roster_plan)
             .map_err(|error| anyhow::anyhow!("invalid vehicle roster configuration: {error}"))?;
-        // Seed the action cursors so a (re)start doesn't replay a backlog of verbs.
-        let mut cursors: HashMap<String, String> = HashMap::new();
-        self.prime_cursors(&mut cursors);
+        let mut action_state = VehicleActionDrainState::default();
         // Until a poll confirms the configured MG90 identity, the roster has no
         // accepted source and publishes no v2 manager claim.
-        self.drain_actions(&mut cursors);
         let mut runtime = VehicleRuntimeSnapshot::pending(&self.host);
         let mut cached = runtime.render();
-        self.publish_legacy_unavailable(&cached);
+        let mut startup_retry = BUS_RETRY_MIN;
+        loop {
+            let activated = self.activate_actions(&mut action_state);
+            let published = activated
+                .as_ref()
+                .map_err(|error| io::Error::other(error.to_string()))
+                .and_then(|()| self.publish_legacy_unavailable(&cached));
+            match published {
+                Ok(()) => break,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::vehicle",
+                    host = %self.host,
+                    %error,
+                    "vehicle Bus activation/publication deferred"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(startup_retry) => {}
+            }
+            startup_retry = startup_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+        }
+        if let Err(error) = self.drain_actions(&mut action_state) {
+            tracing::warn!(target: "mackesd::vehicle", %error, "vehicle action drain deferred");
+        }
         let now = tokio::time::Instant::now();
         let phase = initial_phase_for(&self.host, self.poll);
         let mut current_tick = tokio::time::interval_at(now + phase, self.poll);
@@ -3483,16 +4211,55 @@ impl Worker for VehicleWorker {
             None;
         let mut enrichment_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut enrichment_timed_out = false;
+        let mut pending_commit: Option<VehiclePendingCommit> = None;
         loop {
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
                 _ = current_tick.tick() => {
-                    self.drain_actions(&mut cursors);
-                    roster.ingest_remote(self.bus_root.clone(), Instant::now());
+                    if let Err(error) = self.drain_actions(&mut action_state) {
+                        tracing::warn!(target: "mackesd::vehicle", %error, "vehicle action drain deferred");
+                    }
+                    if let Some(mut pending) = pending_commit.take() {
+                        match self.publish_pending_commit(&mut pending) {
+                            Ok(()) => {
+                                let kind = pending.kind;
+                                runtime = pending.runtime;
+                                cached = pending.cached;
+                                roster = pending.roster;
+                                match kind {
+                                    VehiclePendingCommitKind::Current { healthy, was_online } => {
+                                        if !was_online && runtime.online && enrichment_task.is_none() {
+                                            enrichment_task = Some(self.spawn_enrichment(probe.clone()));
+                                            enrichment_deadline = Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
+                                            enrichment_timed_out = false;
+                                        }
+                                        if healthy {
+                                            current_retry = self.poll;
+                                            current_not_before = None;
+                                        } else {
+                                            current_not_before = Some(tokio::time::Instant::now() + current_retry);
+                                            current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+                                        }
+                                    }
+                                    VehiclePendingCommitKind::Enrichment => {}
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::vehicle", %error, "vehicle state publication retry deferred");
+                                pending_commit = Some(pending);
+                            }
+                        }
+                    }
+                    if pending_commit.is_none() {
+                        if let Err(error) = roster.ingest_remote(self, Instant::now()) {
+                            tracing::warn!(target: "mackesd::vehicle", %error, "remote vehicle roster read deferred");
+                        }
+                    }
                     let retry_ready = current_not_before
                         .map_or(true, |not_before| tokio::time::Instant::now() >= not_before);
-                    let poll_due = roster.local_due(Instant::now(), VehicleScheduleKind::CurrentStatus);
-                    if current_task.is_none() && retry_ready && poll_due {
+                    let poll_due = pending_commit.is_none()
+                        && roster.local_due(Instant::now(), VehicleScheduleKind::CurrentStatus);
+                    if pending_commit.is_none() && current_task.is_none() && retry_ready && poll_due {
                         current_not_before = None;
                         current_task = Some(self.spawn_current_status(probe.clone()));
                         current_deadline =
@@ -3501,26 +4268,44 @@ impl Worker for VehicleWorker {
                     }
                 }
                 _ = enrichment_tick.tick() => {
-                    let enrichment_due = runtime.online
+                    let enrichment_due = pending_commit.is_none()
+                        && runtime.online
                         && roster.local_due(Instant::now(), VehicleScheduleKind::Enrichment);
-                    if runtime.online && enrichment_task.is_none() && enrichment_due {
+                    if pending_commit.is_none() && runtime.online && enrichment_task.is_none() && enrichment_due {
                         enrichment_task = Some(self.spawn_enrichment(probe.clone()));
                         enrichment_deadline = Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
                         enrichment_timed_out = false;
                     }
                 }
                 _ = heartbeat_tick.tick() => {
-                    roster.ingest_remote(self.bus_root.clone(), Instant::now());
-                    if roster.local_due(Instant::now(), VehicleScheduleKind::Heartbeat) {
-                        self.publish_roster_updates(&mut roster, &cached, Instant::now());
-                    }
-                    if !cached.online {
-                        self.publish_legacy_unavailable(&cached);
+                    if pending_commit.is_none() {
+                        if let Err(error) = roster.ingest_remote(self, Instant::now()) {
+                            tracing::warn!(target: "mackesd::vehicle", %error, "remote vehicle roster read deferred");
+                        }
+                        let mut staged_roster = roster.clone();
+                        let heartbeat_due = staged_roster
+                            .local_due(Instant::now(), VehicleScheduleKind::Heartbeat);
+                        let publication = if heartbeat_due {
+                            self.publish_roster_updates(&mut staged_roster, &cached, Instant::now())
+                        } else {
+                            Ok(())
+                        }
+                        .and_then(|()| {
+                            if !cached.online {
+                                self.publish_legacy_unavailable(&cached)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        match publication {
+                            Ok(()) => roster = staged_roster,
+                            Err(error) => tracing::warn!(target: "mackesd::vehicle", %error, "vehicle heartbeat publication deferred"),
+                        }
                     }
                 }
                 result = async {
                     current_task.as_mut().expect("guarded current-status task").await
-                }, if current_task.is_some() => {
+                }, if current_task.is_some() && pending_commit.is_none() => {
                     current_task = None;
                     current_deadline = None;
                     if current_timed_out {
@@ -3528,42 +4313,63 @@ impl Worker for VehicleWorker {
                     } else {
                         let healthy = result.as_ref().is_ok_and(|current| current.online);
                         let was_online = runtime.online;
+                        let mut staged_runtime = runtime.clone();
+                        let mut staged_roster = roster.clone();
                         match result {
-                            Ok(current) => runtime.apply_current(current),
-                            Err(error) => runtime.mark_current_unavailable(
+                            Ok(current) => staged_runtime.apply_current(current),
+                            Err(error) => staged_runtime.mark_current_unavailable(
                                 &format!("task failed: {error}")
                             ),
                         }
-                        let next = runtime.render();
+                        let next = staged_runtime.render();
                         let changed = !vehicle_state_content_eq(&cached, &next);
-                        cached = next;
-                        if healthy {
-                            if let Err(error) = roster.ingest_local(self, &cached, Instant::now()) {
+                        let roster_ready = if healthy {
+                            if let Err(error) = staged_roster.ingest_local(self, &next, Instant::now()) {
                                 tracing::warn!(
                                     target: "mackesd::vehicle",
                                     %error,
                                     "local vehicle snapshot rejected by runtime roster"
                                 );
-                                roster.mark_local_unavailable();
+                                false
+                            } else {
+                                true
                             }
                         } else {
-                            roster.mark_local_unavailable();
-                        }
-                        if changed || healthy {
-                            self.publish_roster_updates(&mut roster, &cached, Instant::now());
-                            if !cached.online {
-                                self.publish_legacy_unavailable(&cached);
+                            staged_roster.mark_local_unavailable();
+                            true
+                        };
+                        if roster_ready {
+                            let mut pending = VehiclePendingCommit {
+                                runtime: staged_runtime,
+                                cached: next,
+                                roster: staged_roster,
+                                kind: VehiclePendingCommitKind::Current { healthy, was_online },
+                                publish_roster: changed || healthy,
+                                publish_unavailable: (changed || healthy) && !healthy,
+                            };
+                            match self.publish_pending_commit(&mut pending) {
+                                Ok(()) => {
+                                    runtime = pending.runtime;
+                                    cached = pending.cached;
+                                    roster = pending.roster;
+                                    if !was_online && runtime.online && enrichment_task.is_none() {
+                                        enrichment_task = Some(self.spawn_enrichment(probe.clone()));
+                                        enrichment_deadline = Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
+                                        enrichment_timed_out = false;
+                                    }
+                                    if healthy {
+                                        current_retry = self.poll;
+                                        current_not_before = None;
+                                    } else {
+                                        current_not_before = Some(tokio::time::Instant::now() + current_retry);
+                                        current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: "mackesd::vehicle", %error, "vehicle current-state publication deferred");
+                                    pending_commit = Some(pending);
+                                }
                             }
-                        }
-                        if !was_online && runtime.online && enrichment_task.is_none() {
-                            enrichment_task = Some(self.spawn_enrichment(probe.clone()));
-                            enrichment_deadline =
-                                Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
-                            enrichment_timed_out = false;
-                        }
-                        if healthy {
-                            current_retry = self.poll;
-                            current_not_before = None;
                         } else {
                             current_not_before =
                                 Some(tokio::time::Instant::now() + current_retry);
@@ -3577,48 +4383,93 @@ impl Worker for VehicleWorker {
                         .expect("guarded current-status deadline")
                         .as_mut()
                         .await
-                }, if current_deadline.is_some() => {
+                }, if current_deadline.is_some() && pending_commit.is_none() => {
                     current_deadline = None;
                     current_timed_out = true;
-                    current_not_before = Some(tokio::time::Instant::now() + current_retry);
-                    current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
-                    runtime.mark_current_unavailable("current-status timeout");
-                    let next = runtime.render();
-                    cached = next;
-                    roster.mark_local_unavailable();
-                    self.publish_roster_updates(&mut roster, &cached, Instant::now());
-                    self.publish_legacy_unavailable(&cached);
+                    let was_online = runtime.online;
+                    let mut staged_runtime = runtime.clone();
+                    staged_runtime.mark_current_unavailable("current-status timeout");
+                    let next = staged_runtime.render();
+                    let mut staged_roster = roster.clone();
+                    staged_roster.mark_local_unavailable();
+                    let mut pending = VehiclePendingCommit {
+                        runtime: staged_runtime,
+                        cached: next,
+                        roster: staged_roster,
+                        kind: VehiclePendingCommitKind::Current {
+                            healthy: false,
+                            was_online,
+                        },
+                        publish_roster: true,
+                        publish_unavailable: true,
+                    };
+                    match self.publish_pending_commit(&mut pending) {
+                        Ok(()) => {
+                            runtime = pending.runtime;
+                            cached = pending.cached;
+                            roster = pending.roster;
+                            current_not_before = Some(tokio::time::Instant::now() + current_retry);
+                            current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::vehicle", %error, "vehicle timeout publication deferred");
+                            pending_commit = Some(pending);
+                        }
+                    }
                 }
                 result = async {
                     enrichment_task.as_mut().expect("guarded enrichment task").await
-                }, if enrichment_task.is_some() => {
+                }, if enrichment_task.is_some() && pending_commit.is_none() => {
                     enrichment_task = None;
                     enrichment_deadline = None;
-                    roster.finish_local_enrichment();
                     if enrichment_timed_out {
                         enrichment_timed_out = false;
                     } else {
+                        let mut staged_runtime = runtime.clone();
+                        let mut staged_roster = roster.clone();
+                        staged_roster.finish_local_enrichment();
                         match result {
-                            Ok(enrichment) => runtime.apply_enrichment(enrichment),
-                            Err(error) => runtime.mark_enrichment_unavailable(
+                            Ok(enrichment) => staged_runtime.apply_enrichment(enrichment),
+                            Err(error) => staged_runtime.mark_enrichment_unavailable(
                                 &format!("task failed: {error}")
                             ),
                         }
-                        let next = runtime.render();
+                        let next = staged_runtime.render();
                         let changed = !vehicle_state_content_eq(&cached, &next);
-                        cached = next;
-                        if runtime.online {
-                            if let Err(error) = roster.ingest_local(self, &cached, Instant::now()) {
+                        let roster_ready = if staged_runtime.online {
+                            if let Err(error) = staged_roster.ingest_local(self, &next, Instant::now()) {
                                 tracing::warn!(
                                     target: "mackesd::vehicle",
                                     %error,
                                     "enriched vehicle snapshot rejected by runtime roster"
                                 );
-                                roster.mark_local_unavailable();
+                                false
+                            } else {
+                                true
                             }
-                        }
-                        if changed {
-                            self.publish_roster_updates(&mut roster, &cached, Instant::now());
+                        } else {
+                            true
+                        };
+                        if roster_ready {
+                            let mut pending = VehiclePendingCommit {
+                                runtime: staged_runtime,
+                                cached: next,
+                                roster: staged_roster,
+                                kind: VehiclePendingCommitKind::Enrichment,
+                                publish_roster: changed,
+                                publish_unavailable: false,
+                            };
+                            match self.publish_pending_commit(&mut pending) {
+                                Ok(()) => {
+                                    runtime = pending.runtime;
+                                    cached = pending.cached;
+                                    roster = pending.roster;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: "mackesd::vehicle", %error, "vehicle enrichment publication deferred");
+                                    pending_commit = Some(pending);
+                                }
+                            }
                         }
                     }
                 }
@@ -3628,26 +4479,54 @@ impl Worker for VehicleWorker {
                         .expect("guarded enrichment deadline")
                         .as_mut()
                         .await
-                }, if enrichment_deadline.is_some() => {
+                }, if enrichment_deadline.is_some() && pending_commit.is_none() => {
                     enrichment_deadline = None;
                     enrichment_timed_out = true;
-                    roster.finish_local_enrichment();
-                    runtime.mark_enrichment_unavailable("enrichment timeout");
-                    let next = runtime.render();
+                    let mut staged_runtime = runtime.clone();
+                    let mut staged_roster = roster.clone();
+                    staged_roster.finish_local_enrichment();
+                    staged_runtime.mark_enrichment_unavailable("enrichment timeout");
+                    let next = staged_runtime.render();
                     let changed = !vehicle_state_content_eq(&cached, &next);
-                    cached = next;
                     if changed {
-                        if runtime.online {
-                            if let Err(error) = roster.ingest_local(self, &cached, Instant::now()) {
+                        let roster_ready = if staged_runtime.online {
+                            if let Err(error) = staged_roster.ingest_local(self, &next, Instant::now()) {
                                 tracing::warn!(
                                     target: "mackesd::vehicle",
                                     %error,
                                     "vehicle timeout snapshot rejected by runtime roster"
                                 );
-                                roster.mark_local_unavailable();
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
+                        if roster_ready {
+                            let mut pending = VehiclePendingCommit {
+                                runtime: staged_runtime,
+                                cached: next,
+                                roster: staged_roster,
+                                kind: VehiclePendingCommitKind::Enrichment,
+                                publish_roster: true,
+                                publish_unavailable: false,
+                            };
+                            match self.publish_pending_commit(&mut pending) {
+                                Ok(()) => {
+                                    runtime = pending.runtime;
+                                    cached = pending.cached;
+                                    roster = pending.roster;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: "mackesd::vehicle", %error, "vehicle enrichment-timeout publication deferred");
+                                    pending_commit = Some(pending);
+                                }
                             }
                         }
-                        self.publish_roster_updates(&mut roster, &cached, Instant::now());
+                    } else {
+                        runtime = staged_runtime;
+                        roster = staged_roster;
                     }
                 }
             }
@@ -5347,7 +6226,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         .unwrap();
         let local = worker.build_state(&FakeProbe::real());
         runtime.ingest_local(&worker, &local, t0).unwrap();
-        worker.publish_roster_updates(&mut runtime, &local, t0);
+        worker
+            .publish_roster_updates(&mut runtime, &local, t0)
+            .unwrap();
 
         let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
         let local_topic = vehicle_state_v2_topic("rig-1", source.as_str());
@@ -5369,8 +6250,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 Some(&serde_json::to_string(&remote).unwrap()),
             )
             .unwrap();
-        runtime.ingest_remote(Some(tmp.path().to_path_buf()), t0);
-        worker.publish_roster_updates(&mut runtime, &local, t0);
+        runtime.ingest_remote(&worker, t0).unwrap();
+        worker
+            .publish_roster_updates(&mut runtime, &local, t0)
+            .unwrap();
         assert_eq!(
             persist.list_since(&remote_topic, None).unwrap().len(),
             1,
@@ -5385,7 +6268,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         runtime
             .ingest_local(&worker, &local, t0 + Duration::from_secs(5))
             .unwrap();
-        worker.publish_roster_updates(&mut runtime, &local, t0 + Duration::from_secs(7));
+        worker
+            .publish_roster_updates(&mut runtime, &local, t0 + Duration::from_secs(7))
+            .unwrap();
         assert_eq!(
             persist.list_since(&local_topic, None).unwrap().len(),
             2,
@@ -6349,6 +7234,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let tmp = tempfile::tempdir().unwrap();
         let bus = tmp.path().to_path_buf();
         let persist = Persist::open(bus.clone()).unwrap();
+        let w = worker()
+            .with_probe(Arc::new(FakeProbe::real()))
+            .with_bus_root(Some(bus.clone()));
+        let mut state = VehicleActionDrainState::default();
+        w.activate_actions(&mut state).unwrap();
         let req = persist
             .write(
                 "action/vehicle/get-config",
@@ -6357,11 +7247,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 Some(r#"{"file":"wan.yaml"}"#),
             )
             .unwrap();
-        let w = worker()
-            .with_probe(Arc::new(FakeProbe::real()))
-            .with_bus_root(Some(bus.clone()));
-        let mut cursors = HashMap::new();
-        assert!(w.drain_actions(&mut cursors), "the gateway node acted");
+        assert!(
+            w.drain_actions(&mut state).unwrap(),
+            "the gateway node acted"
+        );
         let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
         assert_eq!(replies.len(), 1, "exactly one reply");
         let reply: VehicleReply =
@@ -6386,11 +7275,438 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let w = worker()
             .with_probe(Arc::new(FakeProbe::real()))
             .with_bus_root(Some(bus.clone()));
-        let mut cursors = HashMap::new();
-        w.prime_cursors(&mut cursors);
+        let mut state = VehicleActionDrainState::default();
+        w.activate_actions(&mut state).unwrap();
         assert!(
-            !w.drain_actions(&mut cursors),
+            !w.drain_actions(&mut state).unwrap(),
             "the backlog is not replayed after prime"
+        );
+    }
+
+    #[test]
+    fn action_activation_recovers_late_and_replaced_bus_without_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        std::fs::write(&bus, "temporarily unavailable").unwrap();
+        let fake = FakeProbe::real();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()));
+        let mut state = VehicleActionDrainState::default();
+
+        assert!(w.activate_actions(&mut state).is_err());
+        assert!(state.active_index.is_none());
+        assert!(state.cursors.is_empty());
+
+        std::fs::remove_file(&bus).unwrap();
+        let first = Persist::open(bus.clone()).unwrap();
+        first
+            .write(
+                "action/vehicle/get-config",
+                Priority::Default,
+                None,
+                Some(r#"{"file":"retained.yaml"}"#),
+            )
+            .unwrap();
+        w.activate_actions(&mut state).unwrap();
+        assert!(!w.drain_actions(&mut state).unwrap());
+        assert!(fake.ssh_calls().is_empty(), "retained command was skipped");
+
+        first
+            .write(
+                "action/vehicle/get-config",
+                Priority::Default,
+                None,
+                Some(r#"{"file":"forward.yaml"}"#),
+            )
+            .unwrap();
+        assert!(w.drain_actions(&mut state).unwrap());
+        assert_eq!(
+            fake.ssh_calls().as_slice(),
+            &["omgconf latest forward.yaml"]
+        );
+        drop(first);
+
+        let replacement = tmp.path().join("replacement");
+        let replacement_bus = Persist::open(replacement.clone()).unwrap();
+        replacement_bus
+            .write(
+                "action/vehicle/get-config",
+                Priority::Default,
+                None,
+                Some(r#"{"file":"replacement-retained.yaml"}"#),
+            )
+            .unwrap();
+        drop(replacement_bus);
+        std::fs::rename(replacement.join("index.sqlite"), bus.join("index.sqlite")).unwrap();
+
+        assert!(!w.drain_actions(&mut state).unwrap());
+        assert_eq!(
+            fake.ssh_calls().as_slice(),
+            &["omgconf latest forward.yaml"],
+            "replacement retained command was skipped"
+        );
+        let replacement_bus = Persist::open(bus.clone()).unwrap();
+        replacement_bus
+            .write(
+                "action/vehicle/get-config",
+                Priority::Default,
+                None,
+                Some(r#"{"file":"replacement-forward.yaml"}"#),
+            )
+            .unwrap();
+        assert!(w.drain_actions(&mut state).unwrap());
+        assert_eq!(
+            fake.ssh_calls().as_slice(),
+            &[
+                "omgconf latest forward.yaml",
+                "omgconf latest replacement-forward.yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn reboot_reply_failure_retries_result_without_repeating_effect_or_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let db_path = tmp.path().join("events.sqlite");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let fake = FakeProbe::real();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()))
+            .with_db_path(db_path.clone())
+            .with_authorizer(test_authorizer(auth_tmp.path()))
+            .with_reply_failures(1);
+        let mut state = VehicleActionDrainState::default();
+        w.activate_actions(&mut state).unwrap();
+        let request = persist
+            .write(
+                "action/vehicle/reboot",
+                Priority::Default,
+                None,
+                Some(&authorized_reboot_body(
+                    "vehicle-reply-retry",
+                    "ND84720078011035",
+                )),
+            )
+            .unwrap();
+
+        assert!(w.drain_actions(&mut state).is_err());
+        assert!(state.pending_reply.is_some());
+        assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+        assert!(!w.drain_actions(&mut state).unwrap());
+        assert!(state.pending_reply.is_none());
+        assert_eq!(
+            fake.ssh_calls().as_slice(),
+            &["reboot"],
+            "reply retry must not repeat the privileged effect"
+        );
+        let replies = persist
+            .list_since(&reply_topic(&request.ulid), None)
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        let reply: VehicleReply =
+            serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
+        assert!(reply.ok);
+        assert!(reply.audited);
+        let conn = crate::store::open(&db_path).unwrap();
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'admin_action'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1, "audit truth is not duplicated on retry");
+    }
+
+    #[test]
+    fn completed_reboot_journal_survives_worker_restart_without_repeating_effect_or_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let db_path = tmp.path().join("events.sqlite");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let fake = FakeProbe::real();
+        let first = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()))
+            .with_db_path(db_path.clone())
+            .with_authorizer(test_authorizer(auth_tmp.path()))
+            .with_reply_failures(1);
+        let mut first_state = VehicleActionDrainState::default();
+        first.activate_actions(&mut first_state).unwrap();
+        let request = persist
+            .write(
+                "action/vehicle/reboot",
+                Priority::Default,
+                None,
+                Some(&authorized_reboot_body(
+                    "vehicle-crash-result",
+                    "ND84720078011035",
+                )),
+            )
+            .unwrap();
+
+        assert!(first.drain_actions(&mut first_state).is_err());
+        assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+        assert!(first.action_journal_path.is_file());
+        drop(first);
+        drop(first_state);
+        drop(persist);
+
+        let replacement = tmp.path().join("replacement");
+        drop(Persist::open(replacement.clone()).unwrap());
+        fs::rename(replacement.join("index.sqlite"), bus.join("index.sqlite")).unwrap();
+
+        let restarted = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()))
+            .with_db_path(db_path.clone())
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let mut restarted_state = VehicleActionDrainState::default();
+        restarted.activate_actions(&mut restarted_state).unwrap();
+        assert!(restarted.drain_actions(&mut restarted_state).unwrap());
+        assert_eq!(
+            fake.ssh_calls().as_slice(),
+            &["reboot"],
+            "completed recovery republishes onto a replacement Bus without reboot"
+        );
+        let persist = Persist::open(bus.clone()).unwrap();
+        let replies = persist
+            .list_since(&reply_topic(&request.ulid), None)
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        let reply: VehicleReply =
+            serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
+        assert!(reply.ok);
+        assert!(reply.audited);
+        assert!(!restarted.action_journal_path.exists());
+        let conn = crate::store::open(&db_path).unwrap();
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'admin_action'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1, "restart must not duplicate audit truth");
+    }
+
+    #[test]
+    fn claimed_reboot_journal_recovers_indeterminate_without_effect_or_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let db_path = tmp.path().join("events.sqlite");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let fake = FakeProbe::real();
+        let request = persist
+            .write(
+                "action/vehicle/reboot",
+                Priority::Default,
+                None,
+                Some(&authorized_reboot_body(
+                    "vehicle-crash-claim",
+                    "ND84720078011035",
+                )),
+            )
+            .unwrap();
+        let crashed = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()))
+            .with_db_path(db_path.clone())
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        crashed
+            .claim_privileged_action(&request.ulid, "action/vehicle/reboot")
+            .unwrap();
+        drop(crashed);
+
+        let restarted = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()))
+            .with_db_path(db_path.clone())
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let mut state = VehicleActionDrainState::default();
+        restarted.activate_actions(&mut state).unwrap();
+        assert!(restarted.drain_actions(&mut state).unwrap());
+        assert!(fake.ssh_calls().is_empty(), "an orphan claim never reboots");
+        assert_eq!(
+            fake.general_calls(),
+            0,
+            "an orphan claim is not re-evaluated"
+        );
+        let replies = persist
+            .list_since(&reply_topic(&request.ulid), None)
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        let reply: VehicleReply =
+            serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
+        assert!(!reply.ok);
+        assert!(!reply.audited);
+        assert!(reply.gated.as_deref().unwrap().contains("indeterminate"));
+        assert!(!db_path.exists(), "recovery does not fabricate an audit DB");
+        assert!(!restarted.action_journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_privileged_journal_is_rejected_before_reboot() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let db_path = tmp.path().join("events.sqlite");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let fake = FakeProbe::real();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_bus_root(Some(bus.clone()))
+            .with_db_path(db_path)
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let mut state = VehicleActionDrainState::default();
+        w.activate_actions(&mut state).unwrap();
+        persist
+            .write(
+                "action/vehicle/reboot",
+                Priority::Default,
+                None,
+                Some(&authorized_reboot_body(
+                    "vehicle-hostile-journal",
+                    "ND84720078011035",
+                )),
+            )
+            .unwrap();
+
+        let target = tmp.path().join("attacker-owned-target");
+        fs::write(&target, b"do not follow").unwrap();
+        symlink(&target, &w.action_journal_path).unwrap();
+        assert!(w.drain_actions(&mut state).is_err());
+        assert!(fake.ssh_calls().is_empty());
+        fs::remove_file(&w.action_journal_path).unwrap();
+
+        fs::write(
+            &w.action_journal_path,
+            serde_json::to_vec(&VehicleActionJournal::empty(&w.host)).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&w.action_journal_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(w.drain_actions(&mut state).is_err());
+        assert!(fake.ssh_calls().is_empty());
+        fs::remove_file(&w.action_journal_path).unwrap();
+
+        fs::write(
+            &w.action_journal_path,
+            vec![b'x'; usize::try_from(ACTION_JOURNAL_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        fs::set_permissions(&w.action_journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(w.drain_actions(&mut state).is_err());
+        assert!(
+            fake.ssh_calls().is_empty(),
+            "hostile journal never admits reboot"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"do not follow");
+    }
+
+    #[test]
+    fn final_manager_read_failure_commits_no_roster_or_cursor_then_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = worker().with_bus_root(Some(tmp.path().to_path_buf()));
+        let source = roster_source_id();
+        let now = Instant::now();
+        let mut runtime = VehicleRuntimeRoster::new(
+            "rig-1",
+            Some(source.clone()),
+            "manager-b,manager-c",
+            now,
+            VehiclePollPlan::default(),
+        )
+        .unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        for (manager, published_at_ms) in [("manager-b", 100), ("manager-c", 200)] {
+            let mut remote = worker.build_state_v2(&FakeProbe::real());
+            remote.management_node_id = manager.to_string();
+            remote.approval = ApprovalState::Approved;
+            remote.managers = ManagerSet::approved(vec![
+                "rig-1".to_string(),
+                "manager-b".to_string(),
+                "manager-c".to_string(),
+            ])
+            .unwrap();
+            remote.observed_at_ms = published_at_ms;
+            remote.published_at_ms = published_at_ms;
+            persist
+                .write(
+                    &vehicle_state_v2_topic(manager, source.as_str()),
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(&remote).unwrap()),
+                )
+                .unwrap();
+        }
+        let final_topic = vehicle_state_v2_topic("manager-c", source.as_str());
+        worker.set_remote_read_failure(Some(final_topic));
+
+        assert!(runtime.ingest_remote(&worker, now).is_err());
+        assert!(runtime.remote_cursors.is_empty());
+        assert!(matches!(
+            runtime.roster.select_latest(&source),
+            VehicleRosterSelection::NoSource { .. }
+        ));
+
+        worker.set_remote_read_failure(None);
+        runtime.ingest_remote(&worker, now).unwrap();
+        assert_eq!(runtime.remote_cursors.len(), 2);
+        match runtime.roster.select_latest(&source) {
+            VehicleRosterSelection::Selected(snapshot) => {
+                assert_eq!(snapshot.manager_id(), "manager-c")
+            }
+            other => panic!("expected corrected-forward remote snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publication_failure_preserves_sequence_and_clock_until_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        std::fs::write(&bus, "blocked").unwrap();
+        let worker = worker().with_bus_root(Some(bus.clone()));
+        let source = roster_source_id();
+        let now = Instant::now();
+        let mut runtime = VehicleRuntimeRoster::new(
+            "rig-1",
+            Some(source.clone()),
+            "",
+            now,
+            VehiclePollPlan::default(),
+        )
+        .unwrap();
+        let local = worker.build_state(&FakeProbe::real());
+        runtime.ingest_local(&worker, &local, now).unwrap();
+
+        assert!(worker
+            .publish_roster_updates(&mut runtime, &local, now)
+            .is_err());
+        assert_eq!(worker.sequence.load(Ordering::Relaxed), 0);
+        assert!(runtime.roster.published.is_empty());
+
+        std::fs::remove_file(&bus).unwrap();
+        worker
+            .publish_roster_updates(&mut runtime, &local, now)
+            .unwrap();
+        assert_eq!(worker.sequence.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.roster.published.len(), 1);
+        assert_eq!(
+            Persist::open(bus)
+                .unwrap()
+                .list_since(&vehicle_state_v2_topic("rig-1", source.as_str()), None)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }
