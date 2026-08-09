@@ -1,4 +1,4 @@
-//! WL-FUNC-008 — the mackesd `service_aggregator` worker: the unified
+//! WL-FUNC-019 — the mackesd `service_aggregator` worker: the unified
 //! service-provenance/health view.
 //!
 //! Three service sources existed and were never unified — the published KDC
@@ -42,6 +42,8 @@ use mackes_mesh_types::resources::{
     RESOURCE_PUBLISHER_ATTESTATION_KEY_ID, RESOURCE_PUBLISHER_ATTESTATION_TTL_MS,
 };
 use mackes_mesh_types::service_record::ServicesState;
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 use aggregate::{aggregate, ProbeInput, PublishedInput};
 
@@ -64,6 +66,18 @@ const RESOURCE_PUBLISHER_KEY_REF: &str = "resource/publisher-hmac";
 /// lookup resets the delay immediately.
 const PUBLISHER_RETRY_BASE: Duration = Duration::from_secs(30);
 const PUBLISHER_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Startup retry lower bound for an unresolved, unopenable, or unsafe Bus.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Keep recovery responsive without allowing an absent spool to spin.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type BusReadGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
+
+#[cfg(test)]
+type BusWriteGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
 
 #[derive(Debug, Default)]
 struct PublisherRetryState {
@@ -149,17 +163,41 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The default Bus root (the persisted message tree), matching every mackesd worker.
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+/// Resolve the configured/user Bus root, falling back to the canonical system
+/// spool when no user data root exists.
+fn service_aggregator_bus_root(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
-/// Publish a JSON state-mirror body in-process (no fork+exec of the `mde-bus` CLI),
-/// through the SAME bus root every other mackesd worker's mirror uses. Best-effort.
-fn publish_json<T: serde::Serialize>(bus_root: Option<&Path>, topic: &str, body: &T) {
-    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
-        crate::bus_publish::publish_json(&mut persist, topic, body);
+fn default_bus_root() -> PathBuf {
+    service_aggregator_bus_root(mde_bus::default_data_dir())
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
+fn require_live_bus_index(persist: &Persist, bus_root: &Path) -> Result<(), String> {
+    let index = bus_root.join("index.sqlite");
+    let metadata = std::fs::metadata(&index)
+        .map_err(|error| format!("inspect live Bus index {}: {error}", index.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("live Bus index is not a file: {}", index.display()));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if persist.index_inode() != Some(metadata.ino()) {
+            return Err(format!(
+                "Bus index identity changed without a successful reopen: {}",
+                index.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Strict retained-wire form for the desktop-source roster. The published
@@ -415,7 +453,34 @@ impl ProbeSource for InventoryProbe {
     }
 }
 
-/// The WL-FUNC-008 `service_aggregator` worker.
+struct RetainedSource<T> {
+    value: Option<T>,
+    ulid: Option<String>,
+}
+
+#[derive(Clone)]
+struct LastPublication {
+    services: ServicesState,
+    desktop_ulid: Option<String>,
+    ssh_x11_ulid: Option<String>,
+    upnp_ulid: Option<String>,
+}
+
+impl LastPublication {
+    fn same_inputs(&self, other: &Self) -> bool {
+        self.services.same_ignoring_time(&other.services)
+            && self.desktop_ulid == other.desktop_ulid
+            && self.ssh_x11_ulid == other.ssh_x11_ulid
+            && self.upnp_ulid == other.upnp_ulid
+    }
+}
+
+struct StagedPublication {
+    identity: LastPublication,
+    outputs: Vec<(String, String)>,
+}
+
+/// The WL-FUNC-019 `service_aggregator` worker.
 pub struct ServiceAggregatorWorker {
     /// This node's id — the mirror `host` stamp + topic namespace.
     host: String,
@@ -425,8 +490,9 @@ pub struct ServiceAggregatorWorker {
     published: Arc<dyn PublishedSource>,
     /// The probe-inventory half.
     probe: Arc<dyn ProbeSource>,
-    /// The Bus root for the mirror publish (`None` ⇒ publish is a no-op).
-    bus_root: Option<PathBuf>,
+    /// Concrete Bus root. Resolution uses the configured/user root and falls
+    /// back to the canonical system spool.
+    bus_root: PathBuf,
     /// Fold cadence.
     poll: Duration,
     /// Mirror republish heartbeat.
@@ -437,6 +503,10 @@ pub struct ServiceAggregatorWorker {
     publisher_store: SecretStore,
     /// Negative-result cache for the optional publisher-proof lookup.
     publisher_retry: std::sync::Mutex<PublisherRetryState>,
+    #[cfg(test)]
+    bus_read_gate: Option<Arc<BusReadGateFn>>,
+    #[cfg(test)]
+    bus_write_gate: Option<Arc<BusWriteGateFn>>,
 }
 
 impl ServiceAggregatorWorker {
@@ -456,6 +526,10 @@ impl ServiceAggregatorWorker {
             ttl: DEFAULT_TTL,
             publisher_store: SecretStore::resolve(&repo_root(), &workgroup_root),
             publisher_retry: std::sync::Mutex::new(PublisherRetryState::default()),
+            #[cfg(test)]
+            bus_read_gate: None,
+            #[cfg(test)]
+            bus_write_gate: None,
         }
     }
 
@@ -476,7 +550,21 @@ impl ServiceAggregatorWorker {
     /// Override the Bus root (tests point it at a tempdir / `None`).
     #[must_use]
     pub fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
-        self.bus_root = bus_root;
+        self.bus_root = service_aggregator_bus_root(bus_root);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_read_gate(mut self, gate: Arc<BusReadGateFn>) -> Self {
+        self.bus_read_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_write_gate(mut self, gate: Arc<BusWriteGateFn>) -> Self {
+        self.bus_write_gate = Some(gate);
         self
     }
 
@@ -517,200 +605,110 @@ impl ServiceAggregatorWorker {
         }
     }
 
-    /// Read the latest retained desktop roster. A missing topic is a normal
-    /// pre-discovery state; any configured-root read or strict decode failure
-    /// is returned so resource publication can fail closed.
-    fn read_retained_desktop_sources(&self) -> Result<Option<DesktopSourcesState>, String> {
-        let Some(bus_root) = self.bus_root.as_deref() else {
-            return Ok(None);
-        };
-        let persist = mde_bus::persist::Persist::open(bus_root.to_path_buf())
-            .map_err(|error| format!("open Bus root for desktop sources: {error}"))?;
+    fn gate_bus_read(&self, topic: &str, index: usize) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(gate) = self.bus_read_gate.as_ref() {
+            return gate(topic, index);
+        }
+        Ok(())
+    }
+
+    fn read_retained_desktop_sources(
+        &self,
+        persist: &Persist,
+    ) -> Result<RetainedSource<DesktopSourcesState>, String> {
+        self.gate_bus_read(SOURCES_TOPIC, 0)?;
         let Some(message) = persist
             .read_latest(SOURCES_TOPIC)
             .map_err(|error| format!("read retained desktop sources: {error}"))?
         else {
-            return Ok(None);
+            return Ok(RetainedSource {
+                value: None,
+                ulid: None,
+            });
         };
-        let Some(body) = message.body else {
-            return Err("retained desktop sources row has no body".into());
-        };
-        decode_retained_desktop_sources(&body).map(Some)
+        let body = message
+            .body
+            .as_deref()
+            .ok_or_else(|| "retained desktop sources row has no body".to_owned())?;
+        Ok(RetainedSource {
+            value: Some(decode_retained_desktop_sources(body)?),
+            ulid: Some(message.ulid),
+        })
     }
 
-    /// Read the latest retained typed SSH/X11 roster. A missing topic is the
-    /// normal pre-provider state; malformed material fails the catalog fold
-    /// closed rather than publishing an unauthenticated launch surface.
-    fn read_retained_ssh_x11_sources(&self) -> Result<Option<SshX11SourcesState>, String> {
-        let Some(bus_root) = self.bus_root.as_deref() else {
-            return Ok(None);
-        };
-        let persist = mde_bus::persist::Persist::open(bus_root.to_path_buf())
-            .map_err(|error| format!("open Bus root for SSH/X11 sources: {error}"))?;
+    fn read_retained_ssh_x11_sources(
+        &self,
+        persist: &Persist,
+    ) -> Result<RetainedSource<SshX11SourcesState>, String> {
+        self.gate_bus_read(SSH_X11_SOURCES_TOPIC, 1)?;
         let Some(message) = persist
             .read_latest(SSH_X11_SOURCES_TOPIC)
             .map_err(|error| format!("read retained SSH/X11 sources: {error}"))?
         else {
-            return Ok(None);
+            return Ok(RetainedSource {
+                value: None,
+                ulid: None,
+            });
         };
-        let Some(body) = message.body else {
-            return Err("retained SSH/X11 source row has no body".into());
-        };
-        decode_sources_state(&body).map(Some)
+        let body = message
+            .body
+            .as_deref()
+            .ok_or_else(|| "retained SSH/X11 source row has no body".to_owned())?;
+        Ok(RetainedSource {
+            value: Some(decode_sources_state(body)?),
+            ulid: Some(message.ulid),
+        })
     }
 
-    /// Read the latest retained bounded UPnP/SSDP roster. A missing topic is
-    /// the normal pre-discovery state; malformed material suppresses both
-    /// resource mirrors so unvalidated LAN observations cannot be published.
-    fn read_retained_upnp_sources(&self) -> Result<Option<UpnpSourcesState>, String> {
-        let Some(bus_root) = self.bus_root.as_deref() else {
-            return Ok(None);
-        };
-        let persist = mde_bus::persist::Persist::open(bus_root.to_path_buf())
-            .map_err(|error| format!("open Bus root for UPnP sources: {error}"))?;
+    fn read_retained_upnp_sources(
+        &self,
+        persist: &Persist,
+    ) -> Result<RetainedSource<UpnpSourcesState>, String> {
+        self.gate_bus_read(UPNP_SOURCES_TOPIC, 2)?;
         let Some(message) = persist
             .read_latest(UPNP_SOURCES_TOPIC)
             .map_err(|error| format!("read retained UPnP sources: {error}"))?
         else {
-            return Ok(None);
+            return Ok(RetainedSource {
+                value: None,
+                ulid: None,
+            });
         };
-        let Some(body) = message.body else {
-            return Err("retained UPnP source row has no body".into());
-        };
-        decode_upnp_sources_state(&body)
-            .map(Some)
-            .map_err(|error| error.to_string())
+        let body = message
+            .body
+            .as_deref()
+            .ok_or_else(|| "retained UPnP source row has no body".to_owned())?;
+        Ok(RetainedSource {
+            value: Some(decode_upnp_sources_state(body).map_err(|error| error.to_string())?),
+            ulid: Some(message.ulid),
+        })
     }
 
-    /// One fold cycle: build the current state, publish on content-change or the
-    /// heartbeat (mirroring `unit_aggregator` / `openstack`).
-    fn cycle_and_publish(
+    fn prepare_resource_mirror_outputs(
         &self,
-        last: &mut Option<ServicesState>,
-        last_pub_at: &mut Option<Instant>,
-    ) {
-        let state = self.fold_state();
-        let now = Instant::now();
-        let changed = last
-            .as_ref()
-            .is_none_or(|prev| !prev.same_ignoring_time(&state));
-        let heartbeat_due = last_pub_at.is_none_or(|at| now.duration_since(at) >= self.heartbeat);
-        if changed || heartbeat_due {
-            publish_json(self.bus_root.as_deref(), &state_topic(&self.host), &state);
-            let desktop_state = match self.read_retained_desktop_sources() {
-                Ok(desktop_state) => desktop_state,
-                Err(error) => {
-                    tracing::error!(
-                        host = %self.host,
-                        error,
-                        "refusing to publish resource mirrors after invalid retained desktop state"
-                    );
-                    *last_pub_at = Some(now);
-                    *last = Some(state);
-                    return;
-                }
-            };
-            let ssh_x11_state = match self.read_retained_ssh_x11_sources() {
-                Ok(ssh_x11_state) => ssh_x11_state,
-                Err(error) => {
-                    tracing::error!(
-                        host = %self.host,
-                        error,
-                        "refusing to publish resource mirrors after invalid retained SSH/X11 state"
-                    );
-                    *last_pub_at = Some(now);
-                    *last = Some(state);
-                    return;
-                }
-            };
-            let upnp_state = match self.read_retained_upnp_sources() {
-                Ok(upnp_state) => upnp_state,
-                Err(error) => {
-                    tracing::error!(
-                        host = %self.host,
-                        error,
-                        "refusing to publish resource mirrors after invalid retained UPnP state"
-                    );
-                    *last_pub_at = Some(now);
-                    *last = Some(state);
-                    return;
-                }
-            };
-            match super::service_catalog::catalog_from_services_with_root_and_desktops_and_ssh_x11_and_upnp(
-                &state,
-                &self.workgroup_root,
-                desktop_state.as_ref(),
-                ssh_x11_state.as_ref(),
-                upnp_state.as_ref(),
-            ) {
-                Ok(catalog) => match resource_adapters::augment_from_production(
-                    catalog,
-                    &self.workgroup_root,
-                    self.bus_root.as_deref(),
-                ) {
-                    Ok((catalog, adapter_status)) => {
-                        publish_json(
-                            self.bus_root.as_deref(),
-                            resource_adapters::RESOURCE_ADAPTER_STATUS_TOPIC,
-                            &adapter_status,
-                        );
-                        self.publish_resource_mirrors(&catalog);
-                    }
-                    Err(error) => tracing::error!(
-                        host = %self.host,
-                        error,
-                        "refusing to publish universal resource mirrors after source-adapter failure"
-                    ),
-                },
-                Err(error) => tracing::error!(
-                    host = %self.host,
-                    error = %error,
-                    "refusing to publish an invalid universal resource catalog"
-                ),
-            }
-            *last_pub_at = Some(now);
-        }
-        *last = Some(state);
-    }
-
-    /// Admit every client capability in the catalog through the typed registry
-    /// before publishing either retained resource mirror. A registry failure is
-    /// fail-closed: neither mirror can advertise an executable/action-capable
-    /// resource derived from an unadmitted capability set.
-    fn publish_resource_mirrors(&self, catalog: &ResourceCatalog) {
-        let catalog = match catalog.clone().with_content_digest() {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                tracing::error!(
-                    host = %self.host,
-                    error = %error,
-                    "refusing to publish resource mirrors without a valid content digest"
-                );
-                return;
-            }
-        };
+        catalog: &ResourceCatalog,
+    ) -> Result<Vec<(String, String)>, String> {
+        let catalog = catalog
+            .clone()
+            .with_content_digest()
+            .map_err(|error| format!("validate resource catalog content digest: {error}"))?;
         let capability_count = catalog
             .cards
             .iter()
             .map(|card| card.client_capabilities.len())
             .sum::<usize>();
-        let registry = match ClientCapabilityRegistry::admitted(
+        let registry = ClientCapabilityRegistry::admitted(
             catalog
                 .cards
                 .iter()
                 .flat_map(|card| card.client_capabilities.iter().cloned()),
-        ) {
-            Ok(registry) => registry,
-            Err(error) => {
-                tracing::error!(
-                    host = %self.host,
-                    capability_count,
-                    error = %error,
-                    "refusing to publish resource catalog/discovery after client capability admission failure"
-                );
-                return;
-            }
-        };
+        )
+        .map_err(|error| {
+            format!(
+                "admit {capability_count} resource client capabilities before publication: {error}"
+            )
+        })?;
 
         tracing::debug!(
             host = %self.host,
@@ -718,33 +716,144 @@ impl ServiceAggregatorWorker {
             "client capabilities admitted for resource publication"
         );
 
-        let publisher_attestation = self.publisher_attestation(&catalog);
+        let publisher_attestation = self.publisher_attestation(&catalog)?;
+        let discovery = catalog
+            .discovery_projection()
+            .map_err(|error| format!("derive resource discovery projection: {error}"))?;
+        discovery
+            .validate()
+            .map_err(|error| format!("validate resource discovery projection: {error}"))?;
 
-        // Keep the complete, action-capable catalog as the source of truth. The
-        // browser projection is a separately validated, intentionally lossy mirror;
-        // failure to derive it must not erase or suppress the full catalog.
-        publish_json(self.bus_root.as_deref(), RESOURCE_CATALOG_TOPIC, &catalog);
+        let mut outputs = vec![(
+            RESOURCE_CATALOG_TOPIC.to_owned(),
+            serde_json::to_string(&catalog)
+                .map_err(|error| format!("encode resource catalog: {error}"))?,
+        )];
         if let Some(attestation) = publisher_attestation {
-            publish_json(
-                self.bus_root.as_deref(),
-                &resource_publisher_attestation_topic(&catalog.publisher),
-                &attestation,
-            );
+            outputs.push((
+                resource_publisher_attestation_topic(&catalog.publisher),
+                serde_json::to_string(&attestation)
+                    .map_err(|error| format!("encode resource publisher attestation: {error}"))?,
+            ));
         }
-        match catalog.discovery_projection() {
-            Ok(projection) => {
-                publish_json(
-                    self.bus_root.as_deref(),
-                    RESOURCE_DISCOVERY_TOPIC,
-                    &projection,
-                );
-            }
-            Err(error) => tracing::error!(
-                host = %self.host,
-                error = %error,
-                "refusing to publish an invalid resource discovery projection"
+        outputs.push((
+            RESOURCE_DISCOVERY_TOPIC.to_owned(),
+            serde_json::to_string(&discovery)
+                .map_err(|error| format!("encode resource discovery projection: {error}"))?,
+        ));
+        Ok(outputs)
+    }
+
+    fn stage_cycle(&self, persist: &mut Persist) -> Result<StagedPublication, String> {
+        persist.reopen_if_index_changed();
+        require_live_bus_index(persist, &self.bus_root)?;
+
+        let services = self.fold_state();
+        let desktop = self.read_retained_desktop_sources(persist)?;
+        let ssh_x11 = self.read_retained_ssh_x11_sources(persist)?;
+        let upnp = self.read_retained_upnp_sources(persist)?;
+        let catalog = super::service_catalog::catalog_from_services_with_root_and_desktops_and_ssh_x11_and_upnp(
+            &services,
+            &self.workgroup_root,
+            desktop.value.as_ref(),
+            ssh_x11.value.as_ref(),
+            upnp.value.as_ref(),
+        )
+        .map_err(|error| format!("derive universal resource catalog: {error}"))?;
+        let (catalog, adapter_status) = resource_adapters::augment_from_production(
+            catalog,
+            &self.workgroup_root,
+            Some(&self.bus_root),
+        )
+        .map_err(|error| format!("derive resource adapter catalog: {error}"))?;
+
+        let mut outputs = vec![
+            (
+                state_topic(&self.host),
+                serde_json::to_string(&services)
+                    .map_err(|error| format!("encode services state: {error}"))?,
             ),
+            (
+                resource_adapters::RESOURCE_ADAPTER_STATUS_TOPIC.to_owned(),
+                serde_json::to_string(&adapter_status)
+                    .map_err(|error| format!("encode resource adapter status: {error}"))?,
+            ),
+        ];
+        outputs.extend(self.prepare_resource_mirror_outputs(&catalog)?);
+        require_live_bus_index(persist, &self.bus_root)?;
+
+        Ok(StagedPublication {
+            identity: LastPublication {
+                services,
+                desktop_ulid: desktop.ulid,
+                ssh_x11_ulid: ssh_x11.ulid,
+                upnp_ulid: upnp.ulid,
+            },
+            outputs,
+        })
+    }
+
+    fn publish_staged(
+        &self,
+        persist: &mut Persist,
+        staged: &StagedPublication,
+    ) -> Result<(), String> {
+        persist.reopen_if_index_changed();
+        require_live_bus_index(persist, &self.bus_root)?;
+        for (index, (topic, body)) in staged.outputs.iter().enumerate() {
+            #[cfg(test)]
+            if let Some(gate) = self.bus_write_gate.as_ref() {
+                gate(topic, index)?;
+            }
+            persist
+                .write(topic, Priority::Default, None, Some(body))
+                .map_err(|error| format!("publish {topic}: {error}"))?;
         }
+        require_live_bus_index(persist, &self.bus_root)
+    }
+
+    fn cycle_and_publish(
+        &self,
+        persist: &mut Persist,
+        last: &mut Option<LastPublication>,
+        last_pub_at: &mut Option<Instant>,
+    ) -> Result<bool, String> {
+        let staged = self.stage_cycle(persist)?;
+        let now = Instant::now();
+        let changed = last
+            .as_ref()
+            .is_none_or(|previous| !previous.same_inputs(&staged.identity));
+        let heartbeat_due = last_pub_at.is_none_or(|at| now.duration_since(at) >= self.heartbeat);
+        if !changed && !heartbeat_due {
+            return Ok(false);
+        }
+        self.publish_staged(persist, &staged)?;
+        *last = Some(staged.identity);
+        *last_pub_at = Some(now);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn publish_resource_mirrors(&self, catalog: &ResourceCatalog) -> Result<(), String> {
+        let outputs = self.prepare_resource_mirror_outputs(catalog)?;
+        let mut persist = Persist::open(self.bus_root.clone())
+            .map_err(|error| format!("open Bus for resource mirror test: {error}"))?;
+        self.publish_staged(
+            &mut persist,
+            &StagedPublication {
+                identity: LastPublication {
+                    services: ServicesState {
+                        host: self.host.clone(),
+                        records: Vec::new(),
+                        published_at_ms: now_ms(),
+                    },
+                    desktop_ulid: None,
+                    ssh_x11_ulid: None,
+                    upnp_ulid: None,
+                },
+                outputs,
+            },
+        )
     }
 
     /// Mint a detached proof from the approved secret store. A missing key is
@@ -753,7 +862,7 @@ impl ServiceAggregatorWorker {
     fn publisher_attestation(
         &self,
         catalog: &ResourceCatalog,
-    ) -> Option<ResourcePublisherAttestation> {
+    ) -> Result<Option<ResourcePublisherAttestation>, String> {
         let now = Instant::now();
         let allowed = self
             .publisher_retry
@@ -766,7 +875,7 @@ impl ServiceAggregatorWorker {
                 key_ref = RESOURCE_PUBLISHER_KEY_REF,
                 "publisher key lookup still in bounded retry backoff"
             );
-            return None;
+            return Ok(None);
         }
 
         let record_failure = |state: &std::sync::Mutex<PublisherRetryState>| {
@@ -790,38 +899,29 @@ impl ServiceAggregatorWorker {
                     key_ref = RESOURCE_PUBLISHER_KEY_REF,
                     "resource catalog publisher key is not distributed; authenticated proof withheld"
                 );
-                return None;
+                return Ok(None);
             }
             Err(error) => {
                 record_failure(&self.publisher_retry);
-                tracing::error!(
-                    host = %self.host,
-                    key_ref = RESOURCE_PUBLISHER_KEY_REF,
-                    error = %error,
-                    "resource catalog publisher key lookup failed; authenticated proof withheld"
-                );
-                return None;
+                return Err(format!(
+                    "resource catalog publisher key lookup failed: {error}"
+                ));
             }
         };
         let issued_at_ms = u64::try_from(now_ms()).unwrap_or(1).max(1);
         let expires_at_ms = issued_at_ms.saturating_add(RESOURCE_PUBLISHER_ATTESTATION_TTL_MS);
-        match ResourcePublisherAttestation::mint(
+        let attestation = ResourcePublisherAttestation::mint(
             catalog,
             RESOURCE_PUBLISHER_ATTESTATION_KEY_ID,
             key.as_bytes(),
             issued_at_ms,
             expires_at_ms,
-        ) {
-            Ok(attestation) => Some(attestation),
-            Err(error) => {
-                tracing::error!(
-                    host = %self.host,
-                    error = %error,
-                    "resource catalog publisher attestation mint failed; proof withheld"
-                );
-                None
-            }
-        }
+        )
+        .map_err(|error| format!("mint resource publisher attestation: {error}"))?;
+        catalog
+            .validate_publisher_attestation(&attestation, key.as_bytes(), issued_at_ms)
+            .map_err(|error| format!("validate staged resource publisher attestation: {error}"))?;
+        Ok(Some(attestation))
     }
 }
 
@@ -832,20 +932,44 @@ impl Worker for ServiceAggregatorWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let mut last: Option<ServicesState> = None;
+        let mut last: Option<LastPublication> = None;
         let mut last_pub_at: Option<Instant> = None;
         let phase = initial_phase(&self.host, self.poll);
         tokio::select! {
             () = tokio::time::sleep(phase) => {}
             () = shutdown.wait() => return Ok(()),
         }
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let mut persist = loop {
+            match Persist::open(self.bus_root.clone()) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::service_aggregator",
+                    host = %self.host,
+                    %error,
+                    "Service Aggregator Bus unavailable; startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                _ = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
+        };
         // Fold + publish after a bounded host-specific phase so a fleet does not
         // perform the first source reads and resource projection in lockstep.
-        self.cycle_and_publish(&mut last, &mut last_pub_at);
+        if let Err(error) = self.cycle_and_publish(&mut persist, &mut last, &mut last_pub_at) {
+            tracing::warn!(
+                target: "mackesd::service_aggregator",
+                host = %self.host,
+                %error,
+                "Service Aggregator cycle deferred"
+            );
+        }
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         let mut action_worker = resource_actions::ResourceActionWorker::production(
-            self.bus_root.clone(),
+            Some(self.bus_root.clone()),
             self.publisher_store.clone(),
         );
         let mut action_tick = tokio::time::interval(mde_bus::rpc::CONTROL_POLL_INTERVAL);
@@ -853,7 +977,14 @@ impl Worker for ServiceAggregatorWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.cycle_and_publish(&mut last, &mut last_pub_at);
+                    if let Err(error) = self.cycle_and_publish(&mut persist, &mut last, &mut last_pub_at) {
+                        tracing::warn!(
+                            target: "mackesd::service_aggregator",
+                            host = %self.host,
+                            %error,
+                            "Service Aggregator cycle deferred"
+                        );
+                    }
                 }
                 _ = action_tick.tick() => {
                     action_worker.tick(u64::try_from(now_ms()).unwrap_or(0));
@@ -874,6 +1005,7 @@ mod tests {
         ResourcePublisherAttestation, TransportProtocol,
     };
     use mackes_mesh_types::service_record::{ServiceHealth, ServiceProvenance};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FakePublished(Vec<PublishedInput>);
     impl PublishedSource for FakePublished {
@@ -958,6 +1090,30 @@ mod tests {
             .expect("write desktop state");
     }
 
+    async fn wait_for_catalog_card(root: &Path, display_name: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let found = Persist::open(root.to_path_buf())
+                    .ok()
+                    .and_then(|persist| persist.read_latest(RESOURCE_CATALOG_TOPIC).ok().flatten())
+                    .and_then(|message| message.body)
+                    .and_then(|body| ResourceCatalog::from_json(&body).ok())
+                    .is_some_and(|catalog| {
+                        catalog
+                            .cards
+                            .iter()
+                            .any(|card| card.display_name == display_name)
+                    });
+                if found {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("catalog never contained {display_name}"));
+    }
+
     fn write_upnp_state(root: &std::path::Path) {
         let persist = mde_bus::persist::Persist::open(root.to_path_buf()).expect("persist");
         let state = super::super::upnp_sources::UpnpSourcesState {
@@ -1031,10 +1187,12 @@ mod tests {
         let worker = worker_with(vec![], vec![]).with_bus_root(Some(dir.path().to_path_buf()));
         let mut last = None;
         let mut last_pub_at = None;
+        let mut persist = Persist::open(dir.path().to_path_buf()).expect("persist");
 
-        worker.cycle_and_publish(&mut last, &mut last_pub_at);
+        worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .expect("publish staged cycle");
 
-        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
         let body = persist
             .read_latest(RESOURCE_CATALOG_TOPIC)
             .expect("read catalog")
@@ -1073,10 +1231,12 @@ mod tests {
         let worker = worker_with(vec![], vec![]).with_bus_root(Some(dir.path().to_path_buf()));
         let mut last = None;
         let mut last_pub_at = None;
+        let mut persist = Persist::open(dir.path().to_path_buf()).expect("persist");
 
-        worker.cycle_and_publish(&mut last, &mut last_pub_at);
+        worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .expect("publish staged cycle");
 
-        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
         let body = persist
             .read_latest(RESOURCE_CATALOG_TOPIC)
             .expect("read catalog")
@@ -1100,10 +1260,12 @@ mod tests {
         let worker = worker_with(vec![], vec![]).with_bus_root(Some(dir.path().to_path_buf()));
         let mut last = None;
         let mut last_pub_at = None;
+        let mut persist = Persist::open(dir.path().to_path_buf()).expect("persist");
 
-        worker.cycle_and_publish(&mut last, &mut last_pub_at);
+        worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .expect("publish staged cycle");
 
-        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
         let catalog_body = persist
             .read_latest(RESOURCE_CATALOG_TOPIC)
             .expect("read catalog")
@@ -1140,10 +1302,12 @@ mod tests {
         let worker = worker_with(vec![], vec![]).with_bus_root(Some(dir.path().to_path_buf()));
         let mut last = None;
         let mut last_pub_at = None;
+        let mut persist = Persist::open(dir.path().to_path_buf()).expect("persist");
 
-        worker.cycle_and_publish(&mut last, &mut last_pub_at);
+        worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .expect("publish staged cycle");
 
-        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
         let catalog_body = persist
             .read_latest(RESOURCE_CATALOG_TOPIC)
             .expect("read catalog")
@@ -1175,7 +1339,7 @@ mod tests {
     fn malformed_or_invalid_retained_desktop_state_suppresses_resource_mirrors() {
         let assert_suppressed = |body: &str| {
             let dir = tempfile::tempdir().expect("tempdir");
-            let persist =
+            let mut persist =
                 mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
             persist
                 .write(
@@ -1189,14 +1353,14 @@ mod tests {
             let mut last = None;
             let mut last_pub_at = None;
 
-            worker.cycle_and_publish(&mut last, &mut last_pub_at);
+            assert!(worker
+                .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+                .is_err());
 
-            let persist =
-                mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
             assert!(persist
                 .read_latest(&state_topic("me"))
                 .expect("read service state")
-                .is_some());
+                .is_none());
             assert!(persist
                 .read_latest(RESOURCE_CATALOG_TOPIC)
                 .expect("read catalog")
@@ -1205,6 +1369,8 @@ mod tests {
                 .read_latest(RESOURCE_DISCOVERY_TOPIC)
                 .expect("read discovery")
                 .is_none());
+            assert!(last.is_none());
+            assert!(last_pub_at.is_none());
         };
 
         assert_suppressed(r#"{"node":"desktop-discovery","sources":[]}"#);
@@ -1254,7 +1420,7 @@ mod tests {
         let capability = test_capability();
         let catalog = catalog_with_capabilities(vec![capability.clone(), capability]);
 
-        worker.publish_resource_mirrors(&catalog);
+        assert!(worker.publish_resource_mirrors(&catalog).is_err());
 
         let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
         assert!(persist
@@ -1274,7 +1440,9 @@ mod tests {
         let mut catalog = catalog_with_capabilities(vec![]);
         catalog.content_digest = None;
 
-        worker.publish_resource_mirrors(&catalog);
+        worker
+            .publish_resource_mirrors(&catalog)
+            .expect("publish resource mirrors");
 
         let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
         let catalog_body = persist
@@ -1309,7 +1477,9 @@ mod tests {
             .with_publisher_store(store);
         let catalog = catalog_with_capabilities(vec![]);
 
-        worker.publish_resource_mirrors(&catalog);
+        worker
+            .publish_resource_mirrors(&catalog)
+            .expect("publish resource mirrors");
 
         let persist = mde_bus::persist::Persist::open(bus.path().to_path_buf()).expect("persist");
         let catalog_body = persist
@@ -1341,7 +1511,9 @@ mod tests {
         let worker = worker_with(vec![], vec![]).with_bus_root(Some(bus.path().to_path_buf()));
         let catalog = catalog_with_capabilities(vec![]);
 
-        worker.publish_resource_mirrors(&catalog);
+        worker
+            .publish_resource_mirrors(&catalog)
+            .expect("publish resource mirrors");
 
         let persist = mde_bus::persist::Persist::open(bus.path().to_path_buf()).expect("persist");
         let catalog_body = persist
@@ -1378,9 +1550,138 @@ mod tests {
         assert!(state.next_attempt.is_none());
     }
 
+    #[test]
+    fn final_retained_source_failure_publishes_nothing_and_advances_nothing() {
+        let bus = tempfile::tempdir().expect("bus tempdir");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let worker = worker_with(vec![], vec![])
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_bus_read_gate(Arc::new(|topic, index| {
+                (index != 2)
+                    .then_some(())
+                    .ok_or_else(|| format!("injected final-source read failure for {topic}"))
+            }));
+        let mut last = None;
+        let mut last_pub_at = None;
+
+        assert!(worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .is_err());
+        for topic in [
+            state_topic("me"),
+            resource_adapters::RESOURCE_ADAPTER_STATUS_TOPIC.to_owned(),
+            RESOURCE_CATALOG_TOPIC.to_owned(),
+            RESOURCE_DISCOVERY_TOPIC.to_owned(),
+        ] {
+            assert!(persist
+                .read_latest(&topic)
+                .expect("read output topic")
+                .is_none());
+        }
+        assert!(last.is_none());
+        assert!(last_pub_at.is_none());
+    }
+
+    #[test]
+    fn write_failure_keeps_cycle_immediately_retryable() {
+        let bus = tempfile::tempdir().expect("bus tempdir");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let fail_write = Arc::new(AtomicBool::new(true));
+        let worker = worker_with(vec![], vec![])
+            .with_bus_root(Some(bus.path().to_path_buf()))
+            .with_bus_write_gate({
+                let fail_write = Arc::clone(&fail_write);
+                Arc::new(move |topic, index| {
+                    (index != 3 || !fail_write.load(Ordering::SeqCst))
+                        .then_some(())
+                        .ok_or_else(|| format!("injected write failure for {topic}"))
+                })
+            });
+        let mut last = None;
+        let mut last_pub_at = None;
+
+        assert!(worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .is_err());
+        assert!(last.is_none());
+        assert!(last_pub_at.is_none());
+        assert!(persist
+            .read_latest(RESOURCE_DISCOVERY_TOPIC)
+            .expect("read failed discovery output")
+            .is_none());
+
+        fail_write.store(false, Ordering::SeqCst);
+        assert!(worker
+            .cycle_and_publish(&mut persist, &mut last, &mut last_pub_at)
+            .expect("immediate corrected-forward retry"));
+        assert!(last.is_some());
+        assert!(last_pub_at.is_some());
+        assert_eq!(
+            persist
+                .list_since(RESOURCE_DISCOVERY_TOPIC, None)
+                .expect("list discovery outputs")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_worker_recovers_late_external_and_replaced_bus() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let bus_root = base.path().join("late-bus");
+        std::fs::write(&bus_root, b"temporarily unopenable Bus root").expect("block Bus root");
+        let share = tempfile::tempdir().expect("share tempdir");
+        let mut worker = ServiceAggregatorWorker::new("me".into(), share.path().to_path_buf())
+            .with_bus_root(Some(bus_root.clone()))
+            .with_published(Arc::new(FakePublished(vec![])))
+            .with_probe(Arc::new(FakeProbe(vec![])))
+            .with_poll(Duration::from_millis(5));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !task.is_finished(),
+            "late Bus must not terminate the worker"
+        );
+        std::fs::remove_file(&bus_root).expect("unblock Bus root");
+        let mut state = valid_desktop_state();
+        write_desktop_state(&bus_root, &state);
+        wait_for_catalog_card(&bus_root, "Oak Seat").await;
+
+        state.sources[0].name = "External Forward Seat".into();
+        write_desktop_state(&bus_root, &state);
+        wait_for_catalog_card(&bus_root, "External Forward Seat").await;
+
+        let detached = base.path().join("detached-bus");
+        std::fs::rename(&bus_root, &detached).expect("detach active Bus");
+        state.sources[0].name = "Replacement Bus Seat".into();
+        write_desktop_state(&bus_root, &state);
+        wait_for_catalog_card(&bus_root, "Replacement Bus Seat").await;
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("worker shutdown timeout")
+            .expect("join worker")
+            .expect("worker result");
+        assert_eq!(
+            service_aggregator_bus_root(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
     #[tokio::test]
     async fn tick_loop_exits_promptly_on_shutdown() {
-        let mut w = worker_with(vec![], vec![]).with_poll(Duration::from_millis(10));
+        let base = tempfile::tempdir().expect("base tempdir");
+        let unavailable = base.path().join("unavailable-bus");
+        std::fs::write(&unavailable, b"not a directory").expect("block Bus root");
+        let mut w = worker_with(vec![], vec![])
+            .with_bus_root(Some(unavailable))
+            .with_poll(Duration::from_millis(10));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { w.run(token).await });

@@ -476,6 +476,9 @@ behavioral evidence is not completion.
 - **Clock transaction recovery checkpoint (2026-08-09):** durable command and
   audio acknowledgement cursors survive late storage, commit failure, and publication failure in the same worker. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-commit-recovery-r43.md`.
+- **Service-catalog projection recovery checkpoint (2026-08-09):** retained
+  source reads and all derivations now complete before output; write failure remains immediately retryable. BigBoy passed seven exact tests:
+  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
@@ -1130,6 +1133,9 @@ behavioral evidence is not completion.
   requests on new host topics, and defers convergence on read failure. Machine
   194 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-010-WL-FUNC-019-2026-08-09-mesh-mount-bus-recovery-r29.md`.
+- **Service Aggregator transaction checkpoint (2026-08-09):** desktop,
+  SSH/X11, and UPnP inputs plus catalog/discovery/attestation derivation stage before publication; failures do not claim success. BigBoy passed seven exact tests:
+  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
