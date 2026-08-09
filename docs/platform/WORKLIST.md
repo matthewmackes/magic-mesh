@@ -1665,6 +1665,10 @@ behavioral evidence is not completion.
   of permanently terminating the readiness authority; machine 193 passed the
   exact fallback test:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-boot-readiness-bus-fallback-r18.md`.
+- **Session Bus-loss checkpoint (2026-08-09):** an unreadable action log now
+  defers convergence instead of fabricating an empty roster and deleting live
+  sessions; machine 193 passed two exact safety/fallback tests:
+  `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-bus-loss-r19.md`.
 - **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:

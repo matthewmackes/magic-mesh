@@ -1237,13 +1237,12 @@ fn read_new_actions(
     bus_root: &Path,
     cursor: &mut Option<String>,
     authorizer: &ActionAuthorizer,
-) -> Vec<SessionRequest> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
+) -> Result<Vec<SessionRequest>, String> {
+    let persist = Persist::open(bus_root.to_path_buf())
+        .map_err(|error| format!("open session Bus: {error}"))?;
+    let msgs = persist
+        .list_since(ACTION_TOPIC, cursor.as_deref())
+        .map_err(|error| format!("read session actions: {error}"))?;
     let mut out = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
@@ -1273,7 +1272,7 @@ fn read_new_actions(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Return the closed capability verb and stable session target for one typed
@@ -1319,16 +1318,16 @@ fn drain(
     cursor: &mut Option<String>,
     roster: &mut BTreeMap<SessionId, VdiSession>,
     authorizer: &ActionAuthorizer,
-) -> Vec<SessionRequest> {
+) -> Result<Vec<SessionRequest>, String> {
     let mut requests = Vec::new();
-    for req in read_new_actions(bus_root, cursor, authorizer) {
+    for req in read_new_actions(bus_root, cursor, authorizer)? {
         if let Err(e) = apply_request(roster, req.clone(), now_ms()) {
             tracing::warn!(error = %e, "session_broker: dropping unresolvable session op");
         } else {
             requests.push(req);
         }
     }
-    requests
+    Ok(requests)
 }
 
 /// Read guest runtime observations from the replicated state topic. Malformed,
@@ -1499,6 +1498,12 @@ fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
 }
 
+fn session_bus_root(override_root: Option<PathBuf>, default_root: Option<PathBuf>) -> PathBuf {
+    override_root
+        .or(default_root)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1590,8 +1595,8 @@ impl SessionBrokerWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    fn bus_root(&self) -> PathBuf {
+        session_bus_root(self.bus_root_override.clone(), default_bus_root())
     }
 
     /// Only the elected node converges the shared plane (no-fixed-center: any
@@ -1647,10 +1652,7 @@ impl Worker for SessionBrokerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            tracing::debug!("session_broker: no bus root; worker idle");
-            return Ok(());
-        };
+        let bus_root = self.bus_root();
         // Read the FULL action log from the start (unlike `scheduler`, which primes
         // past the backlog): a session's state is a fold of the whole log, so a
         // (re)start must rebuild the complete roster before it converges.
@@ -1663,7 +1665,15 @@ impl Worker for SessionBrokerWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     // Fold the whole session log into the roster, then converge.
-                    let _ = drain(&bus_root, &mut cursor, &mut roster, self.authorizer.as_ref());
+                    if let Err(error) = drain(
+                        &bus_root,
+                        &mut cursor,
+                        &mut roster,
+                        self.authorizer.as_ref(),
+                    ) {
+                        tracing::debug!(%error, "session_broker: Bus unavailable; convergence deferred");
+                        continue;
+                    }
                     if let Some(signer) = self.app_state_signer.as_ref() {
                         for session in roster.values().filter(|session| {
                             session.app.is_some()
@@ -2710,7 +2720,8 @@ mod tests {
         let authorizer = ActionAuthorizer::for_test(AUTH_KEY, bus.path().join("auth"), AUTH_NOW);
         let mut cursor = None;
         let mut roster = BTreeMap::new();
-        drain(bus.path(), &mut cursor, &mut roster, &authorizer);
+        drain(bus.path(), &mut cursor, &mut roster, &authorizer)
+            .expect("drain authorized session actions");
         assert!(roster.is_empty(), "unsigned action mutated the roster");
     }
 
@@ -2739,7 +2750,7 @@ mod tests {
         let authorizer = ActionAuthorizer::for_test(AUTH_KEY, bus.path().join("auth"), AUTH_NOW);
         let mut cursor = None;
         let mut roster = BTreeMap::new();
-        drain(bus.path(), &mut cursor, &mut roster, &authorizer);
+        drain(bus.path(), &mut cursor, &mut roster, &authorizer).expect("drain replay fixture");
         assert_eq!(roster.len(), 1);
         assert_eq!(roster["authorized"].vm_id, "vm-1");
     }
@@ -2747,6 +2758,14 @@ mod tests {
     #[test]
     fn default_bus_root_uses_the_shared_mde_bus_resolver() {
         assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+        assert_eq!(
+            session_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            session_bus_root(Some(PathBuf::from("/tmp/session-bus")), None),
+            PathBuf::from("/tmp/session-bus")
+        );
     }
 
     // ── the store seam ──
@@ -3187,7 +3206,8 @@ mod tests {
 
         let mut cursor = None;
         let mut roster = BTreeMap::new();
-        drain(&bus, &mut cursor, &mut roster, authorizer.as_ref());
+        drain(&bus, &mut cursor, &mut roster, authorizer.as_ref())
+            .expect("drain initial session actions");
         assert_eq!(roster["s1"].state, SessionState::Active, "folded to Active");
         w.converge(&mut roster);
 
@@ -3219,7 +3239,7 @@ mod tests {
                 )
                 .expect("write close");
         }
-        drain(&bus, &mut cursor2, &mut roster, authorizer.as_ref());
+        drain(&bus, &mut cursor2, &mut roster, authorizer.as_ref()).expect("drain close action");
         w.converge(&mut roster);
         assert!(
             rows.lock().expect("rows mutex").is_empty(),
@@ -3250,5 +3270,45 @@ mod tests {
         assert!(joined.is_ok(), "worker must exit promptly on shutdown");
         assert!(joined.unwrap().expect("join").is_ok());
         let _ = std::fs::remove_dir_all(&wg);
+    }
+
+    #[tokio::test]
+    async fn unavailable_bus_defers_convergence_without_removing_live_sessions() {
+        let root = tempfile::tempdir().expect("session Bus failure fixture");
+        let blocker = root.path().join("not-a-bus-directory");
+        std::fs::write(&blocker, b"block Persist::open").expect("write Bus blocker");
+        let workgroup = tempfile::tempdir().expect("session workgroup");
+        let store = FakeStore::default();
+        store
+            .publish(&sess("live", SessionState::Active))
+            .expect("seed live session");
+        let rows = Arc::clone(&store.rows);
+        let mut worker =
+            SessionBrokerWorker::new(workgroup.path().to_path_buf(), "peer:recovery".to_string())
+                .with_store(Box::new(store))
+                .with_bus_root(blocker)
+                .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            !task.is_finished(),
+            "Bus loss must not terminate the worker"
+        );
+        assert!(
+            rows.lock().expect("rows mutex").contains_key("live"),
+            "an unavailable action log must not look like an empty desired roster"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt the worker")
+            .expect("worker task")
+            .expect("worker result");
     }
 }
