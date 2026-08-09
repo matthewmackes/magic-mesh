@@ -464,9 +464,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-snap-scheduler-bus-recovery-r42.md`.
 - **Navigation recovery (2026-08-09):** reads/publication precede cursor commit; failed writes retry without another provider call. Machine 9 passed six exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
-- **Clock transaction recovery checkpoint (2026-08-09):** durable command and
-  audio acknowledgement cursors survive late storage, commit failure, and publication failure in the same worker. Machine 194 passed four exact tests:
-  `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-commit-recovery-r43.md`.
+- **Clock transaction recovery (2026-08-09):** durable command/audio state survives late/replaced Bus and output failure. Machine 194 passed four exact tests:
+  `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Service-catalog projection recovery checkpoint (2026-08-09):** reads/derivations complete before output; write failure remains retryable. BigBoy passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
 - **CUPS action recovery checkpoint (2026-08-09):** both lanes activate atomically; failed replies retry in-process without repeating sync. Machine 193 passed three exact tests:
@@ -1577,9 +1576,8 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
-- **Clock Bus/commit recovery checkpoint (2026-08-09):** durable authority loads
-  before late storage, complete reads precede effects, and failed commit/publication/acknowledgement retains same-worker retry. Machine 194 passed four exact tests:
-  `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-commit-recovery-r43.md`.
+- **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
+  `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-replacement-r86.md`.
 - **Clock documentation/package hard-cut checkpoint (2026-08-09):** the visible
   clock and dedicated bell have distinct canonical routes, daemon-only schedule
   authority is documented, and CI/package lint rejects the retired Timers
