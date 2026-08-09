@@ -89,6 +89,8 @@ RECOVERY_STATES = ("healthy", "degraded", "recovering", "healthy")
 SOURCES = {"farm", "live"}
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LIVE_ATTESTATION_KIND = "mcnf-six-node-live-attestation-v1"
+LIVE_SCENARIO_KIND = "mcnf-six-node-scenario-observation-v2"
+LIVE_RECOVERY_KIND = "mcnf-six-node-recovery-observation-v2"
 # Evidence artifacts are summaries/markers, not raw logs. Keep validation
 # bounded even when an otherwise plausible path and digest are supplied.
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
@@ -108,6 +110,108 @@ def _integer(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise EvidenceError(f"{field} must be a positive integer")
     return value
+
+
+def _digest(value: Any, field: str) -> str:
+    digest = _text(value, field).lower()
+    if not SHA256.fullmatch(digest):
+        raise EvidenceError(f"{field} must be 64 lowercase hex characters")
+    return digest
+
+
+def _candidate(
+    record: Any,
+    *,
+    node_id: str,
+    role: str,
+    revision: str,
+    manifest_sha256: str,
+) -> dict[str, Any]:
+    """Validate the installed-candidate identity emitted by the live collector."""
+
+    if not isinstance(record, dict) or set(record) != {
+        "binaries",
+        "manifest_sha256",
+        "package",
+        "package_payload_sha256",
+        "revision",
+    }:
+        raise EvidenceError(f"{node_id}/candidate must contain exactly its binding fields")
+    if record["revision"] != revision:
+        raise EvidenceError(f"{node_id}/candidate.revision must match the bundle revision")
+    if _digest(record["manifest_sha256"], f"{node_id}/candidate.manifest_sha256") != manifest_sha256:
+        raise EvidenceError(f"{node_id}/candidate.manifest_sha256 must match the bundle")
+    _text(record["package"], f"{node_id}/candidate.package")
+    _digest(record["package_payload_sha256"], f"{node_id}/candidate.package_payload_sha256")
+    binaries = record["binaries"]
+    expected_binaries = {"mackesd"} | ({"mde-shell-egui"} if role == "workstation" else set())
+    if not isinstance(binaries, dict) or set(binaries) != expected_binaries:
+        raise EvidenceError(
+            f"{node_id}/candidate.binaries must contain exactly the {role} runtime payload"
+        )
+    for name, digest in binaries.items():
+        _digest(digest, f"{node_id}/candidate.binaries.{name}")
+    return record
+
+
+def _live_claim_artifact(
+    record: dict[str, Any],
+    *,
+    node_id: str,
+    revision: str,
+    generated_at_ms: int,
+    artifact_root: Path,
+    candidate: dict[str, Any],
+    kind: str,
+    claim_name: str,
+    recovery_kind: str | None = None,
+) -> None:
+    """Require a live claim to be a typed collector artifact, not arbitrary bytes."""
+
+    artifact_path = (artifact_root.resolve() / record["artifact"]).resolve()
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact must contain typed JSON") from exc
+    common_keys = {
+        "candidate",
+        "collected_at_ms",
+        "kind",
+        "node_id",
+        "outcome",
+        "revision",
+        "schema_version",
+    }
+    expected_keys = common_keys | (
+        {"hostname", "machine_id_sha256", "scenario"}
+        if kind == LIVE_SCENARIO_KIND
+        else {"recovery_kind"}
+    )
+    if not isinstance(artifact, dict) or set(artifact) != expected_keys:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact has an unsupported collector schema")
+    if artifact["schema_version"] != 1 or artifact["kind"] != kind:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact has an unsupported collector kind")
+    if artifact["node_id"] != node_id or artifact["revision"] != revision:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact identity does not match the claim")
+    if artifact["candidate"] != candidate:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact candidate does not match the node")
+    if artifact["collected_at_ms"] != generated_at_ms:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact collection time does not match the bundle")
+    if kind == LIVE_SCENARIO_KIND and artifact["scenario"] != claim_name:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact scenario does not match the claim")
+    if recovery_kind is not None and artifact["recovery_kind"] != recovery_kind:
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact recovery kind does not match the claim")
+    outcome = artifact["outcome"]
+    if not isinstance(outcome, dict):
+        raise EvidenceError(f"{node_id}/{claim_name}.artifact outcome must be an object")
+    compared_fields = {"command", "observed_at_ms", "status"} | (
+        set(record) - {"artifact", "sha256"}
+    )
+    for field in compared_fields:
+        if outcome.get(field) != record.get(field):
+            raise EvidenceError(
+                f"{node_id}/{claim_name}.artifact outcome.{field} does not match the claim"
+            )
 
 
 def _scenario(
@@ -372,12 +476,27 @@ def validate(
     nodes = bundle.get("nodes")
     if not isinstance(nodes, list) or len(nodes) != 6:
         raise EvidenceError("nodes must contain exactly six records")
+    has_live_nodes = any(isinstance(node, dict) and node.get("source") == "live" for node in nodes)
+    manifest_sha256 = ""
+    if has_live_nodes:
+        if set(bundle) != {
+            "candidate_manifest_sha256",
+            "generated_at_ms",
+            "nodes",
+            "revision",
+            "schema",
+        }:
+            raise EvidenceError("live evidence root must contain exactly the collector fields")
+        manifest_sha256 = _digest(
+            bundle.get("candidate_manifest_sha256"), "candidate_manifest_sha256"
+        )
 
     seen: set[str] = set()
     role_counts = {role: 0 for role in ROLES}
     normalized_nodes: list[dict[str, Any]] = []
     recovery_records: list[dict[str, str]] = []
     artifact_claims: dict[Path, tuple[str, str]] = {}
+    role_candidates: dict[str, dict[str, Any]] = {}
 
     def claim_artifact(record: dict[str, Any], node_id: str, claim: str) -> None:
         """Prevent one capture from being presented as multiple acceptance events."""
@@ -385,16 +504,6 @@ def validate(
         artifact_path = (artifact_root.resolve() / record["artifact"]).resolve()
         previous = artifact_claims.get(artifact_path)
         if previous is not None:
-            # The required failover scenario is the summary view of the same
-            # detailed recovery.failover event.  No other cross-claim reuse is
-            # valid: join, loss, re-enrollment, corrected-forward, and state
-            # transitions each require their own capture.
-            failover_alias = {
-                f"{node_id}/failover",
-                f"{node_id}/recovery.failover",
-            }
-            if previous[0] == node_id and {previous[1], claim} == failover_alias:
-                return
             raise EvidenceError(
                 f"{claim}.artifact reuses evidence already claimed by "
                 f"{previous[0]} at {previous[1]}"
@@ -417,7 +526,33 @@ def validate(
             raise EvidenceError(f"{node_id} has unsupported source {source!r}")
         if require_live and source != "live":
             raise EvidenceError(f"{node_id} is {source} evidence; live evidence is required")
+        candidate: dict[str, Any] | None = None
         if source == "live":
+            if "live_attestation" not in node:
+                raise EvidenceError(f"{node_id}/live_attestation is required for live evidence")
+            if set(node) != {
+                "candidate",
+                "id",
+                "live_attestation",
+                "recovery",
+                "role",
+                "scenarios",
+                "source",
+            }:
+                raise EvidenceError(f"{node_id} must contain exactly the live collector fields")
+            candidate = _candidate(
+                node.get("candidate"),
+                node_id=node_id,
+                role=role,
+                revision=revision,
+                manifest_sha256=manifest_sha256,
+            )
+            previous_candidate = role_candidates.get(role)
+            if previous_candidate is not None and candidate != previous_candidate:
+                raise EvidenceError(
+                    f"{node_id}/candidate does not match the other {role} candidate payload"
+                )
+            role_candidates[role] = candidate
             _live_attestation(
                 node.get("live_attestation"),
                 node_id,
@@ -431,6 +566,17 @@ def validate(
             raise EvidenceError(f"{node_id} must provide exactly the six required scenarios")
         for scenario in SCENARIOS:
             _scenario(scenarios[scenario], node_id, scenario, now_ms, max_age_ms, artifact_root)
+            if candidate is not None:
+                _live_claim_artifact(
+                    scenarios[scenario],
+                    node_id=node_id,
+                    revision=revision,
+                    generated_at_ms=generated,
+                    artifact_root=artifact_root,
+                    candidate=candidate,
+                    kind=LIVE_SCENARIO_KIND,
+                    claim_name=scenario,
+                )
             claim_artifact(scenarios[scenario], node_id, f"{node_id}/{scenario}")
         if source == "live":
             claim_artifact(
@@ -448,7 +594,42 @@ def validate(
             )
         )
         for index, state in enumerate(recovery["states"]):
+            if candidate is not None:
+                _live_claim_artifact(
+                    state,
+                    node_id=node_id,
+                    revision=revision,
+                    generated_at_ms=generated,
+                    artifact_root=artifact_root,
+                    candidate=candidate,
+                    kind=LIVE_RECOVERY_KIND,
+                    claim_name=f"recovery.states[{index}]",
+                    recovery_kind="state",
+                )
             claim_artifact(state, node_id, f"{node_id}/recovery.states[{index}]")
+        if candidate is not None:
+            _live_claim_artifact(
+                recovery["failover"],
+                node_id=node_id,
+                revision=revision,
+                generated_at_ms=generated,
+                artifact_root=artifact_root,
+                candidate=candidate,
+                kind=LIVE_RECOVERY_KIND,
+                claim_name="recovery.failover",
+                recovery_kind="failover",
+            )
+            _live_claim_artifact(
+                recovery["corrected_forward"],
+                node_id=node_id,
+                revision=revision,
+                generated_at_ms=generated,
+                artifact_root=artifact_root,
+                candidate=candidate,
+                kind=LIVE_RECOVERY_KIND,
+                claim_name="recovery.corrected_forward",
+                recovery_kind="corrected_forward",
+            )
         claim_artifact(
             recovery["failover"], node_id, f"{node_id}/recovery.failover"
         )
@@ -496,7 +677,7 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                     "status": "pass",
                     "observed_at_ms": now_ms,
                     "command": f"six-node-drill {name} --node {prefix}-{index}",
-                    "artifact": f"evidence/{prefix}-{index}/{name}.json",
+                    "artifact": f"evidence/{prefix}-{index}/scenarios/{name}.json",
                     "sha256": hashlib.sha256(f"{prefix}-{index}-{name}".encode()).hexdigest(),
                 }
                 for name in SCENARIOS
@@ -514,7 +695,7 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                         "command": (
                             f"six-node-recovery {state_name} --node {node_id}"
                         ),
-                        "artifact": f"evidence/{node_id}/recovery-state-{state_index}.json",
+                        "artifact": f"evidence/{node_id}/recovery/state-{state_index}.json",
                         "sha256": hashlib.sha256(
                             f"{node_id}-recovery-state-{state_index}".encode()
                         ).hexdigest(),
@@ -528,7 +709,7 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                     "status": "pass",
                     "observed_at_ms": now_ms,
                     "command": f"six-node-failover --node {node_id}",
-                    "artifact": f"evidence/{node_id}/failover.json",
+                    "artifact": f"evidence/{node_id}/recovery/failover.json",
                     "sha256": hashlib.sha256(f"{node_id}-failover".encode()).hexdigest(),
                     "node_id": node_id,
                     "failed_lighthouse_id": "lh-1",
@@ -539,7 +720,7 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                     "status": "pass",
                     "observed_at_ms": now_ms,
                     "command": f"six-node-corrected-forward --node {node_id}",
-                    "artifact": f"evidence/{node_id}/corrected-forward.json",
+                    "artifact": f"evidence/{node_id}/recovery/corrected-forward.json",
                     "sha256": hashlib.sha256(
                         f"{node_id}-corrected-forward".encode()
                     ).hexdigest(),
@@ -551,6 +732,21 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                 },
             }
             if source == "live":
+                manifest_sha256 = hashlib.sha256(b"test-candidate-manifest").hexdigest()
+                binaries = {"mackesd": hashlib.sha256(f"{role}-mackesd".encode()).hexdigest()}
+                if role == "workstation":
+                    binaries["mde-shell-egui"] = hashlib.sha256(
+                        b"workstation-mde-shell-egui"
+                    ).hexdigest()
+                node["candidate"] = {
+                    "revision": "test-revision",
+                    "manifest_sha256": manifest_sha256,
+                    "package": f"magic-mesh-{role} 12.1.6-1.x86_64",
+                    "package_payload_sha256": hashlib.sha256(
+                        f"{role}-rpm-payload".encode()
+                    ).hexdigest(),
+                    "binaries": binaries,
+                }
                 node["live_attestation"] = {
                     "status": "pass",
                     "observed_at_ms": now_ms,
@@ -561,7 +757,17 @@ def _fixture(source: str = "farm", *, now_ms: int = 1_760_000_000_000) -> dict[s
                     "transport": "ssh",
                 }
             nodes.append(node)
-    return {"schema": SCHEMA, "revision": "test-revision", "generated_at_ms": now_ms, "nodes": nodes}
+    bundle = {
+        "schema": SCHEMA,
+        "revision": "test-revision",
+        "generated_at_ms": now_ms,
+        "nodes": nodes,
+    }
+    if source == "live":
+        bundle["candidate_manifest_sha256"] = hashlib.sha256(
+            b"test-candidate-manifest"
+        ).hexdigest()
+    return bundle
 
 
 def _materialize_fixture(bundle: dict[str, Any], root: Path) -> None:
@@ -570,23 +776,93 @@ def _materialize_fixture(bundle: dict[str, Any], root: Path) -> None:
     # that test-only fixture internally coherent without relaxing validate().
     revision = _text(bundle["revision"], "revision")
     for node in bundle["nodes"]:
+        if node["source"] == "live":
+            node["candidate"]["revision"] = revision
         for name, record in node["scenarios"].items():
             artifact = root / record["artifact"]
             artifact.parent.mkdir(parents=True, exist_ok=True)
-            artifact.write_bytes(f"{node['id']}-{name}".encode())
+            if node["source"] == "live":
+                contents = {
+                    "schema_version": 1,
+                    "kind": LIVE_SCENARIO_KIND,
+                    "node_id": node["id"],
+                    "hostname": node["id"],
+                    "machine_id_sha256": hashlib.sha256(node["id"].encode()).hexdigest(),
+                    "revision": revision,
+                    "scenario": name,
+                    "candidate": node["candidate"],
+                    "outcome": {
+                        key: value
+                        for key, value in record.items()
+                        if key not in {"artifact", "sha256"}
+                    },
+                    "collected_at_ms": bundle["generated_at_ms"],
+                }
+                artifact_bytes = json.dumps(
+                    contents, sort_keys=True, separators=(",", ":")
+                ).encode()
+                artifact.write_bytes(artifact_bytes)
+                record["sha256"] = hashlib.sha256(artifact_bytes).hexdigest()
+            else:
+                artifact.write_bytes(f"{node['id']}-{name}".encode())
         recovery = node["recovery"]
         recovery["corrected_forward"]["forward_revision"] = revision
         for state_index, record in enumerate(recovery["states"]):
             artifact = root / record["artifact"]
             artifact.parent.mkdir(parents=True, exist_ok=True)
-            artifact.write_bytes(f"{node['id']}-recovery-state-{state_index}".encode())
+            if node["source"] == "live":
+                contents = {
+                    "schema_version": 1,
+                    "kind": LIVE_RECOVERY_KIND,
+                    "node_id": node["id"],
+                    "revision": revision,
+                    "recovery_kind": "state",
+                    "candidate": node["candidate"],
+                    "outcome": {
+                        key: value
+                        for key, value in record.items()
+                        if key not in {"artifact", "sha256"}
+                    },
+                    "collected_at_ms": bundle["generated_at_ms"],
+                }
+                artifact_bytes = json.dumps(
+                    contents, sort_keys=True, separators=(",", ":")
+                ).encode()
+                artifact.write_bytes(artifact_bytes)
+                record["sha256"] = hashlib.sha256(artifact_bytes).hexdigest()
+            else:
+                artifact.write_bytes(f"{node['id']}-recovery-state-{state_index}".encode())
         for record, contents in (
             (recovery["failover"], f"{node['id']}-failover"),
             (recovery["corrected_forward"], f"{node['id']}-corrected-forward"),
         ):
             artifact = root / record["artifact"]
             artifact.parent.mkdir(parents=True, exist_ok=True)
-            artifact.write_bytes(contents.encode())
+            if node["source"] == "live":
+                recovery_kind = (
+                    "failover" if record is recovery["failover"] else "corrected_forward"
+                )
+                typed_contents = {
+                    "schema_version": 1,
+                    "kind": LIVE_RECOVERY_KIND,
+                    "node_id": node["id"],
+                    "revision": revision,
+                    "recovery_kind": recovery_kind,
+                    "candidate": node["candidate"],
+                    "outcome": {
+                        key: value
+                        for key, value in record.items()
+                        if key not in {"artifact", "sha256"}
+                    },
+                    "collected_at_ms": bundle["generated_at_ms"],
+                }
+                artifact_bytes = json.dumps(
+                    typed_contents, sort_keys=True, separators=(",", ":")
+                ).encode()
+                artifact.write_bytes(artifact_bytes)
+                record["sha256"] = hashlib.sha256(artifact_bytes).hexdigest()
+            else:
+                artifact.write_bytes(contents.encode())
         if "live_attestation" in node:
             record = node["live_attestation"]
             artifact = root / record["artifact"]
@@ -649,7 +925,7 @@ def self_test() -> None:
             raise AssertionError("topology from a different source revision unexpectedly passed")
         for mutation, expected in (
             (lambda b: b["nodes"].pop(), "exactly six"),
-            (lambda b: b["nodes"][0].update({"role": "workstation"}), "requires 3 lighthouse"),
+            (lambda b: b["nodes"][0].update({"role": "workstation"}), "workstation runtime"),
             (lambda b: b["nodes"][0]["scenarios"].pop("loss"), "exactly the six"),
             (lambda b: b["nodes"][0].update({"source": "farm"}), "live evidence"),
         ):
@@ -707,6 +983,43 @@ def self_test() -> None:
             negative_cases += 1
         else:
             raise AssertionError("a farm marker relabeled as live unexpectedly passed")
+        untyped_live_claim = _fixture(source="live")
+        _materialize_fixture(untyped_live_claim, root)
+        untyped_record = untyped_live_claim["nodes"][0]["scenarios"]["join"]
+        untyped_path = root / untyped_record["artifact"]
+        untyped_path.write_bytes(b"operator asserted pass")
+        untyped_record["sha256"] = hashlib.sha256(untyped_path.read_bytes()).hexdigest()
+        try:
+            validate(
+                untyped_live_claim,
+                now_ms=now,
+                max_age_ms=60_000,
+                require_live=True,
+                artifact_root=root,
+            )
+        except EvidenceError as exc:
+            assert "must contain typed JSON" in str(exc), exc
+            negative_cases += 1
+        else:
+            raise AssertionError("arbitrary bytes were accepted as a live drill claim")
+        split_candidate = _fixture(source="live")
+        _materialize_fixture(split_candidate, root)
+        split_candidate["nodes"][4]["candidate"]["package"] = (
+            "magic-mesh-workstation 12.1.7-1.x86_64"
+        )
+        try:
+            validate(
+                split_candidate,
+                now_ms=now,
+                max_age_ms=60_000,
+                require_live=True,
+                artifact_root=root,
+            )
+        except EvidenceError as exc:
+            assert "does not match the other workstation candidate payload" in str(exc), exc
+            negative_cases += 1
+        else:
+            raise AssertionError("a split workstation candidate was accepted as one fleet revision")
         reused_artifact = _fixture()
         _materialize_fixture(reused_artifact, root)
         first_join = reused_artifact["nodes"][0]["scenarios"]["join"]
