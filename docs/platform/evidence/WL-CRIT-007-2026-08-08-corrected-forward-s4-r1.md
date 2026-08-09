@@ -4,9 +4,10 @@
 
 This slice exercises the package-owned boot/network-return recovery path on
 `Basement-Test-Workstation` (`172.20.0.15`, workstation, Nebula
-`10.42.0.5/17`). It is evidence for the ordinary-seat reboot path and the
-required one-lighthouse-loss behavior. It does not claim the still-open
-physical suspend/resume or six-node fleet proof.
+`10.42.0.5/17`) and `DELL-LAPTOP` (`172.20.146.225`, workstation, Nebula
+`10.42.0.4/17`). It is evidence for two ordinary-seat reboot paths, Dell's
+network-return path, and the required one-lighthouse-loss behavior. It does not
+claim the still-open physical suspend/resume or complete fleet proof.
 
 ## Corrected-forward package progression
 
@@ -63,6 +64,33 @@ reported matching 57 MB databases, raft term 4980, advancing applied indexes,
 and `.2` as leader. `member list` from each reachable endpoint agreed on the
 same three voting members. This is a healthy strict 2-of-3 quorum with one
 lighthouse unavailable.
+
+## Three-lighthouse convergence and Dell roster correction
+
+Dell still carried the same retired public lighthouse addresses in its
+Nebula bundle and four retired peer-directory fallback rows. Before mutation,
+the exact files were preserved under
+`/root/mcnf-roster-repair-20260808-dell-r1`. The bundle was updated to the
+three live rows above, the retired rows were moved outside the active peer
+path, and `/etc/mackesd/etcd-endpoints` was aligned to `.1`, `.2`, and `.3`.
+Dell then reached `.2`, `.3`, and the release seat over the overlay.
+
+The live coordination plane subsequently exposed a transport/resource failure
+rather than a data failure. All three persisted members retained cluster ID
+`2bfed5089c4a5a0d` and the expected voter IDs, but legacy supervisor restart
+storms saturated the Nebula UDP receive queues on the 444 MiB lighthouses and
+prevented raft heartbeats. The stale `.2` environment roster was backed up as
+`/etc/etcd/etcd.env.pre-quorum-repair-20260809-r1` and aligned with all three
+members. Coordinated etcd restarts preserved both data directories. The
+supervisor storms were stopped, Nebula was restarted on the exact three
+lighthouses, and the original services were then restored.
+
+After convergence, all three overlay paths passed bidirectional ping, every
+Nebula UDP receive queue was empty, and each local `etcdctl endpoint health`
+committed a proposal. The three members agreed on one 58 MB database and one
+membership roster; `.3` was leader at term 5021 with applied index 417496.
+All three `mackesd.service` instances returned active with zero restarts, and
+Dell's installed boot gate reported strict `3/3` coordination health.
 
 The corrected Release 21 source gate passed live on the seat with:
 
@@ -150,7 +178,31 @@ The accepted post-reboot JSON proved:
 - one active `mde-shell-egui` process for `mm`; and
 - exact active binds for Documents, Downloads, Music, Pictures, and Videos.
 
+## Dell Release 21 corrected-forward reboot
+
+Dell matched the accepted Fedora 44 artifact digest, passed `rpm -K`, exact
+NVR, and a separate `rpm -Uvh --test`, then upgraded from release 12 to
+`magic-mesh-12.1.6-21.x86_64`. The installed package passed `rpm -V` before
+and after reboot. A transient post-transaction transport error was not treated
+as success; the grouped target and strict boot gate were required to settle.
+
+The package-bound preflight accepted exact host `DELL-LAPTOP`, workstation
+role, certificate-authoritative `10.42.0.4/17`, and package ownership. One
+warned, bounded reboot changed boot ID from
+`7423fbc9-6060-4144-b190-fc6b923268da` to
+`3b3f5937-cc61-494d-aa35-777c22e97da6`. The installed network-return unit was
+then exercised explicitly.
+
+The accepted post-reboot snapshot proved Release 21, package-owned recovery,
+one Nebula process, strict `3/3` coordination health, six unique grouped
+workers, healthy Syncthing/Bus substrate, one active `mm` shell, ordered
+substrate/worker starts, and exact active binds for Documents, Downloads,
+Music, Pictures, and Videos. The Browser VM remained shut off; its exact
+overlay disk and seed ISO remained attached, and the overlay disk retained its
+pre-proof size and modification timestamp.
+
 ## Remaining acceptance boundary
 
-WL-CRIT-007 remains `Remaining` because physical suspend/resume and the full
-six-node corrected-forward bundle are separate acceptance requirements.
+WL-CRIT-007 remains `Remaining` because physical suspend/resume and the
+remaining Eagle, T480, Surface, and lighthouse corrected-forward matrix are
+separate acceptance requirements.

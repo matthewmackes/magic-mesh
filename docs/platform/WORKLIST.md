@@ -1459,10 +1459,15 @@ behavioral evidence is not completion.
   remains: `docs/platform/evidence/WL-CRIT-007-2026-08-08-workload-session-recovery-s3-r1.md`.
 - **Corrected-forward Release 21 checkpoint (2026-08-08):** the Fedora 44
   package passed integrity, ABI, payload, transaction, and installed-file
-  verification; one warned reboot on seat `.15` changed the boot ID and
-  recovered one identity, six unique grouped workers, strict 2/3 coordination
-  quorum, Syncthing/Bus, one shell, and all communal XDG binds. Physical
-  suspend/resume and the complete six-node matrix remain. Evidence:
+  verification. Warned reboots on seat `.15` and Dell `.225` changed both boot
+  IDs and recovered one identity, six unique grouped workers, strict
+  coordination quorum, Syncthing/Bus, one shell, and all communal XDG binds.
+  Dell also passed explicit network-return recovery while its shut-off Browser
+  VM disk remained unchanged. The three persisted lighthouse voters were
+  recovered without deleting data and returned to active `3/3` health after
+  stale roster and saturated Nebula transport correction. Physical
+  suspend/resume and the remaining Eagle, T480, Surface, and lighthouse matrix
+  remain. Evidence:
   `docs/platform/evidence/WL-CRIT-007-2026-08-08-corrected-forward-s4-r1.md`.
   1. S1 Define boot dependency order and identity guard.
      - Objective: order network, Nebula, mackesd, etcd, Syncthing, shell, and workload services with one stale-identity cleanup path.
