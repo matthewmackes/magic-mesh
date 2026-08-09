@@ -39,11 +39,15 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
@@ -60,10 +64,29 @@ pub const ACTION_TOPIC: &str = "action/apps/launch";
 /// rare, operator-initiated event, so a 1 s poll is responsive without spinning.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// A bounded page prevents an attacker with Bus write access from making one
+/// poll allocate or execute an unbounded action backlog. The cursor commits
+/// only after the complete page has been staged and the Bus identity rechecked.
+const MAX_ACTIONS_PER_TICK: usize = 32;
+const MAX_ACTION_BODY_BYTES: usize = 64 * 1024;
+const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_JOURNAL_RECORDS: usize = 2_048;
+const JOURNAL_SCHEMA_VERSION: u16 = 1;
+const RESULT_SCHEMA_VERSION: u16 = 1;
+const JOURNAL_FILE: &str = "peer-app-launch-journal.json";
+
 /// Shared-Bus capability context for the remote app-launch mutation. The
 /// worker binds the capability to this node (the only node whose catalog it
 /// may resolve) and the requested catalog id.
 const PEER_APP_LAUNCH_AUTH_VERB: &str = "peer-app-launch";
+
+/// Exact-request result lane. A durable terminal record is republished when a
+/// new Bus generation appears, giving callers corrected-forward truth without
+/// repeating the launch effect.
+#[must_use]
+pub fn launch_result_topic(request_ulid: &str) -> String {
+    format!("reply/{request_ulid}")
+}
 
 /// Stable audit reason for refusing a guest-owned Flatpak at this legacy host
 /// launcher. Keep this machine-readable so operators can distinguish policy
@@ -351,29 +374,367 @@ impl AppLauncher for SpawnLauncher {
 
 // ───────────────────────────── bus plumbing ─────────────────────────────
 
-/// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring [`crate::workers::container`].
-fn read_new_requests(bus_root: &Path, cursor: &mut Option<String>) -> Vec<String> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for msg in msgs {
-        *cursor = Some(msg.ulid.clone());
-        out.push(msg.body.unwrap_or_default());
-    }
-    out
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BusIdentity {
+    device: u64,
+    inode: u64,
 }
 
-/// Seed the cursor to the newest existing message so a (re)start never re-launches
-/// the backlog — a queued launch must not re-fire on the next daemon restart.
-fn prime_cursor(bus_root: &Path) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(ACTION_TOPIC, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
+struct BusTransaction {
+    persist: Persist,
+    root: PathBuf,
+    identity: BusIdentity,
+}
+
+impl BusTransaction {
+    fn open(root: &Path) -> io::Result<Self> {
+        // Persist creates an absent index. Drop that initializer, then bind a
+        // fresh connection between two path-identity observations.
+        if !root.join("index.sqlite").exists() {
+            drop(Persist::open(root.to_path_buf()).map_err(io_other)?);
+        }
+        let before = bus_identity(root)?;
+        let persist = Persist::open(root.to_path_buf()).map_err(io_other)?;
+        let after = bus_identity(root)?;
+        if before != after {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "peer-app launch Bus changed while opening",
+            ));
+        }
+        Ok(Self {
+            persist,
+            root: root.to_path_buf(),
+            identity: after,
+        })
+    }
+
+    fn verify_current(&self) -> io::Result<()> {
+        if bus_identity(&self.root)? != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "peer-app launch Bus connection names a retired index",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn bus_identity(root: &Path) -> io::Result<BusIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer-app launch Bus index is not a regular file",
+        ));
+    }
+    Ok(BusIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchResultStatus {
+    Succeeded,
+    Refused,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LaunchResult {
+    schema_version: u16,
+    request_ulid: String,
+    node: String,
+    app_id: Option<String>,
+    status: LaunchResultStatus,
+    reason: String,
+}
+
+impl LaunchResult {
+    fn new(
+        request_ulid: &str,
+        node: &str,
+        app_id: Option<String>,
+        status: LaunchResultStatus,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: RESULT_SCHEMA_VERSION,
+            request_ulid: request_ulid.to_owned(),
+            node: node.to_owned(),
+            app_id,
+            status,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum LaunchJournalPhase {
+    Prepared,
+    EffectClaimed,
+    Terminal {
+        result: LaunchResult,
+        delivered_to: Option<BusIdentity>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LaunchJournalRecord {
+    body: String,
+    node: String,
+    app_id: String,
+    argv: Vec<String>,
+    phase: LaunchJournalPhase,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LaunchJournalState {
+    schema_version: u16,
+    records: BTreeMap<String, LaunchJournalRecord>,
+}
+
+impl Default for LaunchJournalState {
+    fn default() -> Self {
+        Self {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            records: BTreeMap::new(),
+        }
+    }
+}
+
+struct LaunchJournal {
+    root: PathBuf,
+    path: PathBuf,
+    state: LaunchJournalState,
+}
+
+impl LaunchJournal {
+    fn open(root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        require_safe_directory(root)?;
+        let path = root.join(JOURNAL_FILE);
+        let state = match read_bounded_regular_file(&path, MAX_JOURNAL_BYTES) {
+            Ok(bytes) => serde_json::from_slice::<LaunchJournalState>(&bytes).map_err(io_other)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => LaunchJournalState::default(),
+            Err(error) => return Err(error),
+        };
+        if state.schema_version != JOURNAL_SCHEMA_VERSION
+            || state.records.len() > MAX_JOURNAL_RECORDS
+            || state.records.iter().any(|(ulid, record)| {
+                ulid.is_empty()
+                    || ulid.len() > 64
+                    || record.body.len() > MAX_ACTION_BODY_BYTES
+                    || record.argv.len() > 64
+                    || record.argv.iter().any(|part| part.len() > 4_096)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer-app launch journal is invalid or exceeds its bounds",
+            ));
+        }
+        let mut journal = Self {
+            root: root.to_path_buf(),
+            path,
+            state,
+        };
+        journal.recover_ambiguous_claims()?;
+        Ok(journal)
+    }
+
+    fn recover_ambiguous_claims(&mut self) -> io::Result<()> {
+        let mut changed = false;
+        for (ulid, record) in &mut self.state.records {
+            let reason = match &record.phase {
+                LaunchJournalPhase::Prepared => Some(
+                    "authorization interrupted after durable preparation; launch was not retried",
+                ),
+                LaunchJournalPhase::EffectClaimed => Some(
+                    "launch outcome is indeterminate after recovery of its durable effect claim; launch was not repeated",
+                ),
+                LaunchJournalPhase::Terminal { .. } => None,
+            };
+            if let Some(reason) = reason {
+                record.phase = LaunchJournalPhase::Terminal {
+                    result: LaunchResult::new(
+                        ulid,
+                        &record.node,
+                        Some(record.app_id.clone()),
+                        LaunchResultStatus::Indeterminate,
+                        reason,
+                    ),
+                    delivered_to: None,
+                };
+                changed = true;
+            }
+        }
+        if changed {
+            self.store()?;
+        }
+        Ok(())
+    }
+
+    fn make_room(&mut self) -> io::Result<()> {
+        if self.state.records.len() < MAX_JOURNAL_RECORDS {
+            return Ok(());
+        }
+        let removable = self
+            .state
+            .records
+            .iter()
+            .find_map(|(ulid, record)| match &record.phase {
+                LaunchJournalPhase::Terminal {
+                    delivered_to: Some(_),
+                    ..
+                } => Some(ulid.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "peer-app launch journal is full of undelivered records",
+                )
+            })?;
+        self.state.records.remove(&removable);
+        Ok(())
+    }
+
+    fn insert_prepared(
+        &mut self,
+        ulid: &str,
+        body: String,
+        node: String,
+        app_id: String,
+        argv: Vec<String>,
+    ) -> io::Result<()> {
+        if self.state.records.contains_key(ulid) {
+            return Ok(());
+        }
+        self.make_room()?;
+        self.state.records.insert(
+            ulid.to_owned(),
+            LaunchJournalRecord {
+                body,
+                node,
+                app_id,
+                argv,
+                phase: LaunchJournalPhase::Prepared,
+            },
+        );
+        self.store()
+    }
+
+    fn insert_terminal(&mut self, result: LaunchResult) -> io::Result<()> {
+        if self.state.records.contains_key(&result.request_ulid) {
+            return Ok(());
+        }
+        self.make_room()?;
+        self.state.records.insert(
+            result.request_ulid.clone(),
+            LaunchJournalRecord {
+                body: String::new(),
+                node: result.node.clone(),
+                app_id: result.app_id.clone().unwrap_or_default(),
+                argv: Vec::new(),
+                phase: LaunchJournalPhase::Terminal {
+                    result,
+                    delivered_to: None,
+                },
+            },
+        );
+        self.store()
+    }
+
+    fn set_phase(&mut self, ulid: &str, phase: LaunchJournalPhase) -> io::Result<()> {
+        self.state
+            .records
+            .get_mut(ulid)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "launch record disappeared"))?
+            .phase = phase;
+        self.store()
+    }
+
+    fn store(&self) -> io::Result<()> {
+        require_safe_directory(&self.root)?;
+        let body = serde_json::to_vec(&self.state).map_err(io_other)?;
+        if body.len() > MAX_JOURNAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "peer-app launch journal exceeds its byte bound",
+            ));
+        }
+        atomic_write_file(&self.path, &body)
+    }
+}
+
+fn require_safe_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "peer-app launch state root is not a safe directory",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let file: File = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?
+    .into();
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer-app launch state file is not a bounded regular file",
+        ));
+    }
+    let mut body = Vec::with_capacity((metadata.len() as usize).saturating_add(1));
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut body)?;
+    if body.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer-app launch state file exceeds its bound",
+        ));
+    }
+    Ok(body)
+}
+
+fn atomic_write_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
+    require_safe_directory(parent)?;
+    let temporary = parent.join(format!(".{JOURNAL_FILE}.tmp"));
+    let mut file: File = rustix::fs::open(
+        &temporary,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::TRUNC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )?
+    .into();
+    file.write_all(body)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()
 }
 
 fn default_bus_root() -> Option<PathBuf> {
@@ -382,6 +743,13 @@ fn default_bus_root() -> Option<PathBuf> {
 
 fn default_home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/root"), PathBuf::from)
+}
+
+fn default_state_root() -> PathBuf {
+    crate::default_db_path()
+        .parent()
+        .map(|parent| parent.join("peer-app-launch"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/mde/peer-app-launch"))
 }
 
 // ───────────────────────────── the worker ─────────────────────────────
@@ -400,8 +768,14 @@ pub struct PeerAppLaunchWorker {
     poll: Duration,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
+    /// Host-local state, deliberately outside the replaceable Bus generation.
+    state_root: PathBuf,
     /// Shared, fail-closed authorization gate for the remote launch mutation.
     authorizer: Arc<ActionAuthorizer>,
+    #[cfg(test)]
+    after_action_read: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    #[cfg(test)]
+    after_result_write: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
 }
 
 impl PeerAppLaunchWorker {
@@ -416,7 +790,12 @@ impl PeerAppLaunchWorker {
             launcher: Arc::new(SpawnLauncher),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            state_root: default_state_root(),
             authorizer: Arc::new(ActionAuthorizer::production()),
+            #[cfg(test)]
+            after_action_read: None,
+            #[cfg(test)]
+            after_result_write: None,
         }
     }
 
@@ -448,6 +827,28 @@ impl PeerAppLaunchWorker {
         self
     }
 
+    /// Override the host-local journal root (tests).
+    #[cfg(test)]
+    #[must_use]
+    fn with_state_root(mut self, root: PathBuf) -> Self {
+        self.state_root = root;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_after_action_read(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_action_read = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_after_result_write(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_result_write = Some(Arc::new(hook));
+        self
+    }
+
     /// Inject an isolated verifier and replay ledger for hostile action tests.
     /// Production always uses the systemd-credential-backed authorizer.
     #[cfg(test)]
@@ -472,6 +873,16 @@ impl PeerAppLaunchWorker {
         scan_local_apps(&default_app_dirs(&self.home))
             .into_iter()
             .find(|entry| entry.id == app_id)
+    }
+
+    fn resolve_launch_argv(&self, req: &LaunchRequest) -> Result<Vec<String>, &'static str> {
+        let Some(app) = self.resolve_advertised_app(&req.app_id) else {
+            return Err("app-is-not-in-local-advertised-catalog");
+        };
+        if !self.legacy_launch_allowed(req, &app) {
+            return Err("launch-source-or-mode-refused");
+        }
+        launch_argv(&app.exec).ok_or("advertised-app-has-no-runnable-exec")
     }
 
     /// Enforce the legacy launcher's source/mode boundary before it can reach
@@ -621,14 +1032,238 @@ impl PeerAppLaunchWorker {
         self.handle_request(&req)
     }
 
-    /// Drain + handle new requests addressed to this node. Returns whether any app
-    /// launched (for the caller's own bookkeeping / tests).
-    fn drain_and_launch(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
-        let mut launched = false;
-        for body in read_new_requests(bus_root, cursor) {
-            launched |= self.handle_body(&body);
+    fn publish_pending_results(
+        &self,
+        transaction: &BusTransaction,
+        journal: &mut LaunchJournal,
+    ) -> io::Result<bool> {
+        let pending = journal
+            .state
+            .records
+            .iter()
+            .filter_map(|(ulid, record)| match &record.phase {
+                LaunchJournalPhase::Terminal {
+                    result,
+                    delivered_to,
+                } if *delivered_to != Some(transaction.identity) => {
+                    Some((ulid.clone(), result.clone()))
+                }
+                _ => None,
+            })
+            .take(MAX_ACTIONS_PER_TICK)
+            .collect::<Vec<_>>();
+        for (ulid, result) in &pending {
+            let body = serde_json::to_string(result).map_err(io_other)?;
+            let topic = launch_result_topic(ulid);
+            transaction.verify_current()?;
+            let already_present = transaction
+                .persist
+                .read_latest(&topic)
+                .map_err(io_other)?
+                .and_then(|message| message.body)
+                .is_some_and(|existing| existing == body);
+            transaction.verify_current()?;
+            if !already_present {
+                transaction
+                    .persist
+                    .write(&topic, Priority::Default, None, Some(&body))
+                    .map_err(io_other)?;
+                #[cfg(test)]
+                if let Some(hook) = &self.after_result_write {
+                    hook(&transaction.root);
+                }
+            }
+            transaction.verify_current()?;
+            let record = journal.state.records.get_mut(ulid).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "launch result record disappeared")
+            })?;
+            record.phase = LaunchJournalPhase::Terminal {
+                result: result.clone(),
+                delivered_to: Some(transaction.identity),
+            };
+            journal.store()?;
+            transaction.verify_current()?;
         }
-        launched
+        Ok(!journal.state.records.values().any(|record| {
+            matches!(
+                &record.phase,
+                LaunchJournalPhase::Terminal { delivered_to, .. }
+                    if *delivered_to != Some(transaction.identity)
+            )
+        }))
+    }
+
+    fn activate_bus(
+        &self,
+        transaction: &BusTransaction,
+        journal: &mut LaunchJournal,
+    ) -> io::Result<Option<Option<String>>> {
+        // Snapshot exactly the retained tail at activation. Actions written
+        // after this read are forward work and remain visible via list_since.
+        let tail = transaction
+            .persist
+            .read_latest(ACTION_TOPIC)
+            .map_err(io_other)?
+            .map(|message| message.ulid);
+        transaction.verify_current()?;
+        if !self.publish_pending_results(transaction, journal)? {
+            return Ok(None);
+        }
+        transaction.verify_current()?;
+        Ok(Some(tail))
+    }
+
+    fn terminal_for(
+        &self,
+        ulid: &str,
+        app_id: Option<String>,
+        status: LaunchResultStatus,
+        reason: impl Into<String>,
+    ) -> LaunchResult {
+        LaunchResult::new(ulid, &self.node_id, app_id, status, reason)
+    }
+
+    fn process_action(
+        &self,
+        transaction: &BusTransaction,
+        journal: &mut LaunchJournal,
+        ulid: &str,
+        body: String,
+    ) -> io::Result<()> {
+        if let Some(existing) = journal.state.records.get(ulid) {
+            if matches!(&existing.phase, LaunchJournalPhase::Terminal { .. }) {
+                return Ok(());
+            }
+            let app_id = Some(existing.app_id.clone());
+            journal.set_phase(
+                ulid,
+                LaunchJournalPhase::Terminal {
+                    result: self.terminal_for(
+                        ulid,
+                        app_id,
+                        LaunchResultStatus::Indeterminate,
+                        "recovered non-terminal launch record; effect was not repeated",
+                    ),
+                    delivered_to: None,
+                },
+            )?;
+            return Ok(());
+        }
+        if body.len() > MAX_ACTION_BODY_BYTES {
+            return journal.insert_terminal(self.terminal_for(
+                ulid,
+                None,
+                LaunchResultStatus::Refused,
+                "action-body-exceeds-bound",
+            ));
+        }
+        let Some(request) = parse_launch_request(&body) else {
+            return journal.insert_terminal(self.terminal_for(
+                ulid,
+                None,
+                LaunchResultStatus::Refused,
+                "malformed-launch-request",
+            ));
+        };
+        if !request.targets(&self.node_id) {
+            return Ok(());
+        }
+        let argv = match self.resolve_launch_argv(&request) {
+            Ok(argv) => argv,
+            Err(reason) => {
+                return journal.insert_terminal(self.terminal_for(
+                    ulid,
+                    Some(request.app_id),
+                    LaunchResultStatus::Refused,
+                    reason,
+                ));
+            }
+        };
+        // Preparation durably binds the exact authorized body and resolved
+        // argv before the capability nonce or launch effect can be consumed.
+        journal.insert_prepared(
+            ulid,
+            body.clone(),
+            self.node_id.clone(),
+            request.app_id.clone(),
+            argv.clone(),
+        )?;
+        transaction.verify_current()?;
+        if let Err(error) = self.authorizer.authorize(
+            &body,
+            MutationContext {
+                verb: PEER_APP_LAUNCH_AUTH_VERB,
+                node: &self.node_id,
+                target: &request.app_id,
+            },
+        ) {
+            return journal.set_phase(
+                ulid,
+                LaunchJournalPhase::Terminal {
+                    result: self.terminal_for(
+                        ulid,
+                        Some(request.app_id),
+                        LaunchResultStatus::Refused,
+                        format!("authorization-refused: {error}"),
+                    ),
+                    delivered_to: None,
+                },
+            );
+        }
+        journal.set_phase(ulid, LaunchJournalPhase::EffectClaimed)?;
+        // A replacement after the body read but before this point retires the
+        // transaction and converts the durable claim to indeterminate on the
+        // next pass. It is never allowed to launch from the retired generation.
+        transaction.verify_current()?;
+        let (status, reason) = match self.launcher.launch(&argv) {
+            Ok(()) => (LaunchResultStatus::Succeeded, "launch-spawned".to_string()),
+            Err(error) => (
+                LaunchResultStatus::Indeterminate,
+                format!("launch returned after durable effect claim: {error}"),
+            ),
+        };
+        journal.set_phase(
+            ulid,
+            LaunchJournalPhase::Terminal {
+                result: self.terminal_for(ulid, Some(request.app_id), status, reason),
+                delivered_to: None,
+            },
+        )
+    }
+
+    fn process_page(
+        &self,
+        transaction: &BusTransaction,
+        journal: &mut LaunchJournal,
+        cursor: &mut Option<String>,
+    ) -> io::Result<()> {
+        let messages = transaction
+            .persist
+            .list_since_limit(ACTION_TOPIC, cursor.as_deref(), MAX_ACTIONS_PER_TICK)
+            .map_err(io_other)?;
+        // `list_since_limit` has fully materialized this bounded page. No
+        // cursor or effect changes occur until its connection still names the
+        // path's current index.
+        #[cfg(test)]
+        if let Some(hook) = &self.after_action_read {
+            hook(&transaction.root);
+        }
+        transaction.verify_current()?;
+        let page_tail = messages.last().map(|message| message.ulid.clone());
+        for message in messages {
+            self.process_action(
+                transaction,
+                journal,
+                &message.ulid,
+                message.body.unwrap_or_default(),
+            )?;
+        }
+        self.publish_pending_results(transaction, journal)?;
+        transaction.verify_current()?;
+        if let Some(tail) = page_tail {
+            *cursor = Some(tail);
+        }
+        Ok(())
     }
 }
 
@@ -639,19 +1274,40 @@ impl Worker for PeerAppLaunchWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = self.bus_root();
-        // Skip any backlog so a restart doesn't re-launch stale requests.
-        let mut cursor = bus_root.as_deref().and_then(prime_cursor);
-        let mut tick = tokio::time::interval(self.poll);
-        tick.tick().await; // consume the immediate first tick
+        let mut journal = LaunchJournal::open(&self.state_root)
+            .map_err(|error| anyhow::anyhow!("open peer-app launch journal: {error}"))?;
+        let mut active_identity = None;
+        let mut cursor = None;
         loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    if let Some(root) = &bus_root {
-                        let _ = self.drain_and_launch(root, &mut cursor);
+            if let Some(root) = self.bus_root() {
+                match BusTransaction::open(&root) {
+                    Ok(transaction) => {
+                        if active_identity != Some(transaction.identity) {
+                            match self.activate_bus(&transaction, &mut journal) {
+                                Ok(Some(tail)) => {
+                                    cursor = tail;
+                                    active_identity = Some(transaction.identity);
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(target: "mackesd::peer_app_launch", %error, "peer-app launch Bus activation deferred")
+                                }
+                            }
+                        } else if let Err(error) =
+                            self.process_page(&transaction, &mut journal, &mut cursor)
+                        {
+                            tracing::warn!(target: "mackesd::peer_app_launch", %error, "peer-app launch Bus transaction deferred");
+                            active_identity = None;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "mackesd::peer_app_launch", %error, "peer-app launch Bus unavailable")
                     }
                 }
+            }
+            tokio::select! {
                 () = shutdown.wait() => break,
+                () = tokio::time::sleep(self.poll) => {}
             }
         }
         Ok(())
@@ -662,6 +1318,7 @@ impl Worker for PeerAppLaunchWorker {
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     const AUTH_KEY: &[u8] = b"peer-app-launch-action-auth-key";
@@ -678,6 +1335,14 @@ mod tests {
         fn launch(&self, argv: &[String]) -> std::io::Result<()> {
             self.calls.lock().unwrap().push(argv.to_vec());
             Ok(())
+        }
+    }
+
+    struct FailingLauncher;
+
+    impl AppLauncher for FailingLauncher {
+        fn launch(&self, _argv: &[String]) -> std::io::Result<()> {
+            Err(io::Error::other("ambiguous spawn failure"))
         }
     }
 
@@ -713,10 +1378,14 @@ mod tests {
 
     fn launch_body(app_id: &str, nonce: &str) -> (String, tempfile::TempDir) {
         let auth_root = tempfile::tempdir().unwrap();
+        (armed_launch_body(app_id, nonce), auth_root)
+    }
+
+    fn armed_launch_body(app_id: &str, nonce: &str) -> String {
         let unsigned = format!(
             r#"{{"node":"node-a","app_id":"{app_id}","name":"Test","source":"xdg","mode":"legacy-host","schema_version":1}}"#
         );
-        let armed = authorize_test_body(
+        authorize_test_body(
             AUTH_KEY,
             &unsigned,
             MutationContext {
@@ -726,8 +1395,7 @@ mod tests {
             },
             nonce,
             AUTH_NOW + 30_000,
-        );
-        (armed, auth_root)
+        )
     }
 
     fn worker_with_auth(
@@ -740,6 +1408,27 @@ mod tests {
             auth_root.to_path_buf(),
             AUTH_NOW,
         )))
+    }
+
+    fn replace_index(root: &Path, replacement: &Path) {
+        for sidecar in ["index.sqlite-wal", "index.sqlite-shm"] {
+            match fs::remove_file(root.join(sidecar)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove retired sidecar: {error}"),
+            }
+        }
+        fs::rename(replacement, root.join("index.sqlite")).expect("install replacement index");
+    }
+
+    fn read_result(root: &Path, ulid: &str) -> LaunchResult {
+        let body = Persist::open(root.to_path_buf())
+            .unwrap()
+            .read_latest(&launch_result_topic(ulid))
+            .unwrap()
+            .and_then(|message| message.body)
+            .expect("typed launch result");
+        serde_json::from_str(&body).expect("launch result schema")
     }
 
     #[test]
@@ -1028,5 +1717,258 @@ mod tests {
             "the capability nonce is single-use"
         );
         assert_eq!(launcher.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bus_r87_retained_action_is_skipped_and_first_forward_action_launches_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let state_root = temp.path().join("state");
+        let home = temp.path().join("home");
+        let auth_root = temp.path().join("auth");
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        let retained = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "retained-action")),
+            )
+            .unwrap();
+        let launcher = Arc::new(RecordingLauncher::default());
+        let worker = worker_with_auth(home, Arc::clone(&launcher), &auth_root)
+            .with_state_root(state_root.clone());
+        let mut journal = LaunchJournal::open(&state_root).unwrap();
+        let transaction = BusTransaction::open(&bus_root).unwrap();
+        let mut cursor = worker
+            .activate_bus(&transaction, &mut journal)
+            .unwrap()
+            .expect("activation complete");
+        assert_eq!(cursor.as_deref(), Some(retained.ulid.as_str()));
+
+        let forward = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "first-forward")),
+            )
+            .unwrap();
+        worker
+            .process_page(&transaction, &mut journal, &mut cursor)
+            .unwrap();
+        worker
+            .process_page(&transaction, &mut journal, &mut cursor)
+            .unwrap();
+
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            read_result(&bus_root, &forward.ulid).status,
+            LaunchResultStatus::Succeeded
+        );
+        assert!(Persist::open(bus_root)
+            .unwrap()
+            .read_latest(&launch_result_topic(&retained.ulid))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bus_r87_same_path_replacement_after_read_retires_page_and_preserves_first_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let replacement_root = temp.path().join("replacement");
+        let state_root = temp.path().join("state");
+        let home = temp.path().join("home");
+        let auth_root = temp.path().join("auth");
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        let original = Persist::open(bus_root.clone()).unwrap();
+        let replacement = Persist::open(replacement_root.clone()).unwrap();
+        let retained_replacement = replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "replacement-retained")),
+            )
+            .unwrap();
+        drop(replacement);
+        let launcher = Arc::new(RecordingLauncher::default());
+        let replaced = Arc::new(AtomicBool::new(false));
+        let replace_once = Arc::clone(&replaced);
+        let replacement_index = replacement_root.join("index.sqlite");
+        let worker = worker_with_auth(home, Arc::clone(&launcher), &auth_root)
+            .with_state_root(state_root.clone())
+            .with_after_action_read(move |root| {
+                if !replace_once.swap(true, Ordering::SeqCst) {
+                    replace_index(root, &replacement_index);
+                }
+            });
+        let mut journal = LaunchJournal::open(&state_root).unwrap();
+        let retired = BusTransaction::open(&bus_root).unwrap();
+        let mut cursor = worker
+            .activate_bus(&retired, &mut journal)
+            .unwrap()
+            .expect("initial activation");
+        original
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "retired-forward")),
+            )
+            .unwrap();
+        assert!(worker
+            .process_page(&retired, &mut journal, &mut cursor)
+            .is_err());
+        assert!(launcher.calls.lock().unwrap().is_empty());
+
+        let current = BusTransaction::open(&bus_root).unwrap();
+        cursor = worker
+            .activate_bus(&current, &mut journal)
+            .unwrap()
+            .expect("replacement activation");
+        assert_eq!(cursor.as_deref(), Some(retained_replacement.ulid.as_str()));
+        let forward = Persist::open(bus_root.clone())
+            .unwrap()
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "replacement-forward")),
+            )
+            .unwrap();
+        worker
+            .process_page(&current, &mut journal, &mut cursor)
+            .unwrap();
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            read_result(&bus_root, &forward.ulid).status,
+            LaunchResultStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn bus_r87_replacement_after_result_write_corrects_forward_without_repeating_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let replacement_root = temp.path().join("replacement");
+        let state_root = temp.path().join("state");
+        let home = temp.path().join("home");
+        let auth_root = temp.path().join("auth");
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        let original = Persist::open(bus_root.clone()).unwrap();
+        drop(Persist::open(replacement_root.clone()).unwrap());
+        let launcher = Arc::new(RecordingLauncher::default());
+        let replaced = Arc::new(AtomicBool::new(false));
+        let replace_once = Arc::clone(&replaced);
+        let replacement_index = replacement_root.join("index.sqlite");
+        let worker = worker_with_auth(home, Arc::clone(&launcher), &auth_root)
+            .with_state_root(state_root.clone())
+            .with_after_result_write(move |root| {
+                if !replace_once.swap(true, Ordering::SeqCst) {
+                    replace_index(root, &replacement_index);
+                }
+            });
+        let mut journal = LaunchJournal::open(&state_root).unwrap();
+        let retired = BusTransaction::open(&bus_root).unwrap();
+        let mut cursor = worker
+            .activate_bus(&retired, &mut journal)
+            .unwrap()
+            .expect("activation");
+        let action = original
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "result-race")),
+            )
+            .unwrap();
+        assert!(worker
+            .process_page(&retired, &mut journal, &mut cursor)
+            .is_err());
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
+
+        let current = BusTransaction::open(&bus_root).unwrap();
+        assert!(worker
+            .activate_bus(&current, &mut journal)
+            .unwrap()
+            .is_some());
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            read_result(&bus_root, &action.ulid).status,
+            LaunchResultStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn bus_r87_recovered_effect_claim_and_spawn_error_are_indeterminate_never_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let state_root = temp.path().join("state");
+        let home = temp.path().join("home");
+        let auth_root = temp.path().join("auth");
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        drop(Persist::open(bus_root.clone()).unwrap());
+        let worker = worker_with_auth(home, Arc::new(RecordingLauncher::default()), &auth_root)
+            .with_state_root(state_root.clone());
+        let mut journal = LaunchJournal::open(&state_root).unwrap();
+        journal
+            .insert_prepared(
+                "claimed-before-crash",
+                armed_launch_body("firefox", "claimed-before-crash"),
+                "node-a".into(),
+                "firefox".into(),
+                vec!["firefox".into()],
+            )
+            .unwrap();
+        journal
+            .set_phase("claimed-before-crash", LaunchJournalPhase::EffectClaimed)
+            .unwrap();
+        drop(journal);
+        let mut recovered = LaunchJournal::open(&state_root).unwrap();
+        let transaction = BusTransaction::open(&bus_root).unwrap();
+        worker
+            .activate_bus(&transaction, &mut recovered)
+            .unwrap()
+            .expect("recovery activation");
+        assert_eq!(
+            read_result(&bus_root, "claimed-before-crash").status,
+            LaunchResultStatus::Indeterminate
+        );
+
+        let failure_home = temp.path().join("failure-home");
+        seed_desktop_app(&failure_home, "firefox", "firefox %U");
+        let failing = PeerAppLaunchWorker::new("node-a".into())
+            .with_home(failure_home)
+            .with_launcher(Arc::new(FailingLauncher))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                auth_root.clone(),
+                AUTH_NOW,
+            )))
+            .with_state_root(temp.path().join("failure-state"));
+        let mut failure_journal = LaunchJournal::open(&failing.state_root).unwrap();
+        let mut cursor = failing
+            .activate_bus(&transaction, &mut failure_journal)
+            .unwrap()
+            .expect("failure activation");
+        let action = Persist::open(bus_root.clone())
+            .unwrap()
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed_launch_body("firefox", "spawn-error")),
+            )
+            .unwrap();
+        failing
+            .process_page(&transaction, &mut failure_journal, &mut cursor)
+            .unwrap();
+        assert_eq!(
+            read_result(&bus_root, &action.ulid).status,
+            LaunchResultStatus::Indeterminate
+        );
     }
 }

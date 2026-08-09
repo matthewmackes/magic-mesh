@@ -491,7 +491,7 @@ behavioral evidence is not completion.
 - **Catalog/overlay recovery checkpoints (2026-08-09):** staged state and exact context rechecks now gate publication; BigBoy and machines 193/194/9 passed focused tests:
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`,
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`,
-  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`,
+  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-peer-app-launch-bus-transaction-recovery-r87.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-replacement-suppression-r65.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`,
@@ -1051,6 +1051,8 @@ behavioral evidence is not completion.
   replays durable authority and retries failed publication before cursor/state
   commit. BigBoy passed two exact recovery cases:
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`.
+- **Peer-app launch recovery (2026-08-09):** durable effect claims prevent ambiguous relaunch; late/replaced Bus results correct forward. Machine 9 passed four gates:
+  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-peer-app-launch-bus-transaction-recovery-r87.md`.
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
      - Inputs: catalog projection and trust policy.
