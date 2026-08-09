@@ -443,6 +443,11 @@ pub fn receive_frame(
         &frame.envelope.attribution.pubkey_hex,
         true,
     )?;
+    // Expired sessions no longer own a replay lane. Drop their high-water
+    // marks before deriving `previous`, otherwise an expired hostile/high
+    // generation can reject a fresh generation that legitimately reuses the
+    // same bounded source/session identity.
+    ledger.cleanup(now_ms);
     let previous = ledger.previous(&frame);
     frame
         .envelope
@@ -450,7 +455,6 @@ pub fn receive_frame(
         .map_err(|error| ClipboardMeshRefusal::from_validation(&error))?;
     validate_payload_budget(&frame.envelope)?;
     validate_cas_offers(persist, content_root, &frame.source_peer, &frame.envelope)?;
-    ledger.cleanup(now_ms);
     if ledger.previous(&frame).is_none() && ledger.latest.len() >= MAX_MESH_REPLAY_LANES {
         return Err(ClipboardMeshRefusal::FloodLimited);
     }
@@ -1469,6 +1473,50 @@ mod tests {
         assert!(ledger
             .latest
             .contains_key(&("fresh".to_owned(), "session-fresh".to_owned())));
+    }
+
+    #[test]
+    fn expired_hostile_generation_cannot_block_fresh_session_reuse() {
+        let (root, persist, directory, _source, envelope) = fixture();
+        let frame = ClipboardMeshFrameV1::new(envelope).unwrap();
+        let lane = (
+            frame.source_peer.clone(),
+            frame.envelope.session.to_string(),
+        );
+        let mut ledger = ClipboardMeshReplayLedger::default();
+        ledger.latest.insert(
+            lane.clone(),
+            ReplayMarker {
+                generation: u64::MAX,
+                expires_unix_ms: 1_000,
+                cas_digests: BTreeSet::new(),
+            },
+        );
+
+        let result = receive_frame(
+            &persist,
+            &directory,
+            root.path(),
+            "target",
+            &serde_json::to_vec(&frame).unwrap(),
+            &mut ledger,
+            1_001,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            ClipboardMeshResultV1::Accepted { generation: 1, .. }
+        ));
+        assert_eq!(ledger.previous(&frame), Some(1));
+        assert_eq!(
+            persist
+                .list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(ledger.latest.contains_key(&lane));
     }
 
     #[test]

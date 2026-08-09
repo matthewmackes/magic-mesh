@@ -637,6 +637,11 @@ behavioral evidence is not completion.
   signed authority can reuse sequencing at exact expiry. Machine 9 passed both
   focused boundary tests:
   `docs/platform/evidence/WL-FUNC-016-2026-08-09-replay-mark-expiry-s5-r16.md`.
+- **Mesh expired-replay cleanup checkpoint (2026-08-09):** expired source/session
+  high-water marks are removed before generation validation, so a stale hostile
+  generation cannot block a valid session reuse. Machine 9 passed the exact
+  hostile-generation fixture:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-expired-replay-r17.md`.
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
      - Inputs: collab types and existing clipboard v2.
