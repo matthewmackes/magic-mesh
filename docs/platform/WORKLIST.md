@@ -493,6 +493,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
+- **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus
+  authority recovers, and fresh identity-bound cache persistence precedes map
+  publication. Machine 9 passed two exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
@@ -844,6 +848,10 @@ behavioral evidence is not completion.
   storage recovers, effective location is rechecked after provider I/O, and both
   requested projections serialize before writes. Machine 193 passed three exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
+- **Atmospheric-map transaction checkpoint (2026-08-09):** the exact
+  location/viewport identity is rechecked after NOAA I/O, then a fresh cache
+  commits before map publication. Machine 9 passed two exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

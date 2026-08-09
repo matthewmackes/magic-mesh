@@ -771,7 +771,7 @@ pub struct WeatherAtmosphereWorker {
     host: String,
     probe: Option<Arc<dyn AtmosphericProbe>>,
     clock: Arc<dyn Clock>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     cache_path: PathBuf,
 }
 
@@ -790,17 +790,23 @@ impl WeatherAtmosphereWorker {
             host,
             probe,
             clock: Arc::new(SystemClock),
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             cache_path: cache_path(),
         }
     }
 
+    fn open_bus(&self) -> io::Result<Persist> {
+        let root = weather_atmosphere_bus_root(
+            self.bus_root_override.as_deref(),
+            crate::bus_publish::default_bus_root(),
+        );
+        let mut persist = Persist::open(root).map_err(io_other)?;
+        persist.reopen_if_index_changed();
+        Ok(persist)
+    }
+
     fn read_authority(&self) -> io::Result<AtmosphericAuthority> {
-        let root = self
-            .bus_root
-            .as_ref()
-            .ok_or_else(|| io::Error::other("Bus spool unavailable"))?;
-        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        let persist = self.open_bus()?;
         let now_ms = self.clock.now_ms();
         let location = read_location(&persist, &self.host, now_ms)?;
         let point = effective_location(&location)
@@ -836,11 +842,7 @@ impl WeatherAtmosphereWorker {
         .await
         .map_err(|error| io::Error::other(format!("nowCOAST task failed: {error}")))?;
 
-        let root = self
-            .bus_root
-            .as_ref()
-            .ok_or_else(|| io::Error::other("Bus spool unavailable"))?;
-        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        let persist = self.open_bus()?;
         let now_ms = self.clock.now_ms();
         let latest_location = read_location(&persist, &self.host, now_ms)?;
         let latest_point = effective_location(&latest_location)
@@ -902,7 +904,6 @@ impl WeatherAtmosphereWorker {
             }
         };
         snapshot.validate_at(now_ms).map_err(io_other)?;
-        publish(&persist, &self.host, &snapshot)?;
         if fresh {
             let cache = AtmosphereCache {
                 schema_version: CACHE_SCHEMA_VERSION,
@@ -910,15 +911,23 @@ impl WeatherAtmosphereWorker {
                 location_generation: expected.location.generation,
                 location_point: location.point,
                 viewport,
-                snapshot,
+                snapshot: snapshot.clone(),
             };
             let cache_path = self.cache_path.clone();
             tokio::task::spawn_blocking(move || store_cache(&cache_path, &cache))
                 .await
                 .map_err(|error| io::Error::other(format!("cache task failed: {error}")))??;
         }
+        publish(&persist, &self.host, &snapshot)?;
         Ok(fresh)
     }
+}
+
+fn weather_atmosphere_bus_root(explicit: Option<&Path>, current: Option<PathBuf>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or(current)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 fn io_other(error: impl std::fmt::Display) -> io::Error {
@@ -1086,7 +1095,7 @@ mod tests {
             host: "workstation-1".into(),
             probe: Some(probe),
             clock: Arc::new(TestClock(AtomicI64::new(now_ms))),
-            bus_root: Some(temp.path().join("bus")),
+            bus_root_override: Some(temp.path().join("bus")),
             cache_path: temp.path().join("atmosphere-cache.json"),
         }
     }
@@ -1161,6 +1170,128 @@ mod tests {
             .expect("threads")
             .iter()
             .all(|thread| *thread != runtime_thread));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_and_replaced_bus_recovers_external_authority_and_shutdown() {
+        assert_eq!(
+            weather_atmosphere_bus_root(Some(Path::new("/explicit")), Some("/current".into())),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            weather_atmosphere_bus_root(None, Some("/current".into())),
+            PathBuf::from("/current")
+        );
+        assert_eq!(
+            weather_atmosphere_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("late-bus");
+        fs::write(&root, b"temporarily unopenable Bus root").expect("block Bus root");
+        let mut worker = worker_at(&temp, fixture_probe(), NOW);
+        worker.bus_root_override = Some(root.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "late Bus must not terminate the worker"
+        );
+        fs::remove_file(&root).expect("unblock Bus root");
+        write_location(&root, &location(7, -71.0589));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let persist = Persist::open(root.clone()).expect("open recovered Bus");
+                let generation = persist
+                    .read_latest(&weather_map_state_topic("workstation-1"))
+                    .expect("read recovered projection")
+                    .and_then(|message| message.body)
+                    .and_then(|body| serde_json::from_str::<AtmosphericMapSnapshot>(&body).ok())
+                    .map(|snapshot| snapshot.location_generation);
+                if generation == Some(7) {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before Bus recovery");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late Bus projection");
+
+        let index = root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        write_location(&root, &location(8, -72.0));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let persist = Persist::open(root.clone()).expect("open replacement Bus");
+                let generation = persist
+                    .read_latest(&weather_map_state_topic("workstation-1"))
+                    .expect("read replacement projection")
+                    .and_then(|message| message.body)
+                    .and_then(|body| serde_json::from_str::<AtmosphericMapSnapshot>(&body).ok())
+                    .map(|snapshot| snapshot.location_generation);
+                if generation == Some(8) {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited after Bus replacement");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus projection");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_cache_precedes_publication_and_failures_remain_retryable() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path().join("bus");
+        write_location(&root, &location(7, -71.0589));
+        let worker = worker_at(&temp, fixture_probe(), NOW);
+
+        fs::create_dir(&worker.cache_path).expect("block cache file");
+        let expected = authority(&worker);
+        assert!(worker.refresh_once(expected).await.is_err());
+        let persist = Persist::open(root.clone()).expect("open Bus");
+        assert!(persist
+            .read_latest(&weather_map_state_topic("workstation-1"))
+            .expect("read after cache failure")
+            .is_none());
+        fs::remove_dir(&worker.cache_path).expect("unblock cache file");
+
+        let map_path = root.join(weather_map_state_topic("workstation-1"));
+        fs::create_dir_all(map_path.parent().expect("map parent")).expect("create map parent");
+        fs::write(&map_path, b"block map topic directory").expect("block publication");
+        let expected = authority(&worker);
+        let expected_point = effective_location(&expected.location)
+            .expect("effective location")
+            .point
+            .clone();
+        let expected_viewport = expected.viewport.viewport.clone();
+        assert!(worker.refresh_once(expected).await.is_err());
+        let cache = load_cache(&worker.cache_path)
+            .expect("read durable cache")
+            .expect("fresh cache");
+        assert!(cache.matches("workstation-1", 7, &expected_point, &expected_viewport));
+
+        fs::remove_file(&map_path).expect("unblock publication");
+        let expected = authority(&worker);
+        assert!(worker.refresh_once(expected).await.expect("retry refresh"));
+        assert_eq!(latest(&root).location_generation, 7);
     }
 
     #[test]
