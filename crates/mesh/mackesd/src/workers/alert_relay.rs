@@ -19,11 +19,10 @@
 //! seen-GFIDs via a `BTreeSet` mirrors the existing
 //! `gluster_worker::healed_gfids` de-dupe shape.
 //!
-//! Once a file's been surfaced, its ULID lands in the
-//! `seen_alert_ids` set so repeat invocations of
-//! `mde-alert-emit` against the same alert (idempotent
-//! by design of MON-3's deterministic ULID) don't re-fire
-//! the notification.
+//! Once a file has been delivered, its ULID lands in the in-memory
+//! `seen_alert_ids` set and a durable receipt beside the retained history. That
+//! keeps repeat invocations and daemon restarts idempotent. Delivery failures
+//! are not acknowledged, so the next sweep retries them.
 //!
 //! Best-effort: if `notify-send` isn't installed (operator
 //! running headless), the worker logs at debug + continues
@@ -34,6 +33,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::BTreeSet;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -50,6 +50,15 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(2);
 /// first-poll cadence. The phase is derived from the node identity rather than
 /// process randomness, so a restart does not create a new common-mode pattern.
 const MAX_INITIAL_PHASE: Duration = Duration::from_secs(1);
+
+/// Delivery receipts live beside the retained alert history. Keeping them in a
+/// separate hidden directory lets a restarted worker distinguish history from
+/// work without mutating or deleting the source event.
+const DELIVERY_RECEIPTS_DIR: &str = ".relay-delivered-v1";
+
+/// MON-3 currently emits ULIDs. Leave room for a future namespaced identifier,
+/// but keep the receipt filename bounded and traversal-proof.
+const MAX_ALERT_ID_BYTES: usize = 128;
 
 /// Subset of the MON-3 `AlertEvent` schema the relay needs
 /// to render an FDO notification. The full schema lives in
@@ -93,12 +102,8 @@ pub struct AlertRelayWorker {
     /// `/bin/true`. Empty string disables the Bus path (force the
     /// notify-send fallback in a test).
     bus_binary: String,
-    /// IDs we've already surfaced. Persists for the worker's
-    /// lifetime; on restart the relay re-surfaces every alert
-    /// in the dir (operator can `rm ~/.local/share/mde/alerts/`
-    /// to silence the chatter — those files outlive the
-    /// notification toast by design so MON-5 + future audit
-    /// tools can replay them).
+    /// IDs surfaced by this process. Successful delivery also creates a durable
+    /// receipt beside the retained history so restarts remain idempotent.
     seen_alert_ids: std::sync::Mutex<BTreeSet<String>>,
 }
 
@@ -187,28 +192,85 @@ impl AlertRelayWorker {
                 );
                 continue;
             };
-            if !self.mark_seen(&event.id) {
+            if !valid_receipt_id(&event.id) {
+                tracing::warn!(
+                    target: "mackesd::alert_relay",
+                    path = %path.display(),
+                    "skipping alert event with unsafe or overlong id",
+                );
                 continue;
             }
-            self.fire_notification(&event);
-            fired += 1;
+            if self.was_delivered(&event.id) {
+                continue;
+            }
+            if self.fire_notification(&event) {
+                self.mark_delivered(&event.id);
+                fired += 1;
+            }
         }
         fired
     }
 
-    /// Record `id` as surfaced. Returns `true` if this is the
-    /// first time we've seen it (caller should fire the
-    /// notification); `false` if we've already surfaced it
-    /// in this worker's lifetime.
-    fn mark_seen(&self, id: &str) -> bool {
+    fn was_delivered(&self, id: &str) -> bool {
+        if self
+            .seen_alert_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(id)
+        {
+            return true;
+        }
+        std::fs::symlink_metadata(self.delivery_receipt(id))
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+    }
+
+    /// Acknowledge only after one delivery route succeeds. The in-memory mark
+    /// avoids repeats when a read-only or full alerts directory prevents the
+    /// durable receipt; the missing receipt deliberately permits retry after a
+    /// restart rather than losing an undelivered alert.
+    fn mark_delivered(&self, id: &str) {
         let mut guard = self
             .seen_alert_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(id.to_owned())
+        guard.insert(id.to_owned());
+        drop(guard);
+
+        let receipt = self.delivery_receipt(id);
+        let Some(parent) = receipt.parent() else {
+            return;
+        };
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                target: "mackesd::alert_relay",
+                %error,
+                path = %parent.display(),
+                "could not create durable alert-delivery receipt directory",
+            );
+            return;
+        }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&receipt)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => tracing::warn!(
+                target: "mackesd::alert_relay",
+                %error,
+                path = %receipt.display(),
+                "could not persist durable alert-delivery receipt",
+            ),
+        }
     }
 
-    fn fire_notification(&self, event: &AlertEventPartial) {
+    fn delivery_receipt(&self, id: &str) -> PathBuf {
+        self.alerts_dir.join(DELIVERY_RECEIPTS_DIR).join(id)
+    }
+
+    fn fire_notification(&self, event: &AlertEventPartial) -> bool {
         // EFF-26 — the headless route: EVERY alert lands in the journal
         // at its severity level, unconditionally and first. On a
         // Lighthouse/Server with no desktop and no applet, the journal
@@ -256,7 +318,7 @@ impl AlertRelayWorker {
                         host = %event.host,
                         "published alert on the Bus FDO topic (OBS-8)",
                     );
-                    return;
+                    return true;
                 }
                 Ok(o) => {
                     tracing::debug!(
@@ -287,6 +349,7 @@ impl AlertRelayWorker {
                     host = %event.host,
                     "fired FDO notification (notify-send fallback)",
                 );
+                true
             }
             Ok(o) => {
                 tracing::debug!(
@@ -295,6 +358,7 @@ impl AlertRelayWorker {
                     stderr = %String::from_utf8_lossy(&o.stderr),
                     "notify-send exited non-zero",
                 );
+                false
             }
             Err(e) => {
                 tracing::debug!(
@@ -303,9 +367,20 @@ impl AlertRelayWorker {
                     binary = %self.notify_send,
                     "notify-send launch failed (operator may be running headless)",
                 );
+                false
             }
         }
     }
+}
+
+fn valid_receipt_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ALERT_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        && id != "."
+        && id != ".."
 }
 
 impl Default for AlertRelayWorker {
@@ -524,6 +599,78 @@ mod tests {
         // New event arrives → fires.
         write_event(tmp.path(), "01H8XYZABC0000000000000002", "CRITICAL");
         assert_eq!(w.tick_once(), 1);
+    }
+
+    #[test]
+    fn delivery_receipts_survive_restart_retry_failure_and_reject_hostile_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let id = "01H8XYZABC0000000000000001";
+        write_event(tmp.path(), id, "CRITICAL");
+
+        let first = AlertRelayWorker::new()
+            .with_alerts_dir(tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
+        assert_eq!(first.tick_once(), 1);
+        assert!(tmp.path().join(DELIVERY_RECEIPTS_DIR).join(id).is_file());
+
+        let restarted = AlertRelayWorker::new()
+            .with_alerts_dir(tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
+        assert_eq!(restarted.tick_once(), 0);
+
+        let failed_tmp = tempfile::tempdir().expect("failed tempdir");
+        let failed_id = "01H8XYZABC0000000000000002";
+        write_event(failed_tmp.path(), failed_id, "CRITICAL");
+        let worker = AlertRelayWorker::new()
+            .with_alerts_dir(failed_tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/false")
+            .with_bus_binary("/bin/false");
+
+        assert_eq!(worker.tick_once(), 0);
+        assert_eq!(worker.tick_once(), 0);
+        assert!(!worker.was_delivered(failed_id));
+        assert!(!failed_tmp
+            .path()
+            .join(DELIVERY_RECEIPTS_DIR)
+            .join(failed_id)
+            .exists());
+
+        let hostile_tmp = tempfile::tempdir().expect("hostile tempdir");
+        write_event(hostile_tmp.path(), "..", "CRITICAL");
+        let worker = AlertRelayWorker::new()
+            .with_alerts_dir(hostile_tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
+
+        assert_eq!(worker.tick_once(), 0);
+        assert!(!hostile_tmp.path().join(DELIVERY_RECEIPTS_DIR).exists());
+
+        let symlink_tmp = tempfile::tempdir().expect("symlink tempdir");
+        let symlink_id = "01H8XYZABC0000000000000003";
+        write_event(symlink_tmp.path(), symlink_id, "CRITICAL");
+        let receipts = symlink_tmp.path().join(DELIVERY_RECEIPTS_DIR);
+        std::fs::create_dir(&receipts).expect("receipt directory");
+        let outside = symlink_tmp.path().join("outside");
+        std::fs::write(&outside, b"not a receipt").expect("outside fixture");
+        std::os::unix::fs::symlink(&outside, receipts.join(symlink_id))
+            .expect("hostile receipt symlink");
+
+        let first = AlertRelayWorker::new()
+            .with_alerts_dir(symlink_tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
+        assert_eq!(first.tick_once(), 1);
+        let restarted = AlertRelayWorker::new()
+            .with_alerts_dir(symlink_tmp.path().to_path_buf())
+            .with_notify_send_binary("/bin/true")
+            .with_bus_binary("/bin/true");
+        assert_eq!(restarted.tick_once(), 1);
+        assert_eq!(
+            std::fs::read(&outside).expect("outside intact"),
+            b"not a receipt"
+        );
     }
 
     #[test]

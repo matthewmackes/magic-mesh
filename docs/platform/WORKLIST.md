@@ -528,6 +528,11 @@ behavioral evidence is not completion.
 - **Calls provider lifecycle checkpoint (2026-08-09):** media effects refuse without a compatible provider; cleanup stays available and readiness is re-probed.
   Machine 9 passed 4/4; no production provider is registered: `docs/platform/evidence/WL-FUNC-011-2026-08-09-calls-provider-lifecycle-r6.md`.
 - Remaining work:
+- **Alert delivery restart checkpoint (2026-08-09):** successful Bus/fallback
+  delivery now persists bounded no-follow receipts across daemon restart;
+  failed delivery retries, and traversal/forged-symlink IDs fail safely.
+  Machine 196 passed the exact hostile boundary:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-alert-delivery-restart-r18.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
