@@ -17,8 +17,10 @@
 //! CLI in `bin/mackesd.rs` is the runtime entry point that makes this
 //! engine reachable end-to-end today (§0.12).
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::card::probe::{
     host_card, host_facts, service_card, service_facts, HostFacts, HostSource, ServiceFacts,
@@ -586,15 +588,35 @@ pub fn inventory_fingerprint(workgroup_root: &Path) -> u64 {
 // Q5 scope = mesh peers ∪ local LAN ∪ operator-arbitrary; Q9 default =
 // scan everything, with a do-not-scan exclusion list as the escape
 // hatch (passed to nmap `--exclude`). The pure pieces
-// (`ipv4_network_cidr`, `lan_cidrs_from_ip_json`, `merge_targets`,
-// `read_toml_string_list`) are unit-tested; the env-touching wrappers
-// (`detect_lan_cidrs`, `resolve_targets`) compose them.
+// (`ipv4_network_cidr`, `lan_cidrs_from_ip_json`,
+// `lan_neighbor_ips_from_ip_json`, `merge_targets`, `read_toml_string_list`)
+// are unit-tested; the env-touching wrappers (`detect_lan_cidrs`,
+// `detect_wide_lan_neighbors`, `resolve_targets`) compose them.
 
 /// Interface name-prefixes excluded from LAN detection: loopback, the
 /// Nebula overlay (mesh peers are already covered by `mesh_targets`),
 /// and the usual virtual bridges (container / VM / legacy-mesh nets).
 pub const DEFAULT_EXCLUDE_IFACE_PREFIXES: &[&str] = &[
-    "lo", "nebula", "docker", "podman", "virbr", "cni", "veth", "br-",
+    "lo",
+    "nebula",
+    "docker",
+    "podman",
+    "virbr",
+    "cni",
+    "veth",
+    "br-",
+    "tun",
+    "tap",
+    "wg",
+    "tailscale",
+    "zt",
+    "vmnet",
+    "vboxnet",
+    "dummy",
+    "vxlan",
+    "geneve",
+    "gretap",
+    "ip6tnl",
 ];
 
 /// SUBAUDIT-C3 — smallest LAN prefix (largest range) the probe will
@@ -605,6 +627,17 @@ pub const DEFAULT_EXCLUDE_IFACE_PREFIXES: &[&str] = &[
 /// still come from `mesh_targets`, and a specific subnet can be added via
 /// `probe-targets.toml`.
 pub const MIN_LAN_SCAN_PREFIX: u8 = 22;
+
+/// Bound the number of individual same-LAN neighbours admitted from the
+/// kernel neighbour table.  This fallback exists for wide LANs that are not
+/// safe to enumerate as CIDRs; it must never turn a hostile or unusually
+/// large neighbour table into an unbounded nmap argv.
+pub const MAX_LAN_NEIGHBOR_TARGETS: usize = 128;
+
+/// Reject unexpectedly large command output before deserializing it.  A
+/// normal `ip -j addr` / `ip -j neigh` snapshot is only a few KiB.
+const MAX_IP_JSON_BYTES: usize = 256 * 1024;
+static WIDE_LAN_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// SVC-VIEW-2 — known LAN service hosts the probe always scans as
 /// single IPs, regardless of the [`MIN_LAN_SCAN_PREFIX`] auto-scan cap.
@@ -711,6 +744,64 @@ pub fn lan_cidrs_from_ip_json(json: &str, exclude_prefixes: &[&str]) -> Vec<Stri
     out
 }
 
+/// Report physical IPv4 networks that are deliberately too wide for CIDR
+/// enumeration. These are diagnostic facts, not scan targets: a quiet host on
+/// one of these networks cannot be inferred safely unless it appears in a
+/// bounded address source such as the kernel neighbour table or operator
+/// configuration.
+#[must_use]
+pub fn skipped_wide_lan_cidrs_from_ip_json(json: &str, exclude_prefixes: &[&str]) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Iface {
+        ifname: String,
+        #[serde(default)]
+        addr_info: Vec<AddrInfo>,
+    }
+    #[derive(serde::Deserialize)]
+    struct AddrInfo {
+        family: String,
+        local: String,
+        #[serde(default)]
+        prefixlen: u8,
+    }
+
+    if json.len() > MAX_IP_JSON_BYTES {
+        return Vec::new();
+    }
+    let Ok(ifaces) = serde_json::from_str::<Vec<Iface>>(json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for iface in ifaces {
+        if exclude_prefixes
+            .iter()
+            .any(|prefix| iface.ifname.starts_with(prefix))
+        {
+            continue;
+        }
+        for addr in iface.addr_info {
+            if addr.family != "inet" || addr.prefixlen >= MIN_LAN_SCAN_PREFIX {
+                continue;
+            }
+            if let Some(cidr) = ipv4_network_cidr(&addr.local, addr.prefixlen) {
+                if !out.contains(&cidr) {
+                    out.push(cidr);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn quiet_host_config_guidance(cidr: &str, config_path: &Path) -> String {
+    format!(
+        "LAN {cidr} is too wide for automatic enumeration; passive RDP does not advertise, \n\
+         so a quiet Windows host may remain undiscovered until it appears in the neighbour \n\
+         table. Add its address to {} as: targets = [\"<windows-ip>\"]",
+        config_path.display()
+    )
+}
+
 /// Detect the local LAN network CIDRs by shelling `ip -j addr`. Best-
 /// effort: returns empty when `ip` is missing or errors.
 #[must_use]
@@ -722,6 +813,160 @@ pub fn detect_lan_cidrs() -> Vec<String> {
         ),
         _ => Vec::new(),
     }
+}
+
+/// Detect wide physical LANs omitted from automatic CIDR scanning so callers
+/// can emit an explicit, actionable discovery limitation.
+#[must_use]
+pub fn detect_skipped_wide_lan_cidrs() -> Vec<String> {
+    match Command::new("ip").args(["-j", "addr"]).output() {
+        Ok(output) if output.status.success() => skipped_wide_lan_cidrs_from_ip_json(
+            &String::from_utf8_lossy(&output.stdout),
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        ),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse `ip -j addr` plus `ip -j neigh show` into bounded individual IPv4
+/// targets for physical LANs too wide for automatic CIDR scanning.
+///
+/// A candidate must be a resolved neighbour (have a link-layer address), be
+/// attached to the same non-virtual interface as a local IPv4 address whose
+/// prefix is wider than [`MIN_LAN_SCAN_PREFIX`], and fall inside that exact
+/// local network.  Self, network/broadcast, loopback, multicast, unspecified,
+/// malformed, duplicate, and excluded-interface addresses are rejected.  No
+/// range is expanded: every returned address was already observed by the
+/// kernel neighbour table.
+#[must_use]
+pub fn lan_neighbor_ips_from_ip_json(
+    addr_json: &str,
+    neigh_json: &str,
+    exclude_prefixes: &[&str],
+) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Iface {
+        ifname: String,
+        #[serde(default)]
+        addr_info: Vec<AddrInfo>,
+    }
+    #[derive(serde::Deserialize)]
+    struct AddrInfo {
+        family: String,
+        local: String,
+        #[serde(default)]
+        prefixlen: u8,
+    }
+    #[derive(serde::Deserialize)]
+    struct Neighbor {
+        dst: String,
+        dev: String,
+        #[serde(default)]
+        lladdr: String,
+    }
+
+    if addr_json.len() > MAX_IP_JSON_BYTES || neigh_json.len() > MAX_IP_JSON_BYTES {
+        return Vec::new();
+    }
+    let Ok(ifaces) = serde_json::from_str::<Vec<Iface>>(addr_json) else {
+        return Vec::new();
+    };
+    let Ok(neighbors) = serde_json::from_str::<Vec<Neighbor>>(neigh_json) else {
+        return Vec::new();
+    };
+
+    // (interface, self address, network, mask). Only wide physical LANs need
+    // this fallback; /22 and narrower networks are already bounded CIDR scans.
+    let mut wide_lans: Vec<(String, u32, u32)> = Vec::new();
+    let mut self_ips: Vec<Ipv4Addr> = Vec::new();
+    for iface in ifaces {
+        if exclude_prefixes.iter().any(|p| iface.ifname.starts_with(p)) {
+            continue;
+        }
+        for addr in iface.addr_info {
+            if addr.family != "inet" {
+                continue;
+            }
+            let Ok(local) = addr.local.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if !self_ips.contains(&local) {
+                self_ips.push(local);
+            }
+            if addr.prefixlen >= MIN_LAN_SCAN_PREFIX {
+                continue;
+            }
+            let mask = if addr.prefixlen == 0 {
+                0
+            } else {
+                u32::MAX << (32 - addr.prefixlen)
+            };
+            let network = u32::from(local) & mask;
+            wide_lans.push((iface.ifname.clone(), network, mask));
+        }
+    }
+
+    let mut out = Vec::new();
+    for neighbor in neighbors {
+        // FAILED/INCOMPLETE entries have no link-layer identity and therefore
+        // are not evidence that a host was observed.
+        if neighbor.lladdr.is_empty()
+            || exclude_prefixes.iter().any(|p| neighbor.dev.starts_with(p))
+        {
+            continue;
+        }
+        let Ok(ip) = neighbor.dst.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let octets = ip.octets();
+        if ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || ip.is_broadcast()
+            || octets[0] == 0
+            || octets[0] >= 240
+            || self_ips.contains(&ip)
+        {
+            continue;
+        }
+        let bits = u32::from(ip);
+        let admitted = wide_lans.iter().any(|(dev, network, mask)| {
+            if dev != &neighbor.dev || bits & mask != *network {
+                return false;
+            }
+            let host_mask = !mask;
+            let host = bits & host_mask;
+            host != 0 && host != host_mask
+        });
+        let rendered = ip.to_string();
+        if admitted && !out.contains(&rendered) {
+            out.push(rendered);
+            if out.len() == MAX_LAN_NEIGHBOR_TARGETS {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Detect bounded, already-observed neighbours on wide local LANs. Commands
+/// are fixed argv (no shell or interpolation); any command or parse failure
+/// fails closed to an empty fallback.
+#[must_use]
+pub fn detect_wide_lan_neighbors() -> Vec<String> {
+    let addr = match Command::new("ip").args(["-j", "addr"]).output() {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Vec::new(),
+    };
+    let neigh = match Command::new("ip").args(["-j", "neigh", "show"]).output() {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Vec::new(),
+    };
+    lan_neighbor_ips_from_ip_json(
+        &String::from_utf8_lossy(&addr),
+        &String::from_utf8_lossy(&neigh),
+        DEFAULT_EXCLUDE_IFACE_PREFIXES,
+    )
 }
 
 /// Read a TOML string-array under `key` from `path`. Best-effort:
@@ -762,7 +1007,8 @@ pub fn merge_targets(mesh: &[String], lan: &[String], arbitrary: &[String]) -> V
 
 /// Resolve the full scan scope (Q5): mesh peers (from `workgroup_root`) ∪
 /// enrolled-VM overlay IPs (SVC-VIEW-2, from the replicated compute-inventory
-/// plane) ∪ detected LAN CIDRs ∪ operator-arbitrary targets (from
+/// plane) ∪ detected bounded LAN CIDRs ∪ observed individual neighbours on
+/// wider LANs ∪ operator-arbitrary targets (from
 /// `~/.config/mde/probe-targets.toml`), minus the do-not-scan list
 /// (`~/.config/mde/probe-do-not-scan.toml`, passed to nmap
 /// `--exclude`). `home` locates the config files (injected for tests).
@@ -779,8 +1025,25 @@ pub fn resolve_targets(workgroup_root: &Path, home: &Path) -> TargetSet {
             mesh.push(vm_ip);
         }
     }
-    let lan = detect_lan_cidrs();
+    let mut lan = detect_lan_cidrs();
+    for neighbor in detect_wide_lan_neighbors() {
+        if !lan.contains(&neighbor) {
+            lan.push(neighbor);
+        }
+    }
     let cfg = home.join(".config").join("mde");
+    let arbitrary_targets_path = cfg.join(ARBITRARY_TARGETS_FILE);
+    if !WIDE_LAN_DIAGNOSTIC_EMITTED.swap(true, Ordering::Relaxed) {
+        for cidr in detect_skipped_wide_lan_cidrs() {
+            tracing::warn!(
+                target: "mackesd::probe_nmap",
+                cidr,
+                config_path = %arbitrary_targets_path.display(),
+                "{}",
+                quiet_host_config_guidance(&cidr, &arbitrary_targets_path),
+            );
+        }
+    }
     // SVC-VIEW-2 — known single-IP LAN service hosts (e.g. Airsonic on
     // 172.20.0.2) are always scanned, ahead of operator-arbitrary
     // targets; `merge_targets` dedupes, so an overlap is harmless.
@@ -788,10 +1051,7 @@ pub fn resolve_targets(workgroup_root: &Path, home: &Path) -> TargetSet {
         .iter()
         .map(|h| (*h).to_owned())
         .collect();
-    arbitrary.extend(read_toml_string_list(
-        &cfg.join(ARBITRARY_TARGETS_FILE),
-        "targets",
-    ));
+    arbitrary.extend(read_toml_string_list(&arbitrary_targets_path, "targets"));
     let excludes = read_toml_string_list(&cfg.join(DO_NOT_SCAN_FILE), "exclude");
     TargetSet {
         targets: merge_targets(&mesh, &lan, &arbitrary),
@@ -1373,6 +1633,184 @@ mod tests {
     #[test]
     fn lan_cidrs_empty_for_garbage() {
         assert!(lan_cidrs_from_ip_json("not json", DEFAULT_EXCLUDE_IFACE_PREFIXES).is_empty());
+    }
+
+    #[test]
+    fn wide_lan_diagnostic_identifies_only_skipped_physical_networks() {
+        let json = r#"[
+            {"ifname":"eno1","addr_info":[
+                {"family":"inet","local":"172.20.40.15","prefixlen":16},
+                {"family":"inet","local":"192.168.7.15","prefixlen":24}
+            ]},
+            {"ifname":"nebula1","addr_info":[
+                {"family":"inet","local":"10.42.0.5","prefixlen":16}
+            ]},
+            {"ifname":"virbr0","addr_info":[
+                {"family":"inet","local":"192.168.122.1","prefixlen":16}
+            ]}
+        ]"#;
+        assert_eq!(
+            skipped_wide_lan_cidrs_from_ip_json(json, DEFAULT_EXCLUDE_IFACE_PREFIXES),
+            vec!["172.20.0.0/16".to_owned()]
+        );
+        assert!(
+            skipped_wide_lan_cidrs_from_ip_json("not-json", DEFAULT_EXCLUDE_IFACE_PREFIXES,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn quiet_rdp_diagnostic_names_exact_operator_contract() {
+        let config = Path::new("/home/mm/.config/mde/probe-targets.toml");
+        let guidance = quiet_host_config_guidance("172.20.0.0/16", config);
+        assert!(guidance.contains("passive RDP does not advertise"));
+        assert!(guidance.contains("quiet Windows host may remain undiscovered"));
+        assert!(guidance.contains("/home/mm/.config/mde/probe-targets.toml"));
+        assert!(guidance.contains(r#"targets = ["<windows-ip>"]"#));
+    }
+
+    const WIDE_LAN_ADDR_JSON: &str = r#"[
+        {"ifname":"eno1","addr_info":[
+            {"family":"inet","local":"172.20.0.15","prefixlen":16},
+            {"family":"inet","local":"172.20.0.16","prefixlen":24}
+        ]},
+        {"ifname":"nebula1","addr_info":[
+            {"family":"inet","local":"10.42.0.5","prefixlen":16}
+        ]},
+        {"ifname":"virbr0","addr_info":[
+            {"family":"inet","local":"192.168.122.1","prefixlen":16}
+        ]},
+        {"ifname":"wg0","addr_info":[
+            {"family":"inet","local":"10.77.0.1","prefixlen":16}
+        ]}
+    ]"#;
+
+    #[test]
+    fn wide_lan_neighbors_accepts_only_resolved_same_lan_unicast() {
+        let neighbors = r#"[
+            {"dst":"172.20.40.10","dev":"eno1","lladdr":"00:11:22:33:44:55","state":["STALE"]},
+            {"dst":"172.21.40.10","dev":"eno1","lladdr":"00:11:22:33:44:56","state":["REACHABLE"]},
+            {"dst":"224.0.0.1","dev":"eno1","lladdr":"01:00:5e:00:00:01","state":["PERMANENT"]},
+            {"dst":"172.20.40.11","dev":"eno1","state":["FAILED"]}
+        ]"#;
+        assert_eq!(
+            lan_neighbor_ips_from_ip_json(
+                WIDE_LAN_ADDR_JSON,
+                neighbors,
+                DEFAULT_EXCLUDE_IFACE_PREFIXES,
+            ),
+            vec!["172.20.40.10".to_owned()]
+        );
+    }
+
+    #[test]
+    fn wide_lan_neighbors_reach_curated_rdp_scan() {
+        let neighbors = r#"[
+            {"dst":"172.20.40.10","dev":"eno1","lladdr":"00:11:22:33:44:55"}
+        ]"#;
+        let targets = lan_neighbor_ips_from_ip_json(
+            WIDE_LAN_ADDR_JSON,
+            neighbors,
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        );
+        let argv = fast_argv(&targets);
+        assert_eq!(argv.last().map(String::as_str), Some("172.20.40.10"));
+        let ports = argv
+            .windows(2)
+            .find_map(|pair| (pair[0] == "-p").then_some(pair[1].as_str()))
+            .expect("curated port argument");
+        assert!(ports.split(',').any(|port| port == "3389"));
+    }
+
+    #[test]
+    fn wide_lan_neighbors_rejects_malformed_input_and_addresses() {
+        assert!(
+            lan_neighbor_ips_from_ip_json("not-json", "[]", DEFAULT_EXCLUDE_IFACE_PREFIXES,)
+                .is_empty()
+        );
+        assert!(lan_neighbor_ips_from_ip_json(
+            WIDE_LAN_ADDR_JSON,
+            "not-json",
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        )
+        .is_empty());
+        let hostile = r#"[
+            {"dst":"not-an-ip","dev":"eno1","lladdr":"00:11:22:33:44:55"},
+            {"dst":"::1","dev":"eno1","lladdr":"00:11:22:33:44:56"},
+            {"dst":"0.0.0.0","dev":"eno1","lladdr":"00:11:22:33:44:57"},
+            {"dst":"127.0.0.2","dev":"eno1","lladdr":"00:11:22:33:44:58"},
+            {"dst":"255.255.255.255","dev":"eno1","lladdr":"ff:ff:ff:ff:ff:ff"}
+        ]"#;
+        assert!(lan_neighbor_ips_from_ip_json(
+            WIDE_LAN_ADDR_JSON,
+            hostile,
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn wide_lan_neighbors_caps_oversized_tables() {
+        let neighbors = (1..=MAX_LAN_NEIGHBOR_TARGETS + 1)
+            .map(|i| {
+                format!(r#"{{"dst":"172.20.1.{i}","dev":"eno1","lladdr":"00:11:22:33:44:55"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let neighbors = format!("[{neighbors}]");
+        let got = lan_neighbor_ips_from_ip_json(
+            WIDE_LAN_ADDR_JSON,
+            &neighbors,
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        );
+        assert_eq!(got.len(), MAX_LAN_NEIGHBOR_TARGETS);
+        assert_eq!(got.first().map(String::as_str), Some("172.20.1.1"));
+        assert_eq!(got.last().map(String::as_str), Some("172.20.1.128"));
+    }
+
+    #[test]
+    fn wide_lan_neighbors_dedupes_observations() {
+        let neighbors = r#"[
+            {"dst":"172.20.40.10","dev":"eno1","lladdr":"00:11:22:33:44:55"},
+            {"dst":"172.20.40.10","dev":"eno1","lladdr":"00:11:22:33:44:55"}
+        ]"#;
+        assert_eq!(
+            lan_neighbor_ips_from_ip_json(
+                WIDE_LAN_ADDR_JSON,
+                neighbors,
+                DEFAULT_EXCLUDE_IFACE_PREFIXES,
+            ),
+            vec!["172.20.40.10".to_owned()]
+        );
+    }
+
+    #[test]
+    fn wide_lan_neighbors_rejects_excluded_interfaces() {
+        let neighbors = r#"[
+            {"dst":"10.42.0.9","dev":"nebula1","lladdr":"00:11:22:33:44:55"},
+            {"dst":"192.168.122.9","dev":"virbr0","lladdr":"00:11:22:33:44:56"},
+            {"dst":"10.77.0.9","dev":"wg0","lladdr":"00:11:22:33:44:57"}
+        ]"#;
+        assert!(lan_neighbor_ips_from_ip_json(
+            WIDE_LAN_ADDR_JSON,
+            neighbors,
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn wide_lan_neighbors_rejects_self() {
+        let neighbors = r#"[
+            {"dst":"172.20.0.15","dev":"eno1","lladdr":"00:11:22:33:44:55"},
+            {"dst":"172.20.0.16","dev":"eno1","lladdr":"00:11:22:33:44:56"}
+        ]"#;
+        assert!(lan_neighbor_ips_from_ip_json(
+            WIDE_LAN_ADDR_JSON,
+            neighbors,
+            DEFAULT_EXCLUDE_IFACE_PREFIXES,
+        )
+        .is_empty());
     }
 
     #[test]

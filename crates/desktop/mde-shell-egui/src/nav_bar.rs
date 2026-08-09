@@ -101,6 +101,8 @@ pub(crate) enum Action {
     ToggleDock,
     /// Open one docked app surface.
     OpenSurface(Surface),
+    /// Open the existing Maps & Location surface directly in its Weather mode.
+    OpenWeather,
     /// Add a catalogued surface to the taskbar, preserving existing order.
     PinSurface(Surface),
     /// Remove a catalogued surface from the taskbar, preserving the survivors' order.
@@ -120,6 +122,8 @@ struct BottomTray<'a> {
     opacity: f32,
     env: StatusBarEnv,
     active_surface: Option<Surface>,
+    battery: Option<status_bar::LiveBatteryStatus>,
+    weather: Option<status_bar::LiveWeatherStatus>,
 }
 
 /// The persisted placement choice.
@@ -180,7 +184,7 @@ fn surface_key(surface: Surface) -> &'static str {
         Surface::System => "system",
         Surface::Storage => "storage",
         Surface::About => "about",
-        Surface::Timers => "timers",
+        Surface::Clock => "clock",
         Surface::AutoHome => "auto-home",
     }
 }
@@ -222,7 +226,7 @@ fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
         // Standalone Files is a compatibility deep link only; persisted pins
         // migrate to the one Mesh Teams collaboration destination.
         Surface::Files => Some(Surface::Communications),
-        Surface::AutoHome | Surface::Timers => None,
+        Surface::AutoHome | Surface::Clock => None,
         surface if Surface::ALL.contains(&surface) => Some(surface),
         _ => None,
     }?;
@@ -684,6 +688,8 @@ impl State {
                 opacity: tray_opacity,
                 env: tray_env,
                 active_surface,
+                battery: None,
+                weather: None,
             }),
         )
     }
@@ -702,6 +708,8 @@ impl State {
         segments: &StatusSegments,
         tray_opacity: f32,
         tray_env: StatusBarEnv,
+        battery: Option<status_bar::LiveBatteryStatus>,
+        weather: Option<status_bar::LiveWeatherStatus>,
     ) -> Option<Action> {
         self.mount_with_active_inner(
             ctx,
@@ -715,6 +723,8 @@ impl State {
                 opacity: tray_opacity,
                 env: tray_env,
                 active_surface,
+                battery,
+                weather,
             }),
         )
     }
@@ -903,7 +913,7 @@ impl State {
                 // its clock and system targets remain anchored in the bar and
                 // take the final hit-test priority in their reserved lane.
                 if let Some(tray) = bottom_tray.as_mut() {
-                    status_bar::paint_bottom_tray_with_active(
+                    if status_bar::paint_bottom_tray_with_active(
                         ui,
                         screen,
                         tray.construct,
@@ -911,7 +921,11 @@ impl State {
                         tray.opacity,
                         tray.env,
                         tray.active_surface,
-                    );
+                        tray.battery,
+                        tray.weather.as_ref(),
+                    ) {
+                        action = Some(Action::OpenWeather);
+                    }
                 }
 
                 if let (Some(anchor), Some(overflow)) =
@@ -3417,11 +3431,29 @@ mod tests {
         let clock = ctx
             .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
             .expect("clock remains reachable within the taskbar");
+        let bell = ctx
+            .read_response(status_bar::notification_bell_id("bottom"))
+            .expect("notification bell remains reachable within the taskbar");
         let health = ctx
             .read_response(egui::Id::new(("system-mesh-health", "bottom")))
             .expect("mesh health remains reachable within the taskbar");
         assert_eq!(clock.layer_id, taskbar.layer_id);
+        assert_eq!(bell.layer_id, taskbar.layer_id);
         assert_eq!(health.layer_id, taskbar.layer_id);
+        assert!(
+            clock.rect.intersect(bell.rect).width() <= f32::EPSILON,
+            "clock and bell targets must remain disjoint"
+        );
+        let placement = floating_geometry(screen)
+            .controls
+            .into_iter()
+            .find(|control| control.kind == ControlKind::Pin)
+            .expect("bottom placement target");
+        assert!(
+            placement.rect.intersect(clock.rect).width() <= f32::EPSILON
+                && placement.rect.intersect(bell.rect).width() <= f32::EPSILON,
+            "placement, clock, and bell targets must remain disjoint"
+        );
         assert!(
             bottom_tray_rect(screen).intersects(taskbar.rect),
             "the tray footprint must be part of the taskbar footprint"

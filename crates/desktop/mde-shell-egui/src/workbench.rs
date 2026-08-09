@@ -175,6 +175,8 @@ pub fn show(
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::TEXT_DIM, selected.blurb());
             ui.add_space(Style::SP_M);
+            action_console::show(ui);
+            ui.add_space(Style::SP_M);
             // Every plane is matched explicitly — no `_` wildcard — so a future
             // plane variant can't silently fall through to a placeholder (clippy's
             // `match_wildcard_for_single_variants` fix once only one arm remained).
@@ -216,6 +218,675 @@ pub fn show(
             }
         });
     });
+}
+
+/// WL-ARCH-009 S5 — the production Workers Action Console slice. State lives in
+/// egui's context store so the already-mounted Workbench remains the sole route;
+/// no shell-root field or duplicate surface is introduced.
+mod action_console {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use mackes_mesh_types::worker_runtime::{
+        worker_change_set_action_topic, worker_change_set_digest, worker_change_set_result_topic,
+        WorkerAction, WorkerActionDescriptor, WorkerArmingRequirement, WorkerChangeSetItem,
+        WorkerChangeSetOperation, WorkerChangeSetOutcome, WorkerChangeSetRequest,
+        WorkerChangeSetResult, WorkerChangeSetTarget, WorkerContract, WorkerRuntimeSnapshot,
+        MAX_WORKER_CHANGE_SET_TTL_MS, WORKER_CHANGE_SET_AUTH_VERB, WORKER_RUNTIME_SCHEMA_VERSION,
+    };
+    use mde_bus::hooks::config::Priority;
+    use mde_bus::persist::Persist;
+    use mde_egui::egui::{self, RichText};
+    use mde_egui::Style;
+    use serde::{Deserialize, Serialize};
+
+    const STATE_REFRESH: Duration = Duration::from_secs(2);
+    const CONSOLE_STATE_ID: &str = "workers-action-console-state-v1";
+    const MAX_NODE_WORKERS: usize = 256;
+    const MAX_NODE_STATUS_WIRE_BYTES: usize = 4 * 1024 * 1024;
+    const IMPACT: &str = "Apply the selected typed worker lifecycle action.";
+    const RECOVERY: &str = "Cancel before commit or issue a typed inverse action.";
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WorkerStatusRow {
+        contract: WorkerContract,
+        snapshot: WorkerRuntimeSnapshot,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NodeStatusWire {
+        schema_version: u16,
+        node_id: String,
+        observed_at_ms: u64,
+        workers: Vec<WorkerStatusRow>,
+    }
+
+    impl NodeStatusWire {
+        fn from_body(body: &str, expected_node: &str, now_ms: u64) -> Result<Self, String> {
+            if body.len() > MAX_NODE_STATUS_WIRE_BYTES {
+                return Err("Workers state exceeded the bounded wire size.".to_string());
+            }
+            let state: Self = serde_json::from_str(body)
+                .map_err(|_| "Workers state failed closed-contract admission.".to_string())?;
+            if state.schema_version != WORKER_RUNTIME_SCHEMA_VERSION
+                || state.node_id != expected_node
+                || state.observed_at_ms == 0
+                || state.observed_at_ms > now_ms
+                || state.workers.len() > MAX_NODE_WORKERS
+            {
+                return Err("Workers state identity, clock, or capacity was invalid.".to_string());
+            }
+            let mut previous: Option<(mackes_mesh_types::worker_runtime::WorkerGroup, &str)> = None;
+            for row in &state.workers {
+                row.contract
+                    .validate()
+                    .map_err(|error| format!("Worker contract refused: {error}"))?;
+                row.snapshot
+                    .validate_at(now_ms)
+                    .map_err(|error| format!("Worker snapshot refused: {error}"))?;
+                if row.snapshot.node_id != state.node_id
+                    || row.snapshot.worker_id != row.contract.worker_id
+                    || row.snapshot.group != row.contract.group
+                {
+                    return Err("Worker contract and snapshot identities diverged.".to_string());
+                }
+                let current = (row.contract.group, row.contract.worker_id.as_str());
+                if previous.is_some_and(|prior| prior >= current) {
+                    return Err(
+                        "Workers state was duplicated or not deterministically ordered."
+                            .to_string(),
+                    );
+                }
+                previous = Some(current);
+            }
+            Ok(state)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StagedChange {
+        request_id: String,
+        target: WorkerChangeSetTarget,
+        expected_generation: u64,
+        items: Vec<WorkerChangeSetItem>,
+        arming: WorkerArmingRequirement,
+        digest: String,
+        staged_at_ms: u64,
+        preview_admitted: bool,
+        terminal: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ActionConsoleState {
+        bus_root: Option<PathBuf>,
+        node_id: String,
+        workers: Vec<WorkerStatusRow>,
+        selected_worker: Option<String>,
+        selected_action: Option<WorkerAction>,
+        staged: Option<StagedChange>,
+        result: Option<WorkerChangeSetResult>,
+        last_error: Option<String>,
+        last_poll: Option<Instant>,
+    }
+
+    impl Default for ActionConsoleState {
+        fn default() -> Self {
+            Self {
+                bus_root: mde_bus::client_data_dir(),
+                node_id: local_node_id(),
+                workers: Vec::new(),
+                selected_worker: None,
+                selected_action: None,
+                staged: None,
+                result: None,
+                last_error: None,
+                last_poll: None,
+            }
+        }
+    }
+
+    impl ActionConsoleState {
+        fn poll(&mut self, now_ms: u64) {
+            if self
+                .last_poll
+                .is_some_and(|last| last.elapsed() < STATE_REFRESH)
+            {
+                return;
+            }
+            self.last_poll = Some(Instant::now());
+            let Some(root) = self.bus_root.clone() else {
+                self.last_error = Some("Mesh Bus unavailable; worker actions are disabled.".into());
+                return;
+            };
+            let Ok(persist) = Persist::open(root) else {
+                self.last_error =
+                    Some("Mesh Bus could not be opened; worker actions are disabled.".into());
+                return;
+            };
+            let state_topic = format!("state/mackesd/{}", self.node_id);
+            if let Ok(Some(message)) = persist.read_latest(&state_topic) {
+                if let Some(body) = message.body {
+                    match NodeStatusWire::from_body(&body, &self.node_id, now_ms) {
+                        Ok(state) => {
+                            self.workers = state.workers;
+                            self.reconcile_selection();
+                            self.reconcile_generation();
+                            self.last_error = None;
+                        }
+                        Err(error) => self.last_error = Some(error),
+                    }
+                }
+            }
+            self.poll_result(&persist);
+        }
+
+        fn reconcile_selection(&mut self) {
+            let selected_exists = self.selected_worker.as_ref().is_some_and(|selected| {
+                self.workers.iter().any(|row| {
+                    row.contract.worker_id == *selected && !row.contract.actions.is_empty()
+                })
+            });
+            if !selected_exists {
+                self.selected_worker = self
+                    .workers
+                    .iter()
+                    .find(|row| !row.contract.actions.is_empty())
+                    .map(|row| row.contract.worker_id.clone());
+            }
+            let allowed = self
+                .selected_row()
+                .map_or(&[][..], |row| row.contract.actions.as_slice());
+            if !self.selected_action.is_some_and(|selected| {
+                allowed
+                    .iter()
+                    .any(|descriptor| descriptor.action == selected)
+            }) {
+                self.selected_action = allowed.first().map(|descriptor| descriptor.action);
+            }
+        }
+
+        fn reconcile_generation(&mut self) {
+            let stale = self.staged.as_ref().is_some_and(|staged| {
+                self.workers
+                    .iter()
+                    .find(|row| {
+                        staged.target.worker_id.as_deref() == Some(row.contract.worker_id.as_str())
+                    })
+                    .is_none_or(|row| row.snapshot.generation != staged.expected_generation)
+            });
+            if stale {
+                self.staged = None;
+                self.result = None;
+                self.last_error = Some(
+                    "Worker generation changed; the staged preview was discarded.".to_string(),
+                );
+            }
+        }
+
+        fn selected_row(&self) -> Option<&WorkerStatusRow> {
+            let worker_id = self.selected_worker.as_deref()?;
+            self.workers
+                .iter()
+                .find(|row| row.contract.worker_id == worker_id)
+        }
+
+        fn selected_descriptor(&self) -> Option<&WorkerActionDescriptor> {
+            let action = self.selected_action?;
+            self.selected_row()?
+                .contract
+                .actions
+                .iter()
+                .find(|descriptor| descriptor.action == action)
+        }
+
+        fn stage_preview(&mut self, now_ms: u64) -> Result<(), String> {
+            let row = self
+                .selected_row()
+                .cloned()
+                .ok_or_else(|| "Select a live worker with an admitted action.".to_string())?;
+            let descriptor = self
+                .selected_descriptor()
+                .cloned()
+                .ok_or_else(|| "Select an action admitted by that worker.".to_string())?;
+            let target = WorkerChangeSetTarget {
+                node_id: row.snapshot.node_id.clone(),
+                worker_id: Some(row.contract.worker_id.clone()),
+            };
+            let request_id = format!("workers-{}", uuid::Uuid::new_v4().simple());
+            let items = vec![WorkerChangeSetItem {
+                item_id: format!("item-{}", uuid::Uuid::new_v4().simple()),
+                worker_id: row.contract.worker_id,
+                action: descriptor.action,
+            }];
+            let digest = worker_change_set_digest(
+                &target,
+                row.snapshot.generation,
+                &items,
+                IMPACT,
+                RECOVERY,
+                descriptor.arming,
+            )
+            .map_err(|error| error.to_string())?;
+            self.staged = Some(StagedChange {
+                request_id,
+                target,
+                expected_generation: row.snapshot.generation,
+                items,
+                arming: descriptor.arming,
+                digest,
+                staged_at_ms: now_ms,
+                preview_admitted: false,
+                terminal: false,
+            });
+            self.result = None;
+            if let Err(error) = self.publish_operation(WorkerChangeSetOperation::Preview, now_ms) {
+                self.staged = None;
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        fn publish_operation(
+            &mut self,
+            operation: WorkerChangeSetOperation,
+            now_ms: u64,
+        ) -> Result<(), String> {
+            let staged = self
+                .staged
+                .as_ref()
+                .ok_or_else(|| "No staged worker change exists.".to_string())?;
+            if now_ms.saturating_sub(staged.staged_at_ms) > MAX_WORKER_CHANGE_SET_TTL_MS {
+                return Err("The staged preview expired; stage it again.".to_string());
+            }
+            if staged.terminal {
+                return Err("That staged worker change already reached a terminal result.".into());
+            }
+            if operation == WorkerChangeSetOperation::Commit && !staged.preview_admitted {
+                return Err("Commit requires an admitted preview result.".to_string());
+            }
+            let request = WorkerChangeSetRequest::new(
+                staged.request_id.clone(),
+                operation,
+                staged.target.clone(),
+                staged.expected_generation,
+                staged.items.clone(),
+                IMPACT,
+                RECOVERY,
+                staged.arming,
+                staged.digest.clone(),
+                now_ms,
+                now_ms.saturating_add(MAX_WORKER_CHANGE_SET_TTL_MS),
+            )
+            .map_err(|error| error.to_string())?;
+            let unsigned = request.to_json().map_err(|error| error.to_string())?;
+            let capability_target = format!("change-set:{}", staged.request_id);
+            let body = crate::iac::authorize_root_mutation_body(
+                &unsigned,
+                WORKER_CHANGE_SET_AUTH_VERB,
+                &staged.target.node_id,
+                &capability_target,
+            )?;
+            WorkerChangeSetRequest::from_json(&body).map_err(|error| {
+                format!("Authorized request failed contract admission: {error}")
+            })?;
+            let topic = worker_change_set_action_topic(&staged.target.node_id)
+                .map_err(|error| error.to_string())?;
+            let root = self
+                .bus_root
+                .clone()
+                .ok_or_else(|| "Mesh Bus unavailable; worker actions are disabled.".to_string())?;
+            Persist::open(root)
+                .and_then(|persist| persist.write(&topic, Priority::Default, None, Some(&body)))
+                .map_err(|error| format!("Worker action publication failed: {error}"))?;
+            self.last_error = None;
+            self.last_poll = None;
+            Ok(())
+        }
+
+        fn poll_result(&mut self, persist: &Persist) {
+            let Some(staged) = self.staged.as_mut() else {
+                return;
+            };
+            let Ok(topic) = worker_change_set_result_topic(&staged.target.node_id) else {
+                return;
+            };
+            let Ok(Some(message)) = persist.read_latest(&topic) else {
+                return;
+            };
+            let Some(body) = message.body else {
+                return;
+            };
+            let Ok(result) = WorkerChangeSetResult::from_json(&body) else {
+                self.last_error = Some("Worker result failed closed-contract admission.".into());
+                return;
+            };
+            if result.request_id != staged.request_id
+                || result.target != staged.target
+                || result.expected_generation != staged.expected_generation
+            {
+                return;
+            }
+            staged.preview_admitted = result.operation == WorkerChangeSetOperation::Preview
+                && result.outcome == WorkerChangeSetOutcome::Previewed
+                && result.actual_generation == staged.expected_generation;
+            staged.terminal = result.operation != WorkerChangeSetOperation::Preview
+                || result.outcome != WorkerChangeSetOutcome::Previewed;
+            self.result = Some(result);
+            self.last_error = None;
+        }
+
+        fn show(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+            self.poll(now_ms);
+            egui::CollapsingHeader::new("Action Console")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        Style::TEXT_DIM,
+                        "Preview one admitted worker action, then explicitly commit or cancel it.",
+                    );
+                    if self.workers.is_empty() {
+                        ui.colored_label(
+                            Style::TEXT_DIM,
+                            "No current worker runtime snapshot is available on this node.",
+                        );
+                    } else {
+                        self.show_selection(ui);
+                        self.show_stage(ui, now_ms);
+                    }
+                    if let Some(error) = &self.last_error {
+                        ui.colored_label(Style::DANGER, error);
+                    }
+                    self.show_result(ui);
+                });
+        }
+
+        fn show_selection(&mut self, ui: &mut egui::Ui) {
+            let prior_worker = self.selected_worker.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Target");
+                egui::ComboBox::from_id_salt("workers-action-target")
+                    .selected_text(self.selected_worker.as_deref().unwrap_or("Unavailable"))
+                    .show_ui(ui, |ui| {
+                        for row in &self.workers {
+                            if !row.contract.actions.is_empty() {
+                                ui.selectable_value(
+                                    &mut self.selected_worker,
+                                    Some(row.contract.worker_id.clone()),
+                                    &row.contract.display_name,
+                                );
+                            }
+                        }
+                    });
+                ui.label("Action");
+                let actions = self
+                    .selected_row()
+                    .map(|row| row.contract.actions.clone())
+                    .unwrap_or_default();
+                egui::ComboBox::from_id_salt("workers-action-kind")
+                    .selected_text(
+                        self.selected_descriptor()
+                            .map_or("Unavailable", |descriptor| descriptor.label.as_str()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for descriptor in actions {
+                            ui.selectable_value(
+                                &mut self.selected_action,
+                                Some(descriptor.action),
+                                descriptor.label,
+                            );
+                        }
+                    });
+            });
+            if self.selected_worker != prior_worker {
+                self.selected_action = None;
+                self.reconcile_selection();
+                self.staged = None;
+                self.result = None;
+            }
+            if let Some(row) = self.selected_row() {
+                ui.small(format!(
+                    "{} · generation {} · {}",
+                    row.contract.worker_id,
+                    row.snapshot.generation,
+                    row.snapshot.effective_state(unix_ms()).as_str(),
+                ));
+            }
+        }
+
+        fn show_stage(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.selected_descriptor().is_some(),
+                        egui::Button::new("Preview"),
+                    )
+                    .clicked()
+                {
+                    if let Err(error) = self.stage_preview(now_ms) {
+                        self.last_error = Some(error);
+                    }
+                }
+                let can_commit = self
+                    .staged
+                    .as_ref()
+                    .is_some_and(|staged| staged.preview_admitted);
+                if ui
+                    .add_enabled(can_commit, egui::Button::new("Commit"))
+                    .clicked()
+                {
+                    if let Err(error) =
+                        self.publish_operation(WorkerChangeSetOperation::Commit, now_ms)
+                    {
+                        self.last_error = Some(error);
+                    }
+                }
+                let can_cancel = self.staged.as_ref().is_some_and(|staged| !staged.terminal);
+                if ui
+                    .add_enabled(can_cancel, egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    if let Err(error) =
+                        self.publish_operation(WorkerChangeSetOperation::Cancel, now_ms)
+                    {
+                        self.last_error = Some(error);
+                    }
+                }
+            });
+            if let Some(staged) = &self.staged {
+                ui.monospace(format!(
+                    "{} · generation {} · {}",
+                    staged.request_id, staged.expected_generation, staged.digest
+                ));
+            }
+        }
+
+        fn show_result(&self, ui: &mut egui::Ui) {
+            let Some(result) = &self.result else {
+                return;
+            };
+            ui.separator();
+            ui.label(RichText::new(format!("Result: {:?}", result.outcome)).strong());
+            if let Some(audit_id) = &result.audit_id {
+                ui.monospace(format!("Audit: {audit_id}"));
+            }
+            if let Some(detail) = &result.detail {
+                ui.label(detail);
+            }
+            for item in &result.items {
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(&item.item_id);
+                    ui.label(format!("{:?}", item.outcome));
+                    if let Some(detail) = &item.detail {
+                        ui.colored_label(Style::TEXT_DIM, detail);
+                    }
+                });
+            }
+        }
+    }
+
+    fn unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(1)
+    }
+
+    fn local_node_id() -> String {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "unknown-node".to_string())
+    }
+
+    pub(super) fn show(ui: &mut egui::Ui) {
+        let id = egui::Id::new(CONSOLE_STATE_ID);
+        let mut state = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<ActionConsoleState>(id))
+            .unwrap_or_default();
+        state.show(ui, unix_ms());
+        ui.ctx().data_mut(|data| data.insert_temp(id, state));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use mackes_mesh_types::worker_runtime::{
+            WorkerChangeSetItemOutcome, WorkerChangeSetItemResult, WorkerGroup, WorkerRuntimeState,
+        };
+
+        fn worker(generation: u64) -> WorkerStatusRow {
+            let mut contract =
+                WorkerContract::new("host-state", WorkerGroup::Observation, "Host state")
+                    .expect("worker contract");
+            contract.actions = vec![WorkerActionDescriptor {
+                action: WorkerAction::Refresh,
+                label: "Refresh".to_string(),
+                arming: WorkerArmingRequirement::Confirmation,
+            }];
+            contract.validate().expect("action remains admitted");
+            let snapshot = WorkerRuntimeSnapshot::new(
+                format!("snapshot-{generation}"),
+                "node-a",
+                "host-state",
+                WorkerGroup::Observation,
+                generation,
+                WorkerRuntimeState::Running,
+                1_000,
+                2_000,
+                2_000,
+                12_000,
+            )
+            .expect("snapshot");
+            WorkerStatusRow { contract, snapshot }
+        }
+
+        fn state(root: PathBuf) -> ActionConsoleState {
+            ActionConsoleState {
+                bus_root: Some(root),
+                node_id: "node-a".to_string(),
+                workers: vec![worker(7)],
+                selected_worker: Some("host-state".to_string()),
+                selected_action: Some(WorkerAction::Refresh),
+                staged: None,
+                result: None,
+                last_error: None,
+                last_poll: None,
+            }
+        }
+
+        #[test]
+        fn preview_publication_is_typed_authenticated_and_generation_bound() {
+            let temp = tempfile::tempdir().expect("bus root");
+            let mut console = state(temp.path().to_path_buf());
+            console.stage_preview(3_000).expect("publish preview");
+
+            let persist = Persist::open(temp.path().to_path_buf()).expect("open bus");
+            let message = persist
+                .read_latest("action/workers/change-set/node-a")
+                .expect("read request")
+                .expect("published request");
+            let request =
+                WorkerChangeSetRequest::from_json(message.body.as_deref().expect("request body"))
+                    .expect("admitted authorized request");
+            assert_eq!(request.operation, WorkerChangeSetOperation::Preview);
+            assert_eq!(request.expected_generation, 7);
+            assert_eq!(request.items.len(), 1);
+            assert_eq!(request.items[0].action, WorkerAction::Refresh);
+            assert!(
+                request
+                    .armed_token
+                    .as_deref()
+                    .is_some_and(|token| !token.is_empty()),
+                "the existing action authority must mint the exact-body capability"
+            );
+            assert!(!message.body.as_deref().unwrap().contains("command"));
+            assert!(!message.body.as_deref().unwrap().contains("path"));
+        }
+
+        #[test]
+        fn generation_change_discards_the_staged_preview_before_commit() {
+            let temp = tempfile::tempdir().expect("bus root");
+            let mut console = state(temp.path().to_path_buf());
+            console.stage_preview(3_000).expect("publish preview");
+            console.workers = vec![worker(8)];
+            console.reconcile_generation();
+            assert!(console.staged.is_none());
+            assert!(console.result.is_none());
+            assert!(console
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("generation changed")));
+        }
+
+        #[test]
+        fn admitted_partial_result_preserves_audit_and_per_item_failure() {
+            let temp = tempfile::tempdir().expect("bus root");
+            let mut console = state(temp.path().to_path_buf());
+            console.stage_preview(3_000).expect("publish preview");
+            let staged = console.staged.as_ref().expect("staged").clone();
+            let result = WorkerChangeSetResult {
+                schema_version: WORKER_RUNTIME_SCHEMA_VERSION,
+                request_id: staged.request_id,
+                operation: WorkerChangeSetOperation::Commit,
+                outcome: WorkerChangeSetOutcome::Partial,
+                target: staged.target,
+                expected_generation: staged.expected_generation,
+                actual_generation: staged.expected_generation + 1,
+                items: vec![WorkerChangeSetItemResult {
+                    item_id: staged.items[0].item_id.clone(),
+                    outcome: WorkerChangeSetItemOutcome::Failed,
+                    detail: Some("worker refused the transition".to_string()),
+                }],
+                audit_id: Some("audit-workers-1".to_string()),
+                completed_at_ms: 3_500,
+                detail: Some("one typed action failed".to_string()),
+            };
+            result.validate().expect("typed partial result");
+            let persist = Persist::open(temp.path().to_path_buf()).expect("open bus");
+            persist
+                .write(
+                    "state/workers/change-set/node-a",
+                    Priority::Default,
+                    None,
+                    Some(&result.to_json().expect("result body")),
+                )
+                .expect("publish result");
+            console.poll_result(&persist);
+            let admitted = console.result.as_ref().expect("projected result");
+            assert_eq!(admitted.outcome, WorkerChangeSetOutcome::Partial);
+            assert_eq!(admitted.audit_id.as_deref(), Some("audit-workers-1"));
+            assert_eq!(
+                admitted.items[0].outcome,
+                WorkerChangeSetItemOutcome::Failed
+            );
+        }
+    }
 }
 
 /// MENU-1 — the **State of the Mesh** bar over the five-plane nav (the operator

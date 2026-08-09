@@ -1034,6 +1034,8 @@ pub struct MapsLocationSurface {
     pub offline_maps: OfflineMapManagerState,
     /// Routing/search abstraction state.
     pub local_navigation: LocalNavigationState,
+    /// Canonical daemon navigation consumer and immutable route projection.
+    pub navigation: crate::navigation_ui::NavigationConsumer,
     /// MG90 local-management state.
     pub mg90: Mg90State,
     /// Location-source manager.
@@ -1064,6 +1066,9 @@ pub struct MapsLocationSurface {
     /// Throttle stamp for the per-frame `refresh_from_bus` Bus reads (PERF-5).
     /// Covers both the vehicle and overlay latest-wins mirrors.
     last_bus_poll: Option<Instant>,
+    /// Host identity learned from the caller that owns the live Bus fold. The
+    /// renderer uses this only to queue a typed viewport action.
+    weather_host: Option<String>,
 }
 
 impl MapsLocationSurface {
@@ -1108,6 +1113,7 @@ impl MapsLocationSurface {
             map,
             offline_maps,
             local_navigation: LocalNavigationState::live(),
+            navigation: crate::navigation_ui::NavigationConsumer::default(),
             mg90: Mg90State::live(),
             locations: LocationManager::live(),
             trips: TripRecorderState::live(),
@@ -1131,6 +1137,7 @@ impl MapsLocationSurface {
                     .to_string(),
             ],
             last_bus_poll: None,
+            weather_host: None,
         }
     }
 
@@ -1161,6 +1168,7 @@ impl MapsLocationSurface {
             map: MapViewState::simulated(),
             offline_maps: OfflineMapManagerState::simulated_default(),
             local_navigation: LocalNavigationState::simulated(),
+            navigation: crate::navigation_ui::NavigationConsumer::default(),
             mg90: Mg90State::simulated(),
             locations: LocationManager::simulated(),
             trips: TripRecorderState::simulated(),
@@ -1184,6 +1192,7 @@ impl MapsLocationSurface {
                     .to_string(),
             ],
             last_bus_poll: None,
+            weather_host: None,
         }
     }
 
@@ -1265,6 +1274,7 @@ impl MapsLocationSurface {
             return;
         }
         self.local_navigation.select_destination(idx);
+        self.queue_selected_route_request();
         self.destination_search = false;
         self.arrived = false;
         self.off_route = false;
@@ -1392,6 +1402,7 @@ impl MapsLocationSurface {
 
     /// Leave any navigation-flow overlay and return to the idle Drive HUD.
     pub fn end_navigation(&mut self) {
+        self.navigation.cancel();
         self.arrived = false;
         self.destination_search = false;
         self.route_preview = false;
@@ -1877,13 +1888,21 @@ impl MapsLocationSurface {
     /// reaching into the shell's crate-private `BusReader` seam, matching that
     /// seam's own fail-soft idiom for a cross-crate caller.
     pub fn refresh_from_bus(&mut self, node: &str) {
+        self.weather_host = Some(node.to_string());
+        self.process_pending_weather_search();
+        let has_pending_viewport = self.map.weather.pending_viewport().is_some();
+        let has_pending_location = self.map.weather.pending_location_action().is_some();
+        let has_pending_navigation = self.navigation.has_pending_action();
         // PERF-5: the shell calls this every frame (~60 Hz); gate the Bus spool
         // read + decode to ~2 Hz. The gateway refreshes the mirror ~1 Hz, so a more
         // frequent read is pure waste — the cockpit keeps drawing the last fold
         // between polls (latest-wins, byte-identical result).
-        if self
-            .last_bus_poll
-            .is_some_and(|t| t.elapsed() < BUS_REFRESH)
+        if !has_pending_viewport
+            && !has_pending_location
+            && !has_pending_navigation
+            && self
+                .last_bus_poll
+                .is_some_and(|t| t.elapsed() < BUS_REFRESH)
         {
             return;
         }
@@ -1910,6 +1929,109 @@ impl MapsLocationSurface {
         };
 
         self.refresh_from_persist(&persist, &root, node);
+        self.publish_pending_navigation(&persist, node);
+        self.publish_pending_weather_viewport(&persist, node);
+        self.publish_pending_weather_location(&persist);
+    }
+
+    /// Execute an explicitly submitted offline search before paint. The
+    /// renderer only mutates the in-memory queue and never opens the gazetteer.
+    fn process_pending_weather_search(&mut self) {
+        let Some(query) = self.map.weather.take_pending_manual_search() else {
+            return;
+        };
+        let outcome = crate::geocode::geocode_weather(&query, 24);
+        self.map.weather.complete_manual_search(&query, outcome);
+    }
+
+    /// Capture the interactive map's selected tile without performing I/O in
+    /// the painter. The next live refresh publishes it latest-wins.
+    pub fn queue_weather_viewport(&mut self) {
+        if !self.map.weather.active {
+            return;
+        }
+        let Some(host) = self.weather_host.as_deref() else {
+            return;
+        };
+        let zoom = self.map.zoom;
+        let pan = self.map.pan;
+        self.map
+            .weather
+            .queue_interactive_viewport(host, zoom, pan, unix_now_ms());
+    }
+
+    fn publish_pending_weather_viewport(
+        &mut self,
+        persist: &mde_bus::persist::Persist,
+        node: &str,
+    ) {
+        let Some(request) = self.map.weather.pending_viewport().cloned() else {
+            return;
+        };
+        if request.target_host != node || request.validate_at(unix_now_ms()).is_err() {
+            return;
+        }
+        let Ok(body) = serde_json::to_string(&request) else {
+            return;
+        };
+        if persist
+            .write(
+                &mackes_mesh_types::weather::weather_set_map_viewport_topic(node),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .is_ok()
+        {
+            self.map.weather.clear_pending_viewport(&request.request_id);
+        }
+    }
+
+    fn publish_pending_weather_location(&mut self, persist: &mde_bus::persist::Persist) {
+        use mackes_mesh_types::location::WEATHER_SET_LOCATION_TOPIC;
+
+        let Some(request) = self.map.weather.pending_location_action().cloned() else {
+            return;
+        };
+        if request.validate_at(unix_now_ms()).is_err() {
+            return;
+        }
+        let Ok(body) = serde_json::to_string(&request) else {
+            return;
+        };
+        if persist
+            .write(
+                WEATHER_SET_LOCATION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .is_ok()
+        {
+            self.map
+                .weather
+                .clear_pending_location_action(&request.request_id);
+        }
+    }
+
+    /// Publish one exact canonical navigation action outside render. Failed
+    /// writes retain the same request id/body for replay-safe retry.
+    fn publish_pending_navigation(&mut self, persist: &mde_bus::persist::Persist, node: &str) {
+        let now_ms = unix_now_ms();
+        let Some(action) = self.navigation.prepare_action(node, now_ms).cloned() else {
+            return;
+        };
+        if persist
+            .write(
+                &action.topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&action.body),
+            )
+            .is_ok()
+        {
+            self.navigation.mark_published(&action.request_id);
+        }
     }
 
     /// Fold one already-open Bus spool into the cockpit.
@@ -1988,6 +2110,111 @@ impl MapsLocationSurface {
         if let Some(snapshot) = read_air_quality_mirror(&reader, node) {
             self.refresh_from_air_quality(snapshot);
         }
+        // Weather is one generation-scoped projection set. Fold all four
+        // retained authorities together so a location change retracts older
+        // current/forecast/map children atomically from the UI model.
+        let now_ms = unix_now_ms();
+        if let Some(snapshot) = read_latest_json::<mackes_mesh_types::navigation::NavigationSnapshot>(
+            &reader,
+            &mackes_mesh_types::navigation::navigation_state_topic(node),
+        ) {
+            if self.navigation.fold(node, snapshot, now_ms) {
+                self.apply_navigation_projection();
+            }
+        }
+        self.map.weather.fold(
+            node,
+            read_weather_location_mirror(&reader, node, now_ms),
+            read_weather_current_mirror(&reader, node, now_ms),
+            read_weather_forecast_mirror(&reader, node, now_ms),
+            read_weather_map_mirror(&reader, node, now_ms),
+            read_weather_map_viewport_mirror(&reader, node, now_ms),
+        );
+    }
+
+    /// Queue a route intent using only the currently admitted immutable model
+    /// facts. The Bus host, request id, and wall clock are added by refresh.
+    fn queue_selected_route_request(&mut self) {
+        use mackes_mesh_types::navigation::RouteEndpoint;
+        use mackes_mesh_types::nws_alert::GeoPoint;
+
+        let Some(origin) = self
+            .locations
+            .primary_sample()
+            .filter(|sample| sample.has_fix())
+        else {
+            return;
+        };
+        let Some(destination) = self.local_navigation.active_destination() else {
+            return;
+        };
+        let Some((latitude, longitude)) = destination.geo() else {
+            return;
+        };
+        self.navigation.request_route(
+            RouteEndpoint {
+                label: self.locations.primary.label().to_string(),
+                point: GeoPoint {
+                    latitude: origin.latitude,
+                    longitude: origin.longitude,
+                },
+            },
+            RouteEndpoint {
+                label: destination.label.clone(),
+                point: GeoPoint {
+                    latitude,
+                    longitude,
+                },
+            },
+        );
+    }
+
+    /// Apply only daemon-provided route facts to the legacy Maps presentation
+    /// model. Non-active phases retract stale route options deterministically.
+    fn apply_navigation_projection(&mut self) {
+        use crate::navigation_ui::NavigationRouteStatus;
+
+        let Some(route) = self.navigation.route() else {
+            self.local_navigation.route_options.clear();
+            self.local_navigation.active_route = RoutePlan::none();
+            self.local_navigation.navigating = false;
+            self.off_route = false;
+            self.local_navigation.routing.graceful_unavailable = matches!(
+                self.navigation.status(),
+                NavigationRouteStatus::Unavailable(_)
+            );
+            return;
+        };
+        let miles = (route.distance_remaining_metres as f64 / 1_609.344) as f32;
+        let minutes =
+            u32::try_from(route.duration_remaining_seconds.div_ceil(60)).unwrap_or(u32::MAX);
+        let maneuver_miles = f64::from(route.maneuver_distance_metres) / 1_609.344;
+        self.local_navigation.routing.first_backend = route.provider_label.clone();
+        self.local_navigation.routing.local_only_core = route.offline;
+        self.local_navigation.routing.graceful_unavailable = false;
+        self.local_navigation.route_options = vec![RouteOption {
+            label: route.provider_label.clone(),
+            via: route.maneuver_instruction.clone(),
+            eta: format!("{minutes} min"),
+            remaining_time_min: minutes,
+            remaining_distance_mi: miles,
+            traffic: RouteTraffic::Clear,
+        }];
+        self.local_navigation.selected_route = 0;
+        self.local_navigation.active_route = RoutePlan {
+            current_road: route.maneuver_instruction.clone(),
+            next_maneuver: route.maneuver_instruction.clone(),
+            distance_to_maneuver_mi: maneuver_miles as f32,
+            eta: format!("{minutes} min"),
+            remaining_time_min: minutes,
+            remaining_distance_mi: miles,
+            alternatives: 0,
+            traffic_alert: String::new(),
+            weather_alert: String::new(),
+        };
+        self.local_navigation.navigating = true;
+        self.route_preview = false;
+        self.off_route = route.off_route;
     }
 
     /// Fold a complete USGS snapshot. Whole-snapshot replacement is deliberate:
@@ -2168,7 +2395,7 @@ fn cellular_link_from_wire(link: &mackes_mesh_types::vehicle::CellLink) -> Cellu
     }
 }
 
-fn unix_now_ms() -> i64 {
+pub(crate) fn unix_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2387,6 +2614,73 @@ fn read_air_quality_mirror(
 ) -> Option<mackes_mesh_types::air_quality::AirQualitySnapshot> {
     let topic = mackes_mesh_types::air_quality::air_quality_state_topic(node);
     read_latest_json_for_node(reader, &topic, node)
+}
+
+fn read_weather_location_mirror(
+    reader: &PersistedMirrorReader<'_>,
+    node: &str,
+    now_ms: i64,
+) -> Option<mackes_mesh_types::location::EffectiveLocationSnapshot> {
+    let topic = mackes_mesh_types::location::weather_location_state_topic(node);
+    let body = retained_overlay_body(reader, &topic)?;
+    let snapshot = mackes_mesh_types::location::EffectiveLocationSnapshot::from_json_at(
+        body.as_bytes(),
+        now_ms,
+    )
+    .ok()?;
+    (snapshot.host == node).then_some(snapshot)
+}
+
+fn read_weather_current_mirror(
+    reader: &PersistedMirrorReader<'_>,
+    node: &str,
+    now_ms: i64,
+) -> Option<mackes_mesh_types::weather::CurrentWeatherSnapshot> {
+    let topic = mackes_mesh_types::weather::weather_current_state_topic(node);
+    let body = retained_overlay_body(reader, &topic)?;
+    let snapshot =
+        mackes_mesh_types::weather::CurrentWeatherSnapshot::from_json_at(body.as_bytes(), now_ms)
+            .ok()?;
+    (snapshot.host == node).then_some(snapshot)
+}
+
+fn read_weather_forecast_mirror(
+    reader: &PersistedMirrorReader<'_>,
+    node: &str,
+    now_ms: i64,
+) -> Option<mackes_mesh_types::weather::WeatherForecastSnapshot> {
+    let topic = mackes_mesh_types::weather::weather_forecast_state_topic(node);
+    let body = retained_overlay_body(reader, &topic)?;
+    let snapshot =
+        mackes_mesh_types::weather::WeatherForecastSnapshot::from_json_at(body.as_bytes(), now_ms)
+            .ok()?;
+    (snapshot.host == node).then_some(snapshot)
+}
+
+fn read_weather_map_mirror(
+    reader: &PersistedMirrorReader<'_>,
+    node: &str,
+    now_ms: i64,
+) -> Option<mackes_mesh_types::weather::AtmosphericMapSnapshot> {
+    let topic = mackes_mesh_types::weather::weather_map_state_topic(node);
+    let body = retained_overlay_body(reader, &topic)?;
+    let snapshot =
+        mackes_mesh_types::weather::AtmosphericMapSnapshot::from_json_at(body.as_bytes(), now_ms)
+            .ok()?;
+    (snapshot.host == node).then_some(snapshot)
+}
+
+fn read_weather_map_viewport_mirror(
+    reader: &PersistedMirrorReader<'_>,
+    node: &str,
+    now_ms: i64,
+) -> Option<mackes_mesh_types::weather::WeatherMapViewportState> {
+    let topic = mackes_mesh_types::weather::weather_map_viewport_state_topic(node);
+    let body = retained_overlay_body(reader, &topic)?;
+    let snapshot =
+        mackes_mesh_types::weather::WeatherMapViewportState::from_json_at(body.as_bytes(), now_ms)
+            .ok()?;
+    (snapshot.host == node).then_some(snapshot)
 }
 
 /// Read and decode one retained latest-wins payload from an already-open Bus
@@ -2833,6 +3127,8 @@ pub struct MapViewState {
     pub air_quality_overlay: bool,
     /// Latest AirNow credential/configuration state and nearby station set.
     pub air_quality: crate::air_quality::AirQualityLayerState,
+    /// Single daemon-fed Weather presentation state for the map-first mode.
+    pub weather: crate::weather_ui::WeatherUiState,
     /// Attribution string shown on every map view.
     pub attribution: String,
 }
@@ -2879,6 +3175,7 @@ impl MapViewState {
             traffic_events: crate::traffic::TrafficLayerState::default(),
             air_quality_overlay: false,
             air_quality: crate::air_quality::AirQualityLayerState::default(),
+            weather: crate::weather_ui::WeatherUiState::default(),
             attribution: if region_installed {
                 "OpenStreetMap contributors | local offline package".to_string()
             } else {
@@ -2924,6 +3221,7 @@ impl MapViewState {
             traffic_events: crate::traffic::TrafficLayerState::default(),
             air_quality_overlay: false,
             air_quality: crate::air_quality::AirQualityLayerState::default(),
+            weather: crate::weather_ui::WeatherUiState::default(),
             attribution: "OpenStreetMap contributors | local offline package | simulated route"
                 .to_string(),
         }
@@ -6467,6 +6765,224 @@ mod tests {
             read_vehicle_mirror(&reader, node).is_none(),
             "cross-node vehicle state must not fold under the selected node topic"
         );
+    }
+
+    #[test]
+    fn weather_ui_folds_canonical_topics_and_retracts_old_generation() {
+        use mackes_mesh_types::location::{
+            weather_location_state_topic, EffectiveLocationProvenance, EffectiveLocationSnapshot,
+            EffectiveLocationState, EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
+            WEATHER_LOCATION_SCHEMA_VERSION,
+        };
+        use mackes_mesh_types::nws_alert::GeoPoint;
+        use mackes_mesh_types::weather::{
+            weather_current_state_topic, CurrentConditions, CurrentWeatherSnapshot, Temperature,
+            TemperatureUnit, WeatherAttribution, WeatherAvailability, WeatherConditionKind,
+            WeatherProvider, WEATHER_CONTRACT_SCHEMA_VERSION,
+        };
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let host = "weather-seat-1";
+        let now = test_now_ms();
+        let point = GeoPoint {
+            latitude: 42.36,
+            longitude: -71.06,
+        };
+        let location = |generation| EffectiveLocationSnapshot {
+            schema_version: WEATHER_LOCATION_SCHEMA_VERSION,
+            host: host.to_string(),
+            generation,
+            mode: WeatherLocationMode::Manual,
+            produced_at_ms: now,
+            state: EffectiveLocationState::Available {
+                location: EffectiveWeatherLocation {
+                    label: "Boston, MA".to_string(),
+                    point: point.clone(),
+                    time_zone: "America/New_York".to_string(),
+                    coverage: WeatherCoverage::NwsUnitedStates,
+                    provenance: EffectiveLocationProvenance::ManualVerifiedPlace {
+                        place_id: "boston-ma".to_string(),
+                    },
+                    source_observed_at_ms: None,
+                },
+            },
+        };
+        let current = CurrentWeatherSnapshot {
+            schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+            host: host.to_string(),
+            location_generation: 7,
+            location_point: Some(point),
+            producer_at_ms: now,
+            fetched_at_ms: now,
+            availability: WeatherAvailability::Fresh,
+            conditions: Some(CurrentConditions {
+                observed_at_ms: now,
+                condition: WeatherConditionKind::ClearDay,
+                provider_text: Some("Clear".to_string()),
+                temperature: Some(Temperature {
+                    value: 72.0,
+                    unit: TemperatureUnit::Fahrenheit,
+                }),
+                apparent_temperature: None,
+                relative_humidity_percent: None,
+                precipitation_probability_percent: None,
+                wind_speed: None,
+                wind_direction_degrees: None,
+                wind_gust: None,
+                visibility: None,
+                pressure: None,
+            }),
+            gaps: Vec::new(),
+            attributions: vec![WeatherAttribution {
+                provider: WeatherProvider::NationalWeatherService,
+                source_id: "nws".to_string(),
+                label: "National Weather Service".to_string(),
+            }],
+        };
+        for (topic, body) in [
+            (
+                weather_location_state_topic(host),
+                serde_json::to_string(&location(7)).expect("location json"),
+            ),
+            (
+                weather_current_state_topic(host),
+                serde_json::to_string(&current).expect("current json"),
+            ),
+        ] {
+            persist
+                .write(
+                    &topic,
+                    mde_bus::hooks::config::Priority::Default,
+                    None,
+                    Some(&body),
+                )
+                .expect("retained weather projection");
+        }
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_persist(&persist, dir.path(), host);
+        assert_eq!(state.map.weather.location_label(), "Boston, MA");
+        assert_eq!(state.map.weather.current_summary(), "Clear · 72°F");
+        assert_eq!(state.map.weather.attribution(), "National Weather Service");
+
+        persist
+            .write(
+                &weather_location_state_topic(host),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&location(8)).expect("new location json")),
+            )
+            .expect("new location generation");
+        state.refresh_from_persist(&persist, dir.path(), host);
+        assert_eq!(
+            state.map.weather.current_summary(),
+            "Current conditions unavailable",
+            "a retained generation-7 observation must not survive generation 8"
+        );
+    }
+
+    #[test]
+    fn interactive_weather_viewport_publishes_typed_latest_action() {
+        use mackes_mesh_types::location::{
+            EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
+            EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
+            WEATHER_LOCATION_SCHEMA_VERSION,
+        };
+        use mackes_mesh_types::nws_alert::GeoPoint;
+        use mackes_mesh_types::weather::{
+            weather_set_map_viewport_topic, SetWeatherMapViewportRequest,
+        };
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let host = "weather-seat-publish";
+        let location = EffectiveLocationSnapshot {
+            schema_version: WEATHER_LOCATION_SCHEMA_VERSION,
+            host: host.into(),
+            generation: 7,
+            mode: WeatherLocationMode::Manual,
+            produced_at_ms: unix_now_ms(),
+            state: EffectiveLocationState::Available {
+                location: EffectiveWeatherLocation {
+                    label: "Boston, MA".into(),
+                    point: GeoPoint {
+                        latitude: 42.36,
+                        longitude: -71.06,
+                    },
+                    time_zone: "America/New_York".into(),
+                    coverage: WeatherCoverage::NwsUnitedStates,
+                    provenance: EffectiveLocationProvenance::ManualVerifiedPlace {
+                        place_id: "boston-ma".into(),
+                    },
+                    source_observed_at_ms: None,
+                },
+            },
+        };
+        let mut surface = MapsLocationSurface::live();
+        surface.weather_host = Some(host.into());
+        surface.map.weather.active = true;
+        surface
+            .map
+            .weather
+            .fold(host, Some(location), None, None, None, None);
+        surface.queue_weather_viewport();
+        surface.publish_pending_weather_viewport(&persist, host);
+
+        let body = persist
+            .read_latest(&weather_set_map_viewport_topic(host))
+            .expect("read action")
+            .and_then(|message| message.body)
+            .expect("action body");
+        let action = SetWeatherMapViewportRequest::from_json_at(body.as_bytes(), unix_now_ms())
+            .expect("typed action");
+        assert_eq!(action.target_host, host);
+        assert_eq!(action.expected_location_generation, 7);
+        assert!(surface.map.weather.pending_viewport().is_none());
+    }
+
+    #[test]
+    fn manual_weather_selection_publishes_exact_typed_action() {
+        use mackes_mesh_types::location::{
+            SetWeatherLocationRequest, WeatherCoverage, WeatherLocationMode,
+            WEATHER_SET_LOCATION_TOPIC,
+        };
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let mut surface = MapsLocationSurface::live();
+        surface.map.weather.manual_search_query = "Boston".into();
+        surface.map.weather.complete_manual_search(
+            "Boston",
+            crate::geocode::WeatherGeocodeOutcome {
+                results: vec![crate::geocode::WeatherGeoResult {
+                    place_id: "offline-boston-ma".into(),
+                    label: "Boston, MA".into(),
+                    latitude: 42.36,
+                    longitude: -71.06,
+                    time_zone: "America/New_York".into(),
+                    coverage: WeatherCoverage::NwsUnitedStates,
+                }],
+                note: None,
+            },
+        );
+        let now_ms = unix_now_ms();
+        surface.map.weather.select_manual_result(0, now_ms);
+        surface.publish_pending_weather_location(&persist);
+
+        let body = persist
+            .read_latest(WEATHER_SET_LOCATION_TOPIC)
+            .expect("read action")
+            .and_then(|message| message.body)
+            .expect("action body");
+        let action = SetWeatherLocationRequest::from_json_at(body.as_bytes(), unix_now_ms())
+            .expect("typed action");
+        assert_eq!(action.mode, WeatherLocationMode::Manual);
+        assert_eq!(
+            action.manual_place.expect("manual place").place_id,
+            "offline-boston-ma"
+        );
+        assert!(surface.map.weather.pending_location_action().is_none());
     }
 
     #[test]

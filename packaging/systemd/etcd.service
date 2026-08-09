@@ -7,8 +7,9 @@
 # hiccup can never stall mesh liveness (SUBSTRATE-7/8 boot model).
 Description=MCNF mesh coordination (etcd) — leader/directory/health over Nebula
 Documentation=https://github.com/matthewmackes/magic-mesh docs/design/substrate-v2.md
+Requires=network-online.target nebula.service
 After=network-online.target nebula.service
-Wants=network-online.target
+Before=mackesd-control.service mackesd.target
 # Only run where setup-etcd.sh provisioned a local member (workstations are
 # clients only and carry no env file).
 ConditionPathExists=/etc/etcd/etcd.env

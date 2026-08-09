@@ -35,6 +35,7 @@ use mackes_mesh_types::android_apps::{
     AndroidGuestInventoryRequest, AndroidGuestInventoryResponse, AndroidGuestLaunchOutcome,
     AndroidGuestLaunchRequest, AndroidGuestRequest, AndroidGuestResponse, AndroidImageManifest,
 };
+use mackes_mesh_types::android_provider::AndroidVdiSource;
 use mackes_mesh_types::cloud::{CloudReply, DeliveryType, WorkloadSpec};
 
 use super::super::reconcile;
@@ -43,6 +44,8 @@ use super::CloudActionBody;
 
 #[path = "cuttlefish.rs"]
 mod cuttlefish;
+#[path = "cuttlefish_guest.rs"]
+mod cuttlefish_guest;
 
 pub(crate) use cuttlefish::{
     CuttlefishProviderAdapter, CuttlefishProviderClient, CuttlefishProviderError,
@@ -78,6 +81,34 @@ pub(crate) trait AndroidGuestProvider: Send + Sync {
 
     /// Dispatch the canonical launcher intent for one governed starter app.
     fn launch(&self, request: &AndroidGuestLaunchRequest) -> AndroidGuestLaunchOutcome;
+
+    /// Observe inventory for the exact lifecycle generation.
+    fn inventory_at(
+        &self,
+        request: &AndroidGuestInventoryRequest,
+        _generation: u64,
+    ) -> AndroidAppInventory {
+        self.inventory(request)
+    }
+
+    /// Launch only within the exact lifecycle generation.
+    fn launch_at(
+        &self,
+        request: &AndroidGuestLaunchRequest,
+        _generation: u64,
+    ) -> AndroidGuestLaunchOutcome {
+        self.launch(request)
+    }
+
+    /// Return a truthful guest-owned display source for one generation.
+    fn vdi_source(&self, _generation: u64) -> Option<AndroidVdiSource> {
+        None
+    }
+
+    /// Revoke the guest app/session for one generation before outer-VM cleanup.
+    fn cleanup(&self, _request_id: &str, _generation: u64) -> bool {
+        false
+    }
 }
 
 /// The honest provider used until a Cuttlefish package-manager adapter is
@@ -225,6 +256,11 @@ impl AndroidGuestProviderRegistry {
             })
     }
 
+    /// Remove a provider whose current production preflight no longer passes.
+    pub(crate) fn unregister(&mut self, workload_id: &str) {
+        self.providers.remove(workload_id);
+    }
+
     /// Number of registered workload providers.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
@@ -250,6 +286,43 @@ impl AndroidGuestProviderRegistry {
         let provider: &dyn AndroidGuestProvider =
             self.provider(&workload_id).unwrap_or(&unconfigured);
         dispatch_guest_request(provider, request)
+    }
+
+    pub(crate) fn inventory_at(
+        &self,
+        request: &AndroidGuestInventoryRequest,
+        generation: u64,
+    ) -> AndroidAppInventory {
+        self.provider(&request.workload_id).map_or_else(
+            |_| AndroidAppInventory::pending(request.workload_id.clone()),
+            |provider| provider.inventory_at(request, generation),
+        )
+    }
+
+    pub(crate) fn launch_at(
+        &self,
+        request: &AndroidGuestLaunchRequest,
+        generation: u64,
+    ) -> AndroidGuestLaunchOutcome {
+        self.provider(&request.workload_id)
+            .map_or(AndroidGuestLaunchOutcome::Unavailable, |provider| {
+                provider.launch_at(request, generation)
+            })
+    }
+
+    pub(crate) fn vdi_source(
+        &self,
+        workload_id: &str,
+        generation: u64,
+    ) -> Option<AndroidVdiSource> {
+        self.provider(workload_id)
+            .ok()
+            .and_then(|provider| provider.vdi_source(generation))
+    }
+
+    pub(crate) fn cleanup(&self, workload_id: &str, request_id: &str, generation: u64) -> bool {
+        self.provider(workload_id)
+            .is_ok_and(|provider| provider.cleanup(request_id, generation))
     }
 }
 

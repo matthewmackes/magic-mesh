@@ -22,6 +22,7 @@
 //! dependency — §6 mesh/desktop boundary), the same pattern the Fleet plane and
 //! the Chat surface use for their topics.
 
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -31,11 +32,14 @@ use std::time::{Duration, Instant};
 
 use mde_bus::persist::Persist;
 use mde_egui::egui;
-use mde_egui::{OsdLevel, Severity, Tier, Toast, ToastHost};
+use mde_egui::{OsdLevel, Severity, Style, Tier, Toast, ToastHost};
 use serde::Deserialize;
 
 use crate::notification_center::NotificationRing;
 use crate::surfaces::Surface;
+use crate::timers::{
+    clock_banner_projection, request_clock_banner_action, ClockBannerKind, ClockBannerProjection,
+};
 use crate::workbench::Plane;
 
 /// The typed Bus lane any node / worker raises an alert on (lock 7). Flat — the
@@ -552,7 +556,7 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // The Timers & Alarms surface — the clock's replacement; the
         // `clock` alias keeps a "where did the clock go?" verb landing somewhere
         // honest (lock #5: the clock is now Timers & Alarms).
-        "timers" | "alarms" | "clock" => Some(Surface::Timers),
+        "timers" | "alarms" | "clock" => Some(Surface::Clock),
         // REACH-1 (2026-07-12) — the six surfaces that previously had no `shell/goto`
         // verb, so an alert/chyron action targeting them silently no-op'd. Now every
         // surface is reachable by name.
@@ -613,6 +617,16 @@ pub(crate) struct ToastBridge {
     /// Notification Center semantic). A pure presentation data tap; the
     /// queue/sound policy in [`Self::admit`] is untouched.
     history: NotificationRing,
+    /// Alerts admitted since Notification Center last exposed its visible
+    /// rows. This is process-local presentation state, bounded by the retained
+    /// ring; it is not a second acknowledgement or persistence authority.
+    unread: usize,
+    /// Current daemon-projected Clock banners.  They preempt generic chyrons but
+    /// do not own schedules, deadlines, or command publication.
+    clock_banners: Vec<ClockBannerProjection>,
+    /// Bounded deduplication of occurrence/schedule generations already folded
+    /// into history and sounded by this shell process.
+    seen_clock_banners: VecDeque<ClockBannerProjection>,
 }
 
 impl Default for ToastBridge {
@@ -628,6 +642,9 @@ impl Default for ToastBridge {
             chime: Box::new(SystemChime),
             read_error_logged: false,
             history: NotificationRing::default(),
+            unread: 0,
+            clock_banners: Vec::new(),
+            seen_clock_banners: VecDeque::new(),
         }
     }
 }
@@ -686,11 +703,74 @@ impl ToastBridge {
     pub(crate) fn drive(&mut self, ctx: &egui::Context) -> Option<Navigate> {
         self.tick(ctx);
         self.drain();
-        let action = self.host.chyron(ctx).action;
+        self.sync_clock_banners(ctx);
+        if notification_center_visible(ctx) {
+            self.unread = 0;
+        }
+        publish_unread(ctx, self.unread);
+        let action = if self.clock_banners.is_empty() {
+            self.host.chyron(ctx).action
+        } else {
+            paint_clock_banners(ctx, &self.clock_banners);
+            None
+        };
         // The centered OSD tier is a separate, instant channel; painting it here
         // keeps hardware feedback live without notification clutter.
         self.host.osd(ctx);
         action.as_deref().and_then(resolve_action)
+    }
+
+    fn sync_clock_banners(&mut self, ctx: &egui::Context) {
+        let mut projected = clock_banner_projection(ctx);
+        let now_ms = crate::timers::now_unix().saturating_mul(1_000);
+
+        // Preserve the original bounded action deadline while the same daemon
+        // identity remains live; periodic projections must not keep extending a
+        // retained row's authority forever.
+        for banner in &mut projected {
+            if let Some(existing) = self
+                .seen_clock_banners
+                .iter()
+                .find(|existing| existing.identity == banner.identity)
+            {
+                banner.actions = existing.actions.clone();
+            }
+        }
+        self.history.refresh_clock_actionability(&projected, now_ms);
+
+        for banner in &projected {
+            if self
+                .seen_clock_banners
+                .iter()
+                .any(|existing| existing.identity == banner.identity)
+            {
+                continue;
+            }
+            self.seen_clock_banners.push_back(banner.clone());
+            while self.seen_clock_banners.len() > crate::notification_center::RING_CAP {
+                self.seen_clock_banners.pop_front();
+            }
+            self.history.record_clock(banner, crate::timers::now_unix());
+            self.unread = self.unread.saturating_add(1).min(self.history.len());
+            let severity = clock_banner_severity(banner);
+            if !self.suppress.hushes_sound(severity) {
+                self.chime.ring(severity);
+            }
+        }
+
+        projected.retain(|banner| {
+            banner
+                .actions
+                .iter()
+                .all(|action| now_ms <= action.valid_until_utc_ms)
+                && !self
+                    .suppress
+                    .hides_ambient_push(clock_banner_severity(banner))
+        });
+        self.clock_banners = projected;
+        if !self.clock_banners.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     /// Advance the host's countdowns by the elapsed frame delta and keep the
@@ -787,6 +867,7 @@ impl ToastBridge {
         // found later). Pure data tap; nothing below changes.
         self.history
             .record(severity, &toast.source_host, &toast.flag, &toast.headline);
+        self.unread = self.unread.saturating_add(1).min(self.history.len());
         // Deployment notices tagged AI-GENERATED-ALERT are an explicit operator
         // safety channel: they remain visible through DND/focused-VDI posture so
         // a seat is warned before its shell or services are updated. Audio still
@@ -810,6 +891,92 @@ impl ToastBridge {
     pub(crate) const fn history_mut(&mut self) -> &mut NotificationRing {
         &mut self.history
     }
+
+    /// Mark the rows currently exposed by Notification Center as read.
+    pub(crate) fn mark_visible_read(&mut self, ctx: &egui::Context) {
+        self.unread = 0;
+        publish_unread(ctx, 0);
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn unread(&self) -> usize {
+        self.unread
+    }
+}
+
+const CLOCK_BANNER_VISIBLE_CAP: usize = 4;
+
+const fn clock_banner_severity(banner: &ClockBannerProjection) -> Severity {
+    match banner.actions[0].kind {
+        ClockBannerKind::Alarm => Severity::Critical,
+        ClockBannerKind::Timer => Severity::Warning,
+    }
+}
+
+fn paint_clock_banners(ctx: &egui::Context, banners: &[ClockBannerProjection]) {
+    egui::Area::new(egui::Id::new("shell-clock-action-banners"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, Style::SP_M))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.set_max_width(520.0);
+            ui.vertical(|ui| {
+                for banner in banners.iter().take(CLOCK_BANNER_VISIBLE_CAP) {
+                    egui::Frame::popup(ui.style())
+                        .fill(Style::SURFACE)
+                        .stroke(Style::hairline())
+                        .corner_radius(Style::RADIUS_M)
+                        .inner_margin(Style::SP_M)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(&banner.headline)
+                                    .color(Style::TEXT_STRONG)
+                                    .strong(),
+                            );
+                            ui.horizontal(|ui| {
+                                for action in &banner.actions {
+                                    if ui.button(action.label).clicked() {
+                                        request_clock_banner_action(ui.ctx(), action.clone());
+                                    }
+                                }
+                            });
+                        });
+                }
+                if banners.len() > CLOCK_BANNER_VISIBLE_CAP {
+                    ui.label(format!(
+                        "+{} more Clock alerts in Notification Center",
+                        banners.len() - CLOCK_BANNER_VISIBLE_CAP
+                    ));
+                }
+            });
+        });
+}
+
+fn unread_context_id() -> egui::Id {
+    egui::Id::new("construct-notification-unread")
+}
+
+fn notification_center_visible_id() -> egui::Id {
+    egui::Id::new("construct-notification-center-visible")
+}
+
+pub(crate) fn set_notification_center_visible(ctx: &egui::Context, visible: bool) {
+    ctx.data_mut(|data| data.insert_temp(notification_center_visible_id(), visible));
+}
+
+fn notification_center_visible(ctx: &egui::Context) -> bool {
+    ctx.data(|data| {
+        data.get_temp(notification_center_visible_id())
+            .unwrap_or(false)
+    })
+}
+
+fn publish_unread(ctx: &egui::Context, unread: usize) {
+    ctx.data_mut(|data| data.insert_temp(unread_context_id(), unread));
+}
+
+/// Read-only chrome projection of the bridge's bounded unread count.
+pub(crate) fn unread_count(ctx: &egui::Context) -> usize {
+    ctx.data(|data| data.get_temp(unread_context_id()).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -820,12 +987,12 @@ mod tests {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::Style;
+    use mde_egui::{Style, Toast};
 
     use super::{
         alert_severity, built_in_chime_wav, decode, initial_toast_cursor, plane_by_name,
-        pulse_server_from_runtime_dir, resolve_action, surface_by_name, try_chime_backends, Chime,
-        ChimeBackend, Navigate, Severity, Suppress, ToastBridge, TOAST_TOPIC,
+        pulse_server_from_runtime_dir, resolve_action, surface_by_name, try_chime_backends,
+        unread_count, Chime, ChimeBackend, Navigate, Severity, Suppress, ToastBridge, TOAST_TOPIC,
     };
     use crate::surfaces::Surface;
     use crate::workbench::Plane;
@@ -854,6 +1021,89 @@ mod tests {
         format!(
             r#"{{"severity":"{severity}","source_host":"{host}","flag":"SECURITY","headline":"{headline}"}}"#
         )
+    }
+
+    #[test]
+    fn notification_unread_is_bounded_and_marked_read_only_when_exposed() {
+        let recorder = Recorder::default();
+        let mut bridge = bridge_with(&recorder);
+        bridge.raise(Toast::alert(
+            Severity::Warning,
+            "seat-9",
+            "CLOCK",
+            "Timer complete",
+        ));
+        assert_eq!(bridge.unread(), 1);
+        assert_eq!(bridge.history().len(), 1);
+
+        let ctx = egui::Context::default();
+        bridge.mark_visible_read(&ctx);
+        assert_eq!(bridge.unread(), 0);
+        assert_eq!(unread_count(&ctx), 0);
+        assert_eq!(
+            bridge.history().len(),
+            1,
+            "mark-read must retain the notification row"
+        );
+    }
+
+    #[test]
+    fn clock_projection_is_folded_once_and_stale_rows_lose_actionability() {
+        use crate::notification_center::grouped;
+        use crate::timers::{
+            ClockBannerAction, ClockBannerKind, ClockBannerProjection, ClockBannerVerb,
+        };
+
+        let now_ms = crate::timers::now_unix().saturating_mul(1_000);
+        let action = |label, verb| ClockBannerAction {
+            label,
+            verb,
+            kind: ClockBannerKind::Alarm,
+            occurrence_id: "occurrence-1".into(),
+            occurrence_revision: 5,
+            schedule_id: "alarm-1".into(),
+            schedule_revision: 6,
+            admitted_snapshot_revision: 7,
+            valid_until_utc_ms: now_ms + 60_000,
+        };
+        let banner = ClockBannerProjection {
+            headline: "Alarm · Wake up".into(),
+            identity: "occurrence-1:5:alarm-1:6".into(),
+            actions: [
+                action("Snooze", ClockBannerVerb::Snooze),
+                action("Stop", ClockBannerVerb::Stop),
+            ],
+        };
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("shell-clock-banner-projection"), vec![banner]);
+        });
+        let recorder = Recorder::default();
+        let mut bridge = bridge_with(&recorder);
+        bridge.sync_clock_banners(&ctx);
+        bridge.sync_clock_banners(&ctx);
+        assert_eq!(bridge.history().len(), 1, "projection deduplicated");
+        assert_eq!(recorder.0.borrow().len(), 1, "one Clock chime");
+        assert!(
+            grouped(bridge.history())[0].entries[0]
+                .clock_actions
+                .as_ref()
+                .expect("retained Clock metadata")
+                .actionable
+        );
+
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("shell-clock-banner-projection"),
+                Vec::<ClockBannerProjection>::new(),
+            );
+        });
+        bridge.sync_clock_banners(&ctx);
+        let retained = grouped(bridge.history())[0].entries[0]
+            .clock_actions
+            .as_ref()
+            .expect("metadata remains retained");
+        assert!(!retained.actionable, "stale row must fail closed");
     }
 
     #[test]

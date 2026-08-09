@@ -107,9 +107,7 @@ mod tests {
         assert_eq!(backoff_delay_secs(0, 0, 60), MIN_RETRY_DELAY_SECS);
         assert_eq!(backoff_delay_secs(1, 0, 60), 2);
         assert_eq!(backoff_delay_secs(0, 1, 0), MIN_RETRY_DELAY_SECS);
-        assert!(
-            (0..8).all(|attempt| backoff_delay_secs(attempt, 0, 0) >= MIN_RETRY_DELAY_SECS)
-        );
+        assert!((0..8).all(|attempt| backoff_delay_secs(attempt, 0, 0) >= MIN_RETRY_DELAY_SECS));
     }
 
     #[test]

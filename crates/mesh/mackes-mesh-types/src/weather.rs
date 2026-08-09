@@ -25,7 +25,10 @@ pub const WEATHER_CONTRACT_SCHEMA_VERSION: u16 = 1;
 pub const WEATHER_CURRENT_STATE_PREFIX: &str = "state/weather/current/";
 pub const WEATHER_FORECAST_STATE_PREFIX: &str = "state/weather/forecast/";
 pub const WEATHER_MAP_STATE_PREFIX: &str = "state/weather/map/";
+pub const WEATHER_SET_MAP_VIEWPORT_PREFIX: &str = "action/weather/set-map-viewport/";
+pub const WEATHER_MAP_VIEWPORT_STATE_PREFIX: &str = "state/weather/map-viewport/";
 pub const MAX_WEATHER_WIRE_BYTES: usize = 512 * 1024;
+pub const MAX_WEATHER_VIEWPORT_WIRE_BYTES: usize = 16 * 1024;
 pub const MAX_WEATHER_HOURLY_PERIODS: usize = 120;
 pub const MAX_WEATHER_DAILY_SUMMARIES: usize = 5;
 pub const MAX_WEATHER_GAPS: usize = 16;
@@ -37,6 +40,17 @@ pub const MAX_FORECAST_FRESH_AGE_MS: i64 = 90 * 60 * 1_000;
 pub const MAX_FORECAST_HORIZON_MS: i64 = 6 * 24 * 60 * 60 * 1_000;
 pub const MAX_HOURLY_PERIOD_MS: i64 = 2 * 60 * 60 * 1_000;
 pub const MAX_DAILY_SOURCE_PERIODS: u16 = 25;
+pub const MAX_ATMOSPHERIC_MAP_WIRE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_ATMOSPHERIC_FIELD_PNG_BYTES: usize = 256 * 1024;
+pub const ATMOSPHERIC_FIELD_EDGE: u16 = 256;
+pub const MAX_ATMOSPHERIC_FRESH_AGE_MS: i64 = 20 * 60 * 1_000;
+pub const MAX_ATMOSPHERIC_CACHE_AGE_MS: i64 = 2 * 60 * 60 * 1_000;
+pub const NOWCOAST_NDFD_TEMPERATURE_PATH: &str = "/geoserver/forecasts/ndfd_temperature/ows";
+pub const NOWCOAST_NDFD_TEMPERATURE_LAYER: &str = "air_temperature";
+pub const NOWCOAST_NDFD_WIND_PATH: &str = "/geoserver/forecasts/ndfd_wind/ows";
+pub const NOWCOAST_NDFD_WIND_LAYER: &str = "wind_velocity";
+pub const NOWCOAST_NDFD_SKY_PATH: &str = "/geoserver/forecasts/ndfd_sky/ows";
+pub const NOWCOAST_NDFD_SKY_LAYER: &str = "total_sky_cover";
 
 #[must_use]
 pub fn weather_current_state_topic(host: &str) -> String {
@@ -51,6 +65,16 @@ pub fn weather_forecast_state_topic(host: &str) -> String {
 #[must_use]
 pub fn weather_map_state_topic(host: &str) -> String {
     format!("{WEATHER_MAP_STATE_PREFIX}{host}")
+}
+
+#[must_use]
+pub fn weather_set_map_viewport_topic(host: &str) -> String {
+    format!("{WEATHER_SET_MAP_VIEWPORT_PREFIX}{host}")
+}
+
+#[must_use]
+pub fn weather_map_viewport_state_topic(host: &str) -> String {
+    format!("{WEATHER_MAP_VIEWPORT_STATE_PREFIX}{host}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -228,6 +252,251 @@ pub enum WeatherAvailability {
     Fresh,
     Stale { reason: WeatherStaleReason },
     Unavailable { reason: WeatherUnavailableReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtmosphericFieldKind {
+    Temperature,
+    Wind,
+    CloudCover,
+}
+
+impl AtmosphericFieldKind {
+    #[must_use]
+    pub const fn nowcoast_product(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Temperature => (
+                NOWCOAST_NDFD_TEMPERATURE_PATH,
+                NOWCOAST_NDFD_TEMPERATURE_LAYER,
+            ),
+            Self::Wind => (NOWCOAST_NDFD_WIND_PATH, NOWCOAST_NDFD_WIND_LAYER),
+            Self::CloudCover => (NOWCOAST_NDFD_SKY_PATH, NOWCOAST_NDFD_SKY_LAYER),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtmosphericViewport {
+    pub generation: u64,
+    pub zoom: u8,
+    pub x: u32,
+    pub y: u32,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+impl AtmosphericViewport {
+    fn validate(&self) -> Result<(), WeatherContractError> {
+        if self.generation == 0
+            || !(2..=12).contains(&self.zoom)
+            || self.x >= (1_u32 << self.zoom)
+            || self.y >= (1_u32 << self.zoom)
+            || self.pixel_width != ATMOSPHERIC_FIELD_EDGE
+            || self.pixel_height != ATMOSPHERIC_FIELD_EDGE
+        {
+            return Err(WeatherContractError::InvalidRelationship(
+                "atmospheric_viewport",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetWeatherMapViewportRequest {
+    pub schema_version: u16,
+    pub request_id: String,
+    pub target_host: String,
+    pub expected_location_generation: u64,
+    pub viewport: AtmosphericViewport,
+    pub issued_at_ms: i64,
+}
+
+impl SetWeatherMapViewportRequest {
+    pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
+        validate_weather_schema(self.schema_version)?;
+        validate_id(&self.request_id, "request_id")?;
+        validate_id(&self.target_host, "target_host")?;
+        if self.expected_location_generation == 0 {
+            return Err(WeatherContractError::InvalidGeneration);
+        }
+        self.viewport.validate()?;
+        validate_not_future(self.issued_at_ms, now_ms, "issued_at_ms")
+    }
+
+    pub fn from_json_at(body: &[u8], now_ms: i64) -> Result<Self, WeatherContractError> {
+        let value: Self = decode_json(body, MAX_WEATHER_VIEWPORT_WIRE_BYTES)?;
+        value.validate_at(now_ms)?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherMapViewportSource {
+    MapsAction,
+    EffectiveLocationFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeatherMapViewportState {
+    pub schema_version: u16,
+    pub host: String,
+    pub location_generation: u64,
+    pub viewport: AtmosphericViewport,
+    pub source: WeatherMapViewportSource,
+    pub admitted_at_ms: i64,
+}
+
+impl WeatherMapViewportState {
+    pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
+        validate_weather_schema(self.schema_version)?;
+        validate_id(&self.host, "host")?;
+        if self.location_generation == 0 {
+            return Err(WeatherContractError::InvalidGeneration);
+        }
+        self.viewport.validate()?;
+        validate_not_future(self.admitted_at_ms, now_ms, "admitted_at_ms")
+    }
+
+    pub fn from_json_at(body: &[u8], now_ms: i64) -> Result<Self, WeatherContractError> {
+        let value: Self = decode_json(body, MAX_WEATHER_VIEWPORT_WIRE_BYTES)?;
+        value.validate_at(now_ms)?;
+        Ok(value)
+    }
+}
+
+const fn validate_weather_schema(schema_version: u16) -> Result<(), WeatherContractError> {
+    if schema_version != WEATHER_CONTRACT_SCHEMA_VERSION {
+        return Err(WeatherContractError::UnsupportedSchema {
+            found: schema_version,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtmosphericFieldImage {
+    pub kind: AtmosphericFieldKind,
+    pub provider_service_path: String,
+    pub provider_layer_name: String,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    pub png_base64: String,
+}
+
+impl AtmosphericFieldImage {
+    fn validate(&self) -> Result<(), WeatherContractError> {
+        let (expected_service, expected_layer) = self.kind.nowcoast_product();
+        if self.provider_service_path != expected_service
+            || self.provider_layer_name != expected_layer
+            || self.pixel_width != ATMOSPHERIC_FIELD_EDGE
+            || self.pixel_height != ATMOSPHERIC_FIELD_EDGE
+        {
+            return Err(WeatherContractError::InvalidRelationship(
+                "atmospheric_field_identity",
+            ));
+        }
+        let png = decode_bounded_base64(
+            &self.png_base64,
+            MAX_ATMOSPHERIC_FIELD_PNG_BYTES,
+            "atmospheric_png",
+        )?;
+        validate_png_dimensions(
+            &png,
+            u32::from(self.pixel_width),
+            u32::from(self.pixel_height),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtmosphericMapSnapshot {
+    pub schema_version: u16,
+    pub host: String,
+    pub location_generation: u64,
+    pub location_point: GeoPoint,
+    pub viewport: AtmosphericViewport,
+    pub rendered_at_ms: i64,
+    pub fetched_at_ms: i64,
+    pub availability: WeatherAvailability,
+    #[serde(default)]
+    pub fields: Vec<AtmosphericFieldImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<String>,
+    pub attributions: Vec<WeatherAttribution>,
+}
+
+impl AtmosphericMapSnapshot {
+    pub fn validate_at(&self, now_ms: i64) -> Result<(), WeatherContractError> {
+        validate_common(
+            self.schema_version,
+            &self.host,
+            self.location_generation,
+            Some(&self.location_point),
+            self.rendered_at_ms,
+            self.fetched_at_ms,
+            &self.gaps,
+            &self.attributions,
+            now_ms,
+        )?;
+        self.viewport.validate()?;
+        let age = now_ms.saturating_sub(self.rendered_at_ms).max(0);
+        match self.availability {
+            WeatherAvailability::Fresh => {
+                if age > MAX_ATMOSPHERIC_FRESH_AGE_MS {
+                    return Err(WeatherContractError::InvalidRelationship(
+                        "fresh_atmospheric_age",
+                    ));
+                }
+                self.validate_available_fields()?;
+            }
+            WeatherAvailability::Stale { .. } => {
+                if !(MAX_ATMOSPHERIC_FRESH_AGE_MS < age && age <= MAX_ATMOSPHERIC_CACHE_AGE_MS) {
+                    return Err(WeatherContractError::InvalidRelationship(
+                        "stale_atmospheric_age",
+                    ));
+                }
+                self.validate_available_fields()?;
+            }
+            WeatherAvailability::Unavailable { .. } => {
+                if !self.fields.is_empty() {
+                    return Err(WeatherContractError::InvalidRelationship(
+                        "unavailable_atmospheric_payload",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_available_fields(&self) -> Result<(), WeatherContractError> {
+        if self.fields.len() != 3 {
+            return Err(WeatherContractError::InvalidRelationship(
+                "complete_atmospheric_fields",
+            ));
+        }
+        let mut kinds = BTreeSet::new();
+        for field in &self.fields {
+            field.validate()?;
+            if !kinds.insert(field.kind) {
+                return Err(WeatherContractError::Duplicate("atmospheric_fields"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn from_json_at(body: &[u8], now_ms: i64) -> Result<Self, WeatherContractError> {
+        let value: Self = decode_json(body, MAX_ATMOSPHERIC_MAP_WIRE_BYTES)?;
+        value.validate_at(now_ms)?;
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -742,6 +1011,96 @@ fn validate_time_zone(value: &str) -> Result<(), WeatherContractError> {
     Ok(())
 }
 
+fn decode_bounded_base64(
+    value: &str,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<Vec<u8>, WeatherContractError> {
+    let max_encoded = max_bytes.div_ceil(3).saturating_mul(4);
+    if value.is_empty() || value.len() > max_encoded || value.len() % 4 != 0 {
+        return Err(WeatherContractError::InvalidField(field));
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity((bytes.len() / 4).saturating_mul(3));
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let final_chunk = index + 1 == bytes.len() / 4;
+        let a = base64_value(chunk[0]).ok_or(WeatherContractError::InvalidField(field))?;
+        let b = base64_value(chunk[1]).ok_or(WeatherContractError::InvalidField(field))?;
+        let c_padding = chunk[2] == b'=';
+        let d_padding = chunk[3] == b'=';
+        if c_padding && !d_padding
+            || (!final_chunk && (c_padding || d_padding))
+            || (c_padding && b & 0x0f != 0)
+        {
+            return Err(WeatherContractError::InvalidField(field));
+        }
+        let c = if c_padding {
+            0
+        } else {
+            base64_value(chunk[2]).ok_or(WeatherContractError::InvalidField(field))?
+        };
+        if d_padding && c & 0x03 != 0 {
+            return Err(WeatherContractError::InvalidField(field));
+        }
+        let d = if d_padding {
+            0
+        } else {
+            base64_value(chunk[3]).ok_or(WeatherContractError::InvalidField(field))?
+        };
+        decoded.push((a << 2) | (b >> 4));
+        if !c_padding {
+            decoded.push((b << 4) | (c >> 2));
+        }
+        if !d_padding {
+            decoded.push((c << 6) | d);
+        }
+        if decoded.len() > max_bytes {
+            return Err(WeatherContractError::CapacityExceeded {
+                field,
+                max: max_bytes,
+            });
+        }
+    }
+    Ok(decoded)
+}
+
+fn base64_value(value: u8) -> Option<u8> {
+    match value {
+        b'A'..=b'Z' => Some(value - b'A'),
+        b'a'..=b'z' => Some(value - b'a' + 26),
+        b'0'..=b'9' => Some(value - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn validate_png_dimensions(
+    png: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(), WeatherContractError> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    let width = png
+        .get(16..20)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_be_bytes);
+    let height = png
+        .get(20..24)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_be_bytes);
+    if png.len() < 41
+        || !png.starts_with(SIGNATURE)
+        || png.get(12..16) != Some(b"IHDR")
+        || width != Some(expected_width)
+        || height != Some(expected_height)
+        || png.get(png.len().saturating_sub(8)..png.len().saturating_sub(4)) != Some(b"IEND")
+    {
+        return Err(WeatherContractError::InvalidField("atmospheric_png"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,5 +1422,166 @@ mod tests {
         forecast.hourly.clear();
         forecast.daily.clear();
         assert!(forecast.validate_at(NOW).is_ok());
+    }
+
+    fn atmospheric_field(kind: AtmosphericFieldKind) -> AtmosphericFieldImage {
+        let (service, layer) = kind.nowcoast_product();
+        AtmosphericFieldImage {
+            kind,
+            provider_service_path: service.into(),
+            provider_layer_name: layer.into(),
+            pixel_width: ATMOSPHERIC_FIELD_EDGE,
+            pixel_height: ATMOSPHERIC_FIELD_EDGE,
+            png_base64: "iVBORw0KGgoAAAAASUhEUgAAAQAAAAEAAAAAAAAAAAAASUVORAAAAAA=".into(),
+        }
+    }
+
+    fn atmospheric() -> AtmosphericMapSnapshot {
+        AtmosphericMapSnapshot {
+            schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+            host: "workstation-1".into(),
+            location_generation: 7,
+            location_point: point(),
+            viewport: AtmosphericViewport {
+                generation: 7,
+                zoom: 6,
+                x: 19,
+                y: 23,
+                pixel_width: ATMOSPHERIC_FIELD_EDGE,
+                pixel_height: ATMOSPHERIC_FIELD_EDGE,
+            },
+            rendered_at_ms: NOW - 60_000,
+            fetched_at_ms: NOW - 60_000,
+            availability: WeatherAvailability::Fresh,
+            fields: vec![
+                atmospheric_field(AtmosphericFieldKind::Temperature),
+                atmospheric_field(AtmosphericFieldKind::Wind),
+                atmospheric_field(AtmosphericFieldKind::CloudCover),
+            ],
+            gaps: vec![],
+            attributions: vec![attribution()],
+        }
+    }
+
+    fn viewport_action() -> SetWeatherMapViewportRequest {
+        SetWeatherMapViewportRequest {
+            schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+            request_id: "viewport-8".into(),
+            target_host: "workstation-1".into(),
+            expected_location_generation: 7,
+            viewport: AtmosphericViewport {
+                generation: 8,
+                zoom: 7,
+                x: 38,
+                y: 47,
+                pixel_width: ATMOSPHERIC_FIELD_EDGE,
+                pixel_height: ATMOSPHERIC_FIELD_EDGE,
+            },
+            issued_at_ms: NOW - 1_000,
+        }
+    }
+
+    #[test]
+    fn viewport_action_and_state_are_bounded_latest_wins_contracts() {
+        assert_eq!(
+            weather_set_map_viewport_topic("workstation-1"),
+            "action/weather/set-map-viewport/workstation-1"
+        );
+        assert_eq!(
+            weather_map_viewport_state_topic("workstation-1"),
+            "state/weather/map-viewport/workstation-1"
+        );
+        let action = viewport_action();
+        let body = serde_json::to_vec(&action).expect("encode");
+        assert_eq!(
+            SetWeatherMapViewportRequest::from_json_at(&body, NOW).expect("admit"),
+            action
+        );
+        let state = WeatherMapViewportState {
+            schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+            host: action.target_host.clone(),
+            location_generation: action.expected_location_generation,
+            viewport: action.viewport,
+            source: WeatherMapViewportSource::MapsAction,
+            admitted_at_ms: NOW,
+        };
+        let body = serde_json::to_vec(&state).expect("encode");
+        assert_eq!(
+            WeatherMapViewportState::from_json_at(&body, NOW).expect("admit"),
+            state
+        );
+    }
+
+    #[test]
+    fn viewport_action_rejects_hostile_zoom_dimensions_bounds_and_generation() {
+        let mut action = viewport_action();
+        action.viewport.zoom = 13;
+        assert!(action.validate_at(NOW).is_err());
+        action = viewport_action();
+        action.viewport.pixel_width = ATMOSPHERIC_FIELD_EDGE + 1;
+        assert!(action.validate_at(NOW).is_err());
+        action = viewport_action();
+        action.viewport.x = 1_u32 << action.viewport.zoom;
+        assert!(action.validate_at(NOW).is_err());
+        action = viewport_action();
+        action.expected_location_generation = 0;
+        assert!(action.validate_at(NOW).is_err());
+        let oversized = vec![b' '; MAX_WEATHER_VIEWPORT_WIRE_BYTES + 1];
+        assert!(matches!(
+            SetWeatherMapViewportRequest::from_json_at(&oversized, NOW),
+            Err(WeatherContractError::BodyTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn atmospheric_snapshot_admits_exact_fields_and_typed_age_transitions() {
+        let snapshot = atmospheric();
+        let body = serde_json::to_vec(&snapshot).expect("encode");
+        assert_eq!(
+            AtmosphericMapSnapshot::from_json_at(&body, NOW).expect("admit"),
+            snapshot
+        );
+
+        let mut stale = snapshot.clone();
+        stale.rendered_at_ms = NOW - MAX_ATMOSPHERIC_FRESH_AGE_MS - 1;
+        stale.fetched_at_ms = stale.rendered_at_ms;
+        stale.availability = WeatherAvailability::Stale {
+            reason: WeatherStaleReason::ProviderBackoff,
+        };
+        assert!(stale.validate_at(NOW).is_ok());
+
+        stale.rendered_at_ms = NOW - MAX_ATMOSPHERIC_CACHE_AGE_MS - 1;
+        stale.fetched_at_ms = stale.rendered_at_ms;
+        assert!(stale.validate_at(NOW).is_err());
+        stale.availability = WeatherAvailability::Unavailable {
+            reason: WeatherUnavailableReason::Expired,
+        };
+        stale.fields.clear();
+        assert!(stale.validate_at(NOW).is_ok());
+    }
+
+    #[test]
+    fn atmospheric_snapshot_rejects_product_drift_duplicates_png_and_viewport() {
+        let mut snapshot = atmospheric();
+        snapshot.fields[0].provider_layer_name = NOWCOAST_NDFD_SKY_LAYER.into();
+        assert!(snapshot.validate_at(NOW).is_err());
+        snapshot = atmospheric();
+        snapshot.fields[0].provider_service_path = NOWCOAST_NDFD_SKY_PATH.into();
+        assert!(snapshot.validate_at(NOW).is_err());
+        snapshot = atmospheric();
+        snapshot.fields[1] = snapshot.fields[0].clone();
+        assert!(snapshot.validate_at(NOW).is_err());
+        snapshot = atmospheric();
+        snapshot.fields[0].png_base64 = "bm90IGEgcG5n".into();
+        assert!(snapshot.validate_at(NOW).is_err());
+        snapshot = atmospheric();
+        snapshot.viewport.x = 1_u32 << snapshot.viewport.zoom;
+        assert!(snapshot.validate_at(NOW).is_err());
+
+        let oversized = vec![b' '; MAX_ATMOSPHERIC_MAP_WIRE_BYTES + 1];
+        assert!(matches!(
+            AtmosphericMapSnapshot::from_json_at(&oversized, NOW),
+            Err(WeatherContractError::BodyTooLarge { .. })
+        ));
     }
 }

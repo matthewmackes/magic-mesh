@@ -484,6 +484,7 @@ fn record_audit(
 mod tests {
     use super::*;
     use crate::ca::{mint, MockBackend, NebulaCertBackend};
+    use crate::store::writer::{CaPeerCertWrite, WriteOp, WriteResponse};
 
     const PUBLIC_KEY: &str = "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n\
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n";
@@ -492,6 +493,37 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         let conn = Connection::open_in_memory().expect("memory db");
         crate::store::migrate(&conn).expect("migrate");
         conn
+    }
+
+    fn typed_write(conn: &Connection, operation: WriteOp) -> WriteResponse {
+        crate::store::writer::request_or_execute(conn, operation).expect("typed store write")
+    }
+
+    fn seed_peer(
+        conn: &Connection,
+        node_id: &str,
+        overlay_ip: &str,
+        public_key_pem: Option<&str>,
+        expires_at: i64,
+    ) {
+        typed_write(
+            conn,
+            WriteOp::UpsertPeerCert {
+                mesh_id: "m1".into(),
+                expected_epoch: 0,
+                peer: CaPeerCertWrite {
+                    node_id: node_id.into(),
+                    epoch: 0,
+                    cert_pem: "OLD-CERT".into(),
+                    overlay_ip: overlay_ip.into(),
+                    public_key_pem: public_key_pem.map(str::to_owned),
+                    created_at: None,
+                    expires_at,
+                },
+            },
+        )
+        .into_count()
+        .expect("seed peer through typed writer");
     }
 
     #[test]
@@ -582,19 +614,24 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         mint::mint_ca(&MockBackend, &conn, "m1", Some(&crt), Some(&key)).expect("mint");
         // Pre-populate a peer in nodes + nebula_peer_certs at
         // epoch 0.
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:anvil', 'anvil', 'pk', 'peer', 'healthy', 1)",
-            [],
+        typed_write(
+            &conn,
+            WriteOp::UpsertNode {
+                node_id: "peer:anvil".into(),
+                name: "anvil".into(),
+                public_key: "pk".into(),
+                region: None,
+            },
         )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) \
-             VALUES ('peer:anvil', 0, 'PEM', '10.42.0.5', 9999999, ?1)",
-            [PUBLIC_KEY],
-        )
-        .unwrap();
+        .into_count()
+        .expect("seed peer node through typed writer");
+        seed_peer(
+            &conn,
+            "peer:anvil",
+            "10.42.0.5",
+            Some(PUBLIC_KEY),
+            9_999_999,
+        );
         let outcome = bump_epoch_into(
             &MockBackend,
             &mut conn,
@@ -632,13 +669,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         let crt = tmp.path().join("ca.crt");
         let key = tmp.path().join("ca.key");
         mint::mint_ca(&MockBackend, &conn, "m1", Some(&crt), Some(&key)).expect("mint");
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:legacy', 0, 'OLD-CERT', '10.42.0.7', 0)",
-            [],
-        )
-        .unwrap();
+        seed_peer(&conn, "peer:legacy", "10.42.0.7", None, 0);
         let cert_before = std::fs::read(&crt).unwrap();
         let key_before = crate::ca::seal::read_sealed(&key).unwrap();
         let error = bump_epoch_into(
@@ -775,13 +806,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         let key = tmp.path().join("ca.key");
         let peer_out = tmp.path().join("peer:anvil.crt");
         mint::mint_ca(&MockBackend, &conn, "m1", Some(&crt), Some(&key)).expect("mint");
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) \
-             VALUES ('peer:anvil', 0, 'OLD-CERT', '10.42.0.5', 0, ?1)",
-            [PUBLIC_KEY],
-        )
-        .unwrap();
+        seed_peer(&conn, "peer:anvil", "10.42.0.5", Some(PUBLIC_KEY), 0);
         crate::ca::seal::write_atomic_sealed(&peer_out, b"OLD-OUTPUT").unwrap();
         let ca_before = std::fs::read(&crt).unwrap();
         let error = bump_epoch_into(
@@ -802,12 +827,26 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
     #[test]
     fn role_for_returns_host_when_nodes_row_says_host() {
         let conn = fresh_store();
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:lh', 'lh', 'pk', 'host', 'healthy', 1)",
-            [],
+        typed_write(
+            &conn,
+            WriteOp::UpsertNode {
+                node_id: "peer:lh".into(),
+                name: "lh".into(),
+                public_key: "pk".into(),
+                region: None,
+            },
         )
-        .unwrap();
+        .into_count()
+        .expect("seed host node through typed writer");
+        typed_write(
+            &conn,
+            WriteOp::SetNodeRole {
+                node_id: "peer:lh".into(),
+                role: "host".into(),
+            },
+        )
+        .into_count()
+        .expect("set host role through typed writer");
         assert!(matches!(role_for(&conn, "peer:lh"), sign::PeerRole::Host));
         assert!(matches!(
             role_for(&conn, "peer:never-enrolled"),

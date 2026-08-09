@@ -14,10 +14,12 @@
 pub mod airsonic;
 pub mod bus_responder;
 pub mod cache;
+pub mod clock_audio;
 pub mod creds;
 pub mod domain;
 pub mod engine;
 pub mod mpris;
 pub mod queue;
 pub mod reconnect;
+pub mod seat_audio;
 pub mod state;

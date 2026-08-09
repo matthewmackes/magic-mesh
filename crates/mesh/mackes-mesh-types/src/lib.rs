@@ -35,6 +35,7 @@ pub mod cap_tags;
 // shapes + the `action/cloud/*` lifecycle command contract; all consumers bind
 // to `cloud::*`.
 pub mod cloud;
+pub mod clock;
 pub mod connect;
 // CONNECT-1 (2026-06-19) — unified connectivity / exposure policy model + state.
 pub mod ddns;
@@ -96,6 +97,8 @@ pub mod nebula;
 /// workstation adapter and Maps & Location.
 pub mod nws_alert;
 pub mod nws_forecast;
+/// WL-FUNC-017 S6 — bounded daemon-owned route/navigation contracts.
+pub mod navigation;
 pub mod peer_probe;
 // PEERVER-1 (v2.7, 2026-05-29) — peer-data convergence records.
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
@@ -162,9 +165,16 @@ pub mod weather;
 pub mod workloads;
 
 pub use android_apps::{
-    AndroidAppAvailability, AndroidAppCategory, AndroidAppInventory, AndroidAppInventoryEntry,
-    AndroidAppReadiness, AndroidLaunchIntent, AndroidLaunchReadiness, AndroidStarterAppDescriptor,
-    AospPackageId, AospStarterApp, AospStarterCatalog,
+    android_catalog_import_topic, android_catalog_state_topic, AndroidAppAvailability,
+    AndroidAppCapability, AndroidAppCategory, AndroidAppInventory, AndroidAppInventoryEntry,
+    AndroidAppPermission, AndroidAppReadiness, AndroidCatalogAdmissionError,
+    AndroidCatalogAppPolicy, AndroidCatalogGuestReadiness, AndroidCatalogPayload,
+    AndroidImageManifest, AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
+    AndroidLaunchIntent, AndroidLaunchReadiness, AndroidPackageVersion, AndroidResourceClass,
+    AndroidResourceProfile, AndroidSignedCatalog, AndroidStarterAppDescriptor, AospPackageId,
+    AospStarterApp, AospStarterCatalog, ANDROID_CATALOG_IMPORT_TOPIC_PREFIX,
+    ANDROID_CATALOG_SIGNATURE_DOMAIN, ANDROID_CATALOG_STATE_TOPIC_PREFIX,
+    ANDROID_SIGNED_CATALOG_SCHEMA_VERSION, MAX_ANDROID_CATALOG_TTL_MS,
 };
 pub use connect::{BatterySnapshot, ConnectFacts, PairingState, PeerKind};
 pub use nebula::{NebulaFacts, NebulaRole};

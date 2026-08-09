@@ -1731,6 +1731,10 @@ pub fn cloud_state_topic(node: &str) -> String {
 /// and observation fields. This outer cap keeps a malformed or stale producer
 /// from turning one retained cloud mirror into an unbounded Workloads payload.
 pub const MAX_ANDROID_INVENTORIES_PER_STATE: usize = 128;
+/// Maximum Android provider preflight rows retained in one cloud mirror.
+pub const MAX_ANDROID_PROVIDER_ADMISSIONS_PER_STATE: usize = 128;
+/// Maximum guest-owned Android VDI sources retained in one cloud mirror.
+pub const MAX_ANDROID_VDI_SOURCES_PER_STATE: usize = 128;
 
 /// The per-node cloud backend status the mackesd cloud worker publishes on
 /// [`cloud_state_topic`].
@@ -1801,6 +1805,58 @@ pub struct CloudState {
     /// admitted, not that the guest is ready.
     #[serde(default, deserialize_with = "deserialize_android_inventories")]
     pub android_inventories: Vec<AndroidAppInventory>,
+    /// Fail-closed provider/image/host preflight for Android placements. This
+    /// shares the cloud worker's existing authority and is not guest readiness.
+    #[serde(default, deserialize_with = "deserialize_android_provider_admissions")]
+    pub android_provider_admissions: Vec<crate::android_provider::AndroidProviderAdmission>,
+    /// Guest-owned, generation-bound Android display sources. Absence is the
+    /// honest state until the guest agent proves a live session.
+    #[serde(default, deserialize_with = "deserialize_android_vdi_sources")]
+    pub android_vdi_sources: Vec<crate::android_provider::AndroidVdiSource>,
+}
+
+fn deserialize_android_vdi_sources<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::android_provider::AndroidVdiSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<crate::android_provider::AndroidVdiSource>::deserialize(deserializer)?;
+    if rows.len() > MAX_ANDROID_VDI_SOURCES_PER_STATE {
+        return Err(serde::de::Error::custom("too many Android VDI sources"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for row in &rows {
+        row.validate().map_err(serde::de::Error::custom)?;
+        if !seen.insert(row.workload_id.as_str()) {
+            return Err(serde::de::Error::custom("duplicate Android VDI source"));
+        }
+    }
+    Ok(rows)
+}
+
+fn deserialize_android_provider_admissions<'de, D>(
+    deserializer: D,
+) -> Result<Vec<crate::android_provider::AndroidProviderAdmission>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<crate::android_provider::AndroidProviderAdmission>::deserialize(deserializer)?;
+    if rows.len() > MAX_ANDROID_PROVIDER_ADMISSIONS_PER_STATE {
+        return Err(serde::de::Error::custom(
+            "too many Android provider admissions",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for row in &rows {
+        row.validate().map_err(serde::de::Error::custom)?;
+        if !seen.insert(row.workload_id.as_str()) {
+            return Err(serde::de::Error::custom(
+                "duplicate Android provider admission",
+            ));
+        }
+    }
+    Ok(rows)
 }
 
 fn deserialize_android_inventories<'de, D>(
@@ -1865,6 +1921,8 @@ pub const VERB_CONTAINER_DEPLOY: &str = "container-deploy";
 pub const VERB_CONSOLE_ATTACH: &str = "console-attach";
 /// `android-provision` — the two-layer Cuttlefish path (Linux VM then `cvd`).
 pub const VERB_ANDROID_PROVISION: &str = "android-provision";
+/// `android-lifecycle` — generation-checked Cuttlefish VM/app lifecycle.
+pub const VERB_ANDROID_LIFECYCLE: &str = "android-lifecycle";
 /// `browser-provision` — declare the dedicated Chromium browser VM workload.
 pub const VERB_BROWSER_PROVISION: &str = "browser-provision";
 /// `app-provision` — declare one admitted guest-owned Flatpak App VM.
@@ -3290,6 +3348,8 @@ mod facade_tests {
             drift_summary: DriftSummary::default(),
             node_capacity: NodeCapacity::default(),
             android_inventories: Vec::new(),
+            android_provider_admissions: Vec::new(),
+            android_vdi_sources: Vec::new(),
         };
         assert!(state.backend_ready(), "both tools Up ⇒ ready");
         assert_eq!(

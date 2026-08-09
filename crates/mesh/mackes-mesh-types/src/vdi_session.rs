@@ -307,12 +307,9 @@ impl AppVmLaunchRequest {
             return Err(AppVmLaunchRequestError::InvalidField("app_id"));
         }
         if self.requested_capabilities.len() > crate::cloud::APP_VM_MAX_CAPABILITIES
-            || self
-                .requested_capabilities
-                .iter()
-                .any(|capability| {
-                    !crate::cloud::APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str())
-                })
+            || self.requested_capabilities.iter().any(|capability| {
+                !crate::cloud::APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str())
+            })
         {
             return Err(AppVmLaunchRequestError::InvalidCapability);
         }

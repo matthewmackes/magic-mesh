@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(blog.tags, vec!["tech".to_string(), "news".to_string()]);
         assert_eq!(blog.added_ms, 1_700_000_000_000);
 
-        let nested_children = find_folder(reading_children, "Nested");
+        let nested_children = find_folder(&reading_children, "Nested");
         let deep = only_bookmark(nested_children);
         assert_eq!(deep.url, "https://deep.example/link");
         assert_eq!(deep.title, "Deep Link");

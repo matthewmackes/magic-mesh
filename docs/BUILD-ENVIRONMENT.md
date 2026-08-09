@@ -31,7 +31,7 @@ the release evidence; a successful compile alone is not compatibility proof.
 
 There are **two surfaces**, but only one does heavy builds:
 
-1. **The build farm** (four **Fedora 42** VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and native farm RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
+1. **The build farm** (five **Fedora 42** VMs across five dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170` / `.196`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and native farm RPM cuts. All five are declared in OpenTofu; `.196` is adopt-only until its documented state import. Drive the farm with `install-helpers/xcp-build.sh` and route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
 2. **The local dev host** (`172.20.145.192`, Rocky 9.8) — **fmt / metadata / probe only.** Heavy local `cargo` is **hard-disabled** here by `cargo-farm-guard.sh` (installed ahead of the real `cargo` via `install-helpers/install-drain-guardrails.sh`): local `target/` dirs fill the disk and wedge the drain, so `build`/`test`/`check`/`clippy`/`run` exit 97 and redirect you to the farm. `fmt` still runs locally (`rustup run 1.94.0 rustfmt`). This host's gcc 11.5 rejects `mold` anyway — see §5 for the fresh-box gold-linker override.
 
 **AI directive:** all AI agents must use the build farm for build/test/gate work
@@ -50,7 +50,7 @@ probes currently have a warm bundle on `.50` at `$HOME/mde-cef-active`; do not
 assume `/opt/mde/cef` exists on generic farm VMs unless a packaging/install step
 has staged it.
 
-**RPM target-Fedora note (learned 2026-07-15):** all four farm build VMs
+**RPM target-Fedora note (learned 2026-07-15):** all five farm build VMs
 currently report **Fedora 42**. Therefore `xcp-build.sh rpm` produces a native
 F42-linked RPM, even when the target workstation is Fedora 44. Do not install a
 native farm RPM on an F44 Workstation seat unless `rpm -Uvh --test` passes; media
@@ -274,10 +274,10 @@ install-helpers/xcp-build.sh cargo build -p <crate>   # rsync tree → farm → 
 install-helpers/xcp-build.sh gates                    # fmt + clippy + test
 MCNF_BUILD_HOST=172.20.0.130 \
   install-helpers/xcp-build.sh cargo build --workspace   # long pole → BigBoy (.130)
-install-helpers/farm-topology.sh table                # all 4 nodes: verified util table
+install-helpers/farm-topology.sh table                # all 5 nodes: verified util table
 ```
 
-The four build VMs are not the production six-node topology. Validate a
+The five build VMs are not the production six-node topology. Validate a
 schema-versioned six-node evidence bundle with
 `install-helpers/verify-six-node-topology.py`; use `--require-live` for the
 production gate. The helper fails closed when any lighthouse/workstation,
@@ -360,8 +360,9 @@ user). Secrets are **off-repo** — see "Credentials" below.
 | `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-kvm-xcp1` (172.20.0.90, 4 vCPU/12 GiB) |
 | `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **12 vCPU/20 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
 | `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c / — | hypervisor — build VM `mcnf-build-xen-194` (172.20.0.170, 4 vCPU/11 GiB); the **4th dom0** (added after the 3-dom0 table was first written; confirmed live 2026-07-01) |
+| `XEN-196` | `172.20.145.196` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-xen-196` (172.20.0.196, 4 vCPU/7 GiB, 60 GiB disk); cap 1 preserves headroom for the unchanged `mcnf-control`, `testvm-lin`, and `testvm-win` guests |
 
-> ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. The real farm is **4 build VMs: .50 / .90 / .130 / .170** (there are no live `.51`/`.52` IPs — probing them gives "No route to host"). The non-BigBoy build hostnames are descriptive (`mcnf-build-home-services`, `mcnf-build-kvm-xcp1`, `mcnf-build-xen-194`); BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2 = 9** (not 7).
+> ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, **XEN-194 → `.170+`**. XEN-196 is a fixed adopt-only node at `.196`, not an elastic lane, because that pool has no golden template and carries control/test guests. The real farm is **5 build VMs: .50 / .90 / .130 / .170 / .196**. The non-BigBoy build hostnames are descriptive; BigBoy intentionally keeps `mcnf-build-52`. **Full heavy-slot capacity is 2+2+3+2+1 = 10**.
 
 > Stale `10.0.0.x` build-host pins are invalid on this farm and should be
 > treated as doc/agent drift. Run `install-helpers/farm.sh status` or
@@ -382,10 +383,11 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 ## 4. The build farm (IaC-managed)
 
-The four build VMs are **declared as code** and built by OpenTofu through Xen
-Orchestra (XO drives XAPI, so the `xe`-over-ssh foot-guns are gone). This is the
-**DEVOPS-SUBSTRATE** Farm Automation Manager; the `install-helpers/*xcp*` /
-`farm.sh` bash scripts are the working stopgap underneath.
+The five build VMs are **declared in the XAPI-native OpenTofu root**.
+XEN-196's checksum-verified cloud-image VM is represented as an adopt-only XAPI
+resource until that pool has a golden template. The legacy Xen Orchestra root is
+deprecated; the `install-helpers/*xcp*` / `farm.sh` scripts remain the working
+provisioning stopgap.
 
 ```
 golden template (XCP-2) ──tofu (clone via XO)──▶ cloud-init NM-fix ──ansible──▶ toolchain
@@ -442,7 +444,7 @@ Another AI/operator can rebuild the whole thing from this repo:
    `install-helpers/setup-xcp-golden-template.sh --xcp-host <dom0> --name MDE-VM-golden`.
 3. `cd infra/tofu && source env.sh && tofu init && tofu apply` → the build VMs.
 4. `cd infra/ansible && ansible-playbook build-vm-toolchain.yml` → the toolchain.
-5. `install-helpers/farm.sh status` → all four nodes `ready`; smoke with
+5. `install-helpers/farm.sh status` → all five nodes `ready`; smoke with
    `install-helpers/xcp-build.sh cargo build -p mde-bus`.
 
 **C. First-time dom0 onboarding** (key + overlay): `install-helpers/onboard-xcp-host.sh`
@@ -534,7 +536,7 @@ against the distro before relying on it.
 |---|---|---|---|---|
 | **bootc immutable image base** | **42** | `packaging/bootc/Containerfile:53` (`ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42`) | "matches the fleet's RPM channel … mesh-service container is FROM fedora:42 too" (`Containerfile:50-52`); `--build-arg BOOTC_BASE=…` for an F43+ rebase (`:52`) | The **oldest** live target → the effective glibc **floor**. Anything installed *into* this image (RPM + layered dnf pkgs) must not require a glibc newer than F42's. |
 | **Canonical container RPM cut** | **43** (default) | `install-helpers/build-rpm-fedora43.sh:43` (`FEDORA="${1:-43}"`) | Builds the RPM inside a `fedora:43` container so its glibc `Requires` match F43 and it installs on F43 lighthouses / older cloud images (`:4-9`) | Produces an RPM installable on **F43 and newer** (forward-compat). Positional arg overrides the version. |
-| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**42** current) | `docs/BUILD-ENVIRONMENT.md:11` ("four Fedora 42 VMs"); verify live with `install-helpers/farm.sh status` + `/etc/fedora-release` before relying on it | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc and native library sonames**. Today this is an F42 artifact; it is not a safe F44 Workstation artifact when FFmpeg/ICU/Python sonames differ. For F44 seats, use `install-helpers/build-rpm-fedora43.sh 44` and `rpm -Uvh --test`. |
+| **Farm native RPM cut** (`xcp-build.sh rpm`) | farm VM's Fedora (**42** current) | `docs/BUILD-ENVIRONMENT.md:34` ("five Fedora 42 VMs"); verify live with `install-helpers/farm.sh status` + `/etc/fedora-release` before relying on it | Native release build/gates run on the farm VMs (§4) | Inherits the **farm VM's glibc and native library sonames**. Today this is an F42 artifact; it is not a safe F44 Workstation artifact when FFmpeg/ICU/Python sonames differ. For F44 seats, use `install-helpers/build-rpm-fedora43.sh 44` and `rpm -Uvh --test`. |
 | **CI fedora-native job** | **44** | `.github/workflows/ci.yml:312` (`container: fedora:44`) | Advisory build+test on the real target platform | `continue-on-error: true` — **not** a release artifact; never fed to a channel dir. |
 | **Sovereign mesh dnf channel dirs** | **43 + 44** | `automation/forgejo/dnf-channel-up.sh:30` (`FEDORAS="${MCNF_FEDORA_VERSIONS:-43 44}"`) | Serves `fedora-43` + `fedora-44` dirs mirroring gh-pages | Each dir needs an RPM built on ≤ its Fedora. **No `fedora-42` dir is produced** by default (see 7.3). |
 | **gh-pages channel (client repo)** | `$releasever` (43, 44 live) | `packaging/repo/magic-mesh.repo` (`baseurl=…/fedora-$releasever-$basearch/`) | Client dnf resolves its own `$releasever` dir | Node pulls the RPM under its own Fedora; published for `fedora-43`/`fedora-44` (`docs/platform/WORKLIST.md:1132`). |

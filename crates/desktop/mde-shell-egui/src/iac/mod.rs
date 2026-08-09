@@ -34,21 +34,24 @@
 //! op lands in the session audit trail.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::{carbon_icon, card, field, muted_note, Style};
 
 use mackes_mesh_types::android_apps::AospStarterApp;
+use mackes_mesh_types::android_provider::AndroidVdiSource;
 use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
 use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
     CloudReply as WireCloudReply, CloudState, DeliveryType, DeploymentRole, DriftFlag, WorkloadRow,
     WorkloadSpec, APP_VM_ALLOWED_CAPABILITIES, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
-    CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION, VERB_PLAN, VERB_SET_DESIRED,
+    CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_LIFECYCLE, VERB_ANDROID_PROVISION,
+    VERB_PLAN, VERB_SET_DESIRED,
 };
 use mackes_mesh_types::music_auth::{self, MusicAuthContext};
 use mackes_mesh_types::workloads::{
@@ -80,6 +83,31 @@ const APPLY_ECHO: &str = "apply";
 const EXEC_ACTION_TOPIC: &str = "action/exec/request";
 const EXEC_AUTH_VERB: &str = "exec-request";
 const EXEC_AUTH_NODE: &str = "fleet-control";
+
+const ANDROID_VDI_HANDOFF_ID: &str = "iac-android-vdi-handoff";
+const ANDROID_CATALOG_CACHE_ROOT: &str = "/var/lib/mackesd/android-catalog";
+
+/// Typed handoff from governed Android Workloads into the shell's existing
+/// remote-session attachment authority. It is discovery identity only; the VDI
+/// route must still acquire its own attachment authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AndroidVdiHandoff {
+    pub(crate) placement_node: String,
+    pub(crate) source: AndroidVdiSource,
+}
+
+/// Consume one IAC-owned Android VDI handoff. The shell integration lane can
+/// call this without parsing an endpoint or accepting a raw connection string.
+pub(crate) fn take_android_vdi_handoff(ctx: &egui::Context) -> Option<AndroidVdiHandoff> {
+    ctx.data_mut(|data| {
+        data.remove_temp::<Option<AndroidVdiHandoff>>(egui::Id::new(ANDROID_VDI_HANDOFF_ID))
+            .flatten()
+    })
+}
+
+fn queue_android_vdi_handoff(ctx: &egui::Context, handoff: AndroidVdiHandoff) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(ANDROID_VDI_HANDOFF_ID), Some(handoff)));
+}
 
 /// The systemd credential is a 32-byte HMAC key encoded as 64 hex characters.
 /// Keep a small amount of whitespace headroom while refusing an unexpected file
@@ -335,6 +363,22 @@ fn production_music_auth_seed() -> Result<[u8; 32], String> {
     Ok(seed)
 }
 
+/// Return the already-provisioned root-shell Ed25519 seed for another
+/// domain-separated shell capability. Clock signs the closed
+/// `mcnf-clock-command-v1` transcript, so sharing the host-bound shell seed does
+/// not share either Music's wire format or its authorization domain. A missing
+/// credential remains a hard, visible refusal at the Clock surface.
+pub(crate) fn provisioned_shell_signing_seed() -> Result<[u8; 32], String> {
+    #[cfg(test)]
+    {
+        Ok([7_u8; 32])
+    }
+    #[cfg(not(test))]
+    {
+        production_music_auth_seed()
+    }
+}
+
 #[cfg(not(test))]
 fn music_hex(byte: u8) -> Result<u8, String> {
     match byte {
@@ -510,6 +554,26 @@ fn is_safe_android_action_identity(value: &str, allow_colon: bool) -> bool {
                 || matches!(character, '.' | '-' | '_')
                 || (allow_colon && character == ':')
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AndroidLifecycleRequest {
+    schema_version: u16,
+    node: String,
+    workload_id: String,
+    request_id: String,
+    expected_generation: u64,
+    operation: android_governed::LifecycleOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app: Option<AospStarterApp>,
+}
+
+impl AndroidLifecycleRequest {
+    fn body(&self) -> Result<String, String> {
+        serde_json::to_string(self)
+            .map_err(|error| format!("could not encode Android lifecycle request: {error}"))
+    }
 }
 
 // ───────────────────────────── the delivery-type axis ───────────────────────
@@ -870,6 +934,9 @@ struct CloudReply {
     /// used to keep non-cloud execution replies visible without inventing a
     /// cloud verb name.
     detail: Option<String>,
+    /// Optional bounded typed lifecycle receipt. Android lifecycle replies use
+    /// this to project exact generation/phase without reading daemon files.
+    raw_log: Option<String>,
 }
 
 /// One in-flight `action/cloud/*` request awaiting its `reply/<ulid>`.
@@ -963,6 +1030,17 @@ pub(super) enum ArmAction {
         /// Review subject.
         subject: String,
     },
+    /// Exact generation-checked Android lifecycle request. The request carries
+    /// only closed operation/app enums and bounded identities.
+    AndroidLifecycle {
+        request: AndroidLifecycleRequest,
+        target: String,
+        label: String,
+        echo: String,
+        word: &'static str,
+        subject: String,
+        approval: String,
+    },
 }
 
 impl ArmAction {
@@ -976,6 +1054,7 @@ impl ArmAction {
             Self::Prepared { verb, .. } => verb,
             Self::Workload { .. } => "workload-operation",
             Self::ExecPrepared { .. } => EXEC_AUTH_VERB,
+            Self::AndroidLifecycle { .. } => VERB_ANDROID_LIFECYCLE,
         }
     }
 
@@ -987,6 +1066,7 @@ impl ArmAction {
             Self::Prepared { echo, .. } => echo.clone(),
             Self::Workload { echo, .. } => echo.clone(),
             Self::ExecPrepared { echo, .. } => echo.clone(),
+            Self::AndroidLifecycle { echo, .. } => echo.clone(),
         }
     }
 
@@ -998,6 +1078,7 @@ impl ArmAction {
             Self::Prepared { word, .. } => word,
             Self::Workload { word, .. } => word,
             Self::ExecPrepared { word, .. } => word,
+            Self::AndroidLifecycle { word, .. } => word,
         }
     }
 
@@ -1010,6 +1091,7 @@ impl ArmAction {
             Self::Prepared { subject, .. } => subject.clone(),
             Self::Workload { subject, .. } => subject.clone(),
             Self::ExecPrepared { subject, .. } => subject.clone(),
+            Self::AndroidLifecycle { subject, .. } => subject.clone(),
         }
     }
 
@@ -1019,7 +1101,10 @@ impl ArmAction {
     const fn uses_yes_no_review(&self) -> bool {
         matches!(
             self,
-            Self::Prepared { .. } | Self::Workload { .. } | Self::ExecPrepared { .. }
+            Self::Prepared { .. }
+                | Self::Workload { .. }
+                | Self::ExecPrepared { .. }
+                | Self::AndroidLifecycle { .. }
         )
     }
 }
@@ -1176,6 +1261,25 @@ fn review_sheet_facts(action: &ArmAction, state: &WorkloadsState) -> ReviewSheet
                  outcome in its audit lane."
             ),
         ),
+        ArmAction::AndroidLifecycle {
+            request,
+            target,
+            approval,
+            ..
+        } => {
+            let body = request.body().unwrap_or_else(|_| "{}".to_owned());
+            request_review_facts(
+                command,
+                subject,
+                target.clone(),
+                request.node.clone(),
+                &body,
+                format!(
+                    "{approval}. The capability is bound to workload {} generation {} on {}.",
+                    request.workload_id, request.expected_generation, request.node
+                ),
+            )
+        }
     }
 }
 
@@ -1309,6 +1413,23 @@ pub struct WorkloadsState {
     /// topic (host-sorted). Empty when nothing has published yet — an honest
     /// pre-mirror state, never fabricated.
     states: Vec<CloudState>,
+    /// Admitted signed Android catalogs read during [`Self::poll`], never from
+    /// the render path.
+    android_catalogs: Vec<android_governed::CatalogSnapshot>,
+    /// Root-owned daemon cache digests keyed by placement node, captured only
+    /// during polling and matched against the writable Bus projection.
+    android_admitted_catalog_digests: BTreeMap<String, String>,
+    /// Cache directory seam; production uses the mackesd default while tests
+    /// can exercise admission against isolated files.
+    android_catalog_cache_root: PathBuf,
+    /// Last typed lifecycle receipt per workload, learned from bounded replies.
+    android_lifecycle_receipts: BTreeMap<String, android_governed::LifecycleReceipt>,
+    /// Exact Android lifecycle operation currently awaiting a cloud reply.
+    android_lifecycle_pending: Option<android_governed::PendingLifecycle>,
+    /// Wall-clock snapshot captured by [`Self::poll`] for pure render models.
+    android_projection_now_ms: u64,
+    /// Monotonic in-process request suffix; avoids clock/RNG access in render.
+    android_request_sequence: u64,
     /// When the mirror was last folded (the refresh cadence anchor).
     loaded_at: Option<Instant>,
     /// A manual refresh is queued — re-reads the mirror on the next poll.
@@ -1379,6 +1500,13 @@ impl Default for WorkloadsState {
         Self {
             bus_root: mde_bus::client_data_dir(),
             states: Vec::new(),
+            android_catalogs: Vec::new(),
+            android_admitted_catalog_digests: BTreeMap::new(),
+            android_catalog_cache_root: PathBuf::from(ANDROID_CATALOG_CACHE_ROOT),
+            android_lifecycle_receipts: BTreeMap::new(),
+            android_lifecycle_pending: None,
+            android_projection_now_ms: 0,
+            android_request_sequence: 0,
             loaded_at: None,
             forced: false,
             arming: None,
@@ -1418,6 +1546,7 @@ impl WorkloadsState {
     /// is a cheap local read and the reply is read off the Bus on a later tick.
     pub fn poll(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
+        self.android_projection_now_ms = workload_api_now_ms();
         self.resolve_mutation();
         self.resolve_workload_operation();
 
@@ -1426,6 +1555,9 @@ impl WorkloadsState {
             .is_none_or(|t| now.duration_since(t) >= REFRESH);
         if self.forced || due {
             self.states = self.read_states();
+            let catalogs = self.read_android_catalogs();
+            self.android_admitted_catalog_digests = self.read_android_catalog_digests(&catalogs);
+            self.android_catalogs = catalogs;
             self.loaded_at = Some(now);
             self.forced = false;
         }
@@ -1445,6 +1577,17 @@ impl WorkloadsState {
             return;
         };
         if let Some(reply) = self.read_reply(&ulid) {
+            if pending_verb == VERB_ANDROID_LIFECYCLE {
+                if let Some(receipt) = reply
+                    .raw_log
+                    .as_deref()
+                    .and_then(android_governed::LifecycleReceipt::parse)
+                {
+                    self.android_lifecycle_receipts
+                        .insert(receipt.workload_id.clone(), receipt);
+                }
+                self.android_lifecycle_pending = None;
+            }
             let (note, entry) = fold_mutation(&reply);
             self.record_audit(entry);
             if reply.ok {
@@ -1466,6 +1609,9 @@ impl WorkloadsState {
                      request may still finish; check Audit before retrying."
             ));
             self.mutation_pending = None;
+            if pending_verb == VERB_ANDROID_LIFECYCLE {
+                self.android_lifecycle_pending = None;
+            }
         }
     }
 
@@ -1529,6 +1675,56 @@ impl WorkloadsState {
             .collect();
         states.sort_by(|a, b| a.host.cmp(&b.host));
         states
+    }
+
+    /// Fold admitted signed Android catalogs during polling. The worker has
+    /// already verified Ed25519 trust; the shell additionally refuses malformed,
+    /// oversized, duplicate-node, or intrinsically invalid projections.
+    fn read_android_catalogs(&self) -> Vec<android_governed::CatalogSnapshot> {
+        use mackes_mesh_types::android_apps::ANDROID_CATALOG_STATE_TOPIC_PREFIX;
+
+        let Some(persist) = self.persist() else {
+            return Vec::new();
+        };
+        let Ok(topics) = persist.list_topics() else {
+            return Vec::new();
+        };
+        let mut catalogs = BTreeMap::new();
+        for topic in topics
+            .into_iter()
+            .filter(|topic| topic.starts_with(ANDROID_CATALOG_STATE_TOPIC_PREFIX))
+            .take(64)
+        {
+            let Some(body) = persist
+                .read_latest(&topic)
+                .ok()
+                .flatten()
+                .and_then(|message| message.body)
+            else {
+                continue;
+            };
+            let Some(snapshot) = android_governed::decode_catalog_snapshot(&topic, &body) else {
+                continue;
+            };
+            catalogs.insert(snapshot.node.clone(), snapshot);
+        }
+        catalogs.into_values().collect()
+    }
+
+    fn read_android_catalog_digests(
+        &self,
+        catalogs: &[android_governed::CatalogSnapshot],
+    ) -> BTreeMap<String, String> {
+        catalogs
+            .iter()
+            .filter_map(|snapshot| {
+                let path = self
+                    .android_catalog_cache_root
+                    .join(format!("{}.json", snapshot.node));
+                android_governed::read_admitted_catalog_digest(&path, 0)
+                    .map(|digest| (snapshot.node.clone(), digest))
+            })
+            .collect()
     }
 
     /// Read the reply on `reply/<ulid>`, if one has landed (oldest wins — the RPC
@@ -1728,6 +1924,81 @@ impl WorkloadsState {
         });
     }
 
+    /// Open an explicit review for one closed Android lifecycle operation.
+    /// Generation and app identity come from the already-projected model; no
+    /// package, launcher, command, path, or endpoint string is accepted here.
+    fn arm_android_lifecycle(
+        &mut self,
+        node: &str,
+        workload_id: &str,
+        operation: android_governed::LifecycleOperation,
+        app: Option<AospStarterApp>,
+        expected_generation: u64,
+        approval: String,
+    ) {
+        let node = node.trim();
+        let workload_id = workload_id.trim();
+        if !is_safe_android_action_identity(node, false)
+            || !is_safe_android_action_identity(workload_id, false)
+        {
+            self.note = Some(
+                "Could not prepare Android lifecycle: placement or workload identity is invalid. Nothing was sent."
+                    .to_owned(),
+            );
+            return;
+        }
+        if matches!(
+            operation,
+            android_governed::LifecycleOperation::Start
+                | android_governed::LifecycleOperation::Retry
+        ) != app.is_some()
+        {
+            self.note = Some(
+                "Could not prepare Android lifecycle: start/retry requires one signed app and stop/cancel accepts none. Nothing was sent."
+                    .to_owned(),
+            );
+            return;
+        }
+        self.android_request_sequence = self.android_request_sequence.saturating_add(1);
+        let request = AndroidLifecycleRequest {
+            schema_version: 1,
+            node: node.to_owned(),
+            workload_id: workload_id.to_owned(),
+            request_id: format!(
+                "iac-android-{}-{}-{}",
+                operation.label().to_ascii_lowercase(),
+                expected_generation,
+                self.android_request_sequence
+            ),
+            expected_generation,
+            operation,
+            app,
+        };
+        let app_label = app.map(AospStarterApp::display_name);
+        let label = app_label.map_or_else(
+            || format!("{} {workload_id}", operation.label().to_ascii_lowercase()),
+            |app| {
+                format!(
+                    "{} {app} in {workload_id}",
+                    operation.label().to_ascii_lowercase()
+                )
+            },
+        );
+        self.note = None;
+        self.arming = Some(ReviewSheetState {
+            action: ArmAction::AndroidLifecycle {
+                request,
+                target: workload_id.to_owned(),
+                label: label.clone(),
+                echo: operation.label().to_owned(),
+                word: operation.label(),
+                subject: label,
+                approval,
+            },
+            typed: String::new(),
+        });
+    }
+
     /// Record one session-audit row, trimming to [`MAX_AUDIT`] newest.
     fn record_audit(&mut self, entry: AuditEntry) {
         self.audit.push(entry);
@@ -1834,6 +2105,43 @@ impl WorkloadsState {
                     Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
                 }
             }
+            ArmAction::AndroidLifecycle {
+                request,
+                target,
+                label,
+                echo,
+                ..
+            } => {
+                if !armed(typed, &echo) {
+                    self.note = Some(
+                        "Android lifecycle confirmation did not match; nothing was sent."
+                            .to_owned(),
+                    );
+                    return;
+                }
+                let body = match request.body() {
+                    Ok(body) => body,
+                    Err(error) => {
+                        self.note = Some(format!("{error} Nothing was sent."));
+                        return;
+                    }
+                };
+                match self.authorize_body(&body, VERB_ANDROID_LIFECYCLE, &request.node, &target) {
+                    Ok(body) => {
+                        self.android_lifecycle_pending = Some(android_governed::PendingLifecycle {
+                            workload_id: request.workload_id.clone(),
+                            operation: request.operation,
+                            generation: request.expected_generation.saturating_add(1),
+                            app: request.app,
+                        });
+                        self.issue(VERB_ANDROID_LIFECYCLE, Some(&body), &label);
+                        if self.mutation_pending.is_none() {
+                            self.android_lifecycle_pending = None;
+                        }
+                    }
+                    Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
+                }
+            }
             action => self.perform_cloud(action, typed),
         }
     }
@@ -1896,6 +2204,9 @@ impl WorkloadsState {
             }
             ArmAction::ExecPrepared { .. } => {
                 unreachable!("Android execution actions are handled before the cloud dispatcher")
+            }
+            ArmAction::AndroidLifecycle { .. } => {
+                unreachable!("Android lifecycle actions are handled before the cloud dispatcher")
             }
         };
         if requires_apply_capability && !self.selected_node_apply_armed() {
@@ -2732,32 +3043,93 @@ fn lifecycle_resource_route_for_filter(
         .map(DeliveryView::from_delivery_type)
         .unwrap_or(state.view);
     if should_show_android_starter_catalog(mode, effective_view) {
-        let mut vm_workloads = state
+        let mut workloads = state
             .workloads_of(DeliveryView::AndroidVm)
-            .map(|row| android_apps::AndroidVmWorkload {
+            .map(|row| android_governed::WorkloadInput {
                 workload_id: row.name.clone(),
-                target_host: row.node.clone(),
-                vm_scope: format!("{} on {}", row.name, row.node),
+                node: row.node.clone(),
+                runtime_status: row.status.clone(),
             })
             .collect::<Vec<_>>();
-        vm_workloads.sort_by(|left, right| {
+        workloads.sort_by(|left, right| {
             left.workload_id
                 .cmp(&right.workload_id)
-                .then_with(|| left.vm_scope.cmp(&right.vm_scope))
+                .then_with(|| left.node.cmp(&right.node))
         });
-        let android_inventories = state
-            .states
+        let projections = workloads
             .iter()
-            .flat_map(|cloud_state| cloud_state.android_inventories.iter().cloned())
+            .map(|workload| {
+                let cloud = state
+                    .states
+                    .iter()
+                    .find(|cloud| cloud.host == workload.node);
+                android_governed::project(android_governed::ModelInput {
+                    workload,
+                    catalog: state
+                        .android_catalogs
+                        .iter()
+                        .find(|catalog| catalog.node == workload.node),
+                    admitted_cache_digest: state
+                        .android_admitted_catalog_digests
+                        .get(&workload.node)
+                        .map(String::as_str),
+                    admission: cloud.and_then(|cloud| {
+                        cloud
+                            .android_provider_admissions
+                            .iter()
+                            .find(|row| row.workload_id == workload.workload_id)
+                    }),
+                    inventory: cloud.and_then(|cloud| {
+                        cloud
+                            .android_inventories
+                            .iter()
+                            .find(|row| row.workload_id == workload.workload_id)
+                    }),
+                    vdi_source: cloud.and_then(|cloud| {
+                        cloud
+                            .android_vdi_sources
+                            .iter()
+                            .find(|row| row.workload_id == workload.workload_id)
+                    }),
+                    receipt: state.android_lifecycle_receipts.get(&workload.workload_id),
+                    pending: state.android_lifecycle_pending.as_ref(),
+                    now_unix_ms: state.android_projection_now_ms,
+                })
+            })
             .collect::<Vec<_>>();
-        if let Some(selection) =
-            android_apps::catalog_panel(ui, &vm_workloads, &android_inventories)
+        if let Some(action) =
+            android_governed::panel(ui, &projections, mode == ResourceTableMode::Run)
         {
-            state.arm_android_app_launch(
-                &selection.target_host,
-                &selection.workload_id,
-                selection.app,
-            );
+            match action {
+                android_governed::UiAction::Lifecycle {
+                    node,
+                    workload_id,
+                    operation,
+                    app,
+                    expected_generation,
+                    approval,
+                } => state.arm_android_lifecycle(
+                    &node,
+                    &workload_id,
+                    operation,
+                    app,
+                    expected_generation,
+                    approval,
+                ),
+                android_governed::UiAction::Attach { node, source } => {
+                    queue_android_vdi_handoff(
+                        ui.ctx(),
+                        AndroidVdiHandoff {
+                            placement_node: node,
+                            source,
+                        },
+                    );
+                    state.note = Some(
+                        "Android WebRTC source is ready for the remote-session attachment route."
+                            .to_owned(),
+                    );
+                }
+            }
         }
     }
 }
@@ -3653,6 +4025,7 @@ pub(super) fn render_audit(ui: &mut egui::Ui, audit: &[AuditEntry]) {
 // ─────────────────────────── the seam module layout ─────────────────────────
 
 mod android_apps;
+mod android_governed;
 mod menubar;
 
 mod placement;
@@ -3698,6 +4071,8 @@ mod browser_vm_target_tests {
             drift_summary: DriftSummary::default(),
             node_capacity: NodeCapacity::default(),
             android_inventories: Vec::new(),
+            android_provider_admissions: Vec::new(),
+            android_vdi_sources: Vec::new(),
         }
     }
 

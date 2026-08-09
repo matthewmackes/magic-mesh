@@ -66,7 +66,5 @@ pub use config::{ConfigError, SpiceConfig};
 pub use connect::{BlockingSpiceTransport, ConnectError, SpiceTransport};
 pub use input::{map_event, scancode_for, MouseButton, Scancode, SpiceInputEvent};
 pub use pixel::{Framebuffer, FramebufferError, SurfaceFormat};
-pub use session::{
-    spice_clipboard_status, SpiceClipboardError, SpiceSession, SpiceTextClipboard,
-    SPICE_CLIPBOARD_UNSUPPORTED_REASON,
-};
+pub use session::{spice_clipboard_status, SpiceSession};
+pub use spice_client::vdagent::{ClipboardError, ClipboardEvent, ClipboardStatus};

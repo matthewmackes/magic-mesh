@@ -121,12 +121,72 @@ pub fn export_roster(conn: &rusqlite::Connection) -> Result<Vec<RosterRow>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::writer::{CaPeerCertWrite, WriteOp, WriteResponse};
     use rusqlite::Connection;
+
+    const TEST_MESH_ID: &str = "roster-test-mesh";
 
     fn fresh_store() -> Connection {
         let conn = Connection::open_in_memory().expect("memory db");
         crate::store::migrate(&conn).expect("migrate");
+        typed_write(
+            &conn,
+            WriteOp::MintCa {
+                mesh_id: TEST_MESH_ID.into(),
+                ca_cert_pem: "test-ca:0".into(),
+            },
+        );
         conn
+    }
+
+    fn typed_write(conn: &Connection, operation: WriteOp) -> usize {
+        crate::store::writer::request_or_execute(conn, operation)
+            .and_then(WriteResponse::into_count)
+            .expect("typed roster fixture write")
+    }
+
+    fn upsert_node(conn: &Connection, node_id: &str, role: &str) {
+        typed_write(
+            conn,
+            WriteOp::UpsertNode {
+                node_id: node_id.into(),
+                name: node_id.trim_start_matches("peer:").into(),
+                public_key: format!("test-public-key:{node_id}"),
+                region: None,
+            },
+        );
+        if role != "peer" {
+            typed_write(
+                conn,
+                WriteOp::SetNodeRole {
+                    node_id: node_id.into(),
+                    role: role.into(),
+                },
+            );
+        }
+    }
+
+    fn peer(node_id: &str, epoch: i64, cert_pem: &str, overlay_ip: &str) -> CaPeerCertWrite {
+        CaPeerCertWrite {
+            node_id: node_id.into(),
+            epoch,
+            cert_pem: cert_pem.into(),
+            overlay_ip: overlay_ip.into(),
+            public_key_pem: None,
+            created_at: None,
+            expires_at: 9_999_999,
+        }
+    }
+
+    fn upsert_peer(conn: &Connection, node_id: &str, epoch: i64, cert_pem: &str, overlay_ip: &str) {
+        typed_write(
+            conn,
+            WriteOp::UpsertPeerCert {
+                mesh_id: TEST_MESH_ID.into(),
+                expected_epoch: epoch,
+                peer: peer(node_id, epoch, cert_pem, overlay_ip),
+            },
+        );
     }
 
     #[test]
@@ -139,28 +199,18 @@ mod tests {
     #[test]
     fn export_roster_skips_revoked_certs() {
         let conn = fresh_store();
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:anvil', 'anvil', 'pk', 'peer', 'healthy', 1)",
-            [],
-        )
-        .unwrap();
+        upsert_node(&conn, "peer:anvil", "peer");
         // Active row.
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:anvil', 0, 'PEM-A', '10.42.0.5', 9999999)",
-            [],
-        )
-        .unwrap();
+        upsert_peer(&conn, "peer:anvil", 0, "PEM-A", "10.42.0.5");
         // Revoked row — should be excluded.
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at, revoked_at) \
-             VALUES ('peer:birch', 0, 'PEM-B', '10.42.0.6', 9999999, 1234)",
-            [],
-        )
-        .unwrap();
+        upsert_peer(&conn, "peer:birch", 0, "PEM-B", "10.42.0.6");
+        typed_write(
+            &conn,
+            WriteOp::RevokePeerCert {
+                node_id: "peer:birch".into(),
+                revoked_at: 1234,
+            },
+        );
         let rows = export_roster(&conn).expect("ok");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].node_id, "peer:anvil");
@@ -171,19 +221,17 @@ mod tests {
     #[test]
     fn export_roster_joins_nodes_for_groups_field() {
         let conn = fresh_store();
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:lighthouse-1', 'lighthouse-1', 'pk', 'host', 'healthy', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:lighthouse-1', 1, 'PEM', '10.42.0.1', 9999999)",
-            [],
-        )
-        .unwrap();
+        upsert_node(&conn, "peer:lighthouse-1", "host");
+        typed_write(
+            &conn,
+            WriteOp::RotateCa {
+                mesh_id: TEST_MESH_ID.into(),
+                expected_active_epoch: Some(0),
+                new_epoch: 1,
+                ca_cert_pem: "test-ca:1".into(),
+                peer_certs: vec![peer("peer:lighthouse-1", 1, "PEM", "10.42.0.1")],
+            },
+        );
         let rows = export_roster(&conn).expect("ok");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].groups, "host");
@@ -195,16 +243,13 @@ mod tests {
     fn export_roster_rejects_more_than_maximum_rows() {
         let conn = fresh_store();
         for i in 0..=MAX_ROSTER_ROWS {
-            conn.execute(
-                "INSERT INTO nebula_peer_certs \
-                 (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-                 VALUES (?1, 0, 'PEM', ?2, 9999999)",
-                rusqlite::params![
-                    format!("peer:overflow-{i}"),
-                    format!("10.42.{}.{}", i / 256, (i % 256) + 1)
-                ],
-            )
-            .unwrap();
+            upsert_peer(
+                &conn,
+                &format!("peer:overflow-{i}"),
+                0,
+                "PEM",
+                &format!("10.42.{}.{}", i / 254, (i % 254) + 1),
+            );
         }
         let error = export_roster(&conn).expect_err("oversized roster must fail closed");
         assert!(error.contains("more than 4096"), "{error}");
@@ -216,32 +261,24 @@ mod tests {
         // active rows (one per epoch) — only the highest epoch
         // row should appear in the export.
         let conn = fresh_store();
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-             VALUES ('peer:anvil', 'anvil', 'pk', 'peer', 'healthy', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:anvil', 0, 'PEM-old', '10.42.0.5', 9999999)",
-            [],
-        )
-        .unwrap();
+        upsert_node(&conn, "peer:anvil", "peer");
+        upsert_peer(&conn, "peer:anvil", 0, "PEM-old", "10.42.0.5");
         // Same node, newer epoch, different overlay IP. Need
         // distinct overlay_ip because the (overlay_ip, epoch)
         // partial unique index from migration 0011 requires
         // unique overlay across active rows; using a different
         // IP for the higher-epoch row mirrors the real CA
         // rotation behavior.
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:anvil', 3, 'PEM-new', '10.42.0.6', 9999999)",
-            [],
-        )
-        .unwrap();
+        typed_write(
+            &conn,
+            WriteOp::RotateCa {
+                mesh_id: TEST_MESH_ID.into(),
+                expected_active_epoch: Some(0),
+                new_epoch: 3,
+                ca_cert_pem: "test-ca:3".into(),
+                peer_certs: vec![peer("peer:anvil", 3, "PEM-new", "10.42.0.6")],
+            },
+        );
         let rows = export_roster(&conn).expect("ok");
         assert_eq!(rows.len(), 1, "expected dedup to 1 row");
         assert_eq!(rows[0].epoch, 3, "expected highest epoch");
@@ -257,19 +294,8 @@ mod tests {
             ("peer:anvil", "10.42.0.2"),
             ("peer:birch", "10.42.0.3"),
         ] {
-            conn.execute(
-                "INSERT INTO nodes (node_id, name, public_key, role, health, enrolled_at) \
-                 VALUES (?1, ?1, 'pk', 'peer', 'healthy', 1)",
-                [nid],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO nebula_peer_certs \
-                 (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-                 VALUES (?1, 0, 'PEM', ?2, 9999999)",
-                [nid, ip],
-            )
-            .unwrap();
+            upsert_node(&conn, nid, "peer");
+            upsert_peer(&conn, nid, 0, "PEM", ip);
         }
         let rows = export_roster(&conn).expect("ok");
         let names: Vec<&str> = rows.iter().map(|r| r.node_id.as_str()).collect();

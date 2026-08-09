@@ -17,9 +17,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::clock::{
+    clock_audio_status_topic, ClockAudioRef, ClockAudioRequestV1, ClockMusicKind,
+    CLOCK_AUDIO_ACTION_TOPIC,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
@@ -27,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::airsonic::Client;
+use crate::clock_audio::{ClockAudioAuthority, ClockAudioEffects};
 use crate::creds;
 use crate::domain::{
     build_shelves, dedup_catalog, normalized_identity, ordered_variants, BookmarkItem, CatalogItem,
@@ -37,6 +42,7 @@ use crate::domain::{
     MAX_SOURCE_RECORDS, MUSIC_CONTRACT_VERSION,
 };
 use crate::engine::{Engine, PlaybackTrack, SourceCodec};
+use crate::seat_audio::{SeatAudioAuthority, SeatDuckGeneration};
 
 /// Shared `ipc/action_auth` wire contract for the music responder.
 ///
@@ -472,7 +478,7 @@ mod music_action_auth {
         }
     }
 
-    fn hex_encode(bytes: &[u8]) -> String {
+    pub(super) fn hex_encode(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut output = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
@@ -482,7 +488,7 @@ mod music_action_auth {
         output
     }
 
-    fn sha256(input: &[u8]) -> [u8; 32] {
+    pub(super) fn sha256(input: &[u8]) -> [u8; 32] {
         const K: [u32; 64] = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
             0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -633,6 +639,36 @@ const DOWNLOAD_STORE_FILE: &str = "music-downloads-v1.json";
 const CATALOG_STORE_SCHEMA_VERSION: u16 = 1;
 const CATALOG_STORE_FILE: &str = "music-catalog-v1.json";
 const MAX_CATALOG_ITEMS: usize = MAX_COLLECTION_ITEMS;
+/// Stable Clock-facing identity for catalog-owned aliases. Provider locators
+/// remain below this boundary and are resolved only by mde-musicd.
+const CLOCK_CATALOG_SOURCE_ID: &str = "mde-musicd:catalog";
+/// Stable Clock-facing source identity for daemon-admitted local alarm files.
+/// Clock sees only the map key; this source's filesystem locator is never
+/// serialized into a Clock request or result.
+const CLOCK_LOCAL_FILE_SOURCE_ID: &str = "mde-musicd:local-alarm";
+const CLOCK_LOCAL_FILE_DIRECTORY: &str = "clock-alarm-audio";
+const MAX_CLOCK_LOCAL_FILES: usize = 32;
+const MAX_CLOCK_LOCAL_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// NPR's durable News Now podcast/feed identity.
+const NPR_NEWS_NOW_PRESET_ID: &str = "500005";
+/// News Now is hourly. A retained resolution older than two publication
+/// windows is not honest enough to ring and therefore falls back immediately.
+const NPR_NEWS_NOW_MAX_AGE_MS: u64 = 2 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClockCatalogPreset {
+    content: ContentRef,
+    admitted_at_utc_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClockLocalFileAdmission {
+    /// Path relative to the daemon-owned Clock audio directory.
+    relative_path: String,
+    byte_len: u64,
+    modified_at_utc_ms: u64,
+    sha256: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CatalogPage {
@@ -671,6 +707,14 @@ struct CatalogStoreFile {
     /// than the retained cache navigable without publishing every row.
     #[serde(default)]
     pages: BTreeMap<String, CatalogPage>,
+    /// Bounded catalog-owned aliases for Clock. Values are provider-qualified
+    /// identities, never URLs, paths, commands, credentials, or queue entries.
+    #[serde(default)]
+    clock_presets: BTreeMap<String, ClockCatalogPreset>,
+    /// Fail-closed local-file registry. Keys are stable Clock catalog IDs;
+    /// values remain private to mde-musicd and are never projected to Clock.
+    #[serde(default)]
+    clock_local_files: BTreeMap<String, ClockLocalFileAdmission>,
 }
 
 impl Default for CatalogStoreFile {
@@ -691,6 +735,8 @@ impl Default for CatalogStoreFile {
             bookmarks: Vec::new(),
             search: None,
             pages: BTreeMap::new(),
+            clock_presets: BTreeMap::new(),
+            clock_local_files: BTreeMap::new(),
         }
     }
 }
@@ -1014,6 +1060,164 @@ fn valid_catalog_source(source: &ServerCapabilities) -> bool {
         })
 }
 
+fn valid_clock_catalog_presets(presets: &BTreeMap<String, ClockCatalogPreset>) -> bool {
+    presets.len() <= 8
+        && presets.iter().all(|(identity, preset)| {
+            identity == NPR_NEWS_NOW_PRESET_ID
+                && preset.content.kind == ContentKind::Episode
+                && !preset.content.source_id.trim().is_empty()
+                && preset.content.source_id.len() <= MAX_PLAYLIST_FIELD_BYTES
+                && !preset.content.remote_id.trim().is_empty()
+                && preset.content.remote_id.len() <= MAX_PLAYLIST_FIELD_BYTES
+        })
+}
+
+fn valid_clock_local_id(identity: &str) -> bool {
+    !identity.is_empty()
+        && identity.len() <= mackes_mesh_types::clock::MAX_CLOCK_AUDIO_ID_BYTES
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn supported_clock_local_suffix(path: &Path) -> bool {
+    path.extension()
+        .and_then(|suffix| suffix.to_str())
+        .is_some_and(|suffix| {
+            matches!(
+                suffix.to_ascii_lowercase().as_str(),
+                "flac" | "mp3" | "ogg" | "oga" | "aac" | "m4a" | "wav" | "wave" | "opus"
+            )
+        })
+}
+
+fn valid_clock_local_admissions(admissions: &BTreeMap<String, ClockLocalFileAdmission>) -> bool {
+    admissions.len() <= MAX_CLOCK_LOCAL_FILES
+        && admissions.iter().all(|(identity, admission)| {
+            let relative = Path::new(&admission.relative_path);
+            valid_clock_local_id(identity)
+                && !admission.relative_path.is_empty()
+                && admission.relative_path.len() <= MAX_PLAYLIST_FIELD_BYTES
+                && !relative.is_absolute()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                && supported_clock_local_suffix(relative)
+                && admission.byte_len > 0
+                && admission.byte_len <= MAX_CLOCK_LOCAL_FILE_BYTES
+                && admission.modified_at_utc_ms > 0
+                && admission.sha256.len() == 64
+                && admission
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn clock_file_sha256(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CLOCK_LOCAL_FILE_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Clock local audio size changed outside the admitted bound",
+        ));
+    }
+    Ok(music_action_auth::hex_encode(&music_action_auth::sha256(
+        &bytes,
+    )))
+}
+
+fn modified_at_utc_ms(metadata: &std::fs::Metadata) -> std::io::Result<u64> {
+    let modified = metadata.modified()?;
+    let duration = modified.duration_since(UNIX_EPOCH).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Clock local audio predates the Unix epoch",
+        )
+    })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Clock local audio timestamp exceeds the contract bound",
+        )
+    })
+}
+
+/// Admit one regular audio file already placed beneath mde-musicd's private
+/// Clock directory. Arbitrary paths, symlinks, empty/oversized files, unknown
+/// codecs, and unstable identities fail closed.
+pub fn admit_clock_local_file(
+    data_dir: &Path,
+    identity: &str,
+    candidate: &Path,
+) -> std::io::Result<ClockAudioRef> {
+    if !valid_clock_local_id(identity) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Clock local audio identity",
+        ));
+    }
+    let root = data_dir.join(CLOCK_LOCAL_FILE_DIRECTORY);
+    let canonical_root = std::fs::canonicalize(&root)?;
+    let link_metadata = std::fs::symlink_metadata(candidate)?;
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Clock local audio must be a regular non-symlink file",
+        ));
+    }
+    let canonical_candidate = std::fs::canonicalize(candidate)?;
+    let relative = canonical_candidate
+        .strip_prefix(&canonical_root)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Clock local audio is outside the daemon-owned directory",
+            )
+        })?;
+    if !supported_clock_local_suffix(relative) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported Clock local audio codec",
+        ));
+    }
+    let metadata = std::fs::metadata(&canonical_candidate)?;
+    if metadata.len() == 0 || metadata.len() > MAX_CLOCK_LOCAL_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Clock local audio size is outside the admitted bound",
+        ));
+    }
+    let relative_path = relative.to_string_lossy().into_owned();
+    let admission = ClockLocalFileAdmission {
+        relative_path,
+        byte_len: metadata.len(),
+        modified_at_utc_ms: modified_at_utc_ms(&metadata)?,
+        sha256: clock_file_sha256(&canonical_candidate)?,
+    };
+    let mut catalog = load_catalog(data_dir)?;
+    if catalog.clock_local_files.len() == MAX_CLOCK_LOCAL_FILES
+        && !catalog.clock_local_files.contains_key(identity)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Clock local audio registry is full",
+        ));
+    }
+    catalog
+        .clock_local_files
+        .insert(identity.to_owned(), admission);
+    persist_catalog(data_dir, &catalog)?;
+    Ok(ClockAudioRef::Music {
+        source_id: CLOCK_LOCAL_FILE_SOURCE_ID.to_owned(),
+        remote_id: identity.to_owned(),
+        content_kind: ClockMusicKind::Track,
+        fallback_tone_id: "alarm_classic".to_owned(),
+    })
+}
+
 fn set_catalog_variants_reachable(file: &mut CatalogStoreFile, source_id: &str, reachable: bool) {
     let update_item = |item: &mut CatalogItem| {
         for variant in &mut item.variants {
@@ -1111,6 +1315,8 @@ fn load_catalog(dir: &Path) -> std::io::Result<CatalogStoreFile> {
             .pages
             .iter()
             .any(|(key, page)| key.trim().is_empty() || !valid_catalog_page(page))
+        || !valid_clock_catalog_presets(&file.clock_presets)
+        || !valid_clock_local_admissions(&file.clock_local_files)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1151,6 +1357,8 @@ fn persist_catalog(dir: &Path, file: &CatalogStoreFile) -> std::io::Result<()> {
             .pages
             .iter()
             .any(|(key, page)| key.trim().is_empty() || !valid_catalog_page(page))
+        || !valid_clock_catalog_presets(&file.clock_presets)
+        || !valid_clock_local_admissions(&file.clock_local_files)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1558,7 +1766,7 @@ fn record_catalog_response(dir: &Path, client: &Client, verb: &str, body: &str, 
                 .filter_map(|station| radio_catalog_item(&source_id, station))
                 .collect(),
         ),
-        "podcast-episodes" => merge_catalog_items(&mut file.episodes, {
+        "podcast-episodes" => {
             let channel_id = serde_json::from_str::<Value>(body)
                 .ok()
                 .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -1574,13 +1782,37 @@ fn record_catalog_response(dir: &Path, client: &Client, verb: &str, body: &str, 
                 })
                 .map(|podcast| podcast.title.as_str())
                 .unwrap_or_default();
-            decode_catalog_rows::<crate::airsonic::PodcastEpisode>(result, "episodes")
-                .iter()
-                .filter_map(|episode| {
-                    podcast_episode_catalog_item(&source_id, episode, parent_title)
-                })
-                .collect()
-        }),
+            // The provider's typed podcast response is newest-first. Capture
+            // that ordering before the general catalog's deterministic merge
+            // sorts display rows by normalized identity.
+            let admitted =
+                decode_catalog_rows::<crate::airsonic::PodcastEpisode>(result, "episodes")
+                    .iter()
+                    .filter_map(|episode| {
+                        podcast_episode_catalog_item(&source_id, episode, parent_title)
+                    })
+                    .collect::<Vec<_>>();
+            if channel_id == NPR_NEWS_NOW_PRESET_ID {
+                let newest =
+                    admitted
+                        .first()
+                        .and_then(|item| item.variants.first())
+                        .map(|variant| ClockCatalogPreset {
+                            content: variant.content.clone(),
+                            admitted_at_utc_ms: state::now_ms(),
+                        });
+                match newest {
+                    Some(preset) => {
+                        file.clock_presets
+                            .insert(NPR_NEWS_NOW_PRESET_ID.to_string(), preset);
+                    }
+                    None => {
+                        file.clock_presets.remove(NPR_NEWS_NOW_PRESET_ID);
+                    }
+                }
+            }
+            merge_catalog_items(&mut file.episodes, admitted);
+        }
         "get-song" => {
             if let Some(song) = result.get("song").and_then(|value| {
                 serde_json::from_value::<crate::airsonic::Song>(value.clone()).ok()
@@ -1996,6 +2228,8 @@ pub const TRANSPORT_VERBS: [&str; 7] = [
 /// state files (`music-state-by-peer/`, handoff intents) and need neither
 /// the engine nor the airsonic client.
 pub const PEER_VERBS: [&str; 2] = ["peer-states", "take-over"];
+/// Queue-independent Clock alert handoff verb.
+pub const CLOCK_AUDIO_VERB: &str = "clock-audio";
 
 /// Last-seen control cursors at the instant a renderer fails. A replacement
 /// renderer may continue playback only if no queue or transport request was
@@ -4802,6 +5036,430 @@ fn seek_transport_reply(accepted: bool, position_ms: u64) -> String {
     }
 }
 
+struct MusicClockAudioEffects<'a> {
+    music_engine: Option<&'a Engine>,
+    alert_engine: Option<&'a Engine>,
+    clients: &'a [&'a Client],
+    catalog: &'a CatalogStoreFile,
+    cache_dir: &'a Path,
+    data_dir: &'a Path,
+    seat_audio: &'a mut SeatAudioAuthority,
+}
+
+impl ClockAudioEffects for MusicClockAudioEffects<'_> {
+    fn duck_seat_streams(&mut self, request: &ClockAudioRequestV1) -> Result<(), &'static str> {
+        self.seat_audio
+            .duck(SeatDuckGeneration {
+                occurrence_id: request.occurrence_id.clone(),
+                global_event_id: request.global_event_id.clone(),
+                generation: request.occurrence_generation,
+            })
+            .map_err(|error| error.reason_code())
+    }
+
+    fn restore_seat_streams(&mut self) -> Result<(), &'static str> {
+        self.seat_audio
+            .restore()
+            .map_err(|error| error.reason_code())
+    }
+
+    fn music_volume(&self) -> Option<f32> {
+        self.music_engine
+            .filter(|engine| engine.is_active())
+            .map(|engine| engine.volume())
+    }
+
+    fn set_music_volume(&mut self, volume: f32) {
+        if let Some(engine) = self.music_engine {
+            engine.set_volume(volume);
+        }
+    }
+
+    fn set_alert_volume(&mut self, volume: f32) {
+        if let Some(engine) = self.alert_engine {
+            engine.set_volume(volume);
+        }
+    }
+
+    fn start_bundled(&mut self, tone_id: &str) -> Result<(), &'static str> {
+        let engine = self.alert_engine.ok_or("audio_output_unavailable")?;
+        engine
+            .play_bundled_clock_tone(tone_id)
+            .then_some(())
+            .ok_or("bundled_tone_unavailable")
+    }
+
+    fn start_music(&mut self, audio: &ClockAudioRef) -> Result<(), &'static str> {
+        let engine = self.alert_engine.ok_or("audio_output_unavailable")?;
+        let tracks = governed_clock_playback_tracks(
+            self.data_dir,
+            self.catalog,
+            audio,
+            self.clients,
+            self.cache_dir,
+        )?;
+        engine
+            .play_from_candidates_at(tracks, 0, 0)
+            .then_some(())
+            .ok_or("audio_output_unavailable")
+    }
+
+    fn resolve_audio(&self, audio: &ClockAudioRef) -> Result<(), &'static str> {
+        governed_clock_playback_tracks(
+            self.data_dir,
+            self.catalog,
+            audio,
+            self.clients,
+            self.cache_dir,
+        )
+        .map(|_| ())
+    }
+
+    fn preview_audio(&mut self, audio: &ClockAudioRef) -> Result<(), &'static str> {
+        let engine = self.alert_engine.ok_or("audio_output_unavailable")?;
+        let tracks = governed_clock_playback_tracks(
+            self.data_dir,
+            self.catalog,
+            audio,
+            self.clients,
+            self.cache_dir,
+        )?;
+        engine
+            .play_from_candidates_at(tracks, 0, 0)
+            .then_some(())
+            .ok_or("audio_output_unavailable")
+    }
+
+    fn music_is_audible(&self) -> bool {
+        self.alert_engine.is_some_and(|engine| {
+            engine.is_renderer_healthy() && engine.is_playing() && engine.position_ms() > 0
+        })
+    }
+
+    fn stop_alert(&mut self) {
+        if let Some(engine) = self.alert_engine {
+            engine.stop();
+        }
+    }
+
+    fn revoke_alert(&mut self) {
+        if let Some(engine) = self.alert_engine {
+            engine.revoke_renderer();
+        }
+    }
+}
+
+fn governed_clock_playback_tracks(
+    data_dir: &Path,
+    catalog: &CatalogStoreFile,
+    audio: &ClockAudioRef,
+    clients: &[&Client],
+    cache_dir: &Path,
+) -> Result<Vec<PlaybackTrack>, &'static str> {
+    if let Some(track) = governed_clock_local_track(data_dir, catalog, audio)? {
+        return Ok(vec![track]);
+    }
+    let selected = governed_clock_content(catalog, audio)?;
+    let queue = Queue {
+        songs: vec![selected.remote_id.clone()],
+        current: 0,
+    };
+    selected_source_upcoming_candidates(&queue, &selected, clients, catalog, cache_dir)
+}
+
+fn governed_clock_local_track(
+    data_dir: &Path,
+    catalog: &CatalogStoreFile,
+    audio: &ClockAudioRef,
+) -> Result<Option<PlaybackTrack>, &'static str> {
+    let ClockAudioRef::Music {
+        source_id,
+        remote_id,
+        content_kind,
+        ..
+    } = audio
+    else {
+        return Err("invalid_music_reference");
+    };
+    if source_id != CLOCK_LOCAL_FILE_SOURCE_ID {
+        return Ok(None);
+    }
+    if *content_kind != ClockMusicKind::Track || !valid_clock_local_id(remote_id) {
+        return Err("local_file_reference_malformed");
+    }
+    let admission = catalog
+        .clock_local_files
+        .get(remote_id)
+        .ok_or("local_file_reference_missing")?;
+    if !valid_clock_local_admissions(&BTreeMap::from([(remote_id.clone(), admission.clone())])) {
+        return Err("local_file_reference_unauthorized");
+    }
+    let root = data_dir.join(CLOCK_LOCAL_FILE_DIRECTORY);
+    let canonical_root =
+        std::fs::canonicalize(&root).map_err(|_| "local_file_reference_unavailable")?;
+    let candidate = root.join(&admission.relative_path);
+    let link_metadata =
+        std::fs::symlink_metadata(&candidate).map_err(|_| "local_file_reference_missing")?;
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err("local_file_reference_unauthorized");
+    }
+    let canonical_candidate =
+        std::fs::canonicalize(&candidate).map_err(|_| "local_file_reference_missing")?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err("local_file_reference_unauthorized");
+    }
+    let metadata =
+        std::fs::metadata(&canonical_candidate).map_err(|_| "local_file_reference_missing")?;
+    if metadata.len() != admission.byte_len
+        || modified_at_utc_ms(&metadata).ok() != Some(admission.modified_at_utc_ms)
+        || clock_file_sha256(&canonical_candidate).ok().as_deref()
+            != Some(admission.sha256.as_str())
+    {
+        return Err("local_file_reference_stale");
+    }
+    let codec = SourceCodec::from_suffix(&admission.relative_path);
+    let locator = crate::engine::local_file_stream_url(&canonical_candidate)
+        .ok_or("local_file_reference_unauthorized")?;
+    Ok(Some(PlaybackTrack::single(locator, codec)))
+}
+
+fn governed_clock_content(
+    catalog: &CatalogStoreFile,
+    audio: &ClockAudioRef,
+) -> Result<ContentRef, &'static str> {
+    governed_clock_content_at(catalog, audio, state::now_ms())
+}
+
+fn governed_clock_content_at(
+    catalog: &CatalogStoreFile,
+    audio: &ClockAudioRef,
+    now_ms: u64,
+) -> Result<ContentRef, &'static str> {
+    let ClockAudioRef::Music {
+        source_id,
+        remote_id,
+        content_kind,
+        ..
+    } = audio
+    else {
+        return Err("invalid_music_reference");
+    };
+    let expected = match content_kind {
+        ClockMusicKind::Track => ContentKind::Music,
+        ClockMusicKind::PodcastEpisode => ContentKind::Episode,
+        ClockMusicKind::Radio => ContentKind::Radio,
+    };
+
+    // News Now is a catalog-owned dynamic alias: Clock retains NPR's stable
+    // feed identity while Music resolves the newest admitted hourly episode at
+    // ring time. The resolved provider identity never crosses back into Clock.
+    if source_id == CLOCK_CATALOG_SOURCE_ID
+        && remote_id == NPR_NEWS_NOW_PRESET_ID
+        && expected == ContentKind::Episode
+    {
+        let preset = catalog
+            .clock_presets
+            .get(NPR_NEWS_NOW_PRESET_ID)
+            .ok_or("catalog_reference_missing")?;
+        if preset.admitted_at_utc_ms > now_ms
+            || now_ms.saturating_sub(preset.admitted_at_utc_ms) > NPR_NEWS_NOW_MAX_AGE_MS
+        {
+            return Err("catalog_reference_stale");
+        }
+        return admitted_clock_content(catalog, &preset.content);
+    }
+
+    // A configured NPR member station remains a distinct Radio catalog item.
+    // Clock stores the stable item identity, not the station's provider URL.
+    if source_id == CLOCK_CATALOG_SOURCE_ID && expected == ContentKind::Radio {
+        let selected = catalog
+            .radio
+            .iter()
+            .find(|item| item.kind == ContentKind::Radio && item.id == *remote_id)
+            .and_then(|item| ordered_variants(&item.variants).into_iter().next())
+            .map(|variant| variant.content.clone())
+            .ok_or("catalog_reference_missing")?;
+        return admitted_clock_content(catalog, &selected);
+    }
+
+    let selected = catalog
+        .songs
+        .iter()
+        .chain(catalog.episodes.iter())
+        .chain(catalog.radio.iter())
+        .filter(|item| item.kind == expected)
+        .flat_map(|item| {
+            item.variants.iter().filter(move |variant| {
+                variant.content.source_id == *source_id
+                    && (variant.content.remote_id == *remote_id || item.id == *remote_id)
+            })
+        })
+        .map(|variant| variant.content.clone())
+        .next()
+        .ok_or("catalog_reference_missing")?;
+    admitted_clock_content(catalog, &selected)
+}
+
+fn admitted_clock_content(
+    catalog: &CatalogStoreFile,
+    selected: &ContentRef,
+) -> Result<ContentRef, &'static str> {
+    let source = catalog
+        .sources
+        .iter()
+        .find(|source| source.source_id == selected.source_id)
+        .ok_or("catalog_source_unauthorized")?;
+    if source.authentication_required {
+        return Err("catalog_source_unauthorized");
+    }
+    if !source.reachable {
+        return Err("catalog_source_unreachable");
+    }
+    let retained = catalog
+        .songs
+        .iter()
+        .chain(catalog.episodes.iter())
+        .chain(catalog.radio.iter())
+        .filter(|item| item.kind == selected.kind)
+        .flat_map(|item| item.variants.iter())
+        .any(|variant| variant.content == *selected && (variant.reachable || variant.cached));
+    retained
+        .then(|| selected.clone())
+        .ok_or("catalog_reference_missing")
+}
+
+fn poll_clock_audio_with_authorizer(
+    persist: &Persist,
+    cursors: &mut HashMap<String, String>,
+    authority: &mut ClockAudioAuthority,
+    seat_audio: &mut SeatAudioAuthority,
+    music_engine: Option<&Engine>,
+    alert_engine: Option<&Engine>,
+    clients: &[&Client],
+    authorizer: &music_action_auth::Authorizer,
+) {
+    let since = cursors.get(CLOCK_AUDIO_ACTION_TOPIC).map(String::as_str);
+    let messages =
+        match persist.list_since_limit(CLOCK_AUDIO_ACTION_TOPIC, since, MAX_MESSAGES_PER_POLL) {
+            Ok(messages) => messages,
+            Err(_) => return,
+        };
+    let node = state::local_host();
+    let data_dir = state::data_dir();
+    let catalog = load_catalog(&data_dir).unwrap_or_default();
+    let cache_dir = crate::cache::cache_dir();
+    for message in messages {
+        cursors.insert(CLOCK_AUDIO_ACTION_TOPIC.to_string(), message.ulid.clone());
+        let body = message.body.as_deref().unwrap_or("");
+        let reply = match authorizer.authorize(body, "music-clock-audio", &node, "clock-audio") {
+            Err(error) => unauthorized_reply(CLOCK_AUDIO_VERB, &error),
+            Ok(()) => {
+                let now_ms = i64::try_from(state::now_ms()).unwrap_or(i64::MAX);
+                match ClockAudioRequestV1::from_json_at(body.as_bytes(), now_ms) {
+                    Err(error) => json!({
+                        "ok": false,
+                        "error": format!("clock-audio: invalid request: {error:?}")
+                    })
+                    .to_string(),
+                    Ok(request) => {
+                        let mut effects = MusicClockAudioEffects {
+                            music_engine,
+                            alert_engine,
+                            clients,
+                            catalog: &catalog,
+                            cache_dir: &cache_dir,
+                            data_dir: &data_dir,
+                            seat_audio,
+                        };
+                        let status = authority.apply(request, now_ms, &mut effects);
+                        publish_clock_audio_status(persist, &node, &status);
+                        serde_json::to_string(&status).unwrap_or_else(|_| {
+                            r#"{"ok":false,"error":"clock-audio: reply_failed"}"#.to_string()
+                        })
+                    }
+                }
+            }
+        };
+        let _ = persist.write(
+            &reply_topic(&message.ulid),
+            Priority::Default,
+            None,
+            Some(&reply),
+        );
+    }
+}
+
+fn publish_clock_audio_status(
+    persist: &Persist,
+    node: &str,
+    status: &mackes_mesh_types::clock::ClockAudioStatusV1,
+) {
+    let Ok(topic) = clock_audio_status_topic(node) else {
+        return;
+    };
+    let Ok(body) = serde_json::to_string(status) else {
+        return;
+    };
+    let _ = persist.write(&topic, Priority::Default, None, Some(&body));
+}
+
+fn transition_clock_audio_provider_loss(
+    persist: &Persist,
+    authority: &mut ClockAudioAuthority,
+    seat_audio: &mut SeatAudioAuthority,
+    music_engine: Option<&Engine>,
+    alert_engine: Option<&Engine>,
+) -> Option<f32> {
+    let catalog = CatalogStoreFile::default();
+    let cache_dir = crate::cache::cache_dir();
+    let data_dir = state::data_dir();
+    let mut effects = MusicClockAudioEffects {
+        music_engine,
+        alert_engine,
+        clients: &[],
+        catalog: &catalog,
+        cache_dir: &cache_dir,
+        data_dir: &data_dir,
+        seat_audio,
+    };
+    let transition = authority.provider_lost(
+        i64::try_from(state::now_ms()).unwrap_or(i64::MAX),
+        &mut effects,
+    );
+    // Also retry a previously incomplete restore when the active Clock record
+    // was already terminal. This is the daemon-shutdown/provider-loss backstop.
+    let _ = effects.restore_seat_streams();
+    let transition = transition?;
+    publish_clock_audio_status(persist, &state::local_host(), &transition.status);
+    transition.restored_music_volume
+}
+
+fn poll_clock_audio_start_deadline(
+    persist: &Persist,
+    authority: &mut ClockAudioAuthority,
+    seat_audio: &mut SeatAudioAuthority,
+    music_engine: Option<&Engine>,
+    alert_engine: Option<&Engine>,
+) {
+    let catalog = CatalogStoreFile::default();
+    let cache_dir = crate::cache::cache_dir();
+    let data_dir = state::data_dir();
+    let mut effects = MusicClockAudioEffects {
+        music_engine,
+        alert_engine,
+        clients: &[],
+        catalog: &catalog,
+        cache_dir: &cache_dir,
+        data_dir: &data_dir,
+        seat_audio,
+    };
+    let now_ms = i64::try_from(state::now_ms()).unwrap_or(i64::MAX);
+    let _ = authority.poll_preview(now_ms, &mut effects);
+    if let Some(status) = authority.poll_music_start(now_ms, &mut effects) {
+        publish_clock_audio_status(persist, &state::local_host(), &status);
+    }
+}
+
 /// One transport-poll sweep: dispatch new `action/music/{play,pause,…}`
 /// requests to the engine. MUSIC-RESPONSIVE-10 — the shared Airsonic client
 /// (owned by [`serve`], refreshed on a creds change) is passed in so a
@@ -5071,6 +5729,13 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             tracing::warn!(error = %e, "no audio output — playback disabled; queue + browse still served");
         })
         .ok();
+    // Clock alerts use a second renderer owned by this daemon. It mixes through
+    // PipeWire while leaving the Music queue engine, queue cursor, MPRIS state,
+    // and mesh playback ownership untouched.
+    let mut clock_audio_engine = engine.as_ref().and_then(|_| Engine::new().ok());
+    let mut clock_audio_authority = ClockAudioAuthority::default();
+    let mut seat_audio_authority = SeatAudioAuthority::production();
+    let mut pending_clock_restore_volume = None;
     // AIR-6: bring up the MPRIS surface sharing this engine, so media keys
     // (sway → playerctl → MPRIS) + the lock-screen widget drive the same
     // playback the Bus does. Held for the serve loop's lifetime; dropping
@@ -5161,6 +5826,14 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             .as_ref()
             .is_some_and(|current| !current.is_renderer_healthy())
         {
+            pending_clock_restore_volume = transition_clock_audio_provider_loss(
+                &persist,
+                &mut clock_audio_authority,
+                &mut seat_audio_authority,
+                engine.as_ref(),
+                clock_audio_engine.as_ref(),
+            );
+            clock_audio_engine = None;
             let interrupted_position_ms = engine
                 .as_ref()
                 .and_then(|current| current.interrupted_position_ms());
@@ -5185,6 +5858,9 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         if engine.is_none() && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL {
             last_audio_retry = Instant::now();
             if let Ok(e) = Engine::new() {
+                if let Some(volume) = pending_clock_restore_volume.take() {
+                    e.set_volume(volume);
+                }
                 tracing::info!("audio output acquired on retry — playback enabled");
                 _mpris = Some(crate::mpris::spawn(
                     e.handle(),
@@ -5194,6 +5870,27 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
                 ));
                 engine = Some(e);
             }
+        }
+        if engine.is_some()
+            && clock_audio_engine
+                .as_ref()
+                .is_some_and(|current| !current.is_renderer_healthy())
+        {
+            let _ = transition_clock_audio_provider_loss(
+                &persist,
+                &mut clock_audio_authority,
+                &mut seat_audio_authority,
+                engine.as_ref(),
+                clock_audio_engine.as_ref(),
+            );
+            clock_audio_engine = None;
+        }
+        if engine.is_some()
+            && clock_audio_engine.is_none()
+            && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL
+        {
+            last_audio_retry = Instant::now();
+            clock_audio_engine = Engine::new().ok();
         }
         // BUS-INODE-ORPHAN-1 — if the index inode swapped under us (another
         // process recreated it), reopen so we follow the live DB instead of a
@@ -5227,6 +5924,23 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             .iter()
             .map(|(_, client)| client)
             .collect::<Vec<_>>();
+        poll_clock_audio_with_authorizer(
+            &persist,
+            &mut cursors,
+            &mut clock_audio_authority,
+            &mut seat_audio_authority,
+            engine.as_ref(),
+            clock_audio_engine.as_ref(),
+            &clients,
+            &authorizer,
+        );
+        poll_clock_audio_start_deadline(
+            &persist,
+            &mut clock_audio_authority,
+            &mut seat_audio_authority,
+            engine.as_ref(),
+            clock_audio_engine.as_ref(),
+        );
         poll_transport_with_authorizer(
             &persist,
             queue_path,
@@ -5329,6 +6043,13 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    let _ = transition_clock_audio_provider_loss(
+        &persist,
+        &mut clock_audio_authority,
+        &mut seat_audio_authority,
+        engine.as_ref(),
+        clock_audio_engine.as_ref(),
+    );
     let clients = airsonic
         .iter()
         .map(|(_, client)| client)
@@ -5357,7 +6078,8 @@ pub fn seed_cursors_at_tail(persist: &Persist) -> HashMap<String, String> {
         .chain(BROWSE_VERBS.iter())
         .chain(TRANSPORT_VERBS.iter())
         .chain([WORKSPACE_ACTION_VERB].iter())
-        .chain(PEER_VERBS.iter());
+        .chain(PEER_VERBS.iter())
+        .chain([CLOCK_AUDIO_VERB].iter());
     for verb in verbs {
         let topic = format!("action/music/{verb}");
         if let Ok(Some(latest)) = persist.latest_ulid(&topic) {
@@ -8423,5 +9145,323 @@ mod tests {
         assert!(!wire.contains("secret-token"));
         assert_eq!(request_id_from_body(&wire), "redaction-1");
         assert_eq!(request_id_from_body("{}"), "invalid-request");
+    }
+
+    fn clock_catalog_source(source_id: &str) -> ServerCapabilities {
+        ServerCapabilities {
+            source_id: source_id.to_owned(),
+            api_profile: "subsonic/1.16.1".to_owned(),
+            reachable: true,
+            authentication_required: false,
+            features: BTreeSet::from(["podcast-episodes".to_owned(), "list-radio".to_owned()]),
+        }
+    }
+
+    fn clock_catalog_item(
+        id: &str,
+        kind: ContentKind,
+        title: &str,
+        source_id: &str,
+        remote_id: &str,
+    ) -> CatalogItem {
+        CatalogItem {
+            id: id.to_owned(),
+            kind,
+            title: title.to_owned(),
+            creator: String::new(),
+            parent_title: String::new(),
+            duration_ms: None,
+            artwork_ref: None,
+            starred: false,
+            cached: false,
+            variants: vec![catalog_variant(source_id, remote_id, kind).unwrap()],
+        }
+    }
+
+    #[test]
+    fn clock_news_now_500005_resolves_newest_admitted_episode_at_ring_time() {
+        let source_id = "airsonic:https://music.mesh";
+        let older = clock_catalog_item(
+            "episode|older",
+            ContentKind::Episode,
+            "News Now 11:00",
+            source_id,
+            "episode-older",
+        );
+        let newest = clock_catalog_item(
+            "episode|newest",
+            ContentKind::Episode,
+            "News Now 12:00",
+            source_id,
+            "episode-newest",
+        );
+        let now = 1_700_000_000_000_u64;
+        let catalog = CatalogStoreFile {
+            sources: vec![clock_catalog_source(source_id)],
+            episodes: vec![older, newest.clone()],
+            clock_presets: BTreeMap::from([(
+                NPR_NEWS_NOW_PRESET_ID.to_owned(),
+                ClockCatalogPreset {
+                    content: newest.variants[0].content.clone(),
+                    admitted_at_utc_ms: now,
+                },
+            )]),
+            ..CatalogStoreFile::default()
+        };
+        let stable = ClockAudioRef::Music {
+            source_id: CLOCK_CATALOG_SOURCE_ID.to_owned(),
+            remote_id: NPR_NEWS_NOW_PRESET_ID.to_owned(),
+            content_kind: ClockMusicKind::PodcastEpisode,
+            fallback_tone_id: "alarm_classic".to_owned(),
+        };
+
+        let resolved = governed_clock_content_at(&catalog, &stable, now).unwrap();
+        assert_eq!(resolved.remote_id, "episode-newest");
+        assert!(!serde_json::to_string(&stable).unwrap().contains("http"));
+    }
+
+    #[test]
+    fn news_now_catalog_refresh_records_first_provider_episode_as_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::with_salt("http://127.0.0.1:9", "alice", "unused", "clock-news-now");
+        let source_id = catalog_source_id(&client);
+        let podcast = clock_catalog_item(
+            "Podcast|npr news now|||0",
+            ContentKind::Podcast,
+            "NPR News Now",
+            &source_id,
+            NPR_NEWS_NOW_PRESET_ID,
+        );
+        persist_catalog(
+            dir.path(),
+            &CatalogStoreFile {
+                sources: vec![clock_catalog_source(&source_id)],
+                podcasts: vec![podcast],
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+
+        record_catalog_response(
+            dir.path(),
+            &client,
+            "podcast-episodes",
+            r#"{"id":"500005"}"#,
+            r#"{"ok":true,"result":{"episodes":[{"id":"episode-newest","title":"12:00"},{"id":"episode-older","title":"11:00"}]}}"#,
+        );
+
+        let catalog = load_catalog(dir.path()).unwrap();
+        assert_eq!(
+            catalog.clock_presets[NPR_NEWS_NOW_PRESET_ID]
+                .content
+                .remote_id,
+            "episode-newest"
+        );
+    }
+
+    #[test]
+    fn clock_news_now_refuses_stale_unauthorized_unreachable_or_deleted_state() {
+        let source_id = "airsonic:https://music.mesh";
+        let episode = clock_catalog_item(
+            "episode|newest",
+            ContentKind::Episode,
+            "News Now",
+            source_id,
+            "episode-newest",
+        );
+        let now = 1_700_000_000_000_u64;
+        let stable = ClockAudioRef::Music {
+            source_id: CLOCK_CATALOG_SOURCE_ID.to_owned(),
+            remote_id: NPR_NEWS_NOW_PRESET_ID.to_owned(),
+            content_kind: ClockMusicKind::PodcastEpisode,
+            fallback_tone_id: "alarm_classic".to_owned(),
+        };
+        let base = CatalogStoreFile {
+            sources: vec![clock_catalog_source(source_id)],
+            episodes: vec![episode.clone()],
+            clock_presets: BTreeMap::from([(
+                NPR_NEWS_NOW_PRESET_ID.to_owned(),
+                ClockCatalogPreset {
+                    content: episode.variants[0].content.clone(),
+                    admitted_at_utc_ms: now,
+                },
+            )]),
+            ..CatalogStoreFile::default()
+        };
+
+        assert_eq!(
+            governed_clock_content_at(&base, &stable, now + NPR_NEWS_NOW_MAX_AGE_MS + 1,),
+            Err("catalog_reference_stale")
+        );
+        let mut unauthorized = base.clone();
+        unauthorized.sources[0].authentication_required = true;
+        assert_eq!(
+            governed_clock_content_at(&unauthorized, &stable, now),
+            Err("catalog_source_unauthorized")
+        );
+        let mut unreachable = base.clone();
+        unreachable.sources[0].reachable = false;
+        assert_eq!(
+            governed_clock_content_at(&unreachable, &stable, now),
+            Err("catalog_source_unreachable")
+        );
+        let mut deleted = base;
+        deleted.episodes.clear();
+        assert_eq!(
+            governed_clock_content_at(&deleted, &stable, now),
+            Err("catalog_reference_missing")
+        );
+    }
+
+    #[test]
+    fn clock_malformed_preset_is_rejected_by_the_existing_catalog_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_id = "airsonic:https://music.mesh";
+        let episode = clock_catalog_item(
+            "episode|newest",
+            ContentKind::Episode,
+            "News Now",
+            source_id,
+            "episode-newest",
+        );
+        persist_catalog(
+            dir.path(),
+            &CatalogStoreFile {
+                sources: vec![clock_catalog_source(source_id)],
+                episodes: vec![episode.clone()],
+                clock_presets: BTreeMap::from([(
+                    NPR_NEWS_NOW_PRESET_ID.to_owned(),
+                    ClockCatalogPreset {
+                        content: episode.variants[0].content.clone(),
+                        admitted_at_utc_ms: 1_700_000_000_000,
+                    },
+                )]),
+                ..CatalogStoreFile::default()
+            },
+        )
+        .unwrap();
+        let path = catalog_path(dir.path());
+        let mut wire: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        wire["clock_presets"][NPR_NEWS_NOW_PRESET_ID]["content"]["remote_id"] =
+            Value::String(String::new());
+        std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+
+        assert_eq!(
+            load_catalog(dir.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn clock_npr_live_station_uses_a_separate_stable_catalog_identity() {
+        let source_id = "airsonic:https://music.mesh";
+        let station = clock_catalog_item(
+            "Radio|npr member station|||0",
+            ContentKind::Radio,
+            "NPR Member Station",
+            source_id,
+            "https://provider.invalid/live-stream",
+        );
+        let catalog = CatalogStoreFile {
+            sources: vec![clock_catalog_source(source_id)],
+            radio: vec![station.clone()],
+            ..CatalogStoreFile::default()
+        };
+        let stable = ClockAudioRef::Music {
+            source_id: CLOCK_CATALOG_SOURCE_ID.to_owned(),
+            remote_id: station.id.clone(),
+            content_kind: ClockMusicKind::Radio,
+            fallback_tone_id: "alarm_classic".to_owned(),
+        };
+
+        let resolved = governed_clock_content_at(&catalog, &stable, 1).unwrap();
+        assert_eq!(resolved.remote_id, "https://provider.invalid/live-stream");
+        assert!(!serde_json::to_string(&stable).unwrap().contains("http"));
+        assert_ne!(
+            stable,
+            ClockAudioRef::Music {
+                source_id: CLOCK_CATALOG_SOURCE_ID.to_owned(),
+                remote_id: NPR_NEWS_NOW_PRESET_ID.to_owned(),
+                content_kind: ClockMusicKind::PodcastEpisode,
+                fallback_tone_id: "alarm_classic".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn clock_local_file_admission_resolves_only_the_stable_catalog_identity() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join(CLOCK_LOCAL_FILE_DIRECTORY);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("morning.wav");
+        std::fs::write(&file, b"bounded-audio-fixture").unwrap();
+
+        let audio = admit_clock_local_file(data.path(), "morning-bell", &file).unwrap();
+        let catalog = load_catalog(data.path()).unwrap();
+        let tracks =
+            governed_clock_playback_tracks(data.path(), &catalog, &audio, &[], data.path())
+                .unwrap();
+        assert_eq!(tracks.len(), 1);
+        let wire = serde_json::to_string(&audio).unwrap();
+        assert!(wire.contains("morning-bell"));
+        assert!(!wire.contains(file.to_string_lossy().as_ref()));
+        assert!(!wire.contains("file:") && !wire.contains("bounded-audio-fixture"));
+    }
+
+    #[test]
+    fn clock_local_file_references_fail_closed_when_malformed_stale_missing_or_unauthorized() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join(CLOCK_LOCAL_FILE_DIRECTORY);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("morning.wav");
+        std::fs::write(&file, b"first").unwrap();
+        let audio = admit_clock_local_file(data.path(), "morning-bell", &file).unwrap();
+        let catalog = load_catalog(data.path()).unwrap();
+
+        let malformed = ClockAudioRef::Music {
+            source_id: CLOCK_LOCAL_FILE_SOURCE_ID.to_owned(),
+            remote_id: "../morning.wav".to_owned(),
+            content_kind: ClockMusicKind::Track,
+            fallback_tone_id: "bell".to_owned(),
+        };
+        assert_eq!(
+            governed_clock_local_track(data.path(), &catalog, &malformed),
+            Err("local_file_reference_malformed")
+        );
+
+        std::fs::write(&file, b"changed-and-longer").unwrap();
+        assert_eq!(
+            governed_clock_local_track(data.path(), &catalog, &audio),
+            Err("local_file_reference_stale")
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            governed_clock_local_track(data.path(), &catalog, &audio),
+            Err("local_file_reference_missing")
+        );
+
+        let outside = data.path().join("outside.wav");
+        std::fs::write(&outside, b"outside").unwrap();
+        assert_eq!(
+            admit_clock_local_file(data.path(), "outside", &outside)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let mut unauthorized = catalog;
+        unauthorized.clock_local_files.insert(
+            "morning-bell".to_owned(),
+            ClockLocalFileAdmission {
+                relative_path: "../outside.wav".to_owned(),
+                byte_len: 7,
+                modified_at_utc_ms: 1,
+                sha256: "0".repeat(64),
+            },
+        );
+        assert_eq!(
+            governed_clock_local_track(data.path(), &unauthorized, &audio),
+            Err("local_file_reference_unauthorized")
+        );
     }
 }

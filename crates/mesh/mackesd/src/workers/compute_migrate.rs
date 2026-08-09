@@ -40,12 +40,17 @@
 
 #![cfg(feature = "async-services")]
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
+use mackes_mesh_types::workloads::reject_duplicate_json_keys;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -138,6 +143,19 @@ pub const RSYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// finite so a target that silently never comes up can't strand the
 /// source's domain in the shut-off limbo forever (vdi-vm-5).
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Root-only durable state for distributed migration admission and recovery.
+pub const DEFAULT_MIGRATION_STATE_ROOT: &str = "/var/lib/mackesd/compute-migrate";
+const MIGRATION_LEDGER_FILE: &str = "ledger.json";
+const MIGRATION_LEDGER_SCHEMA_VERSION: u8 = 1;
+const MAX_MIGRATION_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_MIGRATION_JOBS: usize = 128;
+const MAX_MIGRATION_FIELD_BYTES: usize = 64 * 1024;
+const MAX_MIGRATION_WIRE_BYTES: usize = 64 * 1024;
+const MAX_MIGRATION_ID_BYTES: usize = 256;
+const MAX_MIGRATION_PATH_BYTES: usize = 4 * 1024;
+const MAX_MIGRATION_ERROR_BYTES: usize = 4 * 1024;
+const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Migration-request payload per design doc §3.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -303,7 +321,63 @@ impl MigrationAuthority for WorkloadMigrationClient {
 /// Returns a human-readable error string on malformed JSON or
 /// missing required fields.
 pub fn parse_migrate_request(body: &str) -> Result<MigrateRequest, String> {
-    serde_json::from_str(body).map_err(|e| format!("malformed migrate request: {e}"))
+    validate_wire_body(body, "migrate request")?;
+    let request: MigrateRequest = serde_json::from_str(body)
+        .map_err(|error| format!("malformed migrate request: {error}"))?;
+    validate_peer(&request.source_peer)?;
+    validate_peer(&request.target_peer)?;
+    if request.source_peer == request.target_peer {
+        return Err("migration source and target must differ".into());
+    }
+    validate_migration_id(&request.vm_id, "VM identity")?;
+    validate_managed_disk_path(&request.disk_path)?;
+    Ok(request)
+}
+
+fn validate_wire_body(body: &str, label: &str) -> Result<(), String> {
+    if body.len() > MAX_MIGRATION_WIRE_BYTES {
+        return Err(format!("{label} exceeds the wire byte limit"));
+    }
+    reject_duplicate_json_keys(body)
+        .map_err(|_| format!("{label} is malformed or contains duplicate JSON keys"))
+}
+
+fn validate_peer(peer: &str) -> Result<(), String> {
+    if peer.len() > 64 || peer.parse::<std::net::IpAddr>().is_err() {
+        return Err("migration peer is not a bounded IP address".into());
+    }
+    Ok(())
+}
+
+fn validate_migration_id(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > MAX_MIGRATION_ID_BYTES
+        || value.chars().any(char::is_control)
+        || value.contains('/')
+        || value == "."
+        || value == ".."
+    {
+        return Err(format!("migration {label} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_managed_disk_path(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.len() > MAX_MIGRATION_PATH_BYTES
+        || !path.is_absolute()
+        || !path.starts_with(DEFAULT_TARGET_VM_DIR)
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || path.file_name().is_none()
+    {
+        return Err("migration disk path is outside the managed VM directory".into());
+    }
+    Ok(())
 }
 
 /// Stable capability target for a source-side migration.  Keep the source and
@@ -393,7 +467,18 @@ pub fn is_target_peer(event: &MigrateReadyEvent, own_nebula_ip: &str) -> bool {
 ///
 /// Returns a human-readable error on malformed JSON.
 pub fn parse_migrate_ready_event(body: &str) -> Result<MigrateReadyEvent, String> {
-    serde_json::from_str(body).map_err(|e| format!("malformed migrate-ready event: {e}"))
+    validate_wire_body(body, "migrate-ready event")?;
+    let event: MigrateReadyEvent = serde_json::from_str(body)
+        .map_err(|error| format!("malformed migrate-ready event: {error}"))?;
+    validate_peer(&event.source_peer)?;
+    validate_peer(&event.target_peer)?;
+    validate_migration_id(&event.vm_id, "VM identity")?;
+    validate_migration_id(&event.request_ulid, "request identity")?;
+    validate_managed_disk_path(&event.target_disk_path)?;
+    if event.domain_xml.trim().is_empty() || event.domain_xml.len() > MAX_MIGRATION_FIELD_BYTES {
+        return Err("migration retained definition is invalid".into());
+    }
+    Ok(event)
 }
 
 /// Build the `rsync --compress` args for shipping a disk from the
@@ -449,7 +534,19 @@ pub fn build_migrate_ready_event(
 ///
 /// Returns a human-readable error on malformed JSON.
 pub fn parse_migrate_failed_event(body: &str) -> Result<MigrateFailedEvent, String> {
-    serde_json::from_str(body).map_err(|e| format!("malformed migrate-failed event: {e}"))
+    validate_wire_body(body, "migrate-failed event")?;
+    let event: MigrateFailedEvent = serde_json::from_str(body)
+        .map_err(|error| format!("malformed migrate-failed event: {error}"))?;
+    validate_peer(&event.target_peer)?;
+    validate_migration_id(&event.vm_id, "VM identity")?;
+    validate_migration_id(&event.request_ulid, "request identity")?;
+    if event.error.is_empty()
+        || event.error.len() > MAX_MIGRATION_ERROR_BYTES
+        || event.error.chars().any(char::is_control)
+    {
+        return Err("migration failure description is invalid".into());
+    }
+    Ok(event)
 }
 
 /// Parse a migrate-committed event body.
@@ -458,7 +555,14 @@ pub fn parse_migrate_failed_event(body: &str) -> Result<MigrateFailedEvent, Stri
 ///
 /// Returns a human-readable error on malformed JSON.
 pub fn parse_migrate_committed_event(body: &str) -> Result<MigrateCommittedEvent, String> {
-    serde_json::from_str(body).map_err(|e| format!("malformed migrate-committed event: {e}"))
+    validate_wire_body(body, "migrate-committed event")?;
+    let event: MigrateCommittedEvent = serde_json::from_str(body)
+        .map_err(|error| format!("malformed migrate-committed event: {error}"))?;
+    validate_peer(&event.source_peer)?;
+    validate_peer(&event.target_peer)?;
+    validate_migration_id(&event.vm_id, "VM identity")?;
+    validate_migration_id(&event.request_ulid, "request identity")?;
+    Ok(event)
 }
 
 /// Build the `event/compute/migrate-committed` payload from the
@@ -566,9 +670,10 @@ fn run_migration(req: &MigrateRequest, actuator: &dyn MigrationAuthority) -> Mig
 
     // Step 1: ACPI shutdown.
     if let Err(error) = actuator.request_stop(&req.vm_id) {
-        return MigrationOutcome::AuthorityFailure {
+        let outcome = MigrationOutcome::AuthorityFailure {
             reason: error.to_string(),
         };
+        return restore_source_after_failed_migration(req, &domain_xml, actuator, outcome);
     }
 
     // Step 2: poll for shutoff.
@@ -584,22 +689,29 @@ fn run_migration(req: &MigrateRequest, actuator: &dyn MigrationAuthority) -> Mig
             }
             Ok(false) => {}
             Err(error) => {
-                return MigrationOutcome::AuthorityFailure {
+                let outcome = MigrationOutcome::AuthorityFailure {
                     reason: error.to_string(),
                 };
+                return restore_source_after_failed_migration(req, &domain_xml, actuator, outcome);
             }
         }
     }
     if !shutoff {
-        return MigrationOutcome::ShutdownTimeout;
+        return restore_source_after_failed_migration(
+            req,
+            &domain_xml,
+            actuator,
+            MigrationOutcome::ShutdownTimeout,
+        );
     }
 
     // Step 3: rsync.
     let rsync_args = build_rsync_args(&req.disk_path, &req.target_peer, DEFAULT_TARGET_VM_DIR);
     if let Err(e) = run_rsync(&rsync_args) {
-        return MigrationOutcome::RsyncFailure {
+        let outcome = MigrationOutcome::RsyncFailure {
             exit_description: e,
         };
+        return restore_source_after_failed_migration(req, &domain_xml, actuator, outcome);
     }
 
     // NOTE (vdi-vm-5): the source-side `virsh undefine` is DEFERRED. The
@@ -610,6 +722,20 @@ fn run_migration(req: &MigrateRequest, actuator: &dyn MigrationAuthority) -> Mig
     // migrate-ready also happens in the caller so it can carry the
     // request_ulid.
     MigrationOutcome::Ok { domain_xml }
+}
+
+fn restore_source_after_failed_migration(
+    req: &MigrateRequest,
+    domain_xml: &str,
+    actuator: &dyn MigrationAuthority,
+    outcome: MigrationOutcome,
+) -> MigrationOutcome {
+    match actuator.define_and_start(&req.vm_id, domain_xml) {
+        Ok(()) => outcome,
+        Err(error) => MigrationOutcome::AuthorityFailure {
+            reason: format!("migration failed and source recovery failed: {error}"),
+        },
+    }
 }
 
 /// VIRT-8.b — target-side: define + start the migrated VM from the
@@ -725,22 +851,24 @@ fn publish_production_migrate_event<T: serde::Serialize>(
     target: &str,
     vm_id: &str,
     event_name: &str,
-) {
+) -> bool {
     let (signer, nonce, now_ms) = match production_migrate_event_credentials() {
         Ok(credentials) => credentials,
         Err(error) => {
             tracing::warn!(%error, %vm_id, event = event_name, "compute_migrate: migration event credentials unavailable");
-            return;
+            return false;
         }
     };
     if let Err(error) = publish_authorized_migrate_event(
         persist, topic, event, verb, target, &signer, &nonce, now_ms,
     ) {
         tracing::warn!(%error, %vm_id, event = event_name, "compute_migrate: authenticated migration event publish failed");
+        return false;
     }
+    true
 }
 
-fn publish_migrate_failed(persist: &Persist, event: &MigrateReadyEvent, error: &str) {
+fn publish_migrate_failed(persist: &Persist, event: &MigrateReadyEvent, error: &str) -> bool {
     let failed = MigrateFailedEvent {
         vm_id: event.vm_id.clone(),
         target_peer: event.target_peer.clone(),
@@ -756,10 +884,10 @@ fn publish_migrate_failed(persist: &Persist, event: &MigrateReadyEvent, error: &
         &target,
         &failed.vm_id,
         "migrate-failed",
-    );
+    )
 }
 
-fn publish_migrate_ready(persist: &Persist, event: &MigrateReadyEvent) {
+fn publish_migrate_ready(persist: &Persist, event: &MigrateReadyEvent) -> bool {
     let target = migration_event_auth_target(&event.vm_id, &event.source_peer, &event.target_peer);
     publish_production_migrate_event(
         persist,
@@ -769,10 +897,10 @@ fn publish_migrate_ready(persist: &Persist, event: &MigrateReadyEvent) {
         &target,
         &event.vm_id,
         "migrate-ready",
-    );
+    )
 }
 
-fn publish_migrate_committed(persist: &Persist, event: &MigrateReadyEvent) {
+fn publish_migrate_committed(persist: &Persist, event: &MigrateReadyEvent) -> bool {
     let committed = build_migrate_committed_event(event);
     let target = migration_event_auth_target(
         &committed.vm_id,
@@ -787,7 +915,7 @@ fn publish_migrate_committed(persist: &Persist, event: &MigrateReadyEvent) {
         &target,
         &committed.vm_id,
         "migrate-committed",
-    );
+    )
 }
 
 /// A migration whose disk shipped + `migrate-ready` published, now
@@ -795,12 +923,280 @@ fn publish_migrate_committed(persist: &Persist, event: &MigrateReadyEvent) {
 /// `virsh dumpxml` so the source can roll back (re-define + re-start) if
 /// the target fails or the ack times out (vdi-vm-5). The source domain
 /// stays defined-but-shutoff until this resolves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PendingCommit {
     request_ulid: String,
     vm_id: String,
     domain_xml: String,
-    deadline: Instant,
+    ready_event: MigrateReadyEvent,
+    deadline_ms: i64,
+    phase: PendingPhase,
+    next_attempt_ms: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PendingPhase {
+    PublishReady,
+    Waiting,
+    Relinquish,
+    Rollback { reason: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableSourceJob {
+    message_ulid: String,
+    raw_body: String,
+    request: MigrateRequest,
+    authorized: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableTargetJob {
+    message_ulid: String,
+    raw_body: String,
+    event: MigrateReadyEvent,
+    phase: TargetJobPhase,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TargetJobPhase {
+    Prepared,
+    Apply,
+    PublishCommitted,
+    PublishFailed { error: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum DurableAckEvent {
+    Committed { event: MigrateCommittedEvent },
+    Failed { event: MigrateFailedEvent },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableAckJob {
+    message_ulid: String,
+    raw_body: String,
+    event: DurableAckEvent,
+    authorized: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationLedgerState {
+    schema_version: u8,
+    source_cursor: Option<String>,
+    target_cursor: Option<String>,
+    committed_cursor: Option<String>,
+    failed_cursor: Option<String>,
+    source_jobs: Vec<DurableSourceJob>,
+    target_jobs: Vec<DurableTargetJob>,
+    ack_jobs: Vec<DurableAckJob>,
+    pending_commits: Vec<PendingCommit>,
+}
+
+impl Default for MigrationLedgerState {
+    fn default() -> Self {
+        Self {
+            schema_version: MIGRATION_LEDGER_SCHEMA_VERSION,
+            source_cursor: None,
+            target_cursor: None,
+            committed_cursor: None,
+            failed_cursor: None,
+            source_jobs: Vec::new(),
+            target_jobs: Vec::new(),
+            ack_jobs: Vec::new(),
+            pending_commits: Vec::new(),
+        }
+    }
+}
+
+struct MigrationLedger {
+    root: PathBuf,
+    state: MigrationLedgerState,
+}
+
+impl MigrationLedgerState {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != MIGRATION_LEDGER_SCHEMA_VERSION
+            || self.source_jobs.len() > MAX_MIGRATION_JOBS
+            || self.target_jobs.len() > MAX_MIGRATION_JOBS
+            || self.ack_jobs.len() > MAX_MIGRATION_JOBS
+            || self.pending_commits.len() > MAX_MIGRATION_JOBS
+        {
+            return Err("migration ledger violates schema or capacity bounds".into());
+        }
+        let valid = |value: &str| !value.is_empty() && value.len() <= MAX_MIGRATION_FIELD_BYTES;
+        for cursor in [
+            &self.source_cursor,
+            &self.target_cursor,
+            &self.committed_cursor,
+            &self.failed_cursor,
+        ] {
+            if cursor.as_deref().is_some_and(|value| !valid(value)) {
+                return Err("migration ledger contains an invalid cursor".into());
+            }
+        }
+        let mut identities = BTreeSet::new();
+        for job in &self.source_jobs {
+            if !valid(&job.message_ulid)
+                || !valid(&job.raw_body)
+                || !valid(&job.request.vm_id)
+                || !valid(&job.request.source_peer)
+                || !valid(&job.request.target_peer)
+                || !valid(&job.request.disk_path)
+            {
+                return Err("migration ledger contains an invalid source job".into());
+            }
+            if !identities.insert(("source", job.message_ulid.as_str())) {
+                return Err("migration ledger contains a duplicate source job".into());
+            }
+        }
+        for job in &self.target_jobs {
+            if !valid(&job.message_ulid)
+                || !valid(&job.raw_body)
+                || !valid(&job.event.vm_id)
+                || !valid(&job.event.request_ulid)
+                || !valid(&job.event.domain_xml)
+            {
+                return Err("migration ledger contains an invalid target job".into());
+            }
+            if !identities.insert(("target", job.message_ulid.as_str())) {
+                return Err("migration ledger contains a duplicate target job".into());
+            }
+        }
+        for pending in &self.pending_commits {
+            if !valid(&pending.request_ulid)
+                || !valid(&pending.vm_id)
+                || !valid(&pending.domain_xml)
+                || pending.deadline_ms < 0
+                || pending.next_attempt_ms < 0
+            {
+                return Err("migration ledger contains an invalid pending commit".into());
+            }
+            if !identities.insert(("pending", pending.request_ulid.as_str())) {
+                return Err("migration ledger contains a duplicate pending commit".into());
+            }
+        }
+        for ack in &self.ack_jobs {
+            if !valid(&ack.message_ulid) || !valid(&ack.raw_body) {
+                return Err("migration ledger contains an invalid acknowledgement".into());
+            }
+            if !identities.insert(("ack", ack.message_ulid.as_str())) {
+                return Err("migration ledger contains a duplicate acknowledgement".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MigrationLedger {
+    fn open(root: &Path) -> Result<Self, String> {
+        fs::create_dir_all(root)
+            .map_err(|error| format!("create migration state root: {error}"))?;
+        let metadata = fs::symlink_metadata(root)
+            .map_err(|error| format!("inspect migration state root: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("migration state root is not a regular directory".into());
+        }
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure migration state root: {error}"))?;
+        let path = root.join(MIGRATION_LEDGER_FILE);
+        let (state, existed) = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.len() > MAX_MIGRATION_LEDGER_BYTES
+                {
+                    return Err("migration ledger is not a bounded regular file".into());
+                }
+                let mut file: fs::File = rustix::fs::open(
+                    &path,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|error| format!("open migration ledger: {error}"))?
+                .into();
+                let mut body = Vec::with_capacity(metadata.len() as usize);
+                std::io::Read::by_ref(&mut file)
+                    .take(MAX_MIGRATION_LEDGER_BYTES.saturating_add(1))
+                    .read_to_end(&mut body)
+                    .map_err(|error| format!("read migration ledger: {error}"))?;
+                if body.len() as u64 > MAX_MIGRATION_LEDGER_BYTES {
+                    return Err("migration ledger exceeds its byte bound".into());
+                }
+                let text = std::str::from_utf8(&body)
+                    .map_err(|_| "migration ledger is not UTF-8".to_string())?;
+                reject_duplicate_json_keys(text)
+                    .map_err(|_| "migration ledger contains duplicate JSON keys".to_string())?;
+                (
+                    serde_json::from_slice(&body)
+                        .map_err(|error| format!("decode migration ledger: {error}"))?,
+                    true,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (MigrationLedgerState::default(), false)
+            }
+            Err(error) => return Err(format!("inspect migration ledger: {error}")),
+        };
+        state.validate()?;
+        let ledger = Self {
+            root: root.to_path_buf(),
+            state,
+        };
+        if !existed {
+            ledger.store()?;
+        }
+        Ok(ledger)
+    }
+
+    fn store(&self) -> Result<(), String> {
+        self.state.validate()?;
+        let body = serde_json::to_vec(&self.state)
+            .map_err(|error| format!("encode migration ledger: {error}"))?;
+        if body.len() as u64 > MAX_MIGRATION_LEDGER_BYTES {
+            return Err("migration ledger exceeds its byte bound".into());
+        }
+        let destination = self.root.join(MIGRATION_LEDGER_FILE);
+        let temporary = self.root.join(format!(
+            ".{MIGRATION_LEDGER_FILE}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("create migration ledger temporary: {error}"))?;
+        if let Err(error) = file.write_all(&body).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("persist migration ledger: {error}"));
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("commit migration ledger: {error}"));
+        }
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync migration state root: {error}"))
+    }
+}
+
+fn wall_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// Source-side drain of `event/compute/migrate-committed`. Advances
@@ -906,6 +1302,7 @@ pub struct ComputeMigrateWorker {
     poll_interval: Duration,
     commit_timeout: Duration,
     bus_root_override: Option<PathBuf>,
+    state_root: PathBuf,
     authorizer: Arc<ActionAuthorizer>,
     migration_client: WorkloadMigrationClient,
 }
@@ -926,6 +1323,7 @@ impl ComputeMigrateWorker {
             poll_interval: DEFAULT_POLL_INTERVAL,
             commit_timeout: DEFAULT_COMMIT_TIMEOUT,
             bus_root_override: None,
+            state_root: PathBuf::from(DEFAULT_MIGRATION_STATE_ROOT),
             authorizer: Arc::new(ActionAuthorizer::production()),
             migration_client: WorkloadMigrationClient,
         }
@@ -943,6 +1341,13 @@ impl ComputeMigrateWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Override the root-only migration recovery ledger. Used in tests.
+    #[must_use]
+    pub fn with_state_root(mut self, p: PathBuf) -> Self {
+        self.state_root = p;
         self
     }
 
@@ -1088,6 +1493,401 @@ fn drain_target_jobs(
     jobs
 }
 
+fn verify_source_body(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    request: &MigrateRequest,
+) -> Result<(), String> {
+    let target = migration_auth_target(request);
+    authorizer
+        .verify_exact_body(
+            body,
+            MutationContext {
+                verb: COMPUTE_MIGRATE_AUTH_VERB,
+                node: COMPUTE_MIGRATE_NODE_SCOPE,
+                target: &target,
+            },
+        )
+        .map(|_| ())
+}
+
+fn verify_event_body(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    verb: &str,
+    vm_id: &str,
+    source_peer: &str,
+    target_peer: &str,
+) -> Result<(), String> {
+    let target = migration_event_auth_target(vm_id, source_peer, target_peer);
+    authorizer
+        .verify_exact_body(
+            body,
+            MutationContext {
+                verb,
+                node: COMPUTE_MIGRATE_NODE_SCOPE,
+                target: &target,
+            },
+        )
+        .map(|_| ())
+}
+
+fn replay_owned_during_recovery(
+    result: Result<(), String>,
+    recovering: bool,
+) -> Result<(), String> {
+    match result {
+        Err(error) if recovering && error == "armed token was already used" => Ok(()),
+        other => other,
+    }
+}
+
+fn recover_prepared_jobs(
+    ledger: &mut MigrationLedger,
+    authorizer: &ActionAuthorizer,
+) -> Result<(), String> {
+    for index in 0..ledger.state.source_jobs.len() {
+        if ledger.state.source_jobs[index].authorized {
+            continue;
+        }
+        let job = ledger.state.source_jobs[index].clone();
+        let accepted = replay_owned_during_recovery(
+            authorize_source_request(authorizer, &job.raw_body, &job.request),
+            true,
+        )
+        .is_ok();
+        ledger.state.source_jobs[index].authorized = accepted;
+    }
+    ledger.state.source_jobs.retain(|job| job.authorized);
+
+    for index in 0..ledger.state.target_jobs.len() {
+        if !matches!(
+            ledger.state.target_jobs[index].phase,
+            TargetJobPhase::Prepared
+        ) {
+            continue;
+        }
+        let job = ledger.state.target_jobs[index].clone();
+        let accepted = replay_owned_during_recovery(
+            authorize_event_body(
+                authorizer,
+                &job.raw_body,
+                COMPUTE_MIGRATE_READY_AUTH_VERB,
+                &job.event.vm_id,
+                &job.event.source_peer,
+                &job.event.target_peer,
+            ),
+            true,
+        )
+        .is_ok();
+        if accepted {
+            ledger.state.target_jobs[index].phase = TargetJobPhase::Apply;
+        }
+    }
+    ledger
+        .state
+        .target_jobs
+        .retain(|job| !matches!(job.phase, TargetJobPhase::Prepared));
+
+    for index in 0..ledger.state.ack_jobs.len() {
+        if ledger.state.ack_jobs[index].authorized {
+            continue;
+        }
+        let job = ledger.state.ack_jobs[index].clone();
+        let result = match &job.event {
+            DurableAckEvent::Committed { event } => authorize_event_body(
+                authorizer,
+                &job.raw_body,
+                COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+                &event.vm_id,
+                &event.source_peer,
+                &event.target_peer,
+            ),
+            DurableAckEvent::Failed { event } => authorize_event_body(
+                authorizer,
+                &job.raw_body,
+                COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+                &event.vm_id,
+                "",
+                &event.target_peer,
+            ),
+        };
+        ledger.state.ack_jobs[index].authorized =
+            replay_owned_during_recovery(result, true).is_ok();
+    }
+    ledger.state.ack_jobs.retain(|job| job.authorized);
+    ledger.store()
+}
+
+fn admit_source_jobs(
+    persist: &Persist,
+    worker: &ComputeMigrateWorker,
+    ledger: &mut MigrationLedger,
+) -> Result<(), String> {
+    let messages = persist
+        .list_since(ACTION_TOPIC, ledger.state.source_cursor.as_deref())
+        .map_err(|error| format!("list source migration actions: {error}"))?;
+    let own_ip = resolve_nebula_addr(worker);
+    for message in messages {
+        ledger.state.source_cursor = Some(message.ulid.clone());
+        let body = message.body.as_deref().unwrap_or("");
+        let request = parse_migrate_request(body).ok();
+        let relevant = request
+            .as_ref()
+            .is_some_and(|request| is_source_peer(request, &own_ip));
+        if !relevant {
+            ledger.store()?;
+            continue;
+        }
+        let request = request.expect("relevant migration request");
+        if verify_source_body(worker.authorizer.as_ref(), body, &request).is_err()
+            || ledger.state.source_jobs.len() >= MAX_MIGRATION_JOBS
+        {
+            ledger.store()?;
+            continue;
+        }
+        ledger.state.source_jobs.push(DurableSourceJob {
+            message_ulid: message.ulid,
+            raw_body: body.to_owned(),
+            request,
+            authorized: false,
+        });
+        ledger.store()?;
+        let index = ledger.state.source_jobs.len() - 1;
+        let job = &ledger.state.source_jobs[index];
+        if authorize_source_request(worker.authorizer.as_ref(), &job.raw_body, &job.request).is_ok()
+        {
+            ledger.state.source_jobs[index].authorized = true;
+        } else {
+            ledger.state.source_jobs.remove(index);
+        }
+        ledger.store()?;
+    }
+    Ok(())
+}
+
+fn admit_target_jobs(
+    persist: &Persist,
+    worker: &ComputeMigrateWorker,
+    ledger: &mut MigrationLedger,
+) -> Result<(), String> {
+    let messages = persist
+        .list_since(MIGRATE_READY_TOPIC, ledger.state.target_cursor.as_deref())
+        .map_err(|error| format!("list target migration events: {error}"))?;
+    let own_ip = resolve_nebula_addr(worker);
+    for message in messages {
+        ledger.state.target_cursor = Some(message.ulid.clone());
+        let body = message.body.as_deref().unwrap_or("");
+        let event = parse_migrate_ready_event(body).ok();
+        let relevant = event
+            .as_ref()
+            .is_some_and(|event| is_target_peer(event, &own_ip));
+        if !relevant {
+            ledger.store()?;
+            continue;
+        }
+        let event = event.expect("relevant migration-ready event");
+        if verify_event_body(
+            worker.authorizer.as_ref(),
+            body,
+            COMPUTE_MIGRATE_READY_AUTH_VERB,
+            &event.vm_id,
+            &event.source_peer,
+            &event.target_peer,
+        )
+        .is_err()
+            || ledger.state.target_jobs.len() >= MAX_MIGRATION_JOBS
+        {
+            ledger.store()?;
+            continue;
+        }
+        ledger.state.target_jobs.push(DurableTargetJob {
+            message_ulid: message.ulid,
+            raw_body: body.to_owned(),
+            event,
+            phase: TargetJobPhase::Prepared,
+        });
+        ledger.store()?;
+        let index = ledger.state.target_jobs.len() - 1;
+        let job = &ledger.state.target_jobs[index];
+        if authorize_event_body(
+            worker.authorizer.as_ref(),
+            &job.raw_body,
+            COMPUTE_MIGRATE_READY_AUTH_VERB,
+            &job.event.vm_id,
+            &job.event.source_peer,
+            &job.event.target_peer,
+        )
+        .is_ok()
+        {
+            ledger.state.target_jobs[index].phase = TargetJobPhase::Apply;
+        } else {
+            ledger.state.target_jobs.remove(index);
+        }
+        ledger.store()?;
+    }
+    Ok(())
+}
+
+fn admit_ack_jobs(
+    persist: &Persist,
+    worker: &ComputeMigrateWorker,
+    ledger: &mut MigrationLedger,
+) -> Result<(), String> {
+    let committed = persist
+        .list_since(
+            MIGRATE_COMMITTED_TOPIC,
+            ledger.state.committed_cursor.as_deref(),
+        )
+        .map_err(|error| format!("list committed migration events: {error}"))?;
+    for message in committed {
+        ledger.state.committed_cursor = Some(message.ulid.clone());
+        let body = message.body.as_deref().unwrap_or("");
+        let Some(event) = parse_migrate_committed_event(body).ok() else {
+            ledger.store()?;
+            continue;
+        };
+        if !ledger
+            .state
+            .pending_commits
+            .iter()
+            .any(|pending| pending.request_ulid == event.request_ulid)
+            || verify_event_body(
+                worker.authorizer.as_ref(),
+                body,
+                COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+                &event.vm_id,
+                &event.source_peer,
+                &event.target_peer,
+            )
+            .is_err()
+            || ledger.state.ack_jobs.len() >= MAX_MIGRATION_JOBS
+        {
+            ledger.store()?;
+            continue;
+        }
+        ledger.state.ack_jobs.push(DurableAckJob {
+            message_ulid: message.ulid,
+            raw_body: body.to_owned(),
+            event: DurableAckEvent::Committed { event },
+            authorized: false,
+        });
+        ledger.store()?;
+        let index = ledger.state.ack_jobs.len() - 1;
+        let job = ledger.state.ack_jobs[index].clone();
+        let result = match &job.event {
+            DurableAckEvent::Committed { event } => authorize_event_body(
+                worker.authorizer.as_ref(),
+                &job.raw_body,
+                COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+                &event.vm_id,
+                &event.source_peer,
+                &event.target_peer,
+            ),
+            DurableAckEvent::Failed { .. } => unreachable!(),
+        };
+        if result.is_ok() {
+            ledger.state.ack_jobs[index].authorized = true;
+        } else {
+            ledger.state.ack_jobs.remove(index);
+        }
+        ledger.store()?;
+    }
+
+    let failed = persist
+        .list_since(MIGRATE_FAILED_TOPIC, ledger.state.failed_cursor.as_deref())
+        .map_err(|error| format!("list failed migration events: {error}"))?;
+    for message in failed {
+        ledger.state.failed_cursor = Some(message.ulid.clone());
+        let body = message.body.as_deref().unwrap_or("");
+        let Some(event) = parse_migrate_failed_event(body).ok() else {
+            ledger.store()?;
+            continue;
+        };
+        if !ledger
+            .state
+            .pending_commits
+            .iter()
+            .any(|pending| pending.request_ulid == event.request_ulid)
+            || verify_event_body(
+                worker.authorizer.as_ref(),
+                body,
+                COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+                &event.vm_id,
+                "",
+                &event.target_peer,
+            )
+            .is_err()
+            || ledger.state.ack_jobs.len() >= MAX_MIGRATION_JOBS
+        {
+            ledger.store()?;
+            continue;
+        }
+        ledger.state.ack_jobs.push(DurableAckJob {
+            message_ulid: message.ulid,
+            raw_body: body.to_owned(),
+            event: DurableAckEvent::Failed { event },
+            authorized: false,
+        });
+        ledger.store()?;
+        let index = ledger.state.ack_jobs.len() - 1;
+        let job = ledger.state.ack_jobs[index].clone();
+        let result = match &job.event {
+            DurableAckEvent::Failed { event } => authorize_event_body(
+                worker.authorizer.as_ref(),
+                &job.raw_body,
+                COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+                &event.vm_id,
+                "",
+                &event.target_peer,
+            ),
+            DurableAckEvent::Committed { .. } => unreachable!(),
+        };
+        if result.is_ok() {
+            ledger.state.ack_jobs[index].authorized = true;
+        } else {
+            ledger.state.ack_jobs.remove(index);
+        }
+        ledger.store()?;
+    }
+    Ok(())
+}
+
+fn apply_ack_jobs(ledger: &mut MigrationLedger, now_ms: i64) -> Result<(), String> {
+    for ack in ledger.state.ack_jobs.drain(..) {
+        if !ack.authorized {
+            continue;
+        }
+        match ack.event {
+            DurableAckEvent::Committed { event } => {
+                if let Some(pending) = ledger
+                    .state
+                    .pending_commits
+                    .iter_mut()
+                    .find(|pending| pending.request_ulid == event.request_ulid)
+                {
+                    pending.phase = PendingPhase::Relinquish;
+                    pending.next_attempt_ms = now_ms;
+                }
+            }
+            DurableAckEvent::Failed { event } => {
+                if let Some(pending) = ledger
+                    .state
+                    .pending_commits
+                    .iter_mut()
+                    .find(|pending| pending.request_ulid == event.request_ulid)
+                {
+                    pending.phase = PendingPhase::Rollback {
+                        reason: format!("target failed: {}", event.error),
+                    };
+                    pending.next_attempt_ms = now_ms;
+                }
+            }
+        }
+    }
+    ledger.store()
+}
+
 fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
 }
@@ -1113,145 +1913,160 @@ impl Worker for ComputeMigrateWorker {
                 return Ok(());
             }
         };
-        let mut source_cursor: Option<String> = None;
-        let mut target_cursor: Option<String> = None;
-        // Source side (vdi-vm-5): the target's commit/failure acks, plus the
-        // in-flight migrations whose source domain is still defined-but-shutoff
-        // awaiting a commit.
-        let mut committed_cursor: Option<String> = None;
-        let mut failed_cursor: Option<String> = None;
-        let mut pending_commits: Vec<PendingCommit> = Vec::new();
+        let mut ledger = MigrationLedger::open(&self.state_root)
+            .map_err(|error| anyhow::anyhow!("compute migration recovery unavailable: {error}"))?;
+        recover_prepared_jobs(&mut ledger, self.authorizer.as_ref())
+            .map_err(|error| anyhow::anyhow!("recover prepared migrations: {error}"))?;
         let mut tick = tokio::time::interval(self.poll_interval);
         tick.tick().await;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    // Source side (action/compute/migrate): drain requests
-                    // synchronously (cheap Bus read), then run each migration OFF
-                    // the runtime thread. run_migration polls virsh for up to
-                    // DEFAULT_SHUTDOWN_TIMEOUT and rsyncs a multi-GiB disk over the
-                    // overlay — minutes of blocking work that must not pin a
-                    // runtime worker or starve the watchdog beat (mackesd-02).
-                    for (ulid, req) in drain_source_jobs(&persist, self, &mut source_cursor) {
-                        let req_run = req.clone();
+                    admit_source_jobs(&persist, self, &mut ledger)
+                        .map_err(|error| anyhow::anyhow!("admit source migration: {error}"))?;
+                    let source_jobs = ledger
+                        .state
+                        .source_jobs
+                        .iter()
+                        .filter(|job| job.authorized)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for job in source_jobs {
+                        let req_run = job.request.clone();
                         let client = self.migration_client;
                         match tokio::task::spawn_blocking(move || run_migration(&req_run, &client)).await {
                             Ok(MigrationOutcome::Ok { domain_xml }) => {
                                 let event = build_migrate_ready_event(
-                                    &req,
-                                    target_disk_path_for(&req.disk_path, DEFAULT_TARGET_VM_DIR),
-                                    ulid.clone(),
+                                    &job.request,
+                                    target_disk_path_for(&job.request.disk_path, DEFAULT_TARGET_VM_DIR),
+                                    job.message_ulid.clone(),
                                     domain_xml.clone(),
                                 );
-                                publish_migrate_ready(&persist, &event);
-                                // vdi-vm-5: the source domain is now shut off but
-                                // STILL DEFINED. Track the commit so the destructive
-                                // undefine is deferred behind the target's ack, and
-                                // retain the dumpxml for rollback.
-                                pending_commits.push(PendingCommit {
-                                    request_ulid: ulid,
-                                    vm_id: req.vm_id.clone(),
+                                let now_ms = wall_now_ms();
+                                let timeout_ms = i64::try_from(self.commit_timeout.as_millis())
+                                    .unwrap_or(i64::MAX);
+                                ledger.state.pending_commits.push(PendingCommit {
+                                    request_ulid: job.message_ulid.clone(),
+                                    vm_id: job.request.vm_id.clone(),
                                     domain_xml,
-                                    deadline: Instant::now() + self.commit_timeout,
+                                    ready_event: event,
+                                    deadline_ms: now_ms.saturating_add(timeout_ms),
+                                    phase: PendingPhase::PublishReady,
+                                    next_attempt_ms: now_ms,
                                 });
+                                ledger.state.source_jobs.retain(|queued| queued.message_ulid != job.message_ulid);
+                                ledger.store().map_err(|error| anyhow::anyhow!("checkpoint shipped migration: {error}"))?;
                             }
                             Ok(other) => {
                                 tracing::warn!(
-                                    ulid = %ulid,
-                                    vm_id = %req.vm_id,
+                                    ulid = %job.message_ulid,
+                                    vm_id = %job.request.vm_id,
                                     outcome = ?other,
                                     "compute_migrate: migration failed"
                                 );
+                                ledger.state.source_jobs.retain(|queued| queued.message_ulid != job.message_ulid);
+                                ledger.store().map_err(|error| anyhow::anyhow!("checkpoint failed migration: {error}"))?;
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, vm_id = %req.vm_id, "compute_migrate: migration task join failed");
+                                tracing::warn!(error = %e, vm_id = %job.request.vm_id, "compute_migrate: migration task join failed; durable job retained");
                             }
                         }
                     }
-                    // Target side (VIRT-8.b): event/compute/migrate-ready. Define
-                    // + start each migrated VM off-runtime too. On success, ack
-                    // with migrate-committed so the source can undefine (vdi-vm-5).
-                    for event in drain_target_jobs(&persist, self, &mut target_cursor) {
-                        let event_run = event.clone();
+
+                    let now_ms = wall_now_ms();
+                    if let Some(index) = ledger.state.pending_commits.iter().position(|pending|
+                        matches!(pending.phase, PendingPhase::PublishReady)
+                            && now_ms >= pending.next_attempt_ms
+                    ) {
+                        let event = ledger.state.pending_commits[index].ready_event.clone();
+                        if publish_migrate_ready(&persist, &event) {
+                            ledger.state.pending_commits[index].phase = PendingPhase::Waiting;
+                        } else {
+                            ledger.state.pending_commits[index].next_attempt_ms =
+                                now_ms.saturating_add(RETRY_DELAY.as_millis() as i64);
+                        }
+                        ledger.store().map_err(|error| anyhow::anyhow!("checkpoint migrate-ready publish: {error}"))?;
+                    }
+
+                    admit_target_jobs(&persist, self, &mut ledger)
+                        .map_err(|error| anyhow::anyhow!("admit target migration: {error}"))?;
+                    let target_ids = ledger.state.target_jobs.iter().map(|job| job.message_ulid.clone()).collect::<Vec<_>>();
+                    for id in target_ids {
+                        let Some(index) = ledger.state.target_jobs.iter().position(|job| job.message_ulid == id) else { continue; };
+                        let phase = ledger.state.target_jobs[index].phase.clone();
+                        match phase {
+                            TargetJobPhase::Apply => {
+                                let event = ledger.state.target_jobs[index].event.clone();
+                                let event_run = event.clone();
+                                let client = self.migration_client;
+                                match tokio::task::spawn_blocking(move || run_migrate_target(&event_run, &client)).await {
+                                    Ok(Ok(())) => ledger.state.target_jobs[index].phase = TargetJobPhase::PublishCommitted,
+                                    Ok(Err(error)) => ledger.state.target_jobs[index].phase = TargetJobPhase::PublishFailed { error },
+                                    Err(error) => {
+                                        tracing::warn!(vm_id = %event.vm_id, %error, "compute_migrate: target task join failed; durable job retained");
+                                        continue;
+                                    }
+                                }
+                                ledger.store().map_err(|error| anyhow::anyhow!("checkpoint target migration effect: {error}"))?;
+                            }
+                            TargetJobPhase::Prepared => continue,
+                            TargetJobPhase::PublishCommitted | TargetJobPhase::PublishFailed { .. } => {}
+                        }
+                        let Some(index) = ledger.state.target_jobs.iter().position(|job| job.message_ulid == id) else { continue; };
+                        let published = match &ledger.state.target_jobs[index].phase {
+                            TargetJobPhase::PublishCommitted => publish_migrate_committed(&persist, &ledger.state.target_jobs[index].event),
+                            TargetJobPhase::PublishFailed { error } => publish_migrate_failed(&persist, &ledger.state.target_jobs[index].event, error),
+                            _ => false,
+                        };
+                        if published {
+                            ledger.state.target_jobs.remove(index);
+                            ledger.store().map_err(|error| anyhow::anyhow!("checkpoint target migration receipt: {error}"))?;
+                        }
+                    }
+
+                    admit_ack_jobs(&persist, self, &mut ledger)
+                        .map_err(|error| anyhow::anyhow!("admit migration acknowledgement: {error}"))?;
+                    apply_ack_jobs(&mut ledger, now_ms)
+                        .map_err(|error| anyhow::anyhow!("checkpoint migration acknowledgement: {error}"))?;
+                    for pending in &mut ledger.state.pending_commits {
+                        if matches!(pending.phase, PendingPhase::Waiting) && now_ms >= pending.deadline_ms {
+                            pending.phase = PendingPhase::Rollback { reason: "commit timeout".into() };
+                            pending.next_attempt_ms = now_ms;
+                        }
+                    }
+                    ledger.store().map_err(|error| anyhow::anyhow!("checkpoint migration deadlines: {error}"))?;
+
+                    let retry_ids = ledger.state.pending_commits.iter()
+                        .filter(|pending| now_ms >= pending.next_attempt_ms && !matches!(pending.phase, PendingPhase::Waiting | PendingPhase::PublishReady))
+                        .map(|pending| pending.request_ulid.clone()).collect::<Vec<_>>();
+                    for id in retry_ids {
+                        let Some(index) = ledger.state.pending_commits.iter().position(|pending| pending.request_ulid == id) else { continue; };
+                        let pending = ledger.state.pending_commits[index].clone();
                         let client = self.migration_client;
-                        match tokio::task::spawn_blocking(move || run_migrate_target(&event_run, &client)).await {
-                            Ok(Ok(())) => {
-                                tracing::info!(vm_id = %event.vm_id, "compute_migrate: migrated VM defined + started on target");
-                                publish_migrate_committed(&persist, &event);
+                        let result = match &pending.phase {
+                            PendingPhase::Relinquish => {
+                                let vm = pending.vm_id.clone();
+                                tokio::task::spawn_blocking(move || run_source_undefine(&vm, &client)).await
                             }
-                            Ok(Err(e)) => {
-                                tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target define/start failed");
-                                publish_migrate_failed(&persist, &event, &e);
+                            PendingPhase::Rollback { .. } => {
+                                let vm = pending.vm_id.clone();
+                                let xml = pending.domain_xml.clone();
+                                tokio::task::spawn_blocking(move || run_source_rollback(&vm, &xml, &client)).await
                             }
-                            Err(e) => {
-                                tracing::warn!(vm_id = %event.vm_id, error = %e, "compute_migrate: target task join failed");
+                            _ => continue,
+                        };
+                        match result {
+                            Ok(Ok(())) => { ledger.state.pending_commits.remove(index); }
+                            Ok(Err(error)) => {
+                                tracing::error!(vm_id = %pending.vm_id, %error, "compute_migrate: terminal effect failed; durable retry retained");
+                                ledger.state.pending_commits[index].next_attempt_ms = now_ms.saturating_add(RETRY_DELAY.as_millis() as i64);
                             }
-                        }
-                    }
-                    // Source side (vdi-vm-5): resolve pending commits against the
-                    // target's acks + the commit deadline. Only now — after a
-                    // confirmed migrate-committed — does the destructive undefine
-                    // run; a migrate-failed or a timeout instead rolls the domain
-                    // back from the retained dumpxml, so the VM is never lost.
-                    if !pending_commits.is_empty() {
-                        let committed_ulids: Vec<String> =
-                            drain_committed_events(
-                                &persist,
-                                &mut committed_cursor,
-                                self.authorizer.as_ref(),
-                            )
-                                .into_iter()
-                                .map(|e| e.request_ulid)
-                                .collect();
-                        let failed_pairs: Vec<(String, String)> =
-                            drain_failed_events(
-                                &persist,
-                                &mut failed_cursor,
-                                self.authorizer.as_ref(),
-                            )
-                                .into_iter()
-                                .map(|e| (e.request_ulid, e.error))
-                                .collect();
-                        let mut still_pending = Vec::with_capacity(pending_commits.len());
-                        for pc in std::mem::take(&mut pending_commits) {
-                            let timed_out = Instant::now() >= pc.deadline;
-                            match classify_commit(
-                                &pc.request_ulid,
-                                &committed_ulids,
-                                &failed_pairs,
-                                timed_out,
-                            ) {
-                                CommitResolution::Undefine => {
-                                    let vm = pc.vm_id.clone();
-                                    let client = self.migration_client;
-                                    match tokio::task::spawn_blocking(move || {
-                                        run_source_undefine(&vm, &client)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(())) => tracing::info!(vm_id = %pc.vm_id, "compute_migrate: target committed; source definition relinquished (migration complete)"),
-                                        Ok(Err(error)) => tracing::error!(vm_id = %pc.vm_id, %error, "compute_migrate: target committed but source definition relinquish failed"),
-                                        Err(error) => tracing::error!(vm_id = %pc.vm_id, %error, "compute_migrate: source definition relinquish task failed"),
-                                    }
-                                }
-                                CommitResolution::RollBack { reason } => {
-                                    let vm = pc.vm_id.clone();
-                                    let xml = pc.domain_xml.clone();
-                                    let client = self.migration_client;
-                                    match tokio::task::spawn_blocking(move || {
-                                        run_source_rollback(&vm, &xml, &client)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(())) => tracing::warn!(vm_id = %pc.vm_id, reason = ?reason, "compute_migrate: migration rolled back; VM restored on source"),
-                                        Ok(Err(e)) => tracing::error!(vm_id = %pc.vm_id, reason = ?reason, error = %e, "compute_migrate: ROLLBACK FAILED; VM may need manual recovery"),
-                                        Err(e) => tracing::error!(vm_id = %pc.vm_id, error = %e, "compute_migrate: rollback task join failed"),
-                                    }
-                                }
-                                CommitResolution::Pending => still_pending.push(pc),
+                            Err(error) => {
+                                tracing::error!(vm_id = %pending.vm_id, %error, "compute_migrate: terminal task failed; durable retry retained");
+                                ledger.state.pending_commits[index].next_attempt_ms = now_ms.saturating_add(RETRY_DELAY.as_millis() as i64);
                             }
                         }
-                        pending_commits = still_pending;
+                        ledger.store().map_err(|error| anyhow::anyhow!("checkpoint migration terminal retry: {error}"))?;
                     }
                 }
                 _ = shutdown.wait() => break,
@@ -1438,6 +2253,16 @@ mod tests {
     fn parse_migrate_rejects_malformed_json() {
         let err = parse_migrate_request("nope").expect_err("malformed");
         assert!(err.contains("malformed"));
+    }
+
+    #[test]
+    fn migration_wire_admission_rejects_duplicate_keys_traversal_and_oversize() {
+        let duplicate = r#"{"source_peer":"10.42.0.1","source_peer":"10.42.0.9","target_peer":"10.42.0.2","vm_id":"abc","disk_path":"/var/lib/mde-vms/abc.qcow2"}"#;
+        assert!(parse_migrate_request(duplicate).is_err());
+        let traversal = r#"{"source_peer":"10.42.0.1","target_peer":"10.42.0.2","vm_id":"abc","disk_path":"/var/lib/mde-vms/../shadow"}"#;
+        assert!(parse_migrate_request(traversal).is_err());
+        let oversized = "x".repeat(MAX_MIGRATION_WIRE_BYTES + 1);
+        assert!(parse_migrate_request(&oversized).is_err());
     }
 
     // ── is_source_peer ──
@@ -1649,7 +2474,10 @@ mod tests {
             run_migration(&req, &actuator),
             MigrationOutcome::AuthorityFailure { .. }
         ));
-        assert_eq!(actuator.calls(), ["capture:abc-uuid", "stop:abc-uuid"]);
+        assert_eq!(
+            actuator.calls(),
+            ["capture:abc-uuid", "stop:abc-uuid", "define-start:abc-uuid"]
+        );
     }
 
     #[test]
@@ -2389,5 +3217,158 @@ mod tests {
             classify_commit("01JAN", &ulids, &[], false),
             CommitResolution::Undefine
         );
+    }
+
+    fn durable_pending(phase: PendingPhase) -> PendingCommit {
+        let request = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-ledger".into(),
+            disk_path: "/var/lib/mde-vms/vm-ledger.qcow2".into(),
+        };
+        let ready_event = build_migrate_ready_event(
+            &request,
+            request.disk_path.clone(),
+            "01LEDGER".into(),
+            "<domain><name>vm-ledger</name></domain>".into(),
+        );
+        PendingCommit {
+            request_ulid: "01LEDGER".into(),
+            vm_id: request.vm_id,
+            domain_xml: ready_event.domain_xml.clone(),
+            ready_event,
+            deadline_ms: 20_000,
+            phase,
+            next_attempt_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn migration_ledger_recovers_cursors_jobs_and_terminal_retry_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ledger = MigrationLedger::open(tmp.path()).expect("open ledger");
+        ledger.state.source_cursor = Some("01SOURCE".into());
+        ledger.state.target_cursor = Some("01TARGET".into());
+        ledger.state.committed_cursor = Some("01COMMIT".into());
+        ledger.state.failed_cursor = Some("01FAILED".into());
+        ledger
+            .state
+            .pending_commits
+            .push(durable_pending(PendingPhase::Rollback {
+                reason: "target failed".into(),
+            }));
+        ledger.store().expect("store ledger");
+
+        let recovered = MigrationLedger::open(tmp.path()).expect("recover ledger");
+        assert_eq!(recovered.state.source_cursor.as_deref(), Some("01SOURCE"));
+        assert_eq!(recovered.state.target_cursor.as_deref(), Some("01TARGET"));
+        assert_eq!(
+            recovered.state.committed_cursor.as_deref(),
+            Some("01COMMIT")
+        );
+        assert_eq!(recovered.state.failed_cursor.as_deref(), Some("01FAILED"));
+        assert!(matches!(
+            recovered.state.pending_commits[0].phase,
+            PendingPhase::Rollback { .. }
+        ));
+        assert_eq!(recovered.state.pending_commits[0].next_attempt_ms, 10_000);
+    }
+
+    #[test]
+    fn source_admission_persists_authorized_job_and_cursor_before_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).expect("persist");
+        let request = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-admitted".into(),
+            disk_path: "/var/lib/mde-vms/vm-admitted.qcow2".into(),
+        };
+        let body = authorized_request_body(&request, "durable-source-admission");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
+            .expect("publish request");
+        let worker = test_worker(&tmp.path().join("auth"));
+        let state_root = tmp.path().join("state");
+        let mut ledger = MigrationLedger::open(&state_root).expect("open ledger");
+
+        admit_source_jobs(&persist, &worker, &mut ledger).expect("admit source job");
+        drop(ledger);
+
+        let recovered = MigrationLedger::open(&state_root).expect("recover ledger");
+        assert!(recovered.state.source_cursor.is_some());
+        assert_eq!(recovered.state.source_jobs.len(), 1);
+        assert!(recovered.state.source_jobs[0].authorized);
+        assert_eq!(recovered.state.source_jobs[0].request.vm_id, "vm-admitted");
+    }
+
+    #[test]
+    fn committed_ack_atomically_recovers_as_relinquish_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().join("bus")).expect("persist");
+        let state_root = tmp.path().join("state");
+        let mut ledger = MigrationLedger::open(&state_root).expect("open ledger");
+        ledger
+            .state
+            .pending_commits
+            .push(durable_pending(PendingPhase::Waiting));
+        ledger.store().expect("store pending commit");
+        let committed = MigrateCommittedEvent {
+            vm_id: "vm-ledger".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01LEDGER".into(),
+        };
+        let body = authorized_committed_body(&committed, "durable-commit-ack");
+        persist
+            .write(
+                MIGRATE_COMMITTED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("publish committed ack");
+        let worker = test_worker(&tmp.path().join("auth"));
+
+        admit_ack_jobs(&persist, &worker, &mut ledger).expect("admit committed ack");
+        apply_ack_jobs(&mut ledger, AUTH_NOW_MS).expect("checkpoint relinquish phase");
+        drop(ledger);
+
+        let recovered = MigrationLedger::open(&state_root).expect("recover ledger");
+        assert!(recovered.state.committed_cursor.is_some());
+        assert!(recovered.state.ack_jobs.is_empty());
+        assert!(matches!(
+            recovered.state.pending_commits[0].phase,
+            PendingPhase::Relinquish
+        ));
+        assert_eq!(
+            recovered.state.pending_commits[0].next_attempt_ms,
+            AUTH_NOW_MS
+        );
+    }
+
+    #[test]
+    fn migration_ledger_rejects_symlink_duplicate_keys_and_oversize_state() {
+        use std::os::unix::fs::symlink;
+
+        let symlink_tmp = tempfile::tempdir().unwrap();
+        let outside = symlink_tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let linked = symlink_tmp.path().join("linked");
+        symlink(&outside, &linked).unwrap();
+        assert!(MigrationLedger::open(&linked).is_err());
+
+        let duplicate_tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            duplicate_tmp.path().join(MIGRATION_LEDGER_FILE),
+            br#"{"schema_version":1,"schema_version":1,"source_cursor":null,"target_cursor":null,"committed_cursor":null,"failed_cursor":null,"source_jobs":[],"target_jobs":[],"ack_jobs":[],"pending_commits":[]}"#,
+        )
+        .unwrap();
+        assert!(MigrationLedger::open(duplicate_tmp.path()).is_err());
+
+        let oversize_tmp = tempfile::tempdir().unwrap();
+        let file = fs::File::create(oversize_tmp.path().join(MIGRATION_LEDGER_FILE)).unwrap();
+        file.set_len(MAX_MIGRATION_LEDGER_BYTES + 1).unwrap();
+        assert!(MigrationLedger::open(oversize_tmp.path()).is_err());
     }
 }

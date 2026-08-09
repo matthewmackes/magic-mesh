@@ -27,8 +27,9 @@
 //! live) server since they need one to exercise.
 
 use spice_client::{
-    channels::display::DisplaySurface, MouseButton as SpiceMouseButton, SpiceClientShared,
-    SpiceError,
+    channels::display::DisplaySurface,
+    vdagent::{ClipboardEvent, ClipboardStatus, VdAgentClipboard},
+    MouseButton as SpiceMouseButton, SpiceClientShared, SpiceError,
 };
 
 use crate::config::SpiceConfig;
@@ -85,6 +86,7 @@ const fn spice_button(b: MouseButton) -> SpiceMouseButton {
 /// [`SpiceSession`].
 pub struct SpiceTransport {
     client: SpiceClientShared,
+    clipboard: VdAgentClipboard,
     /// The upstream client holds each channel mutex while its receive loop is
     /// waiting for the next wire message.  Keep the decoded primary surface in
     /// the client's update callback so the shell can poll it without contending
@@ -113,6 +115,7 @@ impl SpiceTransport {
         client
             .request_display_size(u32::from(config.width), u32::from(config.height))
             .await?;
+        let clipboard = client.clipboard().await?;
         let latest_surface = std::sync::Arc::new(std::sync::Mutex::new(None));
         let callback_surface = std::sync::Arc::clone(&latest_surface);
         client
@@ -124,6 +127,7 @@ impl SpiceTransport {
             .await?;
         Ok(Self {
             client,
+            clipboard,
             latest_surface,
         })
     }
@@ -134,6 +138,39 @@ impl SpiceTransport {
     #[must_use]
     pub const fn client(&self) -> &SpiceClientShared {
         &self.client
+    }
+
+    /// Current vdagent clipboard negotiation state.
+    #[must_use]
+    pub fn clipboard_status(&self) -> ClipboardStatus {
+        self.clipboard.status()
+    }
+
+    /// Advertise bounded UTF-8 host text to the guest. Bytes are sent only
+    /// after the guest requests the advertised type.
+    pub fn offer_clipboard_text(
+        &self,
+        text: String,
+    ) -> Result<(), spice_client::vdagent::ClipboardError> {
+        self.clipboard.offer_text(text)
+    }
+
+    /// Send the previously offered text after the shell consumes its one-use
+    /// permission ticket in response to the guest request.
+    pub fn send_offered_clipboard_text(&self) -> Result<(), spice_client::vdagent::ClipboardError> {
+        self.clipboard.send_offered_text()
+    }
+
+    /// Withdraw an offered clipboard value when permission is revoked before
+    /// the guest requests the bytes.
+    pub fn cancel_clipboard_offer(&self) -> Result<(), spice_client::vdagent::ClipboardError> {
+        self.clipboard.cancel_offer()
+    }
+
+    /// Drain bounded guest-agent clipboard events.
+    #[must_use]
+    pub fn take_clipboard_events(&self) -> Vec<ClipboardEvent> {
+        self.clipboard.take_events()
     }
 
     /// Pull the display channel's latest decoded primary surface and fold it into
@@ -348,6 +385,36 @@ impl BlockingSpiceTransport {
     pub fn flush_input(&mut self, session: &mut SpiceSession) -> Result<(), ConnectError> {
         self.pace.quicken();
         self.runtime.block_on(self.transport.flush_input(session))
+    }
+
+    /// Current guest-agent clipboard negotiation state.
+    #[must_use]
+    pub fn clipboard_status(&self) -> ClipboardStatus {
+        self.transport.clipboard_status()
+    }
+
+    /// Queue one bounded UTF-8 clipboard offer for demand-driven delivery.
+    pub fn offer_clipboard_text(
+        &self,
+        text: String,
+    ) -> Result<(), spice_client::vdagent::ClipboardError> {
+        self.transport.offer_clipboard_text(text)
+    }
+
+    /// Complete a guest-requested transfer after one-use permission admission.
+    pub fn send_offered_clipboard_text(&self) -> Result<(), spice_client::vdagent::ClipboardError> {
+        self.transport.send_offered_clipboard_text()
+    }
+
+    /// Withdraw a pending offer after permission revocation.
+    pub fn cancel_clipboard_offer(&self) -> Result<(), spice_client::vdagent::ClipboardError> {
+        self.transport.cancel_clipboard_offer()
+    }
+
+    /// Drain guest clipboard and delivery events without blocking the seat.
+    #[must_use]
+    pub fn take_clipboard_events(&self) -> Vec<ClipboardEvent> {
+        self.transport.take_clipboard_events()
     }
 }
 

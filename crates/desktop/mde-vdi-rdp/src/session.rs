@@ -27,22 +27,23 @@
 
 use crate::config::{ConfigError, RdpConfig};
 use crate::egui::{ColorImage, Event};
-use crate::input::{map_event, map_text, ModifierState, RdpInputEvent};
+use crate::input::{ModifierState, RdpInputEvent, map_event, map_text};
 use crate::link::{
     LadderConfig, LinkEstimate, LinkEstimator, LinkThresholds, QualityLadder, QualityMode,
     QualityTier, TierChange,
 };
 use crate::pixel::{Framebuffer, FramebufferError, PixelFormat};
 use crate::tier::RdpTierSettings;
-use mackes_mesh_types::vdi_clipboard::{VdiClipboardStatus, RDP_CLIPBOARD_UNSUPPORTED_REASON};
+use mackes_mesh_types::vdi_clipboard::{RDP_CLIPBOARD_UNSUPPORTED_REASON, VdiClipboardStatus};
 use mde_egui::clipboard::TextClipboard;
 use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
 
 /// Why an RDP text clipboard operation could not be completed.
 ///
-/// CLIPRDR is not wired into the pinned IronRDP session yet. Keeping this error
-/// distinct from a successful empty clipboard prevents a caller from treating a
-/// missing channel as a valid clear/read result.
+/// A detached [`RdpSession`] has no wire-owned CLIPRDR processor. Keeping this
+/// error distinct from a successful empty clipboard prevents a caller from
+/// treating the decoder-only seam as a valid clear/read result. The live
+/// connection owns the real bidirectional channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RdpClipboardError {
     /// The RDP connection has no CLIPRDR processor in this backend.
@@ -59,11 +60,11 @@ impl core::fmt::Display for RdpClipboardError {
 
 impl std::error::Error for RdpClipboardError {}
 
-/// Text-clipboard adapter for an RDP session whose CLIPRDR channel is absent.
+/// Text-clipboard adapter for a decoder-only RDP session with no connection.
 ///
-/// This is the native seam future CLIPRDR wiring will replace. Reads return no
-/// text and writes return/record [`RdpClipboardError::Unsupported`]; neither
-/// operation is reported as successful while the protocol channel is missing.
+/// Reads return no text and writes return/record
+/// [`RdpClipboardError::Unsupported`]; neither operation is reported as
+/// successful unless the caller uses the live connection-owned CLIPRDR seam.
 #[derive(Debug, Default)]
 pub struct RdpTextClipboard {
     last_error: Option<RdpClipboardError>,
@@ -124,9 +125,9 @@ impl TextClipboard for RdpTextClipboard {
 
 /// Current RDP text clipboard capability.
 ///
-/// The backend wires display, framebuffer decode, and input, but it does not yet
-/// open RDP's real CLIPRDR virtual channel. WL-FUNC-016 requires this to be
-/// reported explicitly instead of silently dropping copy/paste requests.
+/// A standalone decoder session cannot open a static virtual channel; only the
+/// live connection can. Report that distinction instead of silently dropping
+/// copy/paste requests made against this detached adapter.
 #[must_use]
 pub fn rdp_clipboard_status() -> VdiClipboardStatus {
     VdiClipboardStatus::rdp_unsupported()
@@ -472,14 +473,14 @@ impl RdpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{rdp_clipboard_status, RdpClipboardError, RdpSession, RdpTextClipboard};
+    use super::{RdpClipboardError, RdpSession, RdpTextClipboard, rdp_clipboard_status};
     use crate::config::RdpConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, Pos2};
     use crate::input::{RdpInputEvent, Scancode};
     use crate::link::{QualityMode, QualityTier};
     use crate::pixel::PixelFormat;
     use mackes_mesh_types::vdi_clipboard::{
-        VdiClipboardLaneStatus, RDP_CLIPBOARD_UNSUPPORTED_REASON,
+        RDP_CLIPBOARD_UNSUPPORTED_REASON, VdiClipboardLaneStatus,
     };
     use mde_egui::clipboard::TextClipboard;
 
@@ -542,7 +543,7 @@ mod tests {
     fn applied_update_makes_a_new_frame_available() {
         let mut s = session();
         let _ = s.frame(); // consume the initial frame
-                           // Paint a 2x1 rect at the origin of the 200x200 desktop.
+        // Paint a 2x1 rect at the origin of the 200x200 desktop.
         let src = [
             0x00, 0x00, 0xFF, 0xFF, // BGRA red
             0xFF, 0x00, 0x00, 0xFF, // BGRA blue
@@ -710,9 +711,10 @@ mod tests {
         assert!(!s.needs_reconnect());
         assert_eq!(s.applied_tier(), QualityTier::Compressed);
         // Re-pinning the same tier is not a change.
-        assert!(s
-            .set_quality_mode(QualityMode::Pinned(QualityTier::Compressed), 2_000)
-            .is_none());
+        assert!(
+            s.set_quality_mode(QualityMode::Pinned(QualityTier::Compressed), 2_000)
+                .is_none()
+        );
     }
 
     #[test]

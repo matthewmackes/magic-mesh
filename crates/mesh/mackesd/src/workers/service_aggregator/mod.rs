@@ -28,6 +28,8 @@
 #![cfg(feature = "async-services")]
 
 pub mod aggregate;
+pub mod resource_actions;
+pub mod resource_adapters;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -641,7 +643,25 @@ impl ServiceAggregatorWorker {
                 ssh_x11_state.as_ref(),
                 upnp_state.as_ref(),
             ) {
-                Ok(catalog) => self.publish_resource_mirrors(&catalog),
+                Ok(catalog) => match resource_adapters::augment_from_production(
+                    catalog,
+                    &self.workgroup_root,
+                    self.bus_root.as_deref(),
+                ) {
+                    Ok((catalog, adapter_status)) => {
+                        publish_json(
+                            self.bus_root.as_deref(),
+                            resource_adapters::RESOURCE_ADAPTER_STATUS_TOPIC,
+                            &adapter_status,
+                        );
+                        self.publish_resource_mirrors(&catalog);
+                    }
+                    Err(error) => tracing::error!(
+                        host = %self.host,
+                        error,
+                        "refusing to publish universal resource mirrors after source-adapter failure"
+                    ),
+                },
                 Err(error) => tracing::error!(
                     host = %self.host,
                     error = %error,
@@ -824,10 +844,19 @@ impl Worker for ServiceAggregatorWorker {
         self.cycle_and_publish(&mut last, &mut last_pub_at);
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
+        let mut action_worker = resource_actions::ResourceActionWorker::production(
+            self.bus_root.clone(),
+            self.publisher_store.clone(),
+        );
+        let mut action_tick = tokio::time::interval(mde_bus::rpc::CONTROL_POLL_INTERVAL);
+        action_tick.tick().await;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     self.cycle_and_publish(&mut last, &mut last_pub_at);
+                }
+                _ = action_tick.tick() => {
+                    action_worker.tick(u64::try_from(now_ms()).unwrap_or(0));
                 }
                 () = shutdown.wait() => break,
             }

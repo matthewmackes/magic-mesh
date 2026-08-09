@@ -982,7 +982,7 @@ mod menubar_coverage {
                          strip; migrating it onto the shared bar is a MENUBAR-SWEEP \
                          follow-on",
             },
-            Surface::Timers => Coverage::Exempt {
+            Surface::Clock => Coverage::Exempt {
                 reason: "bare — the clock-owned Timers & Alarms surface is \
                          deliberately chrome-light; a bar is a MENUBAR-SWEEP \
                          follow-on",
@@ -1023,7 +1023,7 @@ mod menubar_coverage {
             Surface::ThisNode,
             Surface::Phones,
         ]);
-        all.push(Surface::Timers);
+        all.push(Surface::Clock);
         all.push(Surface::AutoHome);
         all
     }
@@ -1099,7 +1099,7 @@ mod menubar_coverage {
                 Surface::MeshView,
                 Surface::Explorer,
                 Surface::Phones,
-                Surface::Timers,
+                Surface::Clock,
                 // AUTO-HOME — the out-of-ALL Auto Mode home, appended after Timers
                 // by `every_routed`; a full-bleed Car-Mode tile launcher, bare by
                 // design.

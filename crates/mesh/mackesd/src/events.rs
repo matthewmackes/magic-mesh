@@ -84,54 +84,30 @@ pub fn append_event(
     detail: serde_json::Value,
 ) -> anyhow::Result<Event> {
     use anyhow::Context;
-    crate::store::with_transaction(conn, |tx| {
-        let prev_hash_hex: String = tx
-            .query_row(
-                "SELECT hash FROM events ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap_or_default();
-        let prev_hash = decode_hex32(&prev_hash_hex).unwrap_or([0u8; 32]);
-        let now_ms = now_ms();
-        let event = Event {
-            event_id: u64::try_from(now_ms.max(0)).unwrap_or(0),
-            kind,
+    let timestamp_ms = now_ms();
+    let event_id = u64::try_from(timestamp_ms.max(0)).unwrap_or(0);
+    let kind_token = serde_json::to_string(&kind)
+        .context("serializing event kind")?
+        .trim_matches('"')
+        .to_owned();
+    crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::AppendEventRecord {
+            event_id,
+            kind: kind_token,
             node_id: node_id.to_owned(),
-            timestamp_ms: now_ms,
-            detail,
-        };
-        let payload = event.payload_bytes().context("serializing event payload")?;
-        let hash = crate::audit::next_hash(&prev_hash, &payload, now_ms);
-        let payload_str = String::from_utf8(payload)
-            .context("event payload is not valid UTF-8 (impossible from serde_json)")?;
-        let kind_token = serde_json::to_string(&kind)
-            .unwrap_or_else(|_| "\"lifecycle\"".to_owned())
-            .trim_matches('"')
-            .to_owned();
-        // `created_at` MUST encode exactly `now_ms` — `load_audit_rows`
-        // reparses this RFC3339 string back to epoch-millis and
-        // recomputes `next_hash` over it, so a second `Utc::now()` call
-        // here would drift from the `now_ms` baked into `hash` and break
-        // chain verification (flaky under load). Derive it from the one
-        // instant instead.
-        let created_at = chrono::DateTime::from_timestamp_millis(now_ms)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339();
-        tx.execute(
-            "INSERT INTO events (prev_hash, hash, kind, actor, payload_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                encode_hex(&prev_hash),
-                encode_hex(&hash),
-                kind_token,
-                node_id,
-                payload_str,
-                created_at,
-            ),
-        )
-        .context("inserting event row")?;
-        Ok(event)
+            timestamp_ms,
+            detail: detail.clone(),
+        },
+    )
+    .context("appending event through SQLite writer")?
+    .into_row_id()?;
+    Ok(Event {
+        event_id,
+        kind,
+        node_id: node_id.to_owned(),
+        timestamp_ms,
+        detail,
     })
 }
 
@@ -171,26 +147,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
-}
-
-fn encode_hex(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
-fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).ok()?;
-        out[i] = u8::from_str_radix(s, 16).ok()?;
-    }
-    Some(out)
 }
 
 /// Walk the configured hooks and fire each whose `for_kind` matches.

@@ -2,14 +2,19 @@ use crate::channels::{Channel, ChannelConnection};
 use crate::error::{Result, SpiceError};
 use crate::protocol::*;
 use crate::utils::sleep;
+use crate::vdagent::{ClipboardCommand, VdAgentClipboard, VdAgentClipboardChannel};
 use binrw::BinRead;
 use instant::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+const VD_AGENT_MAX_DATA_SIZE: usize = 2048;
 
 pub struct MainChannel {
     connection: ChannelConnection,
     session_id: Option<u32>,
     agent_connected: bool,
+    clipboard_handle: VdAgentClipboard,
+    clipboard: VdAgentClipboardChannel,
 }
 
 impl MainChannel {
@@ -17,10 +22,13 @@ impl MainChannel {
         let mut connection = ChannelConnection::new(host, port, ChannelType::Main, 0).await?;
         connection.handshake().await?;
 
+        let (clipboard_handle, clipboard) = VdAgentClipboardChannel::new();
         Ok(Self {
             connection,
             session_id: None,
             agent_connected: false,
+            clipboard_handle,
+            clipboard,
         })
     }
 
@@ -43,10 +51,13 @@ impl MainChannel {
         .await?;
         connection.handshake().await?;
 
+        let (clipboard_handle, clipboard) = VdAgentClipboardChannel::new();
         Ok(Self {
             connection,
             session_id: None,
             agent_connected: false,
+            clipboard_handle,
+            clipboard,
         })
     }
 
@@ -68,14 +79,22 @@ impl MainChannel {
         }
         connection.handshake().await?;
 
+        let (clipboard_handle, clipboard) = VdAgentClipboardChannel::new();
         Ok(Self {
             connection,
             session_id: None,
+            agent_connected: false,
+            clipboard_handle,
+            clipboard,
         })
     }
 
     pub fn get_session_id(&self) -> Option<u32> {
         self.session_id
+    }
+
+    pub fn clipboard(&self) -> VdAgentClipboard {
+        self.clipboard_handle.clone()
     }
 
     pub async fn send_attach_channels(&mut self) -> Result<()> {
@@ -95,6 +114,8 @@ impl MainChannel {
             .send_message(SPICE_MSGC_MAIN_AGENT_START, &u32::MAX.to_le_bytes())
             .await?;
         self.agent_connected = true;
+        let capabilities = self.clipboard.connected();
+        self.send_agent_payload(&capabilities).await?;
         info!("Started SPICE guest-agent channel");
         Ok(())
     }
@@ -317,10 +338,45 @@ impl MainChannel {
 
     pub async fn run(&mut self) -> Result<()> {
         loop {
-            let (header, data) = self.connection.read_message().await?;
-            self.handle_message(&header, &data).await?;
+            tokio::select! {
+                message = self.connection.read_message() => {
+                    let (header, data) = message?;
+                    self.handle_message(&header, &data).await?;
+                }
+                command = self.clipboard.command_rx().recv() => {
+                    let Some(command) = command else {
+                        return Err(SpiceError::ConnectionClosed);
+                    };
+                    self.send_clipboard_command(command).await?;
+                }
+            }
         }
     }
+
+    async fn send_clipboard_command(&mut self, command: ClipboardCommand) -> Result<()> {
+        let sends_host_text = matches!(command, ClipboardCommand::SendOfferedText);
+        let frame = self.clipboard.apply_command(command).map_err(|error| {
+            SpiceError::Protocol(format!("SPICE clipboard command refused: {error}"))
+        })?;
+        self.send_agent_payload(&frame).await?;
+        if sends_host_text {
+            self.clipboard.host_text_sent();
+        }
+        Ok(())
+    }
+
+    async fn send_agent_payload(&mut self, payload: &[u8]) -> Result<()> {
+        for chunk in agent_chunks(payload) {
+            self.connection
+                .send_message(SPICE_MSGC_MAIN_AGENT_DATA, chunk)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+fn agent_chunks(payload: &[u8]) -> std::slice::Chunks<'_, u8> {
+    payload.chunks(VD_AGENT_MAX_DATA_SIZE)
 }
 
 impl Channel for MainChannel {
@@ -484,17 +540,13 @@ impl Channel for MainChannel {
             }
             x if x == MainChannelMessage::AgentDisconnected as u16 => {
                 info!("Agent disconnected");
-                // TODO: Clean up agent state
+                self.agent_connected = false;
+                self.clipboard.disconnected();
             }
             x if x == MainChannelMessage::AgentData as u16 => {
-                let mut cursor = std::io::Cursor::new(data);
-                let agent_data = SpiceMsgMainAgentData::read(&mut cursor)
-                    .map_err(|e| SpiceError::Protocol(format!("Failed to parse AgentData: {e}")))?;
-                debug!(
-                    "Received agent data: protocol {}, type {}, size {}",
-                    agent_data.protocol, agent_data.type_, agent_data.size
-                );
-                // TODO: Process agent data (clipboard, file transfer, etc.)
+                for reply in self.clipboard.ingest(data)? {
+                    self.send_agent_payload(&reply).await?;
+                }
             }
             x if x == MainChannelMessage::AgentToken as u16 => {
                 let mut cursor = std::io::Cursor::new(data);
@@ -634,7 +686,7 @@ fn monitor_config_message(width: u32, height: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod monitor_config_tests {
-    use super::monitor_config_message;
+    use super::{agent_chunks, monitor_config_message, VD_AGENT_MAX_DATA_SIZE};
 
     #[test]
     fn monitor_config_is_packed_spice_agent_frame() {
@@ -647,5 +699,15 @@ mod monitor_config_tests {
         assert_eq!(u32::from_le_bytes(data[28..32].try_into().unwrap()), 1080);
         assert_eq!(u32::from_le_bytes(data[32..36].try_into().unwrap()), 1920);
         assert_eq!(u32::from_le_bytes(data[36..40].try_into().unwrap()), 32);
+    }
+
+    #[test]
+    fn agent_payloads_are_split_at_the_protocol_data_limit() {
+        let payload = vec![0_u8; VD_AGENT_MAX_DATA_SIZE * 2 + 1];
+        let chunks = agent_chunks(&payload).map(<[u8]>::len).collect::<Vec<_>>();
+        assert_eq!(
+            chunks,
+            vec![VD_AGENT_MAX_DATA_SIZE, VD_AGENT_MAX_DATA_SIZE, 1]
+        );
     }
 }

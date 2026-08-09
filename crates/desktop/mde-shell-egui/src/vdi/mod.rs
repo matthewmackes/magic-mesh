@@ -19,6 +19,7 @@
 //! wire transport is the gated E12-4 layer) the panel shows an honest "no desktop"
 //! EmptyState, never a placeholder render of a fake desktop (§7).
 
+use mackes_mesh_types::android_provider::{AndroidVdiProtocol, AndroidVdiSource};
 use mackes_mesh_types::workloads::{
     WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction,
 };
@@ -39,8 +40,19 @@ use std::{
 
 #[cfg(feature = "live-vdi")]
 use {
+    crate::clipboard_permissions::{
+        ClipboardFailure, ClipboardGateReadiness, ClipboardGateTicket, ClipboardPermissionIngress,
+        ClipboardTarget, ClipboardTargetKind,
+    },
+    mackes_mesh_types::vdi_clipboard::{
+        vdi_clipboard_session_topic, ClipboardEnvelopeV2, VdiClipboardDisclosureV2,
+        VdiClipboardLeaseV2, VdiClipboardMessageV2, VdiClipboardReceiptV2, VdiClipboardText,
+        MAX_VDI_CLIPBOARD_LEASE_TTL_MS, VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX,
+        VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX, VDI_CLIPBOARD_LEASE_TOPIC_PREFIX,
+        VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX, VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+    },
     mde_bus::hooks::config::Priority,
-    mde_collab_types::{ClipboardClipBody, MAX_CLIPBOARD_TEXT_BYTES},
+    mde_collab_types::ClipboardClipBody,
     mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
     mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
     mde_vdi_vnc::{PumpOutcome as VncPumpOutcome, VncConfig, VncConnection},
@@ -199,6 +211,9 @@ pub(crate) enum SessionFocusSurface {
 /// [`ConnectRequest`], so this enum has no unknown arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VdiProtocol {
+    /// Guest-owned Cuttlefish WebRTC display. Remote Sessions authorization is
+    /// supported; a seat-side decoder remains an explicit runtime capability.
+    WebRtc,
     /// Sunshine stream consumed by Moonlight. The typed route exists now; the
     /// host decoder remains honestly gated until its live adapter is present.
     Moonlight,
@@ -214,6 +229,7 @@ impl VdiProtocol {
     /// The decoder crate this protocol renders through.
     pub(crate) const fn client_crate(self) -> &'static str {
         match self {
+            Self::WebRtc => "Cuttlefish WebRTC adapter",
             Self::Moonlight => "Moonlight adapter",
             Self::Rdp => "mde-vdi-rdp",
             Self::Vnc => "mde-vdi-vnc",
@@ -229,6 +245,7 @@ impl VdiProtocol {
     /// The short picker / caption label.
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::WebRtc => "WebRTC",
             Self::Moonlight => "Sunshine/Moonlight",
             Self::Rdp => "RDP",
             Self::Vnc => "VNC",
@@ -239,13 +256,14 @@ impl VdiProtocol {
     /// Operator-facing text for the text-clipboard lane behind this protocol.
     /// Keep this beside the routing label so the chooser/connecting surface
     /// cannot imply that every decoder has the same guest integration. RFB
-    /// cut-text is wired; RDP CLIPRDR and SPICE vdagent remain explicit gaps.
+    /// cut-text, RDP CLIPRDR, and SPICE vdagent are wired for bounded text.
     pub(crate) const fn clipboard_summary(self) -> &'static str {
         match self {
+            Self::WebRtc => "clipboard unavailable: Cuttlefish WebRTC adapter is not attached",
             Self::Moonlight => "clipboard unavailable: Moonlight adapter is not attached",
-            Self::Rdp => "clipboard unavailable: RDP CLIPRDR is not implemented",
+            Self::Rdp => "clipboard: bidirectional RDP CLIPRDR text",
             Self::Vnc => "clipboard: bidirectional RFB cut text",
-            Self::Spice => "clipboard unavailable: SPICE vdagent is not implemented",
+            Self::Spice => "clipboard: bidirectional SPICE vdagent UTF-8 text",
         }
     }
 }
@@ -319,6 +337,10 @@ pub(crate) struct ConnectRequest {
     /// metadata only; the broker session id remains the authority for routing.
     /// `None` preserves the ordinary whole-desktop chooser path.
     pub app_id: Option<String>,
+    /// Exact guest-owned Android source carried through the authorized Remote
+    /// Sessions route. It is identity evidence only; VDI never parses its host
+    /// and port into a raw dial target.
+    pub android_source: Option<AndroidVdiSource>,
     /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
     /// off-mesh endpoints leave this empty.
     pub broker_session: Option<BrokerSessionLifecycle>,
@@ -361,6 +383,7 @@ impl ConnectRequest {
             monitors,
             auth,
             app_id: None,
+            android_source: None,
             broker_session: None,
             preferred_size: None,
         }
@@ -380,6 +403,13 @@ impl ConnectRequest {
         self
     }
 
+    /// Preserve a governed Android source without converting it into a raw
+    /// endpoint. The broker session remains the attachment authority.
+    fn with_android_source(mut self, source: AndroidVdiSource) -> Self {
+        self.android_source = Some(source);
+        self
+    }
+
     /// Attach the initial desktop size hint (device pixels) for RDP/SPICE
     /// negotiation (vdi-vm-8). `None` keeps the transport's fallback size.
     #[must_use]
@@ -396,6 +426,7 @@ const fn request_focus_surface(_request: &ConnectRequest) -> SessionFocusSurface
 #[cfg(feature = "live-vdi")]
 enum LiveRdpEvent {
     Connected(String),
+    ClipboardPublished,
     /// The host's TLS certificate changed since it was pinned (vdi-vm-6) — a
     /// non-fatal MITM warning; the session stays live (the Nebula link is the
     /// trust floor). Strict mode instead surfaces as [`LiveRdpEvent::Error`].
@@ -415,7 +446,7 @@ struct LiveRdpHandle {
 #[cfg(feature = "live-vdi")]
 enum LiveVncEvent {
     Connected(String),
-    Clipboard(ClipboardClipBody),
+    ClipboardPublished,
     Error(String),
     Ended(String),
 }
@@ -431,6 +462,8 @@ struct LiveVncHandle {
 #[cfg(feature = "live-vdi")]
 enum LiveSpiceEvent {
     Connected(String),
+    ClipboardPublished,
+    ClipboardStatus(String),
     Error(String),
     Ended(String),
 }
@@ -588,7 +621,10 @@ fn is_release_input(event: &egui::Event) -> bool {
 
 #[cfg(feature = "live-vdi")]
 impl LiveRdpHandle {
-    fn spawn(request: &ConnectRequest) -> Result<Self, String> {
+    fn spawn(
+        request: &ConnectRequest,
+        clipboard_permissions: Option<ClipboardPermissionIngress>,
+    ) -> Result<Self, String> {
         let Some(endpoint) = request.target.endpoint.clone() else {
             return Err("discovery has not published a dialable endpoint for this desktop".into());
         };
@@ -605,6 +641,13 @@ impl LiveRdpHandle {
         )
         .with_port(endpoint.port)
         .with_resolution(width, height);
+        let clipboard_root = request
+            .broker_session
+            .as_ref()
+            .and_then(|broker| broker.bus_root.clone())
+            .or_else(mde_bus::client_data_dir);
+        let clipboard_source = vdi_clipboard_source(request, "rdp");
+        let clipboard_lease = vdi_clipboard_lease("rdp", &clipboard_source, unix_time_ms())?;
         let input = new_input_mailbox();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -615,7 +658,19 @@ impl LiveRdpHandle {
             .spawn({
                 let input = input.clone();
                 let frame_mailbox = frame_mailbox.clone();
-                move || run_live_rdp(config, input, stop_rx, event_tx, frame_mailbox)
+                move || {
+                    run_live_rdp(
+                        config,
+                        input,
+                        stop_rx,
+                        event_tx,
+                        clipboard_root,
+                        clipboard_source,
+                        clipboard_lease,
+                        clipboard_permissions,
+                        frame_mailbox,
+                    )
+                }
             })
             .map_err(|e| format!("failed to spawn live RDP worker: {e}"))?;
 
@@ -645,7 +700,10 @@ impl LiveRdpHandle {
 
 #[cfg(feature = "live-vdi")]
 impl LiveVncHandle {
-    fn spawn(request: &ConnectRequest) -> Result<Self, String> {
+    fn spawn(
+        request: &ConnectRequest,
+        clipboard_permissions: Option<ClipboardPermissionIngress>,
+    ) -> Result<Self, String> {
         let config = live_vnc_config(request)?;
         let clipboard_root = request
             .broker_session
@@ -653,6 +711,7 @@ impl LiveVncHandle {
             .and_then(|broker| broker.bus_root.clone())
             .or_else(mde_bus::client_data_dir);
         let clipboard_source = vnc_clipboard_source(request);
+        let clipboard_lease = vnc_clipboard_lease(&clipboard_source, unix_time_ms())?;
         let input = new_input_mailbox();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -670,6 +729,8 @@ impl LiveVncHandle {
                     event_tx,
                     clipboard_root,
                     clipboard_source,
+                    clipboard_lease,
+                    clipboard_permissions,
                     worker_frame_mailbox,
                 )
             })
@@ -701,8 +762,18 @@ impl LiveVncHandle {
 
 #[cfg(feature = "live-vdi")]
 impl LiveSpiceHandle {
-    fn spawn(request: &ConnectRequest) -> Result<Self, String> {
+    fn spawn(
+        request: &ConnectRequest,
+        clipboard_permissions: Option<ClipboardPermissionIngress>,
+    ) -> Result<Self, String> {
         let config = live_spice_config(request)?;
+        let clipboard_root = request
+            .broker_session
+            .as_ref()
+            .and_then(|broker| broker.bus_root.clone())
+            .or_else(mde_bus::client_data_dir);
+        let clipboard_source = vdi_clipboard_source(request, "spice");
+        let clipboard_lease = vdi_clipboard_lease("spice", &clipboard_source, unix_time_ms())?;
         let input = new_input_mailbox();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -713,7 +784,19 @@ impl LiveSpiceHandle {
             .spawn({
                 let input = input.clone();
                 let frame_mailbox = frame_mailbox.clone();
-                move || run_live_spice(config, input, stop_rx, event_tx, frame_mailbox)
+                move || {
+                    run_live_spice(
+                        config,
+                        input,
+                        stop_rx,
+                        event_tx,
+                        clipboard_root,
+                        clipboard_source,
+                        clipboard_lease,
+                        clipboard_permissions,
+                        frame_mailbox,
+                    )
+                }
             })
             .map_err(|e| format!("failed to spawn live SPICE worker: {e}"))?;
 
@@ -791,26 +874,220 @@ const CLIPBOARD_CAPTURE_TOPIC: &str = "event/clipboard/clip";
 /// and makes a reconnect of the same desktop retain truthful attribution.
 #[cfg(feature = "live-vdi")]
 fn vnc_clipboard_source(request: &ConnectRequest) -> String {
+    vdi_clipboard_source(request, "vnc")
+}
+
+#[cfg(feature = "live-vdi")]
+fn vdi_clipboard_source(request: &ConnectRequest, protocol: &str) -> String {
     let session = request
         .broker_session
         .as_ref()
         .map(|broker| broker.id.as_str())
         .unwrap_or(request.target.name.as_str());
-    format!("vnc:{}:{session}", request.target.serving_peer)
+    format!("{protocol}:{}:{session}", request.target.serving_peer)
 }
 
-/// Read the newest canonical host clipboard event for a VNC worker. Events
-/// emitted by this same VNC session are intentionally not sent back to the
-/// guest: they are the guest→host direction and would otherwise form a loop.
+#[cfg(feature = "live-vdi")]
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+/// Mint a process-monotonic attachment generation. The wall-clock seed keeps a
+/// shell restart from reopening a prior generation; the atomic increment makes
+/// same-tick reconnects distinct.
+#[cfg(feature = "live-vdi")]
+fn next_vdi_clipboard_generation(now_ms: u64) -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seed = now_ms.saturating_mul(1_000).max(1);
+    LAST.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |previous| Some(seed.max(previous.saturating_add(1))),
+    )
+    .map_or(seed, |previous| seed.max(previous.saturating_add(1)))
+}
+
+#[cfg(feature = "live-vdi")]
+fn vnc_clipboard_lease(session_id: &str, now_ms: u64) -> Result<VdiClipboardLeaseV2, String> {
+    vdi_clipboard_lease("vnc", session_id, now_ms)
+}
+
+#[cfg(feature = "live-vdi")]
+fn vdi_clipboard_lease(
+    protocol: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<VdiClipboardLeaseV2, String> {
+    let generation = next_vdi_clipboard_generation(now_ms);
+    let lease = VdiClipboardLeaseV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: session_id.to_owned(),
+        generation,
+        lease_id: format!("{protocol}-clip-{generation}"),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(MAX_VDI_CLIPBOARD_LEASE_TTL_MS),
+        permitted_mime_offers: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+    };
+    lease.validate_at(now_ms).map_err(|error| {
+        format!(
+            "{} clipboard lease refused: {error}",
+            protocol.to_uppercase()
+        )
+    })?;
+    Ok(lease)
+}
+
+#[cfg(feature = "live-vdi")]
+fn renew_vnc_clipboard_lease(
+    previous: &VdiClipboardLeaseV2,
+    now_ms: u64,
+) -> Result<VdiClipboardLeaseV2, String> {
+    renew_vdi_clipboard_lease("vnc", previous, now_ms)
+}
+
+#[cfg(feature = "live-vdi")]
+fn renew_vdi_clipboard_lease(
+    protocol: &str,
+    previous: &VdiClipboardLeaseV2,
+    now_ms: u64,
+) -> Result<VdiClipboardLeaseV2, String> {
+    let lease = VdiClipboardLeaseV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: previous.session_id.clone(),
+        generation: previous.generation,
+        lease_id: format!("{protocol}-clip-{}-{now_ms}", previous.generation),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(MAX_VDI_CLIPBOARD_LEASE_TTL_MS),
+        permitted_mime_offers: previous.permitted_mime_offers.clone(),
+    };
+    lease.validate_at(now_ms).map_err(|error| {
+        format!(
+            "{} clipboard lease renewal refused: {error}",
+            protocol.to_uppercase()
+        )
+    })?;
+    Ok(lease)
+}
+
+#[cfg(feature = "live-vdi")]
+fn vnc_guest_clipboard_message(
+    lease: &VdiClipboardLeaseV2,
+    message_sequence: u64,
+    text: String,
+    now_ms: u64,
+) -> Result<VdiClipboardMessageV2, String> {
+    vdi_guest_clipboard_message("vnc", lease, message_sequence, text, now_ms)
+}
+
+#[cfg(feature = "live-vdi")]
+fn vdi_guest_clipboard_message(
+    protocol: &str,
+    lease: &VdiClipboardLeaseV2,
+    message_sequence: u64,
+    text: String,
+    now_ms: u64,
+) -> Result<VdiClipboardMessageV2, String> {
+    let expires_at_ms = now_ms.saturating_add(60_000).min(lease.expires_at_ms);
+    let envelope = ClipboardEnvelopeV2::new_inline_text(
+        "vdi-guest",
+        protocol,
+        lease.session_id.clone(),
+        message_sequence,
+        now_ms,
+        vec!["text/plain;charset=utf-8".into()],
+        "",
+        VdiClipboardText::new(text).map_err(|error| {
+            format!(
+                "{} guest clipboard refused: {error}",
+                protocol.to_uppercase()
+            )
+        })?,
+        expires_at_ms,
+    )
+    .map_err(|error| {
+        format!(
+            "{} guest clipboard refused: {error}",
+            protocol.to_uppercase()
+        )
+    })?;
+    let message = VdiClipboardMessageV2 {
+        schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: lease.session_id.clone(),
+        generation: lease.generation,
+        lease_id: lease.lease_id.clone(),
+        lease_expires_at_ms: lease.expires_at_ms,
+        message_sequence,
+        selected_mime: "text/plain;charset=utf-8".into(),
+        disclosure: VdiClipboardDisclosureV2::Shareable,
+        envelope,
+    };
+    message.admit(lease, None, now_ms).map_err(|error| {
+        format!(
+            "{} guest clipboard refused: {error}",
+            protocol.to_uppercase()
+        )
+    })?;
+    Ok(message)
+}
+
+#[cfg(feature = "live-vdi")]
+fn publish_vdi_clipboard_lease(root: &Path, lease: &VdiClipboardLeaseV2) -> Result<(), String> {
+    let topic = vdi_clipboard_session_topic(VDI_CLIPBOARD_LEASE_TOPIC_PREFIX, &lease.session_id)
+        .map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(lease).map_err(|_| "lease encoding failed".to_owned())?;
+    Persist::open(root.to_path_buf())
+        .map_err(|error| format!("could not open clipboard Bus: {error}"))?
+        .write(&topic, Priority::Default, None, Some(&body))
+        .map_err(|error| format!("clipboard lease publish failed: {error}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "live-vdi")]
+fn read_vdi_clipboard_receipt(
+    persist: &Persist,
+    lease: &VdiClipboardLeaseV2,
+) -> Result<Option<VdiClipboardReceiptV2>, String> {
+    let topic = vdi_clipboard_session_topic(VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX, &lease.session_id)
+        .map_err(|error| error.to_string())?;
+    let Some(record) = persist
+        .read_latest(&topic)
+        .map_err(|error| format!("clipboard receipt read failed: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let body = record
+        .body
+        .as_deref()
+        .ok_or_else(|| "clipboard receipt omitted its body".to_owned())?;
+    let receipt: VdiClipboardReceiptV2 =
+        serde_json::from_str(body).map_err(|_| "clipboard receipt is malformed".to_owned())?;
+    receipt
+        .validate()
+        .map_err(|error| format!("clipboard receipt refused: {error}"))?;
+    if receipt.session_id != lease.session_id {
+        return Ok(None);
+    }
+    Ok(Some(receipt))
+}
+
+/// Read and admit the newest typed host-to-guest command for this exact live
+/// VNC lease. Rich envelopes may contain richer fallbacks, but VNC can select
+/// only its truthfully advertised UTF-8 plain-text representation.
 #[cfg(feature = "live-vdi")]
 fn read_latest_vnc_host_clipboard(
     root: &std::path::Path,
-    session_source: &str,
-) -> Result<Option<(String, ClipboardClipBody)>, String> {
+    lease: &VdiClipboardLeaseV2,
+    now_ms: u64,
+) -> Result<Option<(VdiClipboardMessageV2, String)>, String> {
     let persist = Persist::open(root.to_path_buf())
         .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
+    let topic =
+        vdi_clipboard_session_topic(VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX, &lease.session_id)
+            .map_err(|error| error.to_string())?;
     let Some(message) = persist
-        .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+        .read_latest(&topic)
         .map_err(|error| format!("clipboard Bus read failed: {error}"))?
     else {
         return Ok(None);
@@ -818,37 +1095,88 @@ fn read_latest_vnc_host_clipboard(
     let Some(body) = message.body.as_deref() else {
         return Ok(None);
     };
-    let clip: ClipboardClipBody = serde_json::from_str(body)
-        .map_err(|error| format!("malformed clipboard event body: {error}"))?;
-    clip.validate()
-        .map_err(|error| format!("clipboard event validation failed: {error:?}"))?;
-    if clip.source == session_source || clip.text.len() > MAX_CLIPBOARD_TEXT_BYTES {
-        return Ok(None);
+    let command = VdiClipboardMessageV2::from_json_bytes(body.as_bytes())
+        .map_err(|error| format!("VNC clipboard command refused: {error}"))?;
+    let receipt = read_vdi_clipboard_receipt(&persist, lease)?;
+    command
+        .admit(lease, receipt.as_ref(), now_ms)
+        .map_err(|error| format!("VNC clipboard command refused: {error}"))?;
+    let text = command
+        .envelope
+        .inline_text
+        .as_ref()
+        .map(|text| text.as_str().to_owned())
+        .ok_or_else(|| "VNC clipboard command refused: protocol does not carry Files".to_owned())?;
+    if !command.selected_mime.eq_ignore_ascii_case("text/plain")
+        && !command
+            .selected_mime
+            .eq_ignore_ascii_case("text/plain;charset=utf-8")
+    {
+        return Err("VNC clipboard command refused: protocol supports plain text only".to_owned());
     }
-    Ok(Some((message.ulid, clip)))
+    Ok(Some((command, text)))
 }
 
-/// Publish one accepted guest `ServerCutText` value on the canonical event
-/// lane. The body is deliberately the existing `{id,text,source,time}` shape;
-/// the VNC session source carries the protocol/session attribution without
-/// inventing a second clipboard topic.
 #[cfg(feature = "live-vdi")]
-fn publish_vnc_clipboard_event(root: Option<&std::path::Path>, clip: &ClipboardClipBody) {
+fn publish_vdi_clipboard_receipt(
+    root: &Path,
+    receipt: &VdiClipboardReceiptV2,
+) -> Result<(), String> {
+    receipt
+        .validate()
+        .map_err(|error| format!("clipboard receipt refused: {error}"))?;
+    let topic =
+        vdi_clipboard_session_topic(VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX, &receipt.session_id)
+            .map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(receipt).map_err(|_| "receipt encoding failed".to_owned())?;
+    Persist::open(root.to_path_buf())
+        .map_err(|error| format!("could not open clipboard Bus: {error}"))?
+        .write(&topic, Priority::Default, None, Some(&body))
+        .map_err(|error| format!("clipboard receipt publish failed: {error}"))?;
+    Ok(())
+}
+
+/// Publish one accepted guest `ServerCutText` as a lease-bound V2 event while
+/// retaining the canonical text event for deployed text consumers.
+#[cfg(feature = "live-vdi")]
+fn try_publish_vnc_clipboard_event(
+    root: Option<&std::path::Path>,
+    clip: &ClipboardClipBody,
+    rich: &VdiClipboardMessageV2,
+) -> Result<(), String> {
     let Some(root) = root else {
-        return;
+        return Err("VNC clipboard Bus root is unavailable".to_owned());
     };
-    let Ok(persist) = Persist::open(root.to_path_buf()) else {
-        return;
-    };
-    let Ok(body) = serde_json::to_string(clip) else {
-        return;
-    };
-    let _ = persist.write(
-        CLIPBOARD_CAPTURE_TOPIC,
-        Priority::Default,
-        None,
-        Some(&body),
-    );
+    let persist = Persist::open(root.to_path_buf())
+        .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
+    let body = serde_json::to_string(clip)
+        .map_err(|error| format!("VNC legacy clipboard encoding failed: {error}"))?;
+    persist
+        .write(
+            CLIPBOARD_CAPTURE_TOPIC,
+            Priority::Default,
+            None,
+            Some(&body),
+        )
+        .map_err(|error| format!("VNC legacy clipboard publish failed: {error}"))?;
+    let topic =
+        vdi_clipboard_session_topic(VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX, &rich.session_id)
+            .map_err(|error| error.to_string())?;
+    let body = serde_json::to_string(rich)
+        .map_err(|error| format!("VNC V2 clipboard encoding failed: {error}"))?;
+    persist
+        .write(&topic, Priority::Default, None, Some(&body))
+        .map_err(|error| format!("VNC V2 clipboard publish failed: {error}"))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "live-vdi", test))]
+fn publish_vnc_clipboard_event(
+    root: Option<&std::path::Path>,
+    clip: &ClipboardClipBody,
+    rich: &VdiClipboardMessageV2,
+) {
+    let _ = try_publish_vnc_clipboard_event(root, clip, rich);
 }
 
 #[cfg(feature = "live-vdi")]
@@ -940,6 +1268,10 @@ fn run_live_rdp(
     input: SharedInputMailbox,
     stop_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<LiveRdpEvent>,
+    clipboard_root: Option<PathBuf>,
+    clipboard_source: String,
+    mut clipboard_lease: VdiClipboardLeaseV2,
+    clipboard_permissions: Option<ClipboardPermissionIngress>,
     frame_mailbox: LatestFrameMailbox,
 ) {
     let target = format!("{}:{}", config.host, config.port);
@@ -967,10 +1299,164 @@ fn run_live_rdp(
         frame_mailbox.publish(frame, damage);
     }
 
+    if let Some(root) = clipboard_root.as_deref() {
+        if let Err(error) = publish_vdi_clipboard_lease(root, &clipboard_lease) {
+            let _ = event_tx.send(LiveRdpEvent::Error(error));
+            return;
+        }
+    }
+
+    let mut gated_host_clipboard = None::<(VdiClipboardMessageV2, String, ClipboardGateTicket)>;
+    let mut last_gated_host_clipboard = None::<(String, u64, u64)>;
+    let mut gated_guest_clipboard = None::<(
+        ClipboardClipBody,
+        VdiClipboardMessageV2,
+        ClipboardGateTicket,
+    )>;
+    let mut pending_guest_clipboard = None::<(ClipboardClipBody, VdiClipboardMessageV2)>;
+    let mut guest_message_sequence = 0_u64;
+
     loop {
         if stop_rx.try_recv().is_ok() {
             let _ = conn.shutdown(&mut session);
             return;
+        }
+
+        let now_ms = unix_time_ms();
+        if gated_host_clipboard.is_none()
+            && gated_guest_clipboard.is_none()
+            && pending_guest_clipboard.is_none()
+            && now_ms.saturating_add(30_000) >= clipboard_lease.expires_at_ms
+        {
+            match renew_vdi_clipboard_lease("rdp", &clipboard_lease, now_ms) {
+                Ok(renewed) => {
+                    clipboard_lease = renewed;
+                    guest_message_sequence = 0;
+                    if let Some(root) = clipboard_root.as_deref() {
+                        if let Err(error) = publish_vdi_clipboard_lease(root, &clipboard_lease) {
+                            let _ = event_tx.send(LiveRdpEvent::Error(error));
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx.send(LiveRdpEvent::Error(error));
+                    return;
+                }
+            }
+        }
+
+        if let Some((command, text, ticket)) = gated_host_clipboard.take() {
+            match ticket.try_begin_materialization() {
+                ClipboardGateReadiness::Pending => {
+                    gated_host_clipboard = Some((command, text, ticket));
+                }
+                ClipboardGateReadiness::Refused => {}
+                ClipboardGateReadiness::Materialize => match conn.send_clipboard_to_guest(text) {
+                    Ok(()) => {
+                        ticket.report_progress(command.envelope.byte_count);
+                        if let Some(root) = clipboard_root.as_deref() {
+                            if let Err(error) =
+                                publish_vdi_clipboard_receipt(root, &command.receipt())
+                            {
+                                ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                                let _ = event_tx.send(LiveRdpEvent::Error(error));
+                                return;
+                            }
+                        }
+                        ticket.report_complete(now_ms);
+                    }
+                    Err(error) => {
+                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                        let _ = event_tx.send(LiveRdpEvent::Error(format!(
+                            "RDP host clipboard refused: {error}"
+                        )));
+                        return;
+                    }
+                },
+            }
+        }
+
+        if let Some((legacy, rich, ticket)) = gated_guest_clipboard.take() {
+            match ticket.try_begin_materialization() {
+                ClipboardGateReadiness::Pending => {
+                    gated_guest_clipboard = Some((legacy, rich, ticket));
+                }
+                ClipboardGateReadiness::Refused => {}
+                ClipboardGateReadiness::Materialize => {
+                    match try_publish_vnc_clipboard_event(clipboard_root.as_deref(), &legacy, &rich)
+                    {
+                        Ok(()) => {
+                            ticket.report_progress(rich.envelope.byte_count);
+                            ticket.report_complete(now_ms);
+                            let _ = event_tx.send(LiveRdpEvent::ClipboardPublished);
+                        }
+                        Err(_) => ticket.report_failure(ClipboardFailure::Transport, now_ms),
+                    }
+                }
+            }
+        }
+
+        if gated_guest_clipboard.is_none() {
+            if let Some((legacy, rich)) = pending_guest_clipboard.take() {
+                if let (Some(ingress), Ok(target)) = (
+                    clipboard_permissions.as_ref(),
+                    ClipboardTarget::new(
+                        ClipboardTargetKind::LocalSeat,
+                        clipboard_lease.session_id.clone(),
+                    ),
+                ) {
+                    match ingress.submit_vdi(&rich, &clipboard_lease, None, target, now_ms) {
+                        Ok(ticket) => gated_guest_clipboard = Some((legacy, rich, ticket)),
+                        Err(crate::clipboard_permissions::ClipboardPermissionError::Busy) => {
+                            pending_guest_clipboard = Some((legacy, rich));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        if gated_host_clipboard.is_none() {
+            if let Some(root) = clipboard_root.as_deref() {
+                if let Ok(Some((command, text))) =
+                    read_latest_vnc_host_clipboard(root, &clipboard_lease, now_ms)
+                {
+                    let key = (
+                        command.lease_id.clone(),
+                        command.generation,
+                        command.message_sequence,
+                    );
+                    if last_gated_host_clipboard.as_ref() != Some(&key) {
+                        if let (Some(ingress), Ok(target)) = (
+                            clipboard_permissions.as_ref(),
+                            ClipboardTarget::new(
+                                ClipboardTargetKind::Guest,
+                                clipboard_lease.session_id.clone(),
+                            ),
+                        ) {
+                            match ingress.submit_vdi(
+                                &command,
+                                &clipboard_lease,
+                                None,
+                                target,
+                                now_ms,
+                            ) {
+                                Ok(ticket) => {
+                                    last_gated_host_clipboard = Some(key);
+                                    gated_host_clipboard = Some((command, text, ticket));
+                                }
+                                Err(
+                                    crate::clipboard_permissions::ClipboardPermissionError::Busy,
+                                ) => {}
+                                Err(_) => last_gated_host_clipboard = Some(key),
+                            }
+                        } else {
+                            last_gated_host_clipboard = Some(key);
+                        }
+                    }
+                }
+            }
         }
 
         let mut had_input = false;
@@ -1007,6 +1493,28 @@ fn run_live_rdp(
                 return;
             }
         }
+
+        if gated_guest_clipboard.is_none() {
+            if let Some(text) = conn.take_guest_clipboard() {
+                guest_message_sequence = guest_message_sequence.saturating_add(1);
+                let clip = ClipboardClipBody::from_text(
+                    text.clone(),
+                    clipboard_source.clone(),
+                    chrono::Utc::now().to_rfc3339(),
+                );
+                if clip.validate().is_ok() && guest_message_sequence != 0 {
+                    if let Ok(rich) = vdi_guest_clipboard_message(
+                        "rdp",
+                        &clipboard_lease,
+                        guest_message_sequence,
+                        text,
+                        now_ms,
+                    ) {
+                        pending_guest_clipboard = Some((clip, rich));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1018,6 +1526,8 @@ fn run_live_vnc(
     event_tx: mpsc::Sender<LiveVncEvent>,
     clipboard_root: Option<PathBuf>,
     clipboard_source: String,
+    mut clipboard_lease: VdiClipboardLeaseV2,
+    clipboard_permissions: Option<ClipboardPermissionIngress>,
     frame_mailbox: LatestFrameMailbox,
 ) {
     let target = format!("{}:{}", config.host, config.port);
@@ -1044,12 +1554,25 @@ fn run_live_vnc(
         frame_mailbox.publish(frame, damage);
     }
 
-    // The canonical event lane is latest-value-wins. Keep the Bus ULID only
-    // after the corresponding ClientCutText has actually flushed: a failed
-    // write leaves the VNC session queue intact and the same event eligible
-    // for retry on the next connection.
-    let mut consumed_host_clipboard = None::<(String, String)>;
-    let mut pending_host_clipboard = None::<(String, String, String)>;
+    if let Some(root) = clipboard_root.as_deref() {
+        if let Err(error) = publish_vdi_clipboard_lease(root, &clipboard_lease) {
+            let _ = event_tx.send(LiveVncEvent::Error(error));
+            return;
+        }
+    }
+
+    // A receipt is persisted only after ClientCutText flushes. The command can
+    // then remain latest-value-wins without replaying after reconnect.
+    let mut gated_host_clipboard = None::<(VdiClipboardMessageV2, String, ClipboardGateTicket)>;
+    let mut pending_host_clipboard = None::<(VdiClipboardMessageV2, ClipboardGateTicket)>;
+    let mut last_gated_host_clipboard = None::<(String, u64, u64)>;
+    let mut pending_guest_clipboard = None::<(ClipboardClipBody, VdiClipboardMessageV2)>;
+    let mut gated_guest_clipboard = None::<(
+        ClipboardClipBody,
+        VdiClipboardMessageV2,
+        ClipboardGateTicket,
+    )>;
+    let mut guest_message_sequence = 0_u64;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -1057,24 +1580,136 @@ fn run_live_vnc(
             return;
         }
 
-        if pending_host_clipboard.is_none() {
-            if let Some(root) = clipboard_root.as_deref() {
-                if let Ok(Some((ulid, clip))) =
-                    read_latest_vnc_host_clipboard(root, &clipboard_source)
-                {
-                    let already_consumed = consumed_host_clipboard.as_ref().is_some_and(
-                        |(consumed_ulid, consumed_id)| {
-                            consumed_ulid == &ulid || consumed_id == &clip.id
-                        },
-                    );
-                    if !already_consumed {
-                        if let Err(error) = session.send_clipboard_to_guest(clip.text.clone()) {
-                            let _ = event_tx.send(LiveVncEvent::Error(format!(
-                                "VNC host clipboard refused: {error}"
-                            )));
+        let now_ms = unix_time_ms();
+        if gated_host_clipboard.is_none()
+            && pending_host_clipboard.is_none()
+            && pending_guest_clipboard.is_none()
+            && gated_guest_clipboard.is_none()
+            && now_ms.saturating_add(30_000) >= clipboard_lease.expires_at_ms
+        {
+            match renew_vnc_clipboard_lease(&clipboard_lease, now_ms) {
+                Ok(renewed) => {
+                    clipboard_lease = renewed;
+                    guest_message_sequence = 0;
+                    if let Some(root) = clipboard_root.as_deref() {
+                        if let Err(error) = publish_vdi_clipboard_lease(root, &clipboard_lease) {
+                            let _ = event_tx.send(LiveVncEvent::Error(error));
                             return;
                         }
-                        pending_host_clipboard = Some((ulid, clip.id, clip.text));
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx.send(LiveVncEvent::Error(error));
+                    return;
+                }
+            }
+        }
+
+        if let Some((command, text, ticket)) = gated_host_clipboard.take() {
+            match ticket.try_begin_materialization() {
+                ClipboardGateReadiness::Pending => {
+                    gated_host_clipboard = Some((command, text, ticket));
+                }
+                ClipboardGateReadiness::Refused => {}
+                ClipboardGateReadiness::Materialize => {
+                    if let Err(error) = session.send_clipboard_to_guest(text) {
+                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                        let _ = event_tx.send(LiveVncEvent::Error(format!(
+                            "VNC host clipboard refused: {error}"
+                        )));
+                        return;
+                    }
+                    ticket.report_progress(command.envelope.byte_count);
+                    pending_host_clipboard = Some((command, ticket));
+                }
+            }
+        }
+
+        if let Some((legacy, rich, ticket)) = gated_guest_clipboard.take() {
+            match ticket.try_begin_materialization() {
+                ClipboardGateReadiness::Pending => {
+                    gated_guest_clipboard = Some((legacy, rich, ticket));
+                }
+                ClipboardGateReadiness::Refused => {}
+                ClipboardGateReadiness::Materialize => {
+                    match try_publish_vnc_clipboard_event(clipboard_root.as_deref(), &legacy, &rich)
+                    {
+                        Ok(()) => {
+                            ticket.report_progress(rich.envelope.byte_count);
+                            ticket.report_complete(now_ms);
+                            let _ = event_tx.send(LiveVncEvent::ClipboardPublished);
+                        }
+                        Err(_) => {
+                            ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                        }
+                    }
+                }
+            }
+        }
+
+        if gated_guest_clipboard.is_none() {
+            if let Some((legacy, rich)) = pending_guest_clipboard.take() {
+                if let (Some(ingress), Ok(target)) = (
+                    clipboard_permissions.as_ref(),
+                    ClipboardTarget::new(
+                        ClipboardTargetKind::LocalSeat,
+                        clipboard_lease.session_id.clone(),
+                    ),
+                ) {
+                    match ingress.submit_vdi(&rich, &clipboard_lease, None, target, now_ms) {
+                        Ok(ticket) => {
+                            gated_guest_clipboard = Some((legacy, rich, ticket));
+                        }
+                        Err(crate::clipboard_permissions::ClipboardPermissionError::Busy) => {
+                            pending_guest_clipboard = Some((legacy, rich));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        if gated_host_clipboard.is_none() && pending_host_clipboard.is_none() {
+            if let Some(root) = clipboard_root.as_deref() {
+                if let Ok(Some((command, text))) =
+                    read_latest_vnc_host_clipboard(root, &clipboard_lease, now_ms)
+                {
+                    let key = (
+                        command.lease_id.clone(),
+                        command.generation,
+                        command.message_sequence,
+                    );
+                    if last_gated_host_clipboard.as_ref() != Some(&key) {
+                        if let (Some(ingress), Ok(target)) = (
+                            clipboard_permissions.as_ref(),
+                            ClipboardTarget::new(
+                                ClipboardTargetKind::Guest,
+                                clipboard_lease.session_id.clone(),
+                            ),
+                        ) {
+                            match ingress.submit_vdi(
+                                &command,
+                                &clipboard_lease,
+                                None,
+                                target,
+                                now_ms,
+                            ) {
+                                Ok(ticket) => {
+                                    last_gated_host_clipboard = Some(key);
+                                    gated_host_clipboard = Some((command, text, ticket));
+                                }
+                                Err(
+                                    crate::clipboard_permissions::ClipboardPermissionError::Busy,
+                                ) => {}
+                                Err(_) => {
+                                    last_gated_host_clipboard = Some(key);
+                                }
+                            }
+                        } else {
+                            // Fail closed when the shell permission controller is
+                            // unavailable; never fall back to direct materialization.
+                            last_gated_host_clipboard = Some(key);
+                        }
                     }
                 }
             }
@@ -1091,11 +1726,21 @@ fn run_live_vnc(
         }
         if had_input || pending_host_clipboard.is_some() {
             if let Err(e) = conn.flush_input(&mut session) {
+                if let Some((_, ticket)) = pending_host_clipboard.as_ref() {
+                    ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                }
                 let _ = event_tx.send(LiveVncEvent::Error(format!("VNC input failed: {e}")));
                 return;
             }
-            if let Some((ulid, id, _)) = pending_host_clipboard.take() {
-                consumed_host_clipboard = Some((ulid, id));
+            if let Some((command, ticket)) = pending_host_clipboard.take() {
+                if let Some(root) = clipboard_root.as_deref() {
+                    if let Err(error) = publish_vdi_clipboard_receipt(root, &command.receipt()) {
+                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                        let _ = event_tx.send(LiveVncEvent::Error(error));
+                        return;
+                    }
+                }
+                ticket.report_complete(now_ms);
             }
         }
 
@@ -1118,13 +1763,21 @@ fn run_live_vnc(
                     .last()
                     .map(mde_vdi_vnc::RfbCutText::into_text)
                 {
+                    guest_message_sequence = guest_message_sequence.saturating_add(1);
                     let clip = ClipboardClipBody::from_text(
-                        text,
+                        text.clone(),
                         clipboard_source.clone(),
                         chrono::Utc::now().to_rfc3339(),
                     );
-                    if clip.validate().is_ok() {
-                        let _ = event_tx.send(LiveVncEvent::Clipboard(clip));
+                    if clip.validate().is_ok() && guest_message_sequence != 0 {
+                        if let Ok(rich) = vnc_guest_clipboard_message(
+                            &clipboard_lease,
+                            guest_message_sequence,
+                            text,
+                            now_ms,
+                        ) {
+                            pending_guest_clipboard = Some((clip, rich));
+                        }
                     }
                 }
             }
@@ -1147,6 +1800,10 @@ fn run_live_spice(
     input: SharedInputMailbox,
     stop_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<LiveSpiceEvent>,
+    clipboard_root: Option<PathBuf>,
+    clipboard_source: String,
+    mut clipboard_lease: VdiClipboardLeaseV2,
+    clipboard_permissions: Option<ClipboardPermissionIngress>,
     frame_mailbox: LatestFrameMailbox,
 ) {
     let target = format!("{}:{}", config.host, config.port);
@@ -1169,12 +1826,253 @@ fn run_live_spice(
         frame_mailbox.publish(frame, damage);
     }
 
+    if let Some(root) = clipboard_root.as_deref() {
+        if let Err(error) = publish_vdi_clipboard_lease(root, &clipboard_lease) {
+            let _ = event_tx.send(LiveSpiceEvent::Error(error));
+            return;
+        }
+    }
+
+    let mut last_clipboard_status = None;
+    let mut gated_host_clipboard = None::<(VdiClipboardMessageV2, String, ClipboardGateTicket)>;
+    let mut pending_host_delivery = None::<(VdiClipboardMessageV2, ClipboardGateTicket)>;
+    let mut last_gated_host_clipboard = None::<(String, u64, u64)>;
+    let mut pending_guest_clipboard = None::<(ClipboardClipBody, VdiClipboardMessageV2)>;
+    let mut gated_guest_clipboard = None::<(
+        ClipboardClipBody,
+        VdiClipboardMessageV2,
+        ClipboardGateTicket,
+    )>;
+    let mut guest_message_sequence = 0_u64;
+
     loop {
         if stop_rx.try_recv().is_ok() {
             let _ = event_tx.send(LiveSpiceEvent::Ended(
                 "SPICE session stopped by shell".to_string(),
             ));
             return;
+        }
+
+        let now_ms = unix_time_ms();
+        let status = conn.clipboard_status();
+        if last_clipboard_status != Some(status) {
+            last_clipboard_status = Some(status);
+            let message = match status {
+                mde_vdi_spice::ClipboardStatus::AgentDisconnected => {
+                    "SPICE clipboard unavailable: guest agent disconnected"
+                }
+                mde_vdi_spice::ClipboardStatus::CapabilityPending => {
+                    "SPICE clipboard waiting for guest-agent capability negotiation"
+                }
+                mde_vdi_spice::ClipboardStatus::Unsupported => {
+                    "SPICE clipboard unavailable: guest agent did not advertise clipboard-by-demand"
+                }
+                mde_vdi_spice::ClipboardStatus::Ready => {
+                    "SPICE clipboard ready: bidirectional UTF-8 text"
+                }
+            };
+            let _ = event_tx.send(LiveSpiceEvent::ClipboardStatus(message.into()));
+        }
+
+        if gated_host_clipboard.is_none()
+            && pending_host_delivery.is_none()
+            && pending_guest_clipboard.is_none()
+            && gated_guest_clipboard.is_none()
+            && now_ms.saturating_add(30_000) >= clipboard_lease.expires_at_ms
+        {
+            match renew_vdi_clipboard_lease("spice", &clipboard_lease, now_ms) {
+                Ok(renewed) => {
+                    clipboard_lease = renewed;
+                    guest_message_sequence = 0;
+                    if let Some(root) = clipboard_root.as_deref() {
+                        if let Err(error) = publish_vdi_clipboard_lease(root, &clipboard_lease) {
+                            let _ = event_tx.send(LiveSpiceEvent::Error(error));
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = event_tx.send(LiveSpiceEvent::Error(error));
+                    return;
+                }
+            }
+        }
+
+        for clipboard_event in conn.take_clipboard_events() {
+            match clipboard_event {
+                mde_vdi_spice::ClipboardEvent::HostTextRequested => {
+                    if let Some((_, ticket)) = pending_host_delivery.as_ref() {
+                        match ticket.try_begin_materialization() {
+                            ClipboardGateReadiness::Materialize => {
+                                if let Err(error) = conn.send_offered_clipboard_text() {
+                                    if let Some((_, ticket)) = pending_host_delivery.take() {
+                                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                                    }
+                                    let _ = event_tx.send(LiveSpiceEvent::ClipboardStatus(
+                                        format!("SPICE host clipboard refused: {error}"),
+                                    ));
+                                }
+                            }
+                            ClipboardGateReadiness::Refused => {
+                                let _ = conn.cancel_clipboard_offer();
+                                pending_host_delivery = None;
+                            }
+                            ClipboardGateReadiness::Pending => {}
+                        }
+                    }
+                }
+                mde_vdi_spice::ClipboardEvent::HostTextSent => {
+                    if let Some((command, ticket)) = pending_host_delivery.take() {
+                        ticket.report_progress(command.envelope.byte_count);
+                        if let Some(root) = clipboard_root.as_deref() {
+                            if let Err(error) =
+                                publish_vdi_clipboard_receipt(root, &command.receipt())
+                            {
+                                ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                                let _ = event_tx.send(LiveSpiceEvent::Error(error));
+                                return;
+                            }
+                        }
+                        ticket.report_complete(now_ms);
+                    }
+                }
+                mde_vdi_spice::ClipboardEvent::GuestText(text) => {
+                    if gated_guest_clipboard.is_none() && pending_guest_clipboard.is_none() {
+                        guest_message_sequence = guest_message_sequence.saturating_add(1);
+                        let clip = ClipboardClipBody::from_text(
+                            text.clone(),
+                            clipboard_source.clone(),
+                            chrono::Utc::now().to_rfc3339(),
+                        );
+                        if clip.validate().is_ok() && guest_message_sequence != 0 {
+                            if let Ok(rich) = vdi_guest_clipboard_message(
+                                "spice",
+                                &clipboard_lease,
+                                guest_message_sequence,
+                                text,
+                                now_ms,
+                            ) {
+                                pending_guest_clipboard = Some((clip, rich));
+                            }
+                        }
+                    }
+                }
+                mde_vdi_spice::ClipboardEvent::CapabilityLost => {
+                    if let Some((_, ticket)) = pending_host_delivery.take() {
+                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                    }
+                }
+            }
+        }
+
+        if let Some((command, text, ticket)) = gated_host_clipboard.take() {
+            match ticket.readiness_before_materialization() {
+                ClipboardGateReadiness::Pending => {
+                    gated_host_clipboard = Some((command, text, ticket));
+                }
+                ClipboardGateReadiness::Refused => {}
+                ClipboardGateReadiness::Materialize => match conn.offer_clipboard_text(text) {
+                    Ok(()) => pending_host_delivery = Some((command, ticket)),
+                    Err(error) => {
+                        ticket.report_failure(ClipboardFailure::Transport, now_ms);
+                        let _ = event_tx.send(LiveSpiceEvent::ClipboardStatus(format!(
+                            "SPICE host clipboard refused: {error}"
+                        )));
+                    }
+                },
+            }
+        }
+
+        if pending_host_delivery.as_ref().is_some_and(|(_, ticket)| {
+            ticket.readiness_before_materialization() == ClipboardGateReadiness::Refused
+        }) {
+            let _ = conn.cancel_clipboard_offer();
+            pending_host_delivery = None;
+        }
+
+        if let Some((legacy, rich, ticket)) = gated_guest_clipboard.take() {
+            match ticket.try_begin_materialization() {
+                ClipboardGateReadiness::Pending => {
+                    gated_guest_clipboard = Some((legacy, rich, ticket));
+                }
+                ClipboardGateReadiness::Refused => {}
+                ClipboardGateReadiness::Materialize => {
+                    match try_publish_vnc_clipboard_event(clipboard_root.as_deref(), &legacy, &rich)
+                    {
+                        Ok(()) => {
+                            ticket.report_progress(rich.envelope.byte_count);
+                            ticket.report_complete(now_ms);
+                            let _ = event_tx.send(LiveSpiceEvent::ClipboardPublished);
+                        }
+                        Err(_) => ticket.report_failure(ClipboardFailure::Transport, now_ms),
+                    }
+                }
+            }
+        }
+
+        if gated_guest_clipboard.is_none() {
+            if let Some((legacy, rich)) = pending_guest_clipboard.take() {
+                if let (Some(ingress), Ok(target)) = (
+                    clipboard_permissions.as_ref(),
+                    ClipboardTarget::new(
+                        ClipboardTargetKind::LocalSeat,
+                        clipboard_lease.session_id.clone(),
+                    ),
+                ) {
+                    match ingress.submit_vdi(&rich, &clipboard_lease, None, target, now_ms) {
+                        Ok(ticket) => gated_guest_clipboard = Some((legacy, rich, ticket)),
+                        Err(crate::clipboard_permissions::ClipboardPermissionError::Busy) => {
+                            pending_guest_clipboard = Some((legacy, rich));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        if status == mde_vdi_spice::ClipboardStatus::Ready
+            && gated_host_clipboard.is_none()
+            && pending_host_delivery.is_none()
+        {
+            if let Some(root) = clipboard_root.as_deref() {
+                if let Ok(Some((command, text))) =
+                    read_latest_vnc_host_clipboard(root, &clipboard_lease, now_ms)
+                {
+                    let key = (
+                        command.lease_id.clone(),
+                        command.generation,
+                        command.message_sequence,
+                    );
+                    if last_gated_host_clipboard.as_ref() != Some(&key) {
+                        if let (Some(ingress), Ok(target)) = (
+                            clipboard_permissions.as_ref(),
+                            ClipboardTarget::new(
+                                ClipboardTargetKind::Guest,
+                                clipboard_lease.session_id.clone(),
+                            ),
+                        ) {
+                            match ingress.submit_vdi(
+                                &command,
+                                &clipboard_lease,
+                                None,
+                                target,
+                                now_ms,
+                            ) {
+                                Ok(ticket) => {
+                                    last_gated_host_clipboard = Some(key);
+                                    gated_host_clipboard = Some((command, text, ticket));
+                                }
+                                Err(
+                                    crate::clipboard_permissions::ClipboardPermissionError::Busy,
+                                ) => {}
+                                Err(_) => last_gated_host_clipboard = Some(key),
+                            }
+                        } else {
+                            last_gated_host_clipboard = Some(key);
+                        }
+                    }
+                }
+            }
         }
 
         let mut had_input = false;
@@ -1611,6 +2509,10 @@ pub(crate) fn request_browser_vm_display1_attach(
 /// picked target the discovery picker requested before a live session attaches.
 #[derive(Default)]
 pub(crate) struct VdiState {
+    /// Pure in-memory presentation of the last admitted universal resource
+    /// catalog. Snapshot ingestion happens outside [`vdi_panel`]; painting this
+    /// model never reaches Bus, a backend, or the network.
+    remote_sessions: RemoteSessionsModel,
     /// The connected desktop, or `None` when nothing is attached (the EmptyState).
     session: Option<Session>,
     /// The GPU texture the desktop framebuffer lives in — allocated on the first
@@ -1641,10 +2543,17 @@ pub(crate) struct VdiState {
     /// `session`. Drives the honest "connecting" caption (which names the chosen
     /// protocol + display) and tells the shell to show the Desktop surface.
     requested: Option<ConnectRequest>,
+    /// Honest controller/authorization result available in every build,
+    /// including builds without live decoder features.
+    route_status: Option<String>,
     /// Exact brokered requests retained while another session has focus. The
     /// request is the authority for Browser profile/transport and authentication;
     /// roster labels are never used to reconstruct a connection.
     retained_requests: BTreeMap<String, ConnectRequest>,
+    /// Focused tests prove authorization refusal cannot enter request
+    /// installation, where a future WebRTC decoder would otherwise be spawned.
+    #[cfg(test)]
+    transport_install_attempted: bool,
     /// Live in-shell RDP transport for a direct endpoint. Kept separate from
     /// `session`, which remains the single-threaded decoder used by tests and VNC.
     #[cfg(feature = "live-vdi")]
@@ -1652,6 +2561,10 @@ pub(crate) struct VdiState {
     /// Live in-shell VNC transport for a direct endpoint / XAPI console fallback.
     #[cfg(feature = "live-vdi")]
     live_vnc: Option<LiveVncHandle>,
+    /// Bounded metadata-only bridge into the shell clipboard permission model.
+    /// The live worker fails closed when this has not been attached.
+    #[cfg(feature = "live-vdi")]
+    clipboard_permissions: Option<ClipboardPermissionIngress>,
     /// Live in-shell SPICE transport for native QEMU/KVM consoles.
     #[cfg(feature = "live-vdi")]
     live_spice: Option<LiveSpiceHandle>,
@@ -1694,6 +2607,30 @@ pub(crate) struct VdiState {
 }
 
 impl VdiState {
+    /// Replace the Remote Sessions browser input with one already bounded and
+    /// semantically admitted universal resource-catalog snapshot.
+    pub(crate) fn install_resource_catalog(
+        &mut self,
+        catalog: mackes_mesh_types::resources::ResourceCatalog,
+    ) -> Result<(), String> {
+        self.remote_sessions.install_catalog(catalog)
+    }
+
+    /// Preserve the last admitted cards while making a failed refresh explicit.
+    pub(crate) fn mark_resource_catalog_reconnecting(&mut self, detail: impl Into<String>) {
+        self.remote_sessions.mark_reconnecting(detail);
+    }
+
+    /// Make absence of a usable resource snapshot explicit.
+    pub(crate) fn mark_resource_catalog_unavailable(&mut self, detail: impl Into<String>) {
+        self.remote_sessions.mark_unavailable(detail);
+    }
+
+    #[cfg(feature = "live-vdi")]
+    pub(crate) fn set_clipboard_permission_ingress(&mut self, ingress: ClipboardPermissionIngress) {
+        self.clipboard_permissions = Some(ingress);
+    }
+
     /// Return the current bounded VDI measurements without exposing transport
     /// credentials, endpoints, or raw decoder state.
     pub(crate) fn metrics_snapshot(&self) -> VdiMetricsSnapshot {
@@ -1786,6 +2723,11 @@ impl VdiState {
     /// Install one exact request after any prior session has already been parked
     /// or explicitly closed. This never publishes broker lifecycle records.
     fn install_request(&mut self, request: ConnectRequest) {
+        #[cfg(test)]
+        {
+            self.transport_install_attempted = true;
+        }
+        self.route_status = None;
         #[cfg(feature = "live-vdi")]
         {
             self.live_status = None;
@@ -1815,7 +2757,10 @@ impl VdiState {
             // A broker-session request without an endpoint belonged to the retired
             // raw console relay. Native presentation now requires an authenticated
             // lease from the typed Workload projection; fail closed here.
-            if request.target.endpoint.is_none() && request.broker_session.is_some() {
+            if request.target.endpoint.is_none()
+                && request.broker_session.is_some()
+                && request.android_source.is_none()
+            {
                 self.live_status = Some(
                     "This legacy desktop session has no typed Workload attachment lease. Nothing was attached."
                         .to_string(),
@@ -1867,6 +2812,7 @@ impl VdiState {
         {
             self.retained_requests.insert(id, request);
         }
+        self.route_status = None;
     }
 
     /// Attach a focused App VM rail session to the existing brokered VDI path.
@@ -1898,6 +2844,79 @@ impl VdiState {
         self.request_connect(request);
     }
 
+    /// Consume one governed Android source through the existing authorized
+    /// Remote Sessions broker. No endpoint is parsed or dialed here: the full
+    /// source remains attached to the request as exact identity evidence.
+    pub(crate) fn request_android_webrtc_connect(
+        &mut self,
+        handoff: crate::iac::AndroidVdiHandoff,
+        client_peer: &str,
+        bus_root: Option<PathBuf>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let source = handoff.source;
+        source
+            .validate()
+            .map_err(|error| format!("Android VDI source is invalid: {error}"))?;
+        if source.protocol != AndroidVdiProtocol::WebRtc {
+            return Err("Android VDI source requested an unsupported protocol.".to_owned());
+        }
+        if source.observed_at_unix_ms > now_ms || source.expires_at_unix_ms <= now_ms {
+            return Err(
+                "Android WebRTC readiness expired; retry the app from Workloads.".to_owned(),
+            );
+        }
+        let request = ConnectRequest::new(
+            RequestedTarget::new(&handoff.placement_node, &source.workload_id),
+            VdiProtocol::WebRtc,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity(client_peer),
+        )
+        .with_android_source(source.clone());
+        let publication = match crate::discovery::publish_exact_open_record(
+            bus_root.as_deref(),
+            &source.session_id,
+            &handoff.placement_node,
+            &source.workload_id,
+            client_peer,
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                self.retain_refused_android_request(
+                    request,
+                    format!(
+                        "Remote Sessions attachment authorization failed: {error} Return to Workloads and retry."
+                    ),
+                );
+                return Err(error);
+            }
+        };
+        self.request_connect(
+            request.with_broker_session(BrokerSessionLifecycle::new(publication.id, bus_root)),
+        );
+        self.route_status = Some(
+            "Remote Sessions authorized this exact Android generation and session, but this shell has no Cuttlefish WebRTC decoder. Return to Workloads to stop or retry the session."
+                .to_owned(),
+        );
+        Ok(())
+    }
+
+    /// Retain only enough typed identity to render an actionable refusal. This
+    /// deliberately bypasses `request_connect`/`install_request`, so neither the
+    /// current transport set nor a future WebRTC decoder can run without a
+    /// successful Remote Sessions authorization record.
+    fn retain_refused_android_request(&mut self, request: ConnectRequest, status: String) {
+        self.park_current_request();
+        self.requested = Some(request);
+        self.route_status = Some(status);
+        #[cfg(feature = "live-vdi")]
+        {
+            self.broker_resolution_gated = true;
+            self.live_status = None;
+        }
+    }
+
     /// Spawn the live decoder transport for `request` (RDP / VNC / SPICE), routing
     /// the honest gate into `live_status` on failure. Shared by the direct-endpoint
     /// path ([`Self::request_connect`]).
@@ -1907,6 +2926,13 @@ impl VdiState {
         // doesn't re-arm for a geometry already requested (see `note_resize_target`).
         self.negotiated_size = request.preferred_size;
         match request.protocol {
+            VdiProtocol::WebRtc => {
+                self.live_status = Some(
+                    "Cuttlefish WebRTC is authorized through Remote Sessions, but its seat-side decoder is unavailable. Return to Workloads to stop or retry."
+                        .to_owned(),
+                );
+                self.broker_resolution_gated = true;
+            }
             VdiProtocol::Moonlight => {
                 self.live_status = Some(
                     "Sunshine/Moonlight selected; the host Moonlight adapter is unavailable. RDP was not attempted."
@@ -1914,33 +2940,39 @@ impl VdiState {
                 );
                 self.broker_resolution_gated = true;
             }
-            VdiProtocol::Rdp => match LiveRdpHandle::spawn(request) {
-                Ok(handle) => {
-                    self.live_status = Some("Opening live RDP transport".to_string());
-                    self.live_rdp = Some(handle);
+            VdiProtocol::Rdp => {
+                match LiveRdpHandle::spawn(request, self.clipboard_permissions.clone()) {
+                    Ok(handle) => {
+                        self.live_status = Some("Opening live RDP transport".to_string());
+                        self.live_rdp = Some(handle);
+                    }
+                    Err(reason) => {
+                        self.live_status = Some(format!("Live RDP gated: {reason}"));
+                    }
                 }
-                Err(reason) => {
-                    self.live_status = Some(format!("Live RDP gated: {reason}"));
+            }
+            VdiProtocol::Vnc => {
+                match LiveVncHandle::spawn(request, self.clipboard_permissions.clone()) {
+                    Ok(handle) => {
+                        self.live_status = Some("Opening live VNC transport".to_string());
+                        self.live_vnc = Some(handle);
+                    }
+                    Err(reason) => {
+                        self.live_status = Some(format!("Live VNC gated: {reason}"));
+                    }
                 }
-            },
-            VdiProtocol::Vnc => match LiveVncHandle::spawn(request) {
-                Ok(handle) => {
-                    self.live_status = Some("Opening live VNC transport".to_string());
-                    self.live_vnc = Some(handle);
+            }
+            VdiProtocol::Spice => {
+                match LiveSpiceHandle::spawn(request, self.clipboard_permissions.clone()) {
+                    Ok(handle) => {
+                        self.live_status = Some("Opening live SPICE transport".to_string());
+                        self.live_spice = Some(handle);
+                    }
+                    Err(reason) => {
+                        self.live_status = Some(format!("Live SPICE gated: {reason}"));
+                    }
                 }
-                Err(reason) => {
-                    self.live_status = Some(format!("Live VNC gated: {reason}"));
-                }
-            },
-            VdiProtocol::Spice => match LiveSpiceHandle::spawn(request) {
-                Ok(handle) => {
-                    self.live_status = Some("Opening live SPICE transport".to_string());
-                    self.live_spice = Some(handle);
-                }
-                Err(reason) => {
-                    self.live_status = Some(format!("Live SPICE gated: {reason}"));
-                }
-            },
+            }
         }
     }
 
@@ -1957,6 +2989,13 @@ impl VdiState {
             .as_ref()
             .and_then(|request| request.broker_session.as_ref())
             .map(|broker| broker.id.as_str())
+    }
+
+    /// Exact governed Android identity retained for the current request.
+    pub(crate) fn requested_android_source(&self) -> Option<&AndroidVdiSource> {
+        self.requested
+            .as_ref()
+            .and_then(|request| request.android_source.as_ref())
     }
 
     /// Clear the pending connect — the operator backed out before a live session
@@ -1992,6 +3031,7 @@ impl VdiState {
             self.incoming_damage = None;
         }
         self.requested = None;
+        self.route_status = None;
     }
 
     /// vdi-vm-4 — a transport drop that is NOT a user-initiated close. Walks the
@@ -2224,6 +3264,7 @@ impl VdiState {
                     // Non-fatal: keep the session live, just raise the banner.
                     self.live_status = Some(message);
                 }
+                LiveRdpEvent::ClipboardPublished => {}
                 LiveRdpEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
                     drop_reason = Some(reason);
@@ -2264,14 +3305,13 @@ impl VdiState {
         let mut publish_active = false;
         let mut got_frame = false;
         let mut drop_reason = None;
-        let mut clipboard_events = Vec::new();
         while let Ok(event) = live.event_rx.try_recv() {
             match event {
                 LiveVncEvent::Connected(target) => {
                     self.live_status = Some(format!("Live VNC connected to {target}"));
                     publish_active = true;
                 }
-                LiveVncEvent::Clipboard(clip) => clipboard_events.push(clip),
+                LiveVncEvent::ClipboardPublished => {}
                 LiveVncEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
                     drop_reason = Some(reason);
@@ -2287,17 +3327,6 @@ impl VdiState {
             self.incoming_damage = Some(damage);
             self.metrics.note_frame();
             got_frame = true;
-        }
-        if !clipboard_events.is_empty() {
-            let root = self
-                .requested
-                .as_ref()
-                .and_then(|request| request.broker_session.as_ref())
-                .and_then(|broker| broker.bus_root.clone())
-                .or_else(mde_bus::client_data_dir);
-            for clip in &clipboard_events {
-                publish_vnc_clipboard_event(root.as_deref(), clip);
-            }
         }
         if got_frame {
             self.note_live_frame();
@@ -2325,6 +3354,12 @@ impl VdiState {
                 LiveSpiceEvent::Connected(target) => {
                     self.live_status = Some(format!("Live SPICE connected to {target}"));
                     publish_active = true;
+                }
+                LiveSpiceEvent::ClipboardPublished => {
+                    self.live_status = Some("SPICE guest clipboard awaiting seat approval".into());
+                }
+                LiveSpiceEvent::ClipboardStatus(status) => {
+                    self.live_status = Some(status);
                 }
                 LiveSpiceEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
@@ -2618,9 +3653,23 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 // names the desktop + the chosen protocol/display below the logo,
                 // never a placeholder render (§7).
                 Some(req) => {
-                    let title = req.app_id.as_ref().map_or_else(
-                        || format!("Connecting to {} via {}", req.target.name, req.protocol.label()),
-                        |app_id| format!("Opening {app_id} via {}", req.protocol.label()),
+                    let title = req.android_source.as_ref().map_or_else(
+                        || req.app_id.as_ref().map_or_else(
+                            || {
+                            format!(
+                                "Connecting to {} via {}",
+                                req.target.name,
+                                req.protocol.label()
+                            )
+                            },
+                            |app_id| format!("Opening {app_id} via {}", req.protocol.label()),
+                        ),
+                        |source| {
+                            format!(
+                                "Android {} · generation {} · session {}",
+                                source.workload_id, source.generation, source.session_id
+                            )
+                        },
                     );
                     // CHOOSER-6 — name the auth mode honestly (SSO vs sealed cred);
                     // `auth.summary()` is log-safe and never carries the secret.
@@ -2631,6 +3680,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         .as_ref()
                         .map_or_else(|| req.target.serving_peer.clone(), DesktopEndpoint::label);
                     let live_status = {
+                        if let Some(status) = &state.route_status {
+                            status.clone()
+                        } else {
                         #[cfg(feature = "live-vdi")]
                         {
                             state
@@ -2642,6 +3694,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         #[cfg(not(feature = "live-vdi"))]
                         {
                             "the live transport is not compiled into this shell build".to_string()
+                        }
                         }
                     };
                     let detail = format!(
@@ -2658,14 +3711,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         Some((title.as_str(), detail.as_str())),
                     );
                 }
-                None => crate::backdrop::show(
-                    ui,
-                    crate::backdrop::Coverage::Empty,
-                    Some((
-                        "No desktop connected",
-                        "Broker a VM desktop (RDP / VNC / Spice) — it renders here in the shell. Clipboard capability is reported per protocol.",
-                    )),
-                ),
+                None => resources::remote_sessions_panel(ui, &mut state.remote_sessions),
             }
         }
     }
@@ -2931,6 +3977,9 @@ pub(crate) fn mock_frame() -> egui::ColorImage {
 mod pointer;
 pub(crate) use pointer::body_device_px;
 use pointer::*;
+
+mod resources;
+use resources::RemoteSessionsModel;
 
 #[cfg(test)]
 mod tests;

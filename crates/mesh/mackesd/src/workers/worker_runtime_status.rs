@@ -1137,6 +1137,7 @@ mod tests {
             digest: format!("sha256:{}", "a".repeat(64)),
             requested_at_ms: 2_000,
             expires_at_ms: 3_000,
+            armed_token: None,
         }
     }
 

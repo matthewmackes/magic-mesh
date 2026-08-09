@@ -7,10 +7,10 @@ tasks.
 
 ## Current Snapshot - 2026-08-06 executable story rewrite
 
-- **17 active epics:** 17 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **Execution order:** complete ARCH-010 stories in order; then consume its
   contracts in ARCH-008, ARCH-009, FUNC-019, FUNC-018, and FUNC-020. Run the
-  vertical slices FUNC-011/FUNC-016, FUNC-017, and FUNC-021 next. Integrate
+  vertical slices FUNC-011/FUNC-016, FUNC-017, FUNC-021, and FUNC-022 next. Integrate
   UX-009, UX-011, UX-012, and UX-013/014 at their named story gates. Close
   every slice through CRIT-006 and CRIT-007.
 - **Single-authority lock:** typed Workload operations are the only VM/container
@@ -53,7 +53,8 @@ authorities. Archive old MEDIA and FUNC-007 IDs; they are evidence only.
 5. Maps/MG90 and universal resource browser.
 6. Flatpak App VMs and Android Workloads.
 7. Music/Media Player.
-8. Quazar visual integration, health modal/Kiron, and release/recovery proof.
+8. Clock, distributed alarms/timers, and notification entry cutover.
+9. Quazar visual integration, health modal/Kiron, and release/recovery proof.
 
 ## Story execution contract
 
@@ -107,9 +108,14 @@ behavioral evidence is not completion.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and
-  pace retryable recovery. Distributed migration cursors and pending commit/
-  rollback state remain memory-backed. Evidence:
+  pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
+- **Distributed migration recovery checkpoint (2026-08-08):** one bounded
+  atomic authority now persists all migration cursors, admitted source/target
+  and acknowledgement jobs, publish state, wall-clock deadlines, and retained
+  relinquish/rollback retries before external effects. BigBoy passed 53/53.
+  Live libvirt crash injection and seat lifecycle proof remain. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-distributed-migration-ledger-r3.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON
   admission rejects duplicate top-level and nested keys; `.50` passed 9/9.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
@@ -261,18 +267,17 @@ behavioral evidence is not completion.
 - Problem: CEF/Servo host Browser code, frame copies, helpers, and package seams still compete with the DRM shell and violate the VM-only application boundary.
 - Required outcome: Preserve the old stack with history in matthewmackes/magic-mesh-browser-stack, remove it from magic-mesh, and make Surface::Browser start/resume a
   browser-vm that renders guest Chromium over VDI with focused input and guest-owned chrome.
-- Current state: The standalone repository and typed Browser workload path exist; source/package removal, portable data migration, guest image quality, audio, and
-  five-seat performance proof remain.
+- Current state: The standalone repository and clean-checkout CI pass and the typed Browser workload path exists; portable live data import, guest image quality,
+  audio, and five-seat performance proof remain.
 - **Portable data checkpoint (2026-08-06):** deterministic migration helper and redacted self-test cover allowlisted profile data, downloads, policies, and extensions;
   BigBoy probe passed. Evidence: `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`. Live legacy-profile import remains open.
-- **Portable-boundary checkpoint (2026-08-06):** the disposable-fixture validator
-  checks allowlists, deterministic manifests, idempotent reruns, symlink rejection,
-  and secret non-export; local and `.50` probes passed. Evidence:
+- **Portable-boundary checkpoint (2026-08-06):** allowlist/idempotency/symlink/secret validator passed local and `.50` probes:
   `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-boundary-validator-r1.md`.
-- **Host Browser negative-boundary checkpoint (2026-08-08):** the host engine,
-  bundled rules, workspace/package edges, and CEF/web kickstart policy were
-  removed; adfilter only replicates guest policy. Boundary lint, locked
-  metadata, and 11/11 `.90` tests pass. Evidence: `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
+- **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
+- **Standalone publication checkpoint (2026-08-08):** GitHub `main` is `2b36cedb`; `.170` passed 123/123 worker tests, `.50` warning-denied clippy,
+  `.196` passed clean-clone boundary/package contracts, and Actions run `31277690513` passed admitted/sandbox/CEF/Servo jobs:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
@@ -344,12 +349,13 @@ behavioral evidence is not completion.
 - Required outcome: six independently supervised mackesd groups publish bounded typed runtime snapshots; one Surface::Workers owns worker tree, graph, inspector, Network
   Operations, and staged Action Console; old surfaces and health duplication are removed.
 - Current state: all 145 production starts have bounded runtime contracts; six grouped services ship, but complete ownership, providers, UI cutover, and fleet proof remain.
-- **Process cutover (2026-08-08):** mandatory `serve --group`, six budgeted services, no packaged monolith. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-required-process-group-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-08-grouped-systemd-cutover-r1.md`.
-- **SQLite owner (2026-08-08):** control owns the typed writer and other groups order behind it; full enforcement/live proof remain. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-writer-boundary-r1.md`.
-- **CA writer (2026-08-08):** typed transactional mint/sign/revoke/restore/rotation cut residual syntax from 61 to 48; BigBoy passed 6/6. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-ca-sqlite-writer-r2.md`.
+- **SQLite authority complete (2026-08-08):** migrations reduced 61 direct writes to zero; final host/job and process-owner proof passed 24/24, and the empty baseline is enforced:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
+- **Workers Action Console checkpoint (2026-08-08):** the canonical Workers
+  surface now stages authenticated, generation-bound Preview/Commit/Cancel
+  requests and renders typed audit and partial-failure results; focused `.50`
+  gates passed 4/4. Live daemon round-trip and responsive captures remain.
+  Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`.
 - Remaining work:
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
@@ -535,14 +541,15 @@ behavioral evidence is not completion.
   with explicit permission, limits, and cleanup.
 - Current state: text shortcuts, direct DRM copy/cut/paste, bounded rich contracts, authenticated mesh adapters, and transfer scaffolding exist; live DRM/mesh,
   guest adapters, permissions, CAS cleanup, and proof remain.
-- **JSON admission (2026-08-06):** recursive duplicate keys fail closed; `.50` passed 1/1. Evidence:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-06-clipboard-json-admission-r1.md`.
-- **S1 rich contract (2026-08-08):** V2 offers, exact generations, limits, secret policy, and typed denials passed 72/72 on `.50`. Evidence:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
-- **S3 mesh transport (2026-08-08):** signed target frames passed 7/7 on `.50`; cross-node/CAS proof remains. Evidence:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
+- **JSON admission (2026-08-06):** duplicate keys fail closed; `.50` passed 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-06-clipboard-json-admission-r1.md`.
+- **S1 rich contract (2026-08-08):** V2 offers, generations, secret policy, and denials passed 72/72: `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
+- **S3 mesh transport (2026-08-08):** signed target frames passed 7/7; cross-node/CAS proof remains: `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
 - **S2 DRM authority (2026-08-08):** one bounded seat authority revokes stale focus generations and keeps Bus I/O off-render; DRM passed 19/19 on `.50`, shell/Bus 1/1 each.
   Live-seat and rich mesh/VDI proof remain: `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`.
+- **S4 VDI transport (2026-08-08):** VNC, RDP, and SPICE carry bounded text with one-use gates, MIME refusal, and replay protection; live guest proof remains:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-08-vdi-clipboard-transport-s4-r1.md`.
+- **S5 permission UI (2026-08-08):** modal, VNC/RDP/SPICE one-use gating, revocation, replay, and redacted audit passed; live guest proof remains:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-08-permission-audit-model-s5-r1.md`.
 - Remaining work:
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
@@ -604,18 +611,18 @@ behavioral evidence is not completion.
 - Required outcome: Maps provides production offline maps, turn-by-turn navigation, and a map-first current/1-day/3-day/5-day weather experience. A live weather icon
   and temperature beside the clock deep-link into Maps. Car exposes typed route/vehicle/radio health; MG90 is bounded, reconnectable, multi-manager, and never presents
   fabricated position, weather, forecast, or link state.
-- Current state: versioned vehicle contracts and bounded projections exist. Maps already has NWS alert polygons, NWS hourly drive-ahead forecasts, and animated
-  IEM/NEXRAD radar seams, but the forecast is vehicle-fix scoped and capped at 24 hours. A general current/manual location authority, current observations, five-day
-  summaries, nowCOAST temperature/wind/cloud layers, clock-adjacent launcher, offline map cache, route execution, radio recovery, and complete live proof remain.
-- **Geocoder boundary checkpoint (2026-08-06):** hostile rows with invalid coordinates/control-bearing or oversized labels are rejected before navigation; BigBoy passed 1/1.
-  Evidence: `docs/platform/evidence/WL-FUNC-017-2026-08-06-geocoder-boundary-r1.md`.
-- **Location/weather contract checkpoint (2026-08-08):** versioned bounded
-  Auto/Manual preference, effective-location, current-condition, 120-hour, and
-  five-day contracts now expose the required weather topics without changing
-  the Car drive-ahead topic. BigBoy passed the full mesh-types crate 454/454,
-  including location 7/7 and weather 8/8. The daemon resolver and providers
-  remain. Evidence:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-08-location-weather-contracts-s1-r1.md`.
+- Current state: typed weather/location, providers, offline cache, map-first UI, launcher, and daemon navigation authority exist.
+  Offline download/package, route provider/data, Maps route wiring, radio recovery, and complete live proof remain.
+- **Current/forecast provider (2026-08-08):** generation-bound 5/10-minute NWS refresh, provider freshness, bounded cache/retry, and off-runtime I/O passed 8/8 twice;
+  live NWS/Maps proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-weather-provider-s3-r1.md`.
+- **Atmospheric provider (2026-08-08):** exact nowCOAST WMS identity, bounded PNG/cache, and latest-wins dual-generation viewport admission passed ten focused tests;
+  GUI publication/live proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-atmospheric-map-provider-s4-r1.md`.
+- **Maps weather UI (2026-08-08):** forecast truth, dual-gen viewport, PNG race refusal, and bounded offline search passed 18 tests; live round-trip remains:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-08-maps-weather-interface-s8-r1.md`.
+- **Clock weather launcher (2026-08-08):** typed icon/temperature deep-link and weather→battery→time geometry passed 5/5; installed live captures remain:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-08-clock-weather-launcher-s9-r1.md`.
+- **S6 navigation authority (2026-08-08):** typed route/progress/cancel, replay, restart, provider refusal, reachable spawn, and Maps consumer passed 9/9 across `.90`/BigBoy:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-08-navigation-authority-s6-r1.md`.
 - Remaining work:
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
@@ -766,7 +773,16 @@ behavioral evidence is not completion.
 - Problem: Construct lacks a governed way to discover and run Flatpak applications without installing native host apps.
 - Required outcome: Front Door searches a signed catalog, starts an isolated App VM through Workloads, displays its Wayland app over VDI, and stops/cleans the session
   predictably.
-- Current state: signed catalog and typed App VM/OpenApp/session contracts exist; catalog freshness, image supply, launch readiness, UX, security, and live proof remain.
+- Current state: bounded signed catalog admission, deterministic search, and a production-registered fail-closed importer now exist alongside typed App VM/OpenApp/session
+  contracts; trust provisioning, image supply, launch readiness, UX, security, and live proof remain.
+- **Signed catalog checkpoint (2026-08-08):** exact-signer bounded admission and deterministic ranking passed 12 focused and 480 complete tests on `.196`:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-08-signed-app-catalog-s1-r1.md`.
+- **Catalog importer checkpoint (2026-08-08):** root-owned trust/state, restart-safe rollback protection, exact replay, last-good retention, and installed-only projection
+  passed 6/6 on `.196`; `.170` compiled the production binary:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-08-catalog-importer-s1-r1.md`.
+- **App VM profile checkpoint (2026-08-08):** the immutable Wayland/Flatpak contract, supervisor, readiness/provenance, and hostile fixtures passed on `.170`;
+  a current built image/hash and live boot remain:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-08-app-vm-profile-s2-r1.md`.
 - Remaining work:
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
@@ -826,14 +842,31 @@ behavioral evidence is not completion.
 - Problem: Remote Sessions is a narrow desktop chooser and does not admit all governed resources, typed capabilities, provenance, or safe actions.
 - Required outcome: one universal resource browser discovers peers, VMs, containers, Apps, Android apps, media, files, and services; deduplicates them by stable identity;
   exposes typed Open/Start/Resume/Transfer actions; and never launches an untrusted or ambiguous resource.
-- Current state: universal identities, cards, capabilities, provenance, and typed execution scaffolding exist; hostile catalog coverage now rejects duplicate identity,
-  malformed provenance, unknown kinds, and admits multiple provenance sources. Adapters, freshness, deduplication, action authority, and full UI proof remain.
+- Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
+  fixtures, responsive captures, and live recovery proof remain.
 - Remaining work:
 - **Resource catalog hostile-boundary checkpoint (2026-08-06):** resource
   contract tests cover multi-source cards, duplicate identities, malformed
   provenance, and unknown kinds; the focused farm lane passed 1/1 on `.90`.
   Source/schema, adapter, action, and live recovery proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-019-2026-08-06-resource-catalog-hostile-r1.md`.
+- **Approved-source adapter checkpoint (2026-08-08):** bounded peer, Workload,
+  admitted App VM/Android, Media, and typed file-share projection plus
+  deterministic conflict collapse and explicit stale/unavailable states passed
+  12/12 focused library tests on `.170`, including generation-bound Workload
+  actions:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-08-resource-adapters-s2-r1.md`.
+- **Remote Sessions presentation checkpoint (2026-08-08):** pure search/filter,
+  grouping, badges, provenance/freshness, and failure states passed 4/4 on `.90`:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-08-resource-browser-s3-r1.md`.
+- **Typed action checkpoint (2026-08-08):** fixed Workload/VDI/clipboard/Android
+  routes, accepted-receipt cancellation, persisted signed Bus ingress, and
+  hostile bypass refusal passed 22/22 on `.196` plus 10/10 shell fixtures:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-08-resource-actions-s4-r1.md`.
+- **Wide-LAN Windows checkpoint (2026-08-08):** skipped broad CIDRs now admit
+  at most 128 valid observed neighbors and issue a one-time explicit-target
+  diagnostic for quiet RDP hosts; `.50` passed 45/45:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-08-wide-lan-rdp-discovery-s2-r1.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
@@ -894,7 +927,17 @@ behavioral evidence is not completion.
   UX.
 - Required outcome: Workloads exposes governed Android app, outer Android VM, and full Workstation desktop choices; the app path uses a signed AOSP/Cuttlefish image,
   typed start/stop/readiness, VDI presentation, and bounded host isolation.
-- Current state: Android delivery/provisioning and outer-VM CloudRunner scaffolding exist; catalog, image, provider, app lifecycle, package, and live proof remain.
+- Current state: signed catalog/import, provider preflight, crash-safe lifecycle, bounded guest relay, typed VDI source, and governed Workloads cards/actions exist;
+  release artifacts, remote-session attachment, guest packaging, nested-KVM run, and live proof remain.
+- **Signed Android catalog (2026-08-08):** image/package/policy binding passed 465/465; monotonic import/restart/last-good passed 3/3; release key/artifact remain:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`.
+- **Provider preflight (2026-08-08):** image hash/identity, KVM nesting, capacity, disk, and libvirt gate registration; 4/4 passed on BigBoy:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
+- **S3 lifecycle (2026-08-08):** exact-generation lifecycle, recovery, bounded guest relay, and fail-closed typed VDI readiness passed focused BigBoy gates:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-lifecycle-s3-r1.md`.
+- **S4 governed Workloads UX (2026-08-08):** daemon-cache-bound signed cards, typed lifecycle, responsive rendering, and WebRTC handoff passed 6/6 on `.170`;
+  authorized Remote Sessions consumption and fail-closed no-dial refusal passed 2/2; live decoder/captures remain. Evidence:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-08-governed-android-ux-s4-r1.md`.
 - Remaining work:
   1. S1 Freeze Android catalog/image contracts.
      - Objective: define signed app identity, package/version, image digest, permissions, capabilities, resource profile, and guest readiness.
@@ -1167,6 +1210,144 @@ behavioral evidence is not completion.
   @farm:{cargo test -p mde-media-egui}
   and shell/RPM/live gates with BigBoy for the longest media job.
 - Origin or merged source IDs: Spotify-class Music survey; archived WL-FUNC-007 and MEDIA-1..17; 2026-08-05/06 Music and Media evidence.
+### WL-FUNC-022 - Deliver the Construct Clock and distributed mesh alarms
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: Construct has only a shell-owned Timers & Alarms panel, a five-zone hand-coded display clock, conflicting clock-click routes, no complete World Clock or
+  Stopwatch, no durable daemon scheduler, and no governed way to ring selected mesh peers or use Music/radio sources without duplicating provider authority.
+- Required outcome: one egui-native Clock surface provides World Clock, Alarms, Timers, and Stopwatch with AOSP DeskClock-derived procedures under Quazar styling. The
+  visible clock opens Clock, a dedicated bell opens Notification Center, mackesd owns persisted scheduling and signed multi-peer execution, and mde-musicd remains the
+  only Music/radio/NPR source and playback authority.
+- Current state: signed contracts, durable scheduling/convergence, governed NPR/local-file audio, and distinct Clock/bell chrome exist; multi-process faults, remaining
+  audio/UI behavior, packaging, and live proof remain.
+- **Clock contract checkpoint (2026-08-08):** 5/5 focused and 473/473 complete tests passed on `.196`; evidence:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`. **Local scheduler checkpoint:** persistence/replay/recovery passed on `.50`;
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-scheduler-s2-r1.md`.
+- **Peer convergence checkpoint (2026-08-08):** delivery/loss/rejoin, replay/reordering, local removal, global Stop, and missed-late passed 3/3 on `.196`:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
+- **Clock audio checkpoint (2026-08-08):** durable signed Start/Stop/Snooze replay and the 3,000 ms audibility fallback passed 7/7 on `.196`:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-audio-s3-r1.md`.
+- **Clock NPR checkpoint:** News Now `500005` and live-station resolution passed 12 tests on `.196`; `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-npr-s3-r1.md`.
+- **Clock UI checkpoint (2026-08-08):** projection, Jiff/IANA time, actions, and fail-closed behavior passed 5/5 on `.50`; evidence:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-ui-s4-r1.md`.
+- Remaining work:
+- **Resolve/preview checkpoint:** typed isolated preview and governed local-file admission passed 13 focused tests on `.196`:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-resolve-preview-s3-r1.md`.
+- **Clock/bell chrome checkpoint:** direct Clock routing, dedicated bell/unread lifecycle, and non-regressions passed 31 focused tests on `.50`:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-chrome-s5-r1.md`.
+  1. S1 Freeze Clock, calendar, audio-reference, and mesh-target contracts.
+     - Objective: define one bounded versioned model for clocks, AOSP-style alarms, multiple timers, stopwatch mirrors, occurrence state, settings, targets, and audio.
+     - Inputs: AOSP DeskClock revision `04e481f37e0b52b74c5a5c7b78b662d1f94e3478`, existing timer folds, mde-musicd `ContentRef`, peer identity/signing,
+       Bus action/reply conventions, system tzdata, and workspace-pinned `jiff = "0.2.21"` with system-zoneinfo support.
+     - Deliverable: `ClockCommandV1`, `ClockSnapshotV1`, `ClockScheduleV1`, `ClockOccurrenceV1`, `ClockTargetState`, `ClockAudioRef`, and `ClockSettingsV1`; constants for
+       `action/clock/command/<target-node>`, `state/clock/<node>`, `event/notify/clock/<node>`, and `reply/<request-id>`; strict validation and topic constructors.
+     - Contract behavior: alarms support one next occurrence or selected weekdays, label, enable, sound, and capability-gated vibration. Timers retain original duration,
+       absolute deadline, pause state, expiry/overtime, and targets. Stopwatch state names one origin and read-only mirrors. All lists, labels, IDs, targets, laps, and bodies
+       have explicit caps; unknown fields, duplicate keys, invalid civil times, unsupported zones, bad signatures, replay, and stale revisions fail closed.
+     - Time behavior: use Jiff against platform `/usr/share/zoneinfo` rather than hand-coded DST. Clock format is fixed 24-hour; the long date is full weekday plus numeric
+       day (`Monday 8`); only the World Clock hero shows seconds. The This Node IANA zone is primary and event/audit timestamps remain UTC.
+     - Depends on: ARCH-009 S1/S2 and FUNC-021 S1/S3.
+     - Acceptance: DST gaps/folds, one-time and weekly alarms, timer recovery, malformed contracts, signature/replay, schema skew, and all cap boundaries are deterministic.
+     - Validation: mesh-types and pure Clock contract/property tests on `.90` with injected wall and monotonic clocks.
+     - Done when: evidence records exact schemas, topic names, caps, default settings, AOSP reference revision, and hostile fixture results.
+  2. S2 Implement the daemon scheduler, persistence, and multi-peer convergence.
+     - Objective: remove scheduling authority from the render loop and make every selected capable Workstation execute an eagerly delivered schedule independently.
+     - Inputs: S1, mackesd grouped-worker runtime, sole SQLite writer, enrolled peer roster, mesh action transport, and expected-state/rejoin projections.
+     - Deliverable: supervised Clock worker, atomic Clock tables/ledger, deadline queue, occurrence journal, target receipts, per-origin blocklist, state publisher, and recovery.
+     - Target behavior: new items target only the current node by default. Users may add enrolled peers advertising Clock executor/audio capability. Every selected target
+       rings; a recipient may disable or remove its copy locally; the source sees that target state without changing other targets. Signed requests from trusted enrolled
+       peers are accepted and visibly name their origin; blocked origins are rejected before persistence or effects.
+     - Acknowledgement behavior: Snooze or Stop silences the acting node immediately and propagates to every reachable target. Occurrence ID plus actor-clock/event ID makes
+       concurrent actions converge; Stop wins an exact tie. Delivered targets execute while the source is offline. A schedule first received after its due occurrence is
+       marked missed and never rings late.
+     - Recovery behavior: persist effects before publication. Active timers use absolute deadlines and honor elapsed wall time across shell restart, reboot, and suspend;
+       locally persisted expired timers alert on recovery. Alarms recovered beyond their configured silence window become missed. No GUI frame is required for execution.
+     - Depends on: S1 and ARCH-009 S3.
+     - Acceptance: crash at every persistence/publication boundary is idempotent; duplicate delivery, reordering, origin loss, target loss/rejoin, opt-out, blocking, and
+       concurrent global acknowledgement converge without duplicate or stale ringing.
+     - Validation: Clock worker/store/fault tests on `.50`; multi-process Bus and signed peer fixtures on BigBoy.
+     - Done when: restart and three-peer traces prove persisted deadlines, all-target execution, global acknowledgement, local opt-out, and missed-late delivery.
+  3. S3 Add queue-independent Clock audio through Music and the seat audio authority.
+     - Objective: let alarms/timers use bundled tones, local files, Music tracks, podcasts, NPR hourly news, and live radio without raw URLs or a second catalog/player.
+     - Inputs: S1/S2, mde-musicd workspace catalog and engine, PipeWire/WirePlumber seat controls, NPR News Now source identity `500005` and official feed
+       `https://feeds.npr.org/500005/podcast.xml`, and licensed bundled tones.
+     - Deliverable: typed resolve/preview/start/stop Clock-audio requests in mde-musicd, stable catalog references, one-shot playback isolated from the user queue, source
+       status/result replies, alarm-volume policy, and exact duck/restore handling.
+     - Source behavior: Music owns discovery, credentials, provider URLs, custom radio, and member-station streams. Ship a governed NPR News Now preset that resolves the
+       newest hourly episode at ring time and retain a separate configured NPR live-station choice. Clock stores only stable source identity plus a bundled fallback tone.
+     - Failure behavior: external audio gets three seconds to begin; absent, stale, malformed, unauthorized, or unreachable content immediately starts the fallback and
+       reports why. Alerts duck other seat audio to 25 percent and restore exact prior levels. Clock playback never mutates Music queue, ownership, history, or bookmarks.
+     - Settings behavior: global alarm snooze defaults to 10 minutes; auto-silence defaults to 10 minutes then records Missed; alarm/timer crescendo defaults off; volume
+       keys offer Volume, Snooze, or Stop with Volume as default. Timer sound/vibration and per-alarm sound follow the AOSP settings model.
+     - Depends on: S1/S2 and FUNC-021 S1-S3.
+     - Acceptance: provider/network loss, source deletion, invalid references, timeout, fallback, duck/restore, simultaneous Music playback, and daemon restart remain honest.
+     - Validation: mde-musicd and PipeWire fixture tests on BigBoy plus bounded NPR feed/radio fixtures; no live network call occurs in a render test.
+     - Done when: evidence proves each source kind, queue isolation, three-second fallback, audible non-silent output, and exact volume restoration.
+  4. S4 Replace Timers with the complete AOSP-derived Clock surface.
+     - Objective: render familiar AOSP DeskClock information hierarchy and procedures through shared Quazar components without copying Android runtime or visual assets.
+     - Inputs: S1-S3, mde-egui Style/Motion/navigation, Surface taxonomy, Front Door, app switcher, icon registry, and the licensed AOSP behavior reference.
+     - Deliverable: `Surface::Clock`, daemon projection/client, World Clock, Alarms, Timers, Stopwatch, Clock settings, responsive navigation, empty/loading/error states, and
+       deterministic render fixtures. Remove `Surface::Timers` and stale shell-owned scheduling code instead of retaining a compatibility surface.
+     - Navigation behavior: Clock is searchable and appears in the app switcher but is excluded from the pin catalog. It always opens World Clock. Wide layouts use a
+       section sidebar; narrow layouts use a top World Clock/Alarms/Timers/Stopwatch selector so no second bottom bar competes with the Construct taskbar.
+     - World Clock behavior: lead with a large digital primary clock, seconds, `Monday 8`, and This Node zone. Maintain one manually ordered mixed city/mesh-peer list over
+       the full searchable IANA catalog. Preserve an offline peer's saved position but hide its row until the peer is online; never substitute UTC or stale peer state.
+     - Alarm behavior: use AOSP-style time creation and progressive expanded rows, not the superseded advanced recurrence editor. Sort enabled alarms by next occurrence,
+       then disabled alarms. Ring with an actionable banner containing Snooze and Stop; auto-silence produces a missed record instead of silently disappearing.
+     - Timer/stopwatch behavior: support multiple named timers with start/pause/resume/reset/delete, Add 1 minute, and overdue count-up. Stopwatch provides start, lap,
+       pause, and reset; laps are ephemeral. Selected peers may display a mirrored stopwatch, but only the origin can control it and stale origin state is labeled/frozen.
+     - Depends on: S1-S3 and UX-009 S1-S4.
+     - Acceptance: render performs no Bus, network, provider, persistence, or scheduling I/O; every action is typed; unavailable state never fabricates time or delivery.
+     - Validation: shell model/navigation/render tests on BigBoy for Dark/Light, wide/narrow, largest text, keyboard, pointer, touch, and every active/empty/failure state.
+     - Done when: reviewed deterministic captures prove all four sections and action traces prove every control reaches the sole daemon authority.
+  5. S5 Cut over clock, bell, banners, Notification Center, and lock curtain.
+     - Objective: give Clock and Notification Center separate persistent entries while preserving weather, battery, health, placement, gestures, and focused-VDI behavior.
+     - Inputs: S4, UX-012 S1-S3, FUNC-017 S9, notification ring/toast bridge, health modal, taskbar placements, and secure curtain.
+     - Deliverable: clock-to-Clock route, dedicated bell with bounded unread badge, actionable Clock banners, retained Clock notification rows, and idle Clock curtain mode.
+     - Chrome behavior: Bottom and Left clock targets open Clock directly; no compact chooser or tray flyout exists. The bell opens Notification Center and shows `99+` at
+       the cap; opening marks visible rows read and Clear All removes them. Existing pull-down/search access remains. Weather still opens Maps, health still opens its one
+       modal, and weather/battery/clock/bell/placement hit regions and focus order remain disjoint.
+     - Alert behavior: alarm banners expose Snooze/Stop; timer banners expose Add 1 minute/Stop; neither navigates away or takes over the screen. Events also enter the
+       bounded Notification Center history and existing signed Mesh Teams alert fold. Audio and due state continue if the shell or Clock surface is closed.
+     - Curtain behavior: the existing secure lock curtain owns a dark low-glare idle Clock view with 24-hour time, seconds, `Monday 8`, next alarm time/label, and active
+       timer summaries. It reveals no peer list and does not weaken PAM, input capture, or focused-VDI gesture guards.
+     - Depends on: S4, UX-012 S1-S3, and FUNC-017 S9.
+     - Acceptance: clock and bell execute only their assigned routes; banners remain actionable over ordinary and VDI surfaces; no target overlaps or duplicate authority.
+     - Validation: shell chrome/input/notification/curtain tests on BigBoy plus Bottom/Left direct-DRM captures on seat `.15`.
+     - Done when: action traces and reviewed captures prove the route cutover, badge lifecycle, alert actions, lock privacy, and weather/battery/health non-regression.
+  6. S6 Hard-cut legacy state, package, document, and prove release behavior.
+     - Objective: land the Clock contract without silently importing obsolete alarms or leaving contradictory docs, routes, services, or installed payloads.
+     - Inputs: S1-S5, package policy, platform interface authority, worklist stewardship, CRIT-006/007, and installed-seat upgrade paths.
+     - Deliverable: fresh Clock database, one-time display-zone migration, package/service updates, design/governance updates, lint gates, farm evidence, and live fleet proof.
+     - Migration behavior: do not read or import `timers-alarms.json`; leave the user file untouched for manual rollback and start Clock with no alarms/timers. Convert the
+       five legacy display-zone values to `America/New_York`, `America/Chicago`, `America/Denver`, `America/Los_Angeles`, or `UTC` and persist the IANA result atomically.
+     - Documentation behavior: add `docs/design/construct-clock.md` as design authority, update `platform-interfaces.md` and AI governance for clock→Clock and bell→
+       Notification Center, update UX-012 dependencies, and remove or supersede prose that claims the clock opens Notification Center or the retired Timers surface.
+     - License behavior: pin AOSP DeskClock revision `04e481f37e0b52b74c5a5c7b78b662d1f94e3478` as a behavior reference only. Use shared registry icons and original egui
+       layout code; any directly adapted Apache-2.0 code retains headers/NOTICE. Do not add Android dependencies, Android assets, a native APK, a second launcher, or a tray flyout.
+     - Depends on: S1-S5, UX-012, FUNC-021, CRIT-006, and CRIT-007.
+     - Acceptance: fresh install and upgrade both start deterministically; legacy files are untouched; installed services own the right payload; all live gaps are explicit.
+     - Validation: worklist self-test/lint, doc-supersession/style/bus/layer gates, Clock/Music/shell package tests, RPM payload checks, and named live-seat/fleet commands.
+     - Done when: one evidence bundle binds revision, farm hosts/slots/results, direct-DRM captures, audio metrics, package identity, and six-node execution/recovery outcomes.
+- Scope: Owns Clock contracts, worker, persistence, World Clock/Alarm/Timer/Stopwatch UX, selected-peer execution, Clock audio seam, clock/bell routing, lock-clock content,
+  migration, packaging, documentation, and proof. Music retains catalog/provider/credentials/general playback; Notification Center retains general history; UX-012 retains
+  taskbar geometry; health and weather retain their existing authorities.
+- Relevant files/components: mesh Clock types and mackesd worker/store, mde-musicd Clock-audio seam, shell Clock/chrome/notification/curtain, mde-egui Style/Motion, package
+  policy, platform-interface/governance docs, and evidence helpers.
+- Dependencies: ARCH-009, FUNC-017, FUNC-021, UX-009, UX-012, CRIT-006, CRIT-007.
+- Acceptance criteria:
+  1. The AOSP-derived four-section Clock is responsive, 24-hour, IANA/DST-correct, searchable but not pinnable, and fully driven by typed daemon projections/actions.
+  2. Alarms/timers survive restart/reboot/suspend, execute on all selected capable peers, converge global Snooze/Stop, honor local opt-out/blocking, and never ring late delivery.
+  3. Bundled/local/Music/podcast/NPR/radio audio is catalog-owned, queue-isolated, bounded, audible, ducked/restored, and falls back within three seconds without raw URLs.
+  4. Clock, bell, weather, battery, health, placement, Notification Center, banners, and lock curtain retain distinct truthful actions in Bottom and Left placements.
+  5. Fresh install, non-importing upgrade, package, direct-DRM/audio, and six-node failure/recovery evidence prove the shipped behavior or name an exact blocker.
+- Verification method: contracts on `.90`, worker/store and focused shell tests on `.50`, longest Music/shell/render/fault suites on BigBoy `.130`, then RPM and seat `.15`
+  direct-DRM/physical-audio proof followed by six-node target/rejoin/suspend/reboot/source-loss/acknowledgement acceptance. Use explicit farm host/slot variables.
+- Origin or merged source IDs: 2026-08-08 Clock Interface 50-question operator survey; AOSP DeskClock reference; existing shell Timers & Alarms implementation; UX-012
+  clock/tray, FUNC-017 clock-weather, FUNC-021 Music/radio, Notification Center, and curtain workstreams.
+
 ### WL-CRIT-006 - Production evidence, six-node acceptance, and corrected-forward recovery
 - Status: Remaining
 - Priority: P0
@@ -1177,6 +1358,8 @@ behavioral evidence is not completion.
   recovery, and corrected-forward promotion without rollback.
 - Current state: evidence schema/signing, topology, recovery, and live/VDI helpers exist; current release binding, seats, lighthouse convergence, and complete failure
   matrix remain.
+- **Farm expansion (2026-08-08):** XEN-196 is a verified fifth build node; topology is 5/5 with 10 slots and `.196` passed `mde-bus` 425/425:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
 - Remaining work:
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
@@ -1257,6 +1440,30 @@ behavioral evidence is not completion.
   identity now refuses corrected-forward join. Systemd ordering and
   destructive live rejoin remain open. Evidence:
   `docs/platform/evidence/WL-CRIT-007-2026-08-06-rejoin-identity-r1.md`.
+- **Boot order/local identity checkpoint (2026-08-08):** Nebula now rejects
+  unsafe, mixed, stale, or untrusted local identity before startup; etcd,
+  Syncthing, six mackesd groups, and the shell follow the verified boot graph.
+  `.90` systemd/hostile fixtures and all three role-package guards passed.
+  Distributed collision authority and live reboot/sleep proof remain. Evidence:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-08-boot-order-identity-s1-r1.md`.
+- **Peer recovery checkpoint (2026-08-08):** post-resume/network-return recovery
+  now refuses offline mutation, coalesces triggers, restores Nebula with bounded
+  backoff, then configured etcd, Syncthing, and grouped mackesd. `.90` fault,
+  systemd, and three-role package checks passed. Live laptop/fleet convergence
+  remains. Evidence:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-08-peer-recovery-s2-r1.md`.
+- **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
+  recovery now reattaches only the latest valid exact generation and revokes
+  superseded, expired, mismatched, orphaned, or stopped-workload leases without
+  invoking lifecycle apply/cancel. `.90` passed 3/3; live first-frame proof
+  remains: `docs/platform/evidence/WL-CRIT-007-2026-08-08-workload-session-recovery-s3-r1.md`.
+- **Corrected-forward Release 21 checkpoint (2026-08-08):** the Fedora 44
+  package passed integrity, ABI, payload, transaction, and installed-file
+  verification; one warned reboot on seat `.15` changed the boot ID and
+  recovered one identity, six unique grouped workers, strict 2/3 coordination
+  quorum, Syncthing/Bus, one shell, and all communal XDG binds. Physical
+  suspend/resume and the complete six-node matrix remain. Evidence:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-08-corrected-forward-s4-r1.md`.
   1. S1 Define boot dependency order and identity guard.
      - Objective: order network, Nebula, mackesd, etcd, Syncthing, shell, and workload services with one stale-identity cleanup path.
      - Inputs: systemd units, enrollment config, mesh-health checks.
@@ -1428,6 +1635,8 @@ behavioral evidence is not completion.
 - Required outcome: a 48px full-width taskbar supports Bottom/Left placement, icon-only Start/Search/Back/Home, user-managed centered pins, right-side placement control,
   clock/tray semantics, and Bing-wallpaper Home with no second launcher.
 - Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and five-seat proof remain.
+- **Live battery (2026-08-08):** the primary UPower percentage/icon is immediately left of the clock in both placements; `.90` passed 24/24 focused status tests:
+  `docs/platform/evidence/WL-UX-012-2026-08-08-live-battery-left-clock-r1.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
@@ -1445,12 +1654,12 @@ behavioral evidence is not completion.
      - Acceptance: each icon has one action and never launches a raw command or second launcher.
      - Validation: shell navigation cargo tests.
      - Done when: action trace and negative route scan pass.
-  3. S3 Implement pins, status, clock, and health anchor.
-     - Objective: persist user-managed centered pins and render right-side placement, FUNC-017 weather launcher, clock/tray, and Health modal entry using typed projections.
+  3. S3 Implement pins, status slots, clock/bell geometry, and health anchor.
+     - Objective: persist centered pins and reserve disjoint typed slots for placement, FUNC-017 weather, battery, clock, bell, tray, and Health without owning their actions.
      - Inputs: S1/S2, UX-013 health authority, and FUNC-017 weather projection/deep link.
-     - Deliverable: bounded settings, taskbar projection, disjoint weather/clock/tray targets, and migration tests.
+     - Deliverable: bounded settings, taskbar projection slots, disjoint weather/battery/clock/bell/tray geometry, and migration tests.
      - Depends on: S2.
-     - Acceptance: pins survive restart; health remains one modal authority; weather beside the clock opens Maps without becoming a second launcher or tray flyout.
+     - Acceptance: pins survive restart; every slot remains reachable and non-overlapping; owning surfaces bind actions later; no tray flyout is introduced.
      - Validation: model/property/render cargo tests.
      - Done when: persistence and deep-link evidence exists.
   4. S4 Prove responsive and release behavior.
@@ -1489,6 +1698,10 @@ behavioral evidence is not completion.
   suite covers `Sleeping → Returned` at the `u64::MAX` boundary and refuses an
   overlong TTL; `.50` passed 1/1. Evidence:
   `docs/platform/evidence/WL-UX-013-2026-08-06-health-boundary-r1.md`.
+- **Durable ingress checkpoint (2026-08-08):** exact approved-publisher health
+  ingress now rejects replay/rollback and atomically preserves its bounded
+  per-observer cursor/ledger across restart; `.170` passed 24/24:
+  `docs/platform/evidence/WL-UX-013-2026-08-08-health-ingress-checkpoint-s2-r1.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.

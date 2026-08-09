@@ -48,6 +48,14 @@ pub const MAX_WORKER_CHANGE_SET_ITEMS: usize = 64;
 pub const MAX_WORKER_FRESHNESS_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Maximum lifetime of a staged change-set preview.
 pub const MAX_WORKER_CHANGE_SET_TTL_MS: u64 = 10 * 60 * 1_000;
+/// Canonical authenticated Bus action lane for staged Workers change sets.
+pub const WORKER_CHANGE_SET_ACTION_TOPIC_PREFIX: &str = "action/workers/change-set";
+/// Canonical latest-wins result lane for staged Workers change sets.
+pub const WORKER_CHANGE_SET_RESULT_TOPIC_PREFIX: &str = "state/workers/change-set";
+/// Capability verb used by the existing root-shell action mint authority.
+pub const WORKER_CHANGE_SET_AUTH_VERB: &str = "workers-change-set";
+/// Maximum encoded size of the short-lived action capability.
+pub const MAX_WORKER_ARMED_TOKEN_BYTES: usize = 4 * 1024;
 /// Maximum retained restart count before a producer must roll its generation.
 pub const MAX_WORKER_RESTART_COUNT: u32 = 1_000_000;
 
@@ -1350,6 +1358,81 @@ pub struct WorkerChangeSetItem {
     pub action: WorkerAction,
 }
 
+/// Build the node-scoped authenticated request topic for the Action Console.
+pub fn worker_change_set_action_topic(node_id: &str) -> Result<String, WorkerRuntimeContractError> {
+    validate_identifier("change_set.topic.node_id", node_id)?;
+    Ok(format!("{WORKER_CHANGE_SET_ACTION_TOPIC_PREFIX}/{node_id}"))
+}
+
+/// Build the node-scoped latest-wins result topic for the Action Console.
+pub fn worker_change_set_result_topic(node_id: &str) -> Result<String, WorkerRuntimeContractError> {
+    validate_identifier("change_set.topic.node_id", node_id)?;
+    Ok(format!("{WORKER_CHANGE_SET_RESULT_TOPIC_PREFIX}/{node_id}"))
+}
+
+/// Bind a staged change set to its exact target, generation, typed items, and
+/// operator-facing impact/recovery contract. The operation and request clock
+/// are deliberately excluded so Preview, Commit, and Cancel can refer to the
+/// same immutable staged intent.
+pub fn worker_change_set_digest(
+    target: &WorkerChangeSetTarget,
+    expected_generation: u64,
+    items: &[WorkerChangeSetItem],
+    impact: &str,
+    recovery: &str,
+    arming: WorkerArmingRequirement,
+) -> Result<String, WorkerRuntimeContractError> {
+    use sha2::{Digest as _, Sha256};
+
+    target.validate()?;
+    if expected_generation == 0 {
+        return Err(WorkerRuntimeContractError::InvalidGeneration(
+            "change_set_digest.expected_generation",
+        ));
+    }
+    if items.is_empty() || items.len() > MAX_WORKER_CHANGE_SET_ITEMS {
+        return Err(WorkerRuntimeContractError::CapacityExceeded {
+            field: "change_set_digest.items",
+            max: MAX_WORKER_CHANGE_SET_ITEMS,
+        });
+    }
+    let mut item_ids = BTreeSet::new();
+    for item in items {
+        item.validate()?;
+        if target
+            .worker_id
+            .as_deref()
+            .is_some_and(|worker_id| worker_id != item.worker_id)
+        {
+            return Err(WorkerRuntimeContractError::InvalidRelationship(
+                "change_set_digest.target_worker",
+            ));
+        }
+        if !item_ids.insert(item.item_id.as_str()) {
+            return Err(WorkerRuntimeContractError::Duplicate(
+                "change_set_digest.items",
+            ));
+        }
+    }
+    validate_text(
+        "change_set_digest.impact",
+        impact,
+        MAX_WORKER_TEXT_BYTES,
+        false,
+    )?;
+    validate_text(
+        "change_set_digest.recovery",
+        recovery,
+        MAX_WORKER_TEXT_BYTES,
+        false,
+    )?;
+    let canonical =
+        serde_json::to_vec(&(target, expected_generation, items, impact, recovery, arming))
+            .map_err(|_| WorkerRuntimeContractError::MalformedWire)?;
+    let digest = Sha256::digest(canonical);
+    Ok(format!("sha256:{digest:x}"))
+}
+
 impl WorkerChangeSetItem {
     fn validate(&self) -> Result<(), WorkerRuntimeContractError> {
         validate_identifier("change_set.item.item_id", &self.item_id)?;
@@ -1373,6 +1456,11 @@ pub struct WorkerChangeSetRequest {
     pub digest: String,
     pub requested_at_ms: u64,
     pub expires_at_ms: u64,
+    /// Short-lived exact-body capability minted by the existing shell action
+    /// authority. Producers leave this absent until the validated body is
+    /// authorized; consumers must verify it before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1390,6 +1478,8 @@ struct WorkerChangeSetRequestWire {
     digest: String,
     requested_at_ms: u64,
     expires_at_ms: u64,
+    #[serde(default)]
+    armed_token: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for WorkerChangeSetRequest {
@@ -1411,6 +1501,7 @@ impl<'de> Deserialize<'de> for WorkerChangeSetRequest {
             digest: wire.digest,
             requested_at_ms: wire.requested_at_ms,
             expires_at_ms: wire.expires_at_ms,
+            armed_token: wire.armed_token,
         };
         request.validate().map_err(de::Error::custom)?;
         Ok(request)
@@ -1446,6 +1537,7 @@ impl WorkerChangeSetRequest {
             digest: digest.into(),
             requested_at_ms,
             expires_at_ms,
+            armed_token: None,
         };
         request.validate()?;
         Ok(request)
@@ -1507,6 +1599,22 @@ impl WorkerChangeSetRequest {
             return Err(WorkerRuntimeContractError::InvalidFreshness(
                 "change_set_request.expires_at_ms",
             ));
+        }
+        if let Some(token) = &self.armed_token {
+            if token.len() > MAX_WORKER_ARMED_TOKEN_BYTES {
+                return Err(WorkerRuntimeContractError::FieldTooLong(
+                    "change_set_request.armed_token",
+                ));
+            }
+            if token.is_empty()
+                || token.trim() != token
+                || !token.is_ascii()
+                || token.chars().any(char::is_whitespace)
+            {
+                return Err(WorkerRuntimeContractError::InvalidField(
+                    "change_set_request.armed_token",
+                ));
+            }
         }
         Ok(())
     }
@@ -2265,6 +2373,52 @@ mod tests {
         assert_eq!(
             WorkerChangeSetResult::from_json(&result_body).expect("decode result"),
             result
+        );
+    }
+
+    #[test]
+    fn action_console_topics_digest_and_capability_field_are_closed_and_stable() {
+        let mut request = request();
+        request.digest = worker_change_set_digest(
+            &request.target,
+            request.expected_generation,
+            &request.items,
+            &request.impact,
+            &request.recovery,
+            request.arming,
+        )
+        .expect("canonical digest");
+        request.armed_token = Some("v1.test-capability".to_string());
+        let decoded =
+            WorkerChangeSetRequest::from_json(&request.to_json().expect("authorized request body"))
+                .expect("authorized request admission");
+        assert_eq!(decoded, request);
+        let mut oversized_token = request.clone();
+        oversized_token.armed_token = Some("x".repeat(MAX_WORKER_ARMED_TOKEN_BYTES + 1));
+        assert!(oversized_token.validate().is_err());
+        assert_eq!(
+            worker_change_set_action_topic("seat-15").expect("action topic"),
+            "action/workers/change-set/seat-15"
+        );
+        assert_eq!(
+            worker_change_set_result_topic("seat-15").expect("result topic"),
+            "state/workers/change-set/seat-15"
+        );
+        assert!(worker_change_set_action_topic("../../escape").is_err());
+
+        let mut changed_items = request.items.clone();
+        changed_items[0].action = WorkerAction::Stop;
+        assert_ne!(
+            request.digest,
+            worker_change_set_digest(
+                &request.target,
+                request.expected_generation,
+                &changed_items,
+                &request.impact,
+                &request.recovery,
+                request.arming,
+            )
+            .expect("changed digest")
         );
     }
 

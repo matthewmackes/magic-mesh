@@ -14,7 +14,243 @@ pub const CUTTLEFISH_PROVIDER_SCHEMA_VERSION: u16 = 1;
 /// The only Cuttlefish lifecycle request schema currently admitted.
 pub const CUTTLEFISH_LIFECYCLE_SCHEMA_VERSION: u16 = 1;
 
+/// Schema for Android placement preflight rows folded into `state/cloud/<node>`.
+pub const ANDROID_PROVIDER_ADMISSION_SCHEMA_VERSION: u16 = 1;
+/// Schema for a guest-owned Android VDI source.
+pub const ANDROID_VDI_SOURCE_SCHEMA_VERSION: u16 = 1;
+
 const MAX_ID_BYTES: usize = 128;
+
+/// Closed display protocol exported by the Cuttlefish guest session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AndroidVdiProtocol {
+    /// Cuttlefish's guest-owned WebRTC display surface.
+    WebRtc,
+}
+
+/// Truthful, generation-bound VDI source reported by the guest agent.
+///
+/// This is discovery data, not a shell command or an attach ticket. Consumers
+/// must still acquire session authorization through the VDI authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidVdiSource {
+    /// Wire schema discriminator.
+    pub schema_version: u16,
+    /// Stable Android workload identity.
+    pub workload_id: String,
+    /// Exact admitted image provenance served by this session.
+    pub image_provenance: CuttlefishImageProvenanceRef,
+    /// SHA-256 digest of the admitted signed catalog payload.
+    pub catalog_digest: String,
+    /// Exact lifecycle generation that owns the session.
+    pub generation: u64,
+    /// Closed display protocol.
+    pub protocol: AndroidVdiProtocol,
+    /// Mesh DNS identity of the outer VM. Raw IPs and URLs are not admitted.
+    pub mesh_host: String,
+    /// Guest-owned display port.
+    pub port: u16,
+    /// Opaque bounded guest session identity.
+    pub session_id: String,
+    /// Observation time in Unix epoch milliseconds.
+    pub observed_at_unix_ms: u64,
+    /// Expiry time in Unix epoch milliseconds.
+    pub expires_at_unix_ms: u64,
+}
+
+impl AndroidVdiSource {
+    /// Validate identity, provenance, generation, host, and freshness bounds.
+    pub fn validate(&self) -> Result<(), CuttlefishContractError> {
+        const MAX_VDI_TTL_MS: u64 = 5 * 60 * 1_000;
+        if self.schema_version != ANDROID_VDI_SOURCE_SCHEMA_VERSION {
+            return Err(CuttlefishContractError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        CuttlefishVmId::new(self.workload_id.clone())?;
+        self.image_provenance.validate()?;
+        if !is_valid_sha256_digest(&self.catalog_digest) {
+            return Err(CuttlefishContractError::InvalidImageDigest);
+        }
+        if self.generation == 0 || self.port == 0 {
+            return Err(CuttlefishContractError::InvalidGeneration);
+        }
+        validate_identity("session_id", &self.session_id)?;
+        if self.mesh_host.len() > MAX_ID_BYTES
+            || !self.mesh_host.ends_with(".mesh")
+            || self.mesh_host.split('.').any(|label| {
+                label.is_empty()
+                    || !label
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            })
+        {
+            return Err(CuttlefishContractError::InvalidField("mesh_host"));
+        }
+        if self.observed_at_unix_ms == 0
+            || self.expires_at_unix_ms <= self.observed_at_unix_ms
+            || self
+                .expires_at_unix_ms
+                .saturating_sub(self.observed_at_unix_ms)
+                > MAX_VDI_TTL_MS
+        {
+            return Err(CuttlefishContractError::InvalidTimestamp);
+        }
+        Ok(())
+    }
+
+    /// Admit a source only when it belongs to the exact running contract.
+    pub fn admitted_against(
+        self,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        generation: u64,
+    ) -> Result<Self, CuttlefishContractError> {
+        self.validate()?;
+        if self.workload_id != target.vm_id.as_str() {
+            return Err(CuttlefishContractError::TargetIdentityMismatch);
+        }
+        if self.image_provenance != target.image_provenance {
+            return Err(CuttlefishContractError::ImageProvenanceMismatch);
+        }
+        if self.catalog_digest != catalog_digest || self.generation != generation {
+            return Err(CuttlefishContractError::GenerationMismatch {
+                expected: generation,
+                actual: self.generation,
+            });
+        }
+        Ok(self)
+    }
+}
+
+/// Closed readiness result for Android provider placement admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AndroidProviderReadiness {
+    /// Every signed-image, host-capability, capacity, and provider-health check passed.
+    Ready,
+    /// Placement is refused; [`AndroidProviderAdmission::refusal`] names why.
+    Unavailable,
+}
+
+/// Exact fail-closed reason an Android placement preflight was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AndroidProviderRefusal {
+    /// No admitted signed catalog is available from the catalog worker.
+    CatalogUnavailable,
+    /// The admitted catalog validity window has elapsed.
+    CatalogExpired,
+    /// Catalog image provenance is internally invalid.
+    CatalogImageMismatch,
+    /// The host-local exact package manifest is absent or invalid.
+    PackageManifestUnavailable,
+    /// The package manifest does not equal the signed catalog binding.
+    PackageManifestMismatch,
+    /// Desired image identity, digest, or resources do not match policy.
+    DesiredImageMismatch,
+    /// No readable immutable image artifact is configured.
+    ImageArtifactUnavailable,
+    /// The artifact bytes do not match the signed digest.
+    ImageDigestMismatch,
+    /// The KVM device is unavailable.
+    KvmUnavailable,
+    /// The active KVM module does not report nested virtualization enabled.
+    NestedVirtualizationUnavailable,
+    /// Available logical CPUs are below the admitted profile.
+    InsufficientVcpu,
+    /// Available host memory is below the admitted profile.
+    InsufficientMemory,
+    /// Available artifact-filesystem space is below the admitted profile.
+    InsufficientDisk,
+    /// The existing libvirt provider health probe is not up.
+    ProviderUnavailable,
+}
+
+/// One bounded Android provider preflight row in the existing cloud authority.
+///
+/// This is placement evidence, not guest readiness. A `Ready` row permits a
+/// Cuttlefish adapter to be considered for placement; only guest-owned evidence
+/// may later claim that Android itself is running or launchable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidProviderAdmission {
+    /// Wire schema discriminator.
+    pub schema_version: u16,
+    /// Stable Android workload identity.
+    pub workload_id: String,
+    /// Signed immutable image binding, absent when no catalog was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_provenance: Option<CuttlefishImageProvenanceRef>,
+    /// Closed placement readiness result.
+    pub readiness: AndroidProviderReadiness,
+    /// Exact reason when readiness is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<AndroidProviderRefusal>,
+    /// Whether `/dev/kvm` is a real character device.
+    pub kvm_available: bool,
+    /// Whether the active KVM vendor module enables nesting.
+    pub nested_virtualization: bool,
+    /// Whether the existing libvirt health authority is up.
+    pub provider_healthy: bool,
+    /// Required logical CPUs from Cuttlefish and signed policy.
+    pub required_vcpus: u16,
+    /// Logical CPUs observed on the host.
+    pub available_vcpus: u16,
+    /// Required memory in MiB.
+    pub required_memory_mib: u64,
+    /// Available host memory in MiB.
+    pub available_memory_mib: u64,
+    /// Required disk space in MiB.
+    pub required_disk_mib: u64,
+    /// Available image-filesystem space in MiB.
+    pub available_disk_mib: u64,
+    /// Host observation time in Unix epoch milliseconds.
+    pub observed_at_unix_ms: u64,
+}
+
+impl AndroidProviderAdmission {
+    /// Validate bounds and prevent a producer from attaching a fake-ready label
+    /// to incomplete host evidence.
+    pub fn validate(&self) -> Result<(), CuttlefishContractError> {
+        if self.schema_version != ANDROID_PROVIDER_ADMISSION_SCHEMA_VERSION {
+            return Err(CuttlefishContractError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        CuttlefishVmId::new(self.workload_id.clone())?;
+        if let Some(provenance) = &self.image_provenance {
+            provenance.validate()?;
+        }
+        if self.required_vcpus == 0
+            || self.required_memory_mib == 0
+            || self.required_disk_mib == 0
+            || self.observed_at_unix_ms == 0
+        {
+            return Err(CuttlefishContractError::InvalidField("provider_admission"));
+        }
+        let evidence_ready = self.image_provenance.is_some()
+            && self.kvm_available
+            && self.nested_virtualization
+            && self.provider_healthy
+            && self.available_vcpus >= self.required_vcpus
+            && self.available_memory_mib >= self.required_memory_mib
+            && self.available_disk_mib >= self.required_disk_mib;
+        match (self.readiness, self.refusal, evidence_ready) {
+            (AndroidProviderReadiness::Ready, None, true)
+            | (AndroidProviderReadiness::Unavailable, Some(_), _) => Ok(()),
+            _ => Err(CuttlefishContractError::InvalidGuestEvidence),
+        }
+    }
+
+    #[must_use]
+    /// Whether the row is internally valid and placement-ready.
+    pub fn is_ready(&self) -> bool {
+        self.validate().is_ok() && self.readiness == AndroidProviderReadiness::Ready
+    }
+}
 
 /// The provider implementation represented by this contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,10 +8,10 @@ pattern='\.(execute|execute_batch|transaction|unchecked_transaction)[[:space:]]*
 
 scan() {
   local destination="$1"
-  rg -n --glob '*.rs' "$pattern" "$source_root" \
+  { rg -n --glob '*.rs' "$pattern" "$source_root" || [[ $? -eq 1 ]]; } \
     | cut -d: -f1 \
     | sed "s#^$repo_root/##" \
-    | rg -v '(^|/)store/' \
+    | { rg -v '(^|/)store/' || [[ $? -eq 1 ]]; } \
     | sort \
     | uniq -c \
     | awk '{print $2 "\t" $1}' \

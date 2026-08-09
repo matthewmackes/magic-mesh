@@ -1413,6 +1413,82 @@ pub(crate) fn spawn_compute_lifecycle_workers(
                 .to_string(),
         )
     });
+    // WL-FUNC-017 S2 — one daemon-owned weather-location authority per node.
+    // This consumes only local Bus state and persisted verified preferences;
+    // network weather production remains in the later weather-provider worker.
+    spawn_tiered(sup, worker_names, role_rank, "weather_location", || {
+        mackesd_core::workers::weather_location::WeatherLocationWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-017 S3 — official NWS current conditions and bounded local
+    // forecast. This consumes the S2 location authority and preserves the
+    // separate vehicle drive-ahead overlay topic and semantics.
+    spawn_tiered(sup, worker_names, role_rank, "weather_forecast", || {
+        mackesd_core::workers::weather_forecast::WeatherForecastWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-017 S4 — NOAA nowCOAST temperature, wind, and cloud-cover
+    // Web-Mercator fields for the daemon-owned effective-location viewport.
+    spawn_tiered(sup, worker_names, role_rank, "weather_atmosphere", || {
+        mackesd_core::workers::weather_atmosphere::WeatherAtmosphereWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-017 S6 — sole node-scoped navigation authority. All provider
+    // work and Bus I/O remain in mackesd; the production provider fails closed
+    // until approved route data and an engine are configured.
+    spawn_tiered(sup, worker_names, role_rank, "navigation", || {
+        mackesd_core::workers::navigation::NavigationWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-022 S2 — local Clock authority. All SQLite mutations cross the
+    // control group's typed sole-writer boundary before Bus publication.
+    spawn_tiered(sup, worker_names, role_rank, "clock", || {
+        mackesd_core::workers::clock::ClockWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+            db_path.clone(),
+        )
+    });
+    // WL-FUNC-020 S1 — fail-closed signed Android app/image catalog importer.
+    // The release signer remains offline; this consumes only the node-scoped
+    // Bus import topic and a locally provisioned public trust anchor.
+    spawn_tiered(sup, worker_names, role_rank, "android_catalog", || {
+        mackesd_core::workers::android_catalog::AndroidCatalogWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-018 S2 — fail-closed signed Flatpak catalog importer. It remains
+    // registered without trust configuration so its unavailable status is
+    // visible instead of silently removing the production path.
+    spawn_tiered(sup, worker_names, role_rank, "app_catalog", || {
+        mackesd_core::workers::app_catalog::AppCatalogWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // WL-FUNC-012 / MG90 airspace — publish a typed per-node scanner mirror.
     // The default constructor is deliberately source-less until a proven MG90
     // survey probe is configured; this makes the worker path live and honest

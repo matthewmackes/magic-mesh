@@ -19,7 +19,7 @@ mod firefox;
 // `netscape::parse` directly in its round-trip tests, without widening the
 // crate's public API — the format parser stays an import-only implementation
 // detail to the outside world.
-mod netscape;
+pub(crate) mod netscape;
 mod normalize;
 mod parsed;
 mod plan;

@@ -911,8 +911,8 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::time::Duration;
+    use tempfile::tempdir;
 
     #[test]
     fn playback_status_maps_engine_flags() {

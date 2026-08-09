@@ -40,21 +40,23 @@ pub fn run(cmd: RevisionsCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 author,
                 peers,
             } => {
-                let payload = load_revision_payload(&conn, &target_id)?;
+                let target_revision_id: i64 = target_id.parse().map_err(|_| {
+                    anyhow::anyhow!("revision id must be an integer (got {target_id})")
+                })?;
                 let author = author.unwrap_or_else(default_node_id);
                 let summary = format!("Rollback to {target_id} (peers={peers})");
-                let mut conn = conn;
                 let now = chrono::Utc::now().to_rfc3339();
-                let revision_id = mackesd_core::store::with_transaction(&mut conn, |tx| {
-                    tx.execute(
-                        "INSERT INTO desired_config \
-                                 (author, message, spec_json, state, created_at) \
-                                 VALUES (?, ?, ?, 'approved', ?)",
-                        (&author, &summary, &payload, &now),
-                    )
-                    .map_err(|e| anyhow::anyhow!("inserting rollback revision: {e}"))?;
-                    Ok(tx.last_insert_rowid())
-                })?;
+                let revision_id = mackesd_core::store::writer::request_or_execute(
+                    &conn,
+                    mackesd_core::store::writer::WriteOp::CreateApprovedRevision {
+                        target_revision_id,
+                        author: author.clone(),
+                        message: summary,
+                        created_at: now,
+                    },
+                )
+                .context("creating approved rollback revision")?
+                .into_row_id()?;
                 let report = serde_json::json!({
                     "rollback":      target_id,
                     "new_revision":  revision_id,

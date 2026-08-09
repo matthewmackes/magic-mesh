@@ -552,6 +552,41 @@ expected = (
         "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf",
         "644",
     ),
+    (
+        "install-helpers/verify-boot-recovery.sh",
+        "/usr/libexec/mackesd/verify-boot-recovery",
+        "755",
+    ),
+    (
+        "install-helpers/mesh-peer-recovery.sh",
+        "/usr/libexec/mackesd/mesh-peer-recovery",
+        "755",
+    ),
+    (
+        "install-helpers/mesh-xdg-bind-recovery.sh",
+        "/usr/libexec/mackesd/mesh-xdg-bind-recovery",
+        "755",
+    ),
+    (
+        "packaging/systemd/mcnf-peer-recovery.service",
+        "/usr/lib/systemd/system/mcnf-peer-recovery.service",
+        "644",
+    ),
+    (
+        "packaging/systemd/mcnf-xdg-bind-recovery.service",
+        "/usr/lib/systemd/system/mcnf-xdg-bind-recovery.service",
+        "644",
+    ),
+    (
+        "packaging/systemd/mcnf-peer-recovery-sleep",
+        "/usr/lib/systemd/system-sleep/mcnf-peer-recovery",
+        "755",
+    ),
+    (
+        "packaging/systemd/90-mcnf-peer-recovery",
+        "/etc/NetworkManager/dispatcher.d/90-mcnf-peer-recovery",
+        "755",
+    ),
 )
 shapes = {
     "base": rpm,
@@ -586,8 +621,8 @@ for shape, table in shapes.items():
     if "mcnf-overlay-identity-claims-materializer" in lifecycle:
         errors.append(f"{shape}: package lifecycle activates/references the disabled producer")
     if "05-overlay-identity-collision-guard" in lifecycle:
-        errors.append(f"{shape}: package lifecycle activates/references the inert guard drop-in")
-    print(f"{shape}: four prerequisite assets present exactly once; lifecycle activation absent")
+        errors.append(f"{shape}: package lifecycle mutates the systemd-owned guard drop-in")
+    print(f"{shape}: eleven identity/recovery assets present exactly once; lifecycle mutation absent")
 
 for source, _dest, _mode in expected:
     if not (repo / source).is_file():
@@ -612,16 +647,84 @@ for line in sorted(required_unit_lines - unit_lines):
 if "ReadWritePaths=/var/lib/mackesd /run/mackesd" in unit_lines:
     errors.append("materializer unit still grants write access to shared /var/lib/mackesd")
 blocker = "ACTIVATION_BLOCKER=pre-nebula-current-authority-transport-unavailable"
-if blocker not in unit or blocker not in dropin:
-    errors.append("typed pre-Nebula transport activation blocker is missing")
+if blocker not in unit:
+    errors.append("distributed producer transport activation blocker is missing")
 if any(line.strip() == "[Install]" for line in unit.splitlines()):
     errors.append("materializer unit gained an [Install] activation section")
-for forbidden in ("[Unit]", "[Service]", "ExecStartPre="):
-    if any(line.strip().startswith(forbidden) for line in dropin.splitlines()):
-        errors.append(f"guard drop-in is no longer inert: {forbidden}")
+required_dropin_lines = {
+    "[Unit]",
+    "Requires=network-online.target",
+    "After=network-online.target",
+    "Before=etcd.service syncthing.service mackesd.target",
+    "[Service]",
+    "ExecStartPre=/usr/libexec/mackesd/verify-boot-recovery --identity-guard",
+}
+dropin_lines = set(dropin.splitlines())
+for line in sorted(required_dropin_lines - dropin_lines):
+    errors.append(f"active local identity guard missing exact contract: {line}")
+if "mcnf-overlay-identity-claims-materializer" in dropin:
+    errors.append("pre-Nebula local guard depends on the post-overlay materializer")
+
+recovery_unit = (repo / "packaging/systemd/mcnf-peer-recovery.service").read_text()
+recovery_helper = (repo / "install-helpers/mesh-peer-recovery.sh").read_text()
+required_recovery_unit_lines = {
+    "Type=notify",
+    "NotifyAccess=all",
+    "ExecStart=/usr/libexec/mackesd/mesh-peer-recovery",
+    "TimeoutStartSec=90",
+    "RuntimeMaxSec=90",
+    "TimeoutStopSec=10",
+    "RuntimeDirectory=mcnf-peer-recovery",
+    "Environment=MCNF_RECOVERY_LOCK=/run/mcnf-peer-recovery/recovery.lock",
+    "ProtectHome=yes",
+}
+recovery_unit_lines = set(recovery_unit.splitlines())
+for line in sorted(required_recovery_unit_lines - recovery_unit_lines):
+    errors.append(f"peer recovery unit missing exact bounded-runtime contract: {line}")
+if "[Install]" in recovery_unit_lines:
+    errors.append("event-triggered peer recovery unit must not be independently enabled")
+xdg_recovery_unit = (repo / "packaging/systemd/mcnf-xdg-bind-recovery.service").read_text()
+required_xdg_unit_lines = {
+    "Type=oneshot",
+    "ExecStart=/usr/libexec/mackesd/mesh-xdg-bind-recovery",
+    "TimeoutStartSec=60",
+}
+xdg_recovery_unit_lines = set(xdg_recovery_unit.splitlines())
+for line in sorted(required_xdg_unit_lines - xdg_recovery_unit_lines):
+    errors.append(f"XDG recovery unit missing exact host-namespace contract: {line}")
+for forbidden_namespace_key in (
+    "ProtectSystem=", "ProtectHome=", "PrivateTmp=", "ReadOnlyPaths=", "ReadWritePaths="
+):
+    if any(line.startswith(forbidden_namespace_key) for line in xdg_recovery_unit_lines):
+        errors.append(f"XDG recovery unit cannot observe PID 1 mounts with {forbidden_namespace_key}")
+if "[Install]" in xdg_recovery_unit_lines:
+    errors.append("XDG recovery subunit must be invoked only by peer recovery")
+if "start mcnf-xdg-bind-recovery.service" not in recovery_helper:
+    errors.append("peer recovery no longer delegates XDG mounts into PID 1's namespace")
+for forbidden in ("mackesd join", "mackesd found", "mackesd leave"):
+    if forbidden in recovery_helper:
+        errors.append(f"peer recovery helper must not re-enroll or tear down identity: {forbidden}")
+xdg_recovery_helper = (repo / "install-helpers/mesh-xdg-bind-recovery.sh").read_text()
+xdg_recovery_code = "\n".join(
+    line for line in xdg_recovery_helper.splitlines()
+    if not line.lstrip().startswith("#")
+)
+if "--type=none --options=bind" not in xdg_recovery_code:
+    errors.append("XDG recovery must request a directory bind mount, not a block-device bind")
+if " --bind " in xdg_recovery_code:
+    errors.append("XDG recovery uses unsupported systemd-mount --bind abbreviation")
+
+sleep_hook = (repo / "packaging/systemd/mcnf-peer-recovery-sleep").read_text()
+network_hook = (repo / "packaging/systemd/90-mcnf-peer-recovery").read_text()
+trigger = 'start --no-block mcnf-peer-recovery.service'
+if trigger not in sleep_hook or "post)" not in sleep_hook:
+    errors.append("system-sleep hook lost its post-resume no-block trigger")
+if trigger not in network_hook or "up|dhcp4-change|dhcp6-change|connectivity-change|reapply" not in network_hook:
+    errors.append("NetworkManager hook lost its positive network-return trigger filter")
 
 print("runtime: dedicated root 0700 state leaf declared; shared daemon state root not writable")
-print("activation: typed blocker present; producer disabled; Nebula drop-in inert")
+print("activation: local identity guard active; distributed producer remains blocked/disabled")
+print("recovery: event-triggered notify service, sleep hook, and network-return hook are role-complete")
 if errors:
     for error in errors:
         print(f"ERROR: {error}", file=sys.stderr)

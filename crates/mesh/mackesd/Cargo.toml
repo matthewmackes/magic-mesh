@@ -412,7 +412,25 @@ payload_compress = "xz"
 # plane and preserve alternate admitted providers behind the selected source.
 # -13 (2026-08-08): replace the monolithic daemon unit with six independently
 # supervised process groups and migrate package activation/drop-ins atomically.
-release = "13"
+# -14 (2026-08-08): restore fail-closed communal XDG bind mounts through the
+# package-owned corrected-forward recovery path without obscuring local data.
+# -15 (2026-08-08): coalesce repeated positive network events and wait for the
+# exact Nebula TUN readiness boundary before retrying, preventing start-limit
+# exhaustion during corrected-forward recovery.
+# -16 (2026-08-08): delegate communal XDG bind restoration to a bounded helper
+# unit in PID 1's mount namespace and use explicit directory-bind syntax.
+# -17 (2026-08-08): preserve exact canonical hyphenated worker names before
+# trying the legacy kebab-to-snake alias during grouped-process admission.
+# -18 (2026-08-08): preserve an already-active boot-time Syncthing process and
+# wait for the notify recovery orchestrator to settle before post-reboot proof.
+# -19 (2026-08-08): wait for all six grouped worker children after restarting
+# their target instead of treating normal boot-time activation as failure.
+# -20 (2026-08-08): preserve an already-activating grouped target and use one
+# non-blocking bounded restart when child readiness genuinely fails to settle.
+# -21 (2026-08-08): prove the configured coordination plane by strict etcd
+# majority so corrected-forward recovery survives one lighthouse loss while
+# still failing closed when the cluster cannot commit proposals.
+release = "21"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -480,13 +498,19 @@ assets = [
     { source = "packaging/systemd/mackesd-data.service", dest = "/usr/lib/systemd/system/mackesd-data.service", mode = "644" },
     { source = "packaging/systemd/mackesd-compute.service", dest = "/usr/lib/systemd/system/mackesd-compute.service", mode = "644" },
     { source = "packaging/systemd/mackesd-integrations.service", dest = "/usr/lib/systemd/system/mackesd-integrations.service", mode = "644" },
-    # WL-CRIT-007 — authenticated post-overlay claim snapshot prerequisite.
-    # These units remain deliberately disabled/inert until the typed pre-Nebula
-    # authority-transport blocker is closed.
+    # WL-CRIT-007 — local identity admission is active before Nebula; the
+    # distributed post-overlay claim producer remains disabled until a typed
+    # pre-Nebula authority transport exists.
     { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
     { source = "install-helpers/mcnf-overlay-identity-collision-guard.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py", mode = "755" },
     { source = "packaging/systemd/mcnf-overlay-identity-claims-materializer.service", dest = "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service", mode = "644" },
     { source = "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf", dest = "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf", mode = "644" },
+    { source = "install-helpers/mesh-peer-recovery.sh", dest = "/usr/libexec/mackesd/mesh-peer-recovery", mode = "755" },
+    { source = "install-helpers/mesh-xdg-bind-recovery.sh", dest = "/usr/libexec/mackesd/mesh-xdg-bind-recovery", mode = "755" },
+    { source = "packaging/systemd/mcnf-peer-recovery.service", dest = "/usr/lib/systemd/system/mcnf-peer-recovery.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-xdg-bind-recovery.service", dest = "/usr/lib/systemd/system/mcnf-xdg-bind-recovery.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-peer-recovery-sleep", dest = "/usr/lib/systemd/system-sleep/mcnf-peer-recovery", mode = "755" },
+    { source = "packaging/systemd/90-mcnf-peer-recovery", dest = "/etc/NetworkManager/dispatcher.d/90-mcnf-peer-recovery", mode = "755" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
@@ -1225,7 +1249,7 @@ summary = "MCNF thin DigitalOcean lighthouse — Nebula relay, etcd quorum, and 
 payload_compress = "xz"
 # Keep the role variants monotonic with the base package for corrected-forward
 # fleet deployment.
-release = "6"
+release = "7"
 license = "GPL-3.0-or-later AND MPL-2.0"
 # The thin variant must replace (not co-install with) any role package that
 # owns the same daemon/unit paths.  An operator can use `dnf swap` for an
@@ -1241,12 +1265,19 @@ assets = [
     { source = "packaging/systemd/mackesd-data.service", dest = "/usr/lib/systemd/system/mackesd-data.service", mode = "644" },
     { source = "packaging/systemd/mackesd-compute.service", dest = "/usr/lib/systemd/system/mackesd-compute.service", mode = "644" },
     { source = "packaging/systemd/mackesd-integrations.service", dest = "/usr/lib/systemd/system/mackesd-integrations.service", mode = "644" },
-    # WL-CRIT-007 — ship the disabled producer and inert guard prerequisite on
-    # the thin control-plane role without adding an activation edge.
+    # WL-CRIT-007 — local identity admission is active before Nebula; the
+    # distributed producer remains disabled on the thin control-plane role.
     { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
     { source = "install-helpers/mcnf-overlay-identity-collision-guard.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py", mode = "755" },
     { source = "packaging/systemd/mcnf-overlay-identity-claims-materializer.service", dest = "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service", mode = "644" },
     { source = "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf", dest = "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf", mode = "644" },
+    { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery", mode = "755" },
+    { source = "install-helpers/mesh-peer-recovery.sh", dest = "/usr/libexec/mackesd/mesh-peer-recovery", mode = "755" },
+    { source = "install-helpers/mesh-xdg-bind-recovery.sh", dest = "/usr/libexec/mackesd/mesh-xdg-bind-recovery", mode = "755" },
+    { source = "packaging/systemd/mcnf-peer-recovery.service", dest = "/usr/lib/systemd/system/mcnf-peer-recovery.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-xdg-bind-recovery.service", dest = "/usr/lib/systemd/system/mcnf-xdg-bind-recovery.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-peer-recovery-sleep", dest = "/usr/lib/systemd/system-sleep/mcnf-peer-recovery", mode = "755" },
+    { source = "packaging/systemd/90-mcnf-peer-recovery", dest = "/etc/NetworkManager/dispatcher.d/90-mcnf-peer-recovery", mode = "755" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },
@@ -1362,12 +1393,18 @@ assets = [
     { source = "packaging/systemd/mackesd-data.service", dest = "/usr/lib/systemd/system/mackesd-data.service", mode = "644" },
     { source = "packaging/systemd/mackesd-compute.service", dest = "/usr/lib/systemd/system/mackesd-compute.service", mode = "644" },
     { source = "packaging/systemd/mackesd-integrations.service", dest = "/usr/lib/systemd/system/mackesd-integrations.service", mode = "644" },
-    # WL-CRIT-007 — the same disabled/inert authenticated snapshot
-    # prerequisite shipped by every role package.
+    # WL-CRIT-007 — the same active local identity admission and disabled
+    # distributed snapshot producer shipped by every role package.
     { source = "install-helpers/mcnf-overlay-identity-claims-materializer.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-claims-materializer.py", mode = "755" },
     { source = "install-helpers/mcnf-overlay-identity-collision-guard.py", dest = "/usr/libexec/mackesd/mcnf-overlay-identity-collision-guard.py", mode = "755" },
     { source = "packaging/systemd/mcnf-overlay-identity-claims-materializer.service", dest = "/usr/lib/systemd/system/mcnf-overlay-identity-claims-materializer.service", mode = "644" },
     { source = "packaging/systemd/nebula.service.d/05-overlay-identity-collision-guard.conf", dest = "/usr/lib/systemd/system/nebula.service.d/05-overlay-identity-collision-guard.conf", mode = "644" },
+    { source = "install-helpers/mesh-peer-recovery.sh", dest = "/usr/libexec/mackesd/mesh-peer-recovery", mode = "755" },
+    { source = "install-helpers/mesh-xdg-bind-recovery.sh", dest = "/usr/libexec/mackesd/mesh-xdg-bind-recovery", mode = "755" },
+    { source = "packaging/systemd/mcnf-peer-recovery.service", dest = "/usr/lib/systemd/system/mcnf-peer-recovery.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-xdg-bind-recovery.service", dest = "/usr/lib/systemd/system/mcnf-xdg-bind-recovery.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-peer-recovery-sleep", dest = "/usr/lib/systemd/system-sleep/mcnf-peer-recovery", mode = "755" },
+    { source = "packaging/systemd/90-mcnf-peer-recovery", dest = "/etc/NetworkManager/dispatcher.d/90-mcnf-peer-recovery", mode = "755" },
     { source = "packaging/systemd/mcnf-cloud-arm-credential.service", dest = "/usr/lib/systemd/system/mcnf-cloud-arm-credential.service", mode = "644" },
     { source = "install-helpers/mesh-secret-recipient-reconcile.sh", dest = "/usr/libexec/mackesd/mesh-secret-recipient-reconcile", mode = "755" },
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.service", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.service", mode = "644" },

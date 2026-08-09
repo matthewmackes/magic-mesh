@@ -13,6 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
+use mackes_mesh_types::location::{VerifiedPlace, WeatherCoverage};
+use mackes_mesh_types::nws_alert::GeoPoint;
 use rusqlite::{params, Connection, OpenFlags};
 
 /// Maximum UTF-8 byte length accepted for one offline-geocoder query.
@@ -68,8 +70,7 @@ fn valid_geo_result(result: &GeoResult) -> bool {
         ]
         .into_iter()
         .all(|text| {
-            text.len() <= MAX_GEOCODER_RESULT_TEXT_BYTES
-                && !text.chars().any(char::is_control)
+            text.len() <= MAX_GEOCODER_RESULT_TEXT_BYTES && !text.chars().any(char::is_control)
         })
 }
 
@@ -132,6 +133,53 @@ pub struct GeocodeOutcome {
     pub note: Option<String>,
 }
 
+/// A weather-capable result admitted from the same offline gazetteer.
+///
+/// Unlike route-only rows, these carry the verified metadata required by the
+/// typed weather-location contract. Missing metadata is never synthesized.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeatherGeoResult {
+    /// Stable identifier provisioned by the offline bundle.
+    pub place_id: String,
+    /// Human display label admitted from bounded gazetteer fields.
+    pub label: String,
+    /// WGS84 latitude.
+    pub latitude: f64,
+    /// WGS84 longitude.
+    pub longitude: f64,
+    /// IANA time-zone identifier provisioned with the place.
+    pub time_zone: String,
+    /// Official weather-provider coverage admitted for this place.
+    pub coverage: WeatherCoverage,
+}
+
+impl WeatherGeoResult {
+    /// Convert an admitted offline row into the exact typed manual preference.
+    #[must_use]
+    pub fn verified_place(&self, verified_at_ms: i64) -> VerifiedPlace {
+        VerifiedPlace {
+            place_id: self.place_id.clone(),
+            label: self.label.clone(),
+            point: GeoPoint {
+                latitude: self.latitude,
+                longitude: self.longitude,
+            },
+            time_zone: self.time_zone.clone(),
+            coverage: self.coverage,
+            verified_at_ms,
+        }
+    }
+}
+
+/// Bounded outcome for manual Weather location search.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WeatherGeocodeOutcome {
+    /// Ranked verified matches, bounded by the query contract.
+    pub results: Vec<WeatherGeoResult>,
+    /// Honest no-results or unavailable explanation.
+    pub note: Option<String>,
+}
+
 /// Turn free user text into an FTS5 prefix-MATCH expression: each alphanumeric
 /// token becomes a quoted prefix term, AND-ed together. `None` when the text
 /// holds no usable token (so we skip the query entirely). Quoting a token that
@@ -188,6 +236,63 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
         })
     })?;
     Ok(rows.flatten().filter(valid_geo_result).collect())
+}
+
+/// Query weather-capable rows from the existing offline gazetteer.
+///
+/// Production bundles add `weather_place_id`, `time_zone`, and
+/// `weather_coverage` to `places`. A legacy route-only gazetteer therefore
+/// fails this query closed instead of manufacturing contract fields.
+pub fn query_weather_db(
+    db: &Path,
+    text: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<WeatherGeoResult>> {
+    let Some(match_expr) = fts_match(text)? else {
+        return Ok(Vec::new());
+    };
+    let conn = open_gazetteer(db)?;
+    let mut stmt = conn.prepare(
+        "SELECT p.weather_place_id, p.name, p.housenumber, p.street, p.city, \
+         p.lat, p.lon, p.time_zone, p.weather_coverage \
+         FROM places_fts f JOIN places p ON p.id = f.rowid \
+         WHERE places_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+    )?;
+    let limit = i64::try_from(limit.min(24)).unwrap_or(24);
+    let rows = stmt.query_map(params![match_expr, limit], |row| {
+        let route = GeoResult {
+            name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            housenumber: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            street: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            city: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            lat: row.get(5)?,
+            lon: row.get(6)?,
+            kind: "weather-place".to_string(),
+        };
+        let coverage = match row.get::<_, String>(8)?.as_str() {
+            "nws_united_states" => Some(WeatherCoverage::NwsUnitedStates),
+            _ => None,
+        };
+        Ok(coverage.map(|coverage| WeatherGeoResult {
+            place_id: row.get(0).unwrap_or_default(),
+            label: route.title(),
+            latitude: route.lat,
+            longitude: route.lon,
+            time_zone: row.get(7).unwrap_or_default(),
+            coverage,
+        }))
+    })?;
+    let now_ms = i64::MAX / 2;
+    Ok(rows
+        .flatten()
+        .flatten()
+        .filter(|result| {
+            let place = result.verified_place(1);
+            place.validate_at(now_ms).is_ok()
+                && result.latitude.is_finite()
+                && result.longitude.is_finite()
+        })
+        .collect())
 }
 
 /// Reject symlinked or non-directory parent components before SQLite sees the
@@ -386,6 +491,34 @@ pub fn geocode(text: &str, limit: usize) -> GeocodeOutcome {
     }
 }
 
+/// Explicit-submit Weather search over the installed offline gazetteer.
+#[must_use]
+pub fn geocode_weather(text: &str, limit: usize) -> WeatherGeocodeOutcome {
+    let Some(db) = gazetteer_path() else {
+        return WeatherGeocodeOutcome {
+            results: Vec::new(),
+            note: Some("Offline location search unavailable: no gazetteer installed".to_string()),
+        };
+    };
+    match query_weather_db(&db, text, limit) {
+        Ok(results) if results.is_empty() => WeatherGeocodeOutcome {
+            results,
+            note: Some("No verified weather locations found".to_string()),
+        },
+        Ok(results) => WeatherGeocodeOutcome {
+            results,
+            note: None,
+        },
+        Err(_) => WeatherGeocodeOutcome {
+            results: Vec::new(),
+            note: Some(
+                "Offline location search unavailable: gazetteer lacks verified weather metadata"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)] // tests fail by panicking, with context
 mod tests {
@@ -465,6 +598,36 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "Snowflake Donuts");
         assert!((hits[0].lat - 32.198).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weather_query_admits_only_exact_verified_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("weather.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE places(id INTEGER PRIMARY KEY, name TEXT, housenumber TEXT, \
+               street TEXT, city TEXT, lat REAL, lon REAL, kind TEXT, \
+               weather_place_id TEXT, time_zone TEXT, weather_coverage TEXT); \
+             CREATE VIRTUAL TABLE places_fts USING fts5(name, housenumber, street, city, \
+               content='places', content_rowid='id', prefix='2 3'); \
+             INSERT INTO places VALUES \
+               (1,'Boston','','','Boston',42.36,-71.06,'place:city', \
+                'offline-boston-ma','America/New_York','nws_united_states'), \
+               (2,'Boston Fake','','','Boston',42.37,-71.07,'place:city', \
+                'offline-boston-fake','invented/zone','unsupported'); \
+             INSERT INTO places_fts(places_fts) VALUES('rebuild');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let hits = query_weather_db(&db, "Boston", 24).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].place_id, "offline-boston-ma");
+        let place = hits[0].verified_place(42);
+        assert_eq!(place.label, "Boston");
+        assert_eq!(place.time_zone, "America/New_York");
+        assert_eq!(place.coverage, WeatherCoverage::NwsUnitedStates);
     }
 
     #[test]
@@ -548,7 +711,11 @@ mod tests {
             .unwrap();
 
         let hits = query_db(&db, "athen", 10).unwrap();
-        assert_eq!(hits.len(), 3, "only valid synthetic rows may cross the boundary");
+        assert_eq!(
+            hits.len(),
+            3,
+            "only valid synthetic rows may cross the boundary"
+        );
         assert!(hits.iter().all(valid_geo_result));
         assert!(hits.iter().all(|hit| hit.name != "Out of range"));
         assert!(hits.iter().all(|hit| hit.name != "Bad longitude"));

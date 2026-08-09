@@ -18,7 +18,7 @@
 //! shell does not grow an X server merely to make an X11 card look launchable.
 
 use crate::resources::SecretReference;
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 /// Schema version for the bounded SSH/X11 admission contract.
@@ -900,24 +900,20 @@ mod tests {
 
     #[test]
     fn hostile_urls_commands_paths_and_traversal_are_rejected() {
-        assert!(
-            SshEndpoint::new(
-                "ssh://workstation.mesh/launch?cmd=id",
-                22,
-                "mde",
-                SshAuthentication::MeshIdentity,
-            )
-            .is_err()
-        );
-        assert!(
-            SshEndpoint::new(
-                "workstation.mesh",
-                22,
-                "mde;id",
-                SshAuthentication::MeshIdentity,
-            )
-            .is_err()
-        );
+        assert!(SshEndpoint::new(
+            "ssh://workstation.mesh/launch?cmd=id",
+            22,
+            "mde",
+            SshAuthentication::MeshIdentity,
+        )
+        .is_err());
+        assert!(SshEndpoint::new(
+            "workstation.mesh",
+            22,
+            "mde;id",
+            SshAuthentication::MeshIdentity,
+        )
+        .is_err());
         assert!(SftpPathSegment::new("../secrets").is_err());
         assert!(SftpPathSegment::new("$(id)").is_err());
         assert!(X11ApplicationId::new("/usr/bin/xterm").is_err());

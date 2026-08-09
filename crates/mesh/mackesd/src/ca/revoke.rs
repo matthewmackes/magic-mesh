@@ -173,27 +173,70 @@ mod tests {
 
     fn setup_db() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE nebula_peer_certs (
-                id INTEGER PRIMARY KEY,
-                node_id TEXT NOT NULL,
-                epoch INTEGER NOT NULL,
-                revoked_at INTEGER
-            );",
-        )
-        .expect("create table");
+        crate::store::migrate(&conn).expect("migrate test store");
         conn
+    }
+
+    fn seed_peer(conn: &rusqlite::Connection, node_id: &str, epoch: i64) {
+        let peer = crate::store::writer::CaPeerCertWrite {
+            node_id: node_id.into(),
+            epoch,
+            cert_pem: format!("cert:{node_id}:{epoch}"),
+            overlay_ip: format!("10.42.0.{}", epoch + 1),
+            public_key_pem: Some(format!("public:{node_id}")),
+            created_at: None,
+            expires_at: 4_102_444_800,
+        };
+        let active_epoch = conn
+            .query_row(
+                "SELECT epoch FROM nebula_ca WHERE mesh_id = 'mesh:test' AND retired_at IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok();
+        let operation = match active_epoch {
+            None => crate::store::writer::WriteOp::SeedLighthouseCa {
+                mesh_id: "mesh:test".into(),
+                epoch,
+                ca_cert_pem: format!("ca:{epoch}"),
+            },
+            Some(active_epoch) if active_epoch != epoch => {
+                crate::store::writer::WriteOp::RotateCa {
+                    mesh_id: "mesh:test".into(),
+                    expected_active_epoch: Some(active_epoch),
+                    new_epoch: epoch,
+                    ca_cert_pem: format!("ca:{epoch}"),
+                    peer_certs: vec![peer.clone()],
+                }
+            }
+            Some(_) => crate::store::writer::WriteOp::UpsertPeerCert {
+                mesh_id: "mesh:test".into(),
+                expected_epoch: epoch,
+                peer: peer.clone(),
+            },
+        };
+        crate::store::writer::request_or_execute(conn, operation)
+            .and_then(crate::store::writer::WriteResponse::into_count)
+            .expect("seed peer certificate");
+        if active_epoch.is_none() {
+            crate::store::writer::request_or_execute(
+                conn,
+                crate::store::writer::WriteOp::UpsertPeerCert {
+                    mesh_id: "mesh:test".into(),
+                    expected_epoch: epoch,
+                    peer,
+                },
+            )
+            .and_then(crate::store::writer::WriteResponse::into_count)
+            .expect("seed peer certificate");
+        }
     }
 
     #[test]
     fn revoke_marks_rows_and_bans_node() {
         let conn = setup_db();
-        conn.execute_batch(
-            "INSERT INTO nebula_peer_certs (node_id, epoch, revoked_at)
-             VALUES ('peer:anvil', 1, NULL),
-                    ('peer:anvil', 2, NULL);",
-        )
-        .expect("insert rows");
+        seed_peer(&conn, "peer:anvil", 1);
+        seed_peer(&conn, "peer:anvil", 2);
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let workgroup_root = tmp.path();
@@ -230,11 +273,16 @@ mod tests {
     #[test]
     fn revoke_already_revoked_rows_skips_them() {
         let conn = setup_db();
-        conn.execute_batch(
-            "INSERT INTO nebula_peer_certs (node_id, epoch, revoked_at)
-             VALUES ('peer:anvil', 1, 9999);",
+        seed_peer(&conn, "peer:anvil", 1);
+        crate::store::writer::request_or_execute(
+            &conn,
+            crate::store::writer::WriteOp::RevokePeerCert {
+                node_id: "peer:anvil".into(),
+                revoked_at: 9999,
+            },
         )
-        .expect("insert");
+        .and_then(crate::store::writer::WriteResponse::into_count)
+        .expect("seed revocation");
         let tmp = tempfile::tempdir().expect("tempdir");
         let count = revoke_peer(&conn, tmp.path(), "peer:self", "peer:anvil").expect("revoke");
         assert_eq!(count, 0, "already-revoked rows not re-touched");
@@ -253,11 +301,7 @@ mod tests {
     fn unsafe_identity_is_rejected_before_database_or_filesystem_mutation() {
         for (self_id, target_id) in [("../escape", "peer:anvil"), ("peer:self", "../escape")] {
             let conn = setup_db();
-            conn.execute(
-                "INSERT INTO nebula_peer_certs (node_id, epoch, revoked_at) VALUES (?1, 1, NULL)",
-                ["peer:anvil"],
-            )
-            .expect("insert active cert");
+            seed_peer(&conn, "peer:anvil", 1);
             let tmp = tempfile::tempdir().expect("workgroup root");
 
             let error = revoke_peer(&conn, tmp.path(), self_id, target_id)

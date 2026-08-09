@@ -45,6 +45,7 @@
 
 use std::time::{Duration, Instant};
 
+use ironrdp_cliprdr::{Client as CliprdrRoleClient, CliprdrClient};
 use ironrdp_connector::credssp::KerberosConfig;
 use ironrdp_connector::sspi::generator::NetworkRequest;
 use ironrdp_connector::{
@@ -66,21 +67,24 @@ use ironrdp_rdpsnd::client::Rdpsnd;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput, SessionError};
 use ironrdp_tokio::{
-    connect_begin, connect_finalize, mark_as_upgraded, FramedWrite as _, NetworkClient, TokioFramed,
+    FramedWrite as _, NetworkClient, TokioFramed, connect_begin, connect_finalize, mark_as_upgraded,
 };
 use tokio::net::TcpStream;
 
 use crate::audio::{
     PendingWave, PipeWireRdpsndHandler, PreparedAudio, RdpAudioCapability, RdpAudioStats,
 };
+use crate::clipboard::{ClipboardBridge, UNICODE_TEXT_FORMAT};
 use crate::config::RdpConfig;
 use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
 use crate::pin::{self, Fingerprint, PinAction, PinOutcome};
 use crate::pixel::{FramebufferError, PixelFormat};
-use crate::session::{rdp_clipboard_status, RdpSession};
+use crate::session::RdpSession;
 use crate::tier::RdpTierSettings;
-use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
+use mackes_mesh_types::vdi_clipboard::{
+    VdiClipboardChannel, VdiClipboardLaneStatus, VdiClipboardStatus,
+};
 
 /// Hard ceiling on the whole connection sequence (TCP + TLS + RDP handshake).
 /// A peer that cannot finish negotiating in this window is not going to.
@@ -170,6 +174,8 @@ pub enum ConnectError {
     Connector(ConnectorError),
     /// The `ironrdp` active-stage processing failed mid-session.
     Session(SessionError),
+    /// The negotiated CLIPRDR channel refused a bounded clipboard operation.
+    Clipboard(String),
     /// A decoded update did not fit the session framebuffer — the negotiated
     /// desktop differs from the [`RdpConfig`] geometry the session was built
     /// with (rebuild the session at [`Negotiated::desktop_size`]).
@@ -220,6 +226,7 @@ impl core::fmt::Display for ConnectError {
             ),
             Self::Connector(e) => write!(f, "rdp connection sequence failed: {e}"),
             Self::Session(e) => write!(f, "rdp active stage failed: {}", e.report()),
+            Self::Clipboard(e) => write!(f, "rdp clipboard failed: {e}"),
             Self::Blit(e) => write!(f, "decoded update does not fit the session desktop: {e}"),
             Self::Timeout { phase } => write!(
                 f,
@@ -254,6 +261,7 @@ impl std::error::Error for ConnectError {
             Self::Session(e) => Some(e),
             Self::Blit(e) => Some(e),
             Self::NoServerPublicKey
+            | Self::Clipboard(_)
             | Self::CertPinChanged { .. }
             | Self::Timeout { .. }
             | Self::Reactivation
@@ -297,13 +305,23 @@ pub struct Negotiated {
     /// The MCS user channel id (diagnostic evidence).
     pub user_channel_id: u16,
     /// The text-clipboard capability that was actually available alongside
-    /// this connection. A successful RDP desktop handshake does not imply
-    /// CLIPRDR is active; this remains an explicit typed unsupported report
-    /// until the wire processor is present.
+    /// this connection. The live connector installs a real text-only CLIPRDR
+    /// processor and reports both directions supported only after that channel
+    /// is part of the negotiated active stage.
     pub clipboard: VdiClipboardStatus,
     /// Typed audio capability snapshot taken when the connection was built.
     /// Use [`RdpConnection::audio_capability`] for the live state.
     pub audio: RdpAudioCapability,
+}
+
+fn live_clipboard_status() -> VdiClipboardStatus {
+    let lane = VdiClipboardLaneStatus::Supported {
+        channel: VdiClipboardChannel::RdpCliprdr,
+    };
+    VdiClipboardStatus {
+        host_to_guest: lane.clone(),
+        guest_to_host: lane,
+    }
 }
 
 /// A detected TLS-certificate change for a host that was already pinned
@@ -548,6 +566,7 @@ pub struct RdpConnection {
     image: DecodedImage,
     negotiated: Negotiated,
     audio: PreparedAudio,
+    clipboard: ClipboardBridge,
     /// A TLS-certificate change detected against the trust-on-first-use pin at
     /// connect time (vdi-vm-6). `Some` only on a non-strict connect whose
     /// fingerprint differed from the pin — the shell surfaces it as a warning.
@@ -580,14 +599,20 @@ impl RdpConnection {
         let mut audio = PreparedAudio::new();
         let initial_audio = audio.initial_capability;
         let audio_handler = audio.handler.take();
+        let (clipboard, clipboard_backend) = ClipboardBridge::pair();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(ConnectError::Runtime)?;
 
-        let (framed, connection_result, cert_pin_change) =
-            runtime.block_on(Self::handshake(config, &host, port, audio_handler))?;
+        let (framed, connection_result, cert_pin_change) = runtime.block_on(Self::handshake(
+            config,
+            &host,
+            port,
+            audio_handler,
+            clipboard_backend,
+        ))?;
 
         let negotiated = Negotiated {
             desktop_size: (
@@ -598,7 +623,7 @@ impl RdpConnection {
             tier,
             io_channel_id: connection_result.io_channel_id,
             user_channel_id: connection_result.user_channel_id,
-            clipboard: rdp_clipboard_status(),
+            clipboard: live_clipboard_status(),
             audio: initial_audio,
         };
         tracing::info!(
@@ -623,6 +648,7 @@ impl RdpConnection {
             image,
             negotiated,
             audio,
+            clipboard,
             cert_pin_change,
             started: Instant::now(),
             first_input_focus_pending: true,
@@ -649,6 +675,7 @@ impl RdpConnection {
         host: &str,
         port: u16,
         audio_handler: Option<PipeWireRdpsndHandler>,
+        clipboard_backend: Box<dyn ironrdp_cliprdr::backend::CliprdrBackend>,
     ) -> Result<
         (
             TlsFramed,
@@ -674,6 +701,7 @@ impl RdpConnection {
         let mut framed = TokioFramed::new(stream);
         config.enable_audio_playback = audio_handler.is_some();
         let mut connector = ClientConnector::new(config, client_addr);
+        connector.attach_static_channel(CliprdrClient::new(clipboard_backend));
         if let Some(handler) = audio_handler {
             connector.attach_static_channel(Rdpsnd::new(Box::new(handler)));
         }
@@ -840,6 +868,80 @@ impl RdpConnection {
                 context: "write",
                 source,
             })
+    }
+
+    /// Offer one bounded host text value through the negotiated CLIPRDR
+    /// channel. The shell permission gate must approve the value before this
+    /// method is called.
+    pub fn send_clipboard_to_guest(&mut self, text: String) -> Result<(), ConnectError> {
+        self.clipboard
+            .offer_host_text(text)
+            .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        let messages = self
+            .active_stage
+            .get_svc_processor_mut::<CliprdrClient>()
+            .ok_or_else(|| ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into()))?
+            .initiate_copy(&[UNICODE_TEXT_FORMAT])
+            .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        self.write_clipboard_messages(messages)
+    }
+
+    /// Take the newest bounded guest Unicode text returned by CLIPRDR.
+    pub fn take_guest_clipboard(&self) -> Option<String> {
+        self.clipboard.take_remote_text()
+    }
+
+    fn write_clipboard_messages(
+        &mut self,
+        messages: ironrdp_cliprdr::CliprdrSvcMessages<CliprdrRoleClient>,
+    ) -> Result<(), ConnectError> {
+        let frame = self
+            .active_stage
+            .process_svc_processor_messages::<CliprdrClient>(messages)
+            .map_err(ConnectError::Session)?;
+        self.write_frame(&frame)
+    }
+
+    fn flush_clipboard_callbacks(&mut self) -> Result<(), ConnectError> {
+        if self.clipboard.take_initial_format_list_request() {
+            let formats = self
+                .clipboard
+                .is_ready()
+                .then(|| vec![UNICODE_TEXT_FORMAT])
+                .unwrap_or_default();
+            let messages = self
+                .active_stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .ok_or_else(|| {
+                    ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
+                })?
+                .initiate_copy(&formats)
+                .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+            self.write_clipboard_messages(messages)?;
+        }
+        if self.clipboard.take_remote_unicode_offer() {
+            let messages = self
+                .active_stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .ok_or_else(|| {
+                    ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
+                })?
+                .initiate_paste(ironrdp_cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT)
+                .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+            self.write_clipboard_messages(messages)?;
+        }
+        if let Some(response) = self.clipboard.take_local_data_response() {
+            let messages = self
+                .active_stage
+                .get_svc_processor_mut::<CliprdrClient>()
+                .ok_or_else(|| {
+                    ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
+                })?
+                .submit_format_data(response)
+                .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+            self.write_clipboard_messages(messages)?;
+        }
+        Ok(())
     }
 
     /// Ask the server to repaint one bounded area of the negotiated desktop.
@@ -1047,7 +1149,7 @@ impl RdpConnection {
                 return Err(ConnectError::Io {
                     context: "read",
                     source,
-                })
+                });
             }
             Ok(Ok(pdu)) => pdu,
         };
@@ -1058,7 +1160,12 @@ impl RdpConnection {
             .process(&mut self.image, action, &frame)
             .map_err(ConnectError::Session)?;
         self.flush_pending_audio();
-        self.apply_outputs(session, outputs)
+        let outcome = self.apply_outputs(session, outputs)?;
+        // The active-stage responses include CLIPRDR acknowledgements. Put
+        // those on the wire before callback-driven follow-up requests so the
+        // peer observes the protocol order required by MS-RDPECLIP.
+        self.flush_clipboard_callbacks()?;
+        Ok(outcome)
     }
 
     /// Drain the session's queued input intents ([`RdpSession::take_input`])
@@ -1112,9 +1219,9 @@ impl RdpConnection {
 #[cfg(test)]
 mod tests {
     use super::{
+        CertPinChange, ConnectError, FOCUS_IN_REPEAT_COUNT, PumpOutcome, TAB_SCANCODE,
         connector_config_for, ensure_rustls_crypto_provider, focus_in_events, push_fastpath_events,
-        refresh_region_for_area, CertPinChange, ConnectError, PumpOutcome, FOCUS_IN_REPEAT_COUNT,
-        TAB_SCANCODE,
+        refresh_region_for_area,
     };
     use crate::audio::{RdpAudioCapability, RdpAudioUnsupportedReason};
     use crate::config::RdpConfig;

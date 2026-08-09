@@ -1854,14 +1854,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let bus = temp.path().join("bus");
         let persist = Persist::open(bus.clone()).expect("open Bus");
-        let connection = rusqlite::Connection::open(bus.join("index.sqlite")).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TRIGGER reject_host_apply BEFORE INSERT ON messages
-                 WHEN NEW.topic = 'action/host/local/apply'
-                 BEGIN SELECT RAISE(FAIL, 'host apply rejected'); END;",
-            )
-            .unwrap();
+        crate::store::writer::install_reject_host_apply_fixture(&bus.join("index.sqlite"))
+            .expect("install host-apply rejection fixture");
         let worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
             .with_bus_root(bus.clone())
             .with_availability_durable_path(temp.path().join("availability/current.json"));

@@ -629,11 +629,7 @@ impl WorkerSpec {
     /// A canonical registration for a worker constructed directly under the
     /// monolithic supervisor during the process-isolation migration.
     #[must_use]
-    const fn direct(
-        name: &'static str,
-        policy: RestartPolicy,
-        group: WorkerGroup,
-    ) -> Self {
+    const fn direct(name: &'static str, policy: RestartPolicy, group: WorkerGroup) -> Self {
         let mut spec = Self::tier(name, 0, policy, group);
         spec.spawn_binding = SpawnBinding::DirectSupervisor;
         spec
@@ -963,6 +959,95 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         WorkerGroup::Integrations,
     )
     .with_config(ConfigPredicate::EnvironmentPresent("MDE_VEHICLE_GATEWAY")),
+    // WL-FUNC-017 S2 — the Workstation weather/map location authority. It is
+    // default-on even without a vehicle source because Manual mode and the
+    // persisted verified fallback remain usable; a Lighthouse has no Maps seat.
+    WorkerSpec::tier(
+        "weather_location",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    )
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 1,
+        max_interval_secs: 5,
+    }),
+    // WL-FUNC-017 S3 — daemon-owned official NWS current conditions and
+    // effective-location forecast. The provider is keyless and default-on for
+    // seated Workstation nodes; all network and projection bounds are internal.
+    WorkerSpec::tier(
+        "weather_forecast",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 30,
+        max_interval_secs: 10 * 60,
+    }),
+    // WL-FUNC-017 S4 — keyless official nowCOAST atmospheric map fields.
+    WorkerSpec::tier(
+        "weather_atmosphere",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Integrations,
+    )
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 30,
+        max_interval_secs: 10 * 60,
+    }),
+    // WL-FUNC-017 S6 — node-scoped route and navigation authority. The worker
+    // is reachable by default on seated nodes and remains honestly unavailable
+    // until an approved production route provider is provisioned.
+    WorkerSpec::tier(
+        "navigation",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    )
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 1,
+        max_interval_secs: 5,
+    }),
+    // WL-FUNC-022 S2 — local persisted Clock deadline authority. Workstation
+    // scoped because this first slice executes local alarms/timers only.
+    WorkerSpec::tier(
+        "clock",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    )
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 1,
+        max_interval_secs: 5,
+    }),
+    // WL-FUNC-020 S1 — workstation Android catalog trust boundary. The worker
+    // remains alive but fail-closed until both local public-key settings exist.
+    WorkerSpec::tier(
+        "android_catalog",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    )
+    .with_config(ConfigPredicate::EnvironmentPresent(
+        "MDE_ANDROID_CATALOG_TRUST_KEY_FILE",
+    ))
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 1,
+        max_interval_secs: 1,
+    }),
+    // WL-FUNC-018 S2 — workstation Flatpak catalog trust boundary. The worker
+    // stays registered but fail-closed until its public trust anchor is present.
+    WorkerSpec::tier(
+        "app_catalog",
+        1,
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    )
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 1,
+        max_interval_secs: 1,
+    }),
     // WL-FUNC-012 / MG90 airspace — workstation-side typed scanner mirror.
     // The default worker publishes an explicit no-source state until a proven
     // MG90 survey probe is configured; it never invents a scanner endpoint.
@@ -1344,65 +1429,189 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // extracted. These used to live in a test-only NON_TIERED_WORKERS
     // exception list, which meant they had no runtime contract at all.
     WorkerSpec::direct("action", RestartPolicy::Always, WorkerGroup::Actions),
-    WorkerSpec::direct("alert_relay", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct(
+        "alert_relay",
+        RestartPolicy::Always,
+        WorkerGroup::Integrations,
+    ),
     WorkerSpec::responder("apps_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("apps_installed", RestartPolicy::Always, WorkerGroup::Observation),
-    WorkerSpec::direct("apps_running", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct(
+        "apps_installed",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::direct(
+        "apps_running",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::responder("bus_retention_gc", WorkerGroup::Data),
-    WorkerSpec::direct("cert_authority", RestartPolicy::Always, WorkerGroup::Control),
+    WorkerSpec::direct(
+        "cert_authority",
+        RestartPolicy::Always,
+        WorkerGroup::Control,
+    ),
     WorkerSpec::responder("clipboard_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("compute_expose", RestartPolicy::Always, WorkerGroup::Compute),
-    WorkerSpec::direct("compute_migrate", RestartPolicy::Always, WorkerGroup::Compute),
-    WorkerSpec::direct("compute_provision", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct(
+        "compute_expose",
+        RestartPolicy::Always,
+        WorkerGroup::Compute,
+    ),
+    WorkerSpec::direct(
+        "compute_migrate",
+        RestartPolicy::Always,
+        WorkerGroup::Compute,
+    ),
+    WorkerSpec::direct(
+        "compute_provision",
+        RestartPolicy::Always,
+        WorkerGroup::Compute,
+    ),
     WorkerSpec::responder("connect_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("connect_firewall", RestartPolicy::OnFailure, WorkerGroup::Actions),
+    WorkerSpec::direct(
+        "connect_firewall",
+        RestartPolicy::OnFailure,
+        WorkerGroup::Actions,
+    ),
     WorkerSpec::direct("copilot", RestartPolicy::Always, WorkerGroup::Integrations),
-    WorkerSpec::direct("cups_sync", RestartPolicy::Always, WorkerGroup::Integrations),
-    WorkerSpec::direct("datacenter_orchestrator", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct(
+        "cups_sync",
+        RestartPolicy::Always,
+        WorkerGroup::Integrations,
+    ),
+    WorkerSpec::direct(
+        "datacenter_orchestrator",
+        RestartPolicy::Always,
+        WorkerGroup::Compute,
+    ),
     WorkerSpec::direct("dc_auditor", RestartPolicy::Always, WorkerGroup::Compute),
     WorkerSpec::responder("dc_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct("dc_health", RestartPolicy::Always, WorkerGroup::Observation),
     WorkerSpec::direct("dc_jobs", RestartPolicy::Always, WorkerGroup::Compute),
     WorkerSpec::responder("dc_power_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct("dc_promote", RestartPolicy::Always, WorkerGroup::Compute),
-    WorkerSpec::direct("dc_snap_scheduler", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct(
+        "dc_snap_scheduler",
+        RestartPolicy::Always,
+        WorkerGroup::Compute,
+    ),
     WorkerSpec::responder("ddns_bus_responder", WorkerGroup::Actions),
     WorkerSpec::responder("ddns_reconcile", WorkerGroup::Integrations),
     WorkerSpec::responder("directory_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct("dr_scheduler", RestartPolicy::Always, WorkerGroup::Compute),
-    WorkerSpec::direct("farm_orchestrator", RestartPolicy::Always, WorkerGroup::Compute),
+    WorkerSpec::direct(
+        "farm_orchestrator",
+        RestartPolicy::Always,
+        WorkerGroup::Compute,
+    ),
     WorkerSpec::responder("files_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("firewall_monitor", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct(
+        "firewall_monitor",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::responder("fleet_bus_responder", WorkerGroup::Actions),
     WorkerSpec::responder("host_ops_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("host_state", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct(
+        "host_state",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::responder("jobs_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("leader_election", RestartPolicy::Always, WorkerGroup::Control),
-    WorkerSpec::direct("media_registry", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct(
+        "leader_election",
+        RestartPolicy::Always,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::direct(
+        "media_registry",
+        RestartPolicy::Always,
+        WorkerGroup::Integrations,
+    ),
     WorkerSpec::direct("mesh_firewall", RestartPolicy::Always, WorkerGroup::Control),
     WorkerSpec::direct("mirror_syncd", RestartPolicy::Always, WorkerGroup::Data),
-    WorkerSpec::direct("navidrome_supervisor", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct(
+        "navidrome_supervisor",
+        RestartPolicy::Always,
+        WorkerGroup::Integrations,
+    ),
     WorkerSpec::responder("nebula_bus_responder", WorkerGroup::Control),
-    WorkerSpec::direct("nebula_ca_backup", RestartPolicy::OnFailure, WorkerGroup::Data),
-    WorkerSpec::direct("nebula_csr_watcher", RestartPolicy::OnFailure, WorkerGroup::Control),
-    WorkerSpec::direct("nebula_enroll_listener", RestartPolicy::OnFailure, WorkerGroup::Control),
-    WorkerSpec::direct("nebula_https_listener", RestartPolicy::OnFailure, WorkerGroup::Control),
+    WorkerSpec::direct(
+        "nebula_ca_backup",
+        RestartPolicy::OnFailure,
+        WorkerGroup::Data,
+    ),
+    WorkerSpec::direct(
+        "nebula_csr_watcher",
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::direct(
+        "nebula_enroll_listener",
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::direct(
+        "nebula_https_listener",
+        RestartPolicy::OnFailure,
+        WorkerGroup::Control,
+    ),
     WorkerSpec::direct("netassess", RestartPolicy::Always, WorkerGroup::Observation),
-    WorkerSpec::direct("netdata_aggregator", RestartPolicy::Always, WorkerGroup::Integrations),
-    WorkerSpec::direct("peer-cap", RestartPolicy::OnFailure, WorkerGroup::Observation),
+    WorkerSpec::direct(
+        "netdata_aggregator",
+        RestartPolicy::Always,
+        WorkerGroup::Integrations,
+    ),
+    WorkerSpec::direct(
+        "peer-cap",
+        RestartPolicy::OnFailure,
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::direct("probe", RestartPolicy::Always, WorkerGroup::Observation),
     WorkerSpec::responder("route_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("router_registry", RestartPolicy::Always, WorkerGroup::Observation),
-    WorkerSpec::direct("selinux_monitor", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct(
+        "router_registry",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::direct(
+        "selinux_monitor",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::responder("settings_bus_responder", WorkerGroup::Actions),
     WorkerSpec::responder("shell_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("surface_enable", RestartPolicy::Always, WorkerGroup::Actions),
-    WorkerSpec::direct("surface_firmware", RestartPolicy::Always, WorkerGroup::Actions),
-    WorkerSpec::direct("surface_verify", RestartPolicy::Always, WorkerGroup::Observation),
-    WorkerSpec::direct("surrounding_hosts", RestartPolicy::Always, WorkerGroup::Observation),
+    WorkerSpec::direct(
+        "surface_enable",
+        RestartPolicy::Always,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::direct(
+        "surface_firmware",
+        RestartPolicy::Always,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::direct(
+        "surface_verify",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::direct(
+        "surrounding_hosts",
+        RestartPolicy::Always,
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::responder("tofu_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("upgrade_intent_watcher", RestartPolicy::Always, WorkerGroup::Actions),
-    WorkerSpec::direct("voice_provision", RestartPolicy::Always, WorkerGroup::Integrations),
+    WorkerSpec::direct(
+        "upgrade_intent_watcher",
+        RestartPolicy::Always,
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::direct(
+        "voice_provision",
+        RestartPolicy::Always,
+        WorkerGroup::Integrations,
+    ),
     WorkerSpec::responder("voip_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct("voip_rtt", RestartPolicy::Always, WorkerGroup::Observation),
     WorkerSpec::responder("vpn_bus_responder", WorkerGroup::Actions),

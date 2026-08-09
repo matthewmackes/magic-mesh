@@ -61,6 +61,15 @@ has_durable_migration_boundary() {
     && contains_literal 'replay_migration_commands' "$file"
 }
 
+has_durable_distributed_migration() {
+  local file="$1"
+  contains_literal 'struct MigrationLedger' "$file" \
+    && contains_literal 'source_cursor' "$file" \
+    && contains_literal 'ack_jobs' "$file" \
+    && contains_literal 'PendingPhase::Relinquish' "$file" \
+    && contains_literal 'PendingPhase::Rollback' "$file"
+}
+
 has_retired_spawn() {
   # Keep this check multiline-aware without making the farm image depend on
   # ripgrep or PCRE: an actuator call ends at the first `});` after its start.
@@ -117,6 +126,19 @@ EOF
   printf '%s\n' 'let mut command = Command::new("virsh");' >"$fixture/compute_migrate.rs"
   if ! production_contains_literal 'Command::new("virsh")' "$fixture/compute_migrate.rs"; then
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — direct migration actuator fixture was not detected' >&2
+    return 1
+  fi
+  printf '%s\n' 'let mut source_cursor = None; let mut pending_commits = Vec::new();' >"$fixture/compute_migrate.rs"
+  if has_durable_distributed_migration "$fixture/compute_migrate.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — volatile distributed migration fixture was accepted' >&2
+    return 1
+  fi
+  cat >"$fixture/compute_migrate.rs" <<'EOF'
+struct MigrationLedger { source_cursor: Option<String>, ack_jobs: Vec<String> }
+fn reconcile() { let _ = PendingPhase::Relinquish; let _ = PendingPhase::Rollback; }
+EOF
+  if ! has_durable_distributed_migration "$fixture/compute_migrate.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — durable distributed migration fixture was rejected' >&2
     return 1
   fi
   printf '%s\n' 'fn drain_migration_commands() {}' >"$fixture/workload_compute.rs"
@@ -201,7 +223,8 @@ if production_contains_literal 'Command::new("virsh")' "$compute_migrate" \
   exit 1
 fi
 if ! contains_literal 'WorkloadMigrationClient' "$compute_migrate" \
-  || ! has_durable_migration_boundary "$workload_compute"; then
+  || ! has_durable_migration_boundary "$workload_compute" \
+  || ! has_durable_distributed_migration "$compute_migrate"; then
   printf '%s\n' 'lint-workload-authority.sh: migration commands are not durably reconciler-owned' >&2
   exit 1
 fi

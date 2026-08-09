@@ -987,12 +987,16 @@ mod tests {
         let store = fresh_store();
         {
             let conn = store.lock().await;
-            conn.execute(
-                "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) \
-                 VALUES ('m1', 0, 'pem', NULL)",
-                [],
+            crate::store::writer::request_or_execute(
+                &conn,
+                crate::store::writer::WriteOp::MintCa {
+                    mesh_id: "m1".into(),
+                    ca_cert_pem: "pem".into(),
+                },
             )
-            .expect("insert ca");
+            .expect("mint ca")
+            .into_count()
+            .expect("mint accepted");
         }
         let svc = NebulaStatusService::new(store, "peer:local", "host")
             .with_role_marker("/nonexistent/marker".into());

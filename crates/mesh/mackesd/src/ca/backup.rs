@@ -353,9 +353,9 @@ pub fn assemble_from_store(
     })
 }
 
-/// Pure helper — apply a [`BundlePlaintext`] to a target store.
-/// INSERT-OR-REPLACE semantics: rows already present at the same
-/// (mesh_id, epoch) get overwritten. Used by the
+/// Pure helper — apply a [`BundlePlaintext`] to a target store through the
+/// typed SQLite-writer authority. Identical durable rows are replay-safe;
+/// conflicting rows at the same authority key are refused. Used by the
 /// `mackesd ca import` CLI's restore path.
 ///
 /// # Errors
@@ -753,6 +753,43 @@ mod tests {
         conn
     }
 
+    fn seed_store(
+        conn: &rusqlite::Connection,
+        mesh_id: &str,
+        ca_cert_pem: &str,
+        peer: Option<(&str, &str, &str)>,
+    ) {
+        let peer_certs = peer
+            .into_iter()
+            .map(
+                |(node_id, cert_pem, overlay_ip)| crate::store::writer::CaPeerCertWrite {
+                    node_id: node_id.into(),
+                    epoch: 0,
+                    cert_pem: cert_pem.into(),
+                    overlay_ip: overlay_ip.into(),
+                    public_key_pem: None,
+                    created_at: Some(100),
+                    expires_at: 200,
+                },
+            )
+            .collect();
+        crate::store::writer::request_or_execute(
+            conn,
+            crate::store::writer::WriteOp::RestoreCaBackup {
+                mesh_id: mesh_id.into(),
+                ca_certs: vec![crate::store::writer::CaCertWrite {
+                    epoch: 0,
+                    ca_cert_pem: ca_cert_pem.into(),
+                    created_at: 100,
+                    retired_at: None,
+                }],
+                peer_certs,
+            },
+        )
+        .and_then(crate::store::writer::WriteResponse::into_count)
+        .expect("seed store through typed writer");
+    }
+
     #[test]
     fn assemble_from_empty_store_returns_empty_lists() {
         let conn = fresh_store();
@@ -765,19 +802,7 @@ mod tests {
     #[test]
     fn assemble_pulls_ca_and_peer_rows() {
         let conn = fresh_store();
-        conn.execute(
-            "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, created_at, retired_at) \
-             VALUES ('m1', 0, 'CA-PEM', 100, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, created_at, expires_at) \
-             VALUES ('peer:a', 0, 'P1', '10.42.0.5', 100, 200)",
-            [],
-        )
-        .unwrap();
+        seed_store(&conn, "m1", "CA-PEM", Some(("peer:a", "P1", "10.42.0.5")));
         let pt = assemble_from_store(&conn, "m1", "CA-KEY").expect("assemble");
         assert_eq!(pt.ca_certs.len(), 1);
         assert_eq!(pt.ca_certs[0].ca_cert_pem, "CA-PEM");
@@ -789,19 +814,7 @@ mod tests {
     #[test]
     fn restore_round_trips_through_assemble() {
         let src = fresh_store();
-        src.execute(
-            "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, created_at, retired_at) \
-             VALUES ('m1', 0, 'CA-PEM', 100, NULL)",
-            [],
-        )
-        .unwrap();
-        src.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, created_at, expires_at) \
-             VALUES ('peer:a', 0, 'P1', '10.42.0.5', 100, 200)",
-            [],
-        )
-        .unwrap();
+        seed_store(&src, "m1", "CA-PEM", Some(("peer:a", "P1", "10.42.0.5")));
         let pt = assemble_from_store(&src, "m1", "CA-KEY").expect("assemble");
 
         // Fresh dest store + restore.
@@ -820,12 +833,7 @@ mod tests {
     #[test]
     fn restore_rejects_invalid_authority_rows_without_partial_effects() {
         let dest = fresh_store();
-        dest.execute(
-            "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, created_at, retired_at) \
-             VALUES ('existing', 0, 'EXISTING-CA', 100, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_store(&dest, "existing", "EXISTING-CA", None);
         let bundle = BundlePlaintext {
             schema_version: 1,
             exported_at: 100,

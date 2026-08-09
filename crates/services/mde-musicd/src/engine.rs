@@ -201,6 +201,21 @@ fn is_cached_stream_url(url: &str) -> bool {
     reqwest::Url::parse(url).map_or(false, |parsed| parsed.scheme() == CACHED_STREAM_SCHEME)
 }
 
+/// Encode a daemon-admitted local file for the private decoder boundary. This
+/// locator is never part of a Clock contract or daemon reply.
+pub(crate) fn local_file_stream_url(path: &std::path::Path) -> Option<String> {
+    reqwest::Url::from_file_path(path)
+        .ok()
+        .map(|url| url.to_string())
+}
+
+fn local_file_stream_path(url: &str) -> Option<std::path::PathBuf> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    (parsed.scheme() == "file")
+        .then(|| parsed.to_file_path().ok())
+        .flatten()
+}
+
 /// Should the queue driver begin pre-buffering the next track? True once
 /// the current track is within [`GAPLESS_LEAD_MS`] of its end (and its
 /// duration is known).
@@ -538,6 +553,86 @@ impl EngineHandle {
         self.play_from(tracks, 0);
     }
 
+    /// Play one closed-set bundled Clock tone until [`stop`](Self::stop).
+    /// Samples are synthesized inside the daemon and never resolve a caller
+    /// supplied path, URL, or command.
+    pub fn play_bundled_clock_tone(&self, tone_id: &str) -> bool {
+        let frequency_hz = match tone_id {
+            "bell" | "bright-bell" => 880.0_f32,
+            "chime" => 660.0_f32,
+            _ => return false,
+        };
+        self.stop();
+        if self.shared.renderer_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.shared.stop.store(false, Ordering::Relaxed);
+        self.shared.playing.store(true, Ordering::Relaxed);
+        self.shared.decode_done.store(false, Ordering::Relaxed);
+        self.shared.frames_played.store(0, Ordering::Relaxed);
+        self.shared.frames_enqueued.store(0, Ordering::Relaxed);
+        self.shared
+            .track_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.shared.begin_track();
+
+        let shared = self.shared.clone();
+        let handle = std::thread::Builder::new()
+            .name("mde-musicd-clock-tone".to_string())
+            .spawn(move || {
+                let frames_per_chunk = (shared.device_rate / 50).max(1) as usize;
+                let channels = usize::from(shared.device_channels);
+                let mut frame_index = 0_u64;
+                while !shared.stop.load(Ordering::Relaxed) {
+                    while !shared.stop.load(Ordering::Relaxed)
+                        && shared
+                            .ring
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .len()
+                            > shared.target_ring
+                    {
+                        std::thread::sleep(Duration::from_millis(8));
+                    }
+                    if shared.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut samples = Vec::with_capacity(frames_per_chunk * channels);
+                    for _ in 0..frames_per_chunk {
+                        let cycle_frame = frame_index % u64::from(shared.device_rate);
+                        let audible = cycle_frame < u64::from(shared.device_rate) * 3 / 5;
+                        let phase =
+                            2.0_f32 * std::f32::consts::PI * frequency_hz * frame_index as f32
+                                / shared.device_rate as f32;
+                        let envelope = if audible { 0.35_f32 } else { 0.0_f32 };
+                        let sample = phase.sin() * envelope;
+                        samples.extend(std::iter::repeat_n(sample, channels));
+                        frame_index = frame_index.saturating_add(1);
+                    }
+                    shared.push_samples(&samples);
+                }
+                shared.playing.store(false, Ordering::Relaxed);
+                shared.decode_done.store(true, Ordering::Relaxed);
+            });
+        match handle {
+            Ok(joined) => {
+                *self
+                    .decode
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(joined);
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not start Clock tone producer");
+                self.shared.playing.store(false, Ordering::Relaxed);
+                self.shared.decode_done.store(true, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
     /// AIR-2.c — like [`play`](EngineHandle::play) but records the queue cursor
     /// that engine-track 0 corresponds to, so the serve loop's auto-advance
     /// driver can map the audible track back to the right queue index as gapless
@@ -718,6 +813,27 @@ impl EngineHandle {
         self.shared.decode_done.store(true, Ordering::Relaxed);
         self.shared.seekable.store(false, Ordering::Relaxed);
         self.shared.seek_ms.store(-1, Ordering::Relaxed);
+    }
+
+    /// Revoke an unhealthy renderer without joining a decode thread that may
+    /// currently be blocked in a failed provider read. Dropping the owning
+    /// [`Engine`] removes the physical output stream; the detached decoder sees
+    /// `stop` and exits when its bounded/provider operation returns.
+    pub fn revoke_renderer(&self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.playing.store(false, Ordering::Release);
+        self.shared
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let _ = self
+            .decode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.shared.decode_done.store(true, Ordering::Release);
+        self.shared.seekable.store(false, Ordering::Release);
     }
 
     /// Set the volume multiplier (clamped to `0.0..=1.0`).
@@ -1001,71 +1117,80 @@ fn decode_track_at(
     }
     let allow_cache = resume_ms.is_none();
     let cache_identity = stream_cache_identity(url, codec);
-    let source: Box<dyn symphonia::core::io::MediaSource> = if is_cached_stream_url(url) {
-        Box::new(Cursor::new(cached_track_source(
-            cache_identity.as_ref(),
-            &format!("offline cache unavailable for {url}"),
-            shared,
-        )?))
-    } else {
-        match fetch_stream_response(
-            &request_url,
-            resume_ms.map(|_| Duration::from_secs(RECONNECT_REQUEST_TIMEOUT_SECS)),
-        )
-        .and_then(|response| {
-            response
-                .error_for_status()
-                .map_err(|error| error.to_string())
-        }) {
-            Ok(resp) => {
-                // AIR — radio/live streams are infinite (no Content-Length / chunked), so
-                // buffering the whole body with `.bytes()` never returns → "error decoding
-                // response body" + an audio underrun (the reported Radio bug). Stream those
-                // through a pipe into an unseekable source instead. A finite track (a song
-                // from the Airsonic `stream` endpoint, which sends Content-Length) is still
-                // buffered into a seekable Cursor so format decoders that seek keep working.
-                let finite = resp.content_length().is_some_and(|n| n > 0);
-                // MUSIC-RFX-2 — only a finite (Cursor-backed) track is seekable; a live
-                // stream stays false so the scrubber is hidden + a seek request no-ops.
-                shared.seekable.store(finite, Ordering::Relaxed);
-                if finite {
-                    let bytes = match resp.bytes() {
-                        Ok(bytes) => bytes.to_vec(),
-                        Err(e) if allow_cache => cached_track_source(
-                            cache_identity.as_ref(),
-                            &format!("read body {request_url}: {e}"),
-                            shared,
-                        )?,
-                        Err(e) => return Err(format!("read body {request_url}: {e}")),
-                    };
-                    if allow_cache {
-                        if let Some((song_id, suffix)) = &cache_identity {
-                            let _ = cache::write_cached_track(
-                                &cache::cache_dir(),
-                                song_id,
-                                suffix,
-                                &bytes,
-                                cache::now_ms(),
-                                false,
-                            );
-                        }
-                    }
-                    Box::new(Cursor::new(bytes))
-                } else {
-                    // Keep the response as the decoder's reader. A producer pipe would
-                    // turn a provider read error into an indistinguishable clean EOF by
-                    // discarding the producer's `io::copy` result.
-                    Box::new(ReadOnlySource::new(resp))
-                }
-            }
-            Err(e) if allow_cache => Box::new(Cursor::new(cached_track_source(
+    let source: Box<dyn symphonia::core::io::MediaSource> =
+        if let Some(path) = local_file_stream_path(url) {
+            shared.seekable.store(true, Ordering::Relaxed);
+            Box::new(std::fs::File::open(&path).map_err(|error| {
+                format!(
+                    "open admitted local Clock audio {}: {error}",
+                    path.display()
+                )
+            })?)
+        } else if is_cached_stream_url(url) {
+            Box::new(Cursor::new(cached_track_source(
                 cache_identity.as_ref(),
-                &format!("fetch {request_url}: {e}"),
+                &format!("offline cache unavailable for {url}"),
                 shared,
-            )?)),
-            Err(e) => return Err(format!("fetch {request_url}: {e}")),
-        }
-    };
+            )?))
+        } else {
+            match fetch_stream_response(
+                &request_url,
+                resume_ms.map(|_| Duration::from_secs(RECONNECT_REQUEST_TIMEOUT_SECS)),
+            )
+            .and_then(|response| {
+                response
+                    .error_for_status()
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(resp) => {
+                    // AIR — radio/live streams are infinite (no Content-Length / chunked), so
+                    // buffering the whole body with `.bytes()` never returns → "error decoding
+                    // response body" + an audio underrun (the reported Radio bug). Stream those
+                    // through a pipe into an unseekable source instead. A finite track (a song
+                    // from the Airsonic `stream` endpoint, which sends Content-Length) is still
+                    // buffered into a seekable Cursor so format decoders that seek keep working.
+                    let finite = resp.content_length().is_some_and(|n| n > 0);
+                    // MUSIC-RFX-2 — only a finite (Cursor-backed) track is seekable; a live
+                    // stream stays false so the scrubber is hidden + a seek request no-ops.
+                    shared.seekable.store(finite, Ordering::Relaxed);
+                    if finite {
+                        let bytes = match resp.bytes() {
+                            Ok(bytes) => bytes.to_vec(),
+                            Err(e) if allow_cache => cached_track_source(
+                                cache_identity.as_ref(),
+                                &format!("read body {request_url}: {e}"),
+                                shared,
+                            )?,
+                            Err(e) => return Err(format!("read body {request_url}: {e}")),
+                        };
+                        if allow_cache {
+                            if let Some((song_id, suffix)) = &cache_identity {
+                                let _ = cache::write_cached_track(
+                                    &cache::cache_dir(),
+                                    song_id,
+                                    suffix,
+                                    &bytes,
+                                    cache::now_ms(),
+                                    false,
+                                );
+                            }
+                        }
+                        Box::new(Cursor::new(bytes))
+                    } else {
+                        // Keep the response as the decoder's reader. A producer pipe would
+                        // turn a provider read error into an indistinguishable clean EOF by
+                        // discarding the producer's `io::copy` result.
+                        Box::new(ReadOnlySource::new(resp))
+                    }
+                }
+                Err(e) if allow_cache => Box::new(Cursor::new(cached_track_source(
+                    cache_identity.as_ref(),
+                    &format!("fetch {request_url}: {e}"),
+                    shared,
+                )?)),
+                Err(e) => return Err(format!("fetch {request_url}: {e}")),
+            }
+        };
 
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
@@ -1413,6 +1538,71 @@ mod tests {
         assert_eq!(SourceCodec::from_suffix("wav"), SourceCodec::Wav);
         assert_eq!(SourceCodec::from_suffix("opus"), SourceCodec::Opus);
         assert_eq!(SourceCodec::from_suffix("xyz"), SourceCodec::Unknown);
+    }
+
+    #[test]
+    fn admitted_local_clock_file_decodes_without_a_network_locator() {
+        let frames = 480_u32;
+        let channels = 2_u16;
+        let sample_rate = 48_000_u32;
+        let bits = 16_u16;
+        let block_align = channels * (bits / 8);
+        let data_len = frames * u32::from(block_align);
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let sample = if frame % 2 == 0 {
+                2_000_i16
+            } else {
+                -2_000_i16
+            };
+            wav.extend_from_slice(&sample.to_le_bytes());
+            wav.extend_from_slice(&(-sample).to_le_bytes());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alarm.wav");
+        std::fs::write(&path, wav).unwrap();
+        let locator = local_file_stream_url(&path).expect("absolute test path");
+        let shared = Shared {
+            ring: Mutex::new(VecDeque::new()),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            decode_done: AtomicBool::new(false),
+            frames_played: AtomicU64::new(0),
+            frames_enqueued: AtomicU64::new(0),
+            track_starts: Mutex::new(vec![0]),
+            seek_ms: AtomicI64::new(-1),
+            seekable: AtomicBool::new(false),
+            device_rate: sample_rate,
+            device_channels: channels,
+            target_ring: 96_000,
+            play_base: AtomicUsize::new(0),
+            renderer_failed: AtomicBool::new(false),
+            renderer_interrupted_playing: AtomicBool::new(false),
+            renderer_interrupted_seekable: AtomicBool::new(false),
+            renderer_interrupted_position_ms: AtomicU64::new(0),
+        };
+
+        decode_track(&locator, SourceCodec::Wav, &shared).unwrap();
+        assert!(shared.seekable.load(Ordering::Relaxed));
+        assert!(!shared
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]

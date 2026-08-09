@@ -82,6 +82,11 @@ repository   = "https://github.com/matthewmackes/magic-mesh"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Clock rendering must resolve admitted IANA names through Jiff rather than a
+# hand-coded offset/DST table. Keep the database-source details in the feature
+# list itself so this comment does not promise a particular runtime source.
+# Keep one exact workspace pin so every lane evaluates the same Jiff API.
+jiff = { version = "=0.2.21", default-features = false, features = ["std", "tz-fat", "tzdb-zoneinfo", "perf-inline"] }
 
 # The published 0.2.0 client underflows while clipping malformed/partial draw
 # rectangles and runs the write-only inputs channel under a receive mutex.  The

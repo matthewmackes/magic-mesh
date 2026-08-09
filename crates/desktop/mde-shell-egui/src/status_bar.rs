@@ -57,7 +57,7 @@ pub(crate) const STATUS_BAR_H: f32 = 24.0;
 /// Width reserved by the bottom taskbar for the Windows-style system tray.
 /// The navigation bar keeps this lane free of app pins so the clock and
 /// controls remain visually stable while the center cluster changes.
-pub(crate) const BOTTOM_TRAY_W: f32 = 376.0;
+pub(crate) const BOTTOM_TRAY_W: f32 = 448.0;
 /// Clear space between the taskbar placement control and the tray.
 pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.8;
 
@@ -79,6 +79,10 @@ const STATUS_CONTROL_W: f32 = STATUS_BAR_H;
 const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
 const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
 const BOTTOM_TRAY_STATUS_MENU_W: f32 = 40.0;
+const NOTIFICATION_BELL_W: f32 = 32.0;
+const BATTERY_STATUS_W: f32 = 58.0;
+const WEATHER_STATUS_W: f32 = 64.0;
+const WEATHER_STATUS_COMPACT_W: f32 = STATUS_BAR_H;
 /// Keep a usable clock lane when a window is narrower than the normal menu
 /// bar. The lane may shrink below this value on an extremely small surface,
 /// but the controls must never consume the centered clock's hit target.
@@ -87,6 +91,130 @@ const STATUS_CLOCK_MIN_W: f32 = Style::SP_XL;
 /// the current fixed labels, but prevents a future daemon-provided label from
 /// turning the rail into an unbounded layout job.
 const MAX_STATUS_TEXT_CHARS: usize = 256;
+
+/// Live primary-battery summary folded from the off-render UPower snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveBatteryStatus {
+    percent: u8,
+    state: mde_seat::BatteryState,
+}
+
+impl LiveBatteryStatus {
+    pub(crate) fn from_batteries(batteries: &[mde_seat::Battery]) -> Option<Self> {
+        let battery = batteries.iter().find(|battery| battery.power_supply)?;
+        if !battery.percentage.is_finite() {
+            return None;
+        }
+        Some(Self {
+            percent: battery.percentage.clamp(0.0, 100.0).round() as u8,
+            state: battery.state,
+        })
+    }
+
+    const fn icon(self) -> IconId {
+        if matches!(
+            self.state,
+            mde_seat::BatteryState::Charging | mde_seat::BatteryState::PendingCharge
+        ) {
+            return IconId::BatteryBolt;
+        }
+        match self.percent {
+            0..=10 => IconId::BatteryEmpty,
+            11..=35 => IconId::BatteryQuarter,
+            36..=60 => IconId::BatteryHalf,
+            61..=85 => IconId::BatteryThreeQuarter,
+            _ => IconId::BatteryFull,
+        }
+    }
+}
+
+/// Render-ready weather launcher state admitted from the existing typed
+/// effective-location and current-condition projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveWeatherStatus {
+    icon: IconId,
+    temperature: Option<String>,
+    label: String,
+}
+
+impl LiveWeatherStatus {
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            icon: IconId::WeatherUnavailable,
+            temperature: None,
+            label: "Weather unavailable — open Maps & Location".to_string(),
+        }
+    }
+
+    pub(crate) fn from_projections(
+        host: &str,
+        location: Option<&mackes_mesh_types::location::EffectiveLocationSnapshot>,
+        current: Option<&mackes_mesh_types::weather::CurrentWeatherSnapshot>,
+        now_ms: i64,
+    ) -> Self {
+        use mackes_mesh_types::location::EffectiveLocationState;
+        use mackes_mesh_types::weather::{TemperatureUnit, WeatherAvailability};
+
+        let (Some(location), Some(current)) = (location, current) else {
+            return Self::unavailable();
+        };
+        if location.validate_at(now_ms).is_err()
+            || current.validate_at(now_ms).is_err()
+            || location.host != host
+            || current.host != host
+            || current.location_generation != location.generation
+            || matches!(&location.state, EffectiveLocationState::Unavailable { .. })
+            || matches!(
+                &current.availability,
+                WeatherAvailability::Unavailable { .. }
+            )
+        {
+            return Self::unavailable();
+        }
+        let Some(conditions) = current.conditions.as_ref() else {
+            return Self::unavailable();
+        };
+        let temperature = conditions.temperature.map(|value| {
+            let unit = match value.unit {
+                TemperatureUnit::Celsius => "°C",
+                TemperatureUnit::Fahrenheit => "°F",
+            };
+            format!("{:.0}{unit}", value.value)
+        });
+        let condition = conditions.provider_text.as_deref().unwrap_or("Weather");
+        let freshness = match &current.availability {
+            WeatherAvailability::Fresh => "live",
+            WeatherAvailability::Stale { .. } => "stale",
+            WeatherAvailability::Unavailable { .. } => unreachable!("filtered above"),
+        };
+        let temperature_label = temperature
+            .as_deref()
+            .map_or(String::new(), |value| format!(" · {value}"));
+        Self {
+            icon: weather_icon(conditions.condition),
+            temperature,
+            label: format!(
+                "{condition}{temperature_label} · {freshness} — open Maps & Location Weather"
+            ),
+        }
+    }
+}
+
+const fn weather_icon(condition: mackes_mesh_types::weather::WeatherConditionKind) -> IconId {
+    use mackes_mesh_types::weather::WeatherConditionKind;
+
+    match condition {
+        WeatherConditionKind::ClearDay => IconId::WeatherClearDay,
+        WeatherConditionKind::ClearNight => IconId::WeatherClearNight,
+        WeatherConditionKind::Clouds => IconId::WeatherClouds,
+        WeatherConditionKind::Rain => IconId::WeatherRain,
+        WeatherConditionKind::Wintry => IconId::WeatherWintry,
+        WeatherConditionKind::Storm => IconId::WeatherStorm,
+        WeatherConditionKind::Fog => IconId::WeatherFog,
+        WeatherConditionKind::Wind => IconId::WeatherWind,
+        WeatherConditionKind::Unavailable => IconId::WeatherUnavailable,
+    }
+}
 
 fn is_status_format_control(ch: char) -> bool {
     ch.is_control() || matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
@@ -182,11 +310,11 @@ fn workspace_tray_width() -> f32 {
         + WORKSPACE_TRAY_GAP * WORKSPACE_TRAY_SURFACES.len().saturating_sub(1) as f32
 }
 
-fn workspace_tray_rect(bar: egui::Rect, clock: egui::Rect) -> egui::Rect {
+fn workspace_tray_rect(bar: egui::Rect, left_anchor: egui::Rect) -> egui::Rect {
     let menu = status_menu_rect(bar);
     let right = (menu.left() - WORKSPACE_TRAY_GAP).max(bar.left());
     let left = (right - workspace_tray_width())
-        .max((clock.right() + WORKSPACE_TRAY_GAP).min(right))
+        .max((left_anchor.right() + WORKSPACE_TRAY_GAP).min(right))
         .max(bar.left());
     egui::Rect::from_min_max(
         egui::pos2(left, bar.top()),
@@ -317,14 +445,43 @@ fn status_bar_area_id() -> egui::Id {
     egui::Id::new("construct-status-bar")
 }
 
-/// Stable id of the centered clock (the Notification Center trigger).
+/// Stable id of the centered clock (the direct Clock-surface trigger).
 pub(crate) fn status_bar_clock_id() -> egui::Id {
     egui::Id::new(("construct-status-bar", "clock"))
+}
+
+/// Stable id of the dedicated Notification Center bell.
+pub(crate) fn notification_bell_id(placement: &'static str) -> egui::Id {
+    egui::Id::new(("construct-notification-bell", placement))
+}
+
+fn unread_badge_label(unread: usize) -> Option<String> {
+    match unread {
+        0 => None,
+        1..=99 => Some(unread.to_string()),
+        _ => Some("99+".to_owned()),
+    }
 }
 
 /// Stable id of the one health control in a taskbar placement.
 fn health_status_id(placement: &'static str) -> egui::Id {
     egui::Id::new(("system-mesh-health", placement))
+}
+
+fn live_battery_id(placement: &'static str) -> egui::Id {
+    egui::Id::new(("live-battery-status", placement))
+}
+
+fn live_weather_id(placement: &'static str) -> egui::Id {
+    egui::Id::new(("live-weather-launcher", placement))
+}
+
+fn weather_status_width(status: &LiveWeatherStatus, available: f32) -> f32 {
+    if status.temperature.is_some() && available >= WEATHER_STATUS_W {
+        WEATHER_STATUS_W
+    } else {
+        WEATHER_STATUS_COMPACT_W.min(available.max(0.0))
+    }
 }
 
 /// Mount the strip — called every frame from `main.rs`'s
@@ -336,7 +493,7 @@ pub fn mount(
     health: &HealthStatus,
     env: StatusBarEnv,
 ) {
-    mount_top_with_active(ctx, construct, segments, health, env, 1.0, None);
+    let _ = mount_top_with_active(ctx, construct, segments, health, env, 1.0, None, None, None);
 }
 
 /// Mount the current top-strip treatment with an explicit cross-fade weight.
@@ -350,7 +507,9 @@ pub(crate) fn mount_top(
     env: StatusBarEnv,
     opacity: f32,
 ) {
-    mount_top_with_active(ctx, construct, segments, health, env, opacity, None);
+    let _ = mount_top_with_active(
+        ctx, construct, segments, health, env, opacity, None, None, None,
+    );
 }
 
 pub(crate) fn mount_top_with_active(
@@ -361,7 +520,9 @@ pub(crate) fn mount_top_with_active(
     env: StatusBarEnv,
     opacity: f32,
     active_surface: Option<Surface>,
-) {
+    battery: Option<LiveBatteryStatus>,
+    weather: Option<LiveWeatherStatus>,
+) -> bool {
     let visible = status_bar_visible(env);
     // The U09 chrome-contract tests drive all mount slots on a bare Context to
     // prove intent routing without opening a frame. Keep this persistent
@@ -369,18 +530,18 @@ pub(crate) fn mount_top_with_active(
     // frame path always has a positive pass number. This mirrors the overlay
     // guard in control_center.rs and notification_center.rs.
     if ctx.cumulative_pass_nr() == 0 {
-        return;
+        return false;
     }
     // The central workspace releases its reserved band when the target state
     // becomes hidden. Do not leave a fading foreground Area over those pixels;
     // the workspace must remain clear for the entire hidden state transition.
     if !visible || opacity <= 0.0 {
-        return;
+        return false;
     }
     let t = Motion::animate(ctx, "construct-status-bar-visible", visible, Motion::BASE)
         * opacity.clamp(0.0, 1.0);
     if t <= 0.0 {
-        return;
+        return false;
     }
     let screen = ctx.screen_rect();
     let bar =
@@ -403,8 +564,18 @@ pub(crate) fn mount_top_with_active(
             // hit regions outside the reserved 24px band on narrow surfaces.
             ui.set_clip_rect(bar);
             ui.set_opacity(t);
-            strip(ui, bar, construct, segments, health, active_surface);
-        });
+            strip(
+                ui,
+                bar,
+                construct,
+                segments,
+                health,
+                active_surface,
+                battery,
+                weather.as_ref(),
+            )
+        })
+        .inner
 }
 
 /// Mount the Windows-style bottom tray used while the taskbar is in its bottom
@@ -446,7 +617,9 @@ pub(crate) fn paint_bottom_tray(
     opacity: f32,
     env: StatusBarEnv,
 ) {
-    paint_bottom_tray_with_active(ui, screen, construct, segments, opacity, env, None);
+    let _ = paint_bottom_tray_with_active(
+        ui, screen, construct, segments, opacity, env, None, None, None,
+    );
 }
 
 pub(crate) fn paint_bottom_tray_with_active(
@@ -457,9 +630,11 @@ pub(crate) fn paint_bottom_tray_with_active(
     opacity: f32,
     env: StatusBarEnv,
     active_surface: Option<Surface>,
-) {
+    battery: Option<LiveBatteryStatus>,
+    weather: Option<&LiveWeatherStatus>,
+) -> bool {
     if opacity <= 0.0 || !status_bar_visible(env) {
-        return;
+        return false;
     }
     bottom_tray(
         ui,
@@ -468,7 +643,9 @@ pub(crate) fn paint_bottom_tray_with_active(
         segments,
         opacity,
         active_surface,
-    );
+        battery,
+        weather,
+    )
 }
 
 /// Return the tray's screen-space footprint. Keeping this in the status-bar
@@ -563,7 +740,9 @@ fn bottom_tray(
     _segments: &StatusSegments,
     opacity: f32,
     active_surface: Option<Surface>,
-) {
+    battery: Option<LiveBatteryStatus>,
+    weather: Option<&LiveWeatherStatus>,
+) -> bool {
     let painter = ui.painter().clone();
     // This is a lane within the taskbar, not a second raised card layered over
     // it. The taskbar already paints the shared backing and top hairline.
@@ -576,19 +755,81 @@ fn bottom_tray(
     let text_dim = Style::NAV_BAR_ICON.gamma_multiply(0.68);
     let opacity = opacity.clamp(0.0, 1.0);
 
-    let now = crate::timers::display_unix();
-    let time = crate::timers::hhmm(now);
-    let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
-    let date = format!("{month:02}/{day:02}/{year:04}");
+    let (time, date) = match crate::timers::display_unix() {
+        Ok(now) => {
+            let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
+            (
+                crate::timers::hhmm(now),
+                format!("{month:02}/{day:02}/{year:04}"),
+            )
+        }
+        Err(_) => ("Unavailable".to_owned(), String::new()),
+    };
     let clock_width = 85.8_f32.min((panel.width() * 0.30).max(39.6));
-    let pin_left = panel.right() - BOTTOM_TRAY_STATUS_MENU_W;
-    let clock = egui::Rect::from_min_max(
+    let bell = egui::Rect::from_min_max(
         egui::pos2(
-            (pin_left - Style::SP_XS - clock_width).max(panel.left()),
+            (panel.right() - BOTTOM_TRAY_STATUS_MENU_W - NOTIFICATION_BELL_W).max(panel.left()),
             panel.top(),
         ),
-        egui::pos2((pin_left - Style::SP_XS).max(panel.left()), panel.bottom()),
+        egui::pos2(
+            (panel.right() - BOTTOM_TRAY_STATUS_MENU_W).max(panel.left()),
+            panel.bottom(),
+        ),
     );
+    let clock = egui::Rect::from_min_max(
+        egui::pos2(
+            (bell.left() - Style::SP_XS - clock_width).max(panel.left()),
+            panel.top(),
+        ),
+        egui::pos2(
+            (bell.left() - Style::SP_XS).max(panel.left()),
+            panel.bottom(),
+        ),
+    );
+    let battery_rect = battery.map(|_| {
+        let right = clock.left();
+        egui::Rect::from_min_max(
+            egui::pos2((right - BATTERY_STATUS_W).max(panel.left()), panel.top()),
+            egui::pos2(right, panel.bottom()),
+        )
+    });
+    if let (Some(status), Some(rect)) = (battery, battery_rect) {
+        paint_live_battery(
+            ui,
+            rect,
+            status,
+            text.gamma_multiply(opacity),
+            opacity,
+            "bottom",
+        );
+    }
+    let weather_right = battery_rect.map_or(clock.left(), |rect| rect.left());
+    let weather_available = (weather_right
+        - panel.left()
+        - workspace_tray_width()
+        - 34.0
+        - BOTTOM_TRAY_STATUS_MENU_W
+        - Style::SP_S)
+        .max(0.0);
+    let weather_width = weather.map_or(0.0, |status| {
+        weather_status_width(status, weather_available)
+    });
+    let weather_rect = weather.map(|_| {
+        egui::Rect::from_min_max(
+            egui::pos2(weather_right - weather_width, panel.top()),
+            egui::pos2(weather_right, panel.bottom()),
+        )
+    });
+    let weather_clicked = weather.zip(weather_rect).is_some_and(|(status, rect)| {
+        paint_live_weather(
+            ui,
+            rect,
+            status,
+            text.gamma_multiply(opacity),
+            opacity,
+            "bottom",
+        )
+    });
     let clock_response = ui.interact(
         clock,
         egui::Id::new(("construct-bottom-system-tray", "clock")),
@@ -598,7 +839,7 @@ fn bottom_tray(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             ui.is_enabled(),
-            format!("Clock {time} — Notification Center"),
+            format!("Clock {time} — open Clock"),
         )
     });
     if clock_response.hovered() {
@@ -637,13 +878,28 @@ fn bottom_tray(
         text_dim.gamma_multiply(opacity),
     );
     if clock_response.clicked() {
-        construct.notification_center_open = !construct.notification_center_open;
+        construct.request_workspace_tray(Surface::Clock);
     }
+    paint_notification_bell(
+        ui,
+        bell,
+        construct,
+        crate::toast_bridge::unread_count(ui.ctx()),
+        text.gamma_multiply(opacity),
+        surface_hi.gamma_multiply(opacity),
+        "bottom",
+    );
 
+    let workspace_limit = weather_rect.map_or(weather_right, |rect| rect.left())
+        - BOTTOM_TRAY_STATUS_MENU_W
+        - 34.0
+        - Style::SP_S;
     let workspace_rect = egui::Rect::from_min_max(
         panel.left_top(),
         egui::pos2(
-            (panel.left() + workspace_tray_width()).min(clock.left()),
+            (panel.left() + workspace_tray_width())
+                .min(workspace_limit)
+                .max(panel.left()),
             panel.bottom(),
         ),
     );
@@ -662,7 +918,7 @@ fn bottom_tray(
     );
     paint_health_status(ui, health_rect, construct, opacity, "bottom");
 
-    let menu_right = clock.left() - Style::SP_XS;
+    let menu_right = weather_rect.map_or(weather_right, |rect| rect.left()) - Style::SP_XS;
     let menu_left = (menu_right - BOTTOM_TRAY_STATUS_MENU_W)
         .max(health_rect.right() + Style::SP_XS)
         .min(menu_right);
@@ -681,8 +937,9 @@ fn bottom_tray(
     );
 
     ui.ctx().request_repaint_after(Duration::from_secs(
-        crate::timers::secs_to_next_minute(now).max(1),
+        crate::timers::secs_to_next_minute(crate::timers::now_unix()).max(1),
     ));
+    weather_clicked
 }
 
 /// Paint the same accessible System and Mesh Health icon in either taskbar
@@ -805,6 +1062,187 @@ fn paint_status_menu(
     }
 }
 
+/// Paint the sole persistent Notification Center target. Its unread badge is
+/// a bounded presentation of the existing in-memory notification ring.
+fn paint_notification_bell(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    construct: &mut ConstructChrome,
+    unread: usize,
+    foreground: egui::Color32,
+    hover: egui::Color32,
+    placement: &'static str,
+) {
+    let label = match unread_badge_label(unread) {
+        Some(badge) => format!("Notifications, {badge} unread"),
+        None => "Notifications, no unread alerts".to_owned(),
+    };
+    let response = ui.interact(rect, notification_bell_id(placement), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
+    });
+    let response = response.on_hover_text(label);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
+    }
+    if let Some(texture) = icon_texture(
+        ui.ctx(),
+        IconId::Notifications,
+        STATUS_CONTROL_ICON,
+        foreground,
+    ) {
+        let draw = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
+        );
+        painter.image(
+            texture.id(),
+            draw,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            foreground,
+        );
+    }
+    if let Some(badge) = unread_badge_label(unread) {
+        let badge_width = if badge == "99+" { 24.0 } else { 14.0 };
+        let badge_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - badge_width / 2.0, rect.top() + 7.0),
+            egui::vec2(badge_width, 14.0),
+        );
+        painter.rect_filled(badge_rect, 7.0, Style::SUPPORT_ERROR);
+        painter.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            badge,
+            Style::typography_font(TypographyRole::Caption),
+            Style::BG,
+        );
+    }
+    if response.clicked() {
+        construct.notification_center_open = true;
+    }
+}
+
+/// Paint the latest primary UPower battery observation immediately before the
+/// clock. No observation means no indicator; the shell never invents a charge.
+fn paint_live_battery(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    battery: LiveBatteryStatus,
+    foreground: egui::Color32,
+    opacity: f32,
+    placement: &'static str,
+) {
+    let label = format!("Battery {}% — {}", battery.percent, battery.state.label());
+    let response = ui.interact(rect, live_battery_id(placement), egui::Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label.clone())
+    });
+    let response = response.on_hover_text(label);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(
+            rect.shrink(2.0),
+            Style::RADIUS_S,
+            Style::SURFACE_HI.gamma_multiply(opacity),
+        );
+    }
+
+    let icon_edge = Style::ICON_M.min(rect.height());
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + icon_edge / 2.0, rect.center().y),
+        egui::vec2(icon_edge, icon_edge),
+    );
+    if let Some(texture) = icon_texture(ui.ctx(), battery.icon(), icon_edge, foreground) {
+        painter.image(
+            texture.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            foreground,
+        );
+    }
+    let percent = format!("{}%", battery.percent);
+    let galley = painter.layout_job(status_text_job(
+        percent,
+        TypographyRole::Caption,
+        foreground,
+        (rect.width() - icon_edge).max(0.0),
+    ));
+    painter.with_clip_rect(rect).galley(
+        egui::pos2(icon_rect.right(), rect.center().y - galley.size().y / 2.0),
+        galley,
+        foreground,
+    );
+}
+
+/// Paint the single launcher for Maps' existing Weather mode. The target owns
+/// only navigation; it never opens a shell flyout or presents a second weather
+/// surface.
+fn paint_live_weather(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    weather: &LiveWeatherStatus,
+    foreground: egui::Color32,
+    opacity: f32,
+    placement: &'static str,
+) -> bool {
+    if rect.width() <= 0.0 {
+        return false;
+    }
+    let response = ui.interact(rect, live_weather_id(placement), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            weather.label.clone(),
+        )
+    });
+    let response = response.on_hover_text(weather.label.clone());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(
+            rect.shrink(2.0),
+            Style::RADIUS_S,
+            Style::SURFACE_HI.gamma_multiply(opacity),
+        );
+    }
+    let icon_edge = Style::ICON_M.min(rect.height());
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + WEATHER_STATUS_COMPACT_W / 2.0,
+            rect.center().y,
+        ),
+        egui::vec2(icon_edge, icon_edge),
+    );
+    if let Some(texture) = icon_texture(ui.ctx(), weather.icon, icon_edge, foreground) {
+        painter.image(
+            texture.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            foreground,
+        );
+    }
+    if rect.width() > WEATHER_STATUS_COMPACT_W {
+        if let Some(temperature) = weather.temperature.as_ref() {
+            let galley = painter.layout_job(status_text_job(
+                temperature.clone(),
+                TypographyRole::Caption,
+                foreground,
+                (rect.width() - WEATHER_STATUS_COMPACT_W).max(0.0),
+            ));
+            painter.with_clip_rect(rect).galley(
+                egui::pos2(
+                    rect.left() + WEATHER_STATUS_COMPACT_W,
+                    rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                foreground,
+            );
+        }
+    }
+    response.clicked()
+}
+
 /// Paint + interact the strip body. Absolute screen-space rects throughout
 /// (the dock's WIN7-DESKTOP-1 lesson: an Area's `fixed_pos` only seeds the Ui,
 /// `ui.painter()`/`ui.interact` stay absolute).
@@ -815,7 +1253,9 @@ fn strip(
     _segments: &StatusSegments,
     _health: &HealthStatus,
     active_surface: Option<Surface>,
-) {
+    battery: Option<LiveBatteryStatus>,
+    weather: Option<&LiveWeatherStatus>,
+) -> bool {
     let painter = ui.painter().clone();
     // The clean BG band + bottom hairline (module doc: persistent chrome, not
     // an overlay — no scrim, guaranteed contrast).
@@ -828,8 +1268,9 @@ fn strip(
     let cy = bar.center().y;
     // ── Center cluster: the one authoritative clock ────────────────────────
     let controls_rect = status_menu_rect(bar);
-    let now = crate::timers::display_unix();
-    let time = crate::timers::hhmm(now);
+    let time = crate::timers::display_unix()
+        .map(crate::timers::hhmm)
+        .unwrap_or_else(|_| "Unavailable".to_owned());
     let time_galley = painter.layout_job(status_text_job(
         time.clone(),
         TypographyRole::Label,
@@ -838,12 +1279,46 @@ fn strip(
     ));
     let time_w = time_galley.size().x;
     let clock_rect = clock_target_rect(bar, time_w, controls_rect);
+    let bell_left = (clock_rect.right() + STATUS_CONTROL_GAP).min(controls_rect.left());
+    let bell_rect = egui::Rect::from_min_max(
+        egui::pos2(bell_left, bar.top()),
+        egui::pos2(
+            (bell_left + NOTIFICATION_BELL_W).min(controls_rect.left()),
+            bar.bottom(),
+        ),
+    );
+    let battery_rect = battery.map(|_| {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                (clock_rect.left() - BATTERY_STATUS_W).max(bar.left()),
+                bar.top(),
+            ),
+            egui::pos2(clock_rect.left(), bar.bottom()),
+        )
+    });
+    if let (Some(status), Some(rect)) = (battery, battery_rect) {
+        paint_live_battery(ui, rect, status, Style::TEXT, 1.0, "top");
+    }
+    let weather_right = battery_rect.map_or(clock_rect.left(), |rect| rect.left());
+    let weather_available = (weather_right - bar.left()).max(0.0);
+    let weather_width = weather.map_or(0.0, |status| {
+        weather_status_width(status, weather_available)
+    });
+    let weather_rect = weather.map(|_| {
+        egui::Rect::from_min_max(
+            egui::pos2(weather_right - weather_width, bar.top()),
+            egui::pos2(weather_right, bar.bottom()),
+        )
+    });
+    let weather_clicked = weather.zip(weather_rect).is_some_and(|(status, rect)| {
+        paint_live_weather(ui, rect, status, Style::TEXT, 1.0, "top")
+    });
     let clock = ui.interact(clock_rect, status_bar_clock_id(), egui::Sense::click());
     clock.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             ui.is_enabled(),
-            format!("Clock {time} — Notification Center"),
+            format!("Clock {time} — open Clock"),
         )
     });
     if clock.hovered() {
@@ -861,18 +1336,25 @@ fn strip(
         Style::TEXT,
     );
     if clock.clicked() {
-        // PLATFORM-INTERFACES §2.3 — "Notification Center | click status-bar
-        // clock": the pub open flag IS the sanctioned seam.
-        construct.notification_center_open = !construct.notification_center_open;
+        construct.request_workspace_tray(Surface::Clock);
     }
+    paint_notification_bell(
+        ui,
+        bell_rect,
+        construct,
+        crate::toast_bridge::unread_count(ui.ctx()),
+        Style::TEXT,
+        Style::SURFACE_HI,
+        "left",
+    );
 
     // One logical health affordance replaces the grade/status cluster. The
     // grade stays available in the modal, while the badge is the exact active,
     // unacknowledged actionable count.
-    let workspace_rect = workspace_tray_rect(bar, clock_rect);
+    let workspace_rect = workspace_tray_rect(bar, bell_rect);
     let cluster_rect = bounded_cluster_rect(
         bar,
-        clock_rect,
+        bell_rect,
         egui::Rect::from_min_max(
             egui::pos2(bar.left(), bar.top()),
             egui::pos2(workspace_rect.left(), bar.bottom()),
@@ -903,14 +1385,32 @@ fn strip(
     // Wake at the next minute rollover so the painted minute is never stale
     // (the dock tray clock's idiom).
     ui.ctx().request_repaint_after(Duration::from_secs(
-        crate::timers::secs_to_next_minute(now).max(1),
+        crate::timers::secs_to_next_minute(crate::timers::now_unix()).max(1),
     ));
+    weather_clicked
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chrome::HealthStatus;
+
+    fn battery(
+        percentage: f64,
+        state: mde_seat::BatteryState,
+        power_supply: bool,
+    ) -> mde_seat::Battery {
+        mde_seat::Battery {
+            model: "test battery".to_owned(),
+            kind: mde_seat::BatteryKind::Internal,
+            percentage,
+            state,
+            power_supply,
+            time_to_empty: None,
+            time_to_full: None,
+            energy_rate: None,
+        }
+    }
 
     fn visible_env() -> StatusBarEnv {
         StatusBarEnv {
@@ -1078,6 +1578,348 @@ mod tests {
             ctx.read_response(health_status_id("bottom")).is_some(),
             "mesh health must remain a keyboard/click reachable target"
         );
+    }
+
+    #[test]
+    fn live_battery_uses_primary_upower_reading_and_charging_icon() {
+        let batteries = [
+            battery(7.0, mde_seat::BatteryState::Discharging, false),
+            battery(72.6, mde_seat::BatteryState::Charging, true),
+        ];
+        let status = LiveBatteryStatus::from_batteries(&batteries).expect("primary battery");
+        assert_eq!(status.percent, 73);
+        assert_eq!(status.state, mde_seat::BatteryState::Charging);
+        assert_eq!(status.icon(), IconId::BatteryBolt);
+        assert!(LiveBatteryStatus::from_batteries(&[battery(
+            7.0,
+            mde_seat::BatteryState::Discharging,
+            false,
+        )])
+        .is_none());
+        assert!(LiveBatteryStatus::from_batteries(&[battery(
+            f64::NAN,
+            mde_seat::BatteryState::Unknown,
+            true,
+        )])
+        .is_none());
+    }
+
+    #[test]
+    fn weather_projection_is_generation_scoped_fresh_or_explicitly_stale() {
+        use mackes_mesh_types::location::{
+            EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
+            EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
+            WEATHER_LOCATION_SCHEMA_VERSION,
+        };
+        use mackes_mesh_types::nws_alert::GeoPoint;
+        use mackes_mesh_types::weather::{
+            CurrentConditions, CurrentWeatherSnapshot, Temperature, TemperatureUnit,
+            WeatherAttribution, WeatherAvailability, WeatherConditionKind, WeatherProvider,
+            WeatherStaleReason, WEATHER_CONTRACT_SCHEMA_VERSION,
+        };
+
+        const NOW: i64 = 1_800_000_000_000;
+        let point = GeoPoint {
+            latitude: 42.36,
+            longitude: -71.06,
+        };
+        let location = EffectiveLocationSnapshot {
+            schema_version: WEATHER_LOCATION_SCHEMA_VERSION,
+            host: "seat".to_string(),
+            generation: 7,
+            mode: WeatherLocationMode::Manual,
+            produced_at_ms: NOW - 30_000,
+            state: EffectiveLocationState::Available {
+                location: EffectiveWeatherLocation {
+                    label: "Boston, MA".to_string(),
+                    point: point.clone(),
+                    time_zone: "America/New_York".to_string(),
+                    coverage: WeatherCoverage::NwsUnitedStates,
+                    provenance: EffectiveLocationProvenance::ManualVerifiedPlace {
+                        place_id: "boston-ma".to_string(),
+                    },
+                    source_observed_at_ms: None,
+                },
+            },
+        };
+        let mut current = CurrentWeatherSnapshot {
+            schema_version: WEATHER_CONTRACT_SCHEMA_VERSION,
+            host: "seat".to_string(),
+            location_generation: 7,
+            location_point: Some(point),
+            producer_at_ms: NOW - 30_000,
+            fetched_at_ms: NOW - 30_000,
+            availability: WeatherAvailability::Fresh,
+            conditions: Some(CurrentConditions {
+                observed_at_ms: NOW - 60_000,
+                condition: WeatherConditionKind::ClearNight,
+                provider_text: Some("Clear".to_string()),
+                temperature: Some(Temperature {
+                    value: 72.0,
+                    unit: TemperatureUnit::Fahrenheit,
+                }),
+                apparent_temperature: None,
+                relative_humidity_percent: None,
+                precipitation_probability_percent: None,
+                wind_speed: None,
+                wind_direction_degrees: None,
+                wind_gust: None,
+                visibility: None,
+                pressure: None,
+            }),
+            gaps: Vec::new(),
+            attributions: vec![WeatherAttribution {
+                provider: WeatherProvider::NationalWeatherService,
+                source_id: "nws".to_string(),
+                label: "National Weather Service".to_string(),
+            }],
+        };
+        let fresh =
+            LiveWeatherStatus::from_projections("seat", Some(&location), Some(&current), NOW);
+        assert_eq!(fresh.icon, IconId::WeatherClearNight);
+        assert_eq!(fresh.temperature.as_deref(), Some("72°F"));
+        assert!(fresh.label.contains("live"));
+
+        current.availability = WeatherAvailability::Stale {
+            reason: WeatherStaleReason::RefreshFailed,
+        };
+        current
+            .conditions
+            .as_mut()
+            .expect("conditions")
+            .observed_at_ms = NOW - 2 * 60 * 60 * 1_000;
+        let stale =
+            LiveWeatherStatus::from_projections("seat", Some(&location), Some(&current), NOW);
+        assert_eq!(stale.temperature.as_deref(), Some("72°F"));
+        assert!(stale.label.contains("stale"));
+
+        current.location_generation = 8;
+        let unavailable =
+            LiveWeatherStatus::from_projections("seat", Some(&location), Some(&current), NOW);
+        assert_eq!(unavailable.icon, IconId::WeatherUnavailable);
+        assert_eq!(unavailable.temperature, None);
+    }
+
+    #[test]
+    fn weather_then_battery_then_time_is_disjoint_in_both_placements() {
+        let battery = LiveBatteryStatus {
+            percent: 64,
+            state: mde_seat::BatteryState::Discharging,
+        };
+        let weather = LiveWeatherStatus {
+            icon: IconId::DarkMode,
+            temperature: Some("72°F".to_string()),
+            label: "Clear · 72°F · live — open Maps & Location Weather".to_string(),
+        };
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+
+        let top_ctx = egui::Context::default();
+        Style::install(&top_ctx);
+        let mut top_construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let health = HealthStatus::default();
+        for _ in 0..3 {
+            let _ = top_ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    mount_top_with_active(
+                        ctx,
+                        &mut top_construct,
+                        &segments,
+                        &health,
+                        visible_env(),
+                        1.0,
+                        None,
+                        Some(battery),
+                        Some(weather.clone()),
+                    );
+                },
+            );
+        }
+        let top_battery = top_ctx
+            .read_response(live_battery_id("top"))
+            .expect("top battery target");
+        let top_clock = top_ctx
+            .read_response(status_bar_clock_id())
+            .expect("top clock target");
+        let top_weather = top_ctx
+            .read_response(live_weather_id("top"))
+            .expect("top weather target");
+        let top_bell = top_ctx
+            .read_response(notification_bell_id("left"))
+            .expect("left-placement bell target");
+        assert_eq!(top_weather.rect.right(), top_battery.rect.left());
+        assert_eq!(top_battery.rect.right(), top_clock.rect.left());
+        assert!(top_weather.rect.intersect(top_battery.rect).width() <= f32::EPSILON);
+        assert!(top_battery.rect.intersect(top_clock.rect).width() <= f32::EPSILON);
+        assert!(top_clock.rect.right() <= top_bell.rect.left());
+        assert!(top_clock.rect.intersect(top_bell.rect).width() <= f32::EPSILON);
+
+        let bottom_ctx = egui::Context::default();
+        Style::install(&bottom_ctx);
+        let mut bottom_construct = ConstructChrome::default();
+        for _ in 0..3 {
+            let _ = bottom_ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        paint_bottom_tray_with_active(
+                            ui,
+                            screen,
+                            &mut bottom_construct,
+                            &segments,
+                            1.0,
+                            visible_env(),
+                            None,
+                            Some(battery),
+                            Some(&weather),
+                        );
+                    });
+                },
+            );
+        }
+        let bottom_battery = bottom_ctx
+            .read_response(live_battery_id("bottom"))
+            .expect("bottom battery target");
+        let bottom_clock = bottom_ctx
+            .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
+            .expect("bottom clock target");
+        let bottom_weather = bottom_ctx
+            .read_response(live_weather_id("bottom"))
+            .expect("bottom weather target");
+        let bottom_bell = bottom_ctx
+            .read_response(notification_bell_id("bottom"))
+            .expect("bottom bell target");
+        assert_eq!(bottom_weather.rect.right(), bottom_battery.rect.left());
+        assert_eq!(bottom_battery.rect.right(), bottom_clock.rect.left());
+        assert!(bottom_weather.rect.intersect(bottom_battery.rect).width() <= f32::EPSILON);
+        assert!(bottom_battery.rect.intersect(bottom_clock.rect).width() <= f32::EPSILON);
+        assert!(bottom_clock.rect.right() <= bottom_bell.rect.left());
+        assert!(bottom_clock.rect.intersect(bottom_bell.rect).width() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn weather_collapses_to_icon_and_abuts_time_when_battery_is_absent() {
+        let weather = LiveWeatherStatus {
+            icon: IconId::Internet,
+            temperature: Some("68°F".to_string()),
+            label: "Cloudy · 68°F · live — open Maps & Location Weather".to_string(),
+        };
+        assert_eq!(
+            weather_status_width(&weather, WEATHER_STATUS_W),
+            WEATHER_STATUS_W
+        );
+        assert_eq!(
+            weather_status_width(&weather, WEATHER_STATUS_COMPACT_W),
+            WEATHER_STATUS_COMPACT_W
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 300.0));
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let health = HealthStatus::default();
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    mount_top_with_active(
+                        ctx,
+                        &mut construct,
+                        &segments,
+                        &health,
+                        visible_env(),
+                        1.0,
+                        None,
+                        None,
+                        Some(weather.clone()),
+                    );
+                },
+            );
+        }
+        let weather_rect = ctx
+            .read_response(live_weather_id("top"))
+            .expect("weather target")
+            .rect;
+        let clock_rect = ctx
+            .read_response(status_bar_clock_id())
+            .expect("clock target")
+            .rect;
+        assert_eq!(weather_rect.right(), clock_rect.left());
+    }
+
+    #[test]
+    fn one_weather_click_emits_only_the_weather_navigation_action() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let weather = LiveWeatherStatus::unavailable();
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let health = HealthStatus::default();
+        let mut run = |events: Vec<egui::Event>| {
+            let mut clicked = false;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    clicked = mount_top_with_active(
+                        ctx,
+                        &mut construct,
+                        &segments,
+                        &health,
+                        visible_env(),
+                        1.0,
+                        None,
+                        None,
+                        Some(weather.clone()),
+                    );
+                },
+            );
+            clicked
+        };
+        for _ in 0..3 {
+            assert!(!run(Vec::new()));
+        }
+        let pos = ctx
+            .read_response(live_weather_id("top"))
+            .expect("weather target")
+            .rect
+            .center();
+        assert!(!run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]));
+        assert!(run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]));
+        drop(run);
+        assert!(!construct.notification_center_open);
+        assert!(!construct.control_center_open);
     }
 
     #[test]
@@ -1258,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_clock_toggles_the_notification_center() {
+    fn left_clock_opens_clock_and_dedicated_bell_opens_notifications() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
@@ -1296,11 +2138,133 @@ mod tests {
             .rect
             .center();
         click(&ctx, &mut construct, &segments, &grades, pos);
-        // PLATFORM-INTERFACES §2.3 — clock click = Notification Center.
-        assert!(construct.notification_center_open, "clock click opens NC");
+        assert_eq!(
+            construct.take_workspace_tray_target(),
+            Some(Surface::Clock),
+            "clock click routes directly to Clock"
+        );
+        assert!(
+            !construct.notification_center_open,
+            "clock must not open Notification Center"
+        );
         assert!(!construct.control_center_open, "CC untouched by the clock");
-        click(&ctx, &mut construct, &segments, &grades, pos);
-        assert!(!construct.notification_center_open, "second click closes");
+
+        let bell = ctx
+            .read_response(notification_bell_id("left"))
+            .expect("dedicated bell registered")
+            .rect
+            .center();
+        click(&ctx, &mut construct, &segments, &grades, bell);
+        assert!(
+            construct.notification_center_open,
+            "bell opens Notification Center"
+        );
+        assert_eq!(construct.take_workspace_tray_target(), None);
+    }
+
+    #[test]
+    fn notification_badge_is_bounded_at_99_plus() {
+        assert_eq!(unread_badge_label(0), None);
+        assert_eq!(unread_badge_label(1).as_deref(), Some("1"));
+        assert_eq!(unread_badge_label(99).as_deref(), Some("99"));
+        assert_eq!(unread_badge_label(100).as_deref(), Some("99+"));
+        assert_eq!(unread_badge_label(usize::MAX).as_deref(), Some("99+"));
+    }
+
+    #[test]
+    fn bottom_clock_and_bell_have_distinct_routes() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let segments = StatusSegments::default();
+        let mut construct = ConstructChrome::default();
+        fn run(
+            ctx: &egui::Context,
+            construct: &mut ConstructChrome,
+            segments: &StatusSegments,
+            screen: egui::Rect,
+            events: Vec<egui::Event>,
+        ) {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| mount_bottom(ctx, construct, segments, 1.0, visible_env()),
+            );
+        }
+        run(&ctx, &mut construct, &segments, screen, Vec::new());
+        run(&ctx, &mut construct, &segments, screen, Vec::new());
+        run(&ctx, &mut construct, &segments, screen, Vec::new());
+
+        let clock = ctx
+            .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
+            .expect("bottom clock registered")
+            .rect
+            .center();
+        let press = egui::Event::PointerButton {
+            pos: clock,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let release = egui::Event::PointerButton {
+            pos: clock,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        run(
+            &ctx,
+            &mut construct,
+            &segments,
+            screen,
+            vec![egui::Event::PointerMoved(clock), press],
+        );
+        run(
+            &ctx,
+            &mut construct,
+            &segments,
+            screen,
+            vec![egui::Event::PointerMoved(clock), release],
+        );
+        assert_eq!(construct.take_workspace_tray_target(), Some(Surface::Clock));
+        assert!(!construct.notification_center_open);
+
+        let bell = ctx
+            .read_response(notification_bell_id("bottom"))
+            .expect("bottom bell registered")
+            .rect
+            .center();
+        let press = egui::Event::PointerButton {
+            pos: bell,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let release = egui::Event::PointerButton {
+            pos: bell,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        run(
+            &ctx,
+            &mut construct,
+            &segments,
+            screen,
+            vec![egui::Event::PointerMoved(bell), press],
+        );
+        run(
+            &ctx,
+            &mut construct,
+            &segments,
+            screen,
+            vec![egui::Event::PointerMoved(bell), release],
+        );
+        assert!(construct.notification_center_open);
+        assert_eq!(construct.take_workspace_tray_target(), None);
     }
 
     #[test]
@@ -1503,10 +2467,12 @@ mod tests {
             screen,
             clock.center(),
         );
-        assert!(
-            construct.notification_center_open,
-            "the centered clock remains clickable beside the narrow status menu"
+        assert_eq!(
+            construct.take_workspace_tray_target(),
+            Some(Surface::Clock),
+            "the centered clock remains directly routable beside the narrow status menu"
         );
+        assert!(!construct.notification_center_open);
 
         click_at(
             &ctx,

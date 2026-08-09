@@ -90,7 +90,7 @@
 //!
 //! - **No audio support** - Playback and Record channels not implemented
 //! - **No USB redirection** - USB channel not implemented
-//! - **No clipboard sharing** - Agent clipboard integration not implemented
+//! - **Text-only clipboard sharing** - vdagent supports bounded UTF-8 text; files and images are not implemented
 //! - **Limited compression** - Only ZLIB compression supported (no LZ4)
 //! - **No TLS encryption** - Only unencrypted connections supported
 //! - **WebSocket proxy required for WASM** - Cannot connect directly to SPICE TCP ports from browsers
@@ -129,6 +129,7 @@ pub mod protocol;
 pub mod transport;
 pub mod utils;
 pub mod video;
+pub mod vdagent;
 pub mod wire_format;
 
 #[cfg(not(target_arch = "wasm32"))]

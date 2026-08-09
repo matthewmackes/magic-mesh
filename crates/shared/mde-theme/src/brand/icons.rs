@@ -298,11 +298,29 @@ pub enum IconId {
     /// spans the icon, overflowing the outline) — draw the fill-level glyph,
     /// then this on top while charging. Also reads alone as "charging".
     BatteryBolt,
+    /// Tray weather: clear daytime conditions.
+    WeatherClearDay,
+    /// Tray weather: clear nighttime conditions.
+    WeatherClearNight,
+    /// Tray weather: cloudy or overcast conditions.
+    WeatherClouds,
+    /// Tray weather: rain or showers.
+    WeatherRain,
+    /// Tray weather: snow, sleet, or other wintry precipitation.
+    WeatherWintry,
+    /// Tray weather: thunderstorm or severe convective conditions.
+    WeatherStorm,
+    /// Tray weather: fog or mist.
+    WeatherFog,
+    /// Tray weather: wind is the primary reported condition.
+    WeatherWind,
+    /// Tray weather: no usable current condition is available.
+    WeatherUnavailable,
 }
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 97] = [
+    pub const ALL: [Self; 106] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -400,12 +418,21 @@ impl IconId {
         Self::BatteryThreeQuarter,
         Self::BatteryFull,
         Self::BatteryBolt,
+        Self::WeatherClearDay,
+        Self::WeatherClearNight,
+        Self::WeatherClouds,
+        Self::WeatherRain,
+        Self::WeatherWintry,
+        Self::WeatherStorm,
+        Self::WeatherFog,
+        Self::WeatherWind,
+        Self::WeatherUnavailable,
     ];
 
     /// The live tray/status glyph subset (NAVBAR-W10-1) — every glyph the tray
     /// renders at 16px, for targeted iteration in the tray and its tests. Retired
     /// Start-bar pin and up-chevron controls stay out of this live subset.
-    pub const TRAY: [Self; 12] = [
+    pub const TRAY: [Self; 21] = [
         Self::Signal,
         Self::Sessions,
         Self::Start,
@@ -418,6 +445,15 @@ impl IconId {
         Self::BatteryThreeQuarter,
         Self::BatteryFull,
         Self::BatteryBolt,
+        Self::WeatherClearDay,
+        Self::WeatherClearNight,
+        Self::WeatherClouds,
+        Self::WeatherRain,
+        Self::WeatherWintry,
+        Self::WeatherStorm,
+        Self::WeatherFog,
+        Self::WeatherWind,
+        Self::WeatherUnavailable,
     ];
 
     /// The embedded SVG source for this glyph — `currentColor` line-art in a
@@ -529,6 +565,19 @@ impl IconId {
             Self::BatteryThreeQuarter => yamis_svg!("status/scalable/battery-080.svg"),
             Self::BatteryFull => yamis_svg!("status/scalable/battery-100.svg"),
             Self::BatteryBolt => yamis_svg!("status/scalable/battery-100-charging.svg"),
+            Self::WeatherClearDay => yamis_svg!("status/scalable/weather-clear.svg"),
+            Self::WeatherClearNight => {
+                yamis_svg!("status/scalable/weather-clear-night-000.svg")
+            }
+            Self::WeatherClouds => yamis_svg!("status/scalable/weather-overcast.svg"),
+            Self::WeatherRain => yamis_svg!("status/scalable/weather-showers.svg"),
+            Self::WeatherWintry => yamis_svg!("status/scalable/weather-snow.svg"),
+            Self::WeatherStorm => yamis_svg!("status/scalable/weather-storm.svg"),
+            Self::WeatherFog => yamis_svg!("status/scalable/weather-fog.svg"),
+            Self::WeatherWind => yamis_svg!("status/scalable/weather-windy.svg"),
+            Self::WeatherUnavailable => {
+                yamis_svg!("status/scalable/weather-none-available.svg")
+            }
         }
     }
 
@@ -636,6 +685,15 @@ impl IconId {
             Self::BatteryThreeQuarter => "yamis-battery-080",
             Self::BatteryFull => "yamis-battery-100",
             Self::BatteryBolt => "yamis-battery-100-charging",
+            Self::WeatherClearDay => "yamis-weather-clear",
+            Self::WeatherClearNight => "yamis-tray-weather-clear-night-000",
+            Self::WeatherClouds => "yamis-weather-overcast",
+            Self::WeatherRain => "yamis-weather-showers",
+            Self::WeatherWintry => "yamis-weather-snow",
+            Self::WeatherStorm => "yamis-weather-storm",
+            Self::WeatherFog => "yamis-weather-fog",
+            Self::WeatherWind => "yamis-weather-windy",
+            Self::WeatherUnavailable => "yamis-weather-none-available",
         }
     }
 }
@@ -986,7 +1044,7 @@ mod tests {
         // (24px covers the flyout/hi-DPI step) — every glyph must come back
         // square, correctly sized and with real ink through the same
         // icon_image loader the shell uses.
-        assert_eq!(IconId::TRAY.len(), 12, "tray subset size");
+        assert_eq!(IconId::TRAY.len(), 21, "tray subset size");
         assert!(
             !IconId::TRAY.contains(&IconId::Pin),
             "retired Start-bar pin glyph must stay out of the live tray subset"

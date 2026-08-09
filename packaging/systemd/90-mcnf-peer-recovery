@@ -1,0 +1,11 @@
+#!/bin/sh
+# NetworkManager dispatcher: trigger only on positive network-return events.
+set -u
+SYSTEMCTL="${MCNF_RECOVERY_SYSTEMCTL:-/usr/bin/systemctl}"
+case "${2:-}" in
+    up|dhcp4-change|dhcp6-change|connectivity-change|reapply)
+        "$SYSTEMCTL" start --no-block mcnf-peer-recovery.service
+        ;;
+    down|pre-down|vpn-down|hostname|dns-change|'') exit 0 ;;
+    *) exit 0 ;;
+esac

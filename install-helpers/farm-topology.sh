@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # farm-topology.sh — THE SINGLE CANONICAL SOURCE OF TRUTH for the MCNF build farm.
 #
-# 4 dom0s, each hosting ONE Fedora build VM (user `mm`, key
+# 5 dom0s, each hosting ONE Fedora build VM (user `mm`, key
 # `mackes_mesh_ed25519`, shared sccache). Every farm-aware tool + doc + skill must
 # READ this file (source it) or CITE it as the authority — never hardcode the node
 # list anywhere else, or it drifts. It DID drift: the 4th dom0 (XEN-194 → build VM
@@ -16,29 +16,31 @@
 #                               # table; EXIT NON-ZERO if any canonical node is
 #                               # unreachable (the never-fall-out-of-sync guard)
 #   ./farm-topology.sh check    # like `table` but quiet on full success (loop tick)
-#   ./farm-topology.sh octets   # print the 4 build-VM octets, space-separated
+#   ./farm-topology.sh octets   # print the 5 build-VM octets, space-separated
 #
 # Canonical roster (build-VM octet / dom0 / dom0 IP / vCPU / heavy-build cap):
 #   .50   XEN-HOME-SERVICES  172.20.0.9      4c   cap 2   mcnf-build-home-services
 #   .90   KVM-XCP1           172.20.145.193  4c   cap 2   mcnf-build-kvm-xcp1
 #   .130  XEN-BIGBOY         172.20.145.165  12c  cap 3   mcnf-build-52 (BigBoy)
 #   .170  XEN-194            172.20.145.194  4c   cap 2   mcnf-build-xen-194
-#   => 9 heavy build slots total (2 + 2 + 3 + 2)
+#   .196  XEN-196            172.20.145.196  4c   cap 1   mcnf-build-xen-196
+#   => 10 heavy build slots total (2 + 2 + 3 + 2 + 1)
 #
 # Build-VM IPs follow per-dom0 lanes; names are descriptive except BigBoy, which
 # intentionally keeps mcnf-build-52 as the long-pole build host.
 
-# --- the canonical arrays (parallel; index 0..3) ---
-FARM_OCTETS=(50 90 130 170)
+# --- the canonical arrays (parallel; index 0..4) ---
+FARM_OCTETS=(50 90 130 170 196)
 FARM_NAMES=(
   "XEN-HOME-SERVICES/mcnf-build-home-services"
   "KVM-XCP1/mcnf-build-kvm-xcp1"
   "XEN-BIGBOY/mcnf-build-52"
   "XEN-194/mcnf-build-xen-194"
+  "XEN-196/mcnf-build-xen-196"
 )
-FARM_DOM0_IPS=(172.20.0.9 172.20.145.193 172.20.145.165 172.20.145.194)
-FARM_CAPS=(2 2 3 2)
-FARM_TOTAL_CAP=9   # 2 + 2 + 3 + 2 — keep in sync with FARM_CAPS
+FARM_DOM0_IPS=(172.20.0.9 172.20.145.193 172.20.145.165 172.20.145.194 172.20.145.196)
+FARM_CAPS=(2 2 3 2 1)
+FARM_TOTAL_CAP=10   # 2 + 2 + 3 + 2 + 1 — keep in sync with FARM_CAPS
 
 FARM_KEY="${MCNF_MESH_KEY:-/root/.ssh/mackes_mesh_ed25519}"
 FARM_SSH_USER="${MCNF_BUILD_USER:-mm}"
@@ -77,7 +79,7 @@ farm_table() {
   done
 
   if [ "$mode" = "check" ] && [ "$down" -eq 0 ]; then
-    echo "farm: 4/4 dom0s up; ${active_sum}/${FARM_TOTAL_CAP} heavy slots active, ${total_free} free."
+    echo "farm: ${#FARM_OCTETS[@]}/${#FARM_OCTETS[@]} dom0s up; ${active_sum}/${FARM_TOTAL_CAP} heavy slots active, ${total_free} free."
   else
     echo "### Xen Host Utilization — Farm Wide (verified $(date -u +%H:%M:%SZ))"
     echo "| Node | dom0 / build VM | cap | active | free | /home | note |"

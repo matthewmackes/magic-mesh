@@ -2,14 +2,16 @@
 
 The no-fixed-center replacement for the XO-backed Xen IaC: the `xenserver`
 provider talks **XAPI directly** to a pool master, so there is no central Xen
-Orchestra to lose. The farm spans **4 standalone pools**, so this uses **4 aliased
+Orchestra to lose. The farm spans **5 standalone pools**, so this uses **5 aliased
 providers** (one per dom0). **This supersedes the `xenorchestra` config in `../`**
 (now deprecated — do not `apply` it; both managing the same VMs would conflict).
 
-**CUTOVER DONE (2026-06-22; roster reconciled 2026-07-06):** the live adopted
+**CUTOVER DONE (2026-06-22; roster extended 2026-08-08):** the live declared
 build VMs are `.50` `mcnf-build-home-services`, `.90` `mcnf-build-kvm-xcp1`,
-`.130` `mcnf-build-52` (BigBoy), and `.170` `mcnf-build-xen-194`. The farm is
-XAPI-managed, no XO.
+`.130` `mcnf-build-52` (BigBoy), `.170` `mcnf-build-xen-194`, and `.196`
+`mcnf-build-xen-196`. `.196` is declared adopt-only and awaits the documented
+`tofu import`; the backend was not initialized during provisioning, so no state
+mutation was attempted. The farm is XAPI-managed, no XO.
 
 ## Status
 
@@ -30,8 +32,9 @@ Orchestra in the path — the no-fixed-center hypothesis for the Xen IaC holds.
   needs (`xenserver_vm`, `xenserver_sr{,_nfs,_smb}`, `xenserver_vdi`,
   `xenserver_network_vlan`, `xenserver_snapshot`, `xenserver_pool`) but its long-term
   stability is unproven here.
-- **Import parity** of the live `.50/.90/.130/.170` build VMs is the real gate before any
-  cutover of `infra/tofu/` — not yet attempted (next increment).
+- **Import parity** remains required for `.196` before its declaration is applied;
+  provisioning intentionally stopped at a validated configuration and documented
+  import command because the HTTP backend was not initialized.
 
 ## Use
 
@@ -76,6 +79,6 @@ resource "xenserver_vm" "build" {
 ## Next steps (DATACENTER-1)
 
 1. ~~Resource path (create/destroy).~~ **DONE.**  2. ~~Import-parity clean plan.~~ **DONE.**
-3. **Full cutover hygiene** (remaining): keep the four imported/adopted build VMs
-   at 0-destroy parity, then retire the deprecated `../` `xenorchestra` root once
-   its state is removed.
+3. **Full cutover hygiene** (remaining): import `.196`, keep all five adopted
+   build VMs at 0-destroy parity, then retire the deprecated `../`
+   `xenorchestra` root once its state is removed.

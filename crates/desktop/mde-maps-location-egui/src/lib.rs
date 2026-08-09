@@ -25,11 +25,15 @@ pub mod firms;
 pub mod geocode;
 pub mod iem_radar;
 pub mod model;
+pub mod navigation_ui;
 pub mod nws_alert;
 pub mod nws_forecast;
+pub mod offline_cache;
+pub mod offline_catalog;
 pub mod traffic;
 pub mod transit;
 pub mod view;
+pub mod weather_ui;
 pub mod wildfire;
 
 use mde_egui::{eframe, egui, run_client};
@@ -78,14 +82,19 @@ fn local_node_id() -> String {
 /// Standalone eframe application wrapper.
 pub struct MapsLocationApp {
     surface: MapsLocationSurface,
+    local_node: String,
 }
 
 impl MapsLocationApp {
     /// Build the app over the same state the shell embeds.
     #[must_use]
     pub fn new() -> Self {
+        let local_node = local_node_id();
+        let mut surface = MapsLocationSurface::live();
+        surface.refresh_from_bus(&local_node);
         Self {
-            surface: real_maps_location(),
+            surface,
+            local_node,
         }
     }
 }
@@ -98,6 +107,7 @@ impl Default for MapsLocationApp {
 
 impl eframe::App for MapsLocationApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.surface.refresh_from_bus(&self.local_node);
         egui::CentralPanel::default().show(ctx, |ui| {
             // Maps owns its cartographic content palette. Its normal Construct
             // workspace chrome is rendered by the panel's shared MenuBar; Car

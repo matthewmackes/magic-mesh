@@ -1822,11 +1822,9 @@ mod tests {
         use std::io::{Read, Write};
         use std::sync::mpsc;
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind capturing one-shot server");
-        let addr = listener
-            .local_addr()
-            .expect("capturing one-shot address");
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind capturing one-shot server");
+        let addr = listener.local_addr().expect("capturing one-shot address");
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {

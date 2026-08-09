@@ -1,40 +1,26 @@
-//! `Surface::Timers` — the **Timers & Alarms** surface (design
-//! `docs/design/vertical-dock.md` locks #5/#16/#20).
+//! Daemon-projected Clock surface.
 //!
-//! Timers is reached from the Construct status clock, whose replacement is a clock-glyph
-//! status cell (`dock::clock_cell` — the live HH:MM *is* the glyph, lock #20)
-//! that opens this surface: create + run **countdown timers** and set daily
-//! **alarms**. The store lives on the [`Shell`](crate) and is ticked from the
-//! shell's per-frame loop ([`TimersState::tick`], the POWER-5 `power_honor`
-//! idiom), so a due timer/alarm fires **even while the surface is closed** — a
-//! shell-side timer that survives surface switches (the design's "Timers
-//! reliability" risk).
-//!
-//! **How a fired timer reaches the operator (glue §6, no new lane).** Firing
-//! emits an alert-shaped JSON body on the **`event/notify/timer`** Bus lane —
-//! one more source suffix under the CHAT-FIX-2 producer's `event/notify/`
-//! prefix, which the `mackesd` chat worker already folds (its
-//! `ALERT_LANE_PREFIXES` matches by prefix) into this host's `alert:<self>`
-//! conversation: the Chat feed shows the card, and the Warning severity bumps
-//! the dock's Chat unread badge / raises a chyron. No second lane, no new
-//! render path. The lane is primed once per shell run with a benign Info
-//! message (the `workers::notify` `prime_lanes` idiom) so the chat worker's
-//! first-sight cursor skip absorbs the prime, never a real alarm.
-//!
-//! **One clock (§6).** All times fold through the crate's ONE calendar — the
-//! same `unix → HH:MM` + [`crate::chat::civil_from_days`] fold the curtain's
-//! giant clock face renders — so the dock glyph, this panel's clock, and the
-//! alarm schedule can never disagree.
-//!
-//! **Honest degrade (§7).** No client data dir → no persistence and no Bus
-//! emission (the solo/headless state), never a fake. Timers still run and
-//! finish in-memory; the panel renders their real state.
+//! The shell owns presentation state only. `mackesd` owns schedules, deadlines,
+//! persistence, ringing, and replicated stopwatch state. Bus reads happen in
+//! [`ClockState::pump`]; [`clock_panel`] is a pure egui projection that emits
+//! typed [`ClockUiAction`] values and performs no Bus, network, persistence, or
+//! scheduling I/O.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::SigningKey;
+use jiff::{tz::TimeZone, Timestamp};
+use mackes_mesh_types::clock::{
+    clock_command_topic, clock_state_topic, ClockAcknowledgementV1, ClockAlarmRecurrenceV1,
+    ClockAlarmV1, ClockAudioRef, ClockCivilTimeV1, ClockCommandKindV1, ClockCommandV1,
+    ClockFoldPolicy, ClockGapPolicy, ClockOccurrencePhase, ClockScheduleKindV1, ClockScheduleV1,
+    ClockSnapshotV1, ClockStopwatchPhase, ClockStopwatchV1, ClockTimerPhase, ClockTimerV1,
+    ClockValidationContext, ClockWeekday, CLOCK_SCHEMA_VERSION, MAX_CLOCK_COMMAND_TTL_MS,
+    MAX_CLOCK_LABEL_BYTES, MAX_CLOCK_TIMER_DURATION_MS,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_egui::egui::{self, RichText};
@@ -42,41 +28,17 @@ use mde_egui::nav_chrome::AppFrame;
 use mde_egui::Style;
 use serde::{Deserialize, Serialize};
 
-/// The Bus lane a fired timer/alarm rides — a `timer` source suffix under the
-/// CHAT-FIX-2 producer's `event/notify/` prefix, so the existing chat-worker
-/// fold (prefix-matched) carries it to the Chat feed + unread badge with no
-/// daemon-side change.
-const NOTIFY_TOPIC: &str = "event/notify/timer";
-
-/// The `source` field the folded Chat card shows (the lane's suffix).
-const NOTIFY_SOURCE: &str = "timer";
-
-/// The persisted store file under the client data dir (the
-/// `settings-appearance.json` / `power-honor.json` sibling).
-const STORE_FILE: &str = "timers-alarms.json";
-const START_TIMER_DISABLED_TIP: &str = "Set a duration first";
-const TIMERS_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
-
-/// Seconds per day — the alarm schedule's civil-day modulus.
 const DAY_SECS: i64 = 86_400;
+const POLL: Duration = Duration::from_millis(500);
 
-/// The user-facing clock zone used by Construct chrome and the clock face.
-/// The persisted `EasternStandard` name remains compatible, but the display
-/// follows the US Eastern Time daylight-saving rules. Mesh and audit timestamps
-/// remain UTC and are not rewritten by this display preference.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClockZone {
-    /// US Eastern Time (UTC−05:00 standard / UTC−04:00 daylight).
     EasternStandard,
-    /// US Central Time (UTC−06:00 standard / UTC−05:00 daylight).
     CentralStandard,
-    /// US Mountain Time (UTC−07:00 standard / UTC−06:00 daylight).
     MountainStandard,
-    /// US Pacific Time (UTC−08:00 standard / UTC−07:00 daylight).
     PacificStandard,
-    /// UTC±00:00.
     Utc,
 }
 
@@ -94,7 +56,6 @@ impl ClockZone {
         Self::PacificStandard,
         Self::Utc,
     ];
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::EasternStandard => "Eastern Time",
@@ -104,7 +65,6 @@ impl ClockZone {
             Self::Utc => "Coordinated Universal Time",
         }
     }
-
     pub(crate) const fn short_label(self) -> &'static str {
         match self {
             Self::EasternStandard => "ET (UTC−05:00/UTC−04:00)",
@@ -114,17 +74,15 @@ impl ClockZone {
             Self::Utc => "UTC (UTC±00:00)",
         }
     }
-
-    const fn standard_offset_seconds(self) -> i64 {
+    const fn iana_name(self) -> &'static str {
         match self {
-            Self::EasternStandard => -5 * 3600,
-            Self::CentralStandard => -6 * 3600,
-            Self::MountainStandard => -7 * 3600,
-            Self::PacificStandard => -8 * 3600,
-            Self::Utc => 0,
+            Self::EasternStandard => "America/New_York",
+            Self::CentralStandard => "America/Chicago",
+            Self::MountainStandard => "America/Denver",
+            Self::PacificStandard => "America/Los_Angeles",
+            Self::Utc => "Etc/UTC",
         }
     }
-
     const fn from_index(index: u8) -> Self {
         match index {
             1 => Self::CentralStandard,
@@ -134,114 +92,964 @@ impl ClockZone {
             _ => Self::EasternStandard,
         }
     }
-
-    fn offset_seconds_at(self, unix_secs: i64) -> i64 {
-        let standard = self.standard_offset_seconds();
-        if matches!(self, Self::Utc) || !us_daylight_time(unix_secs, standard) {
-            standard
-        } else {
-            standard + 3600
-        }
-    }
 }
 
 static CLOCK_ZONE: AtomicU8 = AtomicU8::new(ClockZone::EasternStandard as u8);
-
-/// Apply the persisted display zone to every visible Construct clock.
 pub(crate) fn set_clock_zone(zone: ClockZone) {
     CLOCK_ZONE.store(zone as u8, Ordering::Relaxed);
 }
-
-/// Current Unix time shifted into the configured display zone.
-pub(crate) fn display_unix() -> i64 {
+pub(crate) fn display_unix() -> Result<i64, String> {
     let now = now_unix();
-    now.saturating_add(display_offset_seconds_at(now))
+    display_offset_seconds_at(now).map(|offset| now.saturating_add(offset))
 }
-
-/// The configured zone's UTC offset at an arbitrary Unix timestamp. Consumers
-/// formatting retained historical timestamps use this rather than the current
-/// offset so daylight-saving transitions do not shift old rows.
-pub(crate) fn display_offset_seconds_at(unix_secs: i64) -> i64 {
-    configured_clock_zone().offset_seconds_at(unix_secs)
+pub(crate) fn display_offset_seconds_at(unix_secs: i64) -> Result<i64, String> {
+    zone_offset_seconds_at(configured_clock_zone().iana_name(), unix_secs)
 }
-
 pub(crate) fn display_zone_label() -> &'static str {
     configured_clock_zone().label()
 }
-
 fn configured_clock_zone() -> ClockZone {
     ClockZone::from_index(CLOCK_ZONE.load(Ordering::Relaxed))
 }
-
-/// Return the Unix day containing the first occurrence of `month/day`.
-/// Howard Hinnant's inverse of `civil_from_days`, kept local so the DST rule
-/// remains deterministic and does not depend on the host's locale database.
-const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - if month <= 2 { 1 } else { 0 };
-    let era = (if year >= 0 { year } else { year - 399 }) / 400;
-    let year_of_era = year - era * 400;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365
-        + year_of_era / 4
-        - year_of_era / 100
-        + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactZoneTime {
+    clock: String,
+    offset_seconds: i32,
 }
 
-const fn sunday_on_or_after(first_day: i64) -> i64 {
-    // 1970-01-01 was Thursday; Sunday is weekday zero.
-    first_day + (7 - (first_day + 4).rem_euclid(7)).rem_euclid(7)
+fn exact_zone_time(zone: &str, unix_secs: i64) -> Result<ExactZoneTime, String> {
+    let timestamp = Timestamp::from_second(unix_secs)
+        .map_err(|_| "timestamp is outside the supported range".to_owned())?;
+    let time_zone = TimeZone::get(zone).map_err(|_| {
+        format!("IANA zone {zone} is unavailable in the configured time-zone database")
+    })?;
+    let zoned = timestamp.to_zoned(time_zone);
+    Ok(ExactZoneTime {
+        clock: format!("{:02}:{:02}", zoned.hour(), zoned.minute()),
+        offset_seconds: zoned.offset().seconds(),
+    })
 }
 
-fn us_daylight_time(unix_secs: i64, standard_offset: i64) -> bool {
-    if standard_offset == 0 {
-        return false;
-    }
-    let local_standard_day = (unix_secs + standard_offset).div_euclid(DAY_SECS);
-    let (year, _, _) = crate::chat::civil_from_days(local_standard_day);
-    if year < 2007 {
-        return false;
-    }
-    let march_first = days_from_civil(year, 3, 1);
-    let november_first = days_from_civil(year, 11, 1);
-    let start_day = sunday_on_or_after(march_first) + 7;
-    let end_day = sunday_on_or_after(november_first);
-    let start_utc = start_day * DAY_SECS + 2 * 3600 - standard_offset;
-    let end_utc = end_day * DAY_SECS + 2 * 3600 - (standard_offset + 3600);
-    (start_utc..end_utc).contains(&unix_secs)
+fn zone_offset_seconds_at(zone: &str, unix_secs: i64) -> Result<i64, String> {
+    exact_zone_time(zone, unix_secs).map(|time| i64::from(time.offset_seconds))
 }
-
-// ──────────────────────────── the one clock (§6) ────────────────────────────
-
-/// Seconds since the Unix epoch (0 on a pre-epoch clock — the curtain's guard).
-/// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form for
-/// crate-visible items in a private module — likewise the siblings below.)
 pub fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
-
-/// The wall-clock `HH:MM` for a Unix timestamp — the SAME fold the curtain's
-/// giant clock face runs, restated tiny so the dock's clock glyph and this
-/// panel read one clock (§6).
 pub fn hhmm(unix_secs: i64) -> String {
     let tod = unix_secs.rem_euclid(DAY_SECS);
     format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60)
 }
-
-/// Seconds until the NEXT minute rollover — the dock's clock glyph schedules
-/// its repaint on this so the painted minute is never stale.
 pub fn secs_to_next_minute(unix_secs: i64) -> u64 {
-    let into = unix_secs.rem_euclid(60);
-    u64::try_from(60 - into).unwrap_or(60)
+    u64::try_from(60 - unix_secs.rem_euclid(60)).unwrap_or(60)
 }
 
-/// A countdown rendered `H:MM:SS` (or `MM:SS` under an hour) — the kitchen-timer
-/// reading.
-fn fmt_duration(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClockSection {
+    #[default]
+    WorldClock,
+    Alarms,
+    Timers,
+    Stopwatch,
+}
+impl ClockSection {
+    const ALL: [Self; 4] = [
+        Self::WorldClock,
+        Self::Alarms,
+        Self::Timers,
+        Self::Stopwatch,
+    ];
+    const fn label(self) -> &'static str {
+        match self {
+            Self::WorldClock => "World Clock",
+            Self::Alarms => "Alarms",
+            Self::Timers => "Timers",
+            Self::Stopwatch => "Stopwatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimerAction {
+    Pause,
+    Resume,
+    Restart,
+    AddMinute,
+    Stop,
+    Remove,
+}
+
+/// Presentation-only Clock alert family.  The daemon projection remains the
+/// authority for whether the referenced occurrence is still ringing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockBannerKind {
+    Alarm,
+    Timer,
+}
+
+/// Fixed Clock verbs exposed by banners and retained Notification Center rows.
+/// No free-form topic, command, path, or URL crosses this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockBannerVerb {
+    Snooze,
+    AddMinute,
+    Stop,
+}
+
+/// Bounded identity carried by a Clock action after the visual banner folds
+/// into Notification Center.  Generation checks prevent an old row from acting
+/// on a replacement occurrence or schedule that reused an identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockBannerAction {
+    pub(crate) label: &'static str,
+    pub(crate) verb: ClockBannerVerb,
+    pub(crate) kind: ClockBannerKind,
+    pub(crate) occurrence_id: String,
+    pub(crate) occurrence_revision: u64,
+    pub(crate) schedule_id: String,
+    pub(crate) schedule_revision: u64,
+    pub(crate) admitted_snapshot_revision: u64,
+    pub(crate) valid_until_utc_ms: i64,
+}
+
+/// One daemon-derived actionable Clock banner.  It contains display text and
+/// two fixed typed actions only; scheduling and signing remain in `ClockState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClockBannerProjection {
+    pub(crate) headline: String,
+    pub(crate) identity: String,
+    pub(crate) actions: [ClockBannerAction; 2],
+}
+
+fn clock_banner_projection_id() -> egui::Id {
+    egui::Id::new("shell-clock-banner-projection")
+}
+
+fn clock_banner_request_id() -> egui::Id {
+    egui::Id::new("shell-clock-banner-action-request")
+}
+
+/// Read the latest presentation projection.  Consumers never perform Clock
+/// daemon I/O and cannot manufacture action authority.
+pub(crate) fn clock_banner_projection(ctx: &egui::Context) -> Vec<ClockBannerProjection> {
+    ctx.data(|data| {
+        data.get_temp(clock_banner_projection_id())
+            .unwrap_or_default()
+    })
+}
+
+/// Queue one fixed action for the Clock controller to validate and sign on its
+/// next pump.  At most one click is retained per frame.
+pub(crate) fn request_clock_banner_action(ctx: &egui::Context, action: ClockBannerAction) {
+    ctx.data_mut(|data| data.insert_temp(clock_banner_request_id(), Some(action)));
+}
+
+fn take_clock_banner_action(ctx: &egui::Context) -> Option<ClockBannerAction> {
+    ctx.data_mut(|data| {
+        data.remove_temp::<Option<ClockBannerAction>>(clock_banner_request_id())
+            .flatten()
+    })
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopwatchAction {
+    Start,
+    Pause,
+    Lap,
+    Reset,
+}
+
+/// Every operator gesture leaving the Clock renderer is represented here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClockUiAction {
+    SelectSection(ClockSection),
+    AddWorldClock {
+        time_zone: String,
+    },
+    RemoveWorldClock {
+        time_zone: String,
+    },
+    CreateAlarm {
+        label: String,
+        hour: u8,
+        minute: u8,
+    },
+    SetAlarmEnabled {
+        schedule_id: String,
+        enabled: bool,
+    },
+    RemoveAlarm {
+        schedule_id: String,
+    },
+    CreateTimer {
+        label: String,
+        duration_ms: u64,
+    },
+    ControlTimer {
+        schedule_id: String,
+        action: TimerAction,
+    },
+    ControlStopwatch {
+        stopwatch_id: Option<String>,
+        action: StopwatchAction,
+    },
+    AcknowledgeOccurrence {
+        occurrence_id: String,
+        stop: bool,
+    },
+}
+
+#[derive(Default)]
+struct ClockDrafts {
+    world_zone: String,
+    alarm_label: String,
+    alarm_hour: u8,
+    alarm_minute: u8,
+    timer_label: String,
+    timer_hours: u32,
+    timer_minutes: u32,
+    timer_seconds: u32,
+}
+
+pub(crate) struct ClockState {
+    bus_root: Option<PathBuf>,
+    node_id: String,
+    signer_id: Option<String>,
+    snapshot: Option<ClockSnapshotV1>,
+    section: ClockSection,
+    drafts: ClockDrafts,
+    in_flight: Option<InFlightCommand>,
+    last_poll: Option<Instant>,
+    projection_error: Option<String>,
+    error: Option<String>,
+    command_note: Option<String>,
+}
+
+struct InFlightCommand {
+    request_id: String,
+    expected_revision: u64,
+    expected_body: ClockCommandKindV1,
+    published_at: Instant,
+}
+
+impl Default for ClockState {
+    fn default() -> Self {
+        Self::with_bus_root(mde_bus::client_data_dir(), local_hostname())
+    }
+}
+
+impl ClockState {
+    fn with_bus_root(bus_root: Option<PathBuf>, node_id: String) -> Self {
+        Self {
+            bus_root,
+            node_id,
+            signer_id: std::env::var("MDE_CLOCK_SIGNER_ID")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            snapshot: None,
+            section: ClockSection::default(),
+            drafts: ClockDrafts {
+                world_zone: "Etc/UTC".into(),
+                alarm_hour: 7,
+                ..Default::default()
+            },
+            in_flight: None,
+            last_poll: None,
+            projection_error: None,
+            error: None,
+            command_note: None,
+        }
+    }
+    /// I/O controller hook, called before the surface is rendered.
+    pub(crate) fn pump(&mut self, ctx: &egui::Context) {
+        if let Some(action) = take_clock_banner_action(ctx) {
+            match self.validate_banner_action(action) {
+                Ok(action) => self.publish_action(action),
+                Err(error) => {
+                    self.command_note = None;
+                    self.error = Some(format!("Clock banner action was not sent: {error}"));
+                }
+            }
+        }
+        if self.last_poll.is_some_and(|at| at.elapsed() < POLL) {
+            return;
+        }
+        self.last_poll = Some(Instant::now());
+        ctx.request_repaint_after(POLL);
+        if self.in_flight.as_ref().is_some_and(|pending| {
+            pending.published_at.elapsed()
+                > Duration::from_millis(
+                    u64::try_from(MAX_CLOCK_COMMAND_TTL_MS).unwrap_or(5 * 60 * 1_000),
+                )
+        }) {
+            self.in_flight = None;
+            self.error =
+                Some("Clock daemon confirmation did not arrive before the command expired.".into());
+            self.command_note = None;
+        }
+        let Some(root) = self.bus_root.clone() else {
+            self.projection_error =
+                Some("Clock daemon projection unavailable: no Bus root.".into());
+            return;
+        };
+        let result = (|| {
+            let persist = Persist::open(root).map_err(|e| e.to_string())?;
+            let topic = clock_state_topic(&self.node_id).map_err(|e| e.to_string())?;
+            let message = persist
+                .read_latest(&topic)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "waiting for the Clock daemon projection".to_string())?;
+            let body = message
+                .body
+                .ok_or_else(|| "Clock projection had no body".to_string())?;
+            let now = now_unix().saturating_mul(1000);
+            let context = ClockValidationContext {
+                wall_utc_ms: now,
+                monotonic_ms: 1,
+                zone_exists: &zone_exists,
+            };
+            ClockSnapshotV1::from_persisted_json_at(body.as_bytes(), &context)
+                .map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(snapshot) => {
+                if self
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|pending| snapshot.revision > pending.expected_revision)
+                {
+                    let pending = self.in_flight.take().expect("checked Clock command");
+                    if command_effect_visible(&snapshot, &pending.expected_body) {
+                        self.command_note = Some("Clock change applied by the daemon.".into());
+                        self.error = None;
+                    } else {
+                        self.command_note = None;
+                        self.error = Some(
+                            "The Clock projection advanced without the requested change; the daemon refused or superseded it."
+                                .into(),
+                        );
+                    }
+                }
+                publish_clock_banner_projection(ctx, &snapshot);
+                self.snapshot = Some(snapshot);
+                self.projection_error = None;
+            }
+            Err(error) => {
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        clock_banner_projection_id(),
+                        Vec::<ClockBannerProjection>::new(),
+                    );
+                });
+                self.projection_error = Some(error);
+            }
+        }
+    }
+
+    fn validate_banner_action(&self, action: ClockBannerAction) -> Result<ClockUiAction, String> {
+        let now_ms = now_unix_ms()?;
+        if now_ms > action.valid_until_utc_ms {
+            return Err("the retained Clock action expired".to_owned());
+        }
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| "the daemon projection is unavailable".to_owned())?;
+        if snapshot.revision < action.admitted_snapshot_revision {
+            return Err("the Clock projection is older than the retained action".to_owned());
+        }
+        let occurrence = snapshot
+            .occurrences
+            .iter()
+            .find(|item| item.occurrence_id == action.occurrence_id)
+            .ok_or_else(|| "the Clock occurrence is no longer present".to_owned())?;
+        if occurrence.revision != action.occurrence_revision
+            || occurrence.schedule_id != action.schedule_id
+            || occurrence.phase != ClockOccurrencePhase::Ringing
+        {
+            return Err("the retained Clock occurrence identity is stale".to_owned());
+        }
+        let schedule = snapshot
+            .schedules
+            .iter()
+            .find(|item| item.schedule_id == action.schedule_id)
+            .ok_or_else(|| "the Clock schedule is no longer present".to_owned())?;
+        if schedule.revision != action.schedule_revision
+            || !matches!(
+                (action.kind, &schedule.schedule),
+                (ClockBannerKind::Alarm, ClockScheduleKindV1::Alarm(_))
+                    | (ClockBannerKind::Timer, ClockScheduleKindV1::Timer(_))
+            )
+        {
+            return Err("the retained Clock schedule identity is stale".to_owned());
+        }
+        match (action.kind, action.verb) {
+            (ClockBannerKind::Alarm, ClockBannerVerb::Snooze) => {
+                Ok(ClockUiAction::AcknowledgeOccurrence {
+                    occurrence_id: action.occurrence_id,
+                    stop: false,
+                })
+            }
+            (ClockBannerKind::Alarm | ClockBannerKind::Timer, ClockBannerVerb::Stop) => {
+                Ok(ClockUiAction::AcknowledgeOccurrence {
+                    occurrence_id: action.occurrence_id,
+                    stop: true,
+                })
+            }
+            (ClockBannerKind::Timer, ClockBannerVerb::AddMinute) => {
+                Ok(ClockUiAction::ControlTimer {
+                    schedule_id: action.schedule_id,
+                    action: TimerAction::AddMinute,
+                })
+            }
+            _ => Err("that action is not admitted for this Clock alert".to_owned()),
+        }
+    }
+    fn emit(&mut self, action: ClockUiAction) {
+        if let ClockUiAction::SelectSection(section) = action {
+            self.section = section;
+        } else {
+            self.publish_action(action);
+        }
+    }
+
+    fn publish_action(&mut self, action: ClockUiAction) {
+        if self.in_flight.is_some() {
+            self.error = Some(
+                "A Clock change is still awaiting the daemon projection; try again after it applies."
+                    .into(),
+            );
+            return;
+        }
+        match self.build_and_publish(action) {
+            Ok(pending) => {
+                self.command_note = Some(format!(
+                    "Clock change {} was signed and published; awaiting daemon confirmation.",
+                    pending.request_id
+                ));
+                self.error = None;
+                self.in_flight = Some(pending);
+            }
+            Err(error) => {
+                self.command_note = None;
+                self.error = Some(format!("Clock change was not sent: {error}"));
+            }
+        }
+    }
+
+    fn build_and_publish(&self, action: ClockUiAction) -> Result<InFlightCommand, String> {
+        let root = self
+            .bus_root
+            .as_ref()
+            .ok_or_else(|| "the local mesh Bus is unavailable".to_owned())?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| "the daemon projection is unavailable".to_owned())?;
+        let now_ms = now_unix_ms()?;
+        let monotonic_ms = monotonic_ms();
+        let body = command_body(action, snapshot, now_ms, monotonic_ms)?;
+        let request_id = format!("clock-{}", uuid::Uuid::new_v4());
+        let signer_id = self
+            .signer_id
+            .clone()
+            .ok_or_else(|| "Clock signer configuration MDE_CLOCK_SIGNER_ID is absent".to_owned())?;
+        let signing_key = SigningKey::from_bytes(&crate::iac::provisioned_shell_signing_seed()?);
+        let context = ClockValidationContext {
+            wall_utc_ms: now_ms,
+            monotonic_ms,
+            zone_exists: &zone_exists,
+        };
+        let command = ClockCommandV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: request_id.clone(),
+            origin_node_id: self.node_id.clone(),
+            expected_revision: snapshot.revision,
+            issued_at_utc_ms: now_ms,
+            expires_at_utc_ms: now_ms.saturating_add(MAX_CLOCK_COMMAND_TTL_MS),
+            body: body.clone(),
+            signer_id: String::new(),
+            signature: String::new(),
+        }
+        .sign(signer_id, &signing_key, &context)
+        .map_err(|error| error.to_string())?;
+        let encoded = serde_json::to_string(&command).map_err(|error| error.to_string())?;
+        ClockCommandV1::from_json_at(encoded.as_bytes(), &context)
+            .map_err(|error| error.to_string())?;
+        let topic = clock_command_topic(&self.node_id).map_err(|error| error.to_string())?;
+        Persist::open(root.clone())
+            .and_then(|persist| {
+                persist.write(&topic, Priority::Default, None, Some(encoded.as_str()))
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(InFlightCommand {
+            request_id,
+            expected_revision: snapshot.revision,
+            expected_body: body,
+            published_at: Instant::now(),
+        })
+    }
+}
+
+fn publish_clock_banner_projection(ctx: &egui::Context, snapshot: &ClockSnapshotV1) {
+    let now_ms = now_unix().saturating_mul(1_000);
+    let valid_until_utc_ms = now_ms.saturating_add(MAX_CLOCK_COMMAND_TTL_MS);
+    let mut banners = Vec::new();
+    for occurrence in snapshot
+        .occurrences
+        .iter()
+        .filter(|item| item.phase == ClockOccurrencePhase::Ringing)
+    {
+        let Some(schedule) = snapshot
+            .schedules
+            .iter()
+            .find(|item| item.schedule_id == occurrence.schedule_id)
+        else {
+            continue;
+        };
+        let (kind, first_label, first_verb, prefix) = match &schedule.schedule {
+            ClockScheduleKindV1::Alarm(_) => (
+                ClockBannerKind::Alarm,
+                "Snooze",
+                ClockBannerVerb::Snooze,
+                "Alarm",
+            ),
+            ClockScheduleKindV1::Timer(_) => (
+                ClockBannerKind::Timer,
+                "Add 1 minute",
+                ClockBannerVerb::AddMinute,
+                "Timer",
+            ),
+        };
+        let action = |label, verb| ClockBannerAction {
+            label,
+            verb,
+            kind,
+            occurrence_id: occurrence.occurrence_id.clone(),
+            occurrence_revision: occurrence.revision,
+            schedule_id: schedule.schedule_id.clone(),
+            schedule_revision: schedule.revision,
+            admitted_snapshot_revision: snapshot.revision,
+            valid_until_utc_ms,
+        };
+        banners.push(ClockBannerProjection {
+            headline: format!("{prefix} · {}", schedule.label),
+            identity: format!(
+                "{}:{}:{}:{}",
+                occurrence.occurrence_id,
+                occurrence.revision,
+                schedule.schedule_id,
+                schedule.revision
+            ),
+            actions: [
+                action(first_label, first_verb),
+                action("Stop", ClockBannerVerb::Stop),
+            ],
+        });
+    }
+    ctx.data_mut(|data| data.insert_temp(clock_banner_projection_id(), banners));
+}
+
+fn zone_exists(zone: &str) -> bool {
+    !zone.starts_with('/') && !zone.contains("..") && TimeZone::get(zone).is_ok()
+}
+
+fn now_unix_ms() -> Result<i64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "the system clock is before the Unix epoch".to_owned())
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis())
+                .map_err(|_| "the system clock is outside the supported range".to_owned())
+        })
+}
+
+fn monotonic_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX).saturating_add(1)
+}
+
+fn action_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+fn action_label(value: &str, fallback: &str) -> Result<String, String> {
+    let value = value.trim();
+    let value = if value.is_empty() { fallback } else { value };
+    if value.len() > MAX_CLOCK_LABEL_BYTES || value.chars().any(char::is_control) {
+        return Err(format!(
+            "Clock label must be at most {MAX_CLOCK_LABEL_BYTES} bytes and contain no control characters"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn bundled_tone() -> ClockAudioRef {
+    ClockAudioRef::Bundled {
+        tone_id: "bright-bell".into(),
+    }
+}
+
+fn find_schedule<'a>(
+    snapshot: &'a ClockSnapshotV1,
+    id: &str,
+) -> Result<&'a ClockScheduleV1, String> {
+    snapshot
+        .schedules
+        .iter()
+        .find(|schedule| schedule.schedule_id == id)
+        .ok_or_else(|| "the selected Clock schedule is no longer present".to_owned())
+}
+
+fn acknowledgement_body(
+    snapshot: &ClockSnapshotV1,
+    occurrence_id: &str,
+    node_id: &str,
+    now_ms: i64,
+    stop: bool,
+) -> Result<ClockCommandKindV1, String> {
+    let occurrence = snapshot
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.occurrence_id == occurrence_id)
+        .ok_or_else(|| "the ringing occurrence is no longer present".to_owned())?;
+    if occurrence.phase != ClockOccurrencePhase::Ringing {
+        return Err("the occurrence is no longer ringing".to_owned());
+    }
+    Ok(ClockCommandKindV1::Acknowledge {
+        occurrence_id: occurrence.occurrence_id.clone(),
+        acknowledgement: ClockAcknowledgementV1 {
+            acknowledgement_id: action_id(if stop { "stop" } else { "snooze" }),
+            global_event_id: occurrence.global_event_id.clone(),
+            actor_node_id: node_id.to_owned(),
+            actor_clock: snapshot.revision.saturating_add(1).max(1),
+            acknowledged_at_utc_ms: now_ms,
+            stop,
+        },
+    })
+}
+
+fn stopwatch_elapsed(stopwatch: &ClockStopwatchV1, now_ms: i64) -> u64 {
+    let live = stopwatch
+        .started_wall_utc_ms
+        .and_then(|started| u64::try_from(now_ms.saturating_sub(started)).ok())
+        .unwrap_or(0);
+    stopwatch.accumulated_elapsed_ms.saturating_add(live)
+}
+
+fn command_body(
+    action: ClockUiAction,
+    snapshot: &ClockSnapshotV1,
+    now_ms: i64,
+    monotonic_ms: u64,
+) -> Result<ClockCommandKindV1, String> {
+    match action {
+        ClockUiAction::SelectSection(_) => Err("navigation is not a Clock mutation".to_owned()),
+        ClockUiAction::AddWorldClock { time_zone } => {
+            if !zone_exists(&time_zone) {
+                return Err(format!(
+                    "IANA zone {time_zone} is unavailable in the configured time-zone database"
+                ));
+            }
+            let mut settings = snapshot.settings.clone();
+            if settings.world_clock_time_zones.contains(&time_zone) {
+                return Err("that world-clock zone is already present".to_owned());
+            }
+            settings.world_clock_time_zones.push(time_zone);
+            Ok(ClockCommandKindV1::SetSettings { settings })
+        }
+        ClockUiAction::RemoveWorldClock { time_zone } => {
+            let mut settings = snapshot.settings.clone();
+            let before = settings.world_clock_time_zones.len();
+            settings
+                .world_clock_time_zones
+                .retain(|zone| zone != &time_zone);
+            if settings.world_clock_time_zones.len() == before {
+                return Err("that world-clock zone is no longer present".to_owned());
+            }
+            Ok(ClockCommandKindV1::SetSettings { settings })
+        }
+        ClockUiAction::CreateAlarm {
+            label,
+            hour,
+            minute,
+        } => {
+            let label = action_label(&label, "Alarm")?;
+            let schedule_id = action_id("alarm");
+            Ok(ClockCommandKindV1::UpsertSchedule {
+                schedule: ClockScheduleV1 {
+                    schedule_id,
+                    origin_node_id: snapshot.node_id.clone(),
+                    revision: 1,
+                    label: label.clone(),
+                    selected_target_ids: vec![snapshot.node_id.clone()],
+                    schedule: ClockScheduleKindV1::Alarm(ClockAlarmV1 {
+                        enabled: true,
+                        label,
+                        recurrence: ClockAlarmRecurrenceV1::Weekdays {
+                            local_time: ClockCivilTimeV1 {
+                                hour,
+                                minute,
+                                second: 0,
+                                time_zone: snapshot.settings.this_node_time_zone.clone(),
+                                fold: ClockFoldPolicy::Earlier,
+                                gap: ClockGapPolicy::NextValid,
+                            },
+                            weekdays: vec![
+                                ClockWeekday::Monday,
+                                ClockWeekday::Tuesday,
+                                ClockWeekday::Wednesday,
+                                ClockWeekday::Thursday,
+                                ClockWeekday::Friday,
+                                ClockWeekday::Saturday,
+                                ClockWeekday::Sunday,
+                            ],
+                        },
+                        sound: bundled_tone(),
+                        vibrate: false,
+                    }),
+                },
+            })
+        }
+        ClockUiAction::SetAlarmEnabled {
+            schedule_id,
+            enabled,
+        } => Ok(ClockCommandKindV1::SetScheduleEnabled {
+            schedule_id,
+            enabled,
+        }),
+        ClockUiAction::RemoveAlarm { schedule_id } => {
+            Ok(ClockCommandKindV1::RemoveSchedule { schedule_id })
+        }
+        ClockUiAction::CreateTimer { label, duration_ms } => {
+            if duration_ms == 0 || duration_ms > MAX_CLOCK_TIMER_DURATION_MS {
+                return Err("timer duration is outside the admitted Clock range".to_owned());
+            }
+            let label = action_label(&label, "Timer")?;
+            Ok(ClockCommandKindV1::UpsertSchedule {
+                schedule: ClockScheduleV1 {
+                    schedule_id: action_id("timer"),
+                    origin_node_id: snapshot.node_id.clone(),
+                    revision: 1,
+                    label,
+                    selected_target_ids: vec![snapshot.node_id.clone()],
+                    schedule: ClockScheduleKindV1::Timer(ClockTimerV1 {
+                        original_duration_ms: duration_ms,
+                        phase: ClockTimerPhase::Running,
+                        absolute_deadline_utc_ms: Some(now_ms.saturating_add(duration_ms as i64)),
+                        paused_remaining_ms: None,
+                        expired_at_utc_ms: None,
+                        sound: bundled_tone(),
+                        vibrate: false,
+                    }),
+                },
+            })
+        }
+        ClockUiAction::ControlTimer {
+            schedule_id,
+            action,
+        } => {
+            if action == TimerAction::Remove {
+                return Ok(ClockCommandKindV1::RemoveSchedule { schedule_id });
+            }
+            if action == TimerAction::Stop {
+                let occurrence = snapshot
+                    .occurrences
+                    .iter()
+                    .find(|occurrence| {
+                        occurrence.schedule_id == schedule_id
+                            && occurrence.phase == ClockOccurrencePhase::Ringing
+                    })
+                    .ok_or_else(|| {
+                        "the expired timer has no ringing occurrence to stop".to_owned()
+                    })?;
+                return acknowledgement_body(
+                    snapshot,
+                    &occurrence.occurrence_id,
+                    &snapshot.node_id,
+                    now_ms,
+                    true,
+                );
+            }
+            let mut schedule = find_schedule(snapshot, &schedule_id)?.clone();
+            let ClockScheduleKindV1::Timer(timer) = &mut schedule.schedule else {
+                return Err("the selected schedule is not a timer".to_owned());
+            };
+            match action {
+                TimerAction::Pause if timer.phase == ClockTimerPhase::Running => {
+                    let remaining = timer
+                        .absolute_deadline_utc_ms
+                        .and_then(|deadline| u64::try_from(deadline.saturating_sub(now_ms)).ok())
+                        .unwrap_or(0)
+                        .min(timer.original_duration_ms);
+                    timer.phase = ClockTimerPhase::Paused;
+                    timer.absolute_deadline_utc_ms = None;
+                    timer.paused_remaining_ms = Some(remaining);
+                    timer.expired_at_utc_ms = None;
+                }
+                TimerAction::Resume if timer.phase == ClockTimerPhase::Paused => {
+                    let remaining = timer.paused_remaining_ms.unwrap_or(0);
+                    if remaining == 0 {
+                        return Err("a zero-duration paused timer cannot resume".to_owned());
+                    }
+                    timer.phase = ClockTimerPhase::Running;
+                    timer.absolute_deadline_utc_ms = Some(now_ms.saturating_add(remaining as i64));
+                    timer.paused_remaining_ms = None;
+                    timer.expired_at_utc_ms = None;
+                }
+                TimerAction::Restart if timer.phase == ClockTimerPhase::Expired => {
+                    timer.phase = ClockTimerPhase::Running;
+                    timer.absolute_deadline_utc_ms =
+                        Some(now_ms.saturating_add(timer.original_duration_ms as i64));
+                    timer.paused_remaining_ms = None;
+                    timer.expired_at_utc_ms = None;
+                }
+                TimerAction::AddMinute if timer.phase == ClockTimerPhase::Expired => {
+                    timer.phase = ClockTimerPhase::Running;
+                    timer.absolute_deadline_utc_ms = Some(now_ms.saturating_add(60_000));
+                    timer.paused_remaining_ms = None;
+                    timer.expired_at_utc_ms = None;
+                }
+                _ => return Err("that timer action is stale for its current phase".to_owned()),
+            }
+            Ok(ClockCommandKindV1::UpsertSchedule { schedule })
+        }
+        ClockUiAction::ControlStopwatch {
+            stopwatch_id,
+            action,
+        } => {
+            let mut stopwatch = match stopwatch_id {
+                Some(id) => snapshot
+                    .stopwatches
+                    .iter()
+                    .find(|stopwatch| stopwatch.stopwatch_id == id)
+                    .cloned()
+                    .ok_or_else(|| "the selected stopwatch is no longer present".to_owned())?,
+                None if action == StopwatchAction::Start => ClockStopwatchV1 {
+                    stopwatch_id: action_id("stopwatch"),
+                    origin_node_id: snapshot.node_id.clone(),
+                    mirror_target_ids: vec![snapshot.node_id.clone()],
+                    revision: 1,
+                    phase: ClockStopwatchPhase::Reset,
+                    started_wall_utc_ms: None,
+                    started_monotonic_ms: None,
+                    accumulated_elapsed_ms: 0,
+                    laps: Vec::new(),
+                },
+                None => return Err("start the stopwatch before using that action".to_owned()),
+            };
+            match action {
+                StopwatchAction::Start if stopwatch.phase != ClockStopwatchPhase::Running => {
+                    stopwatch.phase = ClockStopwatchPhase::Running;
+                    stopwatch.started_wall_utc_ms = Some(now_ms);
+                    stopwatch.started_monotonic_ms = Some(monotonic_ms);
+                }
+                StopwatchAction::Pause if stopwatch.phase == ClockStopwatchPhase::Running => {
+                    stopwatch.accumulated_elapsed_ms = stopwatch_elapsed(&stopwatch, now_ms);
+                    stopwatch.phase = ClockStopwatchPhase::Paused;
+                    stopwatch.started_wall_utc_ms = None;
+                    stopwatch.started_monotonic_ms = None;
+                }
+                StopwatchAction::Lap if stopwatch.phase == ClockStopwatchPhase::Running => {
+                    let total = stopwatch_elapsed(&stopwatch, now_ms);
+                    let previous = stopwatch.laps.last().map_or(0, |lap| lap.total_elapsed_ms);
+                    let split = total.saturating_sub(previous);
+                    if split == 0 {
+                        return Err(
+                            "wait for elapsed stopwatch time before recording a lap".to_owned()
+                        );
+                    }
+                    stopwatch.accumulated_elapsed_ms = total;
+                    stopwatch.started_wall_utc_ms = Some(now_ms);
+                    stopwatch.started_monotonic_ms = Some(monotonic_ms);
+                    stopwatch.laps.push(mackes_mesh_types::clock::ClockLapV1 {
+                        lap_id: action_id("lap"),
+                        split_elapsed_ms: split,
+                        total_elapsed_ms: total,
+                    });
+                }
+                StopwatchAction::Reset => {
+                    stopwatch.phase = ClockStopwatchPhase::Reset;
+                    stopwatch.started_wall_utc_ms = None;
+                    stopwatch.started_monotonic_ms = None;
+                    stopwatch.accumulated_elapsed_ms = 0;
+                    stopwatch.laps.clear();
+                }
+                _ => return Err("that stopwatch action is stale for its current phase".to_owned()),
+            }
+            Ok(ClockCommandKindV1::UpsertStopwatch { stopwatch })
+        }
+        ClockUiAction::AcknowledgeOccurrence {
+            occurrence_id,
+            stop,
+        } => acknowledgement_body(snapshot, &occurrence_id, &snapshot.node_id, now_ms, stop),
+    }
+}
+
+fn command_effect_visible(snapshot: &ClockSnapshotV1, body: &ClockCommandKindV1) -> bool {
+    match body {
+        ClockCommandKindV1::UpsertSchedule { schedule } => snapshot
+            .schedules
+            .iter()
+            .find(|candidate| candidate.schedule_id == schedule.schedule_id)
+            .is_some_and(|candidate| {
+                let mut candidate = candidate.clone();
+                let mut expected = schedule.clone();
+                candidate.revision = 1;
+                expected.revision = 1;
+                candidate == expected
+            }),
+        ClockCommandKindV1::RemoveSchedule { schedule_id } => !snapshot
+            .schedules
+            .iter()
+            .any(|schedule| schedule.schedule_id == *schedule_id),
+        ClockCommandKindV1::SetScheduleEnabled {
+            schedule_id,
+            enabled,
+        } => snapshot.schedules.iter().any(|schedule| {
+            schedule.schedule_id == *schedule_id
+                && matches!(
+                    &schedule.schedule,
+                    ClockScheduleKindV1::Alarm(alarm) if alarm.enabled == *enabled
+                )
+        }),
+        ClockCommandKindV1::Acknowledge {
+            occurrence_id,
+            acknowledgement,
+        } => snapshot.occurrences.iter().any(|occurrence| {
+            occurrence.occurrence_id == *occurrence_id
+                && occurrence.acknowledgement.as_ref() == Some(acknowledgement)
+        }),
+        ClockCommandKindV1::UpsertStopwatch { stopwatch } => snapshot
+            .stopwatches
+            .iter()
+            .find(|candidate| candidate.stopwatch_id == stopwatch.stopwatch_id)
+            .is_some_and(|candidate| {
+                let mut candidate = candidate.clone();
+                let mut expected = stopwatch.clone();
+                candidate.revision = 1;
+                expected.revision = 1;
+                candidate == expected
+            }),
+        ClockCommandKindV1::SetSettings { settings } => snapshot.settings == *settings,
+    }
+}
+
+fn local_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+fn fmt_duration(ms: u64) -> String {
+    let s = ms / 1000;
+    let (h, m, s) = (s / 3600, (s % 3600) / 60, s % 60);
     if h > 0 {
         format!("{h}:{m:02}:{s:02}")
     } else {
@@ -249,1118 +1057,603 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// The Unix timestamp of `HH:MM` on the civil day `day` (days since the epoch).
-fn alarm_fire_ts(day: i64, hour: u8, minute: u8) -> i64 {
-    day * DAY_SECS + i64::from(hour) * 3600 + i64::from(minute) * 60
-}
-
-/// The local hostname the notification's `host` field carries (routes the folded
-/// card into this node's `alert:<self>` conversation) — the controller plane's
-/// fallback ladder, restated rather than reached across surface modules.
-fn local_hostname() -> String {
-    if let Ok(h) = std::env::var("HOSTNAME") {
-        let h = h.trim();
-        if !h.is_empty() {
-            return h.to_string();
-        }
-    }
-    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
-        if let Ok(h) = fs::read_to_string(path) {
-            let h = h.trim();
-            if !h.is_empty() {
-                return h.to_string();
-            }
-        }
-    }
-    "localhost".to_string()
-}
-
-// ──────────────────────────── the persisted model ────────────────────────────
-
-/// One countdown timer: its label, the preset duration, and the run state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct TimerEntry {
-    /// The operator's label (the notification headline names it).
-    label: String,
-    /// The preset countdown length in whole seconds.
-    duration_secs: u64,
-    /// Idle / Running / Paused / Finished (see [`TimerRun`]).
-    #[serde(default)]
-    run: TimerRun,
-}
-
-/// A timer's run state. `Running` persists the **absolute** deadline, so a
-/// timer set before a shell restart stays honest across it — a deadline that
-/// elapsed while the shell was down still rings (late, once) on the next tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(tag = "state", rename_all = "snake_case")]
-enum TimerRun {
-    /// Not started — the stored preset, restartable.
-    #[default]
-    Idle,
-    /// Counting down toward the absolute Unix deadline.
-    Running {
-        /// When the countdown elapses (Unix seconds).
-        deadline_unix: i64,
-    },
-    /// Paused with this much of the countdown left.
-    Paused {
-        /// The remaining countdown at pause time, in whole seconds.
-        remaining_secs: u64,
-    },
-    /// The countdown elapsed and its notification was emitted.
-    Finished {
-        /// When it rang (Unix seconds) — the panel shows the honest time.
-        rang_unix: i64,
-    },
-}
-
-/// One daily alarm: fires at `HH:MM` (the shell's displayed wall clock) every
-/// day it is enabled, edge-triggered once per civil day.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AlarmEntry {
-    /// The operator's label (the notification headline names it).
-    label: String,
-    /// Alarm hour, `0..=23` (the shell's displayed wall clock).
-    hour: u8,
-    /// Alarm minute, `0..=59`.
-    minute: u8,
-    /// Whether the alarm is armed — a disabled alarm keeps its slot silently.
-    enabled: bool,
-    /// The last civil day (days since the epoch) it fired — the once-per-day
-    /// edge trigger, persisted so a shell restart can't re-ring today's alarm.
-    #[serde(default)]
-    last_fired_day: Option<i64>,
-}
-
-/// The persisted store — timers + alarms, one JSON file under the client data
-/// dir (atomic temp + rename, the `power_honor` idiom).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-struct TimersFile {
-    /// The countdown timers, in creation order.
-    #[serde(default)]
-    timers: Vec<TimerEntry>,
-    /// The daily alarms, in creation order.
-    #[serde(default)]
-    alarms: Vec<AlarmEntry>,
-}
-
-impl TimersFile {
-    /// Load from `path`, honestly folding a missing / half-written / malformed
-    /// file to the empty store (never a fatal, never a fabricated entry).
-    fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    /// Write to `path` (atomic temp + rename, like the mesh peer/prefs records).
-    fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    }
-}
-
-/// Baseline-arm one alarm at `now`: if its `HH:MM` already passed **today**, mark
-/// today fired so it arms for tomorrow instead of ringing instantly — the notify
-/// worker's "first sight seeds the baseline silently" rule, applied at load, at
-/// creation, and at re-enable (setting a 07:00 alarm at 09:00 means *tomorrow*).
-fn baseline_arm(alarm: &mut AlarmEntry, now: i64) {
-    let today = now.div_euclid(DAY_SECS);
-    if now >= alarm_fire_ts(today, alarm.hour, alarm.minute)
-        && alarm.last_fired_day.is_none_or(|d| d < today)
-    {
-        alarm.last_fired_day = Some(today);
-    }
-}
-
-// ──────────────────────────── the shell-side state ────────────────────────────
-
-/// The Timers & Alarms store + its Bus/persistence seams. Owned by the `Shell`
-/// (NOT the panel) and ticked every frame from `render`, so firing never
-/// depends on the surface being open.
-pub struct TimersState {
-    /// The live store (persisted on every mutation + firing).
-    file: TimersFile,
-    /// The store path (`<client-data-dir>/timers-alarms.json`); `None` headless.
-    store: Option<PathBuf>,
-    /// The client Bus root the notify lane is written to; `None` headless.
-    bus_root: Option<PathBuf>,
-    /// The `host` field the notification carries (routes to `alert:<self>`).
-    self_host: String,
-    /// Whether the notify lane was primed this shell run (once).
-    primed: bool,
-    /// Draft: the new-timer label field.
-    draft_timer_label: String,
-    /// Draft: the new-timer hours / minutes / seconds spinners.
-    draft_timer_hms: (u32, u32, u32),
-    /// Draft: the new-alarm label field.
-    draft_alarm_label: String,
-    /// Draft: the new-alarm hour / minute spinners.
-    draft_alarm_hm: (u32, u32),
-}
-
-impl Default for TimersState {
-    fn default() -> Self {
-        let root = mde_bus::client_data_dir();
-        let store = root.clone().map(|d| d.join(STORE_FILE));
-        Self::with_roots(root, store, local_hostname())
-    }
-}
-
-impl TimersState {
-    /// Build over explicit roots (the testable constructor `Default` folds to):
-    /// load the store, then baseline-arm every alarm so nothing past-due rings
-    /// at boot (silently seeded, the notify-worker idiom).
-    fn with_roots(bus_root: Option<PathBuf>, store: Option<PathBuf>, self_host: String) -> Self {
-        let mut file = store
-            .as_deref()
-            .map_or_else(TimersFile::default, TimersFile::load_from);
-        let now = now_unix();
-        for alarm in &mut file.alarms {
-            baseline_arm(alarm, now);
-        }
-        Self {
-            file,
-            store,
-            bus_root,
-            self_host,
-            primed: false,
-            draft_timer_label: String::new(),
-            draft_timer_hms: (0, 5, 0),
-            draft_alarm_label: String::new(),
-            draft_alarm_hm: (7, 0),
-        }
-    }
-
-    /// The shell's per-frame hook (the POWER-5 two-line idiom): evaluate every
-    /// running timer + armed alarm against the wall clock, emit each firing on
-    /// the notify lane, and self-schedule the next wakeup — so a due alarm
-    /// fires without input, on the idle DRM seat, with the surface closed.
-    pub(crate) fn tick(&mut self, ctx: &egui::Context) {
-        let now = now_unix();
-        if self.tick_at(now) > 0 {
-            ctx.request_repaint();
-        }
-        if let Some(secs) = self.secs_to_next_event(now) {
-            ctx.request_repaint_after(Duration::from_secs(secs.max(1)));
-        }
-    }
-
-    /// One evaluation pass at an explicit `now` (the unit-testable core).
-    /// Returns how many timers/alarms fired; each firing emitted its
-    /// notification and the mutated store was persisted.
-    fn tick_at(&mut self, now: i64) -> usize {
-        self.prime_lane_once(now);
-        let mut fired: Vec<String> = Vec::new();
-        for timer in &mut self.file.timers {
-            if let TimerRun::Running { deadline_unix } = timer.run {
-                if now >= deadline_unix {
-                    timer.run = TimerRun::Finished { rang_unix: now };
-                    fired.push(format!(
-                        "Timer \u{201c}{}\u{201d} finished ({})",
-                        timer.label,
-                        fmt_duration(timer.duration_secs)
-                    ));
-                }
-            }
-        }
-        let today = now.div_euclid(DAY_SECS);
-        for alarm in &mut self.file.alarms {
-            if alarm.enabled
-                && alarm.last_fired_day.is_none_or(|d| d < today)
-                && now >= alarm_fire_ts(today, alarm.hour, alarm.minute)
+pub(crate) fn clock_panel(ui: &mut egui::Ui, state: &mut ClockState) {
+    let _ = AppFrame::new("Clock").show(ui);
+    ui.add_space(Style::SP_S);
+    ui.horizontal_wrapped(|ui| {
+        for section in ClockSection::ALL {
+            if ui
+                .selectable_label(state.section == section, section.label())
+                .clicked()
             {
-                alarm.last_fired_day = Some(today);
-                fired.push(format!(
-                    "Alarm \u{201c}{}\u{201d} \u{2014} {:02}:{:02}",
-                    alarm.label, alarm.hour, alarm.minute
-                ));
+                state.emit(ClockUiAction::SelectSection(section));
             }
         }
-        for summary in &fired {
-            // Warning severity: the chat fold bumps the unread badge / raises a
-            // chyron for Warning+ — a ringing timer must be noticed.
-            self.write_lane("warning", summary, now);
-        }
-        if !fired.is_empty() {
-            self.persist();
-        }
-        fired.len()
+    });
+    ui.separator();
+    let snapshot = state.snapshot.clone();
+    if let Some(error) = &state.error {
+        ui.colored_label(Style::WARN, error);
     }
+    if let Some(error) = &state.projection_error {
+        ui.colored_label(Style::WARN, error);
+    }
+    if let Some(note) = &state.command_note {
+        ui.colored_label(Style::TEXT_DIM, note);
+    }
+    if let Some(pending) = &state.in_flight {
+        ui.colored_label(
+            Style::WARN,
+            format!(
+                "Awaiting Clock daemon confirmation ({:.1}s).",
+                pending.published_at.elapsed().as_secs_f32()
+            ),
+        );
+    }
+    match state.section {
+        ClockSection::WorldClock => world_clock(ui, state, snapshot.as_ref()),
+        ClockSection::Alarms => alarms(ui, state, snapshot.as_ref()),
+        ClockSection::Timers => timers(ui, state, snapshot.as_ref()),
+        ClockSection::Stopwatch => stopwatch(ui, state, snapshot.as_ref()),
+    }
+}
 
-    /// Seconds until the earliest upcoming deadline/alarm (`None` when nothing
-    /// is armed) — the tick's self-scheduled wakeup.
-    fn secs_to_next_event(&self, now: i64) -> Option<u64> {
-        let today = now.div_euclid(DAY_SECS);
-        let timers = self.file.timers.iter().filter_map(|t| match t.run {
-            TimerRun::Running { deadline_unix } => Some(deadline_unix),
-            _ => None,
+fn empty(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(Style::SP_M);
+    ui.colored_label(Style::TEXT_DIM, text);
+}
+fn world_clock(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnapshotV1>) {
+    ui.heading("World Clock");
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(&mut state.drafts.world_zone);
+        if ui.button("Add city").clicked() {
+            let z = state.drafts.world_zone.trim().to_owned();
+            if !z.is_empty() {
+                state.emit(ClockUiAction::AddWorldClock { time_zone: z });
+            }
+        }
+    });
+    let Some(s) = snapshot else {
+        return empty(ui, "Waiting for daemon-projected Clock settings.");
+    };
+    render_zone_time(ui, &s.settings.this_node_time_zone, now_unix(), true);
+    for zone in &s.settings.world_clock_time_zones {
+        ui.horizontal(|ui| {
+            render_zone_time(ui, zone, now_unix(), false);
+            if ui.button("Remove").clicked() {
+                state.emit(ClockUiAction::RemoveWorldClock {
+                    time_zone: zone.clone(),
+                });
+            }
         });
-        let alarms = self.file.alarms.iter().filter(|a| a.enabled).map(|a| {
-            if a.last_fired_day.is_some_and(|d| d >= today) {
-                alarm_fire_ts(today + 1, a.hour, a.minute)
+    }
+}
+
+fn render_zone_time(ui: &mut egui::Ui, zone: &str, unix_secs: i64, primary: bool) {
+    match exact_zone_time(zone, unix_secs) {
+        Ok(time) => {
+            let text = format!("{} · {zone}", time.clock);
+            if primary {
+                ui.label(RichText::new(text).strong());
             } else {
-                alarm_fire_ts(today, a.hour, a.minute)
-            }
-        });
-        timers
-            .chain(alarms)
-            .min()
-            .map(|ts| u64::try_from(ts.saturating_sub(now)).unwrap_or(0))
-    }
-
-    /// Prime the notify lane once per shell run with a benign Info message —
-    /// the `workers::notify::prime_lanes` rule: the chat worker seeds a
-    /// first-seen topic's cursor at head and skips that first message, so the
-    /// prime absorbs the skip and every real firing thereafter is folded.
-    fn prime_lane_once(&mut self, now: i64) {
-        if self.primed || self.bus_root.is_none() {
-            return;
-        }
-        self.primed = true;
-        self.write_lane("info", "timers online", now);
-    }
-
-    /// Serialize + publish one alert-shaped body on the notify lane — the exact
-    /// field set `workers::notify` emits (`fold_alert` classifies `severity`,
-    /// `host` routes to `alert:<self>`). Best-effort: a missing Bus dir is the
-    /// honest solo-host no-op (§7), never a panic.
-    fn write_lane(&self, severity: &str, summary: &str, now: i64) {
-        let Some(root) = self.bus_root.as_ref() else {
-            return;
-        };
-        // arch-11: writer (publishes an alert) — kept on Persist::open; the shared
-        // BusReader seam is read-only.
-        let Ok(persist) = Persist::open(root.clone()) else {
-            return;
-        };
-        let body = serde_json::json!({
-            "severity": severity,
-            "source": NOTIFY_SOURCE,
-            "summary": summary,
-            "host": self.self_host,
-            "ts_unix_ms": now.saturating_mul(1000),
-        })
-        .to_string();
-        let _ = persist.write(NOTIFY_TOPIC, Priority::Default, None, Some(&body));
-    }
-
-    /// Persist the store (a silent no-op headless — no data dir, §7).
-    fn persist(&self) {
-        if let Some(path) = self.store.as_deref() {
-            let _ = self.file.save_to(path);
-        }
-    }
-
-    // ── panel-driven mutations (each persists) ──────────────────────────────
-
-    /// Create a timer from the draft row and start it counting immediately.
-    /// A zero draft duration is refused by the panel (the button disables).
-    fn start_draft_timer(&mut self, now: i64) {
-        let (h, m, s) = self.draft_timer_hms;
-        let duration_secs = u64::from(h) * 3600 + u64::from(m) * 60 + u64::from(s);
-        if duration_secs == 0 {
-            return;
-        }
-        let trimmed = self.draft_timer_label.trim();
-        let label = if trimmed.is_empty() {
-            "Timer".to_string()
-        } else {
-            trimmed.to_string()
-        };
-        self.file.timers.push(TimerEntry {
-            label,
-            duration_secs,
-            run: TimerRun::Running {
-                deadline_unix: now + i64::try_from(duration_secs).unwrap_or(i64::MAX),
-            },
-        });
-        self.draft_timer_label.clear();
-        self.persist();
-    }
-
-    /// Create an alarm from the draft row, baseline-armed (a time already past
-    /// today arms for tomorrow — never an instant ring).
-    fn add_draft_alarm(&mut self, now: i64) {
-        let (h, m) = self.draft_alarm_hm;
-        let trimmed = self.draft_alarm_label.trim();
-        let label = if trimmed.is_empty() {
-            "Alarm".to_string()
-        } else {
-            trimmed.to_string()
-        };
-        let mut alarm = AlarmEntry {
-            label,
-            hour: u8::try_from(h.min(23)).unwrap_or(23),
-            minute: u8::try_from(m.min(59)).unwrap_or(59),
-            enabled: true,
-            last_fired_day: None,
-        };
-        baseline_arm(&mut alarm, now);
-        self.file.alarms.push(alarm);
-        self.draft_alarm_label.clear();
-        self.persist();
-    }
-
-    /// Apply one row action from the panel (collected, then applied — the
-    /// borrow-friendly render idiom), then persist.
-    fn apply(&mut self, action: RowAction, now: i64) {
-        match action {
-            RowAction::TimerStart(i) => {
-                if let Some(t) = self.file.timers.get_mut(i) {
-                    t.run = TimerRun::Running {
-                        deadline_unix: now + i64::try_from(t.duration_secs).unwrap_or(i64::MAX),
-                    };
-                }
-            }
-            RowAction::TimerPause(i) => {
-                if let Some(t) = self.file.timers.get_mut(i) {
-                    if let TimerRun::Running { deadline_unix } = t.run {
-                        t.run = TimerRun::Paused {
-                            remaining_secs: u64::try_from(deadline_unix.saturating_sub(now))
-                                .unwrap_or(0),
-                        };
-                    }
-                }
-            }
-            RowAction::TimerResume(i) => {
-                if let Some(t) = self.file.timers.get_mut(i) {
-                    if let TimerRun::Paused { remaining_secs } = t.run {
-                        t.run = TimerRun::Running {
-                            deadline_unix: now + i64::try_from(remaining_secs).unwrap_or(i64::MAX),
-                        };
-                    }
-                }
-            }
-            RowAction::TimerReset(i) => {
-                if let Some(t) = self.file.timers.get_mut(i) {
-                    t.run = TimerRun::Idle;
-                }
-            }
-            RowAction::TimerRemove(i) => {
-                if i < self.file.timers.len() {
-                    self.file.timers.remove(i);
-                }
-            }
-            RowAction::AlarmToggle(i, on) => {
-                if let Some(a) = self.file.alarms.get_mut(i) {
-                    a.enabled = on;
-                    if on {
-                        // Re-enabling mid-day must not ring instantly for a time
-                        // already past — the same baseline rule as creation.
-                        baseline_arm(a, now);
-                    }
-                }
-            }
-            RowAction::AlarmRemove(i) => {
-                if i < self.file.alarms.len() {
-                    self.file.alarms.remove(i);
-                }
+                ui.label(text);
             }
         }
-        self.persist();
+        Err(_) => {
+            ui.colored_label(Style::WARN, format!("Unavailable · {zone}"));
+        }
     }
 }
 
-/// One deferred row action the render loop collects and applies after the
-/// iteration borrow ends.
-#[derive(Debug, Clone, Copy)]
-enum RowAction {
-    /// (Re)start timer `i` from its full preset.
-    TimerStart(usize),
-    /// Pause running timer `i`, keeping its remaining time.
-    TimerPause(usize),
-    /// Resume paused timer `i` from its remaining time.
-    TimerResume(usize),
-    /// Reset timer `i` back to its idle preset.
-    TimerReset(usize),
-    /// Delete timer `i`.
-    TimerRemove(usize),
-    /// Enable/disable alarm `i`.
-    AlarmToggle(usize, bool),
-    /// Delete alarm `i`.
-    AlarmRemove(usize),
-}
-
-// ──────────────────────────── the panel ────────────────────────────
-
-/// Render the Timers & Alarms surface into `ui`. A pure renderer over the
-/// shell-owned [`TimersState`] — the *shell* ticks the store every frame, so
-/// nothing here is load-bearing for firing (§7: closing the surface never
-/// silences an alarm).
-pub fn timers_panel(ui: &mut egui::Ui, state: &mut TimersState) {
-    let _ = AppFrame::new("Timers & Alarms").show(ui);
-    ui.add_space(Style::SP_S);
-
-    let now = display_unix();
-    clock_header(ui, now);
-
-    let mut action: Option<RowAction> = None;
-    let any_running = timers_section(ui, state, now, &mut action);
-    ui.add_space(Style::SP_M);
-    ui.separator();
-    alarms_section(ui, state, now, &mut action);
-
-    ui.add_space(Style::SP_M);
-    ui.label(
-        RichText::new(
-            "Firings post to the Chat feed (the event/notify lane) and ring even while \
-             this surface is closed — the shell keeps the countdown.",
-        )
-        .size(Style::SMALL)
-        .color(Style::TEXT_DIM),
-    );
-
-    if let Some(act) = action {
-        state.apply(act, now);
-    }
-    // A visible running countdown re-renders each second (the shell's tick
-    // schedules the *firing* wakeups; this is only display smoothness).
-    if any_running {
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
-    }
-}
-
-/// The live clock header — the same one-clock `HH:MM` + civil-date fold as the
-/// curtain face (§6), display-sized.
-fn clock_header(ui: &mut egui::Ui, now: i64) {
-    let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(DAY_SECS));
-    ui.add_space(Style::SP_M);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new(hhmm(now))
-                .size(Style::DISPLAY)
-                .color(Style::TEXT_STRONG),
-        );
-        ui.label(
-            RichText::new(format!("{year:04}-{month:02}-{day:02}"))
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
-    });
-    ui.add_space(Style::SP_M);
-    ui.separator();
-}
-
-/// The **Timers** section: the draft row (label + H/M/S + Start) and one row
-/// per timer with its state-true controls. Returns whether any timer is
-/// visibly counting (the caller keeps a 1 Hz repaint for display smoothness).
-fn timers_section(
-    ui: &mut egui::Ui,
-    state: &mut TimersState,
-    now: i64,
-    action: &mut Option<RowAction>,
-) -> bool {
-    ui.add_space(Style::SP_S);
-    ui.label(
-        RichText::new("Timers")
-            .size(Style::TITLE)
-            .color(Style::TEXT),
-    );
-    ui.add_space(Style::SP_XS);
+fn alarms(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnapshotV1>) {
+    ui.heading("Alarms");
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut state.draft_timer_label)
-                .hint_text("Timer label")
-                .desired_width(160.0),
-        );
-        let (h, m, s) = &mut state.draft_timer_hms;
-        ui.add(egui::DragValue::new(h).range(0..=99).suffix("h"));
-        ui.add(egui::DragValue::new(m).range(0..=59).suffix("m"));
-        ui.add(egui::DragValue::new(s).range(0..=59).suffix("s"));
-        let zero = *h == 0 && *m == 0 && *s == 0;
-        let start_response = ui.add_enabled(!zero, egui::Button::new("Start"));
-        if timers_disabled_hover_text(start_response, START_TIMER_DISABLED_TIP).clicked() {
-            state.start_draft_timer(now);
-        }
-    });
-    ui.add_space(Style::SP_S);
-    if state.file.timers.is_empty() {
-        ui.label(
-            RichText::new("No timers yet — set a duration and press Start.")
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
-    }
-    let mut any_running = false;
-    for (i, timer) in state.file.timers.iter().enumerate() {
-        ui.push_id(("timer-row", i), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&timer.label).color(Style::TEXT));
-                if matches!(timer.run, TimerRun::Running { .. }) {
-                    any_running = true;
-                }
-                timer_row_controls(ui, i, timer, now, action);
+        ui.text_edit_singleline(&mut state.drafts.alarm_label);
+        ui.add(egui::DragValue::new(&mut state.drafts.alarm_hour).range(0..=23));
+        ui.label(":");
+        ui.add(egui::DragValue::new(&mut state.drafts.alarm_minute).range(0..=59));
+        if ui.button("Add alarm").clicked() {
+            state.emit(ClockUiAction::CreateAlarm {
+                label: state.drafts.alarm_label.trim().to_owned(),
+                hour: state.drafts.alarm_hour,
+                minute: state.drafts.alarm_minute,
             });
-        });
-    }
-    any_running
-}
-
-fn timers_tooltip(ui: &mut egui::Ui, text: &str) {
-    let ctx = ui.ctx().clone();
-    let surface = Style::resolve_color(&ctx, Style::SURFACE);
-    let border = Style::resolve_color(&ctx, Style::BORDER);
-    let text_color = Style::resolve_color(&ctx, Style::TEXT);
-    egui::Frame::NONE
-        .fill(surface)
-        .stroke(egui::Stroke::new(1.0, border))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(Style::tooltip_margin())
-        .show(ui, |ui| {
-            ui.set_max_width(TIMERS_TOOLTIP_MAX_W);
-            ui.add(
-                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
-            );
-        });
-}
-
-fn timers_disabled_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
-    let text = text.into();
-    response.on_disabled_hover_ui(move |ui| timers_tooltip(ui, text.as_str()))
-}
-
-/// One timer row's state line + buttons — each run state shows its honest
-/// reading and only the actions that are real for it.
-fn timer_row_controls(
-    ui: &mut egui::Ui,
-    i: usize,
-    timer: &TimerEntry,
-    now: i64,
-    action: &mut Option<RowAction>,
-) {
-    match timer.run {
-        TimerRun::Running { deadline_unix } => {
-            let left = u64::try_from(deadline_unix.saturating_sub(now)).unwrap_or(0);
-            ui.label(
-                RichText::new(fmt_duration(left))
-                    .color(Style::ACCENT)
-                    .strong(),
-            );
-            if ui.button("Pause").clicked() {
-                *action = Some(RowAction::TimerPause(i));
-            }
-            if ui.button("Cancel").clicked() {
-                *action = Some(RowAction::TimerReset(i));
-            }
-        }
-        TimerRun::Paused { remaining_secs } => {
-            ui.label(
-                RichText::new(format!("{} (paused)", fmt_duration(remaining_secs)))
-                    .color(Style::TEXT_DIM),
-            );
-            if ui.button("Resume").clicked() {
-                *action = Some(RowAction::TimerResume(i));
-            }
-            if ui.button("Cancel").clicked() {
-                *action = Some(RowAction::TimerReset(i));
-            }
-        }
-        TimerRun::Idle => {
-            ui.label(RichText::new(fmt_duration(timer.duration_secs)).color(Style::TEXT_DIM));
-            if ui.button("Start").clicked() {
-                *action = Some(RowAction::TimerStart(i));
-            }
-            if ui.button("Remove").clicked() {
-                *action = Some(RowAction::TimerRemove(i));
-            }
-        }
-        TimerRun::Finished { rang_unix } => {
-            ui.label(RichText::new(format!("rang at {}", hhmm(rang_unix))).color(Style::WARN));
-            if ui.button("Restart").clicked() {
-                *action = Some(RowAction::TimerStart(i));
-            }
-            if ui.button("Remove").clicked() {
-                *action = Some(RowAction::TimerRemove(i));
-            }
-        }
-    }
-}
-
-/// The **Alarms** section: the draft row (label + HH:MM + Set) and one row per
-/// alarm — enable toggle, time, label, the daily note, and the honest
-/// "rang today" marker.
-fn alarms_section(
-    ui: &mut egui::Ui,
-    state: &mut TimersState,
-    now: i64,
-    action: &mut Option<RowAction>,
-) {
-    ui.add_space(Style::SP_S);
-    ui.label(
-        RichText::new("Alarms")
-            .size(Style::TITLE)
-            .color(Style::TEXT),
-    );
-    ui.add_space(Style::SP_XS);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut state.draft_alarm_label)
-                .hint_text("Alarm label")
-                .desired_width(160.0),
-        );
-        let (h, m) = &mut state.draft_alarm_hm;
-        ui.add(egui::DragValue::new(h).range(0..=23));
-        ui.label(RichText::new(":").color(Style::TEXT_DIM));
-        ui.add(egui::DragValue::new(m).range(0..=59));
-        if ui.button("Set alarm").clicked() {
-            state.add_draft_alarm(now);
         }
     });
-    ui.add_space(Style::SP_S);
-    if state.file.alarms.is_empty() {
-        ui.label(
-            RichText::new("No alarms set.")
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
-    }
-    let today = now.div_euclid(DAY_SECS);
-    for (i, alarm) in state.file.alarms.iter().enumerate() {
-        ui.push_id(("alarm-row", i), |ui| {
+    let Some(s) = snapshot else {
+        return empty(ui, "Waiting for daemon-projected alarms.");
+    };
+    ringing_occurrences(ui, state, s);
+    let mut any = false;
+    for schedule in &s.schedules {
+        if let ClockScheduleKindV1::Alarm(alarm) = &schedule.schedule {
+            any = true;
             ui.horizontal(|ui| {
-                let mut on = alarm.enabled;
-                if ui.checkbox(&mut on, "").changed() {
-                    *action = Some(RowAction::AlarmToggle(i, on));
-                }
-                let tone = if alarm.enabled {
-                    Style::TEXT
-                } else {
-                    Style::TEXT_DIM
+                let when = match &alarm.recurrence {
+                    ClockAlarmRecurrenceV1::OneTime { due_at_utc_ms } => {
+                        exact_zone_time(&s.settings.this_node_time_zone, due_at_utc_ms / 1000)
+                            .map_or_else(|_| "Unavailable".into(), |time| time.clock)
+                    }
+                    ClockAlarmRecurrenceV1::Weekdays { local_time, .. } => {
+                        format!("{:02}:{:02}", local_time.hour, local_time.minute)
+                    }
                 };
-                ui.label(
-                    RichText::new(format!("{:02}:{:02}", alarm.hour, alarm.minute))
-                        .color(tone)
-                        .strong(),
-                );
-                ui.label(RichText::new(&alarm.label).color(tone));
-                ui.label(
-                    RichText::new("daily")
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
-                if alarm.last_fired_day == Some(today) {
-                    ui.label(
-                        RichText::new("rang today")
-                            .size(Style::SMALL)
-                            .color(Style::WARN),
-                    );
+                ui.label(RichText::new(when).strong());
+                ui.label(&schedule.label);
+                let mut enabled = alarm.enabled;
+                if ui.checkbox(&mut enabled, "Enabled").changed() {
+                    state.emit(ClockUiAction::SetAlarmEnabled {
+                        schedule_id: schedule.schedule_id.clone(),
+                        enabled,
+                    });
                 }
                 if ui.button("Remove").clicked() {
-                    *action = Some(RowAction::AlarmRemove(i));
+                    state.emit(ClockUiAction::RemoveAlarm {
+                        schedule_id: schedule.schedule_id.clone(),
+                    });
                 }
             });
-        });
+        }
+    }
+    if !any {
+        empty(ui, "No alarms in the Clock daemon projection.");
     }
 }
 
-// ──────────────────────────── tests ────────────────────────────
+fn ringing_occurrences(ui: &mut egui::Ui, state: &mut ClockState, snapshot: &ClockSnapshotV1) {
+    for occurrence in snapshot
+        .occurrences
+        .iter()
+        .filter(|occurrence| occurrence.phase == ClockOccurrencePhase::Ringing)
+    {
+        let label = snapshot
+            .schedules
+            .iter()
+            .find(|schedule| schedule.schedule_id == occurrence.schedule_id)
+            .map_or("Clock alert", |schedule| schedule.label.as_str());
+        ui.horizontal(|ui| {
+            ui.colored_label(Style::WARN, format!("Ringing · {label}"));
+            if ui.button("Snooze").clicked() {
+                state.emit(ClockUiAction::AcknowledgeOccurrence {
+                    occurrence_id: occurrence.occurrence_id.clone(),
+                    stop: false,
+                });
+            }
+            if ui.button("Stop").clicked() {
+                state.emit(ClockUiAction::AcknowledgeOccurrence {
+                    occurrence_id: occurrence.occurrence_id.clone(),
+                    stop: true,
+                });
+            }
+        });
+    }
+}
+fn timers(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnapshotV1>) {
+    ui.heading("Timers");
+    ui.horizontal(|ui| {
+        ui.text_edit_singleline(&mut state.drafts.timer_label);
+        ui.add(
+            egui::DragValue::new(&mut state.drafts.timer_hours)
+                .range(0..=99)
+                .suffix("h"),
+        );
+        ui.add(
+            egui::DragValue::new(&mut state.drafts.timer_minutes)
+                .range(0..=59)
+                .suffix("m"),
+        );
+        ui.add(
+            egui::DragValue::new(&mut state.drafts.timer_seconds)
+                .range(0..=59)
+                .suffix("s"),
+        );
+        let ms = (u64::from(state.drafts.timer_hours) * 3600
+            + u64::from(state.drafts.timer_minutes) * 60
+            + u64::from(state.drafts.timer_seconds))
+            * 1000;
+        if ui.add_enabled(ms > 0, egui::Button::new("Start")).clicked() {
+            state.emit(ClockUiAction::CreateTimer {
+                label: state.drafts.timer_label.trim().to_owned(),
+                duration_ms: ms,
+            });
+        }
+    });
+    let Some(s) = snapshot else {
+        return empty(ui, "Waiting for daemon-projected timers.");
+    };
+    let now = now_unix().saturating_mul(1000);
+    let mut any = false;
+    for schedule in &s.schedules {
+        if let ClockScheduleKindV1::Timer(timer) = &schedule.schedule {
+            any = true;
+            ui.horizontal(|ui| {
+                ui.label(&schedule.label);
+                let left = match timer.phase {
+                    ClockTimerPhase::Running => timer
+                        .absolute_deadline_utc_ms
+                        .map_or(0, |d| u64::try_from(d.saturating_sub(now)).unwrap_or(0)),
+                    ClockTimerPhase::Paused => timer.paused_remaining_ms.unwrap_or(0),
+                    ClockTimerPhase::Expired => 0,
+                };
+                ui.label(RichText::new(fmt_duration(left)).strong());
+                if timer.phase == ClockTimerPhase::Expired {
+                    let ringing = s.occurrences.iter().any(|occurrence| {
+                        occurrence.schedule_id == schedule.schedule_id
+                            && occurrence.phase == ClockOccurrencePhase::Ringing
+                    });
+                    if ringing {
+                        if ui.button("Stop").clicked() {
+                            state.emit(ClockUiAction::ControlTimer {
+                                schedule_id: schedule.schedule_id.clone(),
+                                action: TimerAction::Stop,
+                            });
+                        }
+                    } else {
+                        if ui.button("Add 1 minute").clicked() {
+                            state.emit(ClockUiAction::ControlTimer {
+                                schedule_id: schedule.schedule_id.clone(),
+                                action: TimerAction::AddMinute,
+                            });
+                        }
+                        if ui.button("Restart").clicked() {
+                            state.emit(ClockUiAction::ControlTimer {
+                                schedule_id: schedule.schedule_id.clone(),
+                                action: TimerAction::Restart,
+                            });
+                        }
+                    }
+                } else {
+                    let action = if timer.phase == ClockTimerPhase::Running {
+                        TimerAction::Pause
+                    } else {
+                        TimerAction::Resume
+                    };
+                    if ui.button(format!("{action:?}")).clicked() {
+                        state.emit(ClockUiAction::ControlTimer {
+                            schedule_id: schedule.schedule_id.clone(),
+                            action,
+                        });
+                    }
+                }
+                if ui.button("Remove").clicked() {
+                    state.emit(ClockUiAction::ControlTimer {
+                        schedule_id: schedule.schedule_id.clone(),
+                        action: TimerAction::Remove,
+                    });
+                }
+            });
+        }
+    }
+    if !any {
+        empty(ui, "No timers in the Clock daemon projection.");
+    }
+}
+fn stopwatch(ui: &mut egui::Ui, state: &mut ClockState, snapshot: Option<&ClockSnapshotV1>) {
+    ui.heading("Stopwatch");
+    let Some(s) = snapshot else {
+        return empty(ui, "Waiting for daemon-projected stopwatch state.");
+    };
+    let sw = s.stopwatches.first();
+    let now_ms = now_unix().saturating_mul(1_000);
+    let elapsed = sw.map_or(0, |value| stopwatch_elapsed(value, now_ms));
+    ui.label(RichText::new(fmt_duration(elapsed)).size(Style::DISPLAY));
+    let phase = sw.map_or(ClockStopwatchPhase::Reset, |v| v.phase);
+    let id = sw.map(|v| v.stopwatch_id.clone());
+    ui.horizontal(|ui| {
+        let primary = if phase == ClockStopwatchPhase::Running {
+            StopwatchAction::Pause
+        } else {
+            StopwatchAction::Start
+        };
+        if ui.button(format!("{primary:?}")).clicked() {
+            state.emit(ClockUiAction::ControlStopwatch {
+                stopwatch_id: id.clone(),
+                action: primary,
+            });
+        }
+        if ui
+            .add_enabled(
+                phase == ClockStopwatchPhase::Running,
+                egui::Button::new("Lap"),
+            )
+            .clicked()
+        {
+            state.emit(ClockUiAction::ControlStopwatch {
+                stopwatch_id: id.clone(),
+                action: StopwatchAction::Lap,
+            });
+        }
+        if ui.button("Reset").clicked() {
+            state.emit(ClockUiAction::ControlStopwatch {
+                stopwatch_id: id,
+                action: StopwatchAction::Reset,
+            });
+        }
+    });
+    if let Some(sw) = sw {
+        for lap in sw.laps.iter().rev() {
+            ui.label(format!(
+                "Lap {} · {}",
+                lap.lap_id,
+                fmt_duration(lap.total_elapsed_ms)
+            ));
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        alarm_fire_ts, baseline_arm, days_from_civil, fmt_duration, hhmm, secs_to_next_minute,
-        timers_panel, AlarmEntry, ClockZone, TimerEntry, TimerRun, TimersFile, TimersState,
-        DAY_SECS, NOTIFY_TOPIC,
-    };
-    use mde_bus::persist::Persist;
-    use mde_egui::egui;
-    use mde_egui::{Density, Style, StyleColorScheme};
-    use std::path::PathBuf;
+    use super::*;
 
-    /// A fresh per-test scratch dir (no tempdir dev-dep in this crate) —
-    /// removed best-effort on drop.
-    struct Scratch(PathBuf);
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "mde-timers-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::create_dir_all(&dir).expect("scratch dir");
-            Self(dir)
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+    fn snapshot() -> ClockSnapshotV1 {
+        ClockSnapshotV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            node_id: "node-a".into(),
+            revision: 7,
+            produced_at_utc_ms: 1_720_646_365_000,
+            schedules: Vec::new(),
+            occurrences: Vec::new(),
+            stopwatches: Vec::new(),
+            settings: mackes_mesh_types::clock::ClockSettingsV1::defaults(
+                "America/New_York".into(),
+            ),
         }
     }
 
-    /// A state over a real Bus root (notifications land in a real `Persist`)
-    /// with no store file — the emission harness.
-    fn state_with_bus(root: &std::path::Path) -> TimersState {
-        TimersState::with_roots(Some(root.to_path_buf()), None, "testhost".to_string())
-    }
-
-    fn lane_bodies(root: &std::path::Path) -> Vec<String> {
-        let persist = Persist::open(root.to_path_buf()).expect("open persist");
-        persist
-            .list_since(NOTIFY_TOPIC, None)
-            .expect("list lane")
-            .into_iter()
-            .filter_map(|m| m.body)
-            .collect()
-    }
-
-    fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
-        fn text_color(text: &egui::epaint::TextShape) -> egui::Color32 {
-            if let Some(color) = text.override_text_color {
-                return color;
-            }
-            text.galley
-                .job
-                .sections
-                .iter()
-                .find_map(|section| {
-                    (section.format.color != egui::Color32::PLACEHOLDER)
-                        .then_some(section.format.color)
-                })
-                .unwrap_or(text.fallback_color)
-        }
-
-        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
-            match shape {
-                egui::Shape::Text(text) => {
-                    out.push((text.galley.text().to_owned(), text_color(text)))
-                }
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut out = Vec::new();
-        for clipped in shapes {
-            walk(&clipped.shape, &mut out);
-        }
-        out
-    }
-
-    fn painted_fill_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
-        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
-            match shape {
-                egui::Shape::Rect(rect) => {
-                    if rect.fill != egui::Color32::TRANSPARENT {
-                        out.push(rect.fill);
-                    }
-                }
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut out = Vec::new();
-        for clipped in shapes {
-            walk(&clipped.shape, &mut out);
-        }
-        out
-    }
-
-    fn render_timers_tooltip_frame(ctx: &egui::Context) -> egui::FullOutput {
-        ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(320.0, 96.0),
-                )),
-                ..Default::default()
+    fn ringing_snapshot() -> ClockSnapshotV1 {
+        let mut value = snapshot();
+        value.schedules = vec![
+            ClockScheduleV1 {
+                schedule_id: "alarm-1".into(),
+                origin_node_id: "node-a".into(),
+                revision: 3,
+                label: "Wake up".into(),
+                selected_target_ids: vec!["node-a".into()],
+                schedule: ClockScheduleKindV1::Alarm(ClockAlarmV1 {
+                    enabled: true,
+                    label: "Wake up".into(),
+                    recurrence: ClockAlarmRecurrenceV1::OneTime {
+                        due_at_utc_ms: value.produced_at_utc_ms,
+                    },
+                    sound: bundled_tone(),
+                    vibrate: false,
+                }),
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    super::timers_tooltip(ui, super::START_TIMER_DISABLED_TIP);
-                });
+            ClockScheduleV1 {
+                schedule_id: "timer-1".into(),
+                origin_node_id: "node-a".into(),
+                revision: 4,
+                label: "Tea".into(),
+                selected_target_ids: vec!["node-a".into()],
+                schedule: ClockScheduleKindV1::Timer(ClockTimerV1 {
+                    original_duration_ms: 60_000,
+                    phase: ClockTimerPhase::Expired,
+                    absolute_deadline_utc_ms: None,
+                    paused_remaining_ms: None,
+                    expired_at_utc_ms: Some(value.produced_at_utc_ms),
+                    sound: bundled_tone(),
+                    vibrate: false,
+                }),
+            },
+        ];
+        value.occurrences = [
+            ("occurrence-alarm", "alarm-1", 11),
+            ("occurrence-timer", "timer-1", 12),
+        ]
+        .into_iter()
+        .map(
+            |(occurrence_id, schedule_id, revision)| mackes_mesh_types::clock::ClockOccurrenceV1 {
+                occurrence_id: occurrence_id.into(),
+                global_event_id: format!("global-{occurrence_id}"),
+                schedule_id: schedule_id.into(),
+                revision,
+                due_at_utc_ms: value.produced_at_utc_ms,
+                phase: ClockOccurrencePhase::Ringing,
+                targets: Vec::new(),
+                acknowledgement: None,
             },
         )
+        .collect();
+        value
     }
 
     #[test]
-    fn the_clock_folds_read_sanely() {
-        // 2026-07-05 12:34:56 UTC-ish fold points, plus the epoch edge.
-        assert_eq!(hhmm(0), "00:00");
-        assert_eq!(hhmm(12 * 3600 + 34 * 60 + 56), "12:34");
-        assert_eq!(hhmm(-1), "23:59", "pre-epoch folds through rem_euclid");
-        assert_eq!(secs_to_next_minute(0), 60);
-        assert_eq!(secs_to_next_minute(59), 1);
-        assert_eq!(fmt_duration(0), "00:00");
-        assert_eq!(fmt_duration(65), "01:05");
-        assert_eq!(fmt_duration(3600 + 62), "1:01:02");
-    }
-
-    #[test]
-    fn us_time_zones_follow_daylight_saving_rules() {
-        let summer = days_from_civil(2026, 8, 7) * DAY_SECS + 12 * 3600;
-        let winter = days_from_civil(2026, 1, 7) * DAY_SECS + 12 * 3600;
-        assert_eq!(
-            ClockZone::EasternStandard.offset_seconds_at(summer),
-            -4 * 3600,
-            "Eastern Time must not remain one hour behind during daylight time"
-        );
-        assert_eq!(
-            ClockZone::EasternStandard.offset_seconds_at(winter),
-            -5 * 3600
-        );
-        assert_eq!(ClockZone::Utc.offset_seconds_at(summer), 0);
-    }
-
-    #[test]
-    fn a_due_timer_fires_one_warning_notification_on_the_notify_lane() {
-        // The unit's acceptance: a timer that elapses emits the alert-shaped
-        // body on `event/notify/timer` (the CHAT-FIX-2 lane the chat worker
-        // folds), exactly once, and flips to Finished.
-        let scratch = Scratch::new("timer-fires");
-        let mut s = state_with_bus(&scratch.0);
-        let now = 1_800_000_000_i64;
-        s.file.timers.push(TimerEntry {
-            label: "tea".to_string(),
-            duration_secs: 300,
-            run: TimerRun::Running {
-                deadline_unix: now + 300,
-            },
-        });
-
-        // Before the deadline: only the benign prime is on the lane.
-        assert_eq!(s.tick_at(now), 0, "nothing due yet");
-        let primed = lane_bodies(&scratch.0);
-        assert_eq!(primed.len(), 1, "the prime alone rides the lane pre-fire");
-        assert!(
-            primed[0].contains("\"severity\":\"info\""),
-            "the prime is Info"
-        );
-
-        // At/past the deadline: exactly one Warning firing, alert-shaped.
-        assert_eq!(s.tick_at(now + 300), 1, "the due timer fires");
-        let bodies = lane_bodies(&scratch.0);
-        assert_eq!(bodies.len(), 2, "prime + one firing");
-        let fired: serde_json::Value =
-            serde_json::from_str(&bodies[1]).expect("alert-shaped JSON body");
-        assert_eq!(fired["severity"], "warning", "a ring must bump the badge");
-        assert_eq!(fired["source"], "timer");
-        assert_eq!(fired["host"], "testhost", "routes to alert:<self>");
-        assert!(
-            fired["summary"].as_str().unwrap_or("").contains("tea"),
-            "the summary names the timer"
-        );
-        assert!(fired["ts_unix_ms"].as_i64().unwrap_or(0) > 0);
-        assert!(
-            matches!(s.file.timers[0].run, TimerRun::Finished { .. }),
-            "the timer lands Finished"
-        );
-
-        // Edge-triggered: a later tick must NOT re-fire the finished timer.
-        assert_eq!(s.tick_at(now + 400), 0, "no re-fire");
-        assert_eq!(lane_bodies(&scratch.0).len(), 2, "the lane stays at two");
-    }
-
-    #[test]
-    fn an_alarm_fires_once_per_day_and_rearms_tomorrow() {
-        let scratch = Scratch::new("alarm-daily");
-        let mut s = state_with_bus(&scratch.0);
-        // Day-aligned base so the H:M arithmetic below is exact.
-        let day0 = 20_000_i64;
-        let base = day0 * DAY_SECS;
-        s.file.alarms.push(AlarmEntry {
-            label: "standup".to_string(),
-            hour: 9,
-            minute: 30,
-            enabled: true,
-            last_fired_day: None,
-        });
-        let ring = alarm_fire_ts(day0, 9, 30);
-        assert_eq!(s.tick_at(base + 3600), 0, "09:30 not reached at 01:00");
-        assert_eq!(s.tick_at(ring), 1, "fires at 09:30");
-        assert_eq!(s.tick_at(ring + 60), 0, "once per day (edge-triggered)");
-        assert_eq!(s.tick_at(ring + DAY_SECS), 1, "re-arms the next day");
-        // A disabled alarm never fires.
-        s.file.alarms[0].enabled = false;
-        assert_eq!(s.tick_at(ring + 2 * DAY_SECS), 0, "disabled = silent");
-    }
-
-    #[test]
-    fn boot_seeds_past_due_alarms_silently_and_the_store_round_trips() {
-        // An alarm whose time already passed must NOT ring at construction
-        // (the notify worker's silent first-sight baseline), and the atomic
-        // store write must read back byte-identical state.
-        let scratch = Scratch::new("baseline");
-        let store = scratch.0.join("timers-alarms.json");
-        let file = TimersFile {
-            timers: vec![TimerEntry {
-                label: "idle".to_string(),
-                duration_secs: 60,
-                run: TimerRun::Idle,
-            }],
-            alarms: vec![AlarmEntry {
-                label: "early".to_string(),
-                hour: 0,
-                minute: 0,
-                enabled: true,
-                last_fired_day: None,
-            }],
-        };
-        file.save_to(&store).expect("atomic save");
-        assert_eq!(TimersFile::load_from(&store), file, "round trip");
-
-        let mut s =
-            TimersState::with_roots(Some(scratch.0.clone()), Some(store), "testhost".to_string());
-        // The 00:00 alarm passed hours ago today — construction baselined it.
-        let now = super::now_unix();
-        assert_eq!(s.tick_at(now), 0, "no boot-time ring for a passed alarm");
-        let bodies = lane_bodies(&scratch.0);
-        assert_eq!(bodies.len(), 1, "only the prime — nothing rang");
-        // A malformed store folds honestly to empty.
-        let bad = scratch.0.join("garbage.json");
-        std::fs::write(&bad, "{not json").expect("write garbage");
-        assert_eq!(TimersFile::load_from(&bad), TimersFile::default());
-    }
-
-    #[test]
-    fn disabled_start_tooltip_uses_themed_text_and_surface_in_light_mode() {
+    fn clock_banners_expose_only_fixed_actions_with_generation_identity() {
         let ctx = egui::Context::default();
-        Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
-        let out = render_timers_tooltip_frame(&ctx);
-        let text_color = Style::resolve_color(&ctx, Style::TEXT);
-        let surface = Style::resolve_color(&ctx, Style::SURFACE);
-
-        let texts = painted_text_colors(&out.shapes);
-        assert!(
-            texts.iter().any(|(text, color)| {
-                text == super::START_TIMER_DISABLED_TIP && *color == text_color
-            }),
-            "Timers disabled tooltip should paint themed text: {texts:?}"
-        );
-        assert!(
-            text_color != surface,
-            "Timers disabled tooltip text and surface must stay distinct in light mode"
-        );
-
-        let fills = painted_fill_colors(&out.shapes);
-        assert!(
-            fills.contains(&surface),
-            "Timers disabled tooltip should paint its themed surface: {fills:?}"
-        );
-    }
-
-    #[test]
-    fn baseline_arm_only_marks_times_already_past_today() {
-        let day = 10_000_i64;
-        let mut early = AlarmEntry {
-            label: "a".into(),
-            hour: 1,
-            minute: 0,
-            enabled: true,
-            last_fired_day: None,
-        };
-        // Now = 02:00 — the 01:00 alarm is past: seeded fired-today.
-        baseline_arm(&mut early, day * DAY_SECS + 2 * 3600);
-        assert_eq!(early.last_fired_day, Some(day));
-        let mut late = AlarmEntry {
-            label: "b".into(),
-            hour: 23,
-            minute: 0,
-            enabled: true,
-            last_fired_day: None,
-        };
-        // Now = 02:00 — the 23:00 alarm is still ahead: left armed for today.
-        baseline_arm(&mut late, day * DAY_SECS + 2 * 3600);
-        assert_eq!(late.last_fired_day, None);
-    }
-
-    #[test]
-    fn the_tick_schedules_the_earliest_upcoming_wakeup() {
-        let scratch = Scratch::new("wakeup");
-        let mut s = state_with_bus(&scratch.0);
-        let day0 = 20_000_i64;
-        let now = day0 * DAY_SECS + 8 * 3600; // 08:00
-        assert_eq!(s.secs_to_next_event(now), None, "nothing armed → no wake");
-        s.file.alarms.push(AlarmEntry {
-            label: "nine".into(),
-            hour: 9,
-            minute: 0,
-            enabled: true,
-            last_fired_day: None,
-        });
+        let snapshot = ringing_snapshot();
+        publish_clock_banner_projection(&ctx, &snapshot);
+        let banners = clock_banner_projection(&ctx);
+        assert_eq!(banners.len(), 2);
         assert_eq!(
-            s.secs_to_next_event(now),
-            Some(3600),
-            "09:00 is an hour out"
+            banners[0]
+                .actions
+                .clone()
+                .map(|action| (action.label, action.verb)),
+            [
+                ("Snooze", ClockBannerVerb::Snooze),
+                ("Stop", ClockBannerVerb::Stop),
+            ]
         );
-        s.file.timers.push(TimerEntry {
-            label: "soon".into(),
-            duration_secs: 120,
-            run: TimerRun::Running {
-                deadline_unix: now + 120,
-            },
-        });
-        assert_eq!(s.secs_to_next_event(now), Some(120), "the timer is sooner");
-        // Once today's alarm fired, tomorrow's slot is the alarm candidate.
-        s.file.alarms[0].last_fired_day = Some(day0);
-        s.file.timers.clear();
         assert_eq!(
-            s.secs_to_next_event(now + 2 * 3600),
-            Some(23 * 3600),
-            "fired-today re-arms for tomorrow 09:00"
+            banners[1]
+                .actions
+                .clone()
+                .map(|action| (action.label, action.verb)),
+            [
+                ("Add 1 minute", ClockBannerVerb::AddMinute),
+                ("Stop", ClockBannerVerb::Stop),
+            ]
         );
+        assert_eq!(banners[0].actions[0].occurrence_revision, 11);
+        assert_eq!(banners[1].actions[0].schedule_revision, 4);
     }
 
     #[test]
-    fn the_panel_renders_headless_over_real_state() {
-        // The same Context::run → tessellate path the other surface panels
-        // prove reachability with — real state (one of each run state), no
-        // demo data, non-empty primitives.
-        let scratch = Scratch::new("panel");
-        let mut s = state_with_bus(&scratch.0);
-        let now = super::now_unix();
-        s.file.timers.push(TimerEntry {
-            label: "tea".into(),
-            duration_secs: 300,
-            run: TimerRun::Running {
-                deadline_unix: now + 300,
-            },
-        });
-        s.file.timers.push(TimerEntry {
-            label: "rest".into(),
-            duration_secs: 60,
-            run: TimerRun::Paused { remaining_secs: 30 },
-        });
-        s.file.alarms.push(AlarmEntry {
-            label: "standup".into(),
-            hour: 9,
-            minute: 30,
-            enabled: true,
-            last_fired_day: None,
-        });
+    fn retained_clock_action_refuses_stale_generation_and_maps_to_signed_path() {
+        let snapshot = ringing_snapshot();
         let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(960.0, 640.0),
-            )),
-            ..Default::default()
+        publish_clock_banner_projection(&ctx, &snapshot);
+        let banners = clock_banner_projection(&ctx);
+        let mut state = ClockState::with_bus_root(None, "node-a".into());
+        state.snapshot = Some(snapshot);
+
+        assert!(matches!(
+            state
+                .validate_banner_action(banners[0].actions[0].clone())
+                .expect("fresh alarm action"),
+            ClockUiAction::AcknowledgeOccurrence { stop: false, .. }
+        ));
+        assert!(matches!(
+            state
+                .validate_banner_action(banners[1].actions[0].clone())
+                .expect("fresh timer action"),
+            ClockUiAction::ControlTimer {
+                action: TimerAction::AddMinute,
+                ..
+            }
+        ));
+
+        state.snapshot.as_mut().unwrap().occurrences[0].revision += 1;
+        assert!(state
+            .validate_banner_action(banners[0].actions[1].clone())
+            .is_err());
+    }
+
+    #[test]
+    fn banner_click_publishes_a_signed_typed_clock_command_without_navigation() {
+        let bus = tempfile::tempdir().expect("fixture Bus");
+        let ctx = egui::Context::default();
+        let snapshot = ringing_snapshot();
+        publish_clock_banner_projection(&ctx, &snapshot);
+        let action = clock_banner_projection(&ctx)[0].actions[0].clone();
+        request_clock_banner_action(&ctx, action);
+
+        let mut state = ClockState::with_bus_root(Some(bus.path().to_path_buf()), "node-a".into());
+        state.signer_id = Some("clock-shell".into());
+        state.snapshot = Some(snapshot);
+        state.pump(&ctx);
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("fixture Bus");
+        let body = persist
+            .read_latest("action/clock/command/node-a")
+            .expect("read command")
+            .expect("banner command")
+            .body
+            .expect("command body");
+        let context = ClockValidationContext {
+            wall_utc_ms: now_unix_ms().expect("clock"),
+            monotonic_ms: monotonic_ms(),
+            zone_exists: &zone_exists,
         };
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.push_id("shell-timers", |ui| timers_panel(ui, &mut s));
-            });
+        let command = ClockCommandV1::from_json_at(body.as_bytes(), &context)
+            .expect("closed Clock command")
+            .admit_at(
+                "clock-shell",
+                &SigningKey::from_bytes(&[7_u8; 32]).verifying_key(),
+                &context,
+            )
+            .expect("valid Clock signature");
+        assert!(matches!(
+            command.body,
+            ClockCommandKindV1::Acknowledge {
+                acknowledgement: ClockAcknowledgementV1 { stop: false, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_iana_zoneinfo_handles_dst_and_refuses_unknown_zones() {
+        let winter = exact_zone_time("America/New_York", 1_704_067_200).expect("winter");
+        let summer = exact_zone_time("America/New_York", 1_719_792_000).expect("summer");
+        assert_eq!(winter.offset_seconds, -5 * 3_600);
+        assert_eq!(summer.offset_seconds, -4 * 3_600);
+        assert!(exact_zone_time("Mars/Olympus_Mons", 1_719_792_000).is_err());
+        assert!(zone_offset_seconds_at("Mars/Olympus_Mons", 1_719_792_000).is_err());
+    }
+
+    #[test]
+    fn typed_clock_action_is_signed_and_published_on_the_canonical_topic() {
+        let bus = tempfile::tempdir().expect("fixture Bus");
+        let mut state = ClockState::with_bus_root(Some(bus.path().to_path_buf()), "node-a".into());
+        state.signer_id = Some("clock-shell".into());
+        state.snapshot = Some(snapshot());
+        state.emit(ClockUiAction::CreateTimer {
+            label: "Tea".into(),
+            duration_ms: 300_000,
         });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "the Timers panel painted nothing");
+        assert!(state.error.is_none(), "{:?}", state.error);
+        assert!(state.in_flight.is_some());
+
+        let persist = Persist::open(bus.path().to_path_buf()).expect("fixture Bus");
+        let message = persist
+            .read_latest("action/clock/command/node-a")
+            .expect("read command")
+            .expect("published command");
+        let body = message.body.expect("command body");
+        let now_ms = now_unix_ms().expect("clock");
+        let context = ClockValidationContext {
+            wall_utc_ms: now_ms,
+            monotonic_ms: monotonic_ms(),
+            zone_exists: &zone_exists,
+        };
+        let command = ClockCommandV1::from_json_at(body.as_bytes(), &context)
+            .expect("closed Clock command")
+            .admit_at(
+                "clock-shell",
+                &SigningKey::from_bytes(&[7_u8; 32]).verifying_key(),
+                &context,
+            )
+            .expect("valid Clock signature");
+        assert_eq!(command.expected_revision, 7);
+        assert!(matches!(
+            command.body,
+            ClockCommandKindV1::UpsertSchedule {
+                schedule: ClockScheduleV1 {
+                    schedule: ClockScheduleKindV1::Timer(_),
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn absent_signer_configuration_fails_visibly_closed() {
+        let bus = tempfile::tempdir().expect("fixture Bus");
+        let mut state = ClockState::with_bus_root(Some(bus.path().to_path_buf()), "node-a".into());
+        state.signer_id = None;
+        state.snapshot = Some(snapshot());
+        state.emit(ClockUiAction::CreateTimer {
+            label: "Tea".into(),
+            duration_ms: 300_000,
+        });
+        assert!(state.in_flight.is_none());
+        assert!(state
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("MDE_CLOCK_SIGNER_ID")));
+    }
+    #[test]
+    fn four_sections_are_explicit_and_stable() {
+        assert_eq!(
+            ClockSection::ALL.map(ClockSection::label),
+            ["World Clock", "Alarms", "Timers", "Stopwatch"]
+        );
+    }
+    #[test]
+    fn shell_has_no_scheduling_or_store_authority() {
+        let source = include_str!("timers.rs");
+        let forbidden = [
+            ["timers", "-alarms.json"].concat(),
+            ["event/notify/", "timer"].concat(),
+            ["fn tick", "_at"].concat(),
+            ["fn pers", "ist("].concat(),
+            ["deadline", "_unix"].concat(),
+            ["us_daylight", "_time"].concat(),
+            ["standard_offset", "_seconds"].concat(),
+        ];
+        for forbidden in forbidden {
+            assert!(!source.contains(&forbidden), "stale authority: {forbidden}");
+        }
     }
 }

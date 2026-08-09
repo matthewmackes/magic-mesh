@@ -35,6 +35,7 @@
 
 #![cfg(feature = "async-services")]
 
+mod android_provider;
 mod gate;
 mod path_key;
 mod reconcile;
@@ -49,20 +50,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::android_apps::{
-    AndroidAppAvailability, AndroidAppInventory, AndroidAppReadiness, AndroidGuestBootState,
-    AndroidGuestInventoryRequest, AndroidGuestRequest, AndroidGuestResponse,
+    android_catalog_state_topic, AndroidAppAvailability, AndroidAppInventory, AndroidAppReadiness,
+    AndroidGuestBootState, AndroidGuestInventoryRequest, AndroidGuestRequest, AndroidGuestResponse,
     AndroidImagePackageManifest, AndroidLaunchReadiness, AndroidLauncherResolvability,
-    AndroidUnavailableReason, MAX_ANDROID_OBSERVATION_AGE_MS,
+    AndroidSignedCatalog, AndroidUnavailableReason, MAX_ANDROID_OBSERVATION_AGE_MS,
 };
 use mackes_mesh_types::android_provider::{
-    CuttlefishGuestBootState as ProviderGuestBootState,
+    AndroidProviderAdmission, AndroidVdiSource, CuttlefishGuestBootState as ProviderGuestBootState,
     CuttlefishGuestReadiness as ProviderGuestReadiness, CuttlefishGuestReadinessEvidence,
-    CuttlefishImageProvenanceRef, CuttlefishVmId, CuttlefishVmLifecycleState,
-    CuttlefishVmObservation, CuttlefishVmTarget,
+    CuttlefishVmId, CuttlefishVmLifecycleState, CuttlefishVmObservation, CuttlefishVmTarget,
 };
 use mackes_mesh_types::cloud::{
     cloud_state_topic, CloudProviderAdapter, CloudReply, CloudState, DeliveryType, DeploymentRole,
-    DriftSummary, NodeCapacity, ServiceHealth, WorkloadRow, CLOUD_ACTION_PREFIX,
+    DriftSummary, HealthState, NodeCapacity, ServiceHealth, WorkloadRow, CLOUD_ACTION_PREFIX,
     MAX_ANDROID_INVENTORIES_PER_STATE,
 };
 use mde_bus::hooks::config::Priority;
@@ -71,6 +71,10 @@ use mde_bus::rpc::reply_topic;
 
 use super::{ShutdownToken, Worker};
 
+use android_provider::{
+    configured_image_path, preflight, AndroidHostProbe, AndroidPreflightInput,
+    ProductionAndroidHostProbe,
+};
 #[cfg(test)]
 pub(crate) use gate::nonce_digest;
 pub(crate) use gate::{
@@ -161,6 +165,14 @@ pub struct CloudWorker {
     /// Providers keyed by the stable Android VM workload identity. An absent
     /// registration leaves the derived Workloads row pending.
     android_guest_providers: AndroidGuestProviderRegistry,
+    /// Latest fail-closed image/host/provider admission folded into state/cloud.
+    android_provider_admissions: std::sync::Mutex<Vec<AndroidProviderAdmission>>,
+    /// Injectable host/image seam; production reads real local kernel/filesystem facts.
+    android_host_probe: Arc<dyn AndroidHostProbe>,
+    /// Serializes durable Android lifecycle compare-and-mutate operations.
+    android_lifecycle_lock: std::sync::Mutex<()>,
+    /// Current guest-owned display sources, keyed by lifecycle identity.
+    android_vdi_sources: std::sync::Mutex<Vec<AndroidVdiSource>>,
     /// Durable host-scoped Android observation snapshot, if the host identity
     /// can be represented as one safe filename component.
     android_inventory_path: Option<PathBuf>,
@@ -269,6 +281,10 @@ impl CloudWorker {
             db_path: crate::default_db_path(),
             android_inventory_ledger: std::sync::Mutex::new(android_inventory_ledger),
             android_guest_providers: AndroidGuestProviderRegistry::new(),
+            android_provider_admissions: std::sync::Mutex::new(Vec::new()),
+            android_host_probe: Arc::new(ProductionAndroidHostProbe::default()),
+            android_lifecycle_lock: std::sync::Mutex::new(()),
+            android_vdi_sources: std::sync::Mutex::new(Vec::new()),
             android_inventory_path,
             bus_root: default_bus_root(),
             poll: POLL,
@@ -284,6 +300,12 @@ impl CloudWorker {
     #[must_use]
     pub fn with_runner(mut self, runner: Arc<dyn CloudRunner>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_android_host_probe(mut self, probe: Arc<dyn AndroidHostProbe>) -> Self {
+        self.android_host_probe = probe;
         self
     }
 
@@ -732,38 +754,44 @@ impl CloudWorker {
     /// workload on the existing pending projection; it never gets a guessed
     /// image provenance or a fake provider.
     fn ensure_configured_cuttlefish_providers(&mut self) {
+        let catalog = self.load_admitted_android_catalog();
+        let artifact = configured_image_path();
+        let provider_healthy =
+            self.runner.probe_tool(runner::TOOL_LIBVIRT).state == HealthState::Up;
+        let observed_at = u64::try_from(now_ms()).unwrap_or(1).max(1);
+        let mut admissions = Vec::new();
         for spec in reconcile::read_desired_slice(&self.state_root, &self.host)
             .into_iter()
             .filter(|spec| spec.delivery_type == DeliveryType::AndroidVm)
+            .take(MAX_ANDROID_INVENTORIES_PER_STATE)
         {
-            if self.android_guest_providers.provider(&spec.name).is_ok() {
-                continue;
-            }
-            let Some(manifest) = load_android_package_manifest(&self.state_root, &spec.name) else {
-                continue;
-            };
-            if spec.image.as_deref() != Some(manifest.image_provenance.image_id.as_str())
-                || spec.image_digest.as_deref()
-                    != Some(manifest.image_provenance.image_digest.as_str())
-            {
-                tracing::warn!(
-                    target: "mackesd::cloud",
-                    workload = %spec.name,
-                    "Android package manifest does not match the desired image binding"
-                );
-                continue;
-            }
-
             let Ok(vm_id) = CuttlefishVmId::new(spec.name.clone()) else {
+                tracing::warn!(target: "mackesd::cloud", workload = %spec.name, "invalid Android workload identity omitted from provider preflight");
                 continue;
             };
-            let provenance = &manifest.image_provenance;
-            let Ok(image_provenance) = CuttlefishImageProvenanceRef::new(
-                provenance.image_id.clone(),
-                provenance.image_digest.clone(),
-                provenance.source_revision.clone(),
-                provenance.catalog_revision.clone(),
-            ) else {
+            self.android_guest_providers.unregister(&spec.name);
+            let manifest = load_android_package_manifest(&self.state_root, &spec.name);
+            let admission = preflight(
+                AndroidPreflightInput {
+                    workload: &spec,
+                    catalog: catalog.as_ref(),
+                    package_manifest: manifest.as_ref(),
+                    artifact: artifact.as_deref(),
+                    provider_healthy,
+                    now_unix_ms: observed_at,
+                },
+                self.android_host_probe.as_ref(),
+            );
+            let ready = admission.is_ready();
+            admissions.push(admission.clone());
+            if !ready {
+                tracing::warn!(target: "mackesd::cloud", workload = %spec.name, refusal = ?admission.refusal, "Android provider placement refused");
+                continue;
+            }
+            let Some(manifest) = manifest else {
+                continue;
+            };
+            let Some(image_provenance) = admission.image_provenance.clone() else {
                 continue;
             };
             let Ok(target) = CuttlefishVmTarget::new(vm_id, image_provenance) else {
@@ -785,7 +813,19 @@ impl CloudWorker {
             ) else {
                 continue;
             };
-            let client = LibvirtCuttlefishProviderClient::new(self.runner.clone());
+            let Some(catalog_digest) = catalog
+                .as_ref()
+                .and_then(|catalog| catalog.payload.content_digest().ok())
+            else {
+                continue;
+            };
+            let Ok(client) = LibvirtCuttlefishProviderClient::with_guest_contract(
+                self.runner.clone(),
+                manifest.clone(),
+                catalog_digest,
+            ) else {
+                continue;
+            };
             if let Err(error) = self.android_guest_providers.register_cuttlefish_provider(
                 spec.name,
                 target,
@@ -800,6 +840,22 @@ impl CloudWorker {
                 );
             }
         }
+        admissions.sort_by(|left, right| left.workload_id.cmp(&right.workload_id));
+        if let Ok(mut retained) = self.android_provider_admissions.lock() {
+            *retained = admissions;
+        }
+    }
+
+    fn load_admitted_android_catalog(&self) -> Option<AndroidSignedCatalog> {
+        const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+        let root = self.bus_root.as_ref()?;
+        let persist = Persist::open(root.clone()).ok()?;
+        let topic = android_catalog_state_topic(&self.host).ok()?;
+        let body = persist.read_latest(&topic).ok()??.body?;
+        if body.is_empty() || body.len() > MAX_CATALOG_BYTES {
+            return None;
+        }
+        serde_json::from_str(&body).ok()
     }
 
     /// Poll registered Android guest providers and admit only their typed,
@@ -903,6 +959,16 @@ impl CloudWorker {
             .unwrap_or_default();
         let android_inventories =
             merged_android_inventories(&workloads, &retained_android_inventories, now_ms());
+        let android_provider_admissions = self
+            .android_provider_admissions
+            .lock()
+            .map(|rows| rows.clone())
+            .unwrap_or_default();
+        let android_vdi_sources = self
+            .android_vdi_sources
+            .lock()
+            .map(|rows| rows.clone())
+            .unwrap_or_default();
         CloudState {
             host: self.host.clone(),
             role: self.deployment_role,
@@ -917,6 +983,8 @@ impl CloudWorker {
             drift_summary,
             node_capacity: NodeCapacity::default(),
             android_inventories,
+            android_provider_admissions,
+            android_vdi_sources,
         }
     }
 
@@ -1831,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_manifest_auto_registers_libvirt_cuttlefish_provider() {
+    fn unsigned_manifest_cannot_bypass_catalog_and_provider_preflight() {
         let tmp = tempdir().expect("temporary state root");
         let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let spec = mackes_mesh_types::cloud::WorkloadSpec {
@@ -1888,11 +1956,13 @@ mod tests {
             DriftSummary::default(),
         );
 
-        assert!(worker.refresh_android_inventories());
-        assert!(worker.android_guest_providers.provider("phone-a").is_ok());
+        assert!(!worker.refresh_android_inventories());
+        assert!(worker.android_guest_providers.provider("phone-a").is_err());
+        let state = worker.build_state();
+        assert_eq!(state.android_provider_admissions.len(), 1);
         assert_eq!(
-            worker.build_state().android_inventories[0].guest_boot_state,
-            AndroidGuestBootState::Booting
+            state.android_provider_admissions[0].refusal,
+            Some(mackes_mesh_types::android_provider::AndroidProviderRefusal::CatalogUnavailable)
         );
     }
 

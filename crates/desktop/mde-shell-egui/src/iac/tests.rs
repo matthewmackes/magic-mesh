@@ -159,6 +159,8 @@ fn fixture_state() -> CloudState {
             mem_used_mb: 4096,
         },
         android_inventories: Vec::new(),
+        android_provider_admissions: Vec::new(),
+        android_vdi_sources: Vec::new(),
     }
 }
 
@@ -674,44 +676,21 @@ fn run_route_uses_dense_resource_table_before_configure_lens() {
 }
 
 #[test]
-fn android_apps_catalog_renders_in_active_plan_and_run_routes() {
+fn android_apps_fail_closed_without_an_admitted_signed_catalog() {
     for route in [WorkloadsRoute::Plan, WorkloadsRoute::Run] {
         let mut state = state_on(DeliveryView::AndroidVm, route);
         state.states[0]
             .workloads
             .push(workload("android-1", DeliveryType::AndroidVm, "running"));
 
-        // The production panel wraps this route in a vertical ScrollArea. Give
-        // the headless proof enough height to paint the complete scrollable
-        // catalog so the last governed row is asserted too.
         let text = rendered_text_at_height(1_400.0, |ui| route_body(ui, &mut state));
-        assert!(text.contains("AOSP starter apps"), "{route:?}: {text}");
+        assert!(text.contains("Governed Android apps"), "{route:?}: {text}");
         assert!(
-            text.contains(
-                "No guest inventory is connected for Android VM android-1 on eagle; its catalog remains pending."
-            ),
+            text.contains("Unavailable · no admitted signed catalog for this placement"),
             "{route:?}: {text}"
         );
-        for package_id in [
-            "com.android.browser",
-            "com.android.calendar",
-            "com.android.camera2",
-            "com.android.deskclock",
-            "com.android.contacts",
-            "com.android.documentsui",
-            "com.android.gallery3d",
-            "com.android.calculator2",
-            "com.android.settings",
-        ] {
-            assert!(
-                text.contains(package_id),
-                "{route:?} omitted {package_id}: {text}"
-            );
-        }
-        assert!(text.contains("inventory pending"), "{route:?}: {text}");
-        assert!(text.contains("guest pending"), "{route:?}: {text}");
         assert!(
-            text.contains("launch integration pending"),
+            text.contains("No signed app policy cards are available"),
             "{route:?}: {text}"
         );
     }
@@ -1670,6 +1649,478 @@ fn rendered_text_at_height(height: f32, mut run: impl FnMut(&mut egui::Ui)) -> S
         collect(&clipped.shape, &mut text);
     }
     text
+}
+
+const ANDROID_NOW: u64 = 1_800_000_000_000;
+const ANDROID_IMAGE_DIGEST: &str =
+    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn governed_android_catalog() -> mackes_mesh_types::android_apps::AndroidSignedCatalog {
+    use mackes_mesh_types::android_apps::{
+        AndroidAppCapability, AndroidAppPermission, AndroidCatalogAppPolicy,
+        AndroidCatalogGuestReadiness, AndroidCatalogPayload, AndroidImageManifest,
+        AndroidImagePackage, AndroidImagePackageManifest, AndroidImageProvenance,
+        AndroidPackageVersion, AndroidResourceClass, AndroidResourceProfile, AospStarterApp,
+        AospStarterCatalog, ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+    };
+
+    let image = AndroidImageManifest::new(
+        "aosp-cuttlefish-production",
+        ANDROID_IMAGE_DIGEST,
+        "aosp-source-r1",
+        "starter-r1",
+        ANDROID_NOW - 3_000,
+        ANDROID_NOW - 2_000,
+        AospStarterCatalog::v1(),
+    )
+    .expect("image manifest");
+    let provenance = AndroidImageProvenance::from_manifest(&image).expect("image provenance");
+    let packages = AospStarterApp::ALL
+        .into_iter()
+        .map(|app| {
+            AndroidImagePackage::for_app(
+                app,
+                AndroidPackageVersion::new("2026.08.1", 7).expect("package version"),
+            )
+        })
+        .collect();
+    let package_manifest =
+        AndroidImagePackageManifest::new(provenance, packages).expect("package manifest");
+    let app_policies = AospStarterApp::ALL
+        .into_iter()
+        .map(|app| AndroidCatalogAppPolicy {
+            app,
+            permissions: if app == AospStarterApp::Camera {
+                vec![AndroidAppPermission::Camera, AndroidAppPermission::Network]
+            } else {
+                vec![AndroidAppPermission::Network]
+            },
+            capabilities: vec![AndroidAppCapability::VdiDisplay],
+            resources: AndroidResourceProfile {
+                class: AndroidResourceClass::Standard,
+                vcpus: 4,
+                memory_mib: 4_096,
+                disk_mib: 16_384,
+            },
+            guest_readiness: AndroidCatalogGuestReadiness::BootedInventoryAndLauncherReady,
+        })
+        .collect();
+    mackes_mesh_types::android_apps::AndroidSignedCatalog::sign(
+        "android-release-v1",
+        AndroidCatalogPayload {
+            schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
+            catalog_id: "aosp-production".to_owned(),
+            revision: 4,
+            issued_at_unix_ms: ANDROID_NOW - 1_000,
+            expires_at_unix_ms: ANDROID_NOW + 60_000,
+            image_manifest: image,
+            package_manifest,
+            app_policies,
+        },
+        &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+    )
+    .expect("signed catalog")
+}
+
+fn governed_android_inventory() -> mackes_mesh_types::android_apps::AndroidAppInventory {
+    use mackes_mesh_types::android_apps::{
+        AndroidAppAvailability, AndroidAppInventory, AndroidAppInventoryEntry, AndroidAppReadiness,
+        AndroidGuestBootState, AndroidLaunchReadiness, AndroidLauncherResolvability,
+        AndroidPackageVersion, AospStarterApp,
+    };
+
+    let catalog = governed_android_catalog();
+    let entries = AospStarterApp::ALL
+        .into_iter()
+        .map(|app| AndroidAppInventoryEntry {
+            descriptor: app.descriptor(),
+            availability: AndroidAppAvailability::Installed,
+            package_version: Some(
+                AndroidPackageVersion::new("2026.08.1", 7).expect("package version"),
+            ),
+            readiness: AndroidAppReadiness::Ready,
+            launcher_resolvability: AndroidLauncherResolvability::Resolved,
+            launch_readiness: AndroidLaunchReadiness::Ready,
+            unavailable_reason: None,
+        })
+        .collect();
+    AndroidAppInventory::observed(
+        "android-eagle",
+        catalog.payload.package_manifest.image_provenance,
+        AndroidGuestBootState::Ready,
+        ANDROID_NOW - 100,
+        100,
+        entries,
+    )
+    .expect("ready inventory")
+}
+
+fn governed_android_admission() -> mackes_mesh_types::android_provider::AndroidProviderAdmission {
+    use mackes_mesh_types::android_provider::{
+        AndroidProviderAdmission, AndroidProviderReadiness, CuttlefishImageProvenanceRef,
+        ANDROID_PROVIDER_ADMISSION_SCHEMA_VERSION,
+    };
+
+    let provenance = governed_android_catalog()
+        .payload
+        .package_manifest
+        .image_provenance;
+    AndroidProviderAdmission {
+        schema_version: ANDROID_PROVIDER_ADMISSION_SCHEMA_VERSION,
+        workload_id: "android-eagle".to_owned(),
+        image_provenance: Some(
+            CuttlefishImageProvenanceRef::new(
+                provenance.image_id,
+                provenance.image_digest,
+                provenance.source_revision,
+                provenance.catalog_revision,
+            )
+            .expect("provider provenance"),
+        ),
+        readiness: AndroidProviderReadiness::Ready,
+        refusal: None,
+        kvm_available: true,
+        nested_virtualization: true,
+        provider_healthy: true,
+        required_vcpus: 4,
+        available_vcpus: 16,
+        required_memory_mib: 4_096,
+        available_memory_mib: 32_768,
+        required_disk_mib: 16_384,
+        available_disk_mib: 131_072,
+        observed_at_unix_ms: ANDROID_NOW - 100,
+    }
+}
+
+fn governed_catalog_snapshot() -> android_governed::CatalogSnapshot {
+    let catalog = governed_android_catalog();
+    let body = serde_json::to_string(&catalog).expect("catalog body");
+    let topic = mackes_mesh_types::android_apps::android_catalog_state_topic("eagle")
+        .expect("catalog topic");
+    android_governed::decode_catalog_snapshot(&topic, &body).expect("catalog snapshot")
+}
+
+fn governed_android_projection() -> android_governed::WorkloadProjection {
+    let workload = android_governed::WorkloadInput {
+        node: "eagle".to_owned(),
+        workload_id: "android-eagle".to_owned(),
+        runtime_status: "shutoff".to_owned(),
+    };
+    let catalog = governed_catalog_snapshot();
+    let catalog_digest = catalog
+        .catalog
+        .payload
+        .content_digest()
+        .expect("catalog digest");
+    let admission = governed_android_admission();
+    let inventory = governed_android_inventory();
+    android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: Some(&catalog_digest),
+        admission: Some(&admission),
+        inventory: Some(&inventory),
+        vdi_source: None,
+        receipt: None,
+        pending: None,
+        now_unix_ms: ANDROID_NOW,
+    })
+}
+
+#[test]
+fn governed_android_model_uses_exact_signed_permissions_and_refuses_missing_preflight() {
+    let projection = governed_android_projection();
+    assert_eq!(
+        projection.availability,
+        android_governed::WorkloadAvailability::Ready
+    );
+    assert_eq!(projection.cards.len(), 9);
+    let camera = projection
+        .cards
+        .iter()
+        .find(|card| card.app == AospStarterApp::Camera)
+        .expect("camera card");
+    assert_eq!(camera.permissions, "Camera, Network");
+    assert_eq!(camera.capabilities, "VDI display");
+    assert!(camera.approval.contains("android-release-v1"));
+    assert!(camera.can_start);
+
+    let workload = android_governed::WorkloadInput {
+        node: "eagle".to_owned(),
+        workload_id: "android-eagle".to_owned(),
+        runtime_status: "shutoff".to_owned(),
+    };
+    let catalog = governed_catalog_snapshot();
+    let catalog_digest = catalog
+        .catalog
+        .payload
+        .content_digest()
+        .expect("catalog digest");
+    let inventory = governed_android_inventory();
+    let refused = android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: Some(&catalog_digest),
+        admission: None,
+        inventory: Some(&inventory),
+        vdi_source: None,
+        receipt: None,
+        pending: None,
+        now_unix_ms: ANDROID_NOW,
+    });
+    assert!(matches!(
+        refused.availability,
+        android_governed::WorkloadAvailability::Unavailable(ref reason)
+            if reason.contains("preflight")
+    ));
+    assert!(refused.cards.iter().all(|card| !card.can_start));
+
+    let spoofed = android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: None,
+        admission: Some(&governed_android_admission()),
+        inventory: Some(&inventory),
+        vdi_source: None,
+        receipt: None,
+        pending: None,
+        now_unix_ms: ANDROID_NOW,
+    });
+    assert!(matches!(
+        spoofed.availability,
+        android_governed::WorkloadAvailability::Unavailable(ref reason)
+            if reason.contains("not signature authority")
+    ));
+    assert!(spoofed.cards.is_empty());
+    assert_eq!(spoofed.signed_identity, "No admitted signed catalog");
+}
+
+#[test]
+fn governed_android_model_projects_cancel_and_retry_from_exact_generation_state() {
+    let workload = android_governed::WorkloadInput {
+        node: "eagle".to_owned(),
+        workload_id: "android-eagle".to_owned(),
+        runtime_status: "starting".to_owned(),
+    };
+    let catalog = governed_catalog_snapshot();
+    let catalog_digest = catalog
+        .catalog
+        .payload
+        .content_digest()
+        .expect("catalog digest");
+    let admission = governed_android_admission();
+    let inventory = governed_android_inventory();
+    let pending = android_governed::PendingLifecycle {
+        workload_id: "android-eagle".to_owned(),
+        operation: android_governed::LifecycleOperation::Start,
+        generation: 1,
+        app: Some(AospStarterApp::Camera),
+    };
+    let starting = android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: Some(&catalog_digest),
+        admission: Some(&admission),
+        inventory: Some(&inventory),
+        vdi_source: None,
+        receipt: None,
+        pending: Some(&pending),
+        now_unix_ms: ANDROID_NOW,
+    });
+    assert_eq!(
+        starting.availability,
+        android_governed::WorkloadAvailability::Starting
+    );
+    assert_eq!(starting.expected_generation, 1);
+    assert!(starting.can_cancel);
+
+    let failed = android_governed::LifecycleReceipt {
+        schema_version: 1,
+        workload_id: "android-eagle".to_owned(),
+        generation: 1,
+        phase: android_governed::LifecyclePhase::Failed,
+        app: None,
+        last_request_id: Some("start-1".to_owned()),
+        last_operation: Some(android_governed::LifecycleOperation::Start),
+        last_ok: false,
+        failure: Some("guest launcher identity mismatch".to_owned()),
+    };
+    let retry = android_governed::project(android_governed::ModelInput {
+        workload: &workload,
+        catalog: Some(&catalog),
+        admitted_cache_digest: Some(&catalog_digest),
+        admission: Some(&admission),
+        inventory: Some(&inventory),
+        vdi_source: None,
+        receipt: Some(&failed),
+        pending: None,
+        now_unix_ms: ANDROID_NOW,
+    });
+    assert!(matches!(
+        retry.availability,
+        android_governed::WorkloadAvailability::Failed(ref reason)
+            if reason.contains("launcher identity mismatch")
+    ));
+    assert_eq!(retry.expected_generation, 1);
+    assert!(retry.cards.iter().all(|card| card.can_retry));
+}
+
+#[test]
+fn governed_android_lifecycle_publication_is_closed_generation_bound_and_armed() {
+    let (_tmp, mut state) = placed_bus_state();
+    state.arm_android_lifecycle(
+        "eagle",
+        "android-eagle",
+        android_governed::LifecycleOperation::Start,
+        Some(AospStarterApp::Camera),
+        0,
+        "Signed policy · Permissions: Camera, Network · Capabilities: VDI display".to_owned(),
+    );
+    confirm_pending(&mut state);
+
+    let body = emitted_request(&state, VERB_ANDROID_LIFECYCLE);
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["node"], "eagle");
+    assert_eq!(body["workload_id"], "android-eagle");
+    assert_eq!(body["expected_generation"], 0);
+    assert_eq!(body["operation"], "start");
+    assert_eq!(body["app"], "camera");
+    for forbidden in [
+        "command", "path", "endpoint", "intent", "package", "adb", "qemu",
+    ] {
+        assert!(body.get(forbidden).is_none(), "forbidden field {forbidden}");
+    }
+    let token = CloudArmedToken::parse(body["armed_token"].as_str().expect("armed token"))
+        .expect("valid capability");
+    assert_eq!(token.verb, VERB_ANDROID_LIFECYCLE);
+    assert_eq!(token.node, "eagle");
+    assert_eq!(token.target, "android-eagle");
+    assert!(state.android_lifecycle_pending.is_some());
+}
+
+#[test]
+fn governed_android_catalog_decoder_rejects_hostile_and_mismatched_input() {
+    let topic = mackes_mesh_types::android_apps::android_catalog_state_topic("eagle")
+        .expect("catalog topic");
+    assert!(android_governed::decode_catalog_snapshot(&topic, "{").is_none());
+    assert!(android_governed::decode_catalog_snapshot(
+        "state/android/catalog/../../escape",
+        &serde_json::to_string(&governed_android_catalog()).expect("catalog body")
+    )
+    .is_none());
+    assert!(
+        android_governed::decode_catalog_snapshot(&topic, &"x".repeat(2 * 1024 * 1024 + 1))
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn governed_android_admitted_cache_requires_bounded_owned_nofollow_file() {
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    let tmp = tempfile::tempdir().expect("cache tempdir");
+    let path = tmp.path().join("eagle.json");
+    let catalog = governed_android_catalog();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "catalog": catalog,
+    }))
+    .expect("cache body");
+    std::fs::write(&path, &body).expect("cache file");
+    let owner = rustix::process::geteuid().as_raw();
+    let expected = governed_android_catalog()
+        .payload
+        .content_digest()
+        .expect("catalog digest");
+    assert_eq!(
+        android_governed::read_admitted_catalog_digest(&path, owner).as_deref(),
+        Some(expected.as_str())
+    );
+    assert!(
+        android_governed::read_admitted_catalog_digest(&path, owner.saturating_add(1)).is_none()
+    );
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+        .expect("writable cache mode");
+    assert!(android_governed::read_admitted_catalog_digest(&path, owner).is_none());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore cache mode");
+
+    let link = tmp.path().join("linked.json");
+    symlink(&path, &link).expect("cache symlink");
+    assert!(android_governed::read_admitted_catalog_digest(&link, owner).is_none());
+
+    std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024 + 1]).expect("oversized cache");
+    assert!(android_governed::read_admitted_catalog_digest(&path, owner).is_none());
+}
+
+#[test]
+fn governed_android_render_handles_narrow_and_large_text_without_io_or_action() {
+    let projection = governed_android_projection();
+    for (width, scale) in [(320.0, 1.0), (520.0, 1.8)] {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| {
+            for font in style.text_styles.values_mut() {
+                font.size *= scale;
+            }
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 1_800.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(android_governed::panel(ui, &[projection.clone()], true).is_none());
+            });
+        });
+        assert!(!output.shapes.is_empty());
+        assert!(take_android_vdi_handoff(&ctx).is_none());
+    }
+}
+
+#[test]
+fn typed_android_vdi_handoff_preserves_the_proven_source_without_attaching() {
+    use mackes_mesh_types::android_provider::{
+        AndroidVdiProtocol, AndroidVdiSource, CuttlefishImageProvenanceRef,
+        ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+    };
+
+    let catalog = governed_android_catalog();
+    let catalog_digest = catalog.payload.content_digest().expect("catalog digest");
+    let provenance = catalog.payload.package_manifest.image_provenance;
+    let source = AndroidVdiSource {
+        schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+        workload_id: "android-eagle".to_owned(),
+        image_provenance: CuttlefishImageProvenanceRef::new(
+            provenance.image_id,
+            provenance.image_digest,
+            provenance.source_revision,
+            provenance.catalog_revision,
+        )
+        .expect("VDI provenance"),
+        catalog_digest,
+        generation: 3,
+        protocol: AndroidVdiProtocol::WebRtc,
+        mesh_host: "android-eagle.mesh".to_owned(),
+        port: 8443,
+        session_id: "android-session-3".to_owned(),
+        observed_at_unix_ms: ANDROID_NOW - 100,
+        expires_at_unix_ms: ANDROID_NOW + 60_000,
+    };
+    let ctx = egui::Context::default();
+    queue_android_vdi_handoff(
+        &ctx,
+        AndroidVdiHandoff {
+            placement_node: "eagle".to_owned(),
+            source: source.clone(),
+        },
+    );
+    let handoff = take_android_vdi_handoff(&ctx).expect("typed handoff");
+    assert_eq!(handoff.placement_node, "eagle");
+    assert_eq!(handoff.source, source);
+    assert!(take_android_vdi_handoff(&ctx).is_none());
 }
 
 #[test]

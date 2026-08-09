@@ -425,6 +425,29 @@ impl Projection {
         )
     }
 
+    /// Screen rectangle for one Web-Mercator XYZ tile at any admitted zoom.
+    /// Atmospheric WMS images use this seam so they remain geographically
+    /// aligned when their fetch zoom differs from the local basemap bundle.
+    #[must_use]
+    pub fn xyz_tile_rect(&self, zoom: u8, x: u32, y: u32) -> Option<Rect> {
+        if zoom > 20 || x >= (1_u32 << zoom) || y >= (1_u32 << zoom) {
+            return None;
+        }
+        let n = f64::from(1_u32 << zoom);
+        let longitude = |column: u32| f64::from(column) / n * 360.0 - 180.0;
+        let latitude = |row: u32| {
+            let mercator = std::f64::consts::PI * (1.0 - 2.0 * f64::from(row) / n);
+            mercator.sinh().atan().to_degrees()
+        };
+        let north_west = self.project(latitude(y), longitude(x));
+        let south_east = self.project(
+            latitude(y.saturating_add(1)),
+            longitude(x.saturating_add(1)),
+        );
+        let rect = Rect::from_two_pos(north_west, south_east);
+        rect.is_finite().then_some(rect)
+    }
+
     /// Screen rect covered by XYZ tile `(x, y)`. A one-pixel bleed hides the
     /// hairline seam between neighbouring tiles under bilinear sampling.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]

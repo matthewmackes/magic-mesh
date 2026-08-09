@@ -29,9 +29,7 @@ use std::path::Path;
 
 use mackes_mesh_types::app_catalog::is_valid_flatpak_app_id;
 use mackes_mesh_types::cloud::{APP_VM_ALLOWED_CAPABILITIES, CLOUD_ACTION_SCHEMA_VERSION};
-use mackes_mesh_types::vdi_session::{
-    AppVmLaunchRequest, AppVmLifecycleState, SessionRequest,
-};
+use mackes_mesh_types::vdi_session::{AppVmLaunchRequest, AppVmLifecycleState, SessionRequest};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -145,6 +143,51 @@ pub(crate) fn publish_open_record(
     client_peer: &str,
 ) -> OpenPublication {
     publish_open_record_with_profile(bus_root, last_error, serving_peer, vm_id, client_peer, None)
+}
+
+/// Publish one already-minted, guest-owned session identity through the same
+/// authorized Remote Sessions `Open` authority used by the chooser. This is for
+/// typed providers whose readiness contract owns a stable reconnect identity;
+/// it does not accept an endpoint, URL, command, or transport parameter.
+pub(crate) fn publish_exact_open_record(
+    bus_root: Option<&Path>,
+    session_id: &str,
+    serving_peer: &str,
+    vm_id: &str,
+    client_peer: &str,
+) -> Result<OpenPublication, String> {
+    for (field, value) in [
+        ("session_id", session_id),
+        ("serving_peer", serving_peer),
+        ("vm_id", vm_id),
+        ("client_peer", client_peer),
+    ] {
+        if value.trim().is_empty()
+            || value.len() > 128
+            || value.chars().any(char::is_control)
+            || value.contains('/')
+            || value.contains('\\')
+        {
+            return Err(format!("Remote Sessions refused invalid {field} identity."));
+        }
+    }
+    let request = SessionRequest::Open {
+        id: session_id.to_owned(),
+        serving_peer: serving_peer.to_owned(),
+        vm_id: vm_id.to_owned(),
+        client_peer: client_peer.to_owned(),
+        profile: None,
+    };
+    let body = request.to_body();
+    let mut last_error = None;
+    publish(bus_root, &mut last_error, &request);
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    Ok(OpenPublication {
+        id: session_id.to_owned(),
+        body,
+    })
 }
 
 fn publish_open_record_with_profile(

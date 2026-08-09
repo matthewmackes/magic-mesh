@@ -1104,9 +1104,7 @@ impl TransportEndpoint {
                     ));
                 }
                 if *screen > 31 {
-                    return Err(ResourceValidationError::InvalidField(
-                        "endpoint.x11.screen",
-                    ));
+                    return Err(ResourceValidationError::InvalidField("endpoint.x11.screen"));
                 }
             }
             Self::LocalService { service_id } => {
@@ -1437,6 +1435,12 @@ pub enum ResourceActionVerb {
     Test,
     /// Launch or load the service through its typed adapter.
     Launch,
+    /// Start a stopped typed workload or provider-owned resource.
+    Start,
+    /// Resume an existing typed workload or session generation.
+    Resume,
+    /// Transfer through an already-admitted typed clipboard/file capability.
+    Transfer,
     /// Enable a configured service.
     Enable,
     /// Disable a service without deleting its sealed configuration.
@@ -1457,6 +1461,9 @@ impl ResourceActionVerb {
             Self::Configure => "configure",
             Self::Test => "test",
             Self::Launch => "launch",
+            Self::Start => "start",
+            Self::Resume => "resume",
+            Self::Transfer => "transfer",
             Self::Enable => "enable",
             Self::Disable => "disable",
             Self::Remove => "remove",
@@ -2075,6 +2082,12 @@ impl ResourceAction {
                 self.target,
                 ResourceActionTarget::Resource | ResourceActionTarget::TransportClient { .. }
             ),
+            ResourceActionVerb::Start | ResourceActionVerb::Resume => {
+                matches!(self.target, ResourceActionTarget::Resource)
+            }
+            ResourceActionVerb::Transfer => {
+                matches!(self.target, ResourceActionTarget::TransportClient { .. })
+            }
             ResourceActionVerb::RequestApproval => {
                 !matches!(self.target, ResourceActionTarget::TransportClient { .. })
             }
@@ -4450,8 +4463,8 @@ mod tests {
             ))
         ));
 
-        let mut malformed_provenance = serde_json::to_value(valid_catalog())
-            .expect("catalog value");
+        let mut malformed_provenance =
+            serde_json::to_value(valid_catalog()).expect("catalog value");
         malformed_provenance["cards"][0]["provenance"][0]["scope"] =
             serde_json::Value::String("trusted_lan".into());
         let malformed_body =
@@ -4459,9 +4472,7 @@ mod tests {
         assert!(matches!(
             ResourceCatalog::from_json(&malformed_body),
             Err(ResourceCatalogDecodeError::Validation(
-                ResourceValidationError::InvalidRelationship(
-                    "provenance.source_scope_trust",
-                )
+                ResourceValidationError::InvalidRelationship("provenance.source_scope_trust",)
             ))
         ));
 

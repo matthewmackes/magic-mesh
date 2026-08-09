@@ -1,0 +1,9 @@
+#!/bin/sh
+# systemd-sleep calls hooks as: <hook> pre|post suspend|hibernate|hybrid-sleep.
+set -u
+SYSTEMCTL="${MCNF_RECOVERY_SYSTEMCTL:-/usr/bin/systemctl}"
+case "${1:-}" in
+    post) "$SYSTEMCTL" start --no-block mcnf-peer-recovery.service ;;
+    pre) exit 0 ;;
+    *) exit 2 ;;
+esac

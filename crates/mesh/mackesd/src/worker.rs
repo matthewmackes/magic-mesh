@@ -73,7 +73,6 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::audit::next_hash;
 use crate::events::{Event, EventKind};
 use crate::reconcile::{plan_tick, DriftRow, TickPlan};
 use crate::telemetry::{Heartbeat, LinkSample};
@@ -336,7 +335,7 @@ pub fn tick_with(
     // Desired snapshot comes from the latest applied / verified
     // `desired_config` row. On a fresh store (or while no revision
     // has applied yet) this is `DesiredSnapshot::default()`.
-    let mut conn = crate::store::open(db_path)
+    let conn = crate::store::open(db_path)
         .with_context(|| format!("opening store at {}", db_path.display()))?;
     let desired_snapshot = load_desired_snapshot(&conn)?;
     let desired_topo = calculate(&desired_snapshot);
@@ -374,7 +373,7 @@ pub fn tick_with(
     // applied repair's outcome) + log every inbox row. Audit hash
     // chain is per-row so an audit verify walks back through them
     // cleanly (12.6.3 / 12.10.3).
-    let emitted = apply_repair_rows(&mut conn, node_id, &plan.repair_now, &repair.outcomes)?;
+    let emitted = apply_repair_rows(&conn, node_id, &plan.repair_now, &repair.outcomes)?;
     // EFF-25 — fire the 12.6.4 alert hooks for the committed events.
     // Hooks come from /etc/mackesd/mackesd.toml `[[alert_hooks]]`
     // (fail-open load, default empty → no-op). Dispatch is post-commit
@@ -816,7 +815,7 @@ fn resolve_overlay_ip(workgroup_root: &Path, peer: &str) -> Option<String> {
 /// (e.g. WAL contention beyond the busy timeout). FS / serde errors
 /// are logged and the loop continues.
 pub fn apply_repair_rows(
-    conn: &mut Connection,
+    conn: &Connection,
     node_id: &str,
     rows: &[DriftRow],
     outcomes: &[(Edge, RepairOutcome)],
@@ -824,87 +823,62 @@ pub fn apply_repair_rows(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    crate::store::with_transaction(conn, |tx| {
-        // Bootstrap: load the most recent event's hash to chain
-        // onto. Genesis case = 32 zero bytes per `audit::next_hash`.
-        let prev_hash_hex: String = tx
-            .query_row(
-                "SELECT hash FROM events ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap_or_default();
-        let mut prev_hash = decode_hex32(&prev_hash_hex).unwrap_or([0u8; 32]);
-
-        // `now_iso` MUST encode exactly `now_ms_val`: load_audit_rows
-        // reparses created_at → epoch-millis to recompute the chain
-        // hash, so a separate Utc::now() here would drift from the
-        // now_ms_val baked into each row's hash and spuriously fail
-        // `audit::verify`. Derive both from one instant.
-        let now_ms_val = now_ms();
-        let now_iso = chrono::DateTime::from_timestamp_millis(now_ms_val)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339();
-        let mut emitted: Vec<Event> = Vec::with_capacity(rows.len());
-        for (idx, row) in rows.iter().enumerate() {
-            // The safe-repair outcome for this row (aligned by index;
-            // absent only if a future detector emits a repair_now row
-            // with no matching missing edge — record it observe-only).
-            let outcome = outcomes.get(idx).map(|(_, o)| o.clone()).unwrap_or(
-                RepairOutcome::ManualRepairRequired("no aligned repair outcome for drift row"),
-            );
-            // Build the structured Event payload; serialize once for
-            // both the audit chain and the JSON column.
-            let event = Event {
-                event_id: u64::try_from(now_ms_val.max(0)).unwrap_or(0)
-                    + u64::try_from(idx).unwrap_or(0),
-                kind: EventKind::Reconcile,
-                node_id: node_id.to_owned(),
-                timestamp_ms: now_ms_val,
-                detail: serde_json::json!({
-                    "action": outcome.action(),
-                    "drift": DriftRowJson::from(row),
-                    "outcome": repair_outcome_detail(&outcome),
-                }),
-            };
-            let payload = event
-                .payload_bytes()
-                .context("serializing audit event payload")?;
-            let hash = next_hash(&prev_hash, &payload, now_ms_val);
-
-            let payload_str = String::from_utf8(payload).context(
-                "audit payload is not valid UTF-8 (should be impossible from serde_json)",
-            )?;
-            tx.execute(
-                "INSERT INTO events (prev_hash, hash, kind, actor, payload_json, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    encode_hex(&prev_hash),
-                    encode_hex(&hash),
-                    serde_json::to_string(&EventKind::Reconcile)
-                        .unwrap_or_else(|_| "\"reconcile\"".to_owned())
-                        .trim_matches('"')
-                        .to_owned(),
-                    node_id,
-                    payload_str,
-                    &now_iso,
-                ),
-            )
-            .context("inserting audit event row")?;
-
-            info!(
-                actor = %node_id,
-                detector = row.detector,
-                reason = %row.reason,
-                action = outcome.action(),
-                "auto-repair drift row committed to audit log",
-            );
-
-            prev_hash = hash;
-            emitted.push(event);
-        }
-        Ok(emitted)
-    })
+    let now_ms_val = now_ms();
+    let mut emitted: Vec<Event> = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.iter().enumerate() {
+        // The safe-repair outcome for this row (aligned by index;
+        // absent only if a future detector emits a repair_now row
+        // with no matching missing edge — record it observe-only).
+        let outcome = outcomes.get(idx).map(|(_, o)| o.clone()).unwrap_or(
+            RepairOutcome::ManualRepairRequired("no aligned repair outcome for drift row"),
+        );
+        // Build the structured Event payload; serialize once for
+        // both the audit chain and the JSON column.
+        let event = Event {
+            event_id: u64::try_from(now_ms_val.max(0)).unwrap_or(0)
+                + u64::try_from(idx).unwrap_or(0),
+            kind: EventKind::Reconcile,
+            node_id: node_id.to_owned(),
+            timestamp_ms: now_ms_val,
+            detail: serde_json::json!({
+                "action": outcome.action(),
+                "drift": DriftRowJson::from(row),
+                "outcome": repair_outcome_detail(&outcome),
+            }),
+        };
+        emitted.push(event);
+    }
+    let inserted = crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::AppendReconcileEvents {
+            events: emitted.clone(),
+        },
+    )
+    .context("appending reconcile events through SQLite writer")?
+    .into_count()?;
+    if inserted == 0 {
+        return Ok(Vec::new());
+    }
+    if inserted != emitted.len() {
+        anyhow::bail!(
+            "SQLite writer appended {inserted} of {} reconcile events",
+            emitted.len()
+        );
+    }
+    for (idx, row) in rows.iter().enumerate() {
+        let action = outcomes
+            .get(idx)
+            .map(|(_, outcome)| outcome.action())
+            .unwrap_or("manual_repair_required");
+        info!(
+            actor = %node_id,
+            detector = row.detector,
+            reason = %row.reason,
+            action,
+            "auto-repair drift row committed to audit log",
+        );
+    }
+    Ok(emitted)
 }
 
 /// JSON detail block for one [`RepairOutcome`] — the "outcome" leg of
@@ -953,26 +927,6 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-fn encode_hex(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -1082,18 +1036,7 @@ mod tests {
             ],
             "allow_east_west": [],
         });
-        conn.execute(
-            "INSERT INTO desired_config (author, message, spec_json, state, created_at, applied_at) \
-             VALUES (?, ?, ?, 'applied', ?, ?)",
-            (
-                "tester",
-                "seed",
-                payload.to_string(),
-                "2026-05-19T00:00:00Z",
-                "2026-05-19T00:00:00Z",
-            ),
-        )
-        .unwrap();
+        crate::store::writer::insert_desired_config_fixture(&conn, payload, "applied").unwrap();
         let snap = load_desired_snapshot(&conn).unwrap();
         assert_eq!(snap.nodes.len(), 1);
         assert_eq!(snap.nodes[0].id, "peer:anvil");
@@ -1108,12 +1051,7 @@ mod tests {
             ],
             "allow_east_west": [],
         });
-        conn.execute(
-            "INSERT INTO desired_config (author, message, spec_json, state, created_at) \
-             VALUES (?, ?, ?, 'draft', ?)",
-            ("tester", "wip", payload.to_string(), "2026-05-19T00:00:00Z"),
-        )
-        .unwrap();
+        crate::store::writer::insert_desired_config_fixture(&conn, payload, "draft").unwrap();
         let snap = load_desired_snapshot(&conn).unwrap();
         // Draft rows must NOT feed the reconciler — they haven't
         // been approved + applied yet.
@@ -1166,18 +1104,7 @@ mod tests {
             ],
             "allow_east_west": [],
         });
-        conn.execute(
-            "INSERT INTO desired_config (author, message, spec_json, state, created_at, applied_at) \
-             VALUES (?, ?, ?, 'applied', ?, ?)",
-            (
-                "tester",
-                "seed",
-                payload.to_string(),
-                "2026-05-19T00:00:00Z",
-                "2026-05-19T00:00:00Z",
-            ),
-        )
-        .unwrap();
+        crate::store::writer::insert_desired_config_fixture(&conn, payload, "applied").unwrap();
         drop(conn);
         // No observed link → desired edge is "missing" → auto-repairable.
         let outcome = tick(&workgroup_root, "peer:test", &db_path).unwrap();
@@ -1241,26 +1168,6 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "interruptible_sleep took {elapsed:?}; should have exited near 350 ms",
         );
-    }
-
-    #[test]
-    fn hex_round_trip_through_encode_decode() {
-        let mut bytes = [0u8; 32];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = u8::try_from(i).unwrap_or(0);
-        }
-        let s = encode_hex(&bytes);
-        assert_eq!(s.len(), 64);
-        let back = decode_hex32(&s).unwrap();
-        assert_eq!(back, bytes);
-    }
-
-    #[test]
-    fn hex_decode_rejects_wrong_length() {
-        assert!(decode_hex32("").is_none());
-        assert!(decode_hex32("aa").is_none());
-        assert!(decode_hex32(&"a".repeat(63)).is_none());
-        assert!(decode_hex32(&"a".repeat(65)).is_none());
     }
 
     #[test]
@@ -1558,18 +1465,7 @@ mod tests {
             ],
             "allow_east_west": [],
         });
-        conn.execute(
-            "INSERT INTO desired_config (author, message, spec_json, state, created_at, applied_at) \
-             VALUES (?, ?, ?, 'applied', ?, ?)",
-            (
-                "tester",
-                "seed",
-                payload.to_string(),
-                "2026-05-19T00:00:00Z",
-                "2026-05-19T00:00:00Z",
-            ),
-        )
-        .unwrap();
+        crate::store::writer::insert_desired_config_fixture(&conn, payload, "applied").unwrap();
         drop(conn);
         write_test_bundle(&workgroup_root, "peer:remote", "127.0.0.1");
 
@@ -1616,18 +1512,7 @@ mod tests {
             ],
             "allow_east_west": [],
         });
-        conn.execute(
-            "INSERT INTO desired_config (author, message, spec_json, state, created_at, applied_at) \
-             VALUES (?, ?, ?, 'applied', ?, ?)",
-            (
-                "tester",
-                "seed",
-                payload.to_string(),
-                "2026-05-19T00:00:00Z",
-                "2026-05-19T00:00:00Z",
-            ),
-        )
-        .unwrap();
+        crate::store::writer::insert_desired_config_fixture(&conn, payload, "applied").unwrap();
         drop(conn);
         write_test_bundle(&workgroup_root, "peer:remote", "127.0.0.1");
 

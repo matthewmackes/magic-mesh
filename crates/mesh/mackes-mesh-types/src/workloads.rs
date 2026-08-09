@@ -11,8 +11,8 @@
     reason = "public field names and closed variants are the versioned wire contract"
 )]
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -384,9 +384,7 @@ impl WorkloadRuntimeSignals {
         let health = match readiness {
             WorkloadReadiness::Ready => WorkloadHealth::Healthy,
             WorkloadReadiness::Degraded => WorkloadHealth::Degraded,
-            WorkloadReadiness::Failed | WorkloadReadiness::Unavailable => {
-                WorkloadHealth::Failed
-            }
+            WorkloadReadiness::Failed | WorkloadReadiness::Unavailable => WorkloadHealth::Failed,
             _ => WorkloadHealth::Unknown,
         };
         let progress_percent = match phase {
@@ -593,9 +591,7 @@ impl WorkloadStorageCapacity {
     #[must_use]
     pub const fn for_backend(self, backend: WorkloadBackend) -> (u32, u32) {
         match backend {
-            WorkloadBackend::LibvirtVirtqemud => {
-                (self.vm_storage_gb, self.allocated_vm_storage_gb)
-            }
+            WorkloadBackend::LibvirtVirtqemud => (self.vm_storage_gb, self.allocated_vm_storage_gb),
             WorkloadBackend::QuadletSystemd => (
                 self.container_storage_gb,
                 self.allocated_container_storage_gb,
@@ -649,12 +645,7 @@ pub const fn host_reserve(logical_cpus: u16, memory_mb: u32) -> (u16, u32) {
 /// shell/daemon reserve.
 #[must_use]
 pub fn admit_workload(resources: WorkloadResources, host: HostCapacity) -> WorkloadAdmission {
-    admit_workload_with_storage(
-        resources,
-        host,
-        host.storage_gb,
-        host.allocated_storage_gb,
-    )
+    admit_workload_with_storage(resources, host, host.storage_gb, host.allocated_storage_gb)
 }
 
 /// Admit a workload against the storage pool owned by its typed backend.
@@ -1272,7 +1263,8 @@ mod tests {
         };
         assert!(status.validate(1_000).is_ok());
         let body = serde_json::to_string(&status).expect("encode status");
-        let round_trip: WorkloadOperationStatus = serde_json::from_str(&body).expect("decode status");
+        let round_trip: WorkloadOperationStatus =
+            serde_json::from_str(&body).expect("decode status");
         assert_eq!(round_trip.image_ref.as_deref(), Some("mesh-api:1.0"));
 
         status.image_ref = None;
@@ -1327,7 +1319,9 @@ mod tests {
         status.generation = 2;
         assert_eq!(
             status.validate(1_000),
-            Err(WorkloadContractError::InvalidNumber("attachment_generation"))
+            Err(WorkloadContractError::InvalidNumber(
+                "attachment_generation"
+            ))
         );
     }
 

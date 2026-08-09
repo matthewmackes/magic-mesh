@@ -1,0 +1,632 @@
+//! Guest-owned Cuttlefish package/session transport.
+//!
+//! The host sends a closed typed operation over a workload-scoped Unix socket
+//! exposed by the guest relay. It never constructs adb, package-manager, qemu,
+//! intent, endpoint, or shell command lines.
+
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use mackes_mesh_types::android_apps::{
+    AndroidAppInventory, AndroidGuestLaunchOutcome, AndroidGuestLaunchRequest,
+    AndroidImagePackageManifest,
+};
+use mackes_mesh_types::android_provider::{AndroidVdiSource, CuttlefishVmTarget};
+use serde::{Deserialize, Serialize};
+
+use super::cuttlefish::CuttlefishProviderError;
+
+const GUEST_PROTOCOL_SCHEMA_VERSION: u16 = 1;
+const MAX_GUEST_FRAME_BYTES: usize = 256 * 1024;
+const GUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_GUEST_SOCKET_ROOT: &str = "/run/mackesd/cuttlefish-guest";
+const GUEST_SOCKET_ROOT_ENV: &str = "MDE_CUTTLEFISH_GUEST_SOCKET_DIR";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "op",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum GuestOperation {
+    Observe,
+    Launch(AndroidGuestLaunchRequest),
+    Cleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestRequest {
+    schema_version: u16,
+    request_id: String,
+    target: CuttlefishVmTarget,
+    catalog_digest: String,
+    package_manifest: AndroidImagePackageManifest,
+    generation: u64,
+    operation: GuestOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestResponse {
+    schema_version: u16,
+    request_id: String,
+    target: CuttlefishVmTarget,
+    catalog_digest: String,
+    generation: u64,
+    #[serde(default)]
+    inventory: Option<AndroidAppInventory>,
+    #[serde(default)]
+    launch_outcome: Option<AndroidGuestLaunchOutcome>,
+    #[serde(default)]
+    vdi_source: Option<AndroidVdiSource>,
+    #[serde(default)]
+    cleanup_complete: bool,
+}
+
+/// Exact guest evidence returned from an observe operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GuestSnapshot {
+    pub inventory: AndroidAppInventory,
+    pub vdi_source: AndroidVdiSource,
+}
+
+/// Closed guest-agent operations consumed by the Cuttlefish provider client.
+pub(super) trait CuttlefishGuestTransport: Send + Sync {
+    fn observe(
+        &self,
+        request_id: &str,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<GuestSnapshot, CuttlefishProviderError>;
+
+    fn launch(
+        &self,
+        request: &AndroidGuestLaunchRequest,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError>;
+
+    fn cleanup(
+        &self,
+        request_id: &str,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<(), CuttlefishProviderError>;
+}
+
+/// Production framed transport to the workload-scoped guest relay.
+pub(super) struct UnixCuttlefishGuestTransport {
+    socket_root: PathBuf,
+}
+
+impl UnixCuttlefishGuestTransport {
+    pub(super) fn production() -> Self {
+        Self {
+            socket_root: std::env::var_os(GUEST_SOCKET_ROOT_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_GUEST_SOCKET_ROOT)),
+        }
+    }
+
+    #[cfg(test)]
+    fn at(socket_root: PathBuf) -> Self {
+        Self { socket_root }
+    }
+
+    fn exchange(&self, request: GuestRequest) -> Result<GuestResponse, CuttlefishProviderError> {
+        validate_request(&request)?;
+        let socket = socket_path(&self.socket_root, request.target.vm_id.as_str())?;
+        let metadata = fs::symlink_metadata(&socket)
+            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        if !metadata.file_type().is_socket() {
+            return Err(CuttlefishProviderError::ProviderUnavailable);
+        }
+        let mut stream = UnixStream::connect(&socket)
+            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        stream
+            .set_read_timeout(Some(GUEST_IO_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(GUEST_IO_TIMEOUT)))
+            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        let body =
+            serde_json::to_vec(&request).map_err(|_| CuttlefishProviderError::ProviderRejected)?;
+        if body.is_empty() || body.len() > MAX_GUEST_FRAME_BYTES {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
+        let length = u32::try_from(body.len())
+            .map_err(|_| CuttlefishProviderError::ProviderRejected)?
+            .to_be_bytes();
+        stream
+            .write_all(&length)
+            .and_then(|()| stream.write_all(&body))
+            .and_then(|()| stream.flush())
+            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+
+        let mut length = [0_u8; 4];
+        stream
+            .read_exact(&mut length)
+            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        let length = usize::try_from(u32::from_be_bytes(length))
+            .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
+        if length == 0 || length > MAX_GUEST_FRAME_BYTES {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
+        let mut response = vec![0_u8; length];
+        stream
+            .read_exact(&mut response)
+            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
+        let response: GuestResponse = serde_json::from_slice(&response)
+            .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
+        validate_response(&request, response)
+    }
+
+    fn request(
+        request_id: &str,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+        operation: GuestOperation,
+    ) -> GuestRequest {
+        GuestRequest {
+            schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+            request_id: request_id.to_owned(),
+            target: target.clone(),
+            catalog_digest: catalog_digest.to_owned(),
+            package_manifest: package_manifest.clone(),
+            generation,
+            operation,
+        }
+    }
+}
+
+impl CuttlefishGuestTransport for UnixCuttlefishGuestTransport {
+    fn observe(
+        &self,
+        request_id: &str,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<GuestSnapshot, CuttlefishProviderError> {
+        let response = self.exchange(Self::request(
+            request_id,
+            target,
+            catalog_digest,
+            package_manifest,
+            generation,
+            GuestOperation::Observe,
+        ))?;
+        let inventory = response
+            .inventory
+            .ok_or(CuttlefishProviderError::ProviderRejected)?;
+        let vdi_source = response
+            .vdi_source
+            .ok_or(CuttlefishProviderError::ProviderRejected)?;
+        Ok(GuestSnapshot {
+            inventory,
+            vdi_source,
+        })
+    }
+
+    fn launch(
+        &self,
+        request: &AndroidGuestLaunchRequest,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError> {
+        self.exchange(Self::request(
+            &request.request_id,
+            target,
+            catalog_digest,
+            package_manifest,
+            generation,
+            GuestOperation::Launch(request.clone()),
+        ))?
+        .launch_outcome
+        .ok_or(CuttlefishProviderError::ProviderRejected)
+    }
+
+    fn cleanup(
+        &self,
+        request_id: &str,
+        target: &CuttlefishVmTarget,
+        catalog_digest: &str,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<(), CuttlefishProviderError> {
+        let response = self.exchange(Self::request(
+            request_id,
+            target,
+            catalog_digest,
+            package_manifest,
+            generation,
+            GuestOperation::Cleanup,
+        ))?;
+        response
+            .cleanup_complete
+            .then_some(())
+            .ok_or(CuttlefishProviderError::ProviderRejected)
+    }
+}
+
+fn validate_request(request: &GuestRequest) -> Result<(), CuttlefishProviderError> {
+    if request.schema_version != GUEST_PROTOCOL_SCHEMA_VERSION || request.generation == 0 {
+        return Err(CuttlefishProviderError::ProviderRejected);
+    }
+    request
+        .target
+        .validate()
+        .map_err(CuttlefishProviderError::Contract)?;
+    request
+        .package_manifest
+        .validate()
+        .map_err(CuttlefishProviderError::InventoryContract)?;
+    if request.package_manifest.image_provenance.image_id
+        != request.target.image_provenance.image_id
+        || request.package_manifest.image_provenance.image_digest
+            != request.target.image_provenance.image_digest
+        || request.package_manifest.image_provenance.source_revision
+            != request.target.image_provenance.source_revision
+        || request.package_manifest.image_provenance.catalog_revision
+            != request.target.image_provenance.catalog_revision
+        || !valid_digest(&request.catalog_digest)
+        || request.request_id.is_empty()
+        || request.request_id.len() > 128
+    {
+        return Err(CuttlefishProviderError::ProviderRejected);
+    }
+    if let GuestOperation::Launch(launch) = &request.operation {
+        launch
+            .validate()
+            .map_err(|_| CuttlefishProviderError::ProviderRejected)?;
+        if launch.workload_id != request.target.vm_id.as_str() {
+            return Err(CuttlefishProviderError::InvalidWorkloadIdentity);
+        }
+        let package = request
+            .package_manifest
+            .packages
+            .iter()
+            .find(|package| package.app == launch.app)
+            .ok_or(CuttlefishProviderError::ProviderRejected)?;
+        if package.package_id != launch.intent.package_id {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
+    }
+    Ok(())
+}
+
+fn validate_response(
+    request: &GuestRequest,
+    response: GuestResponse,
+) -> Result<GuestResponse, CuttlefishProviderError> {
+    if response.schema_version != GUEST_PROTOCOL_SCHEMA_VERSION
+        || response.request_id != request.request_id
+        || response.target != request.target
+        || response.catalog_digest != request.catalog_digest
+        || response.generation != request.generation
+    {
+        return Err(CuttlefishProviderError::ProviderRejected);
+    }
+    match &request.operation {
+        GuestOperation::Observe => {
+            let inventory = response
+                .inventory
+                .as_ref()
+                .ok_or(CuttlefishProviderError::ProviderRejected)?;
+            inventory
+                .validate()
+                .map_err(CuttlefishProviderError::InventoryContract)?;
+            if inventory.workload_id != request.target.vm_id.as_str()
+                || inventory.image_provenance.as_ref()
+                    != Some(&request.package_manifest.image_provenance)
+                || inventory.guest_boot_state
+                    != mackes_mesh_types::android_apps::AndroidGuestBootState::Ready
+            {
+                return Err(CuttlefishProviderError::ProviderRejected);
+            }
+            let source = response
+                .vdi_source
+                .clone()
+                .ok_or(CuttlefishProviderError::ProviderRejected)?
+                .admitted_against(&request.target, &request.catalog_digest, request.generation)
+                .map_err(CuttlefishProviderError::Contract)?;
+            let now = now_unix_ms();
+            if source.observed_at_unix_ms > now || source.expires_at_unix_ms <= now {
+                return Err(CuttlefishProviderError::ProviderRejected);
+            }
+            if response.launch_outcome.is_some() || response.cleanup_complete {
+                return Err(CuttlefishProviderError::ProviderRejected);
+            }
+        }
+        GuestOperation::Launch(_) => {
+            if response.launch_outcome.is_none()
+                || response.inventory.is_some()
+                || response.vdi_source.is_some()
+                || response.cleanup_complete
+            {
+                return Err(CuttlefishProviderError::ProviderRejected);
+            }
+        }
+        GuestOperation::Cleanup => {
+            if !response.cleanup_complete
+                || response.inventory.is_some()
+                || response.vdi_source.is_some()
+                || response.launch_outcome.is_some()
+            {
+                return Err(CuttlefishProviderError::ProviderRejected);
+            }
+        }
+    }
+    Ok(response)
+}
+
+fn socket_path(root: &Path, workload_id: &str) -> Result<PathBuf, CuttlefishProviderError> {
+    if workload_id.is_empty()
+        || workload_id.len() > 128
+        || !workload_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(CuttlefishProviderError::InvalidWorkloadIdentity);
+    }
+    Ok(root.join(format!("{workload_id}.sock")))
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && value[7..].bytes().any(|byte| byte != b'0')
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    use mackes_mesh_types::android_apps::{
+        AndroidAppAvailability, AndroidAppInventoryEntry, AndroidAppReadiness,
+        AndroidGuestBootState, AndroidImagePackage, AndroidImageProvenance, AndroidLaunchReadiness,
+        AndroidLauncherResolvability, AndroidPackageVersion, AospStarterApp,
+    };
+    use mackes_mesh_types::android_provider::{
+        AndroidVdiProtocol, CuttlefishImageProvenanceRef, CuttlefishVmId,
+        ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+    };
+
+    use super::*;
+
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CATALOG_DIGEST: &str =
+        "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn target() -> CuttlefishVmTarget {
+        CuttlefishVmTarget::new(
+            CuttlefishVmId::new("android-one").expect("VM id"),
+            CuttlefishImageProvenanceRef::new("android-image", DIGEST, "source-r1", "catalog-r1")
+                .expect("image provenance"),
+        )
+        .expect("target")
+    }
+
+    fn manifest() -> AndroidImagePackageManifest {
+        let provenance =
+            AndroidImageProvenance::new("android-image", DIGEST, "source-r1", "catalog-r1")
+                .expect("provenance");
+        let version = AndroidPackageVersion::new("1.0.0", 1).expect("version");
+        AndroidImagePackageManifest::new(
+            provenance,
+            AospStarterApp::ALL
+                .into_iter()
+                .map(|app| AndroidImagePackage::for_app(app, version.clone()))
+                .collect(),
+        )
+        .expect("manifest")
+    }
+
+    fn ready_inventory() -> AndroidAppInventory {
+        let manifest = manifest();
+        let entries = manifest
+            .packages
+            .iter()
+            .map(|package| AndroidAppInventoryEntry {
+                descriptor: package.app.descriptor(),
+                availability: AndroidAppAvailability::Installed,
+                package_version: Some(package.version.clone()),
+                readiness: AndroidAppReadiness::Ready,
+                launcher_resolvability: AndroidLauncherResolvability::Resolved,
+                launch_readiness: AndroidLaunchReadiness::Ready,
+                unavailable_reason: None,
+            })
+            .collect();
+        let now = now_unix_ms();
+        AndroidAppInventory::observed(
+            "android-one",
+            manifest.image_provenance,
+            AndroidGuestBootState::Ready,
+            now,
+            0,
+            entries,
+        )
+        .expect("ready inventory")
+    }
+
+    fn vdi_source() -> AndroidVdiSource {
+        let now = now_unix_ms();
+        AndroidVdiSource {
+            schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+            workload_id: "android-one".to_owned(),
+            image_provenance: target().image_provenance,
+            catalog_digest: CATALOG_DIGEST.to_owned(),
+            generation: 7,
+            protocol: AndroidVdiProtocol::WebRtc,
+            mesh_host: "android-one.mesh".to_owned(),
+            port: 8443,
+            session_id: "session-7".to_owned(),
+            observed_at_unix_ms: now,
+            expires_at_unix_ms: now.saturating_add(60_000),
+        }
+    }
+
+    fn read_request(stream: &mut UnixStream) -> GuestRequest {
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).expect("request length");
+        let mut body = vec![0_u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut body).expect("request body");
+        serde_json::from_slice(&body).expect("typed request")
+    }
+
+    fn write_response(stream: &mut UnixStream, response: &GuestResponse) {
+        let body = serde_json::to_vec(response).expect("response JSON");
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .expect("response length");
+        stream.write_all(&body).expect("response body");
+    }
+
+    #[test]
+    fn observe_constructs_closed_exact_contract_and_admits_ready_vdi() {
+        let temporary = tempfile::tempdir().expect("socket root");
+        let socket = temporary.path().join("android-one.sock");
+        let listener = UnixListener::bind(&socket).expect("guest listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("guest connection");
+            let request = read_request(&mut stream);
+            assert_eq!(request.target, target());
+            assert_eq!(request.package_manifest, manifest());
+            assert_eq!(request.catalog_digest, CATALOG_DIGEST);
+            assert_eq!(request.generation, 7);
+            assert_eq!(request.operation, GuestOperation::Observe);
+            write_response(
+                &mut stream,
+                &GuestResponse {
+                    schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    target: request.target,
+                    catalog_digest: request.catalog_digest,
+                    generation: request.generation,
+                    inventory: Some(ready_inventory()),
+                    launch_outcome: None,
+                    vdi_source: Some(vdi_source()),
+                    cleanup_complete: false,
+                },
+            );
+        });
+        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
+        let snapshot = transport
+            .observe("observe-7", &target(), CATALOG_DIGEST, &manifest(), 7)
+            .expect("admitted guest snapshot");
+        assert_eq!(
+            snapshot.inventory.guest_boot_state,
+            AndroidGuestBootState::Ready
+        );
+        assert_eq!(snapshot.vdi_source.session_id, "session-7");
+        server.join().expect("guest server");
+    }
+
+    #[test]
+    fn oversized_and_identity_drifted_guest_output_fail_closed() {
+        let temporary = tempfile::tempdir().expect("socket root");
+        let socket = temporary.path().join("android-one.sock");
+        let listener = UnixListener::bind(&socket).expect("guest listener");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("guest connection");
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(
+                    &u32::try_from(MAX_GUEST_FRAME_BYTES + 1)
+                        .unwrap()
+                        .to_be_bytes(),
+                )
+                .expect("hostile length");
+        });
+        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
+        assert_eq!(
+            transport.observe("observe-7", &target(), CATALOG_DIGEST, &manifest(), 7),
+            Err(CuttlefishProviderError::ProviderRejected)
+        );
+        server.join().expect("guest server");
+
+        let mut hostile = GuestRequest {
+            schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+            request_id: "launch-7".to_owned(),
+            target: target(),
+            catalog_digest: CATALOG_DIGEST.to_owned(),
+            package_manifest: manifest(),
+            generation: 7,
+            operation: GuestOperation::Launch(
+                AndroidGuestLaunchRequest::for_app(
+                    "launch-7",
+                    "android-one",
+                    AospStarterApp::Browser,
+                )
+                .expect("launch"),
+            ),
+        };
+        hostile.target.image_provenance.catalog_revision = "drifted".to_owned();
+        assert_eq!(
+            validate_request(&hostile),
+            Err(CuttlefishProviderError::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn transport_reconnects_and_cleanup_revokes_the_session() {
+        let temporary = tempfile::tempdir().expect("socket root");
+        let socket = temporary.path().join("android-one.sock");
+        let listener = UnixListener::bind(&socket).expect("guest listener");
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("guest connection");
+                let request = read_request(&mut stream);
+                let cleanup = index == 1;
+                assert_eq!(cleanup, request.operation == GuestOperation::Cleanup);
+                write_response(
+                    &mut stream,
+                    &GuestResponse {
+                        schema_version: GUEST_PROTOCOL_SCHEMA_VERSION,
+                        request_id: request.request_id,
+                        target: request.target,
+                        catalog_digest: request.catalog_digest,
+                        generation: request.generation,
+                        inventory: (!cleanup).then(ready_inventory),
+                        launch_outcome: None,
+                        vdi_source: (!cleanup).then(vdi_source),
+                        cleanup_complete: cleanup,
+                    },
+                );
+            }
+        });
+        let transport = UnixCuttlefishGuestTransport::at(temporary.path().to_path_buf());
+        transport
+            .observe("observe-7", &target(), CATALOG_DIGEST, &manifest(), 7)
+            .expect("first connection");
+        transport
+            .cleanup("cleanup-7", &target(), CATALOG_DIGEST, &manifest(), 7)
+            .expect("reconnected cleanup");
+        server.join().expect("guest server");
+    }
+}

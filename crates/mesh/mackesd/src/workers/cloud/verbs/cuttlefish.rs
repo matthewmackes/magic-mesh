@@ -23,7 +23,11 @@ use mackes_mesh_types::android_provider::{
 };
 
 use super::super::super::runner::CloudRunner;
+use super::cuttlefish_guest::{
+    CuttlefishGuestTransport, GuestSnapshot, UnixCuttlefishGuestTransport,
+};
 use super::AndroidGuestProvider;
+use mackes_mesh_types::android_provider::AndroidVdiSource;
 use mackes_mesh_types::cloud::{CloudInstance, LifecycleAction};
 
 /// Closed failures returned by the Cuttlefish adapter or its backend client.
@@ -77,6 +81,44 @@ pub(crate) trait CuttlefishProviderClient: Send + Sync {
         target: &CuttlefishVmTarget,
         request: &AndroidGuestLaunchRequest,
     ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError>;
+
+    fn inventory_at(
+        &self,
+        _target: &CuttlefishVmTarget,
+        _package_manifest: &AndroidImagePackageManifest,
+        _generation: u64,
+    ) -> Result<AndroidAppInventory, CuttlefishProviderError> {
+        Err(CuttlefishProviderError::ProviderUnavailable)
+    }
+
+    fn launch_at(
+        &self,
+        target: &CuttlefishVmTarget,
+        request: &AndroidGuestLaunchRequest,
+        _generation: u64,
+    ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError> {
+        self.launch(target, request)
+    }
+
+    fn vdi_source(&self, _generation: u64) -> Option<AndroidVdiSource> {
+        None
+    }
+
+    fn cleanup(
+        &self,
+        _request_id: &str,
+        _target: &CuttlefishVmTarget,
+        _package_manifest: &AndroidImagePackageManifest,
+        _generation: u64,
+    ) -> Result<(), CuttlefishProviderError> {
+        Err(CuttlefishProviderError::ProviderUnavailable)
+    }
+}
+
+struct GuestContract {
+    package_manifest: AndroidImagePackageManifest,
+    catalog_digest: String,
+    transport: Arc<dyn CuttlefishGuestTransport>,
 }
 
 /// Production outer-VM client for a Cuttlefish-backed Android workload.
@@ -89,6 +131,8 @@ pub(crate) trait CuttlefishProviderClient: Send + Sync {
 pub(crate) struct LibvirtCuttlefishProviderClient {
     runner: Arc<dyn CloudRunner>,
     generation: Mutex<u64>,
+    guest: Option<GuestContract>,
+    guest_snapshot: Mutex<Option<(u64, GuestSnapshot)>>,
 }
 
 impl LibvirtCuttlefishProviderClient {
@@ -98,7 +142,32 @@ impl LibvirtCuttlefishProviderClient {
         Self {
             runner,
             generation: Mutex::new(0),
+            guest: None,
+            guest_snapshot: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_guest_contract(
+        runner: Arc<dyn CloudRunner>,
+        package_manifest: AndroidImagePackageManifest,
+        catalog_digest: String,
+    ) -> Result<Self, CuttlefishProviderError> {
+        package_manifest
+            .validate()
+            .map_err(CuttlefishProviderError::InventoryContract)?;
+        if catalog_digest.len() != 71 || !catalog_digest.starts_with("sha256:") {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
+        Ok(Self {
+            runner,
+            generation: Mutex::new(0),
+            guest: Some(GuestContract {
+                package_manifest,
+                catalog_digest,
+                transport: Arc::new(UnixCuttlefishGuestTransport::production()),
+            }),
+            guest_snapshot: Mutex::new(None),
+        })
     }
 
     fn stable_generation(&self, present: bool) -> Result<u64, CuttlefishProviderError> {
@@ -224,9 +293,27 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
         match status.to_ascii_uppercase().as_str() {
             "ACTIVE" | "RUNNING" => Self::observation(
                 target,
-                // An active L1 domain is not proof that the nested Android
-                // guest or its package manager is ready.
-                CuttlefishVmLifecycleState::Starting,
+                if let Some(guest) = &self.guest {
+                    match guest.transport.observe(
+                        "provider-observe",
+                        target,
+                        &guest.catalog_digest,
+                        &guest.package_manifest,
+                        generation,
+                    ) {
+                        Ok(snapshot) => {
+                            *self
+                                .guest_snapshot
+                                .lock()
+                                .map_err(|_| CuttlefishProviderError::StatePoisoned)? =
+                                Some((generation, snapshot));
+                            CuttlefishVmLifecycleState::Running
+                        }
+                        Err(_) => CuttlefishVmLifecycleState::Starting,
+                    }
+                } else {
+                    CuttlefishVmLifecycleState::Starting
+                },
                 generation,
                 None,
             ),
@@ -290,13 +377,99 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
 
     fn launch(
         &self,
-        _target: &CuttlefishVmTarget,
-        _request: &AndroidGuestLaunchRequest,
+        target: &CuttlefishVmTarget,
+        request: &AndroidGuestLaunchRequest,
     ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError> {
-        // The outer libvirt runner has no guest package/session authority.
-        // Returning unavailable is required until a typed Cuttlefish guest
-        // transport supplies guest-owned install and launcher evidence.
-        Err(CuttlefishProviderError::ProviderUnavailable)
+        let generation = *self
+            .generation
+            .lock()
+            .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
+        self.launch_at(target, request, generation)
+    }
+
+    fn inventory_at(
+        &self,
+        target: &CuttlefishVmTarget,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<AndroidAppInventory, CuttlefishProviderError> {
+        let guest = self
+            .guest
+            .as_ref()
+            .ok_or(CuttlefishProviderError::ProviderUnavailable)?;
+        if package_manifest != &guest.package_manifest {
+            return Err(CuttlefishProviderError::ImagePackageProvenanceMismatch);
+        }
+        let snapshot = guest.transport.observe(
+            "lifecycle-inventory",
+            target,
+            &guest.catalog_digest,
+            package_manifest,
+            generation,
+        )?;
+        let inventory = snapshot.inventory.clone();
+        *self
+            .guest_snapshot
+            .lock()
+            .map_err(|_| CuttlefishProviderError::StatePoisoned)? = Some((generation, snapshot));
+        Ok(inventory)
+    }
+
+    fn launch_at(
+        &self,
+        target: &CuttlefishVmTarget,
+        request: &AndroidGuestLaunchRequest,
+        generation: u64,
+    ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError> {
+        let guest = self
+            .guest
+            .as_ref()
+            .ok_or(CuttlefishProviderError::ProviderUnavailable)?;
+        guest.transport.launch(
+            request,
+            target,
+            &guest.catalog_digest,
+            &guest.package_manifest,
+            generation,
+        )
+    }
+
+    fn vdi_source(&self, generation: u64) -> Option<AndroidVdiSource> {
+        self.guest_snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.as_ref().cloned())
+            .and_then(|(retained_generation, snapshot)| {
+                (retained_generation == generation).then_some(snapshot.vdi_source)
+            })
+    }
+
+    fn cleanup(
+        &self,
+        request_id: &str,
+        target: &CuttlefishVmTarget,
+        package_manifest: &AndroidImagePackageManifest,
+        generation: u64,
+    ) -> Result<(), CuttlefishProviderError> {
+        let guest = self
+            .guest
+            .as_ref()
+            .ok_or(CuttlefishProviderError::ProviderUnavailable)?;
+        if package_manifest != &guest.package_manifest {
+            return Err(CuttlefishProviderError::ImagePackageProvenanceMismatch);
+        }
+        guest.transport.cleanup(
+            request_id,
+            target,
+            &guest.catalog_digest,
+            package_manifest,
+            generation,
+        )?;
+        *self
+            .guest_snapshot
+            .lock()
+            .map_err(|_| CuttlefishProviderError::StatePoisoned)? = None;
+        Ok(())
     }
 }
 
@@ -446,13 +619,10 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
             CuttlefishVmLifecycleState::Stopped => {
                 self.unavailable_inventory(observation, AndroidUnavailableReason::GuestUnavailable)
             }
-            CuttlefishVmLifecycleState::Running => self.unavailable_inventory(
-                observation,
-                // This adapter owns lifecycle/readiness only. It deliberately
-                // does not turn an image package manifest into guest-installed
-                // package evidence.
-                AndroidUnavailableReason::PackageManagerUnavailable,
-            ),
+            CuttlefishVmLifecycleState::Running => self
+                .client
+                .inventory_at(&self.target, &self.package_manifest, observation.generation)
+                .and_then(|inventory| self.admit_guest_inventory(inventory)),
             CuttlefishVmLifecycleState::Unavailable => self.unavailable_inventory(
                 observation,
                 observation
@@ -501,6 +671,22 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
         inventory
             .validate()
             .map_err(CuttlefishProviderError::InventoryContract)?;
+        Ok(inventory)
+    }
+
+    fn admit_guest_inventory(
+        &self,
+        inventory: AndroidAppInventory,
+    ) -> Result<AndroidAppInventory, CuttlefishProviderError> {
+        inventory
+            .validate()
+            .map_err(CuttlefishProviderError::InventoryContract)?;
+        if inventory.workload_id != self.workload_id
+            || inventory.image_provenance.as_ref() != Some(&self.package_manifest.image_provenance)
+            || inventory.guest_boot_state != AndroidGuestBootState::Ready
+        {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
         Ok(inventory)
     }
 }
@@ -553,6 +739,46 @@ impl<C: CuttlefishProviderClient> AndroidGuestProvider for CuttlefishProviderAda
                 Err(_) => AndroidGuestLaunchOutcome::Unavailable,
             }
         }
+    }
+
+    fn inventory_at(
+        &self,
+        request: &AndroidGuestInventoryRequest,
+        generation: u64,
+    ) -> AndroidAppInventory {
+        if request.workload_id != self.workload_id || generation == 0 {
+            return AndroidAppInventory::pending(request.workload_id.clone());
+        }
+        self.client
+            .inventory_at(&self.target, &self.package_manifest, generation)
+            .and_then(|inventory| self.admit_guest_inventory(inventory))
+            .unwrap_or_else(|_| AndroidAppInventory::pending(self.workload_id.clone()))
+    }
+
+    fn launch_at(
+        &self,
+        request: &AndroidGuestLaunchRequest,
+        generation: u64,
+    ) -> AndroidGuestLaunchOutcome {
+        if request.workload_id != self.workload_id || request.validate().is_err() || generation == 0
+        {
+            return AndroidGuestLaunchOutcome::Rejected;
+        }
+        match self.client.launch_at(&self.target, request, generation) {
+            Ok(outcome) => outcome,
+            Err(CuttlefishProviderError::ProviderRejected) => AndroidGuestLaunchOutcome::Rejected,
+            Err(_) => AndroidGuestLaunchOutcome::Unavailable,
+        }
+    }
+
+    fn vdi_source(&self, generation: u64) -> Option<AndroidVdiSource> {
+        self.client.vdi_source(generation)
+    }
+
+    fn cleanup(&self, request_id: &str, generation: u64) -> bool {
+        self.client
+            .cleanup(request_id, &self.target, &self.package_manifest, generation)
+            .is_ok()
     }
 }
 
@@ -1008,7 +1234,7 @@ mod tests {
                 );
                 assert_eq!(
                     response.inventory.unavailable_reason,
-                    Some(AndroidUnavailableReason::PackageManagerUnavailable)
+                    Some(AndroidUnavailableReason::ProviderUnavailable)
                 );
                 assert!(response
                     .inventory

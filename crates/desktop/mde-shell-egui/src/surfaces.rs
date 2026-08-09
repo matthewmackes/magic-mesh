@@ -51,8 +51,8 @@ pub enum Surface {
     Storage,
     /// Platform identity and legal information.
     About,
-    /// Timers and alarms, reached from the status clock.
-    Timers,
+    /// Daemon-projected Clock workspace, reached from the status clock.
+    Clock,
     /// Car-profile dashboard home.
     AutoHome,
 }
@@ -92,7 +92,7 @@ impl Surface {
             Surface::Phones => IconId::Phones,
             Surface::Communications => IconId::Teams,
             Surface::Storage => IconId::Storage,
-            Surface::About | Surface::Timers => IconId::Mark,
+            Surface::About | Surface::Clock => IconId::Mark,
         }
     }
 
@@ -114,7 +114,7 @@ impl Surface {
             Surface::Phones => "Phones",
             Surface::Communications => "Mesh Teams",
             Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => "This Node",
-            Surface::Timers => "Timers & Alarms",
+            Surface::Clock => "Clock",
             Surface::AutoHome => "Car Home",
         }
     }

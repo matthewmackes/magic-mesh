@@ -788,6 +788,26 @@ mod tests {
         fills
     }
 
+    fn painted_texture_ids(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::TextureId> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<egui::TextureId>) {
+            match shape {
+                egui::Shape::Mesh(mesh) => out.push(mesh.texture_id),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut ids = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut ids);
+        }
+        ids
+    }
+
     fn collect_fills(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
         match shape {
             egui::Shape::Rect(rect) => out.push(rect.fill),
@@ -811,12 +831,12 @@ mod tests {
         // Re-entering promotes, never duplicates.
         s.promote(Surface::Music);
         assert_eq!(s.ring(), [Surface::Music, Surface::Files]);
-        // Cap: cycling every surface (plus the out-of-picker Timers) can never
+        // Cap: cycling every surface (plus the out-of-picker Clock) can never
         // outgrow the platform's real surface count.
         for surface in Surface::ALL {
             s.promote(surface);
         }
-        s.promote(Surface::Timers);
+        s.promote(Surface::Clock);
         assert!(s.ring().len() <= Surface::ALL.len());
         let mut dedup = s.ring().to_vec();
         dedup.sort_by_key(|surface| *surface as usize);
@@ -986,14 +1006,13 @@ mod tests {
     fn a_real_surface_snapshot_replaces_only_that_card_plate() {
         let (ctx, mut construct) = open_switcher();
         let mut snapshots = SurfaceSnapshots::default();
-        snapshots.insert(
-            Surface::Files,
-            ctx.load_texture(
-                "switcher-real-snapshot",
-                egui::ColorImage::new([2, 2], egui::Color32::WHITE),
-                egui::TextureOptions::LINEAR,
-            ),
+        let snapshot = ctx.load_texture(
+            "switcher-real-snapshot",
+            egui::ColorImage::new([2, 2], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
         );
+        let snapshot_id = snapshot.id();
+        snapshots.insert(Surface::Files, snapshot);
         let (_, out) = frame_with_snapshots(
             &ctx,
             &mut construct,
@@ -1009,11 +1028,10 @@ mod tests {
             )),
             "Music still needs its no-snapshot plate: {fills:?}"
         );
+        let texture_ids = painted_texture_ids(&out.shapes);
         assert!(
-            !fills.contains(&Style::tile_plate_fill(
-                group_accent(Surface::Files).unwrap_or(Style::ACCENT)
-            )),
-            "Files should paint the supplied real snapshot instead of its plate: {fills:?}"
+            texture_ids.contains(&snapshot_id),
+            "Files must paint the supplied real snapshot texture: {texture_ids:?}"
         );
     }
 

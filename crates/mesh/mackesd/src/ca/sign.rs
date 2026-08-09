@@ -575,6 +575,23 @@ mod tests {
         tmp
     }
 
+    fn seed_peer(conn: &Connection, node_id: &str, overlay_ip: &str) {
+        persist_peer_cert(conn, "m1", node_id, 0, "pem", overlay_ip, 9_999_999, None)
+            .expect("seed peer through typed writer");
+    }
+
+    fn revoke_peer(conn: &Connection, node_id: &str, revoked_at: i64) {
+        crate::store::writer::request_or_execute(
+            conn,
+            crate::store::writer::WriteOp::RevokePeerCert {
+                node_id: node_id.to_owned(),
+                revoked_at,
+            },
+        )
+        .and_then(crate::store::writer::WriteResponse::into_count)
+        .expect("revoke peer through typed writer");
+    }
+
     const PUBLIC_KEY: &str = "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n\
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n";
 
@@ -782,22 +799,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         // COUNT(DISTINCT node_id) is the right shape regardless.
         let conn = fresh_conn();
         let _tmp = mint_one(&conn);
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:a', 0, 'pem', '10.42.0.1', 9999999), \
-                    ('peer:b', 0, 'pem', '10.42.0.2', 9999999), \
-                    ('peer:c', 0, 'pem', '10.42.0.3', 9999999), \
-                    ('peer:d', 0, 'pem', '10.42.0.4', 9999999)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE nebula_peer_certs SET revoked_at = 1234567890 \
-             WHERE node_id = 'peer:d'",
-            [],
-        )
-        .unwrap();
+        seed_peer(&conn, "peer:a", "10.42.0.1");
+        seed_peer(&conn, "peer:b", "10.42.0.2");
+        seed_peer(&conn, "peer:c", "10.42.0.3");
+        seed_peer(&conn, "peer:d", "10.42.0.4");
+        revoke_peer(&conn, "peer:d", 1_234_567_890);
         assert_eq!(count_active_peers(&conn, "m1").unwrap(), 3);
     }
 
@@ -813,13 +819,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
     fn allocator_skips_taken_ips() {
         let conn = fresh_conn();
         let _tmp = mint_one(&conn);
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:a', 0, 'pem', '10.42.0.1', 9999999)",
-            [],
-        )
-        .unwrap();
+        seed_peer(&conn, "peer:a", "10.42.0.1");
         let next = allocate_overlay_ip(&conn, 0).unwrap();
         assert_eq!(next, "10.42.0.2");
     }

@@ -6,6 +6,7 @@ use crate::channels::MouseButton;
 use crate::error::{Result, SpiceError};
 use crate::protocol::ChannelType;
 use crate::utils::sleep;
+use crate::vdagent::VdAgentClipboard;
 use crate::video::{create_video_output, VideoOutput};
 use instant::Duration;
 use std::collections::HashMap;
@@ -734,6 +735,19 @@ impl SpiceClientShared {
             .send_monitor_config(width, height)
             .await;
         result
+    }
+
+    /// Return the negotiated guest-agent clipboard handle for this connection.
+    pub async fn clipboard(&self) -> Result<VdAgentClipboard> {
+        let main_channel = {
+            let inner = self.inner.lock().await;
+            inner
+                .main_channel
+                .clone()
+                .ok_or_else(|| SpiceError::Protocol("Not connected to main channel".to_string()))?
+        };
+        let clipboard = main_channel.lock().await.clipboard();
+        Ok(clipboard)
     }
 
     /// Gets the current cursor shape for a specific channel.

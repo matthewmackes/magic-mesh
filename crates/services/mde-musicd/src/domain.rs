@@ -599,16 +599,12 @@ impl MusicWorkspaceSnapshotV1 {
                 .bookmarks
                 .iter()
                 .any(|bookmark| !valid_bookmark(bookmark))
-            || self
-                .collections
-                .iter()
-                .any(|collection| {
-                    collection.items.len() > MAX_COLLECTION_ITEMS
-                        || collection.page_size > MAX_LIBRARY_PAGE_SIZE
-                        || (collection.page_size > 0
-                            && collection.items.len() > collection.page_size)
-                        || collection.offset > MAX_LIBRARY_OFFSET
-                })
+            || self.collections.iter().any(|collection| {
+                collection.items.len() > MAX_COLLECTION_ITEMS
+                    || collection.page_size > MAX_LIBRARY_PAGE_SIZE
+                    || (collection.page_size > 0 && collection.items.len() > collection.page_size)
+                    || collection.offset > MAX_LIBRARY_OFFSET
+            })
         {
             return Err("invalid_catalog_identity");
         }

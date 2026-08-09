@@ -947,26 +947,28 @@ fn install_lighthouse_ca(
         secrets.ca_key_pem.as_bytes(),
     )
     .map_err(|e| NetEnrollError::Materialize(format!("install atomic CA pair: {e}")))?;
-    match crate::store::open(&crate::default_db_path()) {
-        Ok(conn) => {
-            let _ = crate::store::migrate(&conn);
-            match conn.execute(
-                "INSERT OR REPLACE INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) \
-                 VALUES (?1, ?2, ?3, NULL)",
-                rusqlite::params![bundle.mesh_id, bundle.epoch, bundle.ca_cert_pem],
-            ) {
-                Ok(_) => tracing::info!(
-                    mesh_id = %bundle.mesh_id,
-                    epoch = bundle.epoch,
-                    "install_lighthouse_ca: CA key+cert installed + store seeded — \
-                     this node is now a full signing lighthouse"
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %e, "install_lighthouse_ca: seeding nebula_ca row failed")
-                }
-            }
+    let operation = crate::store::writer::WriteOp::SeedLighthouseCa {
+        mesh_id: bundle.mesh_id.clone(),
+        epoch: bundle.epoch,
+        ca_cert_pem: bundle.ca_cert_pem.clone(),
+    };
+    let seed_result = (|| -> crate::Result<usize> {
+        if let Some(response) = crate::store::writer::request_if_serving(operation.clone())? {
+            return response.into_count();
         }
-        Err(e) => tracing::warn!(error = %e, "install_lighthouse_ca: opening store failed"),
+        let conn = crate::store::open(&crate::default_db_path())?;
+        crate::store::writer::request_or_execute(&conn, operation)?.into_count()
+    })();
+    match seed_result {
+        Ok(_) => tracing::info!(
+            mesh_id = %bundle.mesh_id,
+            epoch = bundle.epoch,
+            "install_lighthouse_ca: CA key+cert installed + store seeded — \
+             this node is now a full signing lighthouse"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "install_lighthouse_ca: seeding nebula_ca row failed")
+        }
     }
     Ok(())
 }

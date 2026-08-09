@@ -75,6 +75,124 @@ fn write_browser_workload_status(root: &std::path::Path, node: &str) {
         .expect("publish Workloads snapshot");
 }
 
+fn governed_android_handoff(now_ms: u64) -> crate::iac::AndroidVdiHandoff {
+    use mackes_mesh_types::android_provider::{
+        AndroidVdiProtocol, AndroidVdiSource, CuttlefishImageProvenanceRef,
+        ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+    };
+
+    crate::iac::AndroidVdiHandoff {
+        placement_node: "eagle".to_owned(),
+        source: AndroidVdiSource {
+            schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+            workload_id: "android-eagle".to_owned(),
+            image_provenance: CuttlefishImageProvenanceRef::new(
+                "aosp-cuttlefish-x86_64",
+                format!("sha256:{}", "a".repeat(64)),
+                "aosp-2026-08-08",
+                "android-release-v1",
+            )
+            .expect("image provenance"),
+            catalog_digest: format!("sha256:{}", "b".repeat(64)),
+            generation: 3,
+            protocol: AndroidVdiProtocol::WebRtc,
+            mesh_host: "android-eagle.mesh".to_owned(),
+            port: 8443,
+            session_id: "android-session-3".to_owned(),
+            observed_at_unix_ms: now_ms.saturating_sub(100),
+            expires_at_unix_ms: now_ms.saturating_add(60_000),
+        },
+    }
+}
+
+#[test]
+fn governed_android_remote_session_route_preserves_identity_and_authorizes_exact_open_close() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let bus = tempfile::tempdir().expect("Bus root");
+    let handoff = governed_android_handoff(now_ms);
+    let source = handoff.source.clone();
+    let mut state = VdiState::default();
+    state
+        .request_android_webrtc_connect(handoff, "seat-170", Some(bus.path().to_path_buf()), now_ms)
+        .expect("authorized Remote Sessions open");
+
+    let request = state.requested.as_ref().expect("retained VDI request");
+    assert_eq!(request.protocol, VdiProtocol::WebRtc);
+    assert_eq!(request.target.serving_peer, "eagle");
+    assert_eq!(request.target.name, source.workload_id);
+    assert!(request.target.endpoint.is_none());
+    assert_eq!(
+        state.requested_session_id(),
+        Some(source.session_id.as_str())
+    );
+    assert_eq!(state.requested_android_source(), Some(&source));
+    assert!(state.route_status.as_deref().is_some_and(|status| {
+        status.contains("Remote Sessions authorized")
+            && status.contains("no Cuttlefish WebRTC decoder")
+    }));
+
+    let persist = TestPersist::open(bus.path().to_path_buf()).expect("open Bus");
+    let rows = persist
+        .list_since("action/vdi/session", None)
+        .expect("session rows");
+    assert_eq!(rows.len(), 1);
+    let open: serde_json::Value =
+        serde_json::from_str(rows[0].body.as_deref().expect("open body")).expect("open JSON");
+    assert_eq!(open["op"], "open");
+    assert_eq!(open["id"], source.session_id);
+    assert_eq!(open["serving_peer"], "eagle");
+    assert_eq!(open["vm_id"], source.workload_id);
+    assert!(open["armed_token"].as_str().is_some());
+    for forbidden in ["endpoint", "mesh_host", "port", "command", "path"] {
+        assert!(open.get(forbidden).is_none(), "forbidden field {forbidden}");
+    }
+
+    state.clear_target();
+    let rows = persist
+        .list_since("action/vdi/session", None)
+        .expect("session rows after close");
+    assert_eq!(rows.len(), 2);
+    let close: serde_json::Value =
+        serde_json::from_str(rows[1].body.as_deref().expect("close body")).expect("close JSON");
+    assert_eq!(close["op"], "close");
+    assert_eq!(close["id"], source.session_id);
+}
+
+#[test]
+fn governed_android_remote_session_authorization_failure_is_actionable_and_never_dials() {
+    let now_ms = 1_900_000_000_000;
+    let handoff = governed_android_handoff(now_ms);
+    let source = handoff.source.clone();
+    let bus = tempfile::tempdir().expect("Bus parent");
+    let invalid_root = bus.path().join("not-a-directory");
+    std::fs::write(&invalid_root, b"publication must fail").expect("invalid Bus root");
+    let mut state = VdiState::default();
+    let error = state
+        .request_android_webrtc_connect(handoff, "seat-170", Some(invalid_root), now_ms)
+        .expect_err("unopenable Bus must refuse authorization");
+    assert!(error.contains("Couldn't request the session"));
+    let request = state.requested.as_ref().expect("actionable refused route");
+    assert!(request.target.endpoint.is_none());
+    assert!(request.broker_session.is_none());
+    assert_eq!(state.requested_android_source(), Some(&source));
+    assert!(state.route_status.as_deref().is_some_and(|status| {
+        status.contains("attachment authorization failed")
+            && status.contains("Return to Workloads and retry")
+    }));
+    assert!(
+        !state.transport_install_attempted,
+        "authorization refusal must not enter request installation or transport spawn"
+    );
+    let persist = TestPersist::open(bus.path().to_path_buf()).expect("inspect Bus parent");
+    assert!(persist
+        .list_since("action/vdi/session", None)
+        .expect("session rows")
+        .is_empty());
+}
+
 #[test]
 fn no_session_paints_the_empty_state_not_a_blank_panel() {
     let mut state = VdiState::default();
@@ -300,13 +418,15 @@ fn vdi_protocol_clipboard_summary_is_truthful_per_backend() {
         .contains("unavailable"));
     assert!(
         VdiProtocol::Rdp.clipboard_summary().contains("CLIPRDR")
-            && VdiProtocol::Rdp.clipboard_summary().contains("unavailable")
+            && VdiProtocol::Rdp
+                .clipboard_summary()
+                .contains("bidirectional")
     );
     assert!(
         VdiProtocol::Spice.clipboard_summary().contains("vdagent")
             && VdiProtocol::Spice
                 .clipboard_summary()
-                .contains("unavailable")
+                .contains("bidirectional")
     );
     assert!(VdiProtocol::Vnc
         .clipboard_summary()
@@ -336,7 +456,19 @@ fn vnc_clipboard_event_is_canonical_and_session_attributed() {
         source.clone(),
         "2026-07-31T12:00:00Z",
     );
-    super::publish_vnc_clipboard_event(Some(dir.path()), &clip);
+    let now_ms = 1_700_000_000_000;
+    let lease = mackes_mesh_types::vdi_clipboard::VdiClipboardLeaseV2 {
+        schema_version: mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: source.clone(),
+        generation: 7,
+        lease_id: "vnc-clip-7".into(),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms + 60_000,
+        permitted_mime_offers: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+    };
+    let rich = super::vnc_guest_clipboard_message(&lease, 1, "guest → host".into(), now_ms + 1)
+        .expect("typed guest clipboard message");
+    super::publish_vnc_clipboard_event(Some(dir.path()), &clip, &rich);
 
     let persist =
         mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
@@ -359,37 +491,140 @@ fn vnc_clipboard_event_is_canonical_and_session_attributed() {
     assert_eq!(body["source"], source);
     assert_eq!(body["text"], "guest → host");
 
-    let read =
-        super::read_latest_vnc_host_clipboard(dir.path(), &source).expect("read canonical event");
-    assert!(
-        read.is_none(),
-        "a VNC guest event must not loop back to itself"
-    );
+    let rich_topic = mackes_mesh_types::vdi_clipboard::vdi_clipboard_session_topic(
+        mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX,
+        &source,
+    )
+    .expect("guest event topic");
+    let rich_body = persist
+        .read_latest(&rich_topic)
+        .expect("read typed guest event")
+        .expect("typed guest event published")
+        .body
+        .expect("typed body");
+    let published: mackes_mesh_types::vdi_clipboard::VdiClipboardMessageV2 =
+        serde_json::from_str(&rich_body).expect("typed guest event JSON");
+    assert_eq!(published.session_id, source);
+    assert_eq!(published.generation, 7);
+    assert_eq!(published.lease_id, "vnc-clip-7");
+    assert_eq!(published.selected_mime, "text/plain;charset=utf-8");
 }
 
 #[cfg(feature = "live-vdi")]
 #[test]
-fn vnc_host_clipboard_reader_rejects_oversized_utf8_before_client_cut_text() {
+fn vnc_host_clipboard_reader_negotiates_rich_fallback_and_deduplicates_reconnect() {
     let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
-    let oversized = mde_collab_types::ClipboardClipBody::from_text(
-        "x".repeat(mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES + 1),
-        "seat:host",
-        "2026-07-31T12:00:00Z",
-    );
+    let now_ms = 1_700_000_000_000;
+    let lease = mackes_mesh_types::vdi_clipboard::VdiClipboardLeaseV2 {
+        schema_version: mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: "vnc:oak:session".into(),
+        generation: 9,
+        lease_id: "vnc-clip-9".into(),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms + 60_000,
+        permitted_mime_offers: vec!["text/plain;charset=utf-8".into(), "text/plain".into()],
+    };
+    let envelope = mackes_mesh_types::vdi_clipboard::ClipboardEnvelopeV2::new_inline_text(
+        "node-host",
+        "seat-host",
+        "drm-session",
+        4,
+        now_ms,
+        vec![
+            "text/html;charset=utf-8".into(),
+            "text/plain;charset=utf-8".into(),
+        ],
+        "rich text",
+        mackes_mesh_types::vdi_clipboard::VdiClipboardText::new("plain fallback")
+            .expect("bounded text"),
+        now_ms + 30_000,
+    )
+    .expect("rich fallback envelope");
+    let command = mackes_mesh_types::vdi_clipboard::VdiClipboardMessageV2 {
+        schema_version: mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+        session_id: lease.session_id.clone(),
+        generation: lease.generation,
+        lease_id: lease.lease_id.clone(),
+        lease_expires_at_ms: lease.expires_at_ms,
+        message_sequence: 1,
+        selected_mime: "text/plain;charset=utf-8".into(),
+        disclosure: mackes_mesh_types::vdi_clipboard::VdiClipboardDisclosureV2::Shareable,
+        envelope,
+    };
+    command
+        .admit(&lease, None, now_ms + 1)
+        .expect("negotiated rich fallback command");
+    let persist =
+        mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
+    let command_topic = mackes_mesh_types::vdi_clipboard::vdi_clipboard_session_topic(
+        mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
+        &lease.session_id,
+    )
+    .expect("command topic");
+    persist
+        .write(
+            &command_topic,
+            mde_bus::hooks::config::Priority::Default,
+            None,
+            Some(&serde_json::to_string(&command).expect("encode typed command")),
+        )
+        .expect("write typed command");
+
+    let (read, text) = super::read_latest_vnc_host_clipboard(dir.path(), &lease, now_ms + 1)
+        .expect("read typed command")
+        .expect("command admitted");
+    assert_eq!(text, "plain fallback");
+
+    super::publish_vdi_clipboard_receipt(dir.path(), &read.receipt())
+        .expect("persist delivery receipt");
+    let error = super::read_latest_vnc_host_clipboard(dir.path(), &lease, now_ms + 2)
+        .expect_err("same command must not replay after reconnect");
+    assert!(error.contains("already delivered"));
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn vnc_host_clipboard_reader_rejects_secret_oversized_and_expired_lease() {
+    let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
+    let now_ms = 1_700_000_000_000;
+    let lease =
+        super::vnc_clipboard_lease("vnc:oak:session", now_ms).expect("bounded VNC clipboard lease");
+    let mut command = super::vnc_guest_clipboard_message(&lease, 1, "safe".into(), now_ms + 1)
+        .expect("typed command fixture");
+    command.disclosure = mackes_mesh_types::vdi_clipboard::VdiClipboardDisclosureV2::Secret;
+    let topic = mackes_mesh_types::vdi_clipboard::vdi_clipboard_session_topic(
+        mackes_mesh_types::vdi_clipboard::VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
+        &lease.session_id,
+    )
+    .expect("command topic");
     let persist =
         mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
     persist
         .write(
-            "event/clipboard/clip",
+            &topic,
             mde_bus::hooks::config::Priority::Default,
             None,
-            Some(&serde_json::to_string(&oversized).expect("encode oversized event")),
+            Some(&serde_json::to_string(&command).expect("secret command JSON")),
         )
-        .expect("write oversized event");
+        .expect("write secret command");
+    assert!(
+        super::read_latest_vnc_host_clipboard(dir.path(), &lease, now_ms + 2)
+            .expect_err("secret must fail closed")
+            .contains("secret-bearing")
+    );
 
-    let error = super::read_latest_vnc_host_clipboard(dir.path(), "vnc:oak:session")
-        .expect_err("oversized canonical event must fail closed");
-    assert!(error.contains("TextTooLarge"));
+    assert!(
+        super::read_latest_vnc_host_clipboard(dir.path(), &lease, lease.expires_at_ms)
+            .expect_err("expired lease must fail closed")
+            .contains("not current")
+    );
+
+    let oversized =
+        vec![b' '; mackes_mesh_types::vdi_clipboard::MAX_VDI_CLIPBOARD_TRANSPORT_V2_JSON_BYTES + 1];
+    assert_eq!(
+        mackes_mesh_types::vdi_clipboard::VdiClipboardMessageV2::from_json_bytes(&oversized),
+        Err(mackes_mesh_types::vdi_clipboard::VdiClipboardTransportV2Error::BodyTooLarge)
+    );
 }
 
 #[test]

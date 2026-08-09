@@ -41,7 +41,8 @@ use super::cloud::{
 use super::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::{ShutdownToken, Worker};
 use crate::display1_broker::{
-    register_display1_listener, Display1AttachmentServer, Display1Peer, DISPLAY1_SOCKET_ROOT,
+    display1_socket_path_at, register_display1_listener, Display1AttachmentServer, Display1Peer,
+    DISPLAY1_SOCKET_ROOT,
 };
 use crate::workload_reconciler::WorkloadOperationLedger;
 
@@ -168,6 +169,26 @@ pub trait WorkloadActuator: Send + Sync {
         request: &WorkloadOperationRequest,
         status: &WorkloadOperationStatus,
     ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError>;
+
+    /// Reconcile a terminal attachment after daemon or host recovery.
+    ///
+    /// The durable Workload operation remains the sole lifecycle authority.
+    /// Implementations may recreate only the exact, unexpired lease already
+    /// journaled for that generation; stale identity must be revoked rather
+    /// than converted into a new attachment capability.
+    fn recover_attachment(
+        &self,
+        _request: &WorkloadOperationRequest,
+        _status: &WorkloadOperationStatus,
+        _now_ms: u64,
+    ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+        Ok(None)
+    }
+
+    /// Revoke one exact persisted terminal attachment without changing VM or
+    /// container lifecycle state. Implementations without attachment resources
+    /// may leave this as a no-op.
+    fn revoke_attachment(&self, _status: &WorkloadOperationStatus) {}
 
     /// Reap ephemeral adapter resources whose lease has expired.
     ///
@@ -865,6 +886,48 @@ impl SystemWorkloadActuator {
     fn remove_attachment(&self, request: &WorkloadOperationRequest) {
         if let Ok(mut attachments) = self.attachments.lock() {
             attachments.remove(request.workload_id.as_str());
+        }
+    }
+
+    fn revoke_persisted_attachment(&self, status: &WorkloadOperationStatus) {
+        let Some(lease) = status.attachment.as_ref() else {
+            return;
+        };
+        if let Ok(mut attachments) = self.attachments.lock() {
+            let workload_id = status.workload_id.as_str();
+            if attachments
+                .get(workload_id)
+                .is_some_and(|runtime| runtime.server.lease() == lease)
+            {
+                attachments.remove(workload_id);
+            }
+        }
+        let Some(socket) = display1_socket_path_at(&self.display1_root, &lease.lease_id) else {
+            return;
+        };
+        match fs::remove_file(&socket) {
+            Ok(()) => {
+                tracing::info!(path = %socket.display(), "revoked stale Display1 lease socket")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %socket.display(), %error, "stale Display1 lease socket could not be removed")
+            }
+        }
+    }
+
+    fn recovered_attachment_unavailable(reason: impl Into<String>) -> WorkloadActuatorOutcome {
+        WorkloadActuatorOutcome {
+            phase: WorkloadOperationPhase::Completed,
+            power: WorkloadPowerState::Running,
+            readiness: WorkloadReadiness::Unavailable,
+            retryable: false,
+            reason: Some(reason.into()),
+            remediation: Some(
+                "return to Workloads and issue a new Start and attach operation from the current generation"
+                    .into(),
+            ),
+            attachment: None,
         }
     }
 
@@ -1589,6 +1652,85 @@ impl WorkloadActuator for SystemWorkloadActuator {
         if let Ok(mut attachments) = self.attachments.lock() {
             attachments.retain(|_, runtime| runtime.server.lease().expires_at_ms > now_ms);
         }
+    }
+
+    fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+        self.revoke_persisted_attachment(status);
+    }
+
+    fn recover_attachment(
+        &self,
+        request: &WorkloadOperationRequest,
+        status: &WorkloadOperationStatus,
+        now_ms: u64,
+    ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+        if request.action != WorkloadOperationAction::StartAndAttach
+            || status.phase != WorkloadOperationPhase::Completed
+        {
+            return Ok(None);
+        }
+        let Some(lease) = status.attachment.as_ref() else {
+            return Ok(None);
+        };
+        if lease.workload_id != status.workload_id
+            || lease.generation != status.generation
+            || lease.protocol != WorkloadAttachmentProtocol::QemuDisplay1Dmabuf
+            || lease.validate(now_ms).is_err()
+        {
+            self.revoke_persisted_attachment(status);
+            return Ok(Some(Self::recovered_attachment_unavailable(
+                "the recovered Display1 lease was expired or did not match the exact workload generation and was revoked",
+            )));
+        }
+        if !Self::running(request)? {
+            self.revoke_persisted_attachment(status);
+            let mut outcome = Self::recovered_attachment_unavailable(
+                "the recovered workload is not running; its Display1 lease was revoked",
+            );
+            outcome.power = WorkloadPowerState::Stopped;
+            return Ok(Some(outcome));
+        }
+
+        let runtime = self.attachment_for_status(request, status, now_ms)?;
+        if runtime.registration_state() == DISPLAY1_REGISTRATION_NEW {
+            runtime.register(Self::qemu_display1_address(request)?);
+        }
+        if runtime.registration_state() == DISPLAY1_REGISTRATION_FAILED {
+            let reason = runtime
+                .registration_error()
+                .unwrap_or_else(|| "QEMU Display1 recovery registration failed".into());
+            self.revoke_persisted_attachment(status);
+            return Ok(Some(Self::recovered_attachment_unavailable(format!(
+                "{reason}; the recovered lease was revoked"
+            ))));
+        }
+        if runtime.registration_state() == DISPLAY1_REGISTRATION_READY && runtime.first_frame_seen()
+        {
+            return Ok(Some(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::Completed,
+                power: WorkloadPowerState::Running,
+                readiness: WorkloadReadiness::Ready,
+                retryable: false,
+                reason: None,
+                remediation: None,
+                attachment: Some(lease.clone()),
+            }));
+        }
+        Ok(Some(WorkloadActuatorOutcome {
+            phase: WorkloadOperationPhase::Completed,
+            power: WorkloadPowerState::Running,
+            readiness: WorkloadReadiness::PreparingDisplay,
+            retryable: true,
+            reason: Some(
+                "re-attaching the recovered exact-generation Display1 session and waiting for a validated first frame"
+                    .into(),
+            ),
+            remediation: Some(
+                "keep the shell attached; if recovery does not converge, retry from Workloads"
+                    .into(),
+            ),
+            attachment: Some(lease.clone()),
+        }))
     }
 
     fn apply(
@@ -2785,6 +2927,156 @@ impl WorkloadComputeWorker {
         }
     }
 
+    fn refuse_recovered_attachment(
+        &self,
+        ledger: &mut WorkloadOperationLedger,
+        mut status: WorkloadOperationStatus,
+        reason: impl Into<String>,
+        now_ms: u64,
+    ) {
+        self.actuator.revoke_attachment(&status);
+        let request_id = status.request_id.clone();
+        status.readiness = WorkloadReadiness::Unavailable;
+        status.retryable = false;
+        status.next_retry_at_ms = 0;
+        status.reason = Some(reason.into());
+        status.remediation = Some(
+            "return to Workloads and issue a new Start and attach operation from the current generation"
+                .into(),
+        );
+        status.attachment = None;
+        status.signals = WorkloadRuntimeSignals::from_readiness(status.phase, status.readiness);
+        if let Err(error) = ledger.advance(&request_id, status, now_ms) {
+            tracing::error!(%error, %request_id, "recovered attachment refusal could not be journaled");
+        }
+    }
+
+    fn reconcile_recovered_attachments(
+        &mut self,
+        ledger: &mut WorkloadOperationLedger,
+        now_ms: u64,
+    ) {
+        let latest_generation = ledger
+            .statuses()
+            .fold(BTreeMap::new(), |mut latest, status| {
+                latest
+                    .entry(status.workload_id.as_str().to_owned())
+                    .and_modify(|generation: &mut u64| {
+                        *generation = (*generation).max(status.generation)
+                    })
+                    .or_insert(status.generation);
+                latest
+            });
+        let recovered: Vec<_> = ledger
+            .statuses()
+            .filter(|status| status.phase.is_terminal() && status.attachment.is_some())
+            .cloned()
+            .collect();
+
+        for mut status in recovered {
+            if latest_generation.get(status.workload_id.as_str()) != Some(&status.generation) {
+                self.refuse_recovered_attachment(
+                    ledger,
+                    status,
+                    "the recovered Display1 lease belongs to a superseded workload generation and was revoked",
+                    now_ms,
+                );
+                continue;
+            }
+            let Some(request) = ledger.request(&status.request_id).cloned() else {
+                self.refuse_recovered_attachment(
+                    ledger,
+                    status,
+                    "the recovered Display1 lease has no durable owning Workload request and was revoked",
+                    now_ms,
+                );
+                continue;
+            };
+            if status.phase != WorkloadOperationPhase::Completed
+                || request.action != WorkloadOperationAction::StartAndAttach
+            {
+                self.refuse_recovered_attachment(
+                    ledger,
+                    status,
+                    "the recovered Display1 lease is not owned by a completed Start and attach operation and was revoked",
+                    now_ms,
+                );
+                continue;
+            }
+            let outcome = match self.actuator.recover_attachment(&request, &status, now_ms) {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => continue,
+                Err(error) => {
+                    self.refuse_recovered_attachment(
+                        ledger,
+                        status,
+                        bounded_reason(&format!(
+                            "recovered Display1 attachment was refused: {error}"
+                        )),
+                        now_ms,
+                    );
+                    continue;
+                }
+            };
+            if outcome.phase != WorkloadOperationPhase::Completed {
+                tracing::error!(
+                    request_id = %request.request_id,
+                    phase = ?outcome.phase,
+                    "terminal attachment recovery returned a nonterminal phase"
+                );
+                self.refuse_recovered_attachment(
+                    ledger,
+                    status,
+                    "recovered Display1 attachment returned an invalid lifecycle phase and was revoked",
+                    now_ms,
+                );
+                continue;
+            }
+            if let Some(lease) = outcome.attachment.as_ref() {
+                if lease.workload_id != status.workload_id
+                    || lease.generation != status.generation
+                    || lease.protocol != WorkloadAttachmentProtocol::QemuDisplay1Dmabuf
+                    || lease.validate(now_ms).is_err()
+                {
+                    tracing::error!(
+                        request_id = %request.request_id,
+                        "terminal attachment recovery returned mismatched lease identity"
+                    );
+                    self.refuse_recovered_attachment(
+                        ledger,
+                        status,
+                        "recovered Display1 attachment returned mismatched identity and was refused"
+                            .to_owned(),
+                        now_ms,
+                    );
+                    continue;
+                } else {
+                    status.power = outcome.power;
+                    status.readiness = outcome.readiness;
+                    status.retryable = outcome.retryable;
+                    status.reason = outcome.reason;
+                    status.remediation = outcome.remediation;
+                    status.attachment = Some(lease.clone());
+                }
+            } else {
+                status.power = outcome.power;
+                status.readiness = outcome.readiness;
+                status.retryable = outcome.retryable;
+                status.reason = outcome.reason;
+                status.remediation = outcome.remediation;
+                status.attachment = None;
+            }
+            status.next_retry_at_ms = 0;
+            status.signals = WorkloadRuntimeSignals::from_readiness(status.phase, status.readiness);
+            if ledger.status(&request.request_id) == Some(&status) {
+                continue;
+            }
+            if let Err(error) = ledger.advance(&request.request_id, status, now_ms) {
+                tracing::error!(%error, "recovered attachment status could not be journaled");
+            }
+        }
+    }
+
     fn apply_outcome(
         &self,
         ledger: &mut WorkloadOperationLedger,
@@ -2984,6 +3276,7 @@ impl WorkloadComputeWorker {
             }
         }
         self.reconcile_inflight(ledger, now);
+        self.reconcile_recovered_attachments(ledger, now);
         self.actuator.reap_expired(now);
         self.publish(persist, ledger, now);
     }
@@ -3586,6 +3879,56 @@ mod tests {
         }
     }
 
+    struct RecoveryActuator {
+        calls: Arc<Mutex<u32>>,
+        revoked: Arc<Mutex<Vec<(String, u64)>>>,
+        outcome: WorkloadActuatorOutcome,
+    }
+
+    impl WorkloadActuator for RecoveryActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("terminal recovery must not apply a lifecycle operation")
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("terminal recovery must not cancel a lifecycle operation")
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            unreachable!("terminal recovery must not enter inflight observation")
+        }
+
+        fn recover_attachment(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+            _: u64,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            *self.calls.lock().expect("recovery calls") += 1;
+            Ok(Some(self.outcome.clone()))
+        }
+
+        fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+            if let Some(lease) = status.attachment.as_ref() {
+                self.revoked
+                    .lock()
+                    .expect("revoked attachments")
+                    .push((lease.lease_id.clone(), lease.generation));
+            }
+        }
+    }
+
     fn request() -> WorkloadOperationRequest {
         WorkloadOperationRequest {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -3601,6 +3944,40 @@ mod tests {
             deadline_at_ms: now_ms() + 20_000,
             preferred_attachment: None,
             armed_token: None,
+        }
+    }
+
+    fn seed_completed_attachment(
+        ledger: &mut WorkloadOperationLedger,
+        request: WorkloadOperationRequest,
+        lease: WorkloadAttachmentLease,
+        now: u64,
+    ) {
+        let mut status = ledger
+            .accept(request.clone(), now)
+            .expect("queue recovery record");
+        for phase in [
+            WorkloadOperationPhase::Validating,
+            WorkloadOperationPhase::Admitting,
+            WorkloadOperationPhase::Defining,
+            WorkloadOperationPhase::Starting,
+            WorkloadOperationPhase::WaitingForGuest,
+            WorkloadOperationPhase::WaitingForService,
+            WorkloadOperationPhase::PreparingDisplay,
+            WorkloadOperationPhase::WaitingForFirstFrame,
+            WorkloadOperationPhase::Ready,
+            WorkloadOperationPhase::Completed,
+        ] {
+            status.phase = phase;
+            if phase == WorkloadOperationPhase::Completed {
+                status.power = WorkloadPowerState::Running;
+                status.readiness = WorkloadReadiness::Ready;
+                status.signals = WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
+                status.attachment = Some(lease.clone());
+            }
+            status = ledger
+                .advance(&request.request_id, status, now)
+                .expect("advance recovery record");
         }
     }
 
@@ -3753,6 +4130,126 @@ mod tests {
         assert_eq!(runtime.server.lease().generation, status.generation);
         assert!(runtime.server.lease().expires_at_ms > now);
         assert_ne!(runtime.server.lease(), status.attachment.as_ref().unwrap());
+    }
+
+    #[test]
+    fn old_generation_is_revoked_while_latest_exact_attachment_reconciles() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let old_request = request();
+        let old_lease = SystemWorkloadActuator::attachment_lease(&old_request, 1, now);
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        seed_completed_attachment(&mut ledger, old_request.clone(), old_lease.clone(), now);
+        let mut request = request();
+        request.request_id = "op-2".into();
+        request.expected_generation = 1;
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 2, now);
+        seed_completed_attachment(&mut ledger, request.clone(), lease.clone(), now);
+        let calls = Arc::new(Mutex::new(0));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            RecoveryActuator {
+                calls: Arc::clone(&calls),
+                revoked: Arc::clone(&revoked),
+                outcome: WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::PreparingDisplay,
+                    retryable: true,
+                    reason: Some("waiting for recovered first frame".into()),
+                    remediation: Some("keep the shell attached".into()),
+                    attachment: Some(lease.clone()),
+                },
+            },
+        ));
+
+        worker.reconcile_recovered_attachments(&mut ledger, now);
+
+        assert_eq!(*calls.lock().expect("recovery calls"), 1);
+        assert_eq!(
+            *revoked.lock().expect("revoked attachments"),
+            vec![(old_lease.lease_id.clone(), 1)]
+        );
+        let stale = ledger
+            .status(&old_request.request_id)
+            .expect("superseded status");
+        assert!(stale.attachment.is_none());
+        assert_eq!(stale.readiness, WorkloadReadiness::Unavailable);
+        assert!(stale
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("superseded")));
+        let recovered = ledger
+            .status(&request.request_id)
+            .expect("recovered status");
+        assert_eq!(recovered.phase, WorkloadOperationPhase::Completed);
+        assert_eq!(recovered.readiness, WorkloadReadiness::PreparingDisplay);
+        assert_eq!(recovered.attachment.as_ref(), Some(&lease));
+        assert!(recovered
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("recovered first frame")));
+    }
+
+    #[test]
+    fn recovered_attachment_with_wrong_generation_is_refused_and_unpublished() {
+        let temp = tempfile::tempdir().expect("temp");
+        let now = now_ms();
+        let request = request();
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, now);
+        let mut hostile = lease.clone();
+        hostile.generation = 2;
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        seed_completed_attachment(&mut ledger, request.clone(), lease, now);
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(Box::new(
+            RecoveryActuator {
+                calls: Arc::new(Mutex::new(0)),
+                revoked: Arc::new(Mutex::new(Vec::new())),
+                outcome: WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Completed,
+                    power: WorkloadPowerState::Running,
+                    readiness: WorkloadReadiness::Ready,
+                    retryable: false,
+                    reason: None,
+                    remediation: None,
+                    attachment: Some(hostile),
+                },
+            },
+        ));
+
+        worker.reconcile_recovered_attachments(&mut ledger, now);
+
+        let refused = ledger.status(&request.request_id).expect("refused status");
+        assert!(refused.attachment.is_none());
+        assert_eq!(refused.readiness, WorkloadReadiness::Unavailable);
+        assert!(refused
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("mismatched identity")));
+        assert!(refused
+            .remediation
+            .as_deref()
+            .is_some_and(|remediation| remediation.contains("current generation")));
+    }
+
+    #[test]
+    fn revoking_stale_recovered_lease_removes_its_node_local_socket() {
+        let temp = tempfile::tempdir().expect("temp");
+        let display_root = temp.path().join("display1");
+        fs::create_dir_all(&display_root).expect("display root");
+        let request = request();
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, now_ms());
+        let socket = display1_socket_path_at(&display_root, &lease.lease_id).expect("socket path");
+        fs::write(&socket, b"stale socket placeholder").expect("stale socket");
+        let actuator =
+            SystemWorkloadActuator::new(temp.path().join("state")).with_display1_root(display_root);
+        let mut status = queued_status(&request);
+        status.attachment = Some(lease);
+
+        actuator.revoke_persisted_attachment(&status);
+
+        assert!(!socket.exists());
+        assert!(actuator.attachments.lock().expect("attachments").is_empty());
     }
 
     #[test]

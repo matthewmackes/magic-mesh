@@ -33,6 +33,7 @@ mod acceptance_cli;
 mod chat;
 mod chooser;
 mod chrome;
+mod clipboard_permissions;
 mod communications;
 mod console;
 mod construct;
@@ -938,7 +939,7 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         | Surface::Media
         | Surface::Files
         | Surface::Terminal
-        | Surface::Timers
+        | Surface::Clock
         | Surface::Communications
         | Surface::Explorer
         | Surface::Phones => false,
@@ -1059,6 +1060,9 @@ struct Shell {
     /// same world-readable mesh-status snapshot (WB-Controller). Reads no `mackesd`
     /// IPC.
     controller: controller::ControllerState,
+    /// WL-FUNC-016 S5 — payload-free rich clipboard permission, progress, and
+    /// audit controller. Clipboard bytes remain owned by the existing providers.
+    clipboard_permissions: clipboard_permissions::ClipboardPermissionController,
     /// Provisioning plane — the mesh's live onboarding / deployment posture
     /// (per-node deployment tier + role rollup, the fleet version target vs each
     /// node's build + update flag, and per-node enrollment readiness), folded from
@@ -1225,6 +1229,10 @@ struct Shell {
     /// management, simulator-backed MG90 local management, vehicle telemetry, GPIO,
     /// firmware, backups, recovery, and encrypted-at-rest-ready trip/location data.
     maps_location: MapsLocationSurface,
+    /// Clock-adjacent launcher projection admitted from this host's existing
+    /// effective-location/current-weather latest-wins mirrors.
+    weather_launcher: status_bar::LiveWeatherStatus,
+    last_weather_launcher_poll: Option<Instant>,
     /// The Auto Mode driver's-strip readout selection (the selectable status
     /// tiles below the speedometer in the left instrument strip), persisted to
     /// `settings-car-status.json`. A driver taps a tile to cycle its readout.
@@ -1273,12 +1281,9 @@ struct Shell {
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
     /// half is integration-gated, exactly like the VDI / Browser transports.
     self_test: mesh_view::SelfTestWatch,
-    /// The Timers & Alarms store — countdown timers + daily alarms,
-    /// owned by the SHELL (not the panel) and ticked once per frame, so a due
-    /// timer/alarm fires its `event/notify/timer` notification even while the
-    /// surface is closed (the clock's replacement, design lock #16/#20). The
-    /// status clock opens `Surface::Timers` to edit it.
-    timers: timers::TimersState,
+    /// Read-only daemon Clock projection plus typed presentation intents. The
+    /// shell owns no scheduling, persistence, or ringing authority.
+    clock: timers::ClockState,
     /// The POWER-5 idle + lid honorer — the compositorless DRM shell's own
     /// swayidle/logind-lid replacement. Ticked once per frame; enforces the
     /// operator's idle-suspend timeout + lid-close action (read from the System
@@ -1427,6 +1432,7 @@ impl Shell {
             surface_card: surface_card::SurfaceCardState::default(),
             network: network::NetworkState::default(),
             controller: controller::ControllerState::default(),
+            clipboard_permissions: clipboard_permissions::ClipboardPermissionController::default(),
             provisioning: provisioning::ProvisioningState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
@@ -1462,6 +1468,8 @@ impl Shell {
             web: web::WebState::default(),
             _browser_mpris: web::spawn_browser_mpris(),
             maps_location: real_maps_location(),
+            weather_launcher: status_bar::LiveWeatherStatus::unavailable(),
+            last_weather_launcher_poll: None,
             car_status: mde_maps_location_egui::CarStatusSelection::load(),
             car_motion: car_motion_policy::CarMotionPolicy::default(),
             terminal: real_terminal(),
@@ -1474,7 +1482,7 @@ impl Shell {
             this_node_page: this_node_catalog::page_index()[0],
             this_node_search: String::new(),
             self_test: mesh_view::SelfTestWatch::default(),
-            timers: timers::TimersState::default(),
+            clock: timers::ClockState::default(),
             power_honor: power_honor::PowerHonor::default(),
             curtain: curtain::Curtain::pam(),
             lock_signal: lock_signal::LogindLockSource::new(ctx),
@@ -1485,6 +1493,10 @@ impl Shell {
             last_workspace_rect: None,
             layout_mode: LayoutModeControl::default(),
         };
+        #[cfg(feature = "live-vdi")]
+        shell
+            .vdi
+            .set_clipboard_permission_ingress(shell.clipboard_permissions.ingress());
         shell
             .music
             .set_workspace_action_publisher(publish_music_workspace_action);
@@ -1803,6 +1815,57 @@ impl Shell {
         self.nav.surface = canonical_workspace_surface(self.nav.surface);
     }
 
+    fn open_maps_weather(&mut self) {
+        self.reset_home_cycle();
+        self.nav.expanded = true;
+        self.nav.surface = Surface::MapsLocation;
+        self.sessions_picker_open = false;
+        self.maps_location.active = mde_maps_location_egui::model::WorkspaceTab::Map;
+        self.maps_location.map.weather.active = true;
+    }
+
+    fn refresh_weather_launcher(&mut self, now: Instant, now_ms: i64) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(2);
+        if self
+            .last_weather_launcher_poll
+            .is_some_and(|last| now.saturating_duration_since(last) < POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_weather_launcher_poll = Some(now);
+        let reader = bus_reader::BusReader::client();
+        let location_topic =
+            mackes_mesh_types::location::weather_location_state_topic(&self.local_host);
+        let current_topic =
+            mackes_mesh_types::weather::weather_current_state_topic(&self.local_host);
+        let location = reader
+            .latest(&location_topic)
+            .and_then(|message| message.body)
+            .and_then(|body| {
+                mackes_mesh_types::location::EffectiveLocationSnapshot::from_json_at(
+                    body.as_bytes(),
+                    now_ms,
+                )
+                .ok()
+            });
+        let current = reader
+            .latest(&current_topic)
+            .and_then(|message| message.body)
+            .and_then(|body| {
+                mackes_mesh_types::weather::CurrentWeatherSnapshot::from_json_at(
+                    body.as_bytes(),
+                    now_ms,
+                )
+                .ok()
+            });
+        self.weather_launcher = status_bar::LiveWeatherStatus::from_projections(
+            &self.local_host,
+            location.as_ref(),
+            current.as_ref(),
+            now_ms,
+        );
+    }
+
     /// Execute one navigation-bar action. The Auto action uses the same layout
     /// profile seam as Settings and the existing lower-left mode control.
     fn apply_nav_bar_action(&mut self, action: nav_bar::Action, ctx: &egui::Context) {
@@ -1840,6 +1903,7 @@ impl Shell {
                 self.sessions_picker_open = surface == Surface::Desktop;
                 self.normalize_surface_aliases();
             }
+            nav_bar::Action::OpenWeather => self.open_maps_weather(),
             nav_bar::Action::PinSurface(surface) => {
                 self.reset_home_cycle();
                 self.nav_bar.pin_surface(surface);
@@ -1891,6 +1955,10 @@ impl Shell {
         let pinned_sources = self.chooser.pinned_rail_sources();
         let connected_sessions = self.session_rail.connected_entries(&self.local_host);
         let active_session_id = self.vdi.requested_session_id();
+        let battery = self
+            .system
+            .battery_targets()
+            .and_then(|batteries| status_bar::LiveBatteryStatus::from_batteries(&batteries));
         let (bottom_alpha, _) = self.nav_bar.chrome_alphas(Instant::now());
         let env = status_bar::StatusBarEnv {
             curtain_engaged: self.curtain.engaged(),
@@ -1907,6 +1975,8 @@ impl Shell {
             self.notify_status.segments(),
             bottom_alpha,
             env,
+            battery,
+            Some(self.weather_launcher.clone()),
         ) {
             self.apply_nav_bar_action(action, ctx);
         }
@@ -1932,7 +2002,11 @@ impl Shell {
     fn mount_status_bar_slot(&mut self, ctx: &egui::Context) {
         let immersive_vdi = self.immersive_vdi();
         let (_, top_alpha) = self.nav_bar.chrome_alphas(Instant::now());
-        status_bar::mount_top_with_active(
+        let battery = self
+            .system
+            .battery_targets()
+            .and_then(|batteries| status_bar::LiveBatteryStatus::from_batteries(&batteries));
+        let weather_clicked = status_bar::mount_top_with_active(
             ctx,
             &mut self.construct,
             self.notify_status.segments(),
@@ -1944,7 +2018,12 @@ impl Shell {
             },
             top_alpha,
             Some(self.nav.surface),
+            battery,
+            Some(self.weather_launcher.clone()),
         );
+        if weather_clicked {
+            self.open_maps_weather();
+        }
         if let Some(surface) = self.construct.take_workspace_tray_target() {
             self.reset_home_cycle();
             self.nav.expanded = true;
@@ -2034,6 +2113,31 @@ impl Shell {
                 self.construct.control_center_open = false;
             }
         }
+    }
+
+    /// Route the governed Android source into the one Remote Sessions
+    /// controller. Authorization failures still open the Desktop status surface
+    /// so the operator receives an actionable refusal instead of a silent click.
+    fn apply_android_vdi_handoff(&mut self, handoff: iac::AndroidVdiHandoff, ctx: &egui::Context) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0);
+        let result = self.vdi.request_android_webrtc_connect(
+            handoff,
+            &self.local_host,
+            mde_bus::client_data_dir(),
+            now_ms,
+        );
+        if let Err(error) = result {
+            tracing::warn!(target: "shell::android_vdi", %error, "Android Remote Sessions attachment refused");
+        }
+        self.nav.surface = Surface::Desktop;
+        self.nav.expanded = true;
+        self.sessions_picker_open = false;
+        self.construct.control_center_open = false;
+        ctx.request_repaint();
     }
 
     /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE
@@ -2664,6 +2768,9 @@ impl Shell {
                 ui.push_id("shell-infra-code", |ui| {
                     iac::infra_code_panel(ui, infra_code);
                 });
+                if let Some(handoff) = iac::take_android_vdi_handoff(ui.ctx()) {
+                    self.apply_android_vdi_handoff(handoff, ui.ctx());
+                }
             }
             Surface::Music => {
                 music_pump(&mut self.music);
@@ -2788,16 +2895,10 @@ impl Shell {
                     communications.show(ui);
                 });
             }
-            Surface::Timers => {
-                // Timers & Alarms — a pure renderer over the
-                // shell-owned store `render` ticks every frame, so a countdown
-                // never depends on this panel being open (the design's "Timers
-                // reliability" lock). Opened by the status clock
-                // (lock #20); scoped under its own `push_id` like every mounted
-                // surface.
-                let timers = &mut self.timers;
-                ui.push_id("shell-timers", |ui| {
-                    timers::timers_panel(ui, timers);
+            Surface::Clock => {
+                let clock = &mut self.clock;
+                ui.push_id("shell-clock", |ui| {
+                    timers::clock_panel(ui, clock);
                 });
             }
             Surface::AutoHome => {
@@ -3196,12 +3297,10 @@ impl Shell {
             self.curtain.lock();
         }
 
-        // The Timers & Alarms tick (the power_honor idiom): one call
-        // per frame evaluates the shell-owned countdown timers + daily alarms
-        // and fires each due one onto the CHAT-FIX-2 `event/notify/timer` lane —
-        // surface open or closed. It self-schedules the next wakeup, so a due
-        // alarm rings without input even on the idle DRM seat.
-        self.timers.tick(ctx);
+        // Clock state is projected by mackesd. This controller-side pump performs
+        // the local Bus read before the pure Clock renderer runs; the shell never
+        // evaluates deadlines or writes schedule persistence.
+        self.clock.pump(ctx);
 
         // CURTAIN-3 — logind session Lock/Unlock: drain the listener's forwarded
         // signals and route them (`loginctl lock-session` drops the curtain; an
@@ -3237,7 +3336,9 @@ impl Shell {
         // Refresh the live models consumed by the status bar and centers before
         // painting this frame's Construct chrome.
         self.pump_shell_models(ctx);
-        let health_now_ms = u64::try_from(crate::timers::display_unix())
+        let utc_now = crate::timers::now_unix();
+        let projection_now_ms = utc_now.saturating_mul(1_000);
+        let health_now_ms = u64::try_from(utc_now)
             .unwrap_or(0)
             .saturating_mul(1_000);
         let health_open_blocked = self.curtain.engaged()
@@ -3250,11 +3351,17 @@ impl Shell {
             health_now_ms,
             health_open_blocked,
         );
+        let clipboard_focused = ctx.input(|input| input.focused) && !self.curtain.engaged();
+        self.clipboard_permissions.poll_ingress(health_now_ms);
+        let _ = self
+            .clipboard_permissions
+            .set_focused(clipboard_focused, health_now_ms);
 
         // WL-UX-005 — the legacy Start Menu was removed; Springboard and the
         // unified Front Door are the only launch/search surfaces.
 
         let now = Instant::now();
+        self.refresh_weather_launcher(now, projection_now_ms);
         self.finish_menu_bar_minimize_if_done(now);
 
         // The central view: the session↔body cross-fade — or nothing at all
@@ -3371,6 +3478,7 @@ impl Shell {
         self.mount_front_door(ctx);
         self.mount_layout_profile_control(ctx, now);
         health_modal::mount(ctx, &mut self.construct, self.chrome.health().snapshot());
+        self.clipboard_permissions.mount(ctx, health_now_ms);
         if let Some((host, key)) = self.construct.health_inventory_target.take() {
             self.nav.expanded = true;
             self.nav.surface = Surface::Workers;
@@ -4543,6 +4651,7 @@ fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
         nav_bar::Action::OpenEditor => "open_editor",
         nav_bar::Action::ToggleDock => "toggle_dock",
         nav_bar::Action::OpenSurface(_) => "open_surface",
+        nav_bar::Action::OpenWeather => "open_weather",
         nav_bar::Action::PinSurface(_) => "pin_surface",
         nav_bar::Action::UnpinSurface(_) => "unpin_surface",
         nav_bar::Action::DesktopSource(_) => "desktop_source",
@@ -4701,17 +4810,17 @@ mod tests {
         layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_control_visible,
         layout_mode_menu_rect, layout_mode_primary_toggle, layout_profile_row_accesskit_value,
         layout_profile_tooltip, matching_this_node_groups, media_header, media_panel,
-        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, paint_car_speedometer,
-        paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
-        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
-        real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
-        music_browse_topic, screenshot, splash, status, surface_needs_remote_sessions_fallback,
-        terminal_panel,
-        this_node_search_is_compact, this_node_system_route, this_node_system_section, vdi, Boot,
-        HomeCycleStage, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
-        VideoTextureCache, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
-        LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
-        LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION,
+        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, music_browse_topic, nav_bar,
+        nav_bar_action_label, paint_car_speedometer, paint_car_status_tile,
+        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
+        publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
+        remote_sessions_fallback_pos, route_file_operation_request, screenshot, splash, status,
+        surface_needs_remote_sessions_fallback, terminal_panel, this_node_search_is_compact,
+        this_node_system_route, this_node_system_section, vdi, Boot, HomeCycleStage,
+        MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
+        WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
+        LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
+        MENU_BAR_MINIMIZE_DURATION,
     };
     use crate::this_node_catalog::{Section, SectionGroup};
     use mde_bus::hooks::config::Priority;
@@ -5704,8 +5813,36 @@ mod tests {
         ] {
             shell.nav.surface = legacy;
             shell.normalize_surface_aliases();
-            assert_eq!(shell.this_node_tab, expected_tab, "{legacy:?} local-node tab");
+            assert_eq!(
+                shell.this_node_tab, expected_tab,
+                "{legacy:?} local-node tab"
+            );
         }
+    }
+
+    #[test]
+    fn weather_launcher_action_opens_existing_maps_weather_mode() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.nav.expanded = false;
+        shell.nav.surface = Surface::Desktop;
+        shell.maps_location.active = mde_maps_location_egui::model::WorkspaceTab::Drive;
+        shell.maps_location.map.weather.active = false;
+
+        shell.apply_nav_bar_action(nav_bar::Action::OpenWeather, &ctx);
+
+        assert!(shell.nav.expanded);
+        assert_eq!(shell.nav.surface, Surface::MapsLocation);
+        assert_eq!(
+            shell.maps_location.active,
+            mde_maps_location_egui::model::WorkspaceTab::Map
+        );
+        assert!(shell.maps_location.map.weather.active);
+        assert_eq!(
+            nav_bar_action_label(&nav_bar::Action::OpenWeather),
+            "open_weather"
+        );
     }
 
     /// PLATFORM-INTERFACES Q31/Q32 — every surface-jump `CarAction` (plus the
@@ -6088,7 +6225,7 @@ mod tests {
                     | Surface::Media
                     | Surface::Files
                     | Surface::Terminal
-                    | Surface::Timers
+        | Surface::Clock
                     | Surface::Communications
                     | Surface::Explorer
                     | Surface::Phones
@@ -6100,8 +6237,8 @@ mod tests {
             );
         }
         assert!(
-            !surface_needs_remote_sessions_fallback(Surface::Timers),
-            "the Timers surface owns a shared menubar and must not double-mount the fallback"
+            !surface_needs_remote_sessions_fallback(Surface::Clock),
+            "the Clock surface owns a shared menubar and must not double-mount the fallback"
         );
         assert!(
             !surface_needs_remote_sessions_fallback(Surface::Media),
@@ -7688,10 +7825,7 @@ mod tests {
 
         let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
         let msgs = persist
-            .list_since(
-                mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC,
-                None,
-            )
+            .list_since(mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC, None)
             .expect("list lifecycle topic");
         assert_eq!(msgs.len(), 1);
         let body: serde_json::Value =

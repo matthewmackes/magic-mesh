@@ -27,136 +27,22 @@ use crate::egui::{ColorImage, Event};
 use crate::input::{map_event, ModifierState, SpiceInputEvent};
 use crate::pixel::{Framebuffer, FramebufferError, SurfaceFormat};
 use mackes_mesh_types::vdi_clipboard::{
-    VdiClipboardStatus, MAX_VDI_CLIPBOARD_TEXT_BYTES,
-    SPICE_CLIPBOARD_UNSUPPORTED_REASON as SHARED_SPICE_CLIPBOARD_UNSUPPORTED_REASON,
+    VdiClipboardChannel, VdiClipboardLaneStatus, VdiClipboardStatus,
 };
-use mde_egui::clipboard::TextClipboard;
 use mde_vdi_core::{DamageLog, FrameDamage};
 use spice_client::DisplaySurface;
 
-/// Why a SPICE text clipboard operation could not be completed.
-///
-/// The pinned `spice-client` does not expose the vdagent clipboard messages, so
-/// an empty read or clear must not be used to imply that a channel exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpiceClipboardError {
-    /// The text exceeds the canonical VDI clipboard byte limit.
-    TooLarge {
-        /// The rejected UTF-8 byte length.
-        bytes: usize,
-        /// The maximum accepted UTF-8 byte length.
-        max_bytes: usize,
-    },
-    /// The SPICE vdagent clipboard path is not present in this backend.
-    Unsupported,
-}
-
-/// Stable operator-facing explanation for the current SPICE clipboard state.
-///
-/// Keep this text aligned with [`spice_clipboard_status`]: callers that cannot
-/// surface the typed error can still explain why copy/paste is unavailable.
-pub const SPICE_CLIPBOARD_UNSUPPORTED_REASON: &str = SHARED_SPICE_CLIPBOARD_UNSUPPORTED_REASON;
-
-impl core::fmt::Display for SpiceClipboardError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::TooLarge { bytes, max_bytes } => write!(
-                f,
-                "SPICE clipboard text is {bytes} bytes; maximum is {max_bytes}"
-            ),
-            Self::Unsupported => f.write_str("SPICE vdagent clipboard is unsupported"),
-        }
-    }
-}
-
-impl std::error::Error for SpiceClipboardError {}
-
-/// Text-clipboard adapter for a SPICE session whose vdagent channel is absent.
-///
-/// This is the native seam future vdagent wiring will replace. Reads return no
-/// text and writes return/record [`SpiceClipboardError::Unsupported`]; no fake
-/// success is exposed to the shared seat clipboard contract.
-#[derive(Debug, Default)]
-pub struct SpiceTextClipboard {
-    last_error: Option<SpiceClipboardError>,
-}
-
-impl SpiceTextClipboard {
-    /// Create an adapter for the currently unsupported vdagent path.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { last_error: None }
-    }
-
-    /// Whether this adapter can currently exchange text with the guest.
-    #[must_use]
-    pub const fn is_supported(&self) -> bool {
-        false
-    }
-
-    /// Return the explicit reason this adapter cannot exchange clipboard text.
-    #[must_use]
-    pub const fn unsupported_reason(&self) -> &'static str {
-        SPICE_CLIPBOARD_UNSUPPORTED_REASON
-    }
-
-    /// Attempt to read guest clipboard text without converting unsupported
-    /// into an empty successful read.
-    pub fn read_text_checked(&mut self) -> Result<Option<String>, SpiceClipboardError> {
-        Err(SpiceClipboardError::Unsupported)
-    }
-
-    /// Validate and attempt to send text through the vdagent clipboard channel.
-    ///
-    /// Validation happens before capability reporting so an oversized native
-    /// value cannot be misclassified as a missing channel or silently dropped.
-    pub fn write_text_checked(&mut self, text: &str) -> Result<(), SpiceClipboardError> {
-        if text.len() > MAX_VDI_CLIPBOARD_TEXT_BYTES {
-            return Err(SpiceClipboardError::TooLarge {
-                bytes: text.len(),
-                max_bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES,
-            });
-        }
-        Err(SpiceClipboardError::Unsupported)
-    }
-
-    /// Attempt to clear guest clipboard text without claiming the clear was
-    /// delivered to the guest.
-    pub fn clear_text_checked(&mut self) -> Result<(), SpiceClipboardError> {
-        Err(SpiceClipboardError::Unsupported)
-    }
-
-    /// Take the error captured by the infallible shared trait callback.
-    pub fn take_error(&mut self) -> Option<SpiceClipboardError> {
-        self.last_error.take()
-    }
-}
-
-impl TextClipboard for SpiceTextClipboard {
-    fn read_text(&mut self) -> Option<String> {
-        // `TextClipboard::read_text` predates the typed VDI capability contract
-        // and uses `None` for both "empty" and "unavailable". Latch the typed
-        // failure so callers using the legacy trait cannot mistake an
-        // unsupported channel for a successful empty clipboard.
-        self.last_error = Some(SpiceClipboardError::Unsupported);
-        None
-    }
-
-    fn write_text(&mut self, text: &str) {
-        if let Err(error) = self.write_text_checked(text) {
-            self.last_error = Some(error);
-        }
-    }
-}
-
-/// Current SPICE text clipboard capability.
-///
-/// The backend wires main/display/inputs for rendering and input, but it does not
-/// yet drive SPICE vdagent clipboard messages. WL-FUNC-016 requires this to be
-/// reported explicitly instead of silently dropping copy/paste requests.
+/// Protocol support implemented by this backend. Live availability remains
+/// conditional on the guest agent advertising clipboard-by-demand.
 #[must_use]
 pub fn spice_clipboard_status() -> VdiClipboardStatus {
-    VdiClipboardStatus::spice_unsupported()
+    let lane = VdiClipboardLaneStatus::Supported {
+        channel: VdiClipboardChannel::SpiceVdagent,
+    };
+    VdiClipboardStatus {
+        host_to_guest: lane.clone(),
+        guest_to_host: lane,
+    }
 }
 
 /// The egui-facing SPICE desktop: a framebuffer the shell renders + an input
@@ -233,12 +119,6 @@ impl SpiceSession {
     #[must_use]
     pub fn clipboard_status(&self) -> VdiClipboardStatus {
         spice_clipboard_status()
-    }
-
-    /// Create the honest shared text-clipboard seam for this session.
-    #[must_use]
-    pub fn text_clipboard(&self) -> SpiceTextClipboard {
-        SpiceTextClipboard::new()
     }
 
     // ── Decode side (fed by the transport or by tests) ──────────────────────
@@ -348,12 +228,11 @@ impl SpiceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpiceClipboardError, SpiceSession, SpiceTextClipboard};
+    use super::SpiceSession;
     use crate::config::SpiceConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2};
     use crate::input::{Scancode, SpiceInputEvent};
-    use mackes_mesh_types::vdi_clipboard::{VdiClipboardLaneStatus, MAX_VDI_CLIPBOARD_TEXT_BYTES};
-    use mde_egui::clipboard::TextClipboard;
+    use mackes_mesh_types::vdi_clipboard::{VdiClipboardChannel, VdiClipboardLaneStatus};
     use spice_client::DisplaySurface;
 
     fn session() -> SpiceSession {
@@ -383,82 +262,17 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_status_reports_explicit_vdagent_unsupported() {
+    fn clipboard_status_reports_protocol_backed_vdagent_lanes() {
         let status = session().clipboard_status();
-        assert!(!status.is_bidirectional());
+        assert!(status.is_bidirectional());
         for lane in [status.host_to_guest, status.guest_to_host] {
-            match lane {
-                VdiClipboardLaneStatus::Unsupported { reason } => {
-                    assert!(reason.contains("vdagent"));
-                    assert!(reason.contains("mde-vdi-spice"));
+            assert_eq!(
+                lane,
+                VdiClipboardLaneStatus::Supported {
+                    channel: VdiClipboardChannel::SpiceVdagent,
                 }
-                other => panic!("expected unsupported SPICE clipboard lane, got {other:?}"),
-            }
+            );
         }
-    }
-
-    #[test]
-    fn text_clipboard_seam_does_not_claim_unsupported_operations_succeeded() {
-        let mut clipboard = SpiceTextClipboard::new();
-        assert!(!clipboard.is_supported());
-        assert!(clipboard.unsupported_reason().contains("not implemented"));
-        assert_eq!(
-            clipboard.read_text_checked(),
-            Err(SpiceClipboardError::Unsupported)
-        );
-        assert!(clipboard.read_text().is_none());
-        assert_eq!(
-            clipboard.take_error(),
-            Some(SpiceClipboardError::Unsupported)
-        );
-        assert_eq!(
-            clipboard.write_text_checked("hello"),
-            Err(SpiceClipboardError::Unsupported)
-        );
-        clipboard.write_text("hello");
-        assert_eq!(
-            clipboard.take_error(),
-            Some(SpiceClipboardError::Unsupported)
-        );
-        assert!(clipboard.read_text().is_none());
-        assert_eq!(
-            clipboard.clear_text_checked(),
-            Err(SpiceClipboardError::Unsupported)
-        );
-    }
-
-    #[test]
-    fn text_clipboard_rejects_oversized_values_before_channel_check() {
-        let mut clipboard = SpiceTextClipboard::new();
-        let text = "x".repeat(MAX_VDI_CLIPBOARD_TEXT_BYTES + 1);
-
-        assert_eq!(
-            clipboard.write_text_checked(&text),
-            Err(SpiceClipboardError::TooLarge {
-                bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES + 1,
-                max_bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES,
-            })
-        );
-
-        clipboard.write_text(&text);
-        assert_eq!(
-            clipboard.take_error(),
-            Some(SpiceClipboardError::TooLarge {
-                bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES + 1,
-                max_bytes: MAX_VDI_CLIPBOARD_TEXT_BYTES,
-            })
-        );
-    }
-
-    #[test]
-    fn text_clipboard_accepts_the_exact_byte_limit_before_reporting_unsupported() {
-        let mut clipboard = SpiceTextClipboard::new();
-        let text = "x".repeat(MAX_VDI_CLIPBOARD_TEXT_BYTES);
-
-        assert_eq!(
-            clipboard.write_text_checked(&text),
-            Err(SpiceClipboardError::Unsupported)
-        );
     }
 
     #[test]

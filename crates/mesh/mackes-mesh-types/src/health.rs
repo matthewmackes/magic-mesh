@@ -32,6 +32,20 @@ pub const MAX_NODE_AVAILABILITY_ID_BYTES: usize = 128;
 pub const MAX_NODE_AVAILABILITY_REASON_BYTES: usize = 256;
 /// Maximum bytes for a connectivity interface identity.
 pub const MAX_NODE_CONNECTIVITY_INTERFACE_BYTES: usize = 64;
+/// Maximum lifetime admitted for one node-health publication.
+pub const MAX_NODE_HEALTH_PUBLICATION_TTL_MS: u64 = 10 * 60 * 1_000;
+/// Maximum conditions retained in either publication lifecycle lane.
+pub const MAX_NODE_HEALTH_CONDITIONS: usize = 256;
+/// Maximum remediations attached to one condition.
+pub const MAX_HEALTH_REMEDIATIONS: usize = 16;
+/// Maximum structured facts attached to one evidence record.
+pub const MAX_HEALTH_EVIDENCE_FACTS: usize = 32;
+/// Maximum aggregate UTF-8 bytes admitted for one evidence record.
+pub const MAX_HEALTH_EVIDENCE_BYTES: usize = 16 * 1_024;
+/// Maximum bytes for health contract identities and routing labels.
+pub const MAX_HEALTH_ID_BYTES: usize = 128;
+/// Maximum bytes for one operator-readable health string.
+pub const MAX_HEALTH_TEXT_BYTES: usize = 1_024;
 
 /// Format elapsed time using the locale-independent health contract.
 ///
@@ -733,6 +747,7 @@ impl GradeLetter {
 
 /// Typed factor breakdown. Values are capability scores, not incident severity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GradeFactors {
     pub cpu: Option<u8>,
     pub memory: Option<u8>,
@@ -744,6 +759,7 @@ pub struct GradeFactors {
 
 /// One node's condition-backed grade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeGrade {
     pub node: String,
     pub grade: GradeLetter,
@@ -839,6 +855,7 @@ pub enum HealthComponent {
 
 /// Evidence is structured and timestamped so the UI never invents detail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthEvidence {
     pub provider: String,
     pub summary: String,
@@ -849,6 +866,7 @@ pub struct HealthEvidence {
 
 /// One actionable condition with stable lifecycle identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCondition {
     pub id: String,
     pub scope: HealthScope,
@@ -886,6 +904,48 @@ impl HealthCondition {
     }
 }
 
+/// Why a node-health publication was rejected at the shared fold boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeHealthValidationError {
+    UnsupportedSchema(u16),
+    InvalidField(&'static str),
+    FieldTooLong(&'static str),
+    TooMany(&'static str),
+    InvalidGeneration,
+    InvalidTimestamp(&'static str),
+    ExpiryTooFar,
+    SecretBearing(&'static str),
+    Contradictory(&'static str),
+    Stale,
+}
+
+impl fmt::Display for NodeHealthValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "unsupported node-health schema {version}")
+            }
+            Self::InvalidField(field) => write!(formatter, "invalid health field {field}"),
+            Self::FieldTooLong(field) => write!(formatter, "health field is too long: {field}"),
+            Self::TooMany(field) => write!(formatter, "too many health records: {field}"),
+            Self::InvalidGeneration => formatter.write_str("invalid node-health generation"),
+            Self::InvalidTimestamp(field) => {
+                write!(formatter, "invalid health timestamp {field}")
+            }
+            Self::ExpiryTooFar => formatter.write_str("node-health expiry exceeds the bound"),
+            Self::SecretBearing(field) => {
+                write!(formatter, "secret-bearing health field rejected: {field}")
+            }
+            Self::Contradictory(detail) => {
+                write!(formatter, "contradictory node-health publication: {detail}")
+            }
+            Self::Stale => formatter.write_str("stale node-health publication"),
+        }
+    }
+}
+
+impl std::error::Error for NodeHealthValidationError {}
+
 /// An exact allowlist: arbitrary units, paths, and commands cannot be encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -906,6 +966,7 @@ pub enum HealthAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthRemediation {
     pub action: HealthAction,
     pub target: HealthScope,
@@ -955,6 +1016,7 @@ pub struct HealthActionResult {
 
 /// Node-owned publication folded by every observer against the live roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeHealthState {
     pub schema_version: u16,
     pub publisher: String,
@@ -967,6 +1029,282 @@ pub struct NodeHealthState {
     pub active_conditions: Vec<HealthCondition>,
     #[serde(default)]
     pub resolved_conditions: Vec<HealthCondition>,
+}
+
+impl NodeHealthState {
+    /// Validate a complete node-owned publication before it enters a roster
+    /// fold. Nested evidence is bounded and credential-shaped content is
+    /// rejected instead of relying on a renderer to redact it later.
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), NodeHealthValidationError> {
+        if self.schema_version != HEALTH_SCHEMA_VERSION {
+            return Err(NodeHealthValidationError::UnsupportedSchema(
+                self.schema_version,
+            ));
+        }
+        validate_health_identifier("publisher", &self.publisher)?;
+        validate_health_identifier("roster_revision", &self.roster_revision)?;
+        if self.generation == 0 {
+            return Err(NodeHealthValidationError::InvalidGeneration);
+        }
+        if self.published_at_ms == 0 || self.published_at_ms > now_ms {
+            return Err(NodeHealthValidationError::InvalidTimestamp(
+                "published_at_ms",
+            ));
+        }
+        if self.valid_until_ms <= self.published_at_ms {
+            return Err(NodeHealthValidationError::InvalidTimestamp(
+                "valid_until_ms",
+            ));
+        }
+        if self.valid_until_ms - self.published_at_ms > MAX_NODE_HEALTH_PUBLICATION_TTL_MS {
+            return Err(NodeHealthValidationError::ExpiryTooFar);
+        }
+        if self.valid_until_ms < now_ms {
+            return Err(NodeHealthValidationError::Stale);
+        }
+        if self.grade.node != self.publisher {
+            return Err(NodeHealthValidationError::Contradictory(
+                "grade node does not match publisher",
+            ));
+        }
+        validate_grade(&self.grade, self.published_at_ms)?;
+        if self.active_conditions.len() > MAX_NODE_HEALTH_CONDITIONS {
+            return Err(NodeHealthValidationError::TooMany("active_conditions"));
+        }
+        if self.resolved_conditions.len() > MAX_NODE_HEALTH_CONDITIONS {
+            return Err(NodeHealthValidationError::TooMany("resolved_conditions"));
+        }
+        for condition in &self.active_conditions {
+            validate_condition(condition, &self.publisher, self.published_at_ms, true)?;
+        }
+        for condition in &self.resolved_conditions {
+            validate_condition(condition, &self.publisher, self.published_at_ms, false)?;
+        }
+        let evaluated = NodeGrade::evaluate(
+            self.publisher.clone(),
+            self.grade.capability_score,
+            self.grade.factors,
+            &self.active_conditions,
+            self.grade.evaluated_at_ms,
+        );
+        if evaluated.grade != self.grade.grade {
+            return Err(NodeHealthValidationError::Contradictory(
+                "grade does not match active conditions",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_grade(
+    grade: &NodeGrade,
+    published_at_ms: u64,
+) -> Result<(), NodeHealthValidationError> {
+    validate_health_identifier("grade.node", &grade.node)?;
+    if grade.capability_score > 100 {
+        return Err(NodeHealthValidationError::InvalidField(
+            "grade.capability_score",
+        ));
+    }
+    if [
+        grade.factors.cpu,
+        grade.factors.memory,
+        grade.factors.disk,
+        grade.factors.system,
+        grade.factors.mesh,
+        grade.factors.devices,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|score| score > 100)
+    {
+        return Err(NodeHealthValidationError::InvalidField("grade.factors"));
+    }
+    if grade.evaluated_at_ms == 0 || grade.evaluated_at_ms > published_at_ms {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "grade.evaluated_at_ms",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_condition(
+    condition: &HealthCondition,
+    publisher: &str,
+    published_at_ms: u64,
+    expected_active: bool,
+) -> Result<(), NodeHealthValidationError> {
+    validate_health_identifier("condition.id", &condition.id)?;
+    validate_health_label("condition.source", &condition.source)?;
+    match &condition.scope {
+        HealthScope::Node { node } if node == publisher => {
+            validate_health_identifier("condition.scope.node", node)?;
+        }
+        HealthScope::Node { .. } => {
+            return Err(NodeHealthValidationError::Contradictory(
+                "condition scope does not match publisher",
+            ));
+        }
+        HealthScope::Mesh => {
+            return Err(NodeHealthValidationError::Contradictory(
+                "node publication carries a mesh-scoped condition",
+            ));
+        }
+    }
+    if condition.is_active() != expected_active {
+        return Err(NodeHealthValidationError::Contradictory(
+            "condition is in the wrong lifecycle lane",
+        ));
+    }
+    if condition.active_since_ms == 0
+        || condition.active_since_ms > condition.last_observed_ms
+        || condition.last_observed_ms > published_at_ms
+    {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "condition.lifecycle",
+        ));
+    }
+    for (field, timestamp) in [
+        ("condition.resolved_at_ms", condition.resolved_at_ms),
+        ("condition.acknowledged_at_ms", condition.acknowledged_at_ms),
+    ] {
+        if timestamp.is_some_and(|timestamp| {
+            timestamp < condition.active_since_ms || timestamp > published_at_ms
+        }) {
+            return Err(NodeHealthValidationError::InvalidTimestamp(field));
+        }
+    }
+    if condition
+        .snoozed_until_ms
+        .is_some_and(|timestamp| timestamp < condition.active_since_ms)
+    {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "condition.snoozed_until_ms",
+        ));
+    }
+    if condition.remediation.len() > MAX_HEALTH_REMEDIATIONS {
+        return Err(NodeHealthValidationError::TooMany("condition.remediation"));
+    }
+    validate_evidence(&condition.evidence, published_at_ms)?;
+    for remediation in &condition.remediation {
+        validate_health_text("remediation.impact", &remediation.impact)?;
+        if let Some(route) = &remediation.workspace_route {
+            validate_health_text("remediation.workspace_route", route)?;
+        }
+        if remediation.target != condition.scope {
+            return Err(NodeHealthValidationError::Contradictory(
+                "remediation target does not match condition scope",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence(
+    evidence: &HealthEvidence,
+    published_at_ms: u64,
+) -> Result<(), NodeHealthValidationError> {
+    validate_health_label("evidence.provider", &evidence.provider)?;
+    validate_health_text("evidence.summary", &evidence.summary)?;
+    if evidence.observed_at_ms == 0 || evidence.observed_at_ms > published_at_ms {
+        return Err(NodeHealthValidationError::InvalidTimestamp(
+            "evidence.observed_at_ms",
+        ));
+    }
+    if evidence.facts.len() > MAX_HEALTH_EVIDENCE_FACTS {
+        return Err(NodeHealthValidationError::TooMany("evidence.facts"));
+    }
+    let mut bytes = evidence.provider.len() + evidence.summary.len();
+    if contains_secret_material(&evidence.summary) {
+        return Err(NodeHealthValidationError::SecretBearing("evidence.summary"));
+    }
+    for (key, value) in &evidence.facts {
+        validate_health_identifier("evidence.facts.key", key)?;
+        validate_health_text("evidence.facts.value", value)?;
+        bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+        if secret_field_name(key) || contains_secret_material(value) {
+            return Err(NodeHealthValidationError::SecretBearing("evidence.facts"));
+        }
+    }
+    if bytes > MAX_HEALTH_EVIDENCE_BYTES {
+        return Err(NodeHealthValidationError::FieldTooLong("evidence"));
+    }
+    Ok(())
+}
+
+fn validate_health_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), NodeHealthValidationError> {
+    if value.len() > MAX_HEALTH_ID_BYTES {
+        return Err(NodeHealthValidationError::FieldTooLong(field));
+    }
+    if value.is_empty()
+        || value.trim() != value
+        || !value.is_ascii()
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+    {
+        return Err(NodeHealthValidationError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_health_label(
+    field: &'static str,
+    value: &str,
+) -> Result<(), NodeHealthValidationError> {
+    if value.len() > MAX_HEALTH_ID_BYTES {
+        return Err(NodeHealthValidationError::FieldTooLong(field));
+    }
+    if value.is_empty()
+        || value.trim() != value
+        || !value.is_ascii()
+        || value.chars().any(char::is_control)
+    {
+        return Err(NodeHealthValidationError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_health_text(field: &'static str, value: &str) -> Result<(), NodeHealthValidationError> {
+    if value.len() > MAX_HEALTH_TEXT_BYTES {
+        return Err(NodeHealthValidationError::FieldTooLong(field));
+    }
+    if value.trim().is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(NodeHealthValidationError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn secret_field_name(value: &str) -> bool {
+    let normalized: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "privatekey",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn contains_secret_material(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("-----begin ")
+        || lower.contains("authorization: bearer ")
+        || lower.contains("password=")
+        || lower.contains("private_key=")
+        || lower.contains("secret=")
+        || lower.contains("token=")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1027,12 +1365,9 @@ pub fn fold_snapshot(
     let roster_revision = roster_revision.into();
     let mut by_publisher: BTreeMap<String, Option<NodeHealthState>> = BTreeMap::new();
     for state in publications {
-        if state.schema_version != HEALTH_SCHEMA_VERSION
+        if state.validate_at(now_ms).is_err()
             || !canonical_nodes.contains(&state.publisher)
-            || state.grade.node != state.publisher
             || state.roster_revision != roster_revision
-            || state.published_at_ms > now_ms
-            || state.valid_until_ms < now_ms
         {
             continue;
         }
@@ -1604,5 +1939,145 @@ mod tests {
         );
         assert_eq!(snapshot.mesh_summary.reachable_lighthouses, 1);
         assert_eq!(snapshot.active_conditions[0].id, "mesh:publisher-freshness");
+    }
+
+    #[test]
+    fn node_health_publication_rejects_schema_skew_and_malformed_timestamps() {
+        let valid = state("node", 1, 100);
+        assert_eq!(valid.validate_at(100), Ok(()));
+
+        let mut future = valid.clone();
+        future.published_at_ms = 101;
+        assert_eq!(
+            future.validate_at(100),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "published_at_ms"
+            ))
+        );
+
+        let mut reversed = valid.clone();
+        reversed.valid_until_ms = reversed.published_at_ms;
+        assert_eq!(
+            reversed.validate_at(100),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "valid_until_ms"
+            ))
+        );
+
+        let mut oversized_ttl = valid.clone();
+        oversized_ttl.valid_until_ms = oversized_ttl
+            .published_at_ms
+            .saturating_add(MAX_NODE_HEALTH_PUBLICATION_TTL_MS + 1);
+        assert_eq!(
+            oversized_ttl.validate_at(100),
+            Err(NodeHealthValidationError::ExpiryTooFar)
+        );
+
+        let mut stale = valid.clone();
+        stale.valid_until_ms = 150;
+        assert_eq!(
+            stale.validate_at(151),
+            Err(NodeHealthValidationError::Stale)
+        );
+
+        let mut skewed = serde_json::to_value(valid).expect("health state serializes");
+        skewed["grade"]["future_factor"] = serde_json::json!(100);
+        assert!(
+            serde_json::from_value::<NodeHealthState>(skewed).is_err(),
+            "unknown nested schema fields fail closed"
+        );
+    }
+
+    #[test]
+    fn node_health_publication_rejects_secrets_oversized_evidence_and_bad_lifecycle() {
+        let mut producer_shape = state("node", 1, 100);
+        let mut producer_condition = condition("node", HealthSeverity::Warning);
+        producer_condition.source = "mesh-status/services".into();
+        producer_condition.evidence.provider = producer_condition.source.clone();
+        producer_shape.active_conditions.push(producer_condition);
+        producer_shape.grade = NodeGrade::evaluate(
+            "node",
+            95,
+            GradeFactors::default(),
+            &producer_shape.active_conditions,
+            100,
+        );
+        assert_eq!(producer_shape.validate_at(100), Ok(()));
+
+        let mut secret = state("node", 1, 100);
+        let mut secret_condition = condition("node", HealthSeverity::Warning);
+        secret_condition
+            .evidence
+            .facts
+            .insert("api_token".into(), "not-for-health".into());
+        secret.active_conditions.push(secret_condition);
+        assert_eq!(
+            secret.validate_at(100),
+            Err(NodeHealthValidationError::SecretBearing("evidence.facts"))
+        );
+
+        let mut pem = state("node", 1, 100);
+        let mut pem_condition = condition("node", HealthSeverity::Warning);
+        pem_condition.evidence.summary =
+            "-----BEGIN PRIVATE KEY----- redacted-looking-but-still-forbidden".into();
+        pem.active_conditions.push(pem_condition);
+        assert_eq!(
+            pem.validate_at(100),
+            Err(NodeHealthValidationError::SecretBearing("evidence.summary"))
+        );
+
+        let mut oversized = state("node", 1, 100);
+        let mut oversized_condition = condition("node", HealthSeverity::Warning);
+        oversized_condition.evidence.summary = "x".repeat(MAX_HEALTH_TEXT_BYTES + 1);
+        oversized.active_conditions.push(oversized_condition);
+        assert_eq!(
+            oversized.validate_at(100),
+            Err(NodeHealthValidationError::FieldTooLong("evidence.summary"))
+        );
+
+        let mut malformed = state("node", 1, 100);
+        let mut malformed_condition = condition("node", HealthSeverity::Warning);
+        malformed_condition.last_observed_ms = 101;
+        malformed.active_conditions.push(malformed_condition);
+        assert_eq!(
+            malformed.validate_at(100),
+            Err(NodeHealthValidationError::InvalidTimestamp(
+                "condition.lifecycle"
+            ))
+        );
+
+        let mut wrong_lane = state("node", 1, 100);
+        wrong_lane
+            .resolved_conditions
+            .push(condition("node", HealthSeverity::Warning));
+        assert_eq!(
+            wrong_lane.validate_at(100),
+            Err(NodeHealthValidationError::Contradictory(
+                "condition is in the wrong lifecycle lane"
+            ))
+        );
+    }
+
+    #[test]
+    fn fold_rejects_contradictory_or_secret_bearing_publications() {
+        let roster = BTreeSet::from(["node".to_string()]);
+        let mut secret = state("node", 1, 100);
+        let mut secret_condition = condition("node", HealthSeverity::Warning);
+        secret_condition.evidence.facts.insert(
+            "safe_name".into(),
+            "authorization: bearer should-not-cross-health".into(),
+        );
+        secret.active_conditions.push(secret_condition);
+
+        let snapshot = fold_snapshot("node", "r1", &roster, vec![secret], 2, 100, 100, 0);
+        assert_eq!(snapshot.mesh_summary.fresh_nodes, 0);
+        assert_eq!(snapshot.active_conditions[0].id, "mesh:publisher-freshness");
+
+        let mut contradictory_grade = state("node", 2, 100);
+        contradictory_grade.grade.grade = GradeLetter::F;
+        assert!(matches!(
+            contradictory_grade.validate_at(100),
+            Err(NodeHealthValidationError::Contradictory(_))
+        ));
     }
 }

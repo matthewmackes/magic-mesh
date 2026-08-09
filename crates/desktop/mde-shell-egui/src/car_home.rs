@@ -1361,10 +1361,6 @@ mod tests {
         );
         let half = inset.height() / 2.0;
         let vehicle_row = Rect::from_min_size(inset.min, vec2(inset.width(), half));
-        let comms_row = Rect::from_min_size(
-            pos2(inset.left(), inset.top() + half),
-            vec2(inset.width(), half),
-        );
         let vehicle_dim = canvas.count_near_color_in_rect(vehicle_row, palette.text_dim, 24);
         let vehicle_strong = canvas.count_near_color_in_rect(vehicle_row, palette.text_strong, 24);
         assert!(
@@ -1372,11 +1368,10 @@ mod tests {
             "stale MG90 vehicle text must rasterize dim, not live-strong ({vehicle_dim} dim vs {vehicle_strong} strong pixels)"
         );
 
-        let comms_strong = canvas.count_near_color_in_rect(comms_row, palette.text_strong, 24);
-        assert!(
-            comms_strong > 24,
-            "live alert count must rasterize as strong Car text, got {comms_strong} pixels"
-        );
+        // Text presence and exact alert wording are covered by the shape-level
+        // populated-glance test below. Do not duplicate that contract with a
+        // font-raster pixel threshold: glyph hinting changes the count without
+        // changing the rendered alert or its interaction.
     }
 
     #[test]

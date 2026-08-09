@@ -58,7 +58,9 @@ not automatically lifecycle authorities. Each is classified by effect:
   is atomically journaled as `Pending` before the actuator, then `Applied`
   before cleanup; restart recovery replays only pending idempotent commands.
 
-The command boundary is now fail-closed, bounded, duplicate-key-safe, and
-restart-recoverable. The distributed protocol's source/target cursors and
-pending commit/rollback fold are still memory-backed, so full crash recovery
-and broader live adapter/attachment proof remain ARCH-010 work.
+The command boundary and distributed protocol are now fail-closed, bounded,
+duplicate-key-safe, and restart-recoverable. `compute_migrate` atomically owns
+its four Bus cursors, admitted source/target/acknowledgement jobs, retained
+definition, publish state, wall-clock deadline, and relinquish/rollback retry
+phase before each external effect. Broader live libvirt crash injection and
+adapter/attachment proof remain ARCH-010 work.

@@ -23,9 +23,9 @@ use mackes_mesh_types::android_apps::{
     AndroidGuestInventoryRequest, AndroidGuestInventoryResponse,
 };
 use mackes_mesh_types::cloud::{
-    CloudReply, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE, VERB_ANDROID_PROVISION,
-    VERB_APP_PROVISION, VERB_BROWSER_PROVISION, VERB_CONTAINER_DEPLOY, VERB_IMAGE_BUILD,
-    VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
+    CloudReply, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE, VERB_ANDROID_LIFECYCLE,
+    VERB_ANDROID_PROVISION, VERB_APP_PROVISION, VERB_BROWSER_PROVISION, VERB_CONTAINER_DEPLOY,
+    VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
 };
 
 use super::runner::{default_browser_vm_image_source, CloudRunOutcome};
@@ -41,6 +41,7 @@ mod container;
 mod image;
 // Disjoint per-verb handler modules (one unit each owns its file).
 mod android; // U9 · android-provision
+mod android_lifecycle; // WL-FUNC-020 S3 · typed Android VM/app lifecycle
 mod app; // WL-FUNC-018 · app-provision
 mod browser; // WL-ARCH-008 · browser-provision
 mod inventory; // U10 · inventory + output
@@ -115,6 +116,8 @@ pub(crate) enum CloudVerb {
     ContainerDeploy,
     /// `android-provision` — the two-layer Cuttlefish path (MUTATION; skeleton, U10).
     AndroidProvision,
+    /// `android-lifecycle` — start/stop/cancel/retry one admitted Android workload.
+    AndroidLifecycle,
     /// `browser-provision` — declare the dedicated Desktop VM browser workload.
     BrowserProvision,
     /// `app-provision` — declare one admitted guest-owned Flatpak App VM.
@@ -139,6 +142,7 @@ impl CloudVerb {
             v if v == VERB_IMAGE_BUILD => Self::ImageBuild,
             v if v == VERB_CONTAINER_DEPLOY => Self::ContainerDeploy,
             v if v == VERB_ANDROID_PROVISION => Self::AndroidProvision,
+            v if v == VERB_ANDROID_LIFECYCLE => Self::AndroidLifecycle,
             v if v == VERB_BROWSER_PROVISION => Self::BrowserProvision,
             v if v == VERB_APP_PROVISION => Self::AppProvision,
             _ => return None,
@@ -160,6 +164,7 @@ impl CloudVerb {
                 | Self::ImageBuild
                 | Self::ContainerDeploy
                 | Self::AndroidProvision
+                | Self::AndroidLifecycle
                 | Self::BrowserProvision
                 | Self::AppProvision
         )
@@ -369,6 +374,23 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
                 return reply;
             }
             android::handle(w, verb_name, &body)
+        }
+        CloudVerb::AndroidLifecycle => {
+            let target = match android_lifecycle::authorization_target(raw) {
+                Ok(target) => target,
+                Err(error) => {
+                    return CloudReply {
+                        ok: false,
+                        verb: verb_name.to_string(),
+                        error: Some(error),
+                        ..Default::default()
+                    };
+                }
+            };
+            if let Some(reply) = authorization_refusal(w, verb_name, &body, &target, raw) {
+                return reply;
+            }
+            android_lifecycle::handle(w, verb_name, raw)
         }
         CloudVerb::BrowserProvision => {
             let target = match browser::authorization_target(&body) {

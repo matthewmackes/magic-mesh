@@ -39,12 +39,15 @@ use mde_egui::{paint_carbon, Elevation, Motion, Severity, Style, TypographyRole}
 
 use crate::construct::{ChromeIntent, ConstructChrome};
 use crate::status::StatusSegments;
-use crate::timers::{hhmm, now_unix};
+use crate::timers::{
+    hhmm, now_unix, request_clock_banner_action, ClockBannerAction, ClockBannerKind,
+    ClockBannerProjection,
+};
 use crate::toast_bridge::ToastBridge;
 
-/// Honest cap on the retained ring — the Center never pretends to a deeper
-/// history than this shell process actually observed (~the last 50 alerts).
-pub(crate) const RING_CAP: usize = 50;
+/// Honest cap on the retained ring. Keeping more than 99 entries makes the
+/// bell's `99+` state reachable while preserving a strict process-memory cap.
+pub(crate) const RING_CAP: usize = 128;
 
 /// The panel's widest reading; narrower screens inset by [`Style::SP_L`].
 const PANEL_MAX_W: f32 = 560.0;
@@ -74,6 +77,17 @@ pub(crate) struct NotificationEntry {
     pub(crate) headline: String,
     /// Wall-clock arrival (Unix seconds) — the row's `HH:MM` stamp.
     pub(crate) at_unix: i64,
+    /// Fixed daemon-derived Clock actions, retained with their bounded identity.
+    /// `actionable` is cleared as soon as the live projection no longer proves
+    /// the same occurrence and schedule generations.
+    pub(crate) clock_actions: Option<RetainedClockActions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetainedClockActions {
+    pub(crate) identity: String,
+    pub(crate) actions: [ClockBannerAction; 2],
+    pub(crate) actionable: bool,
 }
 
 /// The Notification Center's bounded in-memory history (module doc: the shell
@@ -112,9 +126,54 @@ impl NotificationRing {
             flag: flag.to_owned(),
             headline: headline.to_owned(),
             at_unix,
+            clock_actions: None,
         });
         while self.entries.len() > RING_CAP {
             self.entries.pop_front();
+        }
+    }
+
+    /// Record one actionable Clock row exactly once for an occurrence/schedule
+    /// generation.  Clearing history does not acknowledge the daemon event.
+    pub(crate) fn record_clock(&mut self, banner: &ClockBannerProjection, at_unix: i64) {
+        self.entries.push_back(NotificationEntry {
+            severity: match banner.actions[0].kind {
+                ClockBannerKind::Alarm => Severity::Critical,
+                ClockBannerKind::Timer => Severity::Warning,
+            },
+            source_host: String::new(),
+            flag: "CLOCK".to_owned(),
+            headline: banner.headline.clone(),
+            at_unix,
+            clock_actions: Some(RetainedClockActions {
+                identity: banner.identity.clone(),
+                actions: banner.actions.clone(),
+                actionable: true,
+            }),
+        });
+        while self.entries.len() > RING_CAP {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Refresh only actionability.  Display rows and action identity remain
+    /// retained until the existing per-group/clear-all semantics remove them.
+    pub(crate) fn refresh_clock_actionability(
+        &mut self,
+        live: &[ClockBannerProjection],
+        now_ms: i64,
+    ) {
+        for entry in &mut self.entries {
+            let Some(retained) = &mut entry.clock_actions else {
+                continue;
+            };
+            retained.actionable = live.iter().any(|banner| {
+                banner.identity == retained.identity
+                    && retained
+                        .actions
+                        .iter()
+                        .all(|action| now_ms <= action.valid_until_utc_ms)
+            });
         }
     }
 
@@ -227,6 +286,13 @@ pub(crate) fn mount(
     if construct.take_intent(ChromeIntent::NotificationCenter) {
         construct.notification_center_open = !construct.notification_center_open;
     }
+    // Opening exposes every retained row, so the bell watermark is cleared.
+    // Keep this idempotent while open: an alert arriving into the visible
+    // panel is already visible and therefore never becomes unread chrome.
+    if construct.notification_center_open {
+        toasts.mark_visible_read(ctx);
+    }
+    crate::toast_bridge::set_notification_center_visible(ctx, construct.notification_center_open);
     // Paint-safety gate: laying text out needs fonts, and a Context grows them
     // only once its first `run` pass begins — the U09 contract tests drive the
     // mount slots headlessly without ever running a frame. Nothing is lost:
@@ -348,7 +414,13 @@ fn panel_contents(ui: &mut egui::Ui, toasts: &mut ToastBridge, panel_h: f32) {
                     } else {
                         format!("{} · {}", entry.source_host, hhmm(entry.at_unix))
                     };
-                    row(ui, entry.severity, &entry.headline, &footnote);
+                    row(
+                        ui,
+                        entry.severity,
+                        &entry.headline,
+                        &footnote,
+                        entry.clock_actions.as_ref(),
+                    );
                 }
                 ui.add_space(Style::SP_S);
             }
@@ -383,7 +455,13 @@ fn group_header(ui: &mut egui::Ui, topic: &str, clearable: bool) -> bool {
 
 /// One notification row: the Carbon severity glyph, a `TYPE_BODY` title, and a
 /// `TYPE_FOOTNOTE` `source · HH:MM` line.
-fn row(ui: &mut egui::Ui, severity: Severity, title: &str, footnote: &str) {
+fn row(
+    ui: &mut egui::Ui,
+    severity: Severity,
+    title: &str,
+    footnote: &str,
+    clock_actions: Option<&RetainedClockActions>,
+) {
     // Alert text is external input. Reserve the glyph and its gap before
     // laying out the labels so a long headline cannot expand the modal past
     // its fixed panel width and move controls outside the hit target.
@@ -414,6 +492,23 @@ fn row(ui: &mut egui::Ui, severity: Severity, title: &str, footnote: &str) {
                 )
                 .wrap(),
             );
+            if let Some(actions) = clock_actions {
+                if actions.actionable {
+                    ui.horizontal(|ui| {
+                        for action in &actions.actions {
+                            if ui.button(action.label).clicked() {
+                                request_clock_banner_action(ui.ctx(), action.clone());
+                            }
+                        }
+                    });
+                } else {
+                    ui.label(
+                        RichText::new("Actions no longer available")
+                            .font(Style::typography_font(TypographyRole::Label))
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+            }
         });
     });
     ui.add_space(Style::SP_XS);
@@ -474,6 +569,28 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         ctx
+    }
+
+    fn clock_banner(valid_until_utc_ms: i64) -> ClockBannerProjection {
+        let action = |label, verb| ClockBannerAction {
+            label,
+            verb,
+            kind: ClockBannerKind::Alarm,
+            occurrence_id: "occurrence-1".into(),
+            occurrence_revision: 2,
+            schedule_id: "alarm-1".into(),
+            schedule_revision: 3,
+            admitted_snapshot_revision: 4,
+            valid_until_utc_ms,
+        };
+        ClockBannerProjection {
+            headline: "Alarm · Wake up".into(),
+            identity: "occurrence-1:2:alarm-1:3".into(),
+            actions: [
+                action("Snooze", crate::timers::ClockBannerVerb::Snooze),
+                action("Stop", crate::timers::ClockBannerVerb::Stop),
+            ],
+        }
     }
 
     /// Whether any painted shape carries text containing `needle`.
@@ -571,6 +688,28 @@ mod tests {
             format!("n{}", RING_CAP + 9),
             "the newest survived"
         );
+    }
+
+    #[test]
+    fn retained_clock_actions_keep_identity_and_fail_closed_when_stale() {
+        let banner = clock_banner(10_000);
+        let mut ring = NotificationRing::default();
+        ring.record_clock(&banner, 1);
+        ring.refresh_clock_actionability(std::slice::from_ref(&banner), 9_999);
+        let retained = ring.entries[0]
+            .clock_actions
+            .as_ref()
+            .expect("Clock metadata retained");
+        assert!(retained.actionable);
+        assert_eq!(retained.identity, banner.identity);
+
+        ring.refresh_clock_actionability(&[], 10_000);
+        let retained = ring.entries[0]
+            .clock_actions
+            .as_ref()
+            .expect("stale metadata remains visible");
+        assert!(!retained.actionable);
+        assert_eq!(retained.actions[0].label, "Snooze");
     }
 
     #[test]

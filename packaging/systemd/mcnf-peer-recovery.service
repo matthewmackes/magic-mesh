@@ -1,0 +1,32 @@
+[Unit]
+Description=MCNF peer recovery after resume or network return
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=network.target
+ConditionPathExists=/var/lib/mde/role.toml
+OnFailure=mesh-alert@%n.service
+StartLimitIntervalSec=120
+StartLimitBurst=6
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/libexec/mackesd/mesh-peer-recovery
+TimeoutStartSec=90
+RuntimeMaxSec=90
+TimeoutStopSec=10
+RuntimeDirectory=mcnf-peer-recovery
+RuntimeDirectoryMode=0700
+Environment=MCNF_RECOVERY_LOCK=/run/mcnf-peer-recovery/recovery.lock
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+# Filesystem mutation is delegated to the separately bounded XDG recovery unit,
+# which must run in PID 1's mount namespace. Keep this orchestrator blind to
+# every home directory.
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

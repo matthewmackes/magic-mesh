@@ -12,11 +12,12 @@
 # plan is 0-add / 0-change / 0-destroy against live state (the moved blocks are
 # CONSUMED, no destroy is proposed). NEVER remove them without a `tofu state mv`.
 #
-# Why THREE `for_each` resources (build_xhs / build_kvm / build_big) and not one
-# `xenserver_vm.build`: the farm spans 3 standalone XCP-ng pools, so each VM needs
-# a different aliased `xenserver` provider (xhs / kvm / big). OpenTofu does NOT
+# Why separate `for_each` resources per pool and not one
+# `xenserver_vm.build`: the farm spans 5 standalone XCP-ng pools, so each VM needs
+# a different aliased `xenserver` provider (xhs / kvm / big / x194 / x196).
+# OpenTofu does NOT
 # allow the `provider` meta-argument to vary per `for_each` instance (it must be a
-# static reference), so a single `for_each` resource cannot span the 3 pools. The
+# static reference), so a single `for_each` resource cannot span the 5 pools. The
 # canonical pattern is one `for_each` resource PER provider alias, each iterating
 # the subset of build_vm_specs whose dom0 is on that pool. This also lines up with
 # DAR-32's rendered-provider-alias plan (one resource block per registry dom0).
@@ -69,7 +70,21 @@ locals {
       big_vcpus      = 3 # ~whole 4-core host, 1 core for dom0
       big_mem_gib    = 11
     }
+    "xen-196" = {
+      provider_alias = "x196"
+      network_uuid   = "f3d37714-a267-d78d-3767-5bfcc71f47ca"
+      ip_base        = "172.20.0.196" # fixed adopted node; not autoscaled
+      big_name       = "mcnf-build-xen-196"
+      small_name     = "mcnf-build-xen-196"
+      big_vcpus      = 4
+      big_mem_gib    = 7
+    }
   }
+
+  # XEN-196 carries control/test guests and has no local golden template. Keep
+  # its proven build VM adopt-only; the elastic reconciler must not clone or
+  # resize capacity on this pool until a dedicated golden exists.
+  elastic_dom0 = { for k, v in local.dom0 : k => v if k != "xen-196" }
 
   # Split each dom0's ip_base into the first-3-octets prefix + the last octet, so
   # `small` VMs can step the last octet (+10 each) for distinct LAN IPs.
@@ -119,6 +134,18 @@ locals {
       vcpus    = 4
       mem_gib  = 11
     }
+    # XEN-196 (added 2026-08-08): provisioned from the checksum-verified Fedora
+    # 42 cloud image with setup-xcp-build-vm.sh. The conservative 7 GiB / one-job
+    # cap preserves headroom for mcnf-control, testvm-lin, and testvm-win.
+    # Adopt with:
+    #   tofu import 'xenserver_vm.build_x196["xen-196-0"]' 7bd7d24d-8aa4-30c5-b454-c56f2c1f3ab8
+    "xen-196-0" = {
+      dom0_key = "xen-196"
+      name     = "mcnf-build-xen-196"
+      ip_cidr  = "172.20.0.196/16"
+      vcpus    = 4
+      mem_gib  = 7
+    }
     # F44 BUILDER (added 2026-07-12): the physical seats are Fedora 44 but the
     # golden (and every other build VM) is Fedora 42, so an RPM built elsewhere
     # links ffmpeg-7 sonames that do not exist on F44 (see
@@ -148,7 +175,7 @@ locals {
   # Keyed `<dom0>` (big) or `<dom0>-<n>` (small) so the for_each instances stay
   # stable as the count grows/shrinks.
   shape_build_vms = merge([
-    for dk, d in local.dom0 : (
+    for dk, d in local.elastic_dom0 : (
       lookup(var.shape, dk, "off") == "big" ? {
         (dk) = {
           dom0_key = dk
@@ -196,6 +223,7 @@ locals {
   build_vms_kvm  = { for k, v in local.active_build_vms : k => v if v.dom0_key == "kvm-xcp1" }
   build_vms_big  = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-bigboy" }
   build_vms_x194 = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-194" }
+  build_vms_x196 = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-196" }
 }
 
 # --- One for_each resource per pool/provider-alias --------------------------
@@ -254,6 +282,20 @@ resource "xenserver_vm" "build_x194" {
   vcpus             = each.value.vcpus
   check_ip_timeout  = 0
   network_interface = [{ device = "0", network_uuid = local.dom0["xen-194"].network_uuid }]
+  lifecycle {
+    ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]
+  }
+}
+
+resource "xenserver_vm" "build_x196" {
+  for_each          = local.build_vms_x196
+  provider          = xenserver.x196 # XEN-196
+  name_label        = each.value.name
+  template_name     = "Other install media" # cloud-image import; no golden on this pool
+  static_mem_max    = each.value.mem_gib * 1073741824
+  vcpus             = each.value.vcpus
+  check_ip_timeout  = 0
+  network_interface = [{ device = "0", network_uuid = local.dom0["xen-196"].network_uuid }]
   lifecycle {
     ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]
   }

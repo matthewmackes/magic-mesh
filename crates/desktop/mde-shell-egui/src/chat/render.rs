@@ -68,7 +68,10 @@ pub(super) fn fmt_hh_mm(ts_unix_ms: i64) -> String {
         return String::new();
     }
     let unix_secs = ts_unix_ms / 1000;
-    let secs = unix_secs.saturating_add(crate::timers::display_offset_seconds_at(unix_secs));
+    let Ok(offset) = crate::timers::display_offset_seconds_at(unix_secs) else {
+        return "Unavailable".to_owned();
+    };
+    let secs = unix_secs.saturating_add(offset);
     let tod = secs.rem_euclid(86_400);
     format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60)
 }
@@ -79,7 +82,10 @@ pub(super) fn fmt_full_datetime(ts_unix_ms: i64) -> String {
         return "unknown time".to_string();
     }
     let unix_secs = ts_unix_ms / 1000;
-    let secs = unix_secs.saturating_add(crate::timers::display_offset_seconds_at(unix_secs));
+    let Ok(offset) = crate::timers::display_offset_seconds_at(unix_secs) else {
+        return "time zone unavailable".to_owned();
+    };
+    let secs = unix_secs.saturating_add(offset);
     let tod = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     format!(
@@ -96,7 +102,10 @@ pub(super) fn fmt_date(ts_unix_ms: i64) -> String {
         return "unknown date".to_string();
     }
     let unix_secs = ts_unix_ms / 1000;
-    let secs = unix_secs.saturating_add(crate::timers::display_offset_seconds_at(unix_secs));
+    let Ok(offset) = crate::timers::display_offset_seconds_at(unix_secs) else {
+        return "unknown date".to_owned();
+    };
+    let secs = unix_secs.saturating_add(offset);
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     format!("{year:04}-{month:02}-{day:02}")
 }

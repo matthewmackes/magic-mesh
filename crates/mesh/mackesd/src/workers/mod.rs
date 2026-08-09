@@ -127,6 +127,10 @@ pub use mde_worker_core::{ShutdownToken, Worker};
 // v2.0.0 Phase B workers reparented under workers/. Each is a thin
 // adapter over an existing sync implementation today; they grow real
 // bodies as Phase B fills in.
+/// WL-FUNC-020 S1 — signed Android catalog import and admitted-state authority.
+pub mod android_catalog;
+/// WL-FUNC-018 S2 — signed Flatpak catalog admission and installed-app projection.
+pub mod app_catalog;
 pub mod ansible_pull;
 // EPIC-SYNC-APP-CONFIG (Q26) — native-Rust app-config sync
 // (Sublime Music / Delfin). Replaces the retired `media_sync`
@@ -169,6 +173,10 @@ pub mod reconcile;
 // heartbeat file (peer hasn't enrolled yet) and the local peer
 // (heartbeat-self is unreachable by definition).
 pub mod health_reconciler;
+/// WL-FUNC-022 S2 — daemon-owned local Clock persistence and deadline authority.
+pub mod clock;
+/// WL-FUNC-017 S6 — bounded daemon-owned route/navigation authority.
+pub mod navigation;
 /// WL-UX-013 — bounded daemon-side admission for node availability intent.
 pub mod node_availability;
 /// WL-ARCH-009 — bounded, credential-free worker runtime status projection.
@@ -354,6 +362,17 @@ pub mod cloud;
 // genuine no-op on the nodes with no gateway configured (`MDE_VEHICLE_GATEWAY`
 // unset). Mirrors `cloud`'s injectable-transport + bus-mirror lifecycle.
 pub mod vehicle;
+// WL-FUNC-017 S2 — the single per-node authority for weather/map location.
+// It persists Auto/Manual preference plus the effective generation, admits the
+// typed set-location verb, resolves fresh same-host vehicle GNSS, and clears
+// projections whenever their location generation changes.
+pub mod weather_location;
+// WL-FUNC-017 S3 — NWS current conditions plus bounded 120-hour / five-local-day
+// forecast projections, bound to the exact S2 effective-location generation.
+pub mod weather_forecast;
+// WL-FUNC-017 S4 — official NOAA nowCOAST atmospheric Web-Mercator fields,
+// generation-bound to the daemon-owned effective-location viewport.
+pub mod weather_atmosphere;
 // WL-FUNC-012 / OVERLAY-10 — default-on workstation-side, keyless USGS
 // earthquake adapter. Polls the all-hour GeoJSON feed over rustls and publishes
 // normalized latest-wins `state/overlay/usgs-earthquakes/<node>` snapshots;
@@ -1193,7 +1212,14 @@ impl Supervisor {
     pub fn accepts_worker(&self, name: &str) -> bool {
         match self.worker_group {
             None => true,
+            // A small set of long-lived Worker implementations expose a
+            // kebab-case diagnostic name while their canonical registry entry
+            // predates that spelling and uses snake_case. Preserve exact
+            // canonical names such as `link-traffic`; only try the underscore
+            // alias when exact lookup is absent. Unknown names still fail
+            // closed.
             Some(group) => crate::worker_role::spec(name)
+                .or_else(|| crate::worker_role::spec(&name.replace('-', "_")))
                 .map(|spec| spec.group == group)
                 .unwrap_or_else(|| {
                     panic!(
@@ -1800,6 +1826,11 @@ mod tests {
             .name;
         assert!(supervisor.accepts_worker(control));
         assert!(!supervisor.accepts_worker(other));
+        assert!(supervisor.accepts_worker("mesh-router"));
+        assert!(!supervisor.accepts_worker("link-traffic"));
+        let mut observation = Supervisor::new();
+        observation.set_worker_group(crate::worker_role::WorkerGroup::Observation);
+        assert!(observation.accepts_worker("link-traffic"));
     }
 
     // ── mackesd-05: half-open recovery — behavioral (paused-time) ───

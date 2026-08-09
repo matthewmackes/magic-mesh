@@ -1,0 +1,19 @@
+[Unit]
+Description=Restore package-governed communal Workstation XDG bind mounts
+ConditionPathExists=/var/lib/mde/role.toml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/mackesd/mesh-xdg-bind-recovery
+TimeoutStartSec=60
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# Do not add ProtectSystem, ProtectHome, PrivateTmp, or path namespace options.
+# The helper asks PID 1 to create transient mount units and must observe those
+# host-namespace mounts before it reports success. Its own fail-closed path and
+# exact source/target checks bound the writable surface.

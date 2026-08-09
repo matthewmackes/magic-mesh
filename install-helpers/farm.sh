@@ -14,12 +14,13 @@
 # Architecture + the recovery playbook: docs/farm.md.
 #
 # Fleet (override via env or ~/.config/mcnf-farm.conf — `dom0_ip|label|buildvm_ip`):
-# Canonical dom0/build-VM roster (4 dom0s / 9 heavy slots): install-helpers/farm-topology.sh.
+# Canonical dom0/build-VM roster (5 dom0s / 10 heavy slots): install-helpers/farm-topology.sh.
 #   172.20.145.192  the dev/orchestration host (this box; orchestration only)
 #   172.20.0.9      XEN-HOME-SERVICES  → build VM 172.20.0.50
 #   172.20.145.193  KVM-XCP1           → build VM 172.20.0.90
 #   172.20.145.165  XEN-BIGBOY         → build VM 172.20.0.130
 #   172.20.145.194  XEN-194 (4th dom0) → build VM 172.20.0.170
+#   172.20.145.196  XEN-196            → build VM 172.20.0.196
 #
 # Usage:
 #   farm.sh status                  fleet state (dom0 reachable · VMs · build VM up + toolchained)

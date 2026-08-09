@@ -5,7 +5,7 @@
 //! state. This type is that shared status surface: it is serializable for retained
 //! Bus records and also cheap for the RDP/SPICE session crates to expose directly.
 
-use serde::{Deserialize, Serialize, de};
+use serde::{de, Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
@@ -1215,6 +1215,369 @@ pub const CLIPBOARD_MATERIALIZATION_TOPIC: &str = "state/clipboard/materialize";
 /// handoff is ignored rather than pasted after a shell restart.
 pub const CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS: i64 = 60;
 
+/// Schema version for the bounded VDI guest clipboard transport.
+pub const VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION: u16 = 2;
+/// Maximum encoded transport body admitted before JSON decoding.
+pub const MAX_VDI_CLIPBOARD_TRANSPORT_V2_JSON_BYTES: usize =
+    MAX_CLIPBOARD_ENVELOPE_V2_JSON_BYTES + 16 * 1024;
+/// Maximum lifetime of one VDI clipboard lease. Long-running sessions rotate
+/// leases; they never turn one attachment token into an unbounded capability.
+pub const MAX_VDI_CLIPBOARD_LEASE_TTL_MS: u64 = 5 * 60 * 1_000;
+/// Typed host-to-guest command lane. Append the validated session identity with
+/// [`vdi_clipboard_session_topic`].
+pub const VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX: &str = "state/clipboard/vdi-v2/host-to-guest";
+/// Typed guest-to-host event lane. Append the validated session identity with
+/// [`vdi_clipboard_session_topic`].
+pub const VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX: &str = "event/clipboard/vdi-v2/guest-to-host";
+/// Payload-free acknowledgement lane used to suppress reconnect replay.
+pub const VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX: &str = "state/clipboard/vdi-v2/receipt";
+/// Current short-lived capability advertised by a live VDI adapter.
+pub const VDI_CLIPBOARD_LEASE_TOPIC_PREFIX: &str = "state/clipboard/vdi-v2/lease";
+
+/// Source policy classification carried across the VDI boundary. A secret is
+/// representable for a typed refusal but can never be materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VdiClipboardDisclosureV2 {
+    /// The source policy permits this content to cross the guest boundary.
+    Shareable,
+    /// The source classified the content as secret-bearing.
+    Secret,
+}
+
+/// A short-lived, payload-free capability for one live guest attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VdiClipboardLeaseV2 {
+    /// Closed schema discriminator.
+    pub schema_version: u16,
+    /// Exact broker/session identity.
+    pub session_id: String,
+    /// Monotonic live-attachment generation.
+    pub generation: u64,
+    /// One lease identity within the attachment generation.
+    pub lease_id: String,
+    /// Lease issuance in Unix epoch milliseconds.
+    pub issued_at_ms: u64,
+    /// Exclusive lease expiry in Unix epoch milliseconds.
+    pub expires_at_ms: u64,
+    /// Ordered MIME types this concrete protocol adapter can really consume.
+    pub permitted_mime_offers: Vec<String>,
+}
+
+impl VdiClipboardLeaseV2 {
+    /// Validate identity, time bounds, and the finite protocol offer set.
+    pub fn validate_at(&self, now_ms: u64) -> Result<(), VdiClipboardTransportV2Error> {
+        if self.schema_version != VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION {
+            return Err(VdiClipboardTransportV2Error::UnsupportedSchema);
+        }
+        validate_clipboard_identity("session_id", &self.session_id)
+            .map_err(|_| VdiClipboardTransportV2Error::InvalidIdentity)?;
+        validate_clipboard_identity("lease_id", &self.lease_id)
+            .map_err(|_| VdiClipboardTransportV2Error::InvalidIdentity)?;
+        if self.generation == 0 || self.issued_at_ms == 0 {
+            return Err(VdiClipboardTransportV2Error::InvalidIdentity);
+        }
+        if self.expires_at_ms <= self.issued_at_ms
+            || self.expires_at_ms - self.issued_at_ms > MAX_VDI_CLIPBOARD_LEASE_TTL_MS
+        {
+            return Err(VdiClipboardTransportV2Error::InvalidLease);
+        }
+        if now_ms < self.issued_at_ms || now_ms >= self.expires_at_ms {
+            return Err(VdiClipboardTransportV2Error::ExpiredLease);
+        }
+        if self.permitted_mime_offers.is_empty()
+            || self.permitted_mime_offers.len() > MAX_CLIPBOARD_ENVELOPE_V2_MIME_OFFERS
+        {
+            return Err(VdiClipboardTransportV2Error::UnsupportedMime);
+        }
+        let mut seen = BTreeSet::new();
+        for offer in &self.permitted_mime_offers {
+            if !valid_clipboard_mime_offer(offer)
+                || !seen.insert(offer.to_ascii_lowercase())
+                || secret_bearing_mime(offer)
+            {
+                return Err(VdiClipboardTransportV2Error::UnsupportedMime);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this exact live lease truthfully permits `mime`.
+    #[must_use]
+    pub fn permits_mime(&self, mime: &str) -> bool {
+        self.permitted_mime_offers
+            .iter()
+            .any(|permitted| permitted.eq_ignore_ascii_case(mime))
+    }
+}
+
+/// One negotiated Clipboard V2 transfer bound to a live VDI lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VdiClipboardMessageV2 {
+    /// Closed schema discriminator.
+    pub schema_version: u16,
+    /// Exact broker/session identity copied from the active lease.
+    pub session_id: String,
+    /// Exact attachment generation copied from the active lease.
+    pub generation: u64,
+    /// Exact short-lived lease identity.
+    pub lease_id: String,
+    /// Exact expiry snapshot; a rotated/refreshed lease invalidates old bodies.
+    pub lease_expires_at_ms: u64,
+    /// One-based sequence within this exact lease.
+    pub message_sequence: u64,
+    /// MIME representation selected from both the envelope and lease offers.
+    pub selected_mime: String,
+    /// Explicit source policy classification.
+    pub disclosure: VdiClipboardDisclosureV2,
+    /// Existing bounded Clipboard V2 payload and source ordering metadata.
+    pub envelope: ClipboardEnvelopeV2,
+}
+
+impl VdiClipboardMessageV2 {
+    /// Decode a bounded strict JSON body. Duplicate or unknown fields fail
+    /// before the body can reach a protocol adapter.
+    pub fn from_json_bytes(body: &[u8]) -> Result<Self, VdiClipboardTransportV2Error> {
+        if body.len() > MAX_VDI_CLIPBOARD_TRANSPORT_V2_JSON_BYTES {
+            return Err(VdiClipboardTransportV2Error::BodyTooLarge);
+        }
+        let text =
+            std::str::from_utf8(body).map_err(|_| VdiClipboardTransportV2Error::MalformedBody)?;
+        crate::workloads::reject_duplicate_json_keys(text)
+            .map_err(|_| VdiClipboardTransportV2Error::MalformedBody)?;
+        serde_json::from_slice(body).map_err(|_| VdiClipboardTransportV2Error::MalformedBody)
+    }
+
+    /// Admit this message only for an exact live lease and strictly newer
+    /// payload-free receipt.
+    pub fn admit(
+        &self,
+        lease: &VdiClipboardLeaseV2,
+        previous: Option<&VdiClipboardReceiptV2>,
+        now_ms: u64,
+    ) -> Result<(), VdiClipboardTransportV2Error> {
+        lease.validate_at(now_ms)?;
+        if self.schema_version != VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION {
+            return Err(VdiClipboardTransportV2Error::UnsupportedSchema);
+        }
+        if self.session_id != lease.session_id
+            || self.generation != lease.generation
+            || self.lease_id != lease.lease_id
+            || self.lease_expires_at_ms != lease.expires_at_ms
+        {
+            return Err(VdiClipboardTransportV2Error::LeaseIdentityMismatch);
+        }
+        if self.message_sequence == 0 {
+            return Err(VdiClipboardTransportV2Error::InvalidSequence);
+        }
+        if self.disclosure == VdiClipboardDisclosureV2::Secret
+            || secret_bearing_mime(&self.selected_mime)
+        {
+            return Err(VdiClipboardTransportV2Error::SecretBearing);
+        }
+        if !lease.permits_mime(&self.selected_mime)
+            || !self
+                .envelope
+                .mime_offers
+                .iter()
+                .any(|offer| offer.eq_ignore_ascii_case(&self.selected_mime))
+        {
+            return Err(VdiClipboardTransportV2Error::UnsupportedMime);
+        }
+        self.envelope
+            .validate_at(now_ms)
+            .map_err(VdiClipboardTransportV2Error::InvalidEnvelope)?;
+
+        if let Some(text) = self.envelope.inline_text.as_ref() {
+            if !self
+                .selected_mime
+                .split_once('/')
+                .is_some_and(|(major, _)| major.eq_ignore_ascii_case("text"))
+                || text.len_bytes() > MAX_VDI_CLIPBOARD_TEXT_BYTES
+            {
+                return Err(VdiClipboardTransportV2Error::UnsupportedPayload);
+            }
+        }
+
+        if let Some(receipt) = previous {
+            receipt.validate()?;
+            if receipt.session_id != self.session_id {
+                return Err(VdiClipboardTransportV2Error::LeaseIdentityMismatch);
+            }
+            let same_envelope_source = receipt.source_node == self.envelope.source_node
+                && receipt.source_seat == self.envelope.source_seat
+                && receipt.source_session == self.envelope.source_session;
+            if same_envelope_source && self.envelope.sequence <= receipt.envelope_sequence {
+                return Err(VdiClipboardTransportV2Error::Replay);
+            }
+            let same_lease = receipt.generation == self.generation
+                && receipt.lease_id == self.lease_id
+                && receipt.lease_expires_at_ms == self.lease_expires_at_ms;
+            if same_lease && self.message_sequence <= receipt.message_sequence {
+                return Err(VdiClipboardTransportV2Error::Replay);
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the payload-free receipt persisted only after protocol delivery.
+    #[must_use]
+    pub fn receipt(&self) -> VdiClipboardReceiptV2 {
+        VdiClipboardReceiptV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            generation: self.generation,
+            lease_id: self.lease_id.clone(),
+            lease_expires_at_ms: self.lease_expires_at_ms,
+            message_sequence: self.message_sequence,
+            source_node: self.envelope.source_node.clone(),
+            source_seat: self.envelope.source_seat.clone(),
+            source_session: self.envelope.source_session.clone(),
+            envelope_sequence: self.envelope.sequence,
+            content_hash: self.envelope.content_hash.clone(),
+        }
+    }
+}
+
+/// Payload-free delivery cursor. Persisting this record makes an adapter
+/// reconnect idempotent without retaining clipboard bytes or host paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VdiClipboardReceiptV2 {
+    /// Closed schema discriminator.
+    pub schema_version: u16,
+    /// Exact broker/session identity.
+    pub session_id: String,
+    /// Exact attachment generation.
+    pub generation: u64,
+    /// Exact short-lived lease identity.
+    pub lease_id: String,
+    /// Exact lease expiry snapshot.
+    pub lease_expires_at_ms: u64,
+    /// Highest delivered message sequence.
+    pub message_sequence: u64,
+    /// Clipboard V2 source node for the cross-lease replay high-water mark.
+    pub source_node: String,
+    /// Clipboard V2 source seat for the cross-lease replay high-water mark.
+    pub source_seat: String,
+    /// Clipboard V2 source session for the cross-lease replay high-water mark.
+    pub source_session: String,
+    /// Highest delivered Clipboard V2 source sequence.
+    pub envelope_sequence: u64,
+    /// Payload digest only; clipboard bytes are never retained here.
+    pub content_hash: String,
+}
+
+impl VdiClipboardReceiptV2 {
+    /// Validate a receipt before using it as a replay high-water mark.
+    pub fn validate(&self) -> Result<(), VdiClipboardTransportV2Error> {
+        if self.schema_version != VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION {
+            return Err(VdiClipboardTransportV2Error::UnsupportedSchema);
+        }
+        validate_clipboard_identity("session_id", &self.session_id)
+            .map_err(|_| VdiClipboardTransportV2Error::InvalidIdentity)?;
+        validate_clipboard_identity("lease_id", &self.lease_id)
+            .map_err(|_| VdiClipboardTransportV2Error::InvalidIdentity)?;
+        for value in [&self.source_node, &self.source_seat, &self.source_session] {
+            validate_clipboard_identity("source", value)
+                .map_err(|_| VdiClipboardTransportV2Error::InvalidIdentity)?;
+        }
+        if self.generation == 0
+            || self.message_sequence == 0
+            || self.envelope_sequence == 0
+            || self.lease_expires_at_ms == 0
+            || !valid_clipboard_sha256(&self.content_hash)
+        {
+            return Err(VdiClipboardTransportV2Error::InvalidReceipt);
+        }
+        Ok(())
+    }
+}
+
+/// Stable, log-safe refusal vocabulary for the VDI transport boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VdiClipboardTransportV2Error {
+    /// The body or lease uses an unknown schema version.
+    UnsupportedSchema,
+    /// The encoded body exceeded its pre-parse byte ceiling.
+    BodyTooLarge,
+    /// JSON, duplicate fields, or the closed wire shape was invalid.
+    MalformedBody,
+    /// A session, generation, or lease identity was unsafe or zero.
+    InvalidIdentity,
+    /// Lease issuance, expiry ordering, or lifetime was invalid.
+    InvalidLease,
+    /// The lease is not current at the injected admission time.
+    ExpiredLease,
+    /// Session, generation, lease, or expiry did not exactly match.
+    LeaseIdentityMismatch,
+    /// Message ordering did not start at one.
+    InvalidSequence,
+    /// The selected MIME was not offered by both source and adapter.
+    UnsupportedMime,
+    /// Source policy classified the representation as secret-bearing.
+    SecretBearing,
+    /// The concrete protocol cannot materialize this payload representation.
+    UnsupportedPayload,
+    /// The exact lease sequence was already delivered.
+    Replay,
+    /// A payload-free delivery receipt was malformed.
+    InvalidReceipt,
+    /// The nested Clipboard V2 envelope failed admission.
+    InvalidEnvelope(ClipboardEnvelopeV2ValidationError),
+}
+
+impl fmt::Display for VdiClipboardTransportV2Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::UnsupportedSchema => "unsupported VDI clipboard transport schema",
+            Self::BodyTooLarge => "VDI clipboard transport body is oversized",
+            Self::MalformedBody => "VDI clipboard transport body is malformed",
+            Self::InvalidIdentity => "VDI clipboard transport identity is invalid",
+            Self::InvalidLease => "VDI clipboard lease bounds are invalid",
+            Self::ExpiredLease => "VDI clipboard lease is not current",
+            Self::LeaseIdentityMismatch => "VDI clipboard lease identity does not match",
+            Self::InvalidSequence => "VDI clipboard message sequence is invalid",
+            Self::UnsupportedMime => "VDI clipboard MIME is unsupported",
+            Self::SecretBearing => "VDI clipboard source policy refused secret-bearing content",
+            Self::UnsupportedPayload => "VDI clipboard payload is unsupported by this protocol",
+            Self::Replay => "VDI clipboard message was already delivered",
+            Self::InvalidReceipt => "VDI clipboard receipt is invalid",
+            Self::InvalidEnvelope(_) => "VDI clipboard envelope is invalid",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for VdiClipboardTransportV2Error {}
+
+/// Build one per-session VDI clipboard topic without allowing path-shaped
+/// identities to escape the fixed namespace.
+pub fn vdi_clipboard_session_topic(
+    prefix: &str,
+    session_id: &str,
+) -> Result<String, VdiClipboardTransportV2Error> {
+    if !matches!(
+        prefix,
+        VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX
+            | VDI_CLIPBOARD_GUEST_TO_HOST_TOPIC_PREFIX
+            | VDI_CLIPBOARD_RECEIPT_TOPIC_PREFIX
+            | VDI_CLIPBOARD_LEASE_TOPIC_PREFIX
+    ) {
+        return Err(VdiClipboardTransportV2Error::InvalidIdentity);
+    }
+    validate_clipboard_identity("session_id", session_id)
+        .map_err(|_| VdiClipboardTransportV2Error::InvalidIdentity)?;
+    Ok(format!("{prefix}/{session_id}"))
+}
+
+fn secret_bearing_mime(mime: &str) -> bool {
+    let mime = mime.to_ascii_lowercase();
+    mime.contains("password") || mime.contains("secret") || mime.contains("credential")
+}
+
 /// A validated, bounded UTF-8 text value for the VDI clipboard lane.
 ///
 /// Construct this value at a protocol or platform boundary so every consumer
@@ -1469,6 +1832,164 @@ impl VdiClipboardStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport_lease(now_ms: u64) -> VdiClipboardLeaseV2 {
+        VdiClipboardLeaseV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: "vnc:oak:session-1".into(),
+            generation: 7,
+            lease_id: "clip-lease-7".into(),
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+            permitted_mime_offers: vec!["text/plain;charset=utf-8".into()],
+        }
+    }
+
+    fn transport_message(now_ms: u64, sequence: u64) -> VdiClipboardMessageV2 {
+        let lease = transport_lease(now_ms);
+        let envelope = ClipboardEnvelopeV2::new_inline_text(
+            "node-a",
+            "seat-a",
+            "clipboard-session-a",
+            sequence,
+            now_ms,
+            vec![
+                "text/html;charset=utf-8".into(),
+                "text/plain;charset=utf-8".into(),
+            ],
+            "hello",
+            VdiClipboardText::new("hello").expect("bounded text"),
+            now_ms + 30_000,
+        )
+        .expect("valid rich fallback envelope");
+        VdiClipboardMessageV2 {
+            schema_version: VDI_CLIPBOARD_TRANSPORT_V2_SCHEMA_VERSION,
+            session_id: lease.session_id,
+            generation: lease.generation,
+            lease_id: lease.lease_id,
+            lease_expires_at_ms: lease.expires_at_ms,
+            message_sequence: sequence,
+            selected_mime: "text/plain;charset=utf-8".into(),
+            disclosure: VdiClipboardDisclosureV2::Shareable,
+            envelope,
+        }
+    }
+
+    #[test]
+    fn vdi_transport_admits_only_exact_negotiated_lease_identity() {
+        let now_ms = 1_700_000_000_000;
+        let lease = transport_lease(now_ms);
+        let message = transport_message(now_ms, 1);
+        message
+            .admit(&lease, None, now_ms + 1)
+            .expect("exact current negotiated message");
+
+        let mut wrong_generation = message.clone();
+        wrong_generation.generation += 1;
+        assert_eq!(
+            wrong_generation.admit(&lease, None, now_ms + 1),
+            Err(VdiClipboardTransportV2Error::LeaseIdentityMismatch)
+        );
+        let mut wrong_lease = message;
+        wrong_lease.lease_id = "other-lease".into();
+        assert_eq!(
+            wrong_lease.admit(&lease, None, now_ms + 1),
+            Err(VdiClipboardTransportV2Error::LeaseIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn vdi_transport_receipt_suppresses_reconnect_replay_without_payload() {
+        let now_ms = 1_700_000_000_000;
+        let lease = transport_lease(now_ms);
+        let message = transport_message(now_ms, 3);
+        let receipt = message.receipt();
+        receipt.validate().expect("payload-free receipt");
+        let body = serde_json::to_string(&receipt).expect("receipt JSON");
+        assert!(!body.contains("hello"));
+        assert!(!body.contains("inline_text"));
+        assert_eq!(
+            message.admit(&lease, Some(&receipt), now_ms + 1),
+            Err(VdiClipboardTransportV2Error::Replay)
+        );
+
+        let mut rewrapped = message.clone();
+        rewrapped.message_sequence += 1;
+        assert_eq!(
+            rewrapped.admit(&lease, Some(&receipt), now_ms + 1),
+            Err(VdiClipboardTransportV2Error::Replay),
+            "a newer wrapper cannot replay the same Clipboard V2 source sequence"
+        );
+
+        let newer = transport_message(now_ms, 4);
+        newer
+            .admit(&lease, Some(&receipt), now_ms + 1)
+            .expect("strictly newer delivery");
+    }
+
+    #[test]
+    fn vdi_transport_fails_closed_for_expiry_secret_unsupported_and_oversized() {
+        let now_ms = 1_700_000_000_000;
+        let lease = transport_lease(now_ms);
+        let message = transport_message(now_ms, 1);
+        assert_eq!(
+            message.admit(&lease, None, lease.expires_at_ms),
+            Err(VdiClipboardTransportV2Error::ExpiredLease)
+        );
+
+        let mut secret = message.clone();
+        secret.disclosure = VdiClipboardDisclosureV2::Secret;
+        assert_eq!(
+            secret.admit(&lease, None, now_ms + 1),
+            Err(VdiClipboardTransportV2Error::SecretBearing)
+        );
+
+        let mut unsupported = message;
+        unsupported.selected_mime = "text/html;charset=utf-8".into();
+        assert_eq!(
+            unsupported.admit(&lease, None, now_ms + 1),
+            Err(VdiClipboardTransportV2Error::UnsupportedMime)
+        );
+
+        let oversized = vec![b' '; MAX_VDI_CLIPBOARD_TRANSPORT_V2_JSON_BYTES + 1];
+        assert_eq!(
+            VdiClipboardMessageV2::from_json_bytes(&oversized),
+            Err(VdiClipboardTransportV2Error::BodyTooLarge)
+        );
+    }
+
+    #[test]
+    fn vdi_transport_json_and_topics_reject_hostile_paths_and_duplicate_keys() {
+        let now_ms = 1_700_000_000_000;
+        let message = transport_message(now_ms, 1);
+        let body = serde_json::to_string(&message).expect("message JSON");
+        let decoded =
+            VdiClipboardMessageV2::from_json_bytes(body.as_bytes()).expect("strict transport body");
+        assert_eq!(decoded, message);
+
+        let duplicate = body.replacen(
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"schema_version\":2",
+            1,
+        );
+        assert_eq!(
+            VdiClipboardMessageV2::from_json_bytes(duplicate.as_bytes()),
+            Err(VdiClipboardTransportV2Error::MalformedBody)
+        );
+        assert!(vdi_clipboard_session_topic(
+            VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
+            "../../secret"
+        )
+        .is_err());
+        assert_eq!(
+            vdi_clipboard_session_topic(
+                VDI_CLIPBOARD_HOST_TO_GUEST_TOPIC_PREFIX,
+                "vnc:oak:session-1"
+            )
+            .expect("safe topic"),
+            "state/clipboard/vdi-v2/host-to-guest/vnc:oak:session-1"
+        );
+    }
 
     #[test]
     fn text_value_uses_encoded_bytes_for_the_limit() {

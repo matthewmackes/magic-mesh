@@ -13,7 +13,6 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::Context;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -62,50 +61,23 @@ pub fn plan_push(key: &str, value: &str, peers: &str, author: &str) -> PushPlan 
 /// row carrying the JSON `{key, value}` payload + one
 /// `fleet_settings_apply_log` row per (peer, key) target with
 /// `ok = 0` (the reconcile loop flips it to 1 on success). Atomic
-/// via [`crate::store::with_transaction`].
+/// through the process-isolated typed SQLite writer.
 ///
 /// # Errors
 ///
 /// Returns an error when any of the writes fails. Atomic — if any
 /// row rejects, none of them land.
 pub fn record_push(conn: &mut Connection, plan: &PushPlan) -> Result<i64> {
-    crate::store::with_transaction(conn, |tx| {
-        let now = chrono::Utc::now().to_rfc3339();
-        let payload = serde_json::json!({
-            "key":   &plan.key,
-            "value": &plan.value,
-            "peers": &plan.peers,
-        })
-        .to_string();
-        tx.execute(
-            "INSERT INTO desired_config \
-             (author, message, spec_json, state, created_at) \
-             VALUES (?, ?, ?, 'approved', ?)",
-            (
-                &plan.author,
-                &format!("fleet push: {}", plan.key),
-                &payload,
-                &now,
-            ),
-        )
-        .with_context(|| format!("inserting desired_config for {}", plan.key))?;
-        let revision_id = tx.last_insert_rowid();
-        for peer in &plan.peers {
-            tx.execute(
-                "INSERT INTO fleet_settings_apply_log \
-                 (peer_id, revision_id, key, applied_at, ok) \
-                 VALUES (?, ?, ?, ?, 0)",
-                (peer, revision_id.to_string(), &plan.key, &now),
-            )
-            .with_context(|| {
-                format!(
-                    "inserting fleet_settings_apply_log row for {peer}/{}",
-                    plan.key
-                )
-            })?;
-        }
-        Ok(revision_id)
-    })
+    crate::store::writer::request_or_execute(
+        conn,
+        crate::store::writer::WriteOp::RecordFleetPush {
+            key: plan.key.clone(),
+            value_json: plan.value.clone(),
+            peers: plan.peers.clone(),
+            author: plan.author.clone(),
+        },
+    )?
+    .into_row_id()
 }
 
 /// Parse the `--peers` CLI option into a sorted-deduped peer-id

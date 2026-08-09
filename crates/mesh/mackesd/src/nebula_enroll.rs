@@ -1612,6 +1612,27 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         (ca_crt, ca_key)
     }
 
+    fn seed_active_peer(conn: &rusqlite::Connection, index: u32) {
+        crate::store::writer::request_or_execute(
+            conn,
+            crate::store::writer::WriteOp::UpsertPeerCert {
+                mesh_id: "test-mesh".into(),
+                expected_epoch: 0,
+                peer: crate::store::writer::CaPeerCertWrite {
+                    node_id: format!("peer:slot-{index}"),
+                    epoch: 0,
+                    cert_pem: "pem".into(),
+                    overlay_ip: format!("10.42.{}.{}", index / 254, (index % 254) + 1),
+                    public_key_pem: None,
+                    created_at: None,
+                    expires_at: 9_999_999,
+                },
+            },
+        )
+        .and_then(crate::store::writer::WriteResponse::into_count)
+        .expect("seed peer through typed SQLite writer");
+    }
+
     #[test]
     fn sign_csr_refuses_a_csr_claiming_a_different_path_target_without_effects() {
         let tmp = tempdir().expect("tempdir");
@@ -2348,16 +2369,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         let conn = fresh_store();
         let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
         for i in 1..=cap {
-            conn.execute(
-                "INSERT INTO nebula_peer_certs \
-                 (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-                 VALUES (?1, 0, 'pem', ?2, 9999999)",
-                rusqlite::params![
-                    format!("peer:slot-{i}"),
-                    format!("10.42.{}.{}", i / 256, i % 256)
-                ],
-            )
-            .unwrap();
+            seed_active_peer(&conn, i);
         }
         let _pending = place_csr(tmp.path(), "peer:over");
         let paths = SignCsrPaths {
@@ -2394,16 +2406,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         let conn = fresh_store();
         let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
         for i in 1..=cap {
-            conn.execute(
-                "INSERT INTO nebula_peer_certs \
-                 (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-                 VALUES (?1, 0, 'pem', ?2, 9999999)",
-                rusqlite::params![
-                    format!("peer:slot-{i}"),
-                    format!("10.42.{}.{}", i / 256, i % 256)
-                ],
-            )
-            .unwrap();
+            seed_active_peer(&conn, i);
         }
         let _pending = place_csr(tmp.path(), "peer:over");
         let paths = SignCsrPaths {

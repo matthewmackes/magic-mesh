@@ -18,6 +18,7 @@ use crate::model::{
     VehicleMirrorStatus, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
     VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
+use crate::weather_ui::{format_temperature, WeatherField, WeatherRange, WeatherTruth};
 use crate::MapsLocationSurface;
 
 const RAIL_W: f32 = 176.0;
@@ -395,6 +396,27 @@ impl ProviderRouteGeometry {
     }
 }
 
+fn provider_route_geometry(
+    navigation: &crate::navigation_ui::NavigationConsumer,
+) -> Option<ProviderRouteGeometry> {
+    let route = navigation.route()?;
+    Some(ProviderRouteGeometry {
+        primary: route
+            .geometry
+            .iter()
+            .map(|point| ProviderRoutePoint {
+                latitude: point.latitude,
+                longitude: point.longitude,
+            })
+            .collect(),
+        alternate: Vec::new(),
+        maneuver: Some(ProviderRoutePoint {
+            latitude: route.maneuver_point.latitude,
+            longitude: route.maneuver_point.longitude,
+        }),
+    })
+}
+
 /// A single turn instruction reduced to a direction for the painted arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManeuverKind {
@@ -672,6 +694,7 @@ fn drive_hud(
 
     // --- Paint: scene first, then the floating cards over it. --------------
     let painter = ui.painter_at(rect);
+    let route_geometry = provider_route_geometry(&state.navigation);
     paint_map_scene(
         &painter,
         rect,
@@ -686,7 +709,7 @@ fn drive_hud(
             .local_navigation
             .active_destination()
             .and_then(Destination::geo),
-        None,
+        route_geometry.as_ref(),
         offline.readiness == OfflineNavigationReadiness::Blocked && !has_fix,
     );
 
@@ -1301,6 +1324,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     overview.zoom = 6.5;
     overview.pan = [0.0, 0.0];
     overview.route_visible = true;
+    let route_geometry = provider_route_geometry(&state.navigation);
     paint_map_scene(
         &painter,
         rect,
@@ -1315,7 +1339,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .local_navigation
             .active_destination()
             .and_then(Destination::geo),
-        None,
+        route_geometry.as_ref(),
         false,
     );
     // Gentle scrim so the sheet + chrome read cleanly over the map.
@@ -1366,13 +1390,17 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         }
     }
     if state.local_navigation.route_options.is_empty() {
+        let status = state
+            .navigation
+            .refusal()
+            .unwrap_or_else(|| state.navigation.status().label());
         painter.text(
             egui::pos2(
                 layout.sheet.center().x,
                 (layout.dest.bottom() + layout.start.top()) / 2.0,
             ),
             Align2::CENTER_CENTER,
-            "No offline routing engine — route options unavailable",
+            status,
             Style::typography_font(TypographyRole::Body),
             Style::TEXT_DIM,
         );
@@ -2905,6 +2933,21 @@ fn paint_map_scene(
     // keeps the large-text status lane readable; other no-map states retain it.
     let projection = crate::basemap::paint_basemap(painter, rect, map, center, !hide_empty_state);
 
+    // The daemon-issued PNG is already decoded by the off-render Bus fold.
+    // Paint only when its exact admitted XYZ viewport still matches the active
+    // Weather authority; a late response is therefore never stretched over a
+    // newer interactive viewport.
+    if map.weather.active {
+        if let Some((projection, viewport)) =
+            projection.as_ref().zip(map.weather.selected_viewport())
+        {
+            if let Some(tile_rect) = projection.xyz_tile_rect(viewport.zoom, viewport.x, viewport.y)
+            {
+                let _ = map.weather.paint_selected(painter, tile_rect);
+            }
+        }
+    }
+
     // WL-FUNC-012 / OVERLAY-2 — producer-timed IEM/NWS NEXRAD raster animation.
     // This paints through egui textures on both GLES and wgpu, beneath every
     // vector overlay. Without an installed basemap its vehicle-centred geometry
@@ -3894,6 +3937,12 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     // simulators. Base-map controls stay directly visible; the ten real feed
     // toggles live in one grouped popover so the Map tab remains scannable.
     ui.horizontal_wrapped(|ui| {
+        if ui
+            .selectable_label(state.map.weather.active, "Weather")
+            .clicked()
+        {
+            state.map.weather.active = !state.map.weather.active;
+        }
         ui.checkbox(&mut state.map.dark_mode, "Dark mode");
         ui.checkbox(&mut state.map.route_visible, "Route");
         ui.checkbox(&mut state.map.dead_zone_overlay, "Dead zones");
@@ -3901,6 +3950,10 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         let _ = map_layers_menu(ui, &mut state.map);
     });
     ui.add_space(Style::SP_S);
+    if state.map.weather.active {
+        weather_mode_controls(ui, &mut state.map);
+        ui.add_space(Style::SP_S);
+    }
     ui.horizontal(|ui| {
         ui.add(egui::Slider::new(&mut state.map.zoom, 3.0..=18.0).text("Zoom"));
         ui.add(egui::Slider::new(&mut state.map.rotation_deg, -180.0..=180.0).text("Rotate"));
@@ -3918,6 +3971,7 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         state.local_navigation.active_route.is_planned(),
         500.0,
     );
+    state.queue_weather_viewport();
     // Action buttons float over the map, justified bottom-right (world-class
     // map-nav idiom) instead of sitting in a control row above it. "Preview
     // route" is the Map tab's sole action button; the cluster stacks any others.
@@ -3957,6 +4011,126 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             provider_card(ui, &state.local_navigation.satellite);
         });
     });
+}
+
+/// Runtime-reachable, map-first Weather controls. All values were already
+/// admitted and projected by the off-render Bus fold in `model`; this renderer
+/// performs no I/O and owns no weather cache.
+fn weather_mode_controls(ui: &mut egui::Ui, map: &mut MapViewState) {
+    egui::Frame::NONE
+        .fill(Style::LAYER_02)
+        .stroke(Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS_M)
+        .inner_margin(Style::SP_M)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(map.weather.location_label())
+                        .strong()
+                        .color(Style::TEXT_STRONG),
+                );
+                weather_truth_badge(ui, "Location", map.weather.location_truth());
+                ui.separator();
+                for range in WeatherRange::ALL {
+                    ui.selectable_value(&mut map.weather.range, range, range.label());
+                }
+            });
+            ui.add_space(Style::SP_S);
+            ui.horizontal_wrapped(|ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut map.weather.manual_search_query)
+                        .hint_text("Search an offline place")
+                        .desired_width(280.0),
+                );
+                let submit = ui.button("Search").clicked()
+                    || (field.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                if submit {
+                    map.weather.submit_manual_search();
+                }
+                ui.label(
+                    RichText::new(map.weather.manual_search_message())
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
+            });
+            let manual_results: Vec<(usize, String, String)> = map
+                .weather
+                .manual_search_results()
+                .iter()
+                .enumerate()
+                .map(|(index, result)| (index, result.label.clone(), result.time_zone.clone()))
+                .collect();
+            for (index, label, time_zone) in manual_results {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(label).color(Style::TEXT_STRONG));
+                    ui.label(RichText::new(time_zone).small().color(Style::TEXT_DIM));
+                    if ui.button("Use for weather").clicked() {
+                        map.weather
+                            .select_manual_result(index, crate::model::unix_now_ms());
+                    }
+                });
+            }
+            ui.add_space(Style::SP_S);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Map field").color(Style::TEXT_DIM));
+                for field in WeatherField::ALL {
+                    ui.selectable_value(&mut map.weather.field, field, field.label());
+                }
+                weather_truth_badge(ui, "Field", map.weather.atmosphere_truth());
+                ui.separator();
+                // Safety layers remain independent of the exclusive
+                // atmospheric selector.
+                ui.checkbox(&mut map.iem_radar_overlay, "Radar");
+                ui.checkbox(&mut map.nws_alert_overlay, "Alerts");
+            });
+            ui.add_space(Style::SP_S);
+            ui.horizontal_wrapped(|ui| {
+                weather_truth_badge(ui, "Current", map.weather.current_truth());
+                ui.label(map.weather.current_summary());
+            });
+
+            if map.weather.range != WeatherRange::Current {
+                ui.add_space(Style::SP_S);
+                ui.horizontal_wrapped(|ui| {
+                    weather_truth_badge(ui, "Forecast", map.weather.forecast_truth());
+                    let days = map.weather.visible_days();
+                    if days.is_empty() {
+                        ui.label(RichText::new("Forecast unavailable").color(Style::TEXT_DIM));
+                    } else {
+                        for day in days {
+                            let high = day
+                                .high_temperature
+                                .map_or_else(|| "—".to_string(), format_temperature);
+                            let low = day
+                                .low_temperature
+                                .map_or_else(|| "—".to_string(), format_temperature);
+                            ui.label(format!("{}  {high}/{low}", day.local_date));
+                        }
+                    }
+                });
+            }
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new(format!("Source: {}", map.weather.attribution()))
+                    .small()
+                    .color(Style::TEXT_DIM),
+            );
+        });
+}
+
+fn weather_truth_badge(ui: &mut egui::Ui, label: &str, truth: WeatherTruth) {
+    let color = match truth {
+        WeatherTruth::Fresh => Style::OK,
+        WeatherTruth::Stale => Style::WARN,
+        WeatherTruth::Unavailable => Style::TEXT_DIM,
+    };
+    ui.label(
+        RichText::new(format!("{label}: {}", truth.label()))
+            .small()
+            .strong()
+            .color(color),
+    );
 }
 
 /// Count the ten live external feeds represented by the grouped Layers menu.
@@ -7627,6 +7801,85 @@ mod tests {
         assert_eq!(active_live_overlay_count(&surface.map), 10);
         let texts = painted_texts(&mut surface);
         assert!(texts.iter().any(|text| text == "Layers (10)"));
+    }
+
+    #[test]
+    fn weather_ui_renders_map_first_controls_without_coupling_safety_layers() {
+        let mut surface = MapsLocationSurface::live();
+        surface.active = WorkspaceTab::Map;
+        surface.map.weather.active = true;
+        surface.map.weather.range = WeatherRange::FiveDay;
+        surface.map.weather.field = WeatherField::Wind;
+        surface.map.iem_radar_overlay = false;
+        surface.map.nws_alert_overlay = true;
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    weather_mode_controls(ui, &mut surface.map);
+                });
+            },
+        );
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut texts);
+        }
+        for expected in [
+            "Location unavailable",
+            "Enter a place and select Search",
+            "Current conditions unavailable",
+            "Temperature",
+            "Wind",
+            "Cloud",
+            "Radar",
+            "Alerts",
+            "Source: Weather source unavailable",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "missing Weather UI text {expected:?}: {texts:?}"
+            );
+        }
+        assert!(!surface.map.iem_radar_overlay);
+        assert!(surface.map.nws_alert_overlay);
+        assert_eq!(surface.map.weather.field, WeatherField::Wind);
+        assert_eq!(surface.map.weather.range, WeatherRange::FiveDay);
+    }
+
+    #[test]
+    fn weather_manual_search_renders_honest_unavailable_state() {
+        let mut surface = MapsLocationSurface::live();
+        surface.map.weather.active = true;
+        surface.map.weather.manual_search_query = "Boston".into();
+        surface.map.weather.complete_manual_search(
+            "Boston",
+            crate::geocode::WeatherGeocodeOutcome {
+                results: vec![],
+                note: Some("Offline location search unavailable: no gazetteer installed".into()),
+            },
+        );
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                weather_mode_controls(ui, &mut surface.map);
+            });
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_shape_text(&clipped.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|text| text.contains("search unavailable")));
+        assert!(!texts.iter().any(|text| text == "Use for weather"));
     }
 
     #[test]

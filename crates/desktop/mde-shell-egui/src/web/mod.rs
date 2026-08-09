@@ -874,6 +874,8 @@ mod tests {
             drift_summary: DriftSummary::default(),
             node_capacity: NodeCapacity::default(),
             android_inventories: Vec::new(),
+            android_provider_admissions: Vec::new(),
+            android_vdi_sources: Vec::new(),
         }
     }
 

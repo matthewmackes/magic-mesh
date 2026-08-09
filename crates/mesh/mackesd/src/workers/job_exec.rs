@@ -83,7 +83,7 @@ impl JobExecWorker {
         // Serial per node (W34): handle exactly one pending run per pass so
         // a fleet-wide run can't stampede a box mid-apply.
         if let Some(run) = self.pending_runs().into_iter().next() {
-            let result = self.execute(&run);
+            let result = self.execute_job(&run);
             let _ = write_target_result(&self.workgroup_root, &run.run_id, &result);
             executed.push(run.run_id.clone());
             tracing::info!(
@@ -95,7 +95,7 @@ impl JobExecWorker {
     }
 
     /// Resolve + apply the run's playbook locally.
-    fn execute(&self, run: &JobRun) -> TargetResult {
+    fn execute_job(&self, run: &JobRun) -> TargetResult {
         let playbook = match normalize_playbook_ref(&run.playbook) {
             Ok(playbook) if playbook == run.playbook => playbook,
             Ok(_) => return self.refused("playbook reference is not normalized"),

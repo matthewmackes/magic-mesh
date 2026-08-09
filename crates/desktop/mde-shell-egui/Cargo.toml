@@ -62,7 +62,9 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+jiff = { workspace = true }
 rustix = { version = "0.38", features = ["process", "net"] }
+ed25519-dalek = { version = "2", default-features = false }
 
 # CHOOSER-9 — the Desktop Chooser's mesh-synced favorites/recents/manual sources
 # (`chooser/chooser_prefs.rs`) roam per mesh identity over the Syncthing-replicated
@@ -224,10 +226,6 @@ mde-maps-location-egui = { path = "../mde-maps-location-egui", features = ["sim-
 # spool on a throwaway dir — the same tempdir seam the editor's BusTransport
 # round-trip test uses. Already in the workspace lock, no new lock line.
 tempfile = "3"
-
-# Music authorization tests verify the shell's Ed25519 body against the daemon
-# verifier. This is test-only; production signing stays in mackes-mesh-types.
-ed25519-dalek = { version = "2", default-features = false }
 
 [lints]
 workspace = true

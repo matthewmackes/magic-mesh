@@ -117,6 +117,29 @@ pub trait Display1FrameSource {
     fn poll(&mut self, now: Instant) -> Result<Display1FramePoll, DrmError>;
 }
 
+/// Poll the native source while preserving the KMS ownership boundary on a
+/// transport or protocol failure. A source error is a terminal attachment
+/// transition just like an explicit disconnect: the framebuffer must be
+/// removed before its broker-delivered DMA-BUF descriptor can be dropped.
+fn poll_display1_or_cleanup(
+    source: &mut Option<&mut dyn Display1FrameSource>,
+    now: Instant,
+    cleanup: impl FnOnce() -> Result<(), DrmError>,
+) -> Result<Option<Display1FramePoll>, DrmError> {
+    let Some(source) = source.as_mut() else {
+        return Ok(None);
+    };
+    match (*source).poll(now) {
+        Ok(state) => Ok(Some(state)),
+        Err(source_error) => match cleanup() {
+            Ok(()) => Err(source_error),
+            Err(cleanup_error) => Err(DrmError::Present(format!(
+                "Display1 source failed ({source_error}); native scanout cleanup failed ({cleanup_error})"
+            ))),
+        },
+    }
+}
+
 impl std::fmt::Display for DrmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2313,11 +2336,9 @@ pub fn run_drm_with_clipboard_and_display1(
         // polled only after rendering so the UI loop never performs blocking
         // backend work, and every imported FD is retained through the KMS
         // completion boundary.
-        let display1_state = if let Some(source) = display1.as_mut() {
-            Some((*source).poll(Instant::now())?)
-        } else {
-            None
-        };
+        let display1_state = poll_display1_or_cleanup(&mut display1, Instant::now(), || {
+            clear_external_scanout(&gbm, &mut external_scanout)
+        })?;
         match display1_state {
             Some(Display1FramePoll::Frame { fd, metadata }) => {
                 if let Err(error) = present_external_scanout(
@@ -3013,12 +3034,52 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 mod tests {
     use super::{
         clear_rgba, drm_clipboard_output_text, drm_modifiers, drm_screen_for_scale,
-        explicit_modifier, open_primary_node, probe_prime_import_liveness,
-        push_drm_clipboard_shortcut, refresh_drm_clipboard_offer, store_drm_clipboard_output,
-        DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
+        explicit_modifier, open_primary_node, poll_display1_or_cleanup,
+        probe_prime_import_liveness, push_drm_clipboard_shortcut, refresh_drm_clipboard_offer,
+        store_drm_clipboard_output, Display1FramePoll, Display1FrameSource, DrmError,
+        ExternalDmaBufFrame, ReimportedGemBuffer,
     };
     use crate::{LocalClipboardAuthority, MemoryRichClipboardClient};
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    struct FailedDisplay1Source;
+
+    impl Display1FrameSource for FailedDisplay1Source {
+        fn poll(&mut self, _now: Instant) -> Result<Display1FramePoll, DrmError> {
+            Err(DrmError::Present("native source transport lost".into()))
+        }
+    }
+
+    #[test]
+    fn display1_source_failure_cleans_native_scanout_before_returning() {
+        let cleaned = Cell::new(false);
+        let mut source = FailedDisplay1Source;
+        let mut display1: Option<&mut dyn Display1FrameSource> = Some(&mut source);
+        let error = poll_display1_or_cleanup(&mut display1, Instant::now(), || {
+            cleaned.set(true);
+            Ok(())
+        })
+        .expect_err("source failure must leave the native path");
+
+        assert!(cleaned.get(), "KMS cleanup must run before error return");
+        assert!(error.to_string().contains("native source transport lost"));
+    }
+
+    #[test]
+    fn display1_source_failure_reports_cleanup_failure_without_hiding_source_loss() {
+        let mut source = FailedDisplay1Source;
+        let mut display1: Option<&mut dyn Display1FrameSource> = Some(&mut source);
+        let error = poll_display1_or_cleanup(&mut display1, Instant::now(), || {
+            Err(DrmError::Present("rmfb failed".into()))
+        })
+        .expect_err("combined source and cleanup failure must fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("native source transport lost"));
+        assert!(message.contains("rmfb failed"));
+    }
 
     #[test]
     fn external_dmabuf_metadata_is_bounded_before_prime_import() {

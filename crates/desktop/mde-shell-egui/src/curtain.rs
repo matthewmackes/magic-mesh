@@ -466,7 +466,7 @@ fn face_lines(unix_secs: i64) -> (String, String) {
 
 /// Seconds since the Unix epoch (0 on a pre-epoch clock — same guard as the
 /// tray's clock cell).
-fn unix_now() -> i64 {
+fn unix_now() -> Result<i64, String> {
     crate::timers::display_unix()
 }
 
@@ -851,7 +851,9 @@ impl Curtain {
 
         // The giant clock face (lock 6): thin-reading display-scale HH:MM
         // centred-high, the civil date beneath — UTC, the crate's one calendar.
-        let (time, date) = face_lines(unix_now());
+        let (time, date) = unix_now()
+            .map(face_lines)
+            .unwrap_or_else(|_| ("Time unavailable".to_owned(), String::new()));
         let cx = sheet.center().x;
         let clock_rect = painter.text(
             egui::pos2(cx, sheet.height().mul_add(CLOCK_Y_FRAC, sheet.top())),
@@ -1179,7 +1181,9 @@ fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>) {
             );
             ui.add_space(Style::SP_M);
         }
-        let (_, date) = face_lines(unix_now());
+        let (_, date) = unix_now()
+            .map(face_lines)
+            .unwrap_or_else(|_| ("Time unavailable".to_owned(), String::new()));
         ui.label(
             RichText::new(date)
                 .size(Style::TYPE_CAPTION)

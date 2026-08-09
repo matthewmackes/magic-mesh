@@ -53,6 +53,23 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         sql: include_str!("../../migrations/0013_nebula_peer_public_key.sql"),
     },
+    // WL-FUNC-022 S2 — daemon-owned Clock snapshot and request replay ledger.
+    Migration {
+        version: 14,
+        sql: include_str!("../../migrations/0014_clock_authority.sql"),
+    },
+    // WL-FUNC-022 S3 — exact occurrence audio intents, atomically enqueued by
+    // the Clock authority and acknowledged only by the typed Music status.
+    Migration {
+        version: 15,
+        sql: include_str!("../../migrations/0015_clock_audio_outbox.sql"),
+    },
+    // WL-FUNC-022 S2 — bind replay-ledger identities to the exact admitted
+    // signed command so request-id reuse cannot disguise a conflicting action.
+    Migration {
+        version: 16,
+        sql: include_str!("../../migrations/0016_clock_request_fingerprint.sql"),
+    },
 ];
 
 /// Open the store at `path`, creating its parent directory if needed
