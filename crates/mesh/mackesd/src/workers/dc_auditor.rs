@@ -18,10 +18,14 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use mde_bus::persist::Persist;
+#[cfg(test)]
+use std::sync::Arc;
+
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::{Persist, StoredMessage};
 
 use super::{ShutdownToken, Worker};
 
@@ -29,8 +33,21 @@ use super::{ShutdownToken, Worker};
 /// hammering the Bus index).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Lower bound for retrying an unresolved or unopenable Bus without spinning.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Upper bound for startup retry backoff. The same passive projection worker
+/// must recover when the canonical Bus appears.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
 /// The Bus prefix containing registered datacenter action lanes.
 pub const ACTION_DC_PREFIX: &str = "action/dc/";
+
+/// The Bus prefix containing this projection's durable output lanes.
+const AUDIT_DC_PREFIX: &str = "event/dc/audit/";
 
 /// Admit only topics that still have a production responder. Retained rows for
 /// retired VM verbs must not become fresh audit projections after an upgrade.
@@ -53,7 +70,22 @@ pub const BODY_SUMMARY_LEN: usize = 120;
 /// Bus topic an audit record for `ulid` is published to: `event/dc/audit/<ulid>`.
 #[must_use]
 pub fn audit_topic(ulid: &str) -> String {
-    format!("event/dc/audit/{ulid}")
+    format!("{AUDIT_DC_PREFIX}{ulid}")
+}
+
+/// Recover a request ULID only from the exact stable audit-topic shape emitted
+/// by this worker. Bus-generated ULIDs are 26-character uppercase Crockford
+/// base32 values whose leading digit cannot exceed seven.
+fn projected_ulid_from_audit_topic(topic: &str) -> Option<&str> {
+    let ulid = topic.strip_prefix(AUDIT_DC_PREFIX)?;
+    let bytes = ulid.as_bytes();
+    if bytes.len() != 26 || !matches!(bytes[0], b'0'..=b'7') {
+        return None;
+    }
+    bytes
+        .iter()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z'))
+        .then_some(ulid)
 }
 
 /// The audited action name for a Bus topic: strips the leading `action/` so
@@ -238,7 +270,15 @@ impl DcAuditor {
         body: &str,
         ts_unix_ms: i64,
     ) -> Option<AuditRecord> {
-        if !self.seen.insert(ulid.to_string()) {
+        let record = self.project(topic, ulid, body, ts_unix_ms)?;
+        self.remember(ulid);
+        Some(record)
+    }
+
+    /// Derive a candidate record without advancing dedup state. The I/O worker
+    /// uses this split so a failed Bus write leaves the request retryable.
+    fn project(&self, topic: &str, ulid: &str, body: &str, ts_unix_ms: i64) -> Option<AuditRecord> {
+        if self.seen.contains(ulid) {
             return None;
         }
         Some(AuditRecord {
@@ -251,65 +291,112 @@ impl DcAuditor {
             body_summary: body_summary(body),
         })
     }
+
+    /// Commit one successfully published ULID to the in-memory dedup state.
+    fn remember(&mut self, ulid: &str) {
+        self.seen.insert(ulid.to_string());
+    }
+
+    /// Reconcile identities recovered from completely read durable output
+    /// lanes before deriving any new candidates.
+    fn reconcile_projected(&mut self, projected_ulids: BTreeSet<String>) {
+        self.seen.extend(projected_ulids);
+    }
 }
 
 // ---- thin I/O: watch the action lanes, emit audit records via the Bus ----
 
-/// Publish one audit record onto the Bus in-process (perf-10 / arch-6) — no
-/// fork+exec of the `mde-bus` CLI (a whole process + a fresh SQLite open + a
-/// [`crate::proc_reap`] reaper thread) per record. Byte-identical stored row to
-/// the old `mde-bus publish <topic> --body-flag <body>`.
-///
-/// The publish and read paths both target [`mde_bus::default_data_dir`], the
-/// same resolver the fork+exec'd CLI uses via the inherited `MDE_BUS_ROOT`
-/// environment. Keeping the observer on that canonical root is required for
-/// the live daemon, whose service pins the shared `/run/mde-bus` spool.
-fn publish(rec: &AuditRecord) {
-    publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
+/// Publish one candidate record through the same already-open Bus used for the
+/// complete request snapshot. Failure is explicit so dedup state is not
+/// advanced until durable publication succeeds.
+fn publish_record(persist: &mut Persist, rec: &AuditRecord) -> Result<(), String> {
+    persist
+        .write(&rec.topic(), Priority::Default, None, Some(&rec.body()))
+        .map(|_| ())
+        .map_err(|error| format!("publish {}: {error}", rec.topic()))
 }
 
-/// Root-injectable body of [`publish`] — fresh-opens the Bus at `bus_root` and
-/// writes the record in-process (mirrors the CLI's per-call open). Best-effort:
-/// an absent root or a failed open/write is swallowed, exactly as the old
-/// fire-and-reap swallowed a missing `mde-bus` binary. Tests pass a temp root.
-fn publish_to(bus_root: Option<&std::path::Path>, rec: &AuditRecord) {
-    if let Some(mut persist) =
-        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
-    {
-        crate::bus_publish::publish_body(&mut persist, &rec.topic(), &rec.body());
-    }
+struct ProjectionSnapshot {
+    projected_ulids: BTreeSet<String>,
+    request_history: Vec<(String, StoredMessage)>,
 }
 
-/// One poll pass: enumerate registered `action/dc/*` topics and feed each message
-/// through the dedup core, publishing the records that survive (first-sight
-/// ulids). Best-effort: a failed `list_topics`/`list_since` is logged + skipped.
-fn poll_and_audit(persist: &Persist, core: &mut DcAuditor) {
-    let topics = match persist.list_topics() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::debug!(error = %e, "dc_auditor: list_topics failed");
-            return;
-        }
-    };
-    for topic in topics.iter().filter(|t| is_registered_action_topic(t)) {
-        let msgs = match persist.list_since(topic, None) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(topic = %topic, error = %e, "dc_auditor: list_since failed");
-                continue;
-            }
+/// Read every durable audit-output lane and registered request lane into one
+/// complete projection snapshot. Output identities are accepted only from the
+/// exact `event/dc/audit/<ulid>` shape and only after that lane itself reads
+/// successfully. Any discovery or lane read failure rejects the whole snapshot;
+/// callers publish and remember nothing from a partial view.
+fn read_projection_snapshot(persist: &mut Persist) -> Result<ProjectionSnapshot, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover datacenter projection lanes: {error}"))?;
+    let mut projected_ulids = BTreeSet::new();
+    let mut request_history = Vec::new();
+    for topic in &topics {
+        let Some(ulid) = projected_ulid_from_audit_topic(topic) else {
+            continue;
         };
-        for msg in msgs {
-            let body = msg.body.as_deref().unwrap_or("");
-            if let Some(rec) = core.observe(topic, &msg.ulid, body, msg.ts_unix_ms) {
-                publish(&rec);
-            }
+        let messages = persist
+            .list_since(topic, None)
+            .map_err(|error| format!("read durable audit output {topic}: {error}"))?;
+        if !messages.is_empty() {
+            projected_ulids.insert(ulid.to_string());
         }
     }
+    for topic in topics.into_iter().filter(|t| is_registered_action_topic(t)) {
+        let messages = persist
+            .list_since(&topic, None)
+            .map_err(|error| format!("read datacenter request {topic}: {error}"))?;
+        request_history.extend(messages.into_iter().map(|message| (topic.clone(), message)));
+    }
+    Ok(ProjectionSnapshot {
+        projected_ulids,
+        request_history,
+    })
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+/// Transactional projection pass: obtain complete durable output and request
+/// histories first, recover already-projected identities, then publish each
+/// unseen candidate and remember it only after its Bus write succeeds.
+fn poll_and_audit_with<R, W>(
+    persist: &mut Persist,
+    core: &mut DcAuditor,
+    mut read: R,
+    mut write: W,
+) -> Result<(), String>
+where
+    R: FnMut(&mut Persist) -> Result<ProjectionSnapshot, String>,
+    W: FnMut(&mut Persist, &AuditRecord) -> Result<(), String>,
+{
+    persist.reopen_if_index_changed();
+    let snapshot = read(persist)?;
+    core.reconcile_projected(snapshot.projected_ulids);
+    for (topic, message) in snapshot.request_history {
+        let body = message.body.as_deref().unwrap_or("");
+        if let Some(record) = core.project(&topic, &message.ulid, body, message.ts_unix_ms) {
+            write(persist, &record)?;
+            core.remember(&message.ulid);
+        }
+    }
+    Ok(())
+}
+
+fn poll_and_audit(persist: &mut Persist, core: &mut DcAuditor) -> Result<(), String> {
+    poll_and_audit_with(persist, core, read_projection_snapshot, publish_record)
+}
+
+fn dc_auditor_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    dc_auditor_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn dc_auditor_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 /// The supervised worker. Leader-gated (only the elected node writes the audit
@@ -320,6 +407,8 @@ pub struct DcAuditorWorker {
     node_id: String,
     leader_lock: PathBuf,
     bus_root_override: Option<PathBuf>,
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
 }
 
 impl DcAuditorWorker {
@@ -336,6 +425,8 @@ impl DcAuditorWorker {
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             node_id,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
         }
     }
 
@@ -344,6 +435,32 @@ impl DcAuditorWorker {
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
         self
+    }
+
+    /// Override the poll cadence for focused async tests.
+    #[must_use]
+    pub const fn with_tick_interval(mut self, interval: Duration) -> Self {
+        self.tick_interval = interval;
+        self
+    }
+
+    /// Override Bus opening without changing production retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     /// Only the directory leader audits (no-fixed-center: any eligible node can
@@ -364,23 +481,34 @@ impl Worker for DcAuditorWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = match self.bus_root_override.clone().or_else(default_bus_root) {
-            Some(r) => r,
-            None => {
-                tracing::debug!("dc_auditor: no bus root; worker idle");
-                return Ok(());
+        let bus_root = dc_auditor_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let mut persist = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => break persist,
+                Ok(None) => {
+                    tracing::debug!("dc_auditor: Bus root unavailable; startup will retry")
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "dc_auditor: Bus open failed; startup will retry"
+                ),
             }
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "dc_auditor: persist open failed; worker idle");
-                return Ok(());
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
         loop {
             if self.is_leader() {
-                poll_and_audit(&persist, &mut self.core);
+                if let Err(error) = poll_and_audit(&mut persist, &mut self.core) {
+                    tracing::warn!(
+                        %error,
+                        "dc_auditor: incomplete projection pass deferred"
+                    );
+                }
             }
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
@@ -406,13 +534,290 @@ mod tests {
         assert!(!is_registered_action_topic("action/dc/vm-delete"));
     }
 
-    /// perf-10 / arch-6 — `publish_to` writes the audit record in-process (no
+    #[test]
+    fn auditor_bus_root_falls_back_to_the_canonical_system_spool() {
+        assert_eq!(
+            dc_auditor_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            dc_auditor_bus_root_or_system(Some(PathBuf::from("/tmp/dc-auditor-explicit-bus",))),
+            PathBuf::from("/tmp/dc-auditor-explicit-bus")
+        );
+    }
+
+    #[test]
+    fn incomplete_reads_and_failed_writes_do_not_advance_projection_state() {
+        let bus = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let host = persist
+            .write(
+                "action/dc/host-power",
+                Priority::Default,
+                None,
+                Some(r#"{"dom0":"10.0.0.9","op":"reboot"}"#),
+            )
+            .unwrap();
+        let wol = persist
+            .write(
+                "action/dc/wol",
+                Priority::Default,
+                None,
+                Some(r#"{"host":"farm-1"}"#),
+            )
+            .unwrap();
+        let mut core = DcAuditor::new().with_actor("peer:a".into());
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_for_incomplete = Arc::clone(&writes);
+
+        let incomplete = poll_and_audit_with(
+            &mut persist,
+            &mut core,
+            |persist| {
+                let _first_lane = persist
+                    .list_since("action/dc/host-power", None)
+                    .map_err(|error| error.to_string())?;
+                Err("injected second request-lane read failure".into())
+            },
+            move |_, _| {
+                writes_for_incomplete.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(incomplete.is_err());
+        assert!(core.seen.is_empty());
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let write_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let write_attempts_for_failure = Arc::clone(&write_attempts);
+        let failed_write = poll_and_audit_with(
+            &mut persist,
+            &mut core,
+            |persist| {
+                let message = persist
+                    .list_since("action/dc/host-power", None)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .next()
+                    .expect("host action");
+                Ok(ProjectionSnapshot {
+                    projected_ulids: BTreeSet::new(),
+                    request_history: vec![("action/dc/host-power".into(), message)],
+                })
+            },
+            move |_, _| {
+                write_attempts_for_failure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("injected audit Bus write failure".into())
+            },
+        );
+        assert!(failed_write.is_err());
+        assert!(core.seen.is_empty(), "failed publish must remain retryable");
+        assert_eq!(write_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        poll_and_audit(&mut persist, &mut core).expect("complete retry projects all history");
+        assert_eq!(core.seen.len(), 2);
+        assert_eq!(
+            persist
+                .list_since(&audit_topic(&host.ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            persist
+                .list_since(&audit_topic(&wol.ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_output_snapshot_makes_restart_idempotent_and_read_failure_atomic() {
+        let bus = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let request = persist
+            .write(
+                "action/dc/host-power",
+                Priority::Default,
+                None,
+                Some(r#"{"dom0":"10.0.0.9","op":"reboot"}"#),
+            )
+            .expect("write durable request");
+
+        let mut first_core = DcAuditor::new().with_actor("peer:first".into());
+        poll_and_audit(&mut persist, &mut first_core).expect("initial projection");
+        let topic = audit_topic(&request.ulid);
+        assert_eq!(persist.list_since(&topic, None).unwrap().len(), 1);
+
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_after_restart = Arc::clone(&writes);
+        let mut restarted_core = DcAuditor::new().with_actor("peer:restart".into());
+        poll_and_audit_with(
+            &mut persist,
+            &mut restarted_core,
+            read_projection_snapshot,
+            move |_, _| {
+                writes_after_restart.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect("fresh pass recovers durable projection identity");
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(restarted_core.seen.contains(&request.ulid));
+        assert_eq!(persist.list_since(&topic, None).unwrap().len(), 1);
+
+        assert_eq!(
+            projected_ulid_from_audit_topic(&topic),
+            Some(request.ulid.as_str())
+        );
+        assert_eq!(projected_ulid_from_audit_topic("event/dc/audit/"), None);
+        assert_eq!(
+            projected_ulid_from_audit_topic("event/dc/audit/not-a-ulid"),
+            None
+        );
+        assert_eq!(
+            projected_ulid_from_audit_topic(&format!("{topic}/extra")),
+            None
+        );
+
+        let deferred_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deferred_writes_for_pass = Arc::clone(&deferred_writes);
+        let mut failed_read_core = DcAuditor::new().with_actor("peer:retry".into());
+        let incomplete_output = poll_and_audit_with(
+            &mut persist,
+            &mut failed_read_core,
+            |persist| {
+                let _existing_output = persist
+                    .list_since(&topic, None)
+                    .map_err(|error| error.to_string())?;
+                Err("injected second audit-output lane read failure".into())
+            },
+            move |_, _| {
+                deferred_writes_for_pass.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(incomplete_output.is_err());
+        assert!(failed_read_core.seen.is_empty());
+        assert_eq!(deferred_writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn late_bus_folds_retained_history_and_forward_requests_without_restart() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let bus_root = root.path().join("bus");
+        let external_bus = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        let retained = external_bus
+            .write(
+                "action/dc/host-power",
+                Priority::Default,
+                None,
+                Some(r#"{"dom0":"10.0.0.9","op":"reboot"}"#),
+            )
+            .expect("write retained audit source");
+        let workgroup = root.path().join("workgroup");
+        std::fs::create_dir_all(&workgroup).unwrap();
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let mut worker = DcAuditorWorker::new(workgroup, "peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_tick_interval(Duration::from_millis(5))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable audit Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited during late-Bus recovery"
+                );
+                if !external_bus
+                    .list_since(&audit_topic(&retained.ulid), None)
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retained durable request history must be projected");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 3);
+
+        // The worker retains its own handle. Publish after activation through
+        // this independently opened handle to prove per-pass refresh observes
+        // external Bus writers without restarting the worker.
+        let forward = external_bus
+            .write(
+                "action/dc/wol",
+                Priority::Default,
+                None,
+                Some(r#"{"host":"farm-2"}"#),
+            )
+            .expect("write forward audit source");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while external_bus
+                .list_since(&audit_topic(&forward.ulid), None)
+                .unwrap()
+                .is_empty()
+            {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before forward projection"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forward request must be projected");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            external_bus
+                .list_since(&audit_topic(&retained.ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            external_bus
+                .list_since(&audit_topic(&forward.ulid), None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must interrupt worker promptly")
+            .expect("worker task must join")
+            .expect("worker must exit cleanly");
+    }
+
+    /// perf-10 / arch-6 — `publish_record` writes the audit record in-process (no
     /// fork+exec of `mde-bus`) with EXACTLY the row a
     /// `mde-bus publish event/dc/audit/<ulid> --body-flag <body>` produced: the
     /// topic, default priority, no title/actions/reply, and the record's
     /// `body()` string verbatim.
     #[test]
-    fn publish_to_writes_cli_equivalent_row_in_process() {
+    fn publish_record_writes_cli_equivalent_row_in_process() {
         let tmp = tempfile::tempdir().unwrap();
         // Build an audit record the dedup core would have emitted.
         let rec = AuditRecord {
@@ -425,7 +830,8 @@ mod tests {
             body_summary: r#"{"uuid":"web1","op":"on"}"#.to_string(),
         };
 
-        publish_to(Some(tmp.path()), &rec);
+        let mut persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        publish_record(&mut persist, &rec).unwrap();
 
         // Read the row back through a fresh handle, as any Bus consumer does.
         let reader = Persist::open(tmp.path().to_path_buf()).unwrap();
@@ -440,12 +846,6 @@ mod tests {
         assert!(row.reply_to.is_none());
         // Byte-identical to the record's `body()` — what `--body-flag` carried.
         assert_eq!(row.body.as_deref(), Some(rec.body().as_str()));
-
-        // `None` root (pre-RPM box / disabled) publishes nothing, best-effort.
-        let tmp2 = tempfile::tempdir().unwrap();
-        publish_to(None, &rec);
-        let reader2 = Persist::open(tmp2.path().to_path_buf()).unwrap();
-        assert!(reader2.list_since(&audit_topic, None).unwrap().is_empty());
     }
 
     #[test]

@@ -461,6 +461,9 @@ behavioral evidence is not completion.
   now folds durable request/reply history, and unreadable replies cannot regress
   terminal jobs to false pending state. Machine 196 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-jobs-bus-recovery-r37.md`.
+- **Datacenter audit recovery checkpoint (2026-08-09):** complete request/output
+  snapshots recover late storage and prevent duplicate projections across restart. Machine 9 passed three exact tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-auditor-bus-recovery-r39.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
