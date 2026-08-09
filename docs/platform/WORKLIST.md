@@ -657,6 +657,11 @@ behavioral evidence is not completion.
   generation cannot block a valid session reuse. Machine 9 passed the exact
   hostile-generation fixture:
   `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-expired-replay-r17.md`.
+- **Clipboard bridge Bus checkpoint (2026-08-09):** startup now retries late
+  Bus availability after a fail-closed tail prime; live read failures retain
+  cursor/pending work and recover one queued action exactly once. Machine 194
+  passed five exact recovery/replay tests:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-09-clipboard-bridge-bus-recovery-r20.md`.
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
      - Inputs: collab types and existing clipboard v2.

@@ -103,6 +103,12 @@ pub const MAX_CLIPBOARD_ACTION_BODY_BYTES: usize = 64 * 1024;
 /// [`super::session_broker`] / [`super::scheduler`] drain at).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Startup recovery cadence bounds. The lower bound prevents a test or bad
+/// configuration from spinning; the upper bound keeps a late Bus mount from
+/// silencing clipboard relay for an unbounded interval.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 // ───────────────────────────── data model ─────────────────────────────
 
 /// The MIME-tagged format of a clip's payload.
@@ -576,16 +582,14 @@ impl OsClipboardAccess {
         }
     }
 
-    fn root(&self) -> Option<PathBuf> {
-        self.bus_root.clone().or_else(mde_bus::default_data_dir)
+    fn root(&self) -> PathBuf {
+        self.bus_root.clone().unwrap_or_else(default_bus_root)
     }
 }
 
 impl ClipboardAccess for OsClipboardAccess {
     fn read_local(&self, target_seat: &str) -> Result<Option<ClipPayload>, ClipboardAccessError> {
-        let Some(root) = self.root() else {
-            return Ok(None);
-        };
+        let root = self.root();
         let persist = Persist::open(root).map_err(|error| ClipboardAccessError::Failed {
             op: "read_local",
             reason: format!("open local clipboard Bus: {error}"),
@@ -661,12 +665,7 @@ impl ClipboardAccess for OsClipboardAccess {
                 op: "write_local",
                 reason,
             })?;
-        let Some(root) = self.root() else {
-            return Err(ClipboardAccessError::Failed {
-                op: "write_local",
-                reason: "local clipboard Bus is unavailable".to_owned(),
-            });
-        };
+        let root = self.root();
         let persist = Persist::open(root).map_err(|error| ClipboardAccessError::Failed {
             op: "write_local",
             reason: format!("open local clipboard Bus: {error}"),
@@ -726,13 +725,12 @@ fn read_new_events(
     bus_root: &Path,
     cursor: &mut Option<String>,
     authorizer: &ActionAuthorizer,
-) -> Vec<ClipboardEvent> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
+) -> Result<Vec<ClipboardEvent>, String> {
+    let persist = Persist::open(bus_root.to_path_buf())
+        .map_err(|error| format!("open clipboard action Bus: {error}"))?;
+    let msgs = persist
+        .list_since(ACTION_TOPIC, cursor.as_deref())
+        .map_err(|error| format!("read clipboard action Bus: {error}"))?;
     let mut out = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
@@ -754,20 +752,26 @@ fn read_new_events(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Seed the cursor to the newest existing message so a (re)start doesn't re-apply a
 /// stale clipboard from the backlog (a clip is transient, unlike the broker's
 /// fold-from-genesis roster). `None` when the topic is empty.
-fn prime_cursor(bus_root: &Path) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(ACTION_TOPIC, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
+fn prime_cursor(bus_root: &Path) -> Result<Option<String>, String> {
+    let persist = Persist::open(bus_root.to_path_buf())
+        .map_err(|error| format!("open clipboard action Bus: {error}"))?;
+    persist
+        .latest_ulid(ACTION_TOPIC)
+        .map_err(|error| format!("prime clipboard action cursor: {error}"))
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn default_bus_root() -> PathBuf {
+    bus_root_or_system(mde_bus::default_data_dir())
+}
+
+fn bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 /// The VDI clipboard-bridge worker. Per-session + node-local (NOT leader-gated).
@@ -841,8 +845,10 @@ impl ClipboardBridgeWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    fn bus_root(&self) -> PathBuf {
+        self.bus_root_override
+            .clone()
+            .unwrap_or_else(default_bus_root)
     }
 
     /// Apply one clip: run the pure [`relay`] decision, guard against echo, and relay
@@ -920,9 +926,19 @@ impl ClipboardBridgeWorker {
                 pending.push(event);
             }
         }
-        for event in read_new_events(bus_root, cursor, self.authorizer.as_ref()) {
-            if !self.relay_event(&event, latest) {
-                pending.push(event);
+        match read_new_events(bus_root, cursor, self.authorizer.as_ref()) {
+            Ok(events) => {
+                for event in events {
+                    if !self.relay_event(&event, latest) {
+                        pending.push(event);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "clipboard_bridge: Bus read unavailable; retaining cursor and pending work"
+                );
             }
         }
     }
@@ -935,13 +951,30 @@ impl Worker for ClipboardBridgeWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            tracing::debug!("clipboard_bridge: no bus root; worker idle");
-            return Ok(());
+        let bus_root = self.bus_root();
+        let retry_interval = self
+            .poll
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        // A failed open/read is unavailable state, not an empty action history.
+        // Retry the prime before entering the live loop so a storage race cannot
+        // turn a restart backlog into newly authorized clipboard effects.
+        let mut cursor = loop {
+            match prime_cursor(&bus_root) {
+                Ok(cursor) => break cursor,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "clipboard_bridge: Bus unavailable during cursor prime; retrying"
+                    );
+                }
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
         };
         // Skip the backlog on start — a clip is transient, so a restart must not
         // re-apply a stale clipboard (unlike the broker's fold-from-genesis roster).
-        let mut cursor = prime_cursor(&bus_root);
         let mut latest: BTreeMap<SessionId, ClipPayload> = BTreeMap::new();
         let mut pending = Vec::new();
         let mut tick = tokio::time::interval(self.poll);
@@ -1352,8 +1385,13 @@ mod tests {
     }
 
     #[test]
-    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
-        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+    fn clipboard_bus_root_preserves_resolved_root_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/clipboard-explicit-bus");
+        assert_eq!(bus_root_or_system(Some(explicit.clone())), explicit);
+        assert_eq!(
+            bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
     }
 
     // ── worker wiring (seeded temp bus + injected fake access) ──
@@ -1589,6 +1627,115 @@ mod tests {
         assert!(
             writes.lock().expect("writes mutex").is_empty(),
             "the backlog clip was primed past, not re-applied on start"
+        );
+        let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[tokio::test]
+    async fn startup_bus_failure_recovers_forward_without_restart_and_stops_promptly() {
+        use mde_bus::hooks::config::Priority;
+
+        let holder = tempfile::tempdir().expect("recovery tempdir");
+        let bus = holder.path().join("bus");
+        std::fs::write(&bus, b"not a directory").expect("block Bus root");
+
+        let access = FakeClipboard::default();
+        let writes = access.writes.clone();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            holder.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker = ClipboardBridgeWorker::new()
+            .with_access(Box::new(access))
+            .with_bus_root(bus.clone())
+            .with_authorizer(authorizer)
+            .with_poll(Duration::from_millis(10));
+        let handle =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !handle.is_finished(),
+            "a transient Bus-open failure must not permanently exit the worker"
+        );
+
+        std::fs::remove_file(&bus).expect("remove Bus blocker");
+        let persist = Persist::open(bus.clone()).expect("recover Bus");
+        // Let the startup cursor prime the now-empty Bus before publishing the
+        // forward action; this action belongs to the live worker generation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fresh = event("recovered-session", ClipDirection::ClientToGuest, "forward");
+        let body = signed_body(&fresh, "clip-bus-recovery-forward");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
+            .expect("publish forward action");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if writes.lock().expect("writes mutex").len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered worker must consume the forward action");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            writes.lock().expect("writes mutex").len(),
+            1,
+            "the recovered action must have one clipboard effect"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        let joined = tokio::time::timeout(Duration::from_millis(250), handle)
+            .await
+            .expect("shutdown must interrupt the active wait")
+            .expect("worker task must join");
+        assert!(joined.is_ok());
+    }
+
+    #[test]
+    fn transient_bus_read_failure_retains_cursor_and_queued_action() {
+        let clip = event("queued-session", ClipDirection::ClientToGuest, "queued");
+        let body = signed_body(&clip, "clip-bus-read-recovery");
+        let bus = seed_bodies(&[body]);
+        let backup = bus.with_extension("available");
+        let access = FakeClipboard::default();
+        let writes = access.writes.clone();
+        let worker = ClipboardBridgeWorker::new()
+            .with_access(Box::new(access))
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
+        let mut cursor = None;
+        let mut latest = BTreeMap::new();
+        let mut pending = Vec::new();
+
+        std::fs::rename(&bus, &backup).expect("hide Bus root");
+        std::fs::write(&bus, b"not a directory").expect("block Bus reopen");
+        worker.drain_and_relay(&bus, &mut cursor, &mut latest, &mut pending);
+        assert!(
+            cursor.is_none(),
+            "Bus failure must not advance the action cursor"
+        );
+        assert!(writes.lock().expect("writes mutex").is_empty());
+
+        std::fs::remove_file(&bus).expect("remove Bus blocker");
+        std::fs::rename(&backup, &bus).expect("restore Bus root");
+        worker.drain_and_relay(&bus, &mut cursor, &mut latest, &mut pending);
+        worker.drain_and_relay(&bus, &mut cursor, &mut latest, &mut pending);
+        assert!(
+            cursor.is_some(),
+            "recovery must advance past the queued action"
+        );
+        assert_eq!(
+            writes.lock().expect("writes mutex").len(),
+            1,
+            "the queued capability must survive Bus failure without duplicate effect"
         );
         let _ = std::fs::remove_dir_all(&bus);
     }
