@@ -439,9 +439,9 @@ behavioral evidence is not completion.
 - **Vehicle transaction recovery (2026-08-09):** late/replaced Bus storage preserves staged state; a privileged-reboot journal prevents repeated effects.
   BigBoy passed four exact gates:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-vehicle-bus-transaction-recovery-r67.md`.
-- **Media-source Bus recovery checkpoint (2026-08-09):** discovery waits through late storage, then starts mDNS and publishes the honest merged roster without restart.
-  Machine 193 passed two exact recovery/fallback tests:
-  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`.
+- **Media-source Bus recovery checkpoint (2026-08-09):** discovery survives late and same-path-replaced storage and republishes the complete roster without restart.
+  Exact machine-193/196 gates passed: `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`,
+  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-replacement-r81.md`.
 - **Media-server Bus recovery checkpoint (2026-08-09):** share manifests,
   serving, aggregation, and publication remain behind recoverable Bus startup;
   machine 193 passed two exact activation/fallback tests:

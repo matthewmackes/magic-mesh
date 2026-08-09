@@ -45,7 +45,8 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::media_sources::{
@@ -471,6 +472,12 @@ struct MdnsBrowse {
     browsers: Vec<(&'static str, mdns_sd::Receiver<ServiceEvent>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaSourcesBusIdentity {
+    device: u64,
+    inode: u64,
+}
+
 /// MEDIA-14 — the mesh media-source discovery aggregator worker.
 pub struct MediaSourcesWorker {
     /// This node's id (the publish stamp).
@@ -606,6 +613,31 @@ impl MediaSourcesWorker {
         true
     }
 
+    /// Publish only to the Bus generation that was opened for this pass.
+    /// A same-path replacement may race the SQLite write; clearing the gate on
+    /// a failed verification guarantees the next tick retries the live index.
+    fn publish_current(
+        &mut self,
+        persist: &Persist,
+        bus_root: &Path,
+        identity: MediaSourcesBusIdentity,
+        sources: Vec<MediaSource>,
+        force: bool,
+    ) -> bool {
+        if !self.publish(persist, sources, force) {
+            return false;
+        }
+        if !matches!(media_sources_bus_identity(bus_root), Ok(current) if current == identity) {
+            self.last_fingerprint = None;
+            tracing::debug!(
+                target: "mackesd::media_sources",
+                "Bus changed during media-source publication; retrying on the next tick"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Start the media-type mDNS browsers (graceful degrade: no daemon / no
     /// multicast interface → an honest `gated:` lane, worker keeps aggregating
     /// the registry lane).
@@ -649,9 +681,9 @@ impl Worker for MediaSourcesWorker {
         let retry_interval = self
             .tick
             .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
-        let persist = loop {
-            match Persist::open(bus_root.clone()) {
-                Ok(persist) => break persist,
+        let (persist, identity) = loop {
+            match open_current_media_sources_bus(&bus_root) {
+                Ok(opened) => break opened,
                 Err(error) => tracing::debug!(
                     target: "mackesd::media_sources",
                     %error,
@@ -667,7 +699,9 @@ impl Worker for MediaSourcesWorker {
 
         // Immediate first publish so the Sources panel doesn't wait a heartbeat.
         let sources = self.collect_sources();
-        self.publish(&persist, sources, true);
+        let published = self.publish_current(&persist, &bus_root, identity, sources, true);
+        drop(persist);
+        let mut active_identity = published.then_some(identity);
         let mut last_pub = Instant::now();
 
         let mut tick = tokio::time::interval(self.tick);
@@ -677,11 +711,23 @@ impl Worker for MediaSourcesWorker {
                 _ = tick.tick() => {
                     let mdns_changed = self.drain_mdns(browse.as_ref());
                     let due = last_pub.elapsed() >= self.heartbeat;
-                    if mdns_changed || due {
+                    let Ok((persist, identity)) = open_current_media_sources_bus(&bus_root) else {
+                        continue;
+                    };
+                    let bus_changed = active_identity != Some(identity);
+                    if mdns_changed || due || bus_changed {
                         let sources = self.collect_sources();
                         // A heartbeat republishes unconditionally (late
-                        // subscribers); otherwise only on change.
-                        if self.publish(&persist, sources, due) {
+                        // subscribers); a replacement receives the complete
+                        // current fold even when discovery itself is unchanged.
+                        if self.publish_current(
+                            &persist,
+                            &bus_root,
+                            identity,
+                            sources,
+                            due || bus_changed,
+                        ) {
+                            active_identity = Some(identity);
                             last_pub = Instant::now();
                         }
                     }
@@ -699,6 +745,40 @@ fn media_sources_bus_root(override_root: Option<PathBuf>) -> PathBuf {
 
 fn media_sources_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn media_sources_bus_identity(root: &Path) -> io::Result<MediaSourcesBusIdentity> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("Bus index is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(MediaSourcesBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(MediaSourcesBusIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+}
+
+fn open_current_media_sources_bus(root: &Path) -> io::Result<(Persist, MediaSourcesBusIdentity)> {
+    let before = media_sources_bus_identity(root).ok();
+    let persist =
+        Persist::open(root.to_path_buf()).map_err(|error| io::Error::other(error.to_string()))?;
+    let after = media_sources_bus_identity(root)?;
+    if before.is_some_and(|identity| identity != after) {
+        return Err(io::Error::other("Bus changed while it was being opened"));
+    }
+    Ok((persist, after))
 }
 
 /// Wall-clock epoch millis for the published record.
@@ -1229,6 +1309,70 @@ mod tests {
         .await
         .expect("the same worker must publish immediately after Bus recovery");
         assert!(!task.is_finished(), "recovered worker must remain active");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt media polling")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn same_path_bus_replacement_receives_current_fold_without_worker_restart() {
+        let holder = tempfile::tempdir().expect("media-source replacement root");
+        let bus = holder.path().join("bus");
+        let retired = holder.path().join("retired-bus");
+        let initial = Persist::open(bus.clone()).expect("initial Bus");
+        let workgroup = tempfile::tempdir().expect("media-source workgroup");
+        let mut worker = MediaSourcesWorker::new(
+            "node-replacement".to_string(),
+            workgroup.path().to_path_buf(),
+        )
+        .with_bus_root(bus.clone())
+        .with_tick(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if initial
+                    .read_latest(MEDIA_SOURCES_TOPIC)
+                    .map(|message| message.is_some())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial Bus publication");
+        drop(initial);
+
+        std::fs::rename(&bus, &retired).expect("retire initial Bus");
+        let replacement = Persist::open(bus.clone()).expect("replacement Bus");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if replacement
+                    .read_latest(MEDIA_SOURCES_TOPIC)
+                    .map(|message| message.is_some())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus must receive the current fold");
+        assert!(
+            !task.is_finished(),
+            "replacement must not restart the worker"
+        );
 
         shutdown_tx.send(true).expect("request shutdown");
         tokio::time::timeout(Duration::from_millis(250), task)
