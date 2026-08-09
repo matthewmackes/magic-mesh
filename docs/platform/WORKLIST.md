@@ -611,8 +611,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-vdi-clipboard-transport-s4-r1.md`.
 - **S5 permission UI (2026-08-08):** modal, VNC/RDP/SPICE one-use gating, revocation, replay, and redacted audit passed; live guest proof remains:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-permission-audit-model-s5-r1.md`.
-- **VDI metadata admission checkpoint (2026-08-09):** the 64-KiB pre-decode ceiling and bounded safe identities passed 31/31 hostile tests on `.50`:
-  `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-metadata-admission-r6.md`.
+- **VDI admission checkpoints (2026-08-09):** 64-KiB predecode/identity bounds passed 31/31; lease-capped permission and cleanup passed 12/12 on `.50`:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-metadata-admission-r6.md`; `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-lease-expiry-r7.md`.
 - Remaining work:
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.

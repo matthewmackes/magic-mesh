@@ -73,7 +73,10 @@ impl ClipboardGateMetadata {
             mime_offers: message.envelope.mime_offers.clone(),
             has_files_reference: message.envelope.files_reference.is_some(),
             byte_count: message.envelope.byte_count,
-            expires_at_ms: message.envelope.expires_at_ms,
+            // A permission cannot outlive either authority that admitted it.
+            // Keeping only the envelope expiry would let an approval minted
+            // immediately before lease expiry materialize after lease expiry.
+            expires_at_ms: message.envelope.expires_at_ms.min(lease.expires_at_ms),
             selected_mime: message.selected_mime.clone(),
             disclosure: message.disclosure,
             session_id: message.session_id.clone(),
@@ -402,40 +405,26 @@ impl ClipboardPermissionModel {
         context: ClipboardPermissionContext,
         now_ms: u64,
     ) -> Result<Option<ClipboardApprovalToken>, ClipboardPermissionError> {
-        if let Err(error) = message.admit(lease, previous_receipt, now_ms) {
-            let refusal = match error {
-                mackes_mesh_types::vdi_clipboard::VdiClipboardTransportV2Error::SecretBearing => {
-                    ClipboardPermissionError::SecretBearing
-                }
-                mackes_mesh_types::vdi_clipboard::VdiClipboardTransportV2Error::Replay => {
-                    ClipboardPermissionError::StaleOrReplay
-                }
-                mackes_mesh_types::vdi_clipboard::VdiClipboardTransportV2Error::ExpiredLease => {
-                    ClipboardPermissionError::Expired
-                }
-                mackes_mesh_types::vdi_clipboard::VdiClipboardTransportV2Error::UnsupportedMime
-                | mackes_mesh_types::vdi_clipboard::VdiClipboardTransportV2Error::UnsupportedPayload => {
-                    ClipboardPermissionError::UnsupportedMime
-                }
-                _ => ClipboardPermissionError::InvalidMetadata,
-            };
-            self.audit_refusal(
-                &message.envelope,
-                &target,
-                &message.selected_mime,
-                now_ms,
-                refusal,
-            );
-            return Err(refusal);
-        }
-        self.request(
-            &message.envelope,
-            &message.selected_mime,
-            message.disclosure,
-            target,
-            context,
+        let metadata = match ClipboardGateMetadata::admitted_vdi(
+            message,
+            lease,
+            previous_receipt,
+            target.clone(),
             now_ms,
-        )
+        ) {
+            Ok(metadata) => metadata,
+            Err(refusal) => {
+                self.audit_refusal(
+                    &message.envelope,
+                    &target,
+                    &message.selected_mime,
+                    now_ms,
+                    refusal,
+                );
+                return Err(refusal);
+            }
+        };
+        self.request_metadata(metadata, context, now_ms)
     }
 
     /// Admit a direct-DRM or peer Clipboard V2 envelope. This copies only its
@@ -571,18 +560,21 @@ impl ClipboardPermissionModel {
         now_ms: u64,
     ) -> Result<(), ClipboardPermissionError> {
         self.revoke_if_context_changed(context, now_ms)?;
+        let expired = self
+            .active
+            .as_ref()
+            .ok_or(ClipboardPermissionError::NoActiveTransfer)?
+            .summary
+            .expires_at_ms
+            <= now_ms;
+        if expired {
+            self.fail(ClipboardFailure::Expired, now_ms)?;
+            return Err(ClipboardPermissionError::Expired);
+        }
         let active = self
             .active
             .as_mut()
             .ok_or(ClipboardPermissionError::NoActiveTransfer)?;
-        if now_ms >= active.summary.expires_at_ms {
-            active.state = ClipboardTransferState::Failed(ClipboardFailure::Expired);
-            self.record_active(
-                now_ms,
-                ClipboardAuditOutcome::Failed(ClipboardFailure::Expired),
-            );
-            return Err(ClipboardPermissionError::Expired);
-        }
         match active.state {
             ClipboardTransferState::AwaitingApproval { token: expected } if expected == token => {
                 active.state = ClipboardTransferState::Approved;
@@ -1518,6 +1510,70 @@ mod tests {
             ticket.try_begin_materialization(),
             ClipboardGateReadiness::Pending,
             "one-use ticket must not begin materialization twice"
+        );
+    }
+
+    #[test]
+    fn vdi_permission_expires_with_lease_before_offer_and_cleans_up_ticket() {
+        let mut controller = ClipboardPermissionController::default();
+        let ingress = controller.ingress();
+        let (mut lease, mut message) = vdi_message(23, "text/html", "text/plain;charset=utf-8");
+        lease.expires_at_ms = NOW + 5;
+        message.lease_expires_at_ms = lease.expires_at_ms;
+        let ticket = ingress
+            .submit_vdi(
+                &message,
+                &lease,
+                None,
+                target(ClipboardTargetKind::Guest),
+                NOW,
+            )
+            .expect("offer is valid before its lease expires");
+
+        controller.poll_ingress(NOW);
+        let token = match controller.model.active_state() {
+            Some(ClipboardTransferState::AwaitingApproval { token }) => *token,
+            state => panic!("rich VDI transfer was not gated: {state:?}"),
+        };
+        assert_eq!(
+            controller
+                .model
+                .active_summary()
+                .map(|summary| summary.expires_at_ms),
+            Some(lease.expires_at_ms),
+            "permission lifetime must be bounded by the shorter lease"
+        );
+
+        assert_eq!(
+            controller.apply_operator_action(ClipboardOperatorAction::Approve(token), NOW + 5),
+            Err(ClipboardPermissionError::Expired)
+        );
+        assert_eq!(
+            ticket.try_begin_materialization(),
+            ClipboardGateReadiness::Refused
+        );
+        assert_eq!(
+            controller.model.active_state(),
+            Some(&ClipboardTransferState::Failed(ClipboardFailure::Expired))
+        );
+
+        let mut renewed_lease = lease.clone();
+        renewed_lease.lease_id = "renewed-lease".into();
+        renewed_lease.expires_at_ms = NOW + 60_000;
+        let mut replay = message.clone();
+        replay.lease_id = renewed_lease.lease_id.clone();
+        replay.lease_expires_at_ms = renewed_lease.expires_at_ms;
+        assert_eq!(
+            controller.model.request_vdi(
+                &replay,
+                &renewed_lease,
+                None,
+                target(ClipboardTargetKind::Guest),
+                context(),
+                NOW + 6,
+            ),
+            Err(ClipboardPermissionError::StaleOrReplay),
+            "renewing lease authority must not replay an expired source sequence"
         );
     }
 
