@@ -507,17 +507,43 @@ impl Display1AttachmentServer {
             fs::create_dir_all(parent)
                 .map_err(|error| Display1Error::Attachment(format!("create broker root: {error}")))?;
         }
-        match fs::remove_file(&socket_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                match UnixStream::connect(&socket_path) {
+                    Ok(_) => {
+                        return Err(Display1Error::Attachment(
+                            "Display1 broker socket is already active".into(),
+                        ));
+                    }
+                    Err(probe) if probe.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        fs::remove_file(&socket_path).map_err(|error| {
+                            Display1Error::Attachment(format!(
+                                "remove stale broker socket: {error}"
+                            ))
+                        })?;
+                        UnixListener::bind(&socket_path).map_err(|error| {
+                            Display1Error::Attachment(format!("bind broker socket: {error}"))
+                        })?
+                    }
+                    Err(probe) if probe.kind() == std::io::ErrorKind::NotFound => {
+                        UnixListener::bind(&socket_path).map_err(|error| {
+                            Display1Error::Attachment(format!("bind broker socket: {error}"))
+                        })?
+                    }
+                    Err(probe) => {
+                        return Err(Display1Error::Attachment(format!(
+                            "probe existing broker socket: {probe}"
+                        )));
+                    }
+                }
+            }
             Err(error) => {
                 return Err(Display1Error::Attachment(format!(
-                    "remove stale broker socket: {error}"
-                )))
+                    "bind broker socket: {error}"
+                )));
             }
-        }
-        let listener = UnixListener::bind(&socket_path)
-            .map_err(|error| Display1Error::Attachment(format!("bind broker socket: {error}")))?;
+        };
         listener
             .set_nonblocking(true)
             .map_err(|error| Display1Error::Attachment(format!("configure broker socket: {error}")))?;
@@ -1038,6 +1064,56 @@ mod tests {
             )
             .expect_err("nonce replay must fail");
         assert!(matches!(error, Display1Error::Attachment(message) if message.contains("replayed")));
+    }
+
+    #[test]
+    fn duplicate_server_cannot_replace_an_active_lease_socket() {
+        let temp = tempfile::tempdir().expect("temp");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-duplicate-server".into(),
+            nonce: "nonce-duplicate-server".into(),
+            workload_id: WorkloadId::new("browser-seat15").expect("workload id"),
+            generation: 2,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: display1_now_ms().saturating_add(5_000),
+        };
+        let original = Display1AttachmentServer::start_at(temp.path(), lease.clone())
+            .expect("start original broker");
+
+        let duplicate = match Display1AttachmentServer::start_at(temp.path(), lease) {
+            Ok(_) => panic!("duplicate broker replaced an active lease socket"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            duplicate,
+            Display1Error::Attachment(message) if message.contains("already active")
+        ));
+        assert!(original.socket_path().exists());
+        UnixStream::connect(original.socket_path()).expect("original broker remains reachable");
+    }
+
+    #[test]
+    fn stale_socket_is_replaced_after_the_previous_listener_is_gone() {
+        let temp = tempfile::tempdir().expect("temp");
+        let lease = WorkloadAttachmentLease {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            lease_id: "lease-stale-server".into(),
+            nonce: "nonce-stale-server".into(),
+            workload_id: WorkloadId::new("browser-seat15").expect("workload id"),
+            generation: 2,
+            protocol: WorkloadAttachmentProtocol::QemuDisplay1Dmabuf,
+            expires_at_ms: display1_now_ms().saturating_add(5_000),
+        };
+        let socket_path =
+            display1_socket_path_at(temp.path(), &lease.lease_id).expect("bounded socket path");
+        fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("broker root");
+        let stale = UnixListener::bind(&socket_path).expect("stale listener");
+        drop(stale);
+
+        let replacement = Display1AttachmentServer::start_at(temp.path(), lease)
+            .expect("replace connection-refused stale socket");
+        UnixStream::connect(replacement.socket_path()).expect("replacement broker is reachable");
     }
 
     #[test]

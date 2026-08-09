@@ -925,6 +925,11 @@ impl WorkloadOperationStatus {
         }
         if let Some(attachment) = &self.attachment {
             attachment.validate(now_ms)?;
+            if attachment.workload_id != self.workload_id {
+                return Err(WorkloadContractError::InvalidField(
+                    "attachment_workload_id",
+                ));
+            }
             if attachment.generation != self.generation {
                 return Err(WorkloadContractError::InvalidNumber(
                     "attachment_generation",
@@ -1282,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn status_rejects_a_stale_attachment_generation() {
+    fn status_rejects_a_foreign_workload_or_stale_generation_attachment() {
         let workload_id = WorkloadId::new("browser-seat15").expect("valid workload id");
         let mut status = WorkloadOperationStatus {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -1316,6 +1321,16 @@ mod tests {
         };
         assert!(status.validate(1_000).is_ok());
 
+        status.attachment.as_mut().expect("attachment").workload_id =
+            WorkloadId::new("browser-other-node").expect("valid workload id");
+        assert_eq!(
+            status.validate(1_000),
+            Err(WorkloadContractError::InvalidField(
+                "attachment_workload_id"
+            ))
+        );
+
+        status.attachment.as_mut().expect("attachment").workload_id = status.workload_id.clone();
         status.generation = 2;
         assert_eq!(
             status.validate(1_000),

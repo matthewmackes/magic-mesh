@@ -120,10 +120,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-datacenter-xcp-authority-hard-cut-r7.md`.
 - **Legacy compute-create hard cut (2026-08-09):** the orphan `compute/create/*` worker and direct `virt-install` path were deleted; typed Workloads owns create. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-provision-hard-cut-r8.md`.
-- **Cloud/certificate authority hard cut (2026-08-09):** direct cloud VM apply/lifecycle, shell Provision Apply, and the producerless certificate responder were deleted. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-cert-authority-hard-cut-r9.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-cloud-contract-truth-r10.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-phone-cloud-lifecycle-hard-cut-r11.md`.
+- **Authority/contract hardening (2026-08-09):** lifecycle/provision bypasses were deleted; attachment identity, restart replay, and Display1 ownership fail closed. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-contract-restart-display1-hardening-r12.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and

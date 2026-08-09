@@ -369,6 +369,8 @@ run_action() {
 }
 
 self_test() {
+    local fixture
+    fixture=$(mktemp -d)
     expect_reject() { "$@" && return 1 || return 0; }
     IDENTITY=
     ssh_args
@@ -405,6 +407,22 @@ self_test() {
         /var/lib/libvirt/images/browser-vm-r1-overlay.qcow2 \
         /var/lib/libvirt/images/browser-vm-chromium.qcow2 \
         /var/lib/libvirt/images/browser-vm-chromium.qcow2 qcow2 qcow2 2
+
+    # Exercise the embedded receipt writer as executable Python, not merely as
+    # shell heredoc text. This pins the operator-visible artifact to the same
+    # schema validator used by a live deployment.
+    TARGET=seat15
+    USER_NAME=mm
+    REMOTE_IMAGE=/var/lib/libvirt/images/browser-vm-chromium.qcow2
+    DOMAIN_NAME=browser-vm
+    RECEIPT="$fixture/deployment-receipt.json"
+    SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+    EXPECTED_DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    write_receipt seat15 12345678-1234-4234-8234-123456789abc running \
+        /var/lib/libvirt/images/browser-vm-r1-overlay.qcow2 \
+        "$EXPECTED_DIGEST" "$REMOTE_IMAGE" qcow2 qcow2 1 >/dev/null
+    [[ -s "$RECEIPT" ]] || fail "deployment receipt self-test did not materialize a receipt"
+    rm -rf -- "$fixture"
     echo 'deploy-image: self-test passed'
 }
 

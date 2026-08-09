@@ -2512,6 +2512,8 @@ impl WorkloadComputeWorker {
                 Some(status) => status,
                 None => return,
             };
+        }
+        if status.phase == WorkloadOperationPhase::Validating {
             let (host, storage) = self.capacities(ledger.statuses());
             let admission =
                 admit_workload_for_backend(request.resources, request.backend, host, storage);
@@ -2872,6 +2874,7 @@ impl WorkloadComputeWorker {
                     status.phase,
                     WorkloadOperationPhase::Admitting
                         | WorkloadOperationPhase::Queued
+                        | WorkloadOperationPhase::Validating
                         | WorkloadOperationPhase::Defining
                         | WorkloadOperationPhase::Starting
                         | WorkloadOperationPhase::WaitingForGuest
@@ -2913,6 +2916,7 @@ impl WorkloadComputeWorker {
             if matches!(
                 status.phase,
                 WorkloadOperationPhase::Queued
+                    | WorkloadOperationPhase::Validating
                     | WorkloadOperationPhase::Admitting
                     | WorkloadOperationPhase::Defining
             ) {
@@ -4829,6 +4833,40 @@ mod tests {
                 calls: calls.clone(),
             }));
         worker.reconcile_inflight(&mut ledger, now_ms());
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert_eq!(
+            ledger.status("op-1").expect("status").phase,
+            WorkloadOperationPhase::WaitingForGuest
+        );
+    }
+
+    #[test]
+    fn validating_replay_after_restart_resumes_admission_and_drives_one_side_effect() {
+        let temp = tempfile::tempdir().expect("temp");
+        let calls = Arc::new(Mutex::new(0));
+        let request = request();
+        {
+            let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+            let mut status = ledger
+                .accept(request.clone(), now_ms())
+                .expect("queue request");
+            status.phase = WorkloadOperationPhase::Validating;
+            ledger
+                .advance(&request.request_id, status, now_ms())
+                .expect("persist validating crash boundary");
+        }
+
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("reopened ledger");
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: calls.clone(),
+            }));
+
+        worker.reconcile_inflight(&mut ledger, now_ms());
+
         assert_eq!(*calls.lock().expect("calls"), 1);
         assert_eq!(
             ledger.status("op-1").expect("status").phase,

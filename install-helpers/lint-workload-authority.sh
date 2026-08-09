@@ -44,6 +44,7 @@ retired_xcp_provision="$repo_root/crates/mesh/mackesd/src/workers/xcp_provision.
 retired_xcp_host="$repo_root/crates/mesh/mackesd/src/workers/xcp_host.rs"
 retired_xcp_crate="$repo_root/crates/mesh/mackes-xcp/Cargo.toml"
 retired_compute_provision="$repo_root/crates/mesh/mackesd/src/workers/compute_provision.rs"
+retired_mesh_vm_provision="$repo_root/install-helpers/provision-mesh-vm.sh"
 retired_cert_authority="$repo_root/crates/mesh/mackesd/src/workers/cert_authority.rs"
 retired_vm_lifecycle="$repo_root/crates/mesh/mackesd/src/workers/vm_lifecycle.rs"
 retired_container_lifecycle="$repo_root/crates/mesh/mackesd/src/workers/container.rs"
@@ -289,6 +290,7 @@ for retired_file in \
   "$retired_xcp_host" \
   "$retired_xcp_crate" \
   "$retired_compute_provision" \
+  "$retired_mesh_vm_provision" \
   "$retired_cert_authority" \
   "$retired_vm_lifecycle" \
   "$retired_container_lifecycle"; do
