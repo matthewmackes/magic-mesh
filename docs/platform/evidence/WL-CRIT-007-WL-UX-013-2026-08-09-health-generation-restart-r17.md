@@ -43,10 +43,13 @@ cargo test -p mackesd --lib --features async-services \
   -- --nocapture
 ```
 
-Result: PASS — 1 passed, 0 failed, 4,387 filtered out. `git diff --check`
-passed. A whole-file `rustfmt --check` remains red on an unrelated pre-existing
-assertion block in the same module; the changed hunks require no formatting
-rewrite and no broad test was run.
+Result: PASS — 1 passed, 0 failed, 4,387 filtered out. The related exact
+`applied_actions_emit_audited_results_with_refreshed_evidence` regression also
+passed 1/1 in the same warmed slot, proving ordinary same-process generation
+increments and stale-action refusal remain intact. `git diff --check` passed. A
+whole-file `rustfmt --check` remains red on an unrelated pre-existing assertion
+block in the same module; the changed hunks require no formatting rewrite and no
+broad test was run.
 
 The corrected source is committed for the next governed candidate. It was not
 hot-copied onto Dell; therefore this record does not claim Dell's installed
