@@ -129,6 +129,25 @@ pub fn conversation_topic(key: &str) -> String {
 
 /// Poll cadence — responsive for chat without hammering the Bus index.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Keep a missing startup Bus responsive without spinning or delaying shutdown.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Mutable Chat verbs are transient commands. Every one must be primed to its
+/// current tail before activation so a restart never replays retained effects.
+const TRANSIENT_CHAT_LANES: &[&str] = &[
+    ACTION_CHAT_SEND,
+    ACTION_CHAT_ROOM,
+    ACTION_CHAT_PRESENCE,
+    ACTION_CHAT_MUTE,
+    ACTION_CHAT_NOTIFY_PREFS,
+    ACTION_CHAT_ALERT_ACTION,
+];
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn() -> Result<Option<Persist>, String> + Send + Sync;
+#[cfg(test)]
+type ActivationFn = dyn Fn(&Persist) -> Result<ChatActivation, String> + Send + Sync;
 
 /// The Bus topic **prefixes** the worker folds into chat (lock 11).
 ///
@@ -927,6 +946,12 @@ pub struct ChatWorker {
     signing_key: SigningKey,
     poll_interval: Duration,
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus open seam for startup-race tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    /// Atomic topic/tail/read activation seam for startup-race tests.
+    #[cfg(test)]
+    activation_override: Option<Arc<ActivationFn>>,
     manual_presence: Option<Presence>,
     status_message: Option<String>,
     authorizer: Arc<ActionAuthorizer>,
@@ -944,6 +969,10 @@ impl ChatWorker {
             signing_key,
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            activation_override: None,
             manual_presence: None,
             status_message: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
@@ -963,6 +992,43 @@ impl ChatWorker {
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
         self
+    }
+
+    /// Override dynamic Bus resolution/opening without changing production
+    /// retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override the all-or-nothing topic/tail/read activation transaction.
+    #[cfg(test)]
+    #[must_use]
+    fn with_activation(mut self, activate: Arc<ActivationFn>) -> Self {
+        self.activation_override = Some(activate);
+        self
+    }
+
+    fn open_bus(&self) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open();
+        }
+
+        Persist::open(chat_bus_root(self.bus_root_override.clone()))
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prepare_activation(&self, persist: &Persist) -> Result<ChatActivation, String> {
+        #[cfg(test)]
+        if let Some(activate) = self.activation_override.as_ref() {
+            return activate(persist);
+        }
+
+        prepare_chat_activation(persist)
     }
 
     /// Override the poll cadence (tests use a short value).
@@ -1321,7 +1387,21 @@ impl ChatWorker {
     /// messages are NOT re-persisted (write-own-file); their durable copy is the
     /// sender's Syncthing log, which the union rehydrates on restart.
     fn drain_inbound(&self, persist: &Persist, state: &mut ChatState, dnd: bool) {
-        for m in take_new(persist, &mut state.cursors, EVENT_CHAT_MESSAGE) {
+        let messages = take_new_all(persist, &mut state.cursors, EVENT_CHAT_MESSAGE);
+        self.fold_inbound_messages(persist, state, dnd, true, messages);
+    }
+
+    /// Fold retained or forward signed envelopes. Startup replay suppresses the
+    /// transient toast while still rebuilding the durable conversation model.
+    fn fold_inbound_messages(
+        &self,
+        persist: &Persist,
+        state: &mut ChatState,
+        dnd: bool,
+        emit_live_toasts: bool,
+        messages: Vec<StoredMessage>,
+    ) {
+        for m in messages {
             let Some(body) = m.body.as_deref() else {
                 continue;
             };
@@ -1357,7 +1437,8 @@ impl ChatWorker {
             // backfill re-fold), gated by the per-contact / per-room mute + DND
             // (NOTIFY-CHAT-5 / KIRON lock 9). A muted contact is silent here but
             // was still logged into the ring above.
-            if inserted
+            if emit_live_toasts
+                && inserted
                 && state
                     .notify
                     .should_ring_message(&sender, room_id.as_deref(), dnd)
@@ -1383,39 +1464,56 @@ impl ChatWorker {
             }
         };
         for topic in topics.iter().filter(|t| is_alert_lane(t)) {
-            for m in take_new(persist, &mut state.cursors, topic) {
-                let body = m.body.as_deref().unwrap_or("");
-                let msg = alert_message(topic, &m.ulid, body, m.ts_unix_ms, &self.self_host);
-                let origin = msg.sender.clone();
-                let severity = alert_severity(&msg);
-                let source = alert_source(&msg);
-                // Build the chyron body before the ring consumes the message.
-                let show = toast_for_alert(&msg);
-                let key = alert_key(&origin);
-                let inserted = state
+            let messages = take_new_all(persist, &mut state.cursors, topic);
+            self.fold_alert_messages(persist, state, dnd, true, topic, messages);
+        }
+    }
+
+    /// Fold retained or forward alert history. Retained activation history is
+    /// deterministic and rehydratable, but does not replay its transient chyron.
+    fn fold_alert_messages(
+        &self,
+        persist: &Persist,
+        state: &mut ChatState,
+        dnd: bool,
+        emit_live_toasts: bool,
+        topic: &str,
+        messages: Vec<StoredMessage>,
+    ) {
+        for m in messages {
+            let body = m.body.as_deref().unwrap_or("");
+            let msg = alert_message(topic, &m.ulid, body, m.ts_unix_ms, &self.self_host);
+            let origin = msg.sender.clone();
+            let severity = alert_severity(&msg);
+            let source = alert_source(&msg);
+            // Build the chyron body before the ring consumes the message.
+            let show = toast_for_alert(&msg);
+            let key = alert_key(&origin);
+            let inserted = state
+                .convos
+                .entry(key.clone())
+                .or_insert_with(|| Conversation::new(key.as_str()))
+                .insert(msg.clone());
+            state.dirty.insert(key);
+            if !inserted {
+                // A re-fold / Syncthing backfill of the same alert (same
+                // deterministic id) — already logged + toasted; skip both the
+                // severity-room duplicate and a second chyron.
+                continue;
+            }
+            // Fan the alert into its per-severity system room (a curated view
+            // of the firehose an operator can watch or mute per band).
+            if let Some(sev) = severity {
+                let room = room_key(&severity_room_id(sev));
+                state
                     .convos
-                    .entry(key.clone())
-                    .or_insert_with(|| Conversation::new(key.as_str()))
-                    .insert(msg.clone());
-                state.dirty.insert(key);
-                if !inserted {
-                    // A re-fold / Syncthing backfill of the same alert (same
-                    // deterministic id) — already logged + toasted; skip both the
-                    // severity-room duplicate and a second chyron.
-                    continue;
-                }
-                // Fan the alert into its per-severity system room (a curated view
-                // of the firehose an operator can watch or mute per band).
-                if let Some(sev) = severity {
-                    let room = room_key(&severity_room_id(sev));
-                    state
-                        .convos
-                        .entry(room.clone())
-                        .or_insert_with(|| Conversation::new(room.as_str()))
-                        .insert(msg);
-                    state.dirty.insert(room);
-                }
-                // Raise the transient lower-third only when the gate permits it.
+                    .entry(room.clone())
+                    .or_insert_with(|| Conversation::new(room.as_str()))
+                    .insert(msg);
+                state.dirty.insert(room);
+            }
+            // Raise the transient lower-third only for a forward live event.
+            if emit_live_toasts {
                 if let (Some(show), Some(sev)) = (show, severity) {
                     if state.notify.should_ring_alert(&origin, &source, sev, dnd) {
                         emit_toast(persist, &show);
@@ -1608,6 +1706,48 @@ struct ChatState {
     notify_dirty: bool,
 }
 
+/// All state needed to cross from startup recovery into the live loop. The
+/// value is assembled off-state and installed only after every topic listing,
+/// transient tail read, and retained durable read succeeds.
+struct ChatActivation {
+    cursors: BTreeMap<String, Option<String>>,
+    retained: Vec<(String, Vec<StoredMessage>)>,
+}
+
+fn prepare_chat_activation(persist: &Persist) -> Result<ChatActivation, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover Chat topics: {error}"))?;
+
+    // Transient action/command lanes are one-shot effects. Prime all fixed
+    // lanes into a temporary map so one failed tail leaves no partial cursor
+    // state that a later activation could mistake for ready.
+    let mut cursors = BTreeMap::new();
+    for topic in TRANSIENT_CHAT_LANES {
+        let tail = persist
+            .latest_ulid(topic)
+            .map_err(|error| format!("prime transient {topic}: {error}"))?;
+        cursors.insert((*topic).to_string(), tail);
+    }
+
+    // Signed delivery and folded alerts are durable/idempotent history. Read
+    // retained messages before activation and carry their exact cursors with
+    // them; do not tail-prime them away like mutable commands.
+    let mut durable_topics = BTreeSet::from([EVENT_CHAT_MESSAGE.to_string()]);
+    durable_topics.extend(topics.into_iter().filter(|topic| is_alert_lane(topic)));
+    let mut retained = Vec::with_capacity(durable_topics.len());
+    for topic in durable_topics {
+        let messages = persist
+            .list_since(&topic, None)
+            .map_err(|error| format!("read retained {topic}: {error}"))?;
+        let tail = messages.last().map(|message| message.ulid.clone());
+        cursors.insert(topic.clone(), tail);
+        retained.push((topic, messages));
+    }
+
+    Ok(ChatActivation { cursors, retained })
+}
+
 /// New messages on `topic` since the cursor, seeding the cursor to the current
 /// head on first sight (no backlog replay), then advancing it.
 fn take_new(
@@ -1617,24 +1757,57 @@ fn take_new(
 ) -> Vec<StoredMessage> {
     match cursors.get(topic) {
         None => {
-            let head = persist
-                .list_since(topic, None)
-                .ok()
-                .and_then(|m| m.last().map(|x| x.ulid.clone()));
+            let head = match persist.latest_ulid(topic) {
+                Ok(head) => head,
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::chat", topic, %error, "Chat transient tail read failed; cursor remains inactive");
+                    return Vec::new();
+                }
+            };
             cursors.insert(topic.to_string(), head);
             Vec::new()
         }
         Some(cur) => {
             let cur = cur.clone();
-            let msgs = persist
-                .list_since(topic, cur.as_deref())
-                .unwrap_or_default();
+            let msgs = match persist.list_since(topic, cur.as_deref()) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::chat", topic, %error, "Chat transient lane read failed; cursor retained");
+                    return Vec::new();
+                }
+            };
             if let Some(last) = msgs.last() {
                 cursors.insert(topic.to_string(), Some(last.ulid.clone()));
             }
             msgs
         }
     }
+}
+
+/// Drain durable history from the beginning on first sight and from the exact
+/// last successful read afterward. Unlike mutable action lanes, signed messages
+/// and alert history are deterministic/idempotent and must not disappear just
+/// because their topic appeared after startup. A failed read never advances or
+/// creates a cursor.
+fn take_new_all(
+    persist: &Persist,
+    cursors: &mut BTreeMap<String, Option<String>>,
+    topic: &str,
+) -> Vec<StoredMessage> {
+    let since = cursors.get(topic).cloned().flatten();
+    let messages = match persist.list_since(topic, since.as_deref()) {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!(target: "mackesd::chat", topic, %error, "Chat durable lane read failed; cursor retained");
+            return Vec::new();
+        }
+    };
+    if let Some(last) = messages.last() {
+        cursors.insert(topic.to_string(), Some(last.ulid.clone()));
+    } else {
+        cursors.entry(topic.to_string()).or_insert(None);
+    }
+    messages
 }
 
 /// Republish the `state/chat/conversation/<key>` mirror for each conversation
@@ -1701,15 +1874,21 @@ fn publish(persist: &Persist, topic: &str, body: &str) {
 fn resolve_default_bus_root(
     env_root: Option<std::ffi::OsString>,
     data_dir: Option<PathBuf>,
-) -> Option<PathBuf> {
+) -> PathBuf {
     if let Some(root) = env_root.filter(|root| !root.is_empty()) {
-        return Some(PathBuf::from(root));
+        return PathBuf::from(root);
     }
-    Some(data_dir?.join("mde").join("bus"))
+    data_dir
+        .map(|root| root.join("mde").join("bus"))
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
-fn default_bus_root() -> Option<PathBuf> {
+fn default_bus_root() -> PathBuf {
     resolve_default_bus_root(std::env::var_os("MDE_BUS_ROOT"), dirs::data_dir())
+}
+
+fn chat_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    override_root.unwrap_or_else(default_bus_root)
 }
 
 fn now_unix_ms() -> i64 {
@@ -1726,20 +1905,47 @@ impl Worker for ChatWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::debug!(target: "mackesd::chat", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::chat", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let retry_interval = self
+            .poll_interval
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let (persist, activation) = loop {
+            match self.open_bus() {
+                Ok(Some(persist)) => match self.prepare_activation(&persist) {
+                    Ok(activation) => break (persist, activation),
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::chat",
+                        %error,
+                        "Chat topic/tail/read activation failed; startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::chat",
+                    "Bus root unavailable; Chat startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::chat",
+                    %error,
+                    "Persist open failed; Chat startup will retry"
+                ),
+            }
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         let mut state = ChatState::default();
+        state.cursors = activation.cursors;
         // Rehydrate history + publish it (and the initial roster) immediately.
         self.bootstrap(&mut state);
+        let dnd = self.self_dnd();
+        for (topic, messages) in activation.retained {
+            if topic == EVENT_CHAT_MESSAGE {
+                self.fold_inbound_messages(&persist, &mut state, dnd, false, messages);
+            } else {
+                self.fold_alert_messages(&persist, &mut state, dnd, false, &topic, messages);
+            }
+        }
         self.publish_roster(&persist, &mut state);
         self.publish_rooms(&persist, &mut state);
         publish_notify(&persist, &mut state);
@@ -1765,6 +1971,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use mde_chat::SYS_ALL_FLEET_ID;
     use rand::rngs::OsRng;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const CHAT_AUTH_KEY: &[u8] = b"chat-action-auth-test-key";
@@ -1787,11 +1994,79 @@ mod tests {
                 Some(std::ffi::OsString::from("/run/mde-bus")),
                 Some(PathBuf::from("/root/.local/share")),
             ),
-            Some(PathBuf::from("/run/mde-bus")),
+            PathBuf::from("/run/mde-bus"),
         );
         assert_eq!(
             resolve_default_bus_root(None, Some(PathBuf::from("/root/.local/share"))),
-            Some(PathBuf::from("/root/.local/share/mde/bus")),
+            PathBuf::from("/root/.local/share/mde/bus"),
+        );
+        assert_eq!(
+            resolve_default_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT),
+        );
+    }
+
+    #[test]
+    fn activation_replays_durable_history_and_primes_every_transient_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = persist_at(tmp.path());
+        persist
+            .write(
+                ACTION_CHAT_SEND,
+                Priority::Default,
+                None,
+                Some("retained mutable command"),
+            )
+            .unwrap();
+
+        let mut message = Message::text("nyc3", 10, "retained signed history");
+        sign(&mut message, &key());
+        let envelope = ChatEnvelope {
+            scope: Scope::Peer,
+            to: "eagle".into(),
+            message,
+        };
+        persist
+            .write(
+                EVENT_CHAT_MESSAGE,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&envelope).unwrap()),
+            )
+            .unwrap();
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Urgent,
+                None,
+                Some(r#"{"severity":"critical","host":"nyc3","summary":"retained alert"}"#),
+            )
+            .unwrap();
+
+        let activation = prepare_chat_activation(&persist).unwrap();
+        for topic in TRANSIENT_CHAT_LANES {
+            assert!(
+                activation.cursors.contains_key(*topic),
+                "every mutable lane is tail-primed atomically: {topic}"
+            );
+        }
+        assert_eq!(
+            activation
+                .retained
+                .iter()
+                .find(|(topic, _)| topic == EVENT_CHAT_MESSAGE)
+                .map(|(_, messages)| messages.len()),
+            Some(1),
+            "signed delivery history is retained for replay"
+        );
+        assert_eq!(
+            activation
+                .retained
+                .iter()
+                .find(|(topic, _)| topic == "event/security/alert")
+                .map(|(_, messages)| messages.len()),
+            Some(1),
+            "folded alert history is retained for rehydration"
         );
     }
 
@@ -3248,6 +3523,175 @@ mod tests {
             1,
             "armed destructive action fired"
         );
+    }
+
+    #[tokio::test]
+    async fn late_bus_and_failed_activation_recover_without_replay_or_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bus_root = root.join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+
+        // Syncthing history and retained signed Bus delivery are both durable
+        // inputs and must be visible after the delayed activation.
+        let history_key = dm_key("eagle", "nyc3");
+        let mut history = Message::text("eagle", 10, "rehydrated from Syncthing");
+        sign(&mut history, &key());
+        append_own(root, "eagle", &history_key, &history);
+        let mut retained = Message::text("nyc3", 20, "replayed signed delivery");
+        sign(&mut retained, &key());
+        let retained_envelope = ChatEnvelope {
+            scope: Scope::Peer,
+            to: "eagle".into(),
+            message: retained,
+        };
+        persist
+            .write(
+                EVENT_CHAT_MESSAGE,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&retained_envelope).unwrap()),
+            )
+            .unwrap();
+
+        // This retained mutable command predates activation and must never fire.
+        let stale_body = authorized_send_body(
+            "stale-peer",
+            "retained command must not replay",
+            "chat-late-stale",
+        );
+        persist
+            .write(ACTION_CHAT_SEND, Priority::Default, None, Some(&stale_body))
+            .unwrap();
+
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let mut worker = worker(root)
+            .with_poll_interval(Duration::from_millis(10))
+            .with_bus_opener(Arc::new(move || {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }));
+
+        let activation_attempts = Arc::new(AtomicUsize::new(0));
+        let activation_attempts_for_worker = Arc::clone(&activation_attempts);
+        worker = worker.with_activation(Arc::new(move |persist| {
+            if activation_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("injected topic/tail/read failure".into());
+            }
+            prepare_chat_activation(persist)
+        }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(shutdown_rx);
+        let task = tokio::spawn(async move { worker.run(token).await });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while activation_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover through open and activation failures");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+
+        let fresh_body =
+            authorized_send_body("fresh-peer", "project exactly once", "chat-late-fresh");
+        persist
+            .write(ACTION_CHAT_SEND, Priority::Default, None, Some(&fresh_body))
+            .unwrap();
+
+        let fresh_key = dm_key("eagle", "fresh-peer");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let fresh = read_log(&own_log_path(root, "eagle", &fresh_key));
+                let history_mirror = persist
+                    .read_latest(&conversation_topic(&history_key))
+                    .expect("read rehydrated conversation");
+                if fresh.len() == 1 && history_mirror.is_some() {
+                    let projected: Vec<Message> = serde_json::from_str(
+                        history_mirror
+                            .as_ref()
+                            .and_then(|message| message.body.as_deref())
+                            .expect("history mirror body"),
+                    )
+                    .expect("decode history mirror");
+                    if projected.len() == 2 {
+                        break;
+                    }
+                }
+                assert!(!task.is_finished(), "worker exited before forward send");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("durable history and one forward send must project after recovery");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            read_log(&own_log_path(root, "eagle", &dm_key("eagle", "stale-peer"))).is_empty(),
+            "retained mutable command was tail-primed, not replayed"
+        );
+        assert_eq!(
+            read_log(&own_log_path(root, "eagle", &fresh_key)).len(),
+            1,
+            "the forward operation projected exactly once"
+        );
+        assert!(
+            persist
+                .list_since(EVENT_TOAST_SHOW, None)
+                .unwrap()
+                .is_empty(),
+            "retained durable replay does not replay transient notifications"
+        );
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("worker shutdown timeout")
+            .expect("worker task panicked");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_the_unavailable_bus_retry_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_worker = Arc::clone(&attempts);
+        let mut worker = worker(tmp.path()).with_bus_opener(Arc::new(move || {
+            attempts_for_worker.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }));
+        // Production cadence clamps to the two-second retry ceiling; shutdown
+        // must still interrupt that wait immediately.
+        worker.poll_interval = Duration::from_secs(10);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker must enter unavailable-Bus retry");
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        let result = tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt the bounded Bus retry wait")
+            .expect("worker task panicked");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

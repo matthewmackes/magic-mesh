@@ -562,6 +562,11 @@ behavioral evidence is not completion.
   durable event/log replay; one forward command projects exactly once. Machine
   193 passed three exact recovery/backfill tests:
   `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-collab-bus-recovery-r22.md`.
+- **Chat Bus recovery checkpoint (2026-08-09):** six mutable lanes now
+  tail-prime atomically while signed messages and alert history replay without
+  duplicate toasts; one forward send executes once after late storage. Machine
+  9 passed four exact activation/recovery tests:
+  `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-chat-bus-recovery-r26.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
