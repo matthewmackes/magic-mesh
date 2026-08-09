@@ -16,13 +16,13 @@
 //! The decision is the pure [`decide`] fn folding the catalog + a
 //! [`ServiceProbe`] into a [`KvmHealth`] summary — unit-tested with a fake
 //! probe. `tick_once` is the thin shell: the production [`SystemctlProbe`] seam
-//! + the in-process bus publish ([`crate::bus_publish::publish_json`], perf-10),
-//! so the tested core never touches systemd or the bus.
+//! plus a fresh in-process Bus publication transaction, so the tested core
+//! never touches systemd or the Bus.
 //!
 //! perf-10: the publish path used to fork+exec the `mde-bus` CLI once per tick
 //! (a whole process + a fresh SQLite open + a [`crate::proc_reap`] reaper
-//! thread). It now writes directly through one long-lived [`Persist`] handle —
-//! byte-identical stored row, no spawn, no reaper.
+//! thread). It now writes directly through [`Persist`] — byte-identical stored
+//! rows, no spawn, no reaper, and no process-lifetime failure latch.
 
 #![cfg(feature = "async-services")]
 
@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 use crate::kvm::{KvmService, KVM_SERVICES};
@@ -169,16 +170,15 @@ pub fn decide(
     }
 }
 
-/// Publish a health summary to [`SERVICES_TOPIC`] in-process (perf-10) through
-/// the long-lived [`Persist`] handle — byte-identical to the
+/// Publish a health summary to [`SERVICES_TOPIC`] in-process (perf-10), byte-identical to the
 /// `mde-bus publish <topic> --body-flag <json>` this worker used to fork+exec.
-/// Best-effort: a serialize/write failure (or an absent store on a pre-RPM dev
-/// box, where `persist` is `None`) is swallowed, exactly as the old
-/// fire-and-reap path swallowed a missing `mde-bus` binary.
-fn publish(persist: Option<&mut Persist>, health: &KvmHealth) {
-    if let Some(persist) = persist {
-        crate::bus_publish::publish_json(persist, SERVICES_TOPIC, health);
-    }
+/// Failures remain visible to the run loop and retry on its bounded cadence.
+fn publish(persist: &Persist, health: &KvmHealth) -> Result<(), String> {
+    let body = serde_json::to_string(health).map_err(|error| error.to_string())?;
+    persist
+        .write(SERVICES_TOPIC, Priority::Default, None, Some(&body))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// The KVM-HEALTH worker.
@@ -192,11 +192,10 @@ pub struct KvmHealthWorker {
     probe: Box<dyn ServiceProbe + Send + Sync>,
     /// Tick cadence (default [`DEFAULT_TICK_INTERVAL`]).
     tick: Duration,
-    /// Bus root the in-process publish writes to (perf-10). Defaults to the same
-    /// root a CLI publish would use ([`crate::bus_publish::default_bus_root`],
-    /// honouring `MDE_BUS_ROOT`); `None` disables the publish (pre-RPM dev box /
-    /// tests), leaving the probe + alert path intact.
-    bus_root: Option<PathBuf>,
+    /// Explicit Bus root override. Production resolves current user/service
+    /// storage on every transaction and falls back to the system spool.
+    bus_root_override: Option<PathBuf>,
+    bus_disabled: bool,
 }
 
 impl KvmHealthWorker {
@@ -210,7 +209,8 @@ impl KvmHealthWorker {
             catalog: KVM_SERVICES,
             probe: Box::new(SystemctlProbe),
             tick: DEFAULT_TICK_INTERVAL,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
+            bus_disabled: false,
         }
     }
 
@@ -218,7 +218,8 @@ impl KvmHealthWorker {
     /// test never writes into the real `~/.local/share/mde/bus` store.
     #[must_use]
     pub fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
-        self.bus_root = bus_root;
+        self.bus_disabled = bus_root.is_none();
+        self.bus_root_override = bus_root;
         self
     }
 
@@ -245,7 +246,19 @@ impl KvmHealthWorker {
 
     /// One tick: probe the catalog, log a degraded stack on the alert lane, and
     /// publish the summary through the (optional) long-lived bus handle.
-    fn tick_once(&self, persist: Option<&mut Persist>) {
+    fn bus_root(&self) -> Option<PathBuf> {
+        if self.bus_disabled {
+            return None;
+        }
+        Some(
+            self.bus_root_override
+                .clone()
+                .or_else(crate::bus_publish::default_bus_root)
+                .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)),
+        )
+    }
+
+    fn tick_once(&self) -> Result<(), String> {
         let health = decide(&self.host, self.catalog, self.probe.as_ref(), now_ms());
         if !health.all_healthy {
             // Repeated every tick while degraded — a log-pipeline window alert
@@ -258,7 +271,11 @@ impl KvmHealthWorker {
                 health.status_line(),
             );
         }
-        publish(persist, &health);
+        let Some(root) = self.bus_root() else {
+            return Ok(());
+        };
+        let persist = Persist::open(root).map_err(|error| error.to_string())?;
+        publish(&persist, &health)
     }
 }
 
@@ -269,32 +286,18 @@ impl Worker for KvmHealthWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        // perf-10 — open ONE Persist handle up front and reuse it across every
-        // tick (no per-message fork+exec / SQLite open / reaper thread). A
-        // missing root or a failed open leaves `persist = None`: the probe +
-        // alert path still runs, the publish is a swallowed no-op (pre-RPM dev
-        // box parity). `reopen_if_index_changed` inside the helper follows a
-        // rotated index for the handle's lifetime.
-        let mut persist = self
-            .bus_root
-            .clone()
-            .and_then(|root| match Persist::open(root) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::debug!(
-                        target: "mackesd::bus_publish",
-                        error = %e,
-                        "kvm_health bus open failed; publishing disabled this run",
-                    );
-                    None
-                }
-            });
         // Publish an immediate summary on start so a panel doesn't wait a full
         // tick for the first health row.
-        self.tick_once(persist.as_mut());
+        if let Err(error) = self.tick_once() {
+            tracing::debug!(target: "mackesd::bus_publish", %error, "kvm_health publication deferred");
+        }
         loop {
             tokio::select! {
-                () = tokio::time::sleep(self.tick) => self.tick_once(persist.as_mut()),
+                () = tokio::time::sleep(self.tick) => {
+                    if let Err(error) = self.tick_once() {
+                        tracing::debug!(target: "mackesd::bus_publish", %error, "kvm_health publication deferred");
+                    }
+                },
                 () = shutdown.wait() => break,
             }
         }
@@ -622,5 +625,68 @@ mod tests {
         // Re-serializing the decoded summary reproduces the stored body exactly —
         // proving the row carries the same compact JSON `--body-flag` did.
         assert_eq!(serde_json::to_string(&summary).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_late_and_replaced_bus_without_restart() {
+        let fixture = tempfile::tempdir().expect("KVM Bus recovery fixture");
+        let root = fixture.path().join("bus");
+        std::fs::write(&root, b"block initial Bus open").expect("block Bus");
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut worker = KvmHealthWorker::new("node-recovery".to_string())
+            .with_probe(Box::new(FakeProbe::all()))
+            .with_tick(Duration::from_millis(10))
+            .with_bus_root(Some(root.clone()));
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task.is_finished(),
+            "late Bus must not terminate the worker"
+        );
+        std::fs::remove_file(&root).expect("remove blocker");
+        let late = Persist::open(root.clone()).expect("install late Bus");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if late
+                    .read_latest(SERVICES_TOPIC)
+                    .expect("read late health")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late Bus receives health");
+        drop(late);
+
+        let replacement_root = fixture.path().join("replacement");
+        Persist::open(replacement_root.clone()).expect("prepare replacement");
+        std::fs::rename(&root, fixture.path().join("retired")).expect("retire Bus");
+        std::fs::rename(&replacement_root, &root).expect("install replacement");
+        let replacement = Persist::open(root).expect("open replacement");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if replacement
+                    .read_latest(SERVICES_TOPIC)
+                    .expect("read replacement health")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus receives health");
+
+        tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("join")
+            .expect("worker");
     }
 }

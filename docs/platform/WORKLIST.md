@@ -197,8 +197,9 @@ behavioral evidence is not completion.
   refused before effects, retained the VM shut off, and produced typed failure. OpenTofu, Ansible, libvirt, KVM, Podman, storage, shell, and all six workers passed.
   Remediation now recommends Small; larger-seat first-frame and lifecycle proof remain:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-dell-capacity-refusal-r1.md`.
-- **Startup readiness checkpoint (2026-08-09):** a not-running VM awaiting guest readiness retries instead of falsely completing stopped; BigBoy passed 37/37:
+- **Startup/readiness recovery checkpoint (2026-08-09):** stopped guests fail closed; KVM health publication recovers late/replaced Bus storage. Focused gates passed:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-startup-readiness-fail-closed-r13.md`.
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-kvm-health-bus-recovery-r73.md`.
 - **Compute firewall outcome checkpoint (2026-08-09):** root-owned result journaling, restart-safe reply recovery, honest partial/failed projections, and exact Mesh
   removal identity passed machine 194:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-firewall-outcome-r18.md`.
@@ -476,6 +477,7 @@ behavioral evidence is not completion.
 - **Health/Units/forecast recovery checkpoints (2026-08-09):** reads stage before effects and failed replies retry; machines 194/193 and BigBoy passed focused gates:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-kvm-health-bus-recovery-r73.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
 - **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority recovers and cache persistence precedes publication; machine 9 passed two exact tests:
