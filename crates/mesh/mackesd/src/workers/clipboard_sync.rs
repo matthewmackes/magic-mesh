@@ -56,7 +56,7 @@ use mackes_mesh_types::vdi_clipboard::{
     ClipboardSessionConsentV1, ClipboardSessionConsentValidationError, VdiClipboardText,
     CLIPBOARD_MATERIALIZATION_TOPIC,
 };
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use mde_collab_types::{
     ClipboardEnvelopeV2 as CollabClipboardEnvelopeV2,
     ClipboardEnvelopeV2ValidationError as CollabClipboardEnvelopeV2ValidationError,
@@ -158,6 +158,16 @@ const MAX_V2_CONSENT_SESSIONS: usize = 256;
 
 /// Bus-drain cadence for the canonical clipboard event lane.
 pub const CLIP_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Startup retries begin quickly enough to recover during ordinary boot
+/// ordering without spinning on an absent or unreadable Bus spool.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Bound startup retry latency while keeping the same supervised worker alive.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type BusReadGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
 
 /// One clipboard entry in the mesh-global history. `id` is a stable
 /// content fingerprint so the viewer/IPC can address an entry (pin/delete)
@@ -1015,12 +1025,18 @@ impl ClipboardEnvelopeV2Ledger {
     /// Seed only bounded retained metadata at daemon startup. This prevents a
     /// replay published after a restart from being accepted merely because the
     /// worker's in-memory ledger was reset; retained payloads are never folded.
-    fn seed_from_retained(&mut self, persist: &Persist) {
-        let Ok(messages) = persist.read_tail(CLIPBOARD_ENVELOPE_V2_TOPIC, MAX_V2_SOURCE_LANES)
-        else {
-            return;
-        };
+    fn seed_from_retained(
+        &mut self,
+        persist: &Persist,
+        activation_tail: Option<&str>,
+    ) -> Result<(), String> {
+        let messages = persist
+            .read_tail(CLIPBOARD_ENVELOPE_V2_TOPIC, MAX_V2_SOURCE_LANES)
+            .map_err(|error| format!("seed {CLIPBOARD_ENVELOPE_V2_TOPIC}: {error}"))?;
         for message in messages {
+            if activation_tail.is_none_or(|tail| message.ulid.as_str() > tail) {
+                continue;
+            }
             let Some(body) = message.body.as_deref() else {
                 continue;
             };
@@ -1029,6 +1045,7 @@ impl ClipboardEnvelopeV2Ledger {
             };
             self.record(&envelope);
         }
+        Ok(())
     }
 
     fn admit(
@@ -1140,14 +1157,21 @@ struct CollabClipboardEnvelopeV2Ledger {
 
 impl CollabClipboardEnvelopeV2Ledger {
     /// Seed replay metadata from retained envelopes without materializing them.
-    fn seed_from_retained(&mut self, persist: &Persist) {
-        let Ok(messages) = persist.read_tail(
-            COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
-            MAX_COLLAB_V2_SOURCE_LANES,
-        ) else {
-            return;
-        };
+    fn seed_from_retained(
+        &mut self,
+        persist: &Persist,
+        activation_tail: Option<&str>,
+    ) -> Result<(), String> {
+        let messages = persist
+            .read_tail(
+                COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                MAX_COLLAB_V2_SOURCE_LANES,
+            )
+            .map_err(|error| format!("seed {COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC}: {error}"))?;
         for message in messages {
+            if activation_tail.is_none_or(|tail| message.ulid.as_str() > tail) {
+                continue;
+            }
             let Some(body) = message.body.as_deref() else {
                 continue;
             };
@@ -1156,6 +1180,7 @@ impl CollabClipboardEnvelopeV2Ledger {
             };
             self.record(&envelope);
         }
+        Ok(())
     }
 
     fn admit(
@@ -1312,6 +1337,67 @@ pub fn clip_share_writable(workgroup_root: &Path) -> bool {
     clip_share_writable_core(workgroup_root, workgroup_root.is_dir())
 }
 
+/// Fully staged startup state. It is installed only after every forward-lane
+/// tail read, every replay-ledger seed, and every required cursor write has
+/// succeeded. Mesh receive deliberately has no first-boot tail prime.
+struct ClipboardActivation {
+    cursor: Option<String>,
+    consent_cursor: Option<String>,
+    v2_cursor: Option<String>,
+    collab_v2_cursor: Option<String>,
+    mesh_send_cursor: Option<String>,
+    mesh_receive_cursor: Option<String>,
+    v2_ledger: ClipboardEnvelopeV2Ledger,
+    collab_v2_ledger: CollabClipboardEnvelopeV2Ledger,
+    mesh_replay_ledger: mesh::ClipboardMeshReplayLedger,
+}
+
+/// One complete, effect-free Bus read sweep. No member is processed unless all
+/// lane reads succeeded against the same reopened spool view.
+struct ClipboardRuntimeBatch {
+    consents: Vec<StoredMessage>,
+    v2: Vec<StoredMessage>,
+    mesh_send: Vec<StoredMessage>,
+    mesh_receive: Vec<StoredMessage>,
+    collab_v2: Vec<StoredMessage>,
+    clips: Vec<StoredMessage>,
+}
+
+fn clipboard_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    clipboard_bus_root_or_system(override_root.or_else(crate::bus_publish::default_bus_root))
+}
+
+fn clipboard_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
+fn require_live_bus_index(persist: &Persist, bus_root: &Path) -> Result<(), String> {
+    let index = bus_root.join("index.sqlite");
+    let metadata = std::fs::metadata(&index)
+        .map_err(|error| format!("inspect live Bus index {}: {error}", index.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("live Bus index is not a file: {}", index.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if persist.index_inode() != Some(metadata.ino()) {
+            return Err(format!(
+                "Bus index identity changed without a successful reopen: {}",
+                index.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The clipboard-sync worker. Holds the replicated root and folds canonical
 /// `event/clipboard/clip` Bus bodies through [`apply_clip_event`].
 pub struct ClipboardSyncWorker {
@@ -1322,7 +1408,8 @@ pub struct ClipboardSyncWorker {
     /// Exact direct-seat identity that may consume a replicated history
     /// materialization on this node.
     target_seat: String,
-    /// Bus root override (tests). `None` ⇒ [`crate::bus_publish::default_bus_root`].
+    /// Bus root override (tests). Production resolves the ordinary data root
+    /// and then falls back to the canonical system spool.
     bus_root_override: Option<PathBuf>,
     /// Bus drain cadence.
     poll: Duration,
@@ -1336,6 +1423,10 @@ pub struct ClipboardSyncWorker {
     /// Read-only enrollment key/availability projection used to bind signed
     /// clipboard frames to authenticated mesh peers.
     mesh_peer_directory: Arc<dyn mesh::MeshClipboardPeerDirectory>,
+    #[cfg(test)]
+    activation_read_gate: Option<Arc<BusReadGateFn>>,
+    #[cfg(test)]
+    runtime_read_gate: Option<Arc<BusReadGateFn>>,
 }
 
 impl ClipboardSyncWorker {
@@ -1353,6 +1444,10 @@ impl ClipboardSyncWorker {
             mesh_peer_directory: Arc::new(mesh::SqliteMeshClipboardPeerDirectory::new(
                 crate::default_db_path(),
             )),
+            #[cfg(test)]
+            activation_read_gate: None,
+            #[cfg(test)]
+            runtime_read_gate: None,
         }
     }
 
@@ -1380,10 +1475,242 @@ impl ClipboardSyncWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override
-            .clone()
-            .or_else(crate::bus_publish::default_bus_root)
+    fn bus_root(&self) -> PathBuf {
+        clipboard_bus_root(self.bus_root_override.clone())
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_activation_read_gate(mut self, gate: Arc<BusReadGateFn>) -> Self {
+        self.activation_read_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_runtime_read_gate(mut self, gate: Arc<BusReadGateFn>) -> Self {
+        self.runtime_read_gate = Some(gate);
+        self
+    }
+
+    fn activate_bus(
+        &self,
+        persist: &Persist,
+        bus_root: &Path,
+        now_ms: u64,
+    ) -> Result<ClipboardActivation, String> {
+        #[cfg(test)]
+        let gate = |topic: &str, index: usize| -> Result<(), String> {
+            self.activation_read_gate
+                .as_ref()
+                .map_or(Ok(()), |gate| gate(topic, index))
+        };
+        let checkpoint = cursor_path(bus_root);
+        let existing_cursor = read_cursor(&checkpoint);
+        let cursor = match existing_cursor.as_ref() {
+            Some(_) => existing_cursor.clone(),
+            None => {
+                #[cfg(test)]
+                gate(CLIP_TOPIC, 0)?;
+                persist
+                    .latest_ulid(CLIP_TOPIC)
+                    .map_err(|error| format!("prime {CLIP_TOPIC}: {error}"))?
+            }
+        };
+
+        let consent_checkpoint = consent_cursor_path(bus_root);
+        let existing_consent_cursor = read_consent_cursor(&consent_checkpoint);
+        let consent_cursor = match existing_consent_cursor.as_ref() {
+            Some(_) => existing_consent_cursor.clone(),
+            None => {
+                #[cfg(test)]
+                gate(CLIPBOARD_SESSION_CONSENT_TOPIC, 1)?;
+                persist
+                    .latest_ulid(CLIPBOARD_SESSION_CONSENT_TOPIC)
+                    .map_err(|error| format!("prime {CLIPBOARD_SESSION_CONSENT_TOPIC}: {error}"))?
+            }
+        };
+
+        let v2_checkpoint = v2_cursor_path(bus_root);
+        let existing_v2_cursor = read_v2_cursor(&v2_checkpoint);
+        let v2_cursor = match existing_v2_cursor.as_ref() {
+            Some(_) => existing_v2_cursor.clone(),
+            None => {
+                #[cfg(test)]
+                gate(CLIPBOARD_ENVELOPE_V2_TOPIC, 2)?;
+                persist
+                    .latest_ulid(CLIPBOARD_ENVELOPE_V2_TOPIC)
+                    .map_err(|error| format!("prime {CLIPBOARD_ENVELOPE_V2_TOPIC}: {error}"))?
+            }
+        };
+
+        let collab_v2_checkpoint = collab_v2_cursor_path(bus_root);
+        let existing_collab_v2_cursor = read_collab_v2_cursor(&collab_v2_checkpoint);
+        let collab_v2_cursor = match existing_collab_v2_cursor.as_ref() {
+            Some(_) => existing_collab_v2_cursor.clone(),
+            None => {
+                #[cfg(test)]
+                gate(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, 3)?;
+                persist
+                    .latest_ulid(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC)
+                    .map_err(|error| {
+                        format!("prime {COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC}: {error}")
+                    })?
+            }
+        };
+
+        let mesh_send_checkpoint = bus_root.join(MESH_SEND_CURSOR_FILE_NAME);
+        let existing_mesh_send_cursor =
+            mesh::read_mesh_cursor(&mesh_send_checkpoint, mesh::MESH_SEND_TOPIC);
+        let mesh_send_cursor = match existing_mesh_send_cursor.as_ref() {
+            Some(_) => existing_mesh_send_cursor.clone(),
+            None => {
+                #[cfg(test)]
+                gate(mesh::MESH_SEND_TOPIC, 4)?;
+                persist
+                    .latest_ulid(mesh::MESH_SEND_TOPIC)
+                    .map_err(|error| format!("prime {}: {error}", mesh::MESH_SEND_TOPIC))?
+            }
+        };
+
+        let mesh_receive_topic = mesh::mesh_frame_topic(&self.target_node);
+        let mesh_receive_checkpoint = bus_root.join(MESH_RECEIVE_CURSOR_FILE_NAME);
+        let mesh_receive_cursor =
+            mesh::read_mesh_cursor(&mesh_receive_checkpoint, &mesh_receive_topic);
+
+        // Replay-ledger reads are part of activation, not optional enrichment.
+        // A failed seed leaves no state installed and admits no retained body.
+        let mut v2_ledger = ClipboardEnvelopeV2Ledger::default();
+        #[cfg(test)]
+        gate(CLIPBOARD_ENVELOPE_V2_TOPIC, 5)?;
+        v2_ledger.seed_from_retained(persist, v2_cursor.as_deref())?;
+        let mut collab_v2_ledger = CollabClipboardEnvelopeV2Ledger::default();
+        #[cfg(test)]
+        gate(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, 6)?;
+        collab_v2_ledger.seed_from_retained(persist, collab_v2_cursor.as_deref())?;
+        let mut mesh_replay_ledger = mesh::ClipboardMeshReplayLedger::default();
+        #[cfg(test)]
+        gate(&mesh_receive_topic, 7)?;
+        mesh_replay_ledger.seed_from_retained(persist, now_ms)?;
+
+        // Commit first-boot forward cursors only after the complete candidate
+        // has been read. A write failure prevents in-memory activation.
+        if existing_cursor.is_none() {
+            if let Some(ulid) = cursor.as_deref() {
+                write_cursor(&checkpoint, ulid)?;
+            }
+        }
+        if existing_consent_cursor.is_none() {
+            if let Some(ulid) = consent_cursor.as_deref() {
+                write_consent_cursor(&consent_checkpoint, ulid)?;
+            }
+        }
+        if existing_v2_cursor.is_none() {
+            if let Some(ulid) = v2_cursor.as_deref() {
+                write_v2_cursor(&v2_checkpoint, ulid)?;
+            }
+        }
+        if existing_collab_v2_cursor.is_none() {
+            if let Some(ulid) = collab_v2_cursor.as_deref() {
+                write_collab_v2_cursor(&collab_v2_checkpoint, ulid)?;
+            }
+        }
+        if existing_mesh_send_cursor.is_none() {
+            if let Some(ulid) = mesh_send_cursor.as_deref() {
+                mesh::write_mesh_cursor(&mesh_send_checkpoint, mesh::MESH_SEND_TOPIC, ulid)?;
+            }
+        }
+
+        Ok(ClipboardActivation {
+            cursor,
+            consent_cursor,
+            v2_cursor,
+            collab_v2_cursor,
+            mesh_send_cursor,
+            mesh_receive_cursor,
+            v2_ledger,
+            collab_v2_ledger,
+            mesh_replay_ledger,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_runtime_batch(
+        &self,
+        persist: &mut Persist,
+        bus_root: &Path,
+        cursor: Option<&str>,
+        consent_cursor: Option<&str>,
+        v2_cursor: Option<&str>,
+        collab_v2_cursor: Option<&str>,
+        mesh_send_cursor: Option<&str>,
+        mesh_receive_cursor: Option<&str>,
+    ) -> Result<ClipboardRuntimeBatch, String> {
+        persist.reopen_if_index_changed();
+        require_live_bus_index(persist, bus_root)?;
+        #[cfg(test)]
+        let gate = |topic: &str, index: usize| -> Result<(), String> {
+            self.runtime_read_gate
+                .as_ref()
+                .map_or(Ok(()), |gate| gate(topic, index))
+        };
+        #[cfg(test)]
+        gate(CLIPBOARD_SESSION_CONSENT_TOPIC, 0)?;
+        let consents = persist
+            .list_since(CLIPBOARD_SESSION_CONSENT_TOPIC, consent_cursor)
+            .map_err(|error| format!("read {CLIPBOARD_SESSION_CONSENT_TOPIC}: {error}"))?;
+        #[cfg(test)]
+        gate(CLIPBOARD_ENVELOPE_V2_TOPIC, 1)?;
+        let v2 = persist
+            .list_since(CLIPBOARD_ENVELOPE_V2_TOPIC, v2_cursor)
+            .map_err(|error| format!("read {CLIPBOARD_ENVELOPE_V2_TOPIC}: {error}"))?;
+        #[cfg(test)]
+        gate(mesh::MESH_SEND_TOPIC, 2)?;
+        let mesh_send = persist
+            .list_since_limit(
+                mesh::MESH_SEND_TOPIC,
+                mesh_send_cursor,
+                mesh::MAX_MESH_FRAMES_PER_TICK,
+            )
+            .map_err(|error| format!("read {}: {error}", mesh::MESH_SEND_TOPIC))?;
+        let mesh_receive_topic = mesh::mesh_frame_topic(&self.target_node);
+        #[cfg(test)]
+        gate(&mesh_receive_topic, 3)?;
+        let mesh_receive = persist
+            .list_since_limit(
+                &mesh_receive_topic,
+                mesh_receive_cursor,
+                mesh::MAX_MESH_FRAMES_PER_TICK,
+            )
+            .map_err(|error| format!("read {mesh_receive_topic}: {error}"))?;
+        #[cfg(test)]
+        gate(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, 4)?;
+        let collab_v2 = persist
+            .list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, collab_v2_cursor)
+            .map_err(|error| format!("read {COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC}: {error}"))?;
+        #[cfg(test)]
+        gate(CLIP_TOPIC, 5)?;
+        let clips = persist
+            .list_since(CLIP_TOPIC, cursor)
+            .map_err(|error| format!("read {CLIP_TOPIC}: {error}"))?;
+        // Catch an unlink/recreate that raced the reads. Rows from an orphaned
+        // SQLite handle are not a valid empty/current Bus view.
+        require_live_bus_index(persist, bus_root)?;
+        Ok(ClipboardRuntimeBatch {
+            consents,
+            v2,
+            mesh_send,
+            mesh_receive,
+            collab_v2,
+            clips,
+        })
     }
 
     /// Require the collaboration envelope's typed destination to identify this
@@ -1741,27 +2068,14 @@ impl ClipboardSyncWorker {
     /// for this cursor and cannot change the ledger. Only a body that passes
     /// strict typed decoding, exact capability binding, and the existing
     /// full-identity monotonic consent ledger can enable V2 materialization.
-    fn drain_clipboard_consents(
+    fn process_clipboard_consents(
         &self,
-        persist: &mut Persist,
+        messages: Vec<StoredMessage>,
         cursor: &mut Option<String>,
         checkpoint: Option<&Path>,
         ledger: &mut ClipboardSessionConsentLedger,
         now_ms: u64,
     ) -> usize {
-        persist.reopen_if_index_changed();
-        let messages = match persist.list_since(CLIPBOARD_SESSION_CONSENT_TOPIC, cursor.as_deref())
-        {
-            Ok(messages) => messages,
-            Err(error) => {
-                debug!(
-                    target: "clipboard_sync",
-                    error = %error,
-                    "clipboard consent drain failed"
-                );
-                return 0;
-            }
-        };
         let mut admitted = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -1823,6 +2137,22 @@ impl ClipboardSyncWorker {
         admitted
     }
 
+    fn drain_clipboard_consents(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ledger: &mut ClipboardSessionConsentLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let Ok(messages) = persist.list_since(CLIPBOARD_SESSION_CONSENT_TOPIC, cursor.as_deref())
+        else {
+            return 0;
+        };
+        self.process_clipboard_consents(messages, cursor, checkpoint, ledger, now_ms)
+    }
+
     /// Acknowledge one terminal V2 result. Malformed, expired, replayed, and
     /// currently unsupported envelopes are not retried forever; transient
     /// materialization failures return before this helper is called.
@@ -1844,27 +2174,16 @@ impl ClipboardSyncWorker {
 
     /// Drain serialized V2 envelopes through bounded admission, source-session
     /// replay tracking, and the existing text-only materialization lane.
-    fn drain_clipboard_envelopes(
+    fn process_clipboard_envelopes(
         &self,
         persist: &mut Persist,
+        messages: Vec<StoredMessage>,
         cursor: &mut Option<String>,
         checkpoint: Option<&Path>,
         ledger: &mut ClipboardEnvelopeV2Ledger,
         consent_ledger: &ClipboardSessionConsentLedger,
         now_ms: u64,
     ) -> usize {
-        persist.reopen_if_index_changed();
-        let messages = match persist.list_since(CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref()) {
-            Ok(messages) => messages,
-            Err(error) => {
-                debug!(
-                    target: "clipboard_sync",
-                    error = %error,
-                    "clipboard V2 envelope drain failed"
-                );
-                return 0;
-            }
-        };
         let mut materialized = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -1932,6 +2251,31 @@ impl ClipboardSyncWorker {
         materialized
     }
 
+    fn drain_clipboard_envelopes(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+        ledger: &mut ClipboardEnvelopeV2Ledger,
+        consent_ledger: &ClipboardSessionConsentLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let Ok(messages) = persist.list_since(CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref())
+        else {
+            return 0;
+        };
+        self.process_clipboard_envelopes(
+            persist,
+            messages,
+            cursor,
+            checkpoint,
+            ledger,
+            consent_ledger,
+            now_ms,
+        )
+    }
+
     /// Acknowledge one terminal collaboration-envelope result without storing
     /// any clipboard body in the cursor file.
     fn acknowledge_collab_v2(
@@ -1957,25 +2301,14 @@ impl ClipboardSyncWorker {
     /// Drain locally authored canonical rich envelopes into target-specific,
     /// enrollment-key-bound mesh frames. Every terminal refusal is typed and
     /// acknowledged so an unavailable or hostile peer cannot pin the lane.
-    fn drain_mesh_send_requests(
+    fn process_mesh_send_requests(
         &self,
         persist: &mut Persist,
+        messages: Vec<StoredMessage>,
         cursor: &mut Option<String>,
         checkpoint: &Path,
         now_ms: u64,
     ) -> usize {
-        persist.reopen_if_index_changed();
-        let messages = match persist.list_since_limit(
-            mesh::MESH_SEND_TOPIC,
-            cursor.as_deref(),
-            mesh::MAX_MESH_FRAMES_PER_TICK,
-        ) {
-            Ok(messages) => messages,
-            Err(error) => {
-                debug!(target: "clipboard_sync", %error, "clipboard mesh send drain failed");
-                return 0;
-            }
-        };
         let mut sent = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -2027,31 +2360,38 @@ impl ClipboardSyncWorker {
         sent
     }
 
+    fn drain_mesh_send_requests(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: &Path,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let Ok(messages) = persist.list_since_limit(
+            mesh::MESH_SEND_TOPIC,
+            cursor.as_deref(),
+            mesh::MAX_MESH_FRAMES_PER_TICK,
+        ) else {
+            return 0;
+        };
+        self.process_mesh_send_requests(persist, messages, cursor, checkpoint, now_ms)
+    }
+
     /// Drain only this node's target-specific authenticated frame lane and
     /// forward admitted canonical envelopes to the existing collaboration
     /// authority. Replay state is payload-free and expiry-cleaned each tick.
-    fn drain_mesh_receive_frames(
+    fn process_mesh_receive_frames(
         &self,
         persist: &mut Persist,
+        messages: Vec<StoredMessage>,
         cursor: &mut Option<String>,
         checkpoint: &Path,
         ledger: &mut mesh::ClipboardMeshReplayLedger,
         now_ms: u64,
     ) -> usize {
-        persist.reopen_if_index_changed();
         ledger.cleanup(now_ms);
         let topic = mesh::mesh_frame_topic(&self.target_node);
-        let messages = match persist.list_since_limit(
-            &topic,
-            cursor.as_deref(),
-            mesh::MAX_MESH_FRAMES_PER_TICK,
-        ) {
-            Ok(messages) => messages,
-            Err(error) => {
-                debug!(target: "clipboard_sync", %error, "clipboard mesh receive drain failed");
-                return 0;
-            }
-        };
         let mut admitted = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -2100,31 +2440,37 @@ impl ClipboardSyncWorker {
         admitted
     }
 
+    fn drain_mesh_receive_frames(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: &Path,
+        ledger: &mut mesh::ClipboardMeshReplayLedger,
+        now_ms: u64,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let topic = mesh::mesh_frame_topic(&self.target_node);
+        let Ok(messages) =
+            persist.list_since_limit(&topic, cursor.as_deref(), mesh::MAX_MESH_FRAMES_PER_TICK)
+        else {
+            return 0;
+        };
+        self.process_mesh_receive_frames(persist, messages, cursor, checkpoint, ledger, now_ms)
+    }
+
     /// Drain signed collaboration clipboard envelopes through bounded decode,
     /// exact-target, fresh-consent, replay, expiry, and echo admission. Only a
     /// sole inline `text/plain` offer can reach the existing seat handoff.
-    fn drain_collab_clipboard_envelopes(
+    fn process_collab_clipboard_envelopes(
         &self,
         persist: &mut Persist,
+        messages: Vec<StoredMessage>,
         cursor: &mut Option<String>,
         checkpoint: Option<&Path>,
         ledger: &mut CollabClipboardEnvelopeV2Ledger,
         consent_ledger: &ClipboardSessionConsentLedger,
         now_ms: u64,
     ) -> usize {
-        persist.reopen_if_index_changed();
-        let messages =
-            match persist.list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref()) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    debug!(
-                        target: "clipboard_sync",
-                        error = %error,
-                        "collaboration clipboard V2 drain failed"
-                    );
-                    return 0;
-                }
-            };
         let mut materialized = 0;
         for message in messages {
             let body = message.body.as_deref().unwrap_or("");
@@ -2212,21 +2558,40 @@ impl ClipboardSyncWorker {
         materialized
     }
 
-    /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
-    fn drain_clip_events(
+    fn drain_collab_clipboard_envelopes(
         &self,
         persist: &mut Persist,
         cursor: &mut Option<String>,
         checkpoint: Option<&Path>,
+        ledger: &mut CollabClipboardEnvelopeV2Ledger,
+        consent_ledger: &ClipboardSessionConsentLedger,
+        now_ms: u64,
     ) -> usize {
         persist.reopen_if_index_changed();
-        let msgs = match persist.list_since(CLIP_TOPIC, cursor.as_deref()) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                debug!(target: "clipboard_sync", error = %e, "clipboard event drain failed");
-                return 0;
-            }
+        let Ok(messages) =
+            persist.list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, cursor.as_deref())
+        else {
+            return 0;
         };
+        self.process_collab_clipboard_envelopes(
+            persist,
+            messages,
+            cursor,
+            checkpoint,
+            ledger,
+            consent_ledger,
+            now_ms,
+        )
+    }
+
+    /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
+    fn process_clip_events(
+        &self,
+        persist: &mut Persist,
+        msgs: Vec<StoredMessage>,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+    ) -> usize {
         let mut applied = 0;
         for msg in msgs {
             let body = msg.body.as_deref().unwrap_or("");
@@ -2296,6 +2661,19 @@ impl ClipboardSyncWorker {
         }
         applied
     }
+
+    fn drain_clip_events(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+    ) -> usize {
+        persist.reopen_if_index_changed();
+        let Ok(messages) = persist.list_since(CLIP_TOPIC, cursor.as_deref()) else {
+            return 0;
+        };
+        self.process_clip_events(persist, messages, cursor, checkpoint)
+    }
 }
 
 #[async_trait::async_trait]
@@ -2305,111 +2683,51 @@ impl Worker for ClipboardSyncWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            debug!("clipboard_sync: no bus root; worker idle");
-            return Ok(());
-        };
-        let mut persist = match Persist::open(bus_root.clone()) {
-            Ok(persist) => persist,
-            Err(e) => {
-                warn!(target: "clipboard_sync", error = %e, "bus open failed; worker idle");
-                return Ok(());
+        let bus_root = self.bus_root();
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let (mut persist, activation) = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => {
+                    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                    match self.activate_bus(&persist, &bus_root, now_ms) {
+                        Ok(activation) => break (persist, activation),
+                        Err(error) => warn!(
+                            target: "clipboard_sync",
+                            %error,
+                            "clipboard Bus activation failed; startup will retry"
+                        ),
+                    }
+                }
+                Err(error) => warn!(
+                    target: "clipboard_sync",
+                    %error,
+                    "clipboard Bus open failed; startup will retry"
+                ),
             }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                _ = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
-        // Existing retained clipboard events may predate this daemon instance and
-        // could resurrect a user-deleted/cleared history row. Start at the tail and
-        // consume newly published lane events from here.
+
         let checkpoint = cursor_path(&bus_root);
-        let mut cursor = read_cursor(&checkpoint);
-        if cursor.is_none() {
-            // First boot is intentionally forward-only: retained pre-daemon
-            // events must not resurrect a user's deleted/cleared history.
-            cursor = persist.latest_ulid(CLIP_TOPIC).ok().flatten();
-            if let Some(ulid) = cursor.as_deref() {
-                if let Err(e) = write_cursor(&checkpoint, ulid) {
-                    warn!(target: "clipboard_sync", error = %e, "initial clipboard cursor checkpoint failed");
-                }
-            }
-        }
         let consent_checkpoint = consent_cursor_path(&bus_root);
-        let mut consent_cursor = read_consent_cursor(&consent_checkpoint);
-        if consent_cursor.is_none() {
-            // Consent is session-scoped and must not resurrect across a daemon
-            // start. Seed the cursor past retained controls; only a control
-            // published after this worker starts can establish fresh in-memory
-            // consent for this process.
-            consent_cursor = persist
-                .latest_ulid(CLIPBOARD_SESSION_CONSENT_TOPIC)
-                .ok()
-                .flatten();
-            if let Some(ulid) = consent_cursor.as_deref() {
-                if let Err(error) = write_consent_cursor(&consent_checkpoint, ulid) {
-                    warn!(target: "clipboard_sync", error = %error, "initial clipboard consent cursor checkpoint failed");
-                }
-            }
-        }
         let v2_checkpoint = v2_cursor_path(&bus_root);
-        let mut v2_cursor = read_v2_cursor(&v2_checkpoint);
-        if v2_cursor.is_none() {
-            // V2 follows the same forward-only first-boot rule as the legacy
-            // lane. Retained V2 metadata still seeds replay protection, but it
-            // is never materialized merely because this worker started.
-            v2_cursor = persist
-                .latest_ulid(CLIPBOARD_ENVELOPE_V2_TOPIC)
-                .ok()
-                .flatten();
-            if let Some(ulid) = v2_cursor.as_deref() {
-                if let Err(error) = write_v2_cursor(&v2_checkpoint, ulid) {
-                    warn!(target: "clipboard_sync", error = %error, "initial clipboard V2 cursor checkpoint failed");
-                }
-            }
-        }
-        let mut v2_ledger = ClipboardEnvelopeV2Ledger::default();
-        v2_ledger.seed_from_retained(&persist);
         let collab_v2_checkpoint = collab_v2_cursor_path(&bus_root);
-        let mut collab_v2_cursor = read_collab_v2_cursor(&collab_v2_checkpoint);
-        if collab_v2_cursor.is_none() {
-            // First boot is forward-only, matching both existing clipboard
-            // lanes. Retained metadata still seeds replay protection below.
-            collab_v2_cursor = persist
-                .latest_ulid(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC)
-                .ok()
-                .flatten();
-            if let Some(ulid) = collab_v2_cursor.as_deref() {
-                if let Err(error) = write_collab_v2_cursor(&collab_v2_checkpoint, ulid) {
-                    warn!(target: "clipboard_sync", error = %error, "initial collaboration clipboard V2 cursor checkpoint failed");
-                }
-            }
-        }
-        let mut collab_v2_ledger = CollabClipboardEnvelopeV2Ledger::default();
-        collab_v2_ledger.seed_from_retained(&persist);
         let mesh_send_checkpoint = bus_root.join(MESH_SEND_CURSOR_FILE_NAME);
-        let mut mesh_send_cursor =
-            mesh::read_mesh_cursor(&mesh_send_checkpoint, mesh::MESH_SEND_TOPIC);
-        if mesh_send_cursor.is_none() {
-            // Local send requests are session actions, never durable desired
-            // state. A daemon restart starts at the tail rather than reviving
-            // an old clipboard generation.
-            mesh_send_cursor = persist.latest_ulid(mesh::MESH_SEND_TOPIC).ok().flatten();
-            if let Some(ulid) = mesh_send_cursor.as_deref() {
-                if let Err(error) =
-                    mesh::write_mesh_cursor(&mesh_send_checkpoint, mesh::MESH_SEND_TOPIC, ulid)
-                {
-                    warn!(target: "clipboard_sync", %error, "initial clipboard mesh send cursor checkpoint failed");
-                }
-            }
-        }
-        let mesh_receive_topic = mesh::mesh_frame_topic(&self.target_node);
         let mesh_receive_checkpoint = bus_root.join(MESH_RECEIVE_CURSOR_FILE_NAME);
-        let mut mesh_receive_cursor =
-            mesh::read_mesh_cursor(&mesh_receive_checkpoint, &mesh_receive_topic);
-        // A receiver must inspect retained frames after first start or cursor
-        // loss. Rebuild the payload-free high-water marks from the canonical
-        // lane first, then signature/expiry admission safely rejects old or
-        // already-forwarded entries without dropping a still-fresh transfer.
-        let mut mesh_replay_ledger = mesh::ClipboardMeshReplayLedger::default();
-        let startup_now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-        mesh_replay_ledger.seed_from_retained(&persist, startup_now_ms);
+        let ClipboardActivation {
+            mut cursor,
+            mut consent_cursor,
+            mut v2_cursor,
+            mut collab_v2_cursor,
+            mut mesh_send_cursor,
+            mut mesh_receive_cursor,
+            mut v2_ledger,
+            mut collab_v2_ledger,
+            mut mesh_replay_ledger,
+        } = activation;
         // Consent starts disabled on every daemon/session start. Fresh signed
         // controls are drained before either V2 envelope lane on each tick.
         let mut v2_consent_ledger = ClipboardSessionConsentLedger::default();
@@ -2430,48 +2748,72 @@ impl Worker for ClipboardSyncWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis());
-                    if let Ok(now_ms) = now_ms {
-                        self.drain_clipboard_consents(
-                            &mut persist,
+                    let Ok(now_ms) = u64::try_from(chrono::Utc::now().timestamp_millis()) else {
+                        warn!(target: "clipboard_sync", "system clock is before the Unix epoch; clipboard effect sweep deferred");
+                        continue;
+                    };
+                    let batch = match self.read_runtime_batch(
+                        &mut persist,
+                        &bus_root,
+                        cursor.as_deref(),
+                        consent_cursor.as_deref(),
+                        v2_cursor.as_deref(),
+                        collab_v2_cursor.as_deref(),
+                        mesh_send_cursor.as_deref(),
+                        mesh_receive_cursor.as_deref(),
+                    ) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            warn!(target: "clipboard_sync", %error, "clipboard Bus sweep unavailable; all effects deferred");
+                            continue;
+                        }
+                    };
+                    self.process_clipboard_consents(
+                            batch.consents,
                             &mut consent_cursor,
                             Some(&consent_checkpoint),
                             &mut v2_consent_ledger,
                             now_ms,
                         );
-                        self.drain_clipboard_envelopes(
+                    self.process_clipboard_envelopes(
                             &mut persist,
+                            batch.v2,
                             &mut v2_cursor,
                             Some(&v2_checkpoint),
                             &mut v2_ledger,
                             &v2_consent_ledger,
                             now_ms,
                         );
-                        self.drain_mesh_send_requests(
+                    self.process_mesh_send_requests(
                             &mut persist,
+                            batch.mesh_send,
                             &mut mesh_send_cursor,
                             &mesh_send_checkpoint,
                             now_ms,
                         );
-                        self.drain_mesh_receive_frames(
+                    self.process_mesh_receive_frames(
                             &mut persist,
+                            batch.mesh_receive,
                             &mut mesh_receive_cursor,
                             &mesh_receive_checkpoint,
                             &mut mesh_replay_ledger,
                             now_ms,
                         );
-                        self.drain_collab_clipboard_envelopes(
+                    self.process_collab_clipboard_envelopes(
                             &mut persist,
+                            batch.collab_v2,
                             &mut collab_v2_cursor,
                             Some(&collab_v2_checkpoint),
                             &mut collab_v2_ledger,
                             &v2_consent_ledger,
                             now_ms,
                         );
-                    } else {
-                        warn!(target: "clipboard_sync", "system clock is before the Unix epoch; clipboard V2 admission deferred");
-                    }
-                    self.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint));
+                    self.process_clip_events(
+                        &mut persist,
+                        batch.clips,
+                        &mut cursor,
+                        Some(&checkpoint),
+                    );
                     if let Err(error) = self.materialize_replicated_head(
                         &mut persist,
                         &mut observed_history_head,
@@ -2519,6 +2861,7 @@ mod tests {
         ClipboardUnavailableReason as CollabClipboardUnavailableReason,
         ClipboardUnsupportedReason as CollabClipboardUnsupportedReason, FileRefId,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const CONSENT_AUTH_KEY: &[u8] = b"clipboard-consent-command-test-key";
     const CONSENT_AUTH_NOW: i64 = 1_700_000_000_000;
@@ -3969,5 +4312,234 @@ mod tests {
         };
         assert!(!apply_clip_event(&mut h, &body));
         assert!(h.entries.is_empty(), "blank/whitespace selections skipped");
+    }
+
+    #[test]
+    fn clipboard_activation_is_atomic_and_preserves_mesh_receive_semantics() {
+        let bus = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let retained_clip = persist
+            .write(CLIP_TOPIC, Priority::Default, None, Some("{}"))
+            .unwrap();
+        let retained_consent = persist
+            .write(
+                CLIPBOARD_SESSION_CONSENT_TOPIC,
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .unwrap();
+        let retained_v2 = persist
+            .write(
+                CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .unwrap();
+        let retained_collab = persist
+            .write(
+                COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC,
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .unwrap();
+        let retained_send = persist
+            .write(mesh::MESH_SEND_TOPIC, Priority::Default, None, Some("{}"))
+            .unwrap();
+
+        let receive_topic = mesh::mesh_frame_topic("eagle");
+        let receive_checkpoint = bus.path().join(MESH_RECEIVE_CURSOR_FILE_NAME);
+        let durable_receive = "01J00000000000000000000000";
+        mesh::write_mesh_cursor(&receive_checkpoint, &receive_topic, durable_receive).unwrap();
+
+        let worker = ClipboardSyncWorker::new(share.path().to_path_buf())
+            .with_target_node("eagle")
+            .with_activation_read_gate(Arc::new(|_, index| {
+                (index != 7)
+                    .then_some(())
+                    .ok_or_else(|| "injected replay-ledger seed failure".to_owned())
+            }));
+        assert!(worker.activate_bus(&persist, bus.path(), 1).is_err());
+        assert!(!cursor_path(bus.path()).exists());
+        assert!(!consent_cursor_path(bus.path()).exists());
+        assert!(!v2_cursor_path(bus.path()).exists());
+        assert!(!collab_v2_cursor_path(bus.path()).exists());
+        assert!(!bus.path().join(MESH_SEND_CURSOR_FILE_NAME).exists());
+        assert_eq!(
+            mesh::read_mesh_cursor(&receive_checkpoint, &receive_topic).as_deref(),
+            Some(durable_receive),
+            "durable mesh receive checkpoint must not be tail-primed or replaced"
+        );
+
+        // Publish after the V2 activation-tail read but before replay-ledger
+        // seeding. The ledger must be bounded by that staged tail so this
+        // forward message remains admissible on the first runtime sweep.
+        let dynamic_v2 = v2_inline(9, &["text/plain"]);
+        let dynamic_v2_body = serde_json::to_string(&dynamic_v2).unwrap();
+        let gate_bus_root = bus.path().to_path_buf();
+        let gate_body = dynamic_v2_body.clone();
+        let activation = ClipboardSyncWorker::new(share.path().to_path_buf())
+            .with_target_node("eagle")
+            .with_activation_read_gate(Arc::new(move |_, index| {
+                if index == 5 {
+                    Persist::open(gate_bus_root.clone())
+                        .map_err(|error| error.to_string())?
+                        .write(
+                            CLIPBOARD_ENVELOPE_V2_TOPIC,
+                            Priority::Default,
+                            None,
+                            Some(&gate_body),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }))
+            .activate_bus(&persist, bus.path(), 1)
+            .unwrap();
+        assert_eq!(
+            activation.cursor.as_deref(),
+            Some(retained_clip.ulid.as_str())
+        );
+        assert_eq!(
+            activation.consent_cursor.as_deref(),
+            Some(retained_consent.ulid.as_str())
+        );
+        assert_eq!(
+            activation.v2_cursor.as_deref(),
+            Some(retained_v2.ulid.as_str())
+        );
+        assert_eq!(
+            activation.collab_v2_cursor.as_deref(),
+            Some(retained_collab.ulid.as_str())
+        );
+        assert_eq!(
+            activation.mesh_send_cursor.as_deref(),
+            Some(retained_send.ulid.as_str())
+        );
+        assert_eq!(
+            activation.mesh_receive_cursor.as_deref(),
+            Some(durable_receive)
+        );
+        assert!(activation
+            .v2_ledger
+            .admit(dynamic_v2_body.as_bytes(), CONSENT_AUTH_NOW as u64 + 1,)
+            .is_ok());
+        assert_eq!(
+            clipboard_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let index = bus.path().join("index.sqlite");
+        let detached = bus.path().join("index.sqlite.detached");
+        std::fs::rename(&index, &detached).unwrap();
+        assert!(require_live_bus_index(&persist, bus.path()).is_err());
+        std::fs::rename(detached, index).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clipboard_bus_recovery_skips_retained_and_defers_failed_sweep() {
+        let base = tempfile::tempdir().unwrap();
+        let bus_root = base.path().join("late-bus");
+        std::fs::write(&bus_root, b"temporarily not a Bus directory").unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let activation_ready = Arc::new(AtomicBool::new(false));
+        let reads_ready = Arc::new(AtomicBool::new(false));
+        let mut worker = ClipboardSyncWorker::new(share.path().to_path_buf())
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(5))
+            .with_activation_read_gate({
+                let activation_ready = Arc::clone(&activation_ready);
+                Arc::new(move |_, _| {
+                    activation_ready
+                        .load(Ordering::SeqCst)
+                        .then_some(())
+                        .ok_or_else(|| "activation held for retained setup".to_owned())
+                })
+            })
+            .with_runtime_read_gate({
+                let reads_ready = Arc::clone(&reads_ready);
+                Arc::new(move |_, index| {
+                    (index != 5 || reads_ready.load(Ordering::SeqCst))
+                        .then_some(())
+                        .ok_or_else(|| "injected final-lane read failure".to_owned())
+                })
+            });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        std::fs::remove_file(&bus_root).unwrap();
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        let retained = ClipEventBody::from_text(
+            "retained destructive effect",
+            "node-a",
+            "2026-08-09T00:00:00Z",
+        );
+        let retained_message = persist
+            .write(
+                CLIP_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&retained).unwrap()),
+            )
+            .unwrap();
+        activation_ready.store(true, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if read_cursor(&cursor_path(&bus_root)).as_deref()
+                    == Some(retained_message.ulid.as_str())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker activates after late Bus");
+
+        let fresh = ClipEventBody::from_text(
+            "fresh post-activation clipboard",
+            "node-a",
+            "2026-08-09T00:00:01Z",
+        );
+        persist
+            .write(
+                CLIP_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&fresh).unwrap()),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            read_history(&history_path(share.path())).entries.is_empty(),
+            "a failed final lane read must defer the complete effect sweep"
+        );
+
+        reads_ready.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let entries = read_history(&history_path(share.path())).entries;
+                if entries.first().map(|entry| entry.text.as_str())
+                    == Some("fresh post-activation clipboard")
+                {
+                    assert!(entries
+                        .iter()
+                        .all(|entry| entry.text != "retained destructive effect"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("post-activation forward work executes after read recovery");
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
     }
 }

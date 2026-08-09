@@ -451,6 +451,9 @@ behavioral evidence is not completion.
   monitoring now survives late Bus storage, while failed durable Cloud-lane
   reads retain their cursor and rollup. Machine 193 passed two exact tests:
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`.
+- **Clipboard-sync recovery checkpoint (2026-08-09):** six lanes now activate
+  and read atomically across late/replaced Bus storage without replaying retained mutations. BigBoy passed four exact tests:
+  `docs/platform/evidence/WL-FUNC-016-WL-ARCH-009-2026-08-09-clipboard-sync-bus-recovery-r38.md`.
 - **Bookmarks/ad-filter Bus recovery checkpoint (2026-08-09):** both workers
   recover after late storage, atomically skip retained mutations, admit first
   post-activation commands, and preserve durable state. Machine 9 and BigBoy
@@ -710,6 +713,9 @@ behavioral evidence is not completion.
   cursor/pending work and recover one queued action exactly once. Machine 194
   passed five exact recovery/replay tests:
   `docs/platform/evidence/WL-FUNC-016-2026-08-09-clipboard-bridge-bus-recovery-r20.md`.
+- **Clipboard sync Bus checkpoint (2026-08-09):** startup preserves durable
+  receive checkpoints, skips retained mutation lanes, and defers every effect after an incomplete six-lane read. BigBoy passed four exact tests:
+  `docs/platform/evidence/WL-FUNC-016-WL-ARCH-009-2026-08-09-clipboard-sync-bus-recovery-r38.md`.
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
      - Inputs: collab types and existing clipboard v2.

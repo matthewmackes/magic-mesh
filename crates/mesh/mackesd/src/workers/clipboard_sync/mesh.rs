@@ -299,12 +299,12 @@ pub struct ClipboardMeshReplayLedger {
 impl ClipboardMeshReplayLedger {
     /// Rebuild payload-free replay high-water marks from the canonical
     /// collaboration lane after restart or cursor loss.
-    pub fn seed_from_retained(&mut self, persist: &Persist, now_ms: u64) {
-        let Ok(messages) =
-            persist.read_tail(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, MAX_MESH_REPLAY_LANES)
-        else {
-            return;
-        };
+    pub fn seed_from_retained(&mut self, persist: &Persist, now_ms: u64) -> Result<(), String> {
+        let messages = persist
+            .read_tail(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, MAX_MESH_REPLAY_LANES)
+            .map_err(|error| {
+                format!("seed clipboard mesh replay ledger from retained envelopes: {error}")
+            })?;
         for message in messages {
             let Some(body) = message.body.as_deref() else {
                 continue;
@@ -332,6 +332,7 @@ impl ClipboardMeshReplayLedger {
                 self.latest.insert(key, marker);
             }
         }
+        Ok(())
     }
 
     /// Remove every expired source/session marker.
@@ -951,7 +952,7 @@ mod tests {
                 let frames = persist.list_since(&topic, None).unwrap();
                 assert_eq!(frames.len(), 1);
                 let mut ledger = ClipboardMeshReplayLedger::default();
-                ledger.seed_from_retained(&persist, 1_002);
+                ledger.seed_from_retained(&persist, 1_002).unwrap();
                 let result = receive_frame(
                     &persist,
                     &directory,
@@ -991,7 +992,7 @@ mod tests {
                     .is_empty());
                 let retained = persist.read_latest(&topic).unwrap().unwrap();
                 let mut ledger = ClipboardMeshReplayLedger::default();
-                ledger.seed_from_retained(&persist, 1_003);
+                ledger.seed_from_retained(&persist, 1_003).unwrap();
                 assert_eq!(
                     receive_frame(
                         &persist,
@@ -1010,7 +1011,7 @@ mod tests {
                 let frames = persist.list_since(&topic, Some(&cursor)).unwrap();
                 assert_eq!(frames.len(), 1);
                 let mut ledger = ClipboardMeshReplayLedger::default();
-                ledger.seed_from_retained(&persist, 20_000);
+                ledger.seed_from_retained(&persist, 20_000).unwrap();
                 let expected = if role == "expired" {
                     ClipboardMeshRefusal::Stale
                 } else {
@@ -1531,7 +1532,7 @@ mod tests {
             )
             .unwrap();
         let mut ledger = ClipboardMeshReplayLedger::default();
-        ledger.seed_from_retained(&persist, 1_001);
+        ledger.seed_from_retained(&persist, 1_001).unwrap();
         let frame = ClipboardMeshFrameV1::new(envelope).unwrap();
         assert_eq!(
             receive_frame(
