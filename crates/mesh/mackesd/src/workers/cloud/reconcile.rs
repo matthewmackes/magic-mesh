@@ -10,8 +10,8 @@
 //!   reads its own `<N>/*` slice, so N's `terraform.tfvars.json` carries only N's
 //!   workloads (per-node apply — no node renders another node's set).
 //! - **The desired/render bridge** ([`rendered_tfvars_for_node`]) — renders the
-//!   slice into tfvars ([`super::render`]) for both plan and live apply, so the
-//!   authorized runner never applies a stale or missing desired document.
+//!   slice into tfvars ([`super::render`]) for read-only planning. The retired
+//!   cloud live-apply lane no longer consumes this document.
 //! - **The plan bridge** ([`plan_counts_for_node`]) — shells `tofu plan -json`
 //!   through the injectable [`CloudRunner`] seam, returning the pending-change
 //!   [`PlanCounts`].
@@ -519,13 +519,12 @@ pub(crate) fn remove_desired_doc(
 }
 
 /// Render node `node`'s canonical desired slice into the exact tfvars document
-/// consumed by both `tofu plan` and `tofu apply`.
+/// consumed by read-only `tofu plan`.
 ///
 /// The strict reader is intentional: a malformed, foreign, or non-regular
-/// desired document must stop a live apply rather than allowing OpenTofu to
-/// consume a stale file left by an earlier plan. An empty valid slice remains a
-/// valid declarative document (it represents the requested removal of all
-/// workloads from this placement node).
+/// desired document must stop planning rather than allowing OpenTofu to consume
+/// a stale file left by an earlier plan. An empty valid slice remains a valid
+/// declarative planning document.
 ///
 /// # Errors
 /// An honest desired-state error before any backend process is invoked.

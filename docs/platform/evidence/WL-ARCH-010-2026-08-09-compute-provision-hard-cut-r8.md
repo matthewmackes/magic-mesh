@@ -14,10 +14,12 @@ none were retained as filler. Host virtual-storage setup remains owned by the
 storage plane, while VM creation uses the typed Workload operation and its
 approved-image `qemu-img`/`virsh define` adapter.
 
-The certificate-authority responder remains as an authenticated operator/API
-surface, although it has no shipped producer after this cut. Cold migration
-also remains: the same worker owns source and target protocol handling, while
-all libvirt effects cross its bounded, durable Workload actuator channel.
+The certificate-authority responder was retained at this checkpoint pending a
+caller audit. The immediate follow-up found no publisher, packaged client, or
+versioned operator API and deleted it; canonical enrollment already signs
+through the sealed CA module. Cold migration remains: the same worker owns
+source and target protocol handling, while all libvirt effects cross its
+bounded, durable Workload actuator channel.
 
 This cut does not claim that legacy automatic guest Nebula enrollment, MeshFS
 attachment, or exact audio/video flags have converged through typed Workloads.

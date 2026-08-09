@@ -17,9 +17,8 @@ use mackes_mesh_types::android_apps::{
 };
 use mackes_mesh_types::android_provider::{
     CuttlefishContractError, CuttlefishGuestBootState, CuttlefishGuestReadiness,
-    CuttlefishGuestReadinessEvidence, CuttlefishLifecycleOperation, CuttlefishLifecycleRequest,
-    CuttlefishUnavailableReason, CuttlefishVmLifecycleState, CuttlefishVmObservation,
-    CuttlefishVmTarget,
+    CuttlefishGuestReadinessEvidence, CuttlefishUnavailableReason, CuttlefishVmLifecycleState,
+    CuttlefishVmObservation, CuttlefishVmTarget,
 };
 
 use super::super::super::runner::CloudRunner;
@@ -28,7 +27,7 @@ use super::cuttlefish_guest::{
 };
 use super::AndroidGuestProvider;
 use mackes_mesh_types::android_provider::AndroidVdiSource;
-use mackes_mesh_types::cloud::{CloudInstance, LifecycleAction};
+use mackes_mesh_types::cloud::CloudInstance;
 
 /// Closed failures returned by the Cuttlefish adapter or its backend client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,12 +60,6 @@ pub(crate) trait CuttlefishProviderClient: Send + Sync {
     fn observe(
         &self,
         target: &CuttlefishVmTarget,
-    ) -> Result<CuttlefishVmObservation, CuttlefishProviderError>;
-
-    /// Apply one already-admitted closed lifecycle operation.
-    fn lifecycle(
-        &self,
-        request: &CuttlefishLifecycleRequest,
     ) -> Result<CuttlefishVmObservation, CuttlefishProviderError>;
 
     /// Dispatch one already-admitted starter-app launcher request against the
@@ -121,13 +114,11 @@ struct GuestContract {
     transport: Arc<dyn CuttlefishGuestTransport>,
 }
 
-/// Production outer-VM client for a Cuttlefish-backed Android workload.
+/// Production read-only outer-VM observer for a Cuttlefish-backed Android workload.
 ///
-/// This client owns only the L1 libvirt lifecycle. `virsh` is reached through
-/// the existing typed [`CloudRunner`] authority, while the inner Android guest
-/// remains explicitly unready until a future guest-owned provider supplies the
-/// package-manager/session evidence required by the Cuttlefish contract. The
-/// client never turns an active libvirt domain into a false Android-ready claim.
+/// Lifecycle is owned by typed Workloads. This client only observes the L1
+/// libvirt roster while the inner Android guest remains explicitly unready until
+/// guest-owned package-manager/session evidence satisfies the Cuttlefish contract.
 pub(crate) struct LibvirtCuttlefishProviderClient {
     runner: Arc<dyn CloudRunner>,
     generation: Mutex<u64>,
@@ -181,24 +172,6 @@ impl LibvirtCuttlefishProviderClient {
             return Ok(0);
         }
         Ok(*generation)
-    }
-
-    fn next_generation(&self) -> Result<u64, CuttlefishProviderError> {
-        let mut generation = self
-            .generation
-            .lock()
-            .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
-        *generation = generation.saturating_add(1).max(1);
-        Ok(*generation)
-    }
-
-    fn reset_generation(&self) -> Result<(), CuttlefishProviderError> {
-        let mut generation = self
-            .generation
-            .lock()
-            .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
-        *generation = 0;
-        Ok(())
     }
 
     fn observation(
@@ -336,43 +309,6 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
                 Some(CuttlefishUnavailableReason::ProviderUnavailable),
             ),
         }
-    }
-
-    fn lifecycle(
-        &self,
-        request: &CuttlefishLifecycleRequest,
-    ) -> Result<CuttlefishVmObservation, CuttlefishProviderError> {
-        let action = match request.operation {
-            CuttlefishLifecycleOperation::Provision => {
-                // Provision is owned by the armed desired-state/tofu lane; this
-                // client has no authority to invent a workload document.
-                return Err(CuttlefishProviderError::ProviderUnavailable);
-            }
-            CuttlefishLifecycleOperation::Start => LifecycleAction::Start,
-            CuttlefishLifecycleOperation::Stop => LifecycleAction::Stop,
-            CuttlefishLifecycleOperation::Reboot => LifecycleAction::Reboot,
-            CuttlefishLifecycleOperation::Destroy => LifecycleAction::Delete,
-        };
-        let outcome = self.runner.lifecycle(action, request.target.vm_id.as_str());
-        if !outcome.ok || !outcome.applied {
-            return Err(CuttlefishProviderError::ProviderRejected);
-        }
-
-        if request.operation == CuttlefishLifecycleOperation::Destroy {
-            self.reset_generation()?;
-            return Self::observation(&request.target, CuttlefishVmLifecycleState::Absent, 0, None);
-        }
-
-        let generation = self.next_generation()?;
-        let state = match request.operation {
-            CuttlefishLifecycleOperation::Start => CuttlefishVmLifecycleState::Starting,
-            CuttlefishLifecycleOperation::Stop => CuttlefishVmLifecycleState::Stopped,
-            CuttlefishLifecycleOperation::Reboot => CuttlefishVmLifecycleState::Rebooting,
-            CuttlefishLifecycleOperation::Provision | CuttlefishLifecycleOperation::Destroy => {
-                unreachable!("handled above")
-            }
-        };
-        Self::observation(&request.target, state, generation, None)
     }
 
     fn launch(
@@ -564,35 +500,6 @@ impl<C: CuttlefishProviderClient> CuttlefishProviderAdapter<C> {
             .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
         let observed = self.client.observe(&self.target)?;
         commit_observation(&self.target, &mut current, observed)
-    }
-
-    /// Apply one typed lifecycle request after local admission.
-    ///
-    /// `admitted_against` is intentionally evaluated while the retained state
-    /// lock is held and before the client call. This makes stale generations,
-    /// image drift, identity drift, and invalid state transitions fail closed
-    /// without provider contact.
-    pub(crate) fn lifecycle(
-        &self,
-        request: CuttlefishLifecycleRequest,
-    ) -> Result<CuttlefishVmObservation, CuttlefishProviderError> {
-        let request = request
-            .admitted()
-            .map_err(CuttlefishProviderError::Contract)?;
-        let mut current = self
-            .observation
-            .lock()
-            .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
-        request
-            .admitted_against(&current)
-            .map_err(CuttlefishProviderError::Contract)?;
-
-        let observed = self.client.lifecycle(&request)?;
-        if request.operation == CuttlefishLifecycleOperation::Destroy {
-            commit_destroy_observation(&self.target, &mut current, observed)
-        } else {
-            commit_observation(&self.target, &mut current, observed)
-        }
     }
 
     fn inventory_from_observation(
@@ -817,36 +724,6 @@ fn commit_observation(
     Ok(observed)
 }
 
-/// Destroy is the one admitted lifecycle operation that intentionally resets a
-/// VM generation to the contract's `Absent/generation=0` state. Keep its target
-/// and timestamp checks, but do not apply the normal monotonic-generation rule.
-fn commit_destroy_observation(
-    target: &CuttlefishVmTarget,
-    current: &mut CuttlefishVmObservation,
-    observed: CuttlefishVmObservation,
-) -> Result<CuttlefishVmObservation, CuttlefishProviderError> {
-    observed
-        .validate()
-        .map_err(CuttlefishProviderError::Contract)?;
-    if observed.target != *target {
-        return Err(CuttlefishProviderError::Contract(
-            CuttlefishContractError::TargetIdentityMismatch,
-        ));
-    }
-    if observed.observed_at_unix_ms < current.observed_at_unix_ms {
-        return Err(CuttlefishProviderError::Contract(
-            CuttlefishContractError::InvalidTimestamp,
-        ));
-    }
-    if observed.lifecycle_state != CuttlefishVmLifecycleState::Absent {
-        return Err(CuttlefishProviderError::Contract(
-            CuttlefishContractError::InvalidLifecycleState,
-        ));
-    }
-    *current = observed.clone();
-    Ok(observed)
-}
-
 fn android_image_provenance(
     target: &CuttlefishVmTarget,
 ) -> Result<AndroidImageProvenance, CuttlefishProviderError> {
@@ -901,7 +778,7 @@ mod tests {
     };
     use mackes_mesh_types::android_provider::{
         CuttlefishGuestBootState, CuttlefishGuestReadiness, CuttlefishGuestReadinessEvidence,
-        CuttlefishImageProvenanceRef, CuttlefishLifecycleOperation, CuttlefishVmId,
+        CuttlefishImageProvenanceRef, CuttlefishVmId,
     };
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -909,27 +786,19 @@ mod tests {
     #[derive(Clone)]
     struct FakeClient {
         observe_calls: Arc<AtomicUsize>,
-        lifecycle_calls: Arc<AtomicUsize>,
         launch_calls: Arc<AtomicUsize>,
         observe_result:
-            Arc<Mutex<Option<Result<CuttlefishVmObservation, CuttlefishProviderError>>>>,
-        lifecycle_result:
             Arc<Mutex<Option<Result<CuttlefishVmObservation, CuttlefishProviderError>>>>,
         launch_result:
             Arc<Mutex<Option<Result<AndroidGuestLaunchOutcome, CuttlefishProviderError>>>>,
     }
 
     impl FakeClient {
-        fn new(
-            observe_result: Result<CuttlefishVmObservation, CuttlefishProviderError>,
-            lifecycle_result: Result<CuttlefishVmObservation, CuttlefishProviderError>,
-        ) -> Self {
+        fn new(observe_result: Result<CuttlefishVmObservation, CuttlefishProviderError>) -> Self {
             Self {
                 observe_calls: Arc::new(AtomicUsize::new(0)),
-                lifecycle_calls: Arc::new(AtomicUsize::new(0)),
                 launch_calls: Arc::new(AtomicUsize::new(0)),
                 observe_result: Arc::new(Mutex::new(Some(observe_result))),
-                lifecycle_result: Arc::new(Mutex::new(Some(lifecycle_result))),
                 launch_result: Arc::new(Mutex::new(Some(Ok(AndroidGuestLaunchOutcome::Started)))),
             }
         }
@@ -946,18 +815,6 @@ mod tests {
                 .expect("observe result lock")
                 .take()
                 .expect("one observe call")
-        }
-
-        fn lifecycle(
-            &self,
-            _request: &CuttlefishLifecycleRequest,
-        ) -> Result<CuttlefishVmObservation, CuttlefishProviderError> {
-            self.lifecycle_calls.fetch_add(1, Ordering::Relaxed);
-            self.lifecycle_result
-                .lock()
-                .expect("lifecycle result lock")
-                .take()
-                .expect("one lifecycle call")
         }
 
         fn launch(
@@ -1068,141 +925,10 @@ mod tests {
         .expect("observation")
     }
 
-    fn adapter(
-        initial: CuttlefishVmObservation,
-        lifecycle_result: Result<CuttlefishVmObservation, CuttlefishProviderError>,
-    ) -> (CuttlefishProviderAdapter<FakeClient>, FakeClient) {
-        let client = FakeClient::new(Ok(initial.clone()), lifecycle_result);
-        let client_handle = client.clone();
-        let adapter = CuttlefishProviderAdapter::new(
-            "android-t480",
-            target(),
-            package_manifest(),
-            initial,
-            client,
-        )
-        .expect("adapter");
-        (adapter, client_handle)
-    }
-
-    #[test]
-    fn valid_lifecycle_call_reaches_client_after_preserving_provenance() {
-        let initial = observation(CuttlefishVmLifecycleState::Stopped, 7, 100);
-        let next = observation(CuttlefishVmLifecycleState::Starting, 8, 200);
-        let (adapter, client) = adapter(initial, Ok(next));
-        let request = CuttlefishLifecycleRequest::new(
-            "start-t480-01",
-            target(),
-            CuttlefishLifecycleOperation::Start,
-            7,
-        )
-        .expect("valid lifecycle request");
-
-        let result = adapter.lifecycle(request).expect("provider response");
-        assert_eq!(result.lifecycle_state, CuttlefishVmLifecycleState::Starting);
-        assert_eq!(result.generation, 8);
-        assert_eq!(client.lifecycle_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            adapter.package_manifest().packages.len(),
-            AospStarterApp::ALL.len()
-        );
-        assert_eq!(
-            adapter.package_manifest().image_provenance.image_digest,
-            DIGEST
-        );
-    }
-
-    #[test]
-    fn invalid_transition_is_rejected_before_provider_contact() {
-        let initial = observation(CuttlefishVmLifecycleState::Stopped, 7, 100);
-        let (adapter, client) = adapter(
-            initial,
-            Ok(observation(CuttlefishVmLifecycleState::Starting, 8, 200)),
-        );
-        let request = CuttlefishLifecycleRequest::new(
-            "stop-t480-01",
-            target(),
-            CuttlefishLifecycleOperation::Stop,
-            7,
-        )
-        .expect("shape-valid lifecycle request");
-
-        assert_eq!(
-            adapter.lifecycle(request),
-            Err(CuttlefishProviderError::Contract(
-                CuttlefishContractError::OperationNotAllowed {
-                    operation: CuttlefishLifecycleOperation::Stop,
-                    state: CuttlefishVmLifecycleState::Stopped,
-                }
-            ))
-        );
-        assert_eq!(client.lifecycle_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn stale_generation_is_rejected_before_provider_contact() {
-        let initial = observation(CuttlefishVmLifecycleState::Stopped, 7, 100);
-        let (adapter, client) = adapter(
-            initial,
-            Ok(observation(CuttlefishVmLifecycleState::Starting, 8, 200)),
-        );
-        let request = CuttlefishLifecycleRequest::new(
-            "start-t480-stale",
-            target(),
-            CuttlefishLifecycleOperation::Start,
-            6,
-        )
-        .expect("shape-valid stale request");
-
-        assert_eq!(
-            adapter.lifecycle(request),
-            Err(CuttlefishProviderError::Contract(
-                CuttlefishContractError::GenerationMismatch {
-                    expected: 6,
-                    actual: 7,
-                }
-            ))
-        );
-        assert_eq!(client.lifecycle_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn provider_failure_leaves_the_last_admitted_observation_intact() {
-        let initial = observation(CuttlefishVmLifecycleState::Stopped, 7, 100);
-        let (adapter, client) = adapter(
-            initial.clone(),
-            Err(CuttlefishProviderError::ProviderUnavailable),
-        );
-        let request = CuttlefishLifecycleRequest::new(
-            "start-t480-failure",
-            target(),
-            CuttlefishLifecycleOperation::Start,
-            7,
-        )
-        .expect("valid lifecycle request");
-
-        assert_eq!(
-            adapter.lifecycle(request),
-            Err(CuttlefishProviderError::ProviderUnavailable)
-        );
-        assert_eq!(client.lifecycle_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(adapter.current_observation().expect("state").generation, 7);
-        assert_eq!(
-            adapter
-                .current_observation()
-                .expect("state")
-                .lifecycle_state,
-            CuttlefishVmLifecycleState::Stopped
-        );
-    }
-
     #[test]
     fn registry_reaches_typed_readiness_and_keeps_package_inventory_pending() {
         let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
-        let client = FakeClient::new(
-            Ok(initial.clone()),
-            Err(CuttlefishProviderError::ProviderRejected),
-        );
+        let client = FakeClient::new(Ok(initial.clone()));
         let client_handle = client.clone();
         let mut registry = super::super::AndroidGuestProviderRegistry::new();
         registry
@@ -1252,10 +978,7 @@ mod tests {
     #[test]
     fn launch_waits_for_guest_owned_ready_evidence() {
         let initial = observation(CuttlefishVmLifecycleState::Starting, 7, now_unix_ms());
-        let client = FakeClient::new(
-            Ok(initial.clone()),
-            Err(CuttlefishProviderError::ProviderUnavailable),
-        );
+        let client = FakeClient::new(Ok(initial.clone()));
         let calls = client.launch_calls.clone();
         let adapter = CuttlefishProviderAdapter::new(
             "android-t480",
@@ -1285,10 +1008,7 @@ mod tests {
     #[test]
     fn launch_reaches_backend_only_after_guest_ready_observation() {
         let initial = observation(CuttlefishVmLifecycleState::Running, 7, now_unix_ms());
-        let client = FakeClient::new(
-            Ok(initial.clone()),
-            Err(CuttlefishProviderError::ProviderUnavailable),
-        );
+        let client = FakeClient::new(Ok(initial.clone()));
         let calls = client.launch_calls.clone();
         // This fixture's Running observation carries guest-ready evidence, so
         // a typed client launch is permitted. The inventory layer still stays
@@ -1316,11 +1036,8 @@ mod tests {
     fn package_manifest_drift_is_rejected_without_contact() {
         let mut manifest = package_manifest();
         manifest.image_provenance.image_id = "different-image".to_owned();
-        let client = FakeClient::new(
-            Ok(observation(CuttlefishVmLifecycleState::Absent, 0, 100)),
-            Err(CuttlefishProviderError::ProviderUnavailable),
-        );
-        let calls = client.lifecycle_calls.clone();
+        let client = FakeClient::new(Ok(observation(CuttlefishVmLifecycleState::Absent, 0, 100)));
+        let calls = client.observe_calls.clone();
         assert!(matches!(
             CuttlefishProviderAdapter::new(
                 "android-t480",
@@ -1356,48 +1073,5 @@ mod tests {
         );
         assert_eq!(observed.guest.readiness, CuttlefishGuestReadiness::NotReady);
         assert!(!observed.is_guest_ready());
-    }
-
-    #[test]
-    fn libvirt_client_drives_typed_lifecycle_and_destroy_resets_generation() {
-        let runner = Arc::new(crate::workers::cloud::runner::fake::FakeRunner {
-            roster: vec![CloudInstance {
-                id: "android-t480".to_owned(),
-                name: "android-t480".to_owned(),
-                status: "SHUTOFF".to_owned(),
-                flavor: None,
-                image: None,
-                networks: None,
-            }],
-            ..Default::default()
-        });
-        let client = LibvirtCuttlefishProviderClient::new(runner.clone());
-        let stopped = client.observe(&target()).expect("stopped observation");
-        assert_eq!(stopped.generation, 1);
-
-        let start = CuttlefishLifecycleRequest::new(
-            "start-t480-production",
-            target(),
-            CuttlefishLifecycleOperation::Start,
-            stopped.generation,
-        )
-        .expect("start request");
-        let starting = client.lifecycle(&start).expect("start lifecycle");
-        assert_eq!(
-            starting.lifecycle_state,
-            CuttlefishVmLifecycleState::Starting
-        );
-        assert_eq!(starting.generation, 2);
-
-        let destroy = CuttlefishLifecycleRequest::new(
-            "destroy-t480-production",
-            target(),
-            CuttlefishLifecycleOperation::Destroy,
-            starting.generation,
-        )
-        .expect("destroy request");
-        let absent = client.lifecycle(&destroy).expect("destroy lifecycle");
-        assert_eq!(absent.lifecycle_state, CuttlefishVmLifecycleState::Absent);
-        assert_eq!(absent.generation, 0);
     }
 }

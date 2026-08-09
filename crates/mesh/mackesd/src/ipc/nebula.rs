@@ -4,8 +4,7 @@
 //! verbs migrated off the retired `dev.mackes.MDE.Nebula.Status`
 //! D-Bus interface onto the mesh **Bus** action/reply pattern
 //! (`action/nebula/<verb>`), mirroring the session lifecycle
-//! migration (`crates/shell/mde-session/src/session.rs`) and the
-//! cert-authority Bus responder (`workers::cert_authority`). The
+//! migration (`crates/shell/mde-session/src/session.rs`). The
 //! Bus responder ([`serve_bus`] / [`poll_once`]) is spawned from
 //! `mackesd` `run_serve` on its own OS thread (rusqlite isn't
 //! `Send`, so it runs a current-thread runtime off the main
@@ -69,8 +68,7 @@ use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 /// Poll cadence for the `action/nebula/<verb>` topics. Control
 /// surface (not on a human's interactive path), so 400 ms keeps
 /// index-read churn low while staying well under the 30 s RPC
-/// timeout — matches `rpc::CONTROL_POLL_INTERVAL` +
-/// `workers::cert_authority::DEFAULT_POLL_INTERVAL`.
+/// timeout — matching the shared control-plane cadence.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// The read-projection verbs served on `action/nebula/<verb>`.

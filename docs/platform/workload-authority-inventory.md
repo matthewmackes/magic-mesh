@@ -46,7 +46,8 @@ worklist. Repository paths are the durable owner identifiers.
 | Replicated `compute-inventory.json` VM roster used as probe targets | enrolled peer identity bundles plus bounded LAN/operator targets | production resolver and legacy reader were deleted; authority lint rejects the retired file/symbol |
 | Datacenter `action/dc/vm-*` responders and `event/dc/vm/*` roster | typed Workload operations and `state/workloads/<node>` | VM verbs and XAPI VM sampling were deleted; retained VM topics are ignored and cannot be republished |
 | XCP `action/provision/*`, `compute/xcp-host/*`, `xcp_provision`, and `xcp_host` | typed Workload operations and backend-specific HostCapacity admission | both workers and the runtime `mackes-xcp` crate were deleted; authority lint rejects their files, modules, registrations, and topics |
-| `compute/create/*`, `compute/create-ack/*`, and `compute_provision` | typed Workload create operations and `state/workloads/<node>` status | the orphan worker had no production publisher and directly ran `virt-install`; its module, spawn, registry entry, topics, and artifact were deleted and are rejected by authority lint |
+| `compute/create/*`, `compute/create-ack/*`, `compute_provision`, and its producerless certificate responder | typed Workload create operations, canonical sealed-CA enrollment, and `state/workloads/<node>` status | the orphan worker directly ran `virt-install`; it and the obsolete responder had no production publishers, were deleted, and are rejected by authority lint |
+| cloud `provision`, direct instance lifecycle, and shell Provision Apply | typed Workload operations | OpenTofu apply and direct libvirt lifecycle methods were deleted; the retained provision wire verb refuses without consuming authorization or contacting a backend, and authority lint rejects restoration |
 
 ## Known non-lifecycle runtime tools
 

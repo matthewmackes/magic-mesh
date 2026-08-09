@@ -2,8 +2,8 @@
 //!
 //! [`CloudVerb`] classifies a drained `action/cloud/<verb>` token; [`dispatch`] is
 //! the single match that routes a classified verb to its handler. The existing
-//! verbs (list/status/provision/configure/instance-*) keep their behavior; legacy
-//! workspace-wide destroy is explicitly refused;
+//! verbs (list/status/configure) keep their behavior; legacy live provision and
+//! workspace-wide destroy are explicitly refused;
 //! the U1a Workloads verbs (set-desired/plan/inventory/output/image-build/
 //! container-deploy/android-provision/browser-provision) land here as
 //! typed handlers or honest gates — recognized + routed, never faked (§7). U4–U10
@@ -28,7 +28,7 @@ use mackes_mesh_types::cloud::{
     VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
 };
 
-use super::runner::{default_browser_vm_image_source, CloudRunOutcome};
+use super::runner::CloudRunOutcome;
 use super::CloudWorker;
 
 /// The maximum action body accepted before JSON materialization. Direct callers
@@ -101,7 +101,7 @@ pub(crate) enum CloudVerb {
     Output,
     /// `plan` — the pending-change counts for a node's slice (READ; skeleton, U5).
     Plan,
-    /// `provision` — `tofu plan/apply` in `infra/tofu/cloud` (MUTATION).
+    /// Retired live `provision` wire verb. Classified only for an explicit refusal.
     Provision,
     /// `configure` — `ansible-playbook` over the mesh inventory (MUTATION).
     Configure,
@@ -427,34 +427,19 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
             app::handle(w, verb_name, &body)
         }
 
-        // ── implemented MUTATIONS — the armed-token gate ──
-        CloudVerb::Provision => {
-            if let Some(reply) =
-                authorization_refusal(w, verb_name, &body, CLOUD_ARM_NODE_SCOPE, raw)
-            {
-                return reply;
-            }
-            let tfvars = match super::reconcile::rendered_tfvars_for_node(
-                &w.state_root,
-                body.node.trim(),
-                &super::runner::default_libvirt_uri(),
-                &default_browser_vm_image_source(),
-            ) {
-                Ok(tfvars) => tfvars,
-                Err(error) => {
-                    return CloudReply {
-                        ok: false,
-                        verb: verb_name.to_string(),
-                        error: Some(format!(
-                            "provision desired state could not be rendered: {error}"
-                        )),
-                        ..Default::default()
-                    }
-                }
-            };
-            let outcome = w.runner.provision(&tfvars);
-            finish_authorized_mutation(w, verb, verb_name, &outcome, None)
-        }
+        // Live VM provisioning is owned exclusively by the typed Workload
+        // operation lane. Keep the old verb classified so retained/out-of-tree
+        // publishers receive an explicit refusal, but do not consume an armed
+        // token, render mutable inputs, or contact a backend.
+        CloudVerb::Provision => CloudReply {
+            ok: false,
+            verb: verb_name.to_string(),
+            error: Some(
+                "cloud provision is retired; use `action/workload/operation` for typed Workload provisioning"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
         CloudVerb::Configure => {
             if let Some(reply) =
                 authorization_refusal(w, verb_name, &body, CLOUD_ARM_NODE_SCOPE, raw)

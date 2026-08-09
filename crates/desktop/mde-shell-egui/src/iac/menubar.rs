@@ -23,8 +23,6 @@ pub(super) enum MenuAction {
     Open(WorkloadsRoute),
     /// Emit a provision plan (dry-run) — direct (`Provision → Plan`).
     ProvisionPlan,
-    /// Open the typed-confirm for a live provision apply (`Provision → Apply`).
-    ProvisionApply,
     /// Emit a configuration check (dry-run) — direct (`Configure → Check`).
     ConfigureCheck,
     /// Open the typed-confirm for a live configuration apply (`Configure → Apply`).
@@ -60,13 +58,10 @@ fn build_menus() -> Vec<Menu<MenuAction>> {
         ),
         Menu::new(
             "Provision",
-            vec![
-                Entry::Item(Item::new(MenuAction::ProvisionPlan, "Plan (dry-run)")),
-                Entry::Item(Item::new(
-                    MenuAction::ProvisionApply,
-                    "Apply infrastructure\u{2026}",
-                )),
-            ],
+            vec![Entry::Item(Item::new(
+                MenuAction::ProvisionPlan,
+                "Plan (dry-run)",
+            ))],
         ),
         Menu::new(
             "Configure",
@@ -178,10 +173,6 @@ pub(super) fn apply(state: &mut WorkloadsState, action: MenuAction) {
             state.set_route(WorkloadsRoute::Provision);
             state.plan_provision();
         }
-        MenuAction::ProvisionApply => {
-            state.set_route(WorkloadsRoute::Provision);
-            state.arm_provision();
-        }
         MenuAction::ConfigureCheck => {
             state.set_route(WorkloadsRoute::Run);
             state.check_configure();
@@ -223,9 +214,7 @@ mod tests {
         let menus = build_menus();
         // The plan/apply gate lives in the Provision menu.
         let provision = menu(&menus, "Provision").expect("Provision menu");
-        for want in [MenuAction::ProvisionPlan, MenuAction::ProvisionApply] {
-            assert!(ids(provision).contains(&want), "missing {want:?}");
-        }
+        assert_eq!(ids(provision), vec![MenuAction::ProvisionPlan]);
         // Configure carries check + apply.
         let configure = menu(&menus, "Configure").expect("Configure menu");
         assert!(ids(configure).contains(&MenuAction::ConfigureCheck));
@@ -257,16 +246,6 @@ mod tests {
         // A route jump opens the lifecycle route.
         apply(&mut state, MenuAction::Open(WorkloadsRoute::Drift));
         assert_eq!(state.route(), WorkloadsRoute::Drift);
-        // Apply infrastructure fails closed without a selected node capability.
-        apply(&mut state, MenuAction::ProvisionApply);
-        assert_eq!(state.route(), WorkloadsRoute::Provision);
-        assert!(
-            !state.has_arming(),
-            "unavailable apply must not open the confirm"
-        );
-        assert!(state
-            .note_text()
-            .is_some_and(|note| note.contains("unavailable")));
         // Help surfaces the honest posture note.
         apply(&mut state, MenuAction::HelpAbout);
         assert!(state.note_text().is_some_and(|n| n.contains("apply")));

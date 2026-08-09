@@ -1438,11 +1438,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         WorkerGroup::Observation,
     ),
     WorkerSpec::responder("bus_retention_gc", WorkerGroup::Data),
-    WorkerSpec::direct(
-        "cert_authority",
-        RestartPolicy::Always,
-        WorkerGroup::Control,
-    ),
     WorkerSpec::responder("clipboard_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct(
         "compute_expose",
@@ -2961,7 +2956,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 144);
+        assert_eq!(WORKER_REGISTRY.len(), 143);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3277,13 +3272,11 @@ mod tests {
         // WL-FUNC-012 OVERLAY-3 +1 rank-1 traffic_overlay => ws 85.
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
-        // gateway proxies brought the real pre-cutover count to 90; removing all
-        // 11 host Browser workers for the Chromium VM cutover leaves 79
-        // role-gated registrations. WL-ARCH-009 adds the 66 directly bound
-        // supervisor/responders to the same canonical diagnostic roster. The
-        // retired XCP capacity and provisioning authorities are absent.
-        assert_eq!(lh.len(), 106);
-        assert_eq!(ws.len(), 144);
+        // gateway proxies brought the real pre-cutover count to 90. The current
+        // canonical roster contains 82 tiered/dynamic registrations plus 61
+        // direct supervisors/responders; all retired VM authorities are absent.
+        assert_eq!(lh.len(), 105);
+        assert_eq!(ws.len(), 143);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

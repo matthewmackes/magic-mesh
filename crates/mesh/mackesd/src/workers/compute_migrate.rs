@@ -35,7 +35,7 @@
 //! (VIRT-8.followup) to amend the design doc.
 //!
 //! Non-source peers see each message, advance the cursor, and skip
-//! — same shape as `cert_authority`.
+//! — the standard authenticated request/reply shape.
 
 #![cfg(feature = "async-services")]
 

@@ -264,22 +264,6 @@ fn cloud_mirror_freshness_rejects_missing_stale_and_far_future_stamps() {
     assert!(!cloud_state_is_fresh_at(&future, now));
 }
 
-#[test]
-fn stale_armed_node_cannot_open_live_provision_confirmation() {
-    let (_tmp, mut state) = placed_bus_state();
-    state.states[0].published_at_ms = now_ms() - CLOUD_MIRROR_STALE_AFTER_MS - 1;
-
-    state.arm_provision();
-
-    assert!(
-        !state.has_arming(),
-        "stale capability must not arm live apply"
-    );
-    assert!(state
-        .note_text()
-        .is_some_and(|note| note.contains("unavailable")));
-}
-
 /// Decode the only UI request emitted for `verb` from a fixture Bus.
 fn emitted_request(state: &WorkloadsState, verb: &str) -> serde_json::Value {
     let persist =
@@ -441,7 +425,7 @@ fn provision_route_renders_ordered_guided_flow_with_one_next_action() {
         "Workload details",
         "Desired state",
         "Dry-run plan",
-        "Live provision",
+        "Typed row operation",
         "Next step",
         "Save desired state",
     ] {
@@ -490,12 +474,12 @@ fn guided_flow_reveals_only_the_backend_acknowledged_next_step() {
 
     state.provision_progress = ProvisionProgress::Planned;
     let apply = rendered_text(|ui| route_body(ui, &mut state));
-    assert!(apply.contains("Provision live"), "{apply}");
+    assert!(
+        apply.contains("typed Start") && apply.contains("Attach"),
+        "{apply}"
+    );
+    assert!(!apply.contains("Provision live"), "{apply}");
     assert!(!apply.contains("Run dry-run plan"), "{apply}");
-
-    state.provision_progress = ProvisionProgress::Applied;
-    let complete = rendered_text(|ui| route_body(ui, &mut state));
-    assert!(complete.contains("Provisioning complete"), "{complete}");
 }
 
 #[test]
@@ -899,51 +883,16 @@ fn the_roster_reads_its_workloads_by_delivery_type() {
 }
 
 #[test]
-fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm() {
-    // Dry-run default: a plan is a direct emit (no confirm). Apply is gated.
-    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
-    state.selected_node = Some("eagle".to_string());
-    state.states[0].apply_armed = true;
-
-    // Reviewing a live apply OPENS the confirm and publishes NOTHING (§ RUN-006).
-    state.arm_provision();
-    let arming = state.arming.as_ref().expect("apply opens the confirm");
-    assert_eq!(arming.action, ArmAction::Provision);
-    assert_eq!(arming.action.verb(), "provision");
-    assert!(arming.typed.is_empty());
-    assert!(
-        state.mutation_pending.is_none() && state.note.is_none(),
-        "an unconfirmed apply publishes nothing"
-    );
-
-    // The gate: only the exact echo arms; a partial/empty echo does not.
-    assert!(armed("apply", &ArmAction::Provision.echo()));
-    assert!(
-        !armed("  apply ", &ArmAction::Provision.echo()),
-        "padded echo is not exact"
-    );
-    assert!(
-        !armed("appl", &ArmAction::Provision.echo()),
-        "partial does not arm"
-    );
-    assert!(
-        !armed("", &ArmAction::Provision.echo()),
-        "empty does not arm"
-    );
-
-    // Past the gate, perform reaches the publish seam once placement is explicit
-    // (no Bus in the test → an honest error note naming the provision verb).
-    state.selected_node = Some("eagle".to_string());
-    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
-    state.perform(ArmAction::Provision, "apply");
-    assert!(
-        state
-            .note
-            .as_deref()
-            .is_some_and(|n| n.contains("provision")),
-        "the confirmed apply emits the provision verb: {:?}",
-        state.note
-    );
+fn shell_has_no_cloud_provision_publisher() {
+    for source in [
+        include_str!("mod.rs"),
+        include_str!("menubar.rs"),
+        include_str!("provision_form.rs"),
+    ] {
+        assert!(!source.contains("ArmAction::Provision"));
+        assert!(!source.contains("issue(\"provision\""));
+        assert!(!source.contains("MenuAction::ProvisionApply"));
+    }
 }
 
 #[test]
@@ -975,29 +924,6 @@ fn provision_plan_emits_dedicated_plan_request_contract() {
     assert!(
         plan.get("armed_token").is_none(),
         "dry-run plan requests are not armed live-apply mutations"
-    );
-}
-
-#[test]
-fn plan_only_selected_node_cannot_open_live_provision_arm() {
-    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
-    state.selected_node = Some("eagle".to_string());
-
-    state.arm_provision();
-
-    assert!(
-        !state.has_arming(),
-        "plan-only nodes must not open live apply"
-    );
-    assert!(state
-        .note_text()
-        .is_some_and(|note| note.contains("plan-only")));
-
-    state.states[0].apply_armed = true;
-    state.arm_provision();
-    assert!(
-        state.has_arming(),
-        "an armed node may open the typed confirm"
     );
 }
 
@@ -1141,20 +1067,6 @@ fn android_cuttlefish_reply_reads_as_desired_saved_not_live_applied() {
 #[test]
 fn ui_mutation_requests_carry_their_explicit_placement_node() {
     let (_tmp, mut state) = placed_bus_state();
-
-    state.perform(ArmAction::Provision, "apply");
-    let provision = emitted_request(&state, "provision");
-    assert_eq!(provision["schema_version"], 1);
-    assert_eq!(provision["node"], "eagle");
-    let provision_token = CloudArmedToken::parse(provision["armed_token"].as_str().unwrap())
-        .expect("root shell minted provision token");
-    assert_eq!(provision_token.verb, "provision");
-    assert_eq!(provision_token.node, "eagle");
-    assert_eq!(provision_token.target, CLOUD_ARM_NODE_SCOPE);
-    assert_eq!(
-        provision_token.request_sha256,
-        mackes_mesh_types::cloud::cloud_request_digest(&provision.to_string()).unwrap()
-    );
 
     state.perform(ArmAction::Configure, "apply");
     let configure = emitted_request(&state, "configure");
@@ -1528,7 +1440,7 @@ fn lifecycle_and_console_actions_reject_incomplete_workload_identity() {
 #[test]
 fn perform_rechecks_confirmation_and_mints_nothing_on_mismatch() {
     let (_tmp, mut state) = placed_bus_state();
-    state.perform(ArmAction::Provision, "appl");
+    state.perform(ArmAction::Configure, "appl");
     assert!(state.mutation_pending.is_none());
     assert!(state
         .note
@@ -1536,7 +1448,7 @@ fn perform_rechecks_confirmation_and_mints_nothing_on_mismatch() {
         .is_some_and(|note| note.contains("did not match")));
 
     state.note = None;
-    state.perform(ArmAction::Provision, " apply ");
+    state.perform(ArmAction::Configure, " apply ");
     assert!(
         state.mutation_pending.is_none(),
         "padded confirmation must not mint a capability"

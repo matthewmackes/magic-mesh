@@ -14,8 +14,7 @@ use std::thread;
 use std::time::Instant;
 
 use mackes_mesh_types::cloud::{
-    CloudInstance, EndpointInterface, HealthState, LifecycleAction, ResourceRow, ResourceTable,
-    ServiceHealth,
+    CloudInstance, EndpointInterface, HealthState, ResourceRow, ResourceTable, ServiceHealth,
 };
 
 // ── IaC tree + libvirt env overrides ──
@@ -241,20 +240,9 @@ pub trait CloudRunner: Send + Sync {
     /// backend can't be reached (an honest gate, never a fabricated empty roster).
     fn list_instances(&self) -> Result<Vec<CloudInstance>, String>;
 
-    /// Provision via OpenTofu using the caller's freshly rendered desired slice.
-    /// This seam writes that document as `terraform.tfvars.json` and always
-    /// performs `tofu apply`; the caller must consume mutation authority before
-    /// invoking it. Preview uses the separate read-only
-    /// [`CloudRunner::plan_json`] seam.
-    fn provision(&self, tfvars_json: &str) -> CloudRunOutcome;
-
     /// Configure via Ansible. This seam always performs the playbook; the caller
     /// must consume mutation authority before invoking it.
     fn configure(&self) -> CloudRunOutcome;
-
-    /// Perform one per-instance lifecycle operation via `virsh`. The caller must
-    /// consume target-bound mutation authority before invoking this seam.
-    fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome;
 
     /// Workloads U4/U5 — write the caller-rendered `terraform.tfvars.json` into the
     /// OpenTofu root and run `tofu plan -json`, returning the raw newline-delimited
@@ -467,25 +455,6 @@ impl CloudRunner for ShellCloudRunner {
         Ok(instances)
     }
 
-    fn provision(&self, tfvars_json: &str) -> CloudRunOutcome {
-        let tfvars_path = self.tofu_dir.join("terraform.tfvars.json");
-        if let Err(error) = std::fs::write(&tfvars_path, tfvars_json) {
-            return CloudRunOutcome::failed(format!(
-                "tofu apply unavailable: write {}: {error}",
-                tfvars_path.display()
-            ));
-        }
-        let chdir = self.tofu_chdir();
-        let args = [
-            &*chdir,
-            "apply",
-            "-auto-approve",
-            "-input=false",
-            "-no-color",
-        ];
-        Self::outcome(Self::run("tofu", &args), true, "tofu apply")
-    }
-
     fn configure(&self) -> CloudRunOutcome {
         let playbook = self.ansible_dir.join("playbooks").join("site.yml");
         let playbook_str = playbook.display().to_string();
@@ -496,26 +465,6 @@ impl CloudRunner for ShellCloudRunner {
             Self::run("ansible-playbook", &args),
             true,
             "ansible-playbook",
-        )
-    }
-
-    fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome {
-        // Map the neutral lifecycle action onto the virsh subcommand.
-        let subcmd = match action {
-            LifecycleAction::Start => "start",
-            LifecycleAction::Stop => "shutdown",
-            LifecycleAction::Reboot => "reboot",
-            LifecycleAction::Delete => "undefine",
-        };
-        // A Delete first force-stops the domain (best-effort) so the undefine
-        // succeeds on a running persistent domain.
-        if matches!(action, LifecycleAction::Delete) {
-            let _ = Self::run("virsh", &["-c", &self.libvirt_uri, "destroy", instance]);
-        }
-        Self::outcome(
-            Self::run("virsh", &["-c", &self.libvirt_uri, subcmd, instance]),
-            true,
-            &format!("virsh {subcmd} {instance}"),
         )
     }
 
@@ -647,11 +596,6 @@ pub(crate) mod fake {
         pub plan_err: Option<String>,
         /// The tfvars documents `plan_json` was handed — proves the renderer ran.
         pub tfvars_written: Mutex<Vec<String>>,
-        /// The tfvars documents the authorized live provision was handed — proves
-        /// apply consumed the current desired slice rather than stale plan state.
-        pub provision_tfvars: Mutex<Vec<String>>,
-        /// Optional lifecycle result for negative provider-contract tests.
-        pub lifecycle_outcome: Option<CloudRunOutcome>,
         /// `run_tool` invocations recorded as `(bin, args)` — proves the image-build
         /// / container-deploy pipelines drove the right tools.
         pub tool_calls: Mutex<Vec<(String, Vec<String>)>>,
@@ -707,24 +651,9 @@ pub(crate) mod fake {
                 None => Ok(self.roster.clone()),
             }
         }
-        fn provision(&self, tfvars_json: &str) -> CloudRunOutcome {
-            self.provision_tfvars
-                .lock()
-                .unwrap()
-                .push(tfvars_json.to_string());
-            self.record("provision", true);
-            CloudRunOutcome::ok("2 to add, 0 to change", true)
-        }
         fn configure(&self) -> CloudRunOutcome {
             self.record("configure", true);
             CloudRunOutcome::ok("ok=3 changed=1", true)
-        }
-        fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome {
-            self.record(&format!("lifecycle-{}", action.cli_verb()), true);
-            if let Some(outcome) = &self.lifecycle_outcome {
-                return outcome.clone();
-            }
-            CloudRunOutcome::ok(format!("virsh {} {instance}", action.cli_verb()), true)
         }
 
         fn plan_json(&self, tfvars_json: &str) -> Result<String, String> {

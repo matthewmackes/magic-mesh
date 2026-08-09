@@ -2759,21 +2759,6 @@ pub(crate) fn spawn_fleet_compute_workers(
         .expect("worker_names mutex")
         .push("apps_installed".into());
 
-    // VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
-    // spawns the worker; only the CA peer (presence of
-    // ~/.config/mde/nebula/ca.key) actually signs + replies, the
-    // others advance the cursor silently. No shipped publisher remains after
-    // the legacy VM-provision path was retired; authenticated operator/API
-    // requests can still use the responder.
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::cert_authority::CertAuthorityWorker::new(),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("cert_authority".into());
-
     // VIRT-7 (v5.0.0) — per-network firewalld port forwarding.
     // Each peer subscribes to its own `compute/expose/<addr>` +
     // `compute/unexpose/<addr>` topics and applies firewall-cmd

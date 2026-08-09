@@ -4,11 +4,11 @@
 //! The worker is the mesh-side runner + status publisher for that stack. It:
 //!
 //! 1. **Drains `action/cloud/*` verbs off the Bus** ([`CLOUD_ACTION_PREFIX`]) and
-//!    answers each with a neutral `CloudReply` on `reply/<ulid>`. Verbs:
-//!    `list`/`list-instances` + `status` (READS), `provision` / `configure` /
-//!    `destroy` and `instance-{start,stop,reboot,delete}` (MUTATIONS), plus the
-//!    U1a Workloads verbs (`set-desired`/`plan`/`inventory`/…) as honest skeletons.
-//! 2. **Shells OpenTofu + Ansible + virsh** through the injectable
+//!    answers each with a neutral `CloudReply` on `reply/<ulid>`. It serves
+//!    inventory/status reads, dry plans, armed Ansible configuration, and typed
+//!    desired-state/image declarations. Retained `provision` requests explicitly
+//!    fail closed; direct VM lifecycle and console verbs are unclassified.
+//! 2. **Shells read-only/dry-run OpenTofu and armed Ansible** through the injectable
 //!    [`CloudRunner`](runner::CloudRunner) seam (production
 //!    [`ShellCloudRunner`](runner::ShellCloudRunner); tests inject a fake).
 //! 3. **Publishes `state/cloud/<node>`** — a [`CloudState`] carrying per-tool
@@ -21,9 +21,7 @@
 //!   env wall. A live mutation is authorized by a root-shell-minted HMAC **armed
 //!   token** (nonce + expiry, bound to verb + placement + target). `CloudState.
 //!   apply_armed` is reinterpreted as *token-arming available on this node* (a
-//!   capability, not a wall). Destructive per-workload lifecycle operations also
-//!   require a `typed_name` matching the exact target; legacy workspace-wide
-//!   `destroy` is refused.
+//!   capability, not a wall). Legacy workspace-wide `destroy` is refused.
 //! - **Placement gate** ([`gate::placement_match`]) — replaces the leader gate.
 //!   Every node drains `action/cloud/*`, but performs a MUTATION iff `body.node ==
 //!   self.host`; a mutation for another node is that node's to perform, and a
@@ -1316,19 +1314,18 @@ mod tests {
     fn unsigned_mutations_are_refused_before_any_backend_call() {
         let runner = Arc::new(FakeRunner::default());
         let w = staged_worker(runner.clone());
-        for (verb, body) in [
-            ("provision", r#"{"schema_version":1,"node":"me"}"#),
-            ("configure", r#"{"schema_version":1,"node":"me"}"#),
-        ] {
-            let reply = w.handle(verb, body);
-            assert!(!reply.ok, "{verb} must not fabricate success");
-            let gated = reply.gated.unwrap();
-            assert!(gated.contains("no armed token"), "{verb}: {gated}");
-            assert!(
-                gated.contains("nothing changed or disclosed"),
-                "{verb}: {gated}"
-            );
-        }
+        let reply = w.handle("configure", r#"{"schema_version":1,"node":"me"}"#);
+        assert!(!reply.ok, "configure must not fabricate success");
+        let gated = reply.gated.unwrap();
+        assert!(gated.contains("no armed token"), "{gated}");
+        assert!(gated.contains("nothing changed or disclosed"), "{gated}");
+
+        let retired = w.handle("provision", r#"{"schema_version":1,"node":"me"}"#);
+        assert!(!retired.ok);
+        assert!(retired
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cloud provision is retired")));
         assert!(
             runner.calls.lock().unwrap().is_empty(),
             "unsigned mutations must be refused before the backend seam"
@@ -1354,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn an_armed_mutation_applies_and_is_not_audited_when_non_destructive() {
+    fn retired_provision_refuses_even_an_armed_request_without_backend_contact() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
         let base = r#"{"schema_version":1,"node":"me"}"#;
@@ -1368,16 +1365,16 @@ mod tests {
             )
         );
         let reply = w.handle("provision", &body);
-        assert!(reply.ok, "gated: {:?}", reply.gated);
-        assert!(!reply.audited, "provision is not destructive");
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), true)]
-        );
+        assert!(!reply.ok);
+        assert!(reply.error.as_deref().is_some_and(|error| {
+            error.contains("cloud provision is retired")
+                && error.contains("action/workload/operation")
+        }));
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn android_desired_state_is_rendered_into_the_live_provision_input() {
+    fn android_provision_retains_desired_state_without_live_apply() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner::default());
         let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
@@ -1401,37 +1398,15 @@ mod tests {
             mackes_mesh_types::cloud::DeliveryType::AndroidVm
         );
 
-        let provision_base = r#"{"schema_version":1,"node":"me"}"#;
-        let provision_token = valid_token(
-            "provision",
-            "me",
-            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
-            provision_base,
-        );
-        let provision_body =
-            format!(r#"{{"schema_version":1,"node":"me","armed_token":"{provision_token}"}}"#);
-        let applied = w.handle("provision", &provision_body);
-        assert!(
-            applied.ok,
-            "gated: {:?} error: {:?}",
-            applied.gated, applied.error
-        );
-
-        let rendered = runner.provision_tfvars.lock().unwrap();
-        assert_eq!(rendered.len(), 1);
-        let tfvars: serde_json::Value = serde_json::from_str(&rendered[0]).unwrap();
-        assert_eq!(tfvars["vms"]["phone"]["delivery_type"], "android_vm");
-        assert_eq!(tfvars["vms"]["phone"]["vcpu"], 4);
-        assert_eq!(tfvars["vms"]["phone"]["memory_mb"], 8192);
-        assert_eq!(tfvars["vms"]["phone"]["disk_gb"], 80);
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn an_armed_token_is_single_use_even_across_worker_restart() {
+    fn retired_provision_does_not_consume_tokens_across_worker_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let base = r#"{"schema_version":1,"node":"me"}"#;
         let token = valid_token(
-            "provision",
+            "configure",
             "me",
             mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
             base,
@@ -1443,11 +1418,8 @@ mod tests {
             .with_runner(first_runner.clone())
             .with_signer(Arc::new(signer()))
             .with_bus_root(None);
-        assert!(first.handle("provision", &body).ok);
-        assert_eq!(
-            first_runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), true)]
-        );
+        assert!(!first.handle("provision", &body).ok);
+        assert!(first_runner.calls.lock().unwrap().is_empty());
         drop(first);
 
         let restarted_runner = Arc::new(FakeRunner::default());
@@ -1458,9 +1430,9 @@ mod tests {
         let replay = restarted.handle("provision", &body);
         assert!(!replay.ok);
         assert!(replay
-            .gated
+            .error
             .as_deref()
-            .is_some_and(|reason| reason.contains("already used")));
+            .is_some_and(|reason| reason.contains("cloud provision is retired")));
         assert!(
             restarted_runner.calls.lock().unwrap().is_empty(),
             "a replay must be refused before the backend seam"
@@ -1468,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_or_forged_token_never_reaches_the_backend() {
+    fn a_forged_token_never_reaches_the_backend() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
         // A token minted by a different key is forged from this worker's vantage.
@@ -1476,7 +1448,7 @@ mod tests {
             &HmacTokenSigner::new(b"other".to_vec()),
             "nonce-12345678",
             valid_expiry(),
-            "provision",
+            "configure",
             "me",
             mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
             &mackes_mesh_types::cloud::cloud_request_digest(r#"{"schema_version":1,"node":"me"}"#)
@@ -1484,7 +1456,7 @@ mod tests {
         )
         .encode();
         let body = format!(r#"{{"schema_version":1,"node":"me","armed_token":"{forged}"}}"#);
-        let reply = w.handle("provision", &body);
+        let reply = w.handle("configure", &body);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("signature did not verify"));
         assert!(
@@ -1502,7 +1474,7 @@ mod tests {
             &signer(),
             "nonce-overlong-cloud-capability",
             now_ms().saturating_add(MAX_AUTH_TTL_MS + 30_000),
-            "provision",
+            "configure",
             "me",
             mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
             &mackes_mesh_types::cloud::cloud_request_digest(base).unwrap(),
@@ -1510,7 +1482,7 @@ mod tests {
         .encode();
         let body = format!(r#"{{"schema_version":1,"node":"me","armed_token":"{token}"}}"#);
 
-        let reply = w.handle("provision", &body);
+        let reply = w.handle("configure", &body);
         assert!(!reply.ok);
         assert!(reply
             .gated
@@ -1645,7 +1617,7 @@ mod tests {
     fn a_missing_mutation_schema_is_rejected_before_any_backend_call() {
         let runner = Arc::new(FakeRunner::default());
         let w = staged_worker(runner.clone());
-        let reply = w.handle("instance-start", r#"{"node":"me","instance":"web"}"#);
+        let reply = w.handle("configure", r#"{"node":"me","playbook":"site.yml"}"#);
         assert!(!reply.ok);
         assert!(reply
             .error
@@ -2150,7 +2122,7 @@ mod tests {
             "a non-placement node must not reply for a reachable target"
         );
 
-        // The placement node "l" (arm-capable) drains: it performs + replies ok.
+        // The placement node "l" drains and explicitly refuses the retired verb.
         let runner = Arc::new(FakeRunner::default());
         let leader = CloudWorker::new("l".into(), "peer:l".into(), tmp.path().to_path_buf())
             .with_runner(runner.clone())
@@ -2164,12 +2136,12 @@ mod tests {
         let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
         assert_eq!(replies.len(), 1, "exactly one reply");
         let reply: CloudReply = serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
-        assert!(reply.ok, "gated: {:?}", reply.gated);
-        assert_eq!(
-            runner.calls.lock().unwrap().as_slice(),
-            &[("provision".into(), true)],
-            "the placement node applied the armed mutation"
-        );
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cloud provision is retired")));
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

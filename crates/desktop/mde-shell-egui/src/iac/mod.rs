@@ -951,7 +951,7 @@ struct Pending {
 }
 
 /// Progress through the shared guided provisioning flow. This is deliberately
-/// delivery-neutral: every workload follows desired state → plan → live apply.
+/// delivery-neutral: every workload follows desired state → plan → typed row operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(super) enum ProvisionProgress {
     /// The current draft has not been saved as desired state.
@@ -961,7 +961,7 @@ pub(super) enum ProvisionProgress {
     DesiredSaved,
     /// The backend returned a successful dry-run plan.
     Planned,
-    /// Live provisioning completed.
+    /// The typed Workload row operation completed.
     Applied,
 }
 
@@ -970,8 +970,6 @@ pub(super) enum ProvisionProgress {
 /// What a confirmed review-sheet echo releases onto the Bus (RUN-006 idiom).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ArmAction {
-    /// A live `provision` (OpenTofu apply) — echo [`APPLY_ECHO`].
-    Provision,
     /// A live `configure` (Ansible apply) — echo [`APPLY_ECHO`].
     Configure,
     /// A destructive per-workload lifecycle op (`instance-reboot` /
@@ -1048,7 +1046,6 @@ impl ArmAction {
     /// path matches the variant directly).
     const fn verb(&self) -> &'static str {
         match self {
-            Self::Provision => "provision",
             Self::Configure => "configure",
             Self::Lifecycle { verb, .. } => verb,
             Self::Prepared { verb, .. } => verb,
@@ -1061,7 +1058,7 @@ impl ArmAction {
     /// The exact echo the operator must type before this action publishes.
     fn echo(&self) -> String {
         match self {
-            Self::Provision | Self::Configure => APPLY_ECHO.to_string(),
+            Self::Configure => APPLY_ECHO.to_string(),
             Self::Lifecycle { name, .. } => name.clone(),
             Self::Prepared { echo, .. } => echo.clone(),
             Self::Workload { echo, .. } => echo.clone(),
@@ -1073,7 +1070,7 @@ impl ArmAction {
     /// The confirm button's verb word.
     fn confirm_word(&self) -> &'static str {
         match self {
-            Self::Provision | Self::Configure => "Apply",
+            Self::Configure => "Apply",
             Self::Lifecycle { verb, .. } => verb_label(verb),
             Self::Prepared { word, .. } => word,
             Self::Workload { word, .. } => word,
@@ -1085,7 +1082,6 @@ impl ArmAction {
     /// What the confirm acts on — the review copy's subject.
     fn subject(&self) -> String {
         match self {
-            Self::Provision => "the OpenTofu-managed infrastructure (live apply)".to_string(),
             Self::Configure => "the Ansible convergence (live apply)".to_string(),
             Self::Lifecycle { name, .. } => format!("workload {name}"),
             Self::Prepared { subject, .. } => subject.clone(),
@@ -1156,25 +1152,6 @@ fn review_sheet_facts(action: &ArmAction, state: &WorkloadsState) -> ReviewSheet
     };
     let subject = action.subject();
     match action {
-        ArmAction::Provision => {
-            let node = state
-                .selected_node()
-                .map(str::trim)
-                .filter(|node| !node.is_empty())
-                .unwrap_or("no placement selected");
-            let body = node_request_body(node);
-            request_review_facts(
-                command,
-                subject,
-                CLOUD_ARM_NODE_SCOPE.to_string(),
-                node.to_string(),
-                &body,
-                format!(
-                    "Live OpenTofu apply can change infrastructure on placement node {node}; \
-                     authorization is scoped to {CLOUD_ARM_NODE_SCOPE}."
-                ),
-            )
-        }
         ArmAction::Configure => {
             let node = state
                 .selected_node()
@@ -1348,7 +1325,7 @@ fn request_body_preview(body: &str) -> String {
 enum AuditOutcome {
     /// The op was applied live (and, if destructive, audited to the events plane).
     Applied,
-    /// The backend persisted desired state, but a separate live apply remains.
+    /// The backend persisted desired state, but a separate typed row operation remains.
     Desired,
     /// The op was staged (a `tofu plan` / `--check` dry-run — nothing applied).
     Staged,
@@ -2155,22 +2132,8 @@ impl WorkloadsState {
             self.note = Some("Typed confirmation did not match; nothing was sent.".to_string());
             return;
         }
-        let requires_apply_capability =
-            matches!(&action, ArmAction::Provision | ArmAction::Configure);
+        let requires_apply_capability = matches!(&action, ArmAction::Configure);
         let (verb, node, target, body, label) = match action {
-            ArmAction::Provision => {
-                let Some(node) = self.require_selected_node("live provision") else {
-                    return;
-                };
-                let body = node_request_body(&node);
-                (
-                    "provision",
-                    node,
-                    CLOUD_ARM_NODE_SCOPE.to_string(),
-                    body,
-                    "live provision (apply)".to_string(),
-                )
-            }
             ArmAction::Configure => {
                 let Some(node) = self.require_selected_node("live configuration") else {
                     return;
@@ -2233,24 +2196,6 @@ impl WorkloadsState {
         };
         let body = node_request_body(&node);
         self.issue(VERB_PLAN, Some(&body), "provision plan (dry-run)");
-    }
-
-    /// Open the review-sheet confirm for a live provision **apply** (#RUN-006 —
-    /// nothing publishes until the echo matches).
-    pub(super) fn arm_provision(&mut self) {
-        if !self.selected_node_apply_armed() {
-            self.note = Some(
-                "Live provision is unavailable: the selected node is plan-only or no longer \
-                 reports an armed-apply capability."
-                    .to_string(),
-            );
-            return;
-        }
-        self.note = None;
-        self.arming = Some(ReviewSheetState {
-            action: ArmAction::Provision,
-            typed: String::new(),
-        });
     }
 
     /// Emit a configuration **check** (dry-run `--check`) — direct.

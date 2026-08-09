@@ -35,8 +35,7 @@ with a TUI — honoring §1 (Nebula control plane only; **no Tailscale/Headscale
 - `POST /enroll` body `{ bearer, name, pubkey_pem, role }` →
   1. validate `bearer` against the single-use ledger (reuse `enroll-token`'s
      bearer-hash ledger; reject replays/expired);
-  2. sign the peer's pubkey with the mesh CA (reuse the `ca` module / the
-     `cert_authority` signing path);
+  2. sign the peer's pubkey with the canonical sealed `ca` module path;
   3. return the nebula **bundle** JSON (ca.crt, the peer's host.crt, the
      `lighthouses` roster with public `external_addr`, `mesh_cidr`, overlay_ip).
 - Reuses: the bearer ledger, the CA signer, `ca::bundle` shape. The QNM-Shared

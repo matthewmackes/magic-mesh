@@ -1,12 +1,11 @@
 //! U15 — the **provision form**: author a [`mackes_mesh_types::cloud::WorkloadSpec`]
 //! (delivery type · sizing · image · network isolation) with the raw-HCL escape
-//! hatch, then hand it to `set-desired` / `plan` / armed `provision`.
+//! hatch, then hand it to `set-desired` / dry-run `plan`.
 //!
 //! The delivery type follows the active [`DeliveryView`]; the node is whatever the
 //! placement picker selected (`None` reads as an honest "pick a node first").
-//! **Set desired** persists the authored spec, **Plan** dry-runs it (counts only),
-//! and **Provision** opens the typed-arm before any live apply — never a fake
-//! apply (§7): a live apply only ever reaches the Bus past the arming gate.
+//! **Set desired** persists the authored spec and **Plan** dry-runs it (counts
+//! only). VM mutation continues through typed Workload row operations.
 
 use mde_egui::egui::{self, Color32, Response, RichText};
 use mde_egui::{card, field, section, Style, TypographyRole};
@@ -106,14 +105,6 @@ impl State {
     }
 }
 
-/// The live provision affordance requires both a valid draft and positive
-/// capability evidence from the selected placement node. Plan-only nodes can
-/// still author/plan, but must not open a live-apply arm that the worker cannot
-/// honor.
-pub(super) const fn live_provision_enabled(valid: bool, apply_armed: bool) -> bool {
-    valid && apply_armed
-}
-
 /// Trim a field, folding blank to `None` (the honest "unset").
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
@@ -139,8 +130,8 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         );
         mde_egui::muted_note(
             ui,
-            "Author a workload spec for the selected node, then set it desired, plan it, or \
-             provision it.",
+            "Author a workload spec for the selected node, save it as desired, run a dry plan, \
+             then use the typed Workload row operation.",
         );
     });
 
@@ -166,7 +157,6 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 
     let mut set_desired = false;
     let mut plan = false;
-    let mut provision = false;
     let mut android_prepare = false;
     provision_workspace(
         ui,
@@ -178,7 +168,6 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         request_pending,
         &mut set_desired,
         &mut plan,
-        &mut provision,
         &mut android_prepare,
     );
 
@@ -190,9 +179,6 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     }
     if plan {
         state.plan_provision();
-    }
-    if provision {
-        state.arm_provision();
     }
     if android_prepare {
         state.arm_android_provision(&android_name);
@@ -210,7 +196,6 @@ fn provision_workspace(
     request_pending: bool,
     set_desired: &mut bool,
     plan: &mut bool,
-    provision: &mut bool,
     android_prepare: &mut bool,
 ) {
     guided_progress(ui, progress, valid);
@@ -225,7 +210,6 @@ fn provision_workspace(
             request_pending,
             set_desired,
             plan,
-            provision,
             android_prepare,
         );
     });
@@ -247,7 +231,6 @@ fn provision_action_controls(
     request_pending: bool,
     set_desired: &mut bool,
     plan: &mut bool,
-    provision: &mut bool,
     android_prepare: &mut bool,
 ) {
     if request_pending {
@@ -292,24 +275,9 @@ fn provision_action_controls(
         ProvisionProgress::Planned => {
             mde_egui::muted_note(
                 ui,
-                "Step 5 of 5 — review and apply the plan to the selected node.",
+                "Plan complete. Open the existing Workload row and use its typed Start and \
+                 Attach operations. OpenTofu live provision is retired.",
             );
-            if action_button(
-                ui,
-                live_provision_enabled(valid, live_apply_available),
-                "Provision live\u{2026}",
-                Style::DANGER,
-            )
-            .clicked()
-            {
-                *provision = true;
-            }
-            if !live_apply_available {
-                mde_egui::muted_note(
-                    ui,
-                    "Live apply is unavailable because this node currently reports plan-only.",
-                );
-            }
         }
         ProvisionProgress::Applied => {
             ui.colored_label(
@@ -606,7 +574,7 @@ fn guided_progress(ui: &mut egui::Ui, progress: ProvisionProgress, valid: bool) 
                 ("Workload details", valid),
                 ("Desired state", progress >= ProvisionProgress::DesiredSaved),
                 ("Dry-run plan", progress >= ProvisionProgress::Planned),
-                ("Live provision", progress >= ProvisionProgress::Applied),
+                ("Typed row operation", progress >= ProvisionProgress::Applied),
             ]
             .into_iter()
             .enumerate()
@@ -731,12 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn live_provision_requires_a_valid_draft_and_armed_node() {
-        assert!(!live_provision_enabled(false, true));
-        assert!(!live_provision_enabled(true, false));
-        assert!(live_provision_enabled(true, true));
-    }
-
     #[test]
     fn set_desired_serializes_the_worker_envelope() {
         let form = State {

@@ -2792,7 +2792,7 @@ fn run_serve(
             mackesd_core::workers::metrics_exporter::MetricsExporterWorker::new(
                 db_path.clone(),
                 mackesd_core::metrics::default_textfile_dir(),
-                Some(mackesd_core::workers::cert_authority::default_ca_cert_path()),
+                Some(PathBuf::from(mackesd_core::ca::DEFAULT_CA_CERT_PATH)),
             )
             .with_router_metrics(Arc::clone(&router_metrics))
             // EFF-26 — worker/breaker gauges + trip alert.

@@ -340,20 +340,11 @@ pub mod apps_running;
 // blocking live RPC — the on-demand `action/apps/peer-list` verb reads
 // this replicated file locally (lazy-mesh: a dead peer never blocks).
 pub mod apps_installed;
-// VIRT-5 (v5.0.0) — VM Nebula cert signing via Bus. Every peer
-// drains `action/compute/cert-sign-request`; on the CA peer
-// (detected by ~/.config/mde/nebula/ca.key) calls `nebula-cert
-// sign` and replies on `reply/<ulid>`; non-CA peers advance the
-// cursor and skip. Topic shape locked to `action/<domain>/<verb>`
-// per Q96 + rpc.rs convention (design doc §3's per-ULID notation
-// reinterpreted accordingly).
-pub mod cert_authority;
-// WL-ARCH-001 Phase B — the OpenTofu + Ansible cloud backend worker (the
-// successor to the deleted `openstack` worker tree). Drains `action/cloud/*`
-// verbs (leader-gated), shells OpenTofu (`infra/tofu/cloud`) + Ansible + virsh
-// with live mutation operator-gated behind `MDE_CLOUD_APPLY=1`, and publishes
-// `state/cloud/<node>` (provider health + resource roster via the neutral
-// `mackes_mesh_types::cloud` types). Rank-0 universal like service_aggregator.
+// WL-ARCH-001 Phase B — the OpenTofu + Ansible cloud observer/planner (the
+// successor to the deleted `openstack` worker tree). It serves read-only
+// inventory and dry plans, applies armed Ansible configuration, accepts typed
+// desired-state/image declarations, and publishes `state/cloud/<node>`.
+// VM creation/lifecycle belongs only to the Workload operation lane.
 pub mod cloud;
 // Rolling Node — the `vehicle` worker: the workstation-side adapter that
 // SSH/HTTP-polls a mobile Sierra AirLink MG90 (oMG) gateway and publishes a
