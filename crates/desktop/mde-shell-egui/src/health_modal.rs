@@ -3,9 +3,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::health::{
-    format_health_duration_ms, HealthAction, HealthActionRequest, HealthComponent,
-    HealthCondition, HealthScope, HealthSeverity, NodeGrade, SystemMeshHealthSnapshot,
-    ACTION_TOPIC, HEALTH_SCHEMA_VERSION,
+    format_health_duration_ms, HealthAction, HealthActionRequest, HealthComponent, HealthCondition,
+    HealthScope, HealthSeverity, NodeGrade, SystemMeshHealthSnapshot, ACTION_TOPIC,
+    HEALTH_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -144,10 +144,7 @@ fn show(
 /// snapshot reorder/removal.  Selection belongs to the operator-facing modal
 /// model; deriving it from `current_node_grades.first()` on every paint lets an
 /// asynchronously refreshed roster silently move the evidence pane.
-fn stabilize_selection(
-    chrome: &mut ConstructChrome,
-    snapshot: Option<&SystemMeshHealthSnapshot>,
-) {
+fn stabilize_selection(chrome: &mut ConstructChrome, snapshot: Option<&SystemMeshHealthSnapshot>) {
     if chrome.health_selected_node.is_none() {
         chrome.health_selected_node = snapshot.and_then(|snapshot| {
             snapshot
@@ -402,13 +399,19 @@ fn detail(
     }
 
     if let Some(snapshot) = snapshot {
-        let resolved = sorted_history(&snapshot.resolved_conditions, &node);
+        let resolved = recurrence_history(&snapshot.resolved_conditions, &node);
         if !resolved.is_empty() {
             ui.separator();
             ui.strong("Recent History");
-            for condition in resolved {
+            for recurrence in resolved {
+                let condition = recurrence.condition;
+                let recurrence_copy = if recurrence.occurrences == 1 {
+                    "once".to_string()
+                } else {
+                    format!("{} times", recurrence.occurrences)
+                };
                 ui.label(format!(
-                    "{} · resolved {} · duration {}",
+                    "{} · occurred {recurrence_copy} · resolved {} · duration {}",
                     condition.evidence.summary,
                     condition
                         .resolved_at_ms
@@ -588,23 +591,62 @@ fn resolution_duration_ms(condition: &HealthCondition) -> Option<u64> {
         .map(|resolved| resolved.saturating_sub(condition.active_since_ms))
 }
 
-fn sorted_history<'a>(
+struct HistoryRecurrence<'a> {
+    condition: &'a HealthCondition,
+    occurrences: usize,
+}
+
+/// Aggregate stable lifecycle identities without materializing the complete
+/// history in the modal. The first pass retains only the strongest eight
+/// identities; the second pass counts recurrences for those retained rows.
+/// This keeps paint-time memory fixed even if an untrusted caller bypasses the
+/// snapshot's wire-level collection bound.
+fn recurrence_history<'a>(
     conditions: &'a [HealthCondition],
     node: &str,
-) -> Vec<&'a HealthCondition> {
-    let mut resolved: Vec<&'a HealthCondition> = Vec::with_capacity(HISTORY_PAGE_SIZE);
-    for condition in conditions.iter().filter(|condition| {
-        matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
-    }) {
+) -> Vec<HistoryRecurrence<'a>> {
+    let applies_to_node = |condition: &HealthCondition| matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node);
+    let mut resolved: Vec<HistoryRecurrence<'a>> = Vec::with_capacity(HISTORY_PAGE_SIZE);
+    for condition in conditions
+        .iter()
+        .filter(|condition| applies_to_node(condition))
+    {
+        if let Some(recurrence) = resolved
+            .iter_mut()
+            .find(|recurrence| recurrence.condition.id == condition.id)
+        {
+            if history_order(condition, recurrence.condition) == std::cmp::Ordering::Less {
+                recurrence.condition = condition;
+                resolved.sort_by(|left, right| history_order(left.condition, right.condition));
+            }
+            continue;
+        }
         let insert_at = resolved.partition_point(|existing| {
-            history_order(existing, condition) != std::cmp::Ordering::Greater
+            history_order(existing.condition, condition) != std::cmp::Ordering::Greater
         });
         if insert_at >= HISTORY_PAGE_SIZE {
             continue;
         }
-        resolved.insert(insert_at, condition);
+        resolved.insert(
+            insert_at,
+            HistoryRecurrence {
+                condition,
+                occurrences: 0,
+            },
+        );
         if resolved.len() > HISTORY_PAGE_SIZE {
             resolved.pop();
+        }
+    }
+    for condition in conditions
+        .iter()
+        .filter(|condition| applies_to_node(condition))
+    {
+        if let Some(recurrence) = resolved
+            .iter_mut()
+            .find(|recurrence| recurrence.condition.id == condition.id)
+        {
+            recurrence.occurrences = recurrence.occurrences.saturating_add(1);
         }
     }
     resolved
@@ -616,6 +658,11 @@ fn history_order(left: &HealthCondition, right: &HealthCondition) -> std::cmp::O
         .cmp(&left.severity)
         .then_with(|| resolution_duration_ms(right).cmp(&resolution_duration_ms(left)))
         .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| right.resolved_at_ms.cmp(&left.resolved_at_ms))
+        .then_with(|| right.last_observed_ms.cmp(&left.last_observed_ms))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.evidence.provider.cmp(&right.evidence.provider))
+        .then_with(|| left.evidence.summary.cmp(&right.evidence.summary))
 }
 
 #[cfg(test)]
@@ -1072,9 +1119,12 @@ mod tests {
         long_warning.resolved_at_ms = Some(20_000);
         let conditions = vec![long_warning, short_critical, long_critical];
 
-        let ordered = sorted_history(&conditions, "node");
+        let ordered = recurrence_history(&conditions, "node");
         assert_eq!(
-            ordered.iter().map(|condition| condition.id.as_str()).collect::<Vec<_>>(),
+            ordered
+                .iter()
+                .map(|recurrence| recurrence.condition.id.as_str())
+                .collect::<Vec<_>>(),
             ["critical-long", "critical-short", "warning-long"]
         );
     }
@@ -1086,7 +1136,10 @@ mod tests {
         let mut chrome = ConstructChrome::default();
 
         stabilize_selection(&mut chrome, Some(&initial));
-        assert_eq!(chrome.health_selected_node.as_deref(), Some(selected.as_str()));
+        assert_eq!(
+            chrome.health_selected_node.as_deref(),
+            Some(selected.as_str())
+        );
 
         initial.current_node_grades.reverse();
         assert_ne!(initial.current_node_grades[0].node, selected);
@@ -1147,11 +1200,11 @@ mod tests {
         other.resolved_at_ms = Some(9_999);
         conditions.push(other);
 
-        let page = sorted_history(&conditions, "node");
+        let page = recurrence_history(&conditions, "node");
         assert_eq!(page.len(), 8, "one paint materializes at most eight rows");
         assert_eq!(
             page.iter()
-                .map(|condition| condition.id.as_str())
+                .map(|recurrence| recurrence.condition.id.as_str())
                 .collect::<Vec<_>>(),
             [
                 "node:critical-long",
@@ -1165,9 +1218,90 @@ mod tests {
             ],
             "bounded insertion retains the same severity/duration/id ordering"
         );
-        assert!(page.iter().all(|condition| {
-            matches!(&condition.scope, HealthScope::Node { node } if node == "node")
+        assert!(page.iter().all(|recurrence| {
+            matches!(&recurrence.condition.scope, HealthScope::Node { node } if node == "node")
         }));
+    }
+
+    #[test]
+    fn recurrence_aggregation_is_bounded_complete_and_order_independent() {
+        let mut conditions = Vec::new();
+        for index in 0..32 {
+            let mut resolved = condition(
+                &format!("node:warning-{index:02}"),
+                "node",
+                HealthSeverity::Warning,
+                HealthComponent::System,
+            );
+            resolved.resolved_at_ms = Some(2_000 + index);
+            conditions.push(resolved);
+        }
+        for duration in [9_000, 3_000, 7_000] {
+            let mut recurrence = condition(
+                "node:recurring-critical",
+                "node",
+                HealthSeverity::Critical,
+                HealthComponent::Resources,
+            );
+            recurrence.active_since_ms = 1_000;
+            recurrence.resolved_at_ms = Some(1_000 + duration);
+            conditions.push(recurrence);
+        }
+        let mut equal_duration_later = condition(
+            "node:recurring-critical",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::Resources,
+        );
+        equal_duration_later.active_since_ms = 2_000;
+        equal_duration_later.resolved_at_ms = Some(11_000);
+        conditions.push(equal_duration_later);
+        let mut wrong_node = condition(
+            "node:recurring-critical",
+            "other",
+            HealthSeverity::Critical,
+            HealthComponent::Resources,
+        );
+        wrong_node.resolved_at_ms = Some(u64::MAX);
+        conditions.push(wrong_node);
+
+        let mut reversed_conditions = conditions.clone();
+        reversed_conditions.reverse();
+        let forward = recurrence_history(&conditions, "node");
+        let reversed = recurrence_history(&reversed_conditions, "node");
+        let summarize = |page: &[HistoryRecurrence<'_>]| {
+            page.iter()
+                .map(|recurrence| {
+                    (
+                        recurrence.condition.id.clone(),
+                        recurrence.occurrences,
+                        resolution_duration_ms(recurrence.condition),
+                        recurrence.condition.resolved_at_ms,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(forward.len(), HISTORY_PAGE_SIZE);
+        assert_eq!(summarize(&forward), summarize(&reversed));
+        assert_eq!(
+            summarize(&forward)[0],
+            (
+                "node:recurring-critical".to_string(),
+                4,
+                Some(9_000),
+                Some(11_000)
+            ),
+            "all same-node occurrences are counted and equal durations choose the latest resolution"
+        );
+        assert_eq!(
+            forward
+                .iter()
+                .filter(|recurrence| recurrence.condition.id == "node:recurring-critical")
+                .count(),
+            1,
+            "a stable lifecycle identity occupies exactly one bounded row"
+        );
     }
 
     #[test]

@@ -1878,6 +1878,11 @@ behavioral evidence is not completion.
   shared and worker suites: `docs/platform/evidence/WL-UX-013-WL-UX-014-2026-08-09-grade-e-authority-r5.md`.
 - **History/selection checkpoint (2026-08-09):** paint-time history retains only the ordered top eight node rows, and live reorder/removal cannot silently move the
   selected detail target. Machine 9 passed both focused tests: `docs/platform/evidence/WL-UX-013-2026-08-09-history-selection-r6.md`.
+- **Recurrence aggregation checkpoint (2026-08-09):** repeated stable condition
+  identities now occupy one bounded history row with an exact same-node count;
+  representative choice is deterministic under reversed input and history
+  still materializes at most eight rows. BigBoy passed the exact hostile test:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-recurrence-aggregation-r7.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.
