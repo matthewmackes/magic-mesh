@@ -1077,6 +1077,9 @@ behavioral evidence is not completion.
 - **Release-artifact admission (2026-08-09):** schema-v2 readiness binds the release, package manifest, architecture/compatibility, and canonical installed tool digest;
   machine 193 package/verifier gates passed: `docs/platform/evidence/WL-FUNC-020-2026-08-09-release-artifact-admission-s2-s5-r5.md`.
 - Remaining work:
+  - **S1 importer retry boundary (2026-08-09):** transient persistence/publication failure no longer acknowledges a signed catalog row; terminal refusals still
+    advance and the repaired retry publishes exactly once. Machine 9 exact regression passed 1/1:
+    `docs/platform/evidence/WL-FUNC-020-2026-08-09-android-import-side-effect-retry-s1-r6.md`.
   1. S1 Freeze Android catalog/image contracts.
      - Objective: define signed app identity, package/version, image digest, permissions, capabilities, resource profile, and guest readiness.
      - Inputs: Android mesh types and provider policy.

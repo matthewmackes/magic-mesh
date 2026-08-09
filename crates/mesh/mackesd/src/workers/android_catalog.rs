@@ -84,18 +84,21 @@ impl AndroidCatalogWorker {
             .map_err(io_other)?;
         let mut admitted = 0;
         for row in rows {
-            *cursor = Some(row.ulid);
+            let row_ulid = row.ulid;
             let Some(body) = row.body else {
+                *cursor = Some(row_ulid);
                 continue;
             };
             if body.len() > MAX_IMPORT_BYTES {
                 tracing::warn!(target: "mackesd::android_catalog", "refused oversized Android catalog import");
+                *cursor = Some(row_ulid);
                 continue;
             }
             let candidate = match serde_json::from_str::<AndroidSignedCatalog>(&body) {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     tracing::warn!(target: "mackesd::android_catalog", %error, "refused malformed Android catalog import");
+                    *cursor = Some(row_ulid);
                     continue;
                 }
             };
@@ -104,6 +107,7 @@ impl AndroidCatalogWorker {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     tracing::warn!(target: "mackesd::android_catalog", ?error, "refused untrusted Android catalog import");
+                    *cursor = Some(row_ulid);
                     continue;
                 }
             };
@@ -112,11 +116,13 @@ impl AndroidCatalogWorker {
                 .is_some_and(|existing| candidate.payload.revision <= existing.payload.revision)
             {
                 tracing::warn!(target: "mackesd::android_catalog", revision = candidate.payload.revision, "refused stale Android catalog revision");
+                *cursor = Some(row_ulid);
                 continue;
             }
             store_last_good(&config.state_file, &candidate)?;
             publish_admitted(persist, &self.host, &candidate)?;
             *current = Some(candidate);
+            *cursor = Some(row_ulid);
             admitted += 1;
         }
         Ok(admitted)
@@ -510,6 +516,43 @@ mod tests {
         );
         fs::write(path, b"not-json").unwrap();
         assert!(load_last_good(worker.config.as_ref().unwrap(), NOW).is_err());
+    }
+
+    #[test]
+    fn transient_side_effect_failure_keeps_signed_import_retryable() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let state_parent = worker.config.as_ref().unwrap().state_file.parent().unwrap();
+        fs::write(state_parent, b"hostile non-directory").unwrap();
+
+        let mut persist = Persist::open(temp.path().join("bus")).unwrap();
+        import(&persist, &signed_catalog(&key, 7));
+        let mut cursor = None;
+        let mut current = None;
+        assert!(worker
+            .process_once(&mut persist, &mut cursor, &mut current, NOW)
+            .is_err());
+        assert_eq!(cursor, None, "failed governed effects must not acknowledge");
+        assert_eq!(current, None);
+
+        fs::remove_file(state_parent).unwrap();
+        assert_eq!(
+            worker
+                .process_once(&mut persist, &mut cursor, &mut current, NOW)
+                .unwrap(),
+            1
+        );
+        assert!(cursor.is_some(), "successful retry acknowledges the import");
+        assert_eq!(current.unwrap().payload.revision, 7);
+        assert_eq!(
+            persist
+                .list_since(&android_catalog_state_topic("node-01").unwrap(), None)
+                .unwrap()
+                .len(),
+            1,
+            "retry publishes exactly once"
+        );
     }
 
     #[tokio::test]
