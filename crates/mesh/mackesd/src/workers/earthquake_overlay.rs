@@ -18,6 +18,8 @@ use std::time::Duration;
 use mackes_mesh_types::earthquake::{
     earthquake_state_topic, EarthquakeEvent, EarthquakeSnapshot, PagerAlert,
 };
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 use reqwest::blocking::Client;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::Deserialize;
@@ -54,6 +56,11 @@ pub enum ProbeResponse {
 pub trait EarthquakeProbe: Send + Sync {
     /// Fetch or conditionally validate the current USGS feed.
     fn fetch(&self) -> io::Result<ProbeResponse>;
+
+    /// Forget conditional validators unless a fresh response transaction was
+    /// published. The next request must fetch a complete body so a 304 cannot
+    /// strand rejected or unpublished data outside last-good authority.
+    fn publication_deferred(&self) {}
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +142,17 @@ impl EarthquakeProbe for UsgsHttpProbe {
         validators.etag = etag;
         validators.last_modified = last_modified;
         Ok(ProbeResponse::Modified(body))
+    }
+
+    fn publication_deferred(&self) {
+        match self.validators.lock() {
+            Ok(mut validators) => *validators = Validators::default(),
+            Err(error) => tracing::warn!(
+                target: "mackesd::earthquake_overlay",
+                %error,
+                "USGS validator reset failed after deferred publication"
+            ),
+        }
     }
 }
 
@@ -285,7 +303,15 @@ pub struct EarthquakeOverlayWorker {
     host: String,
     probe: Option<Arc<dyn EarthquakeProbe>>,
     bus_root: Option<PathBuf>,
+    bus_disabled: bool,
     poll: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    Fresh,
+    Degraded,
+    Deferred,
 }
 
 impl EarthquakeOverlayWorker {
@@ -316,7 +342,8 @@ impl EarthquakeOverlayWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root: None,
+            bus_disabled: false,
             poll: POLL,
         }
     }
@@ -328,9 +355,10 @@ impl EarthquakeOverlayWorker {
         self
     }
 
-    /// Override or disable Bus publishing.
+    /// Override or explicitly disable Bus publishing.
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
+        self.bus_disabled = root.is_none();
         self.bus_root = root;
         self
     }
@@ -342,64 +370,93 @@ impl EarthquakeOverlayWorker {
         self
     }
 
-    fn publish(&self, snapshot: &EarthquakeSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &earthquake_state_topic(&self.host),
-                snapshot,
-            );
+    fn bus_root(&self) -> PathBuf {
+        resolve_bus_root(self.bus_root.clone(), mde_bus::default_data_dir())
+    }
+
+    fn publish(&self, snapshot: &EarthquakeSnapshot) -> io::Result<()> {
+        if self.bus_disabled {
+            return Ok(());
         }
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        let persist = Persist::open(self.bus_root()).map_err(io_other)?;
+        #[cfg(test)]
+        if FAIL_NEXT_PUBLICATION.with(|fail| fail.replace(false)) {
+            return Err(io::Error::other("injected earthquake publication failure"));
+        }
+        persist
+            .write(
+                &earthquake_state_topic(&self.host),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
     }
 
     fn poll_once(
         &self,
         probe: &dyn EarthquakeProbe,
         last_good: &mut Option<EarthquakeSnapshot>,
-    ) -> bool {
-        self.handle_probe_result(probe.fetch(), last_good)
+    ) -> PollOutcome {
+        let outcome = self.handle_probe_result(probe.fetch(), last_good);
+        if outcome != PollOutcome::Fresh {
+            probe.publication_deferred();
+        }
+        outcome
     }
 
     fn handle_probe_result(
         &self,
         result: io::Result<ProbeResponse>,
         last_good: &mut Option<EarthquakeSnapshot>,
-    ) -> bool {
+    ) -> PollOutcome {
         match result {
             Ok(ProbeResponse::Modified(body)) => {
                 match parse_snapshot(&self.host, &body, now_ms()) {
-                    Ok(snapshot) => {
-                        self.publish(&snapshot);
-                        *last_good = Some(snapshot);
-                        true
-                    }
+                    Ok(snapshot) => match self.publish(&snapshot) {
+                        Ok(()) => {
+                            *last_good = Some(snapshot);
+                            PollOutcome::Fresh
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::earthquake_overlay", host = %self.host, %error, "earthquake publication failed; refresh remains uncommitted");
+                            PollOutcome::Deferred
+                        }
+                    },
                     Err(error) => {
-                        self.publish_failure(last_good, &format!("USGS payload invalid: {error}"));
-                        false
+                        self.publish_failure(last_good, &format!("USGS payload invalid: {error}"))
                     }
                 }
             }
             Ok(ProbeResponse::NotModified) => {
-                if let Some(snapshot) = last_good {
-                    snapshot.fetched_at_ms = now_ms();
-                    snapshot
+                if let Some(snapshot) = last_good.as_ref() {
+                    let mut refreshed = snapshot.clone();
+                    refreshed.fetched_at_ms = now_ms();
+                    refreshed
                         .gaps
                         .retain(|gap| !gap.starts_with("USGS refresh failed:"));
-                    self.publish(snapshot);
-                    true
+                    match self.publish(&refreshed) {
+                        Ok(()) => {
+                            *last_good = Some(refreshed);
+                            PollOutcome::Fresh
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::earthquake_overlay", host = %self.host, %error, "earthquake 304 publication failed; refresh remains uncommitted");
+                            PollOutcome::Deferred
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         target: "mackesd::earthquake_overlay",
                         host = %self.host,
                         "USGS returned 304 before this process had a last-good snapshot"
                     );
-                    false
+                    PollOutcome::Degraded
                 }
             }
-            Err(error) => {
-                self.publish_failure(last_good, &format!("USGS refresh failed: {error}"));
-                false
-            }
+            Err(error) => self.publish_failure(last_good, &format!("USGS refresh failed: {error}")),
         }
     }
 
@@ -411,8 +468,9 @@ impl EarthquakeOverlayWorker {
         probe: Arc<dyn EarthquakeProbe>,
         last_good: &mut Option<EarthquakeSnapshot>,
         shutdown: &mut ShutdownToken,
-    ) -> Option<bool> {
-        let task = tokio::task::spawn_blocking(move || probe.fetch());
+    ) -> Option<PollOutcome> {
+        let fetch_probe = probe.clone();
+        let task = tokio::task::spawn_blocking(move || fetch_probe.fetch());
         tokio::select! {
             () = shutdown.wait() => None,
             joined = task => {
@@ -420,26 +478,65 @@ impl EarthquakeOverlayWorker {
                     Ok(result) => result,
                     Err(error) => Err(io::Error::other(format!("USGS fetch task failed: {error}"))),
                 };
-                Some(self.handle_probe_result(result, last_good))
+                let outcome = self.handle_probe_result(result, last_good);
+                if outcome != PollOutcome::Fresh {
+                    probe.publication_deferred();
+                }
+                Some(outcome)
             }
         }
     }
 
-    fn publish_failure(&self, last_good: &mut Option<EarthquakeSnapshot>, gap: &str) {
+    fn publish_failure(
+        &self,
+        last_good: &mut Option<EarthquakeSnapshot>,
+        gap: &str,
+    ) -> PollOutcome {
         tracing::warn!(
             target: "mackesd::earthquake_overlay",
             host = %self.host,
             error = gap,
             "USGS earthquake refresh failed; retaining last-good snapshot"
         );
-        if let Some(snapshot) = last_good {
-            snapshot
+        if let Some(snapshot) = last_good.as_ref() {
+            let mut degraded = snapshot.clone();
+            degraded
                 .gaps
                 .retain(|existing| !existing.starts_with("USGS refresh failed:"));
-            snapshot.gaps.push(gap.to_string());
-            self.publish(snapshot);
+            degraded.gaps.push(gap.to_string());
+            match self.publish(&degraded) {
+                Ok(()) => {
+                    *last_good = Some(degraded);
+                    PollOutcome::Degraded
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::earthquake_overlay", host = %self.host, %error, "earthquake degraded publication failed; gap remains uncommitted");
+                    PollOutcome::Deferred
+                }
+            }
+        } else {
+            PollOutcome::Degraded
         }
     }
+}
+
+fn resolve_bus_root(configured: Option<PathBuf>, user: Option<PathBuf>) -> PathBuf {
+    configured
+        .or(user)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn cadence_after(outcome: PollOutcome, retry: Duration, poll: Duration) -> (Duration, Duration) {
+    match outcome {
+        PollOutcome::Fresh => (poll, RETRY_MIN.min(poll)),
+        PollOutcome::Degraded => (retry, retry.saturating_mul(2).min(poll)),
+        PollOutcome::Deferred => (retry, retry),
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[async_trait::async_trait]
@@ -462,18 +559,14 @@ impl Worker for EarthquakeOverlayWorker {
         let mut last_good = None;
         let mut retry = RETRY_MIN.min(self.poll);
         loop {
-            let Some(success) = self
+            let Some(outcome) = self
                 .poll_once_async(probe.clone(), &mut last_good, &mut shutdown)
                 .await
             else {
                 break;
             };
-            let delay = if success { self.poll } else { retry };
-            retry = if success {
-                RETRY_MIN.min(self.poll)
-            } else {
-                retry.saturating_mul(2).min(self.poll)
-            };
+            let (delay, next_retry) = cadence_after(outcome, retry, self.poll);
+            retry = next_retry;
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 () = shutdown.wait() => break,
@@ -660,9 +753,15 @@ mod tests {
         ]));
         let w = worker().with_probe(fake).with_bus_root(Some(root.clone()));
         let mut last = None;
-        assert!(w.poll_once(w.probe.as_deref().expect("probe"), &mut last));
+        assert_eq!(
+            w.poll_once(w.probe.as_deref().expect("probe"), &mut last),
+            PollOutcome::Fresh
+        );
         let fetched = last.as_ref().expect("last").fetched_at_ms;
-        assert!(!w.poll_once(w.probe.as_deref().expect("probe"), &mut last));
+        assert_eq!(
+            w.poll_once(w.probe.as_deref().expect("probe"), &mut last),
+            PollOutcome::Degraded
+        );
         assert_eq!(last.as_ref().expect("last").fetched_at_ms, fetched);
         assert!(last
             .as_ref()
@@ -686,10 +785,113 @@ mod tests {
         ]));
         let w = worker().with_probe(fake);
         let mut last = None;
-        assert!(w.poll_once(w.probe.as_deref().expect("probe"), &mut last));
+        assert_eq!(
+            w.poll_once(w.probe.as_deref().expect("probe"), &mut last),
+            PollOutcome::Fresh
+        );
         let before = last.as_ref().expect("last").events.clone();
-        assert!(w.poll_once(w.probe.as_deref().expect("probe"), &mut last));
+        assert_eq!(
+            w.poll_once(w.probe.as_deref().expect("probe"), &mut last),
+            PollOutcome::Fresh
+        );
         assert_eq!(last.as_ref().expect("last").events, before);
+    }
+
+    #[test]
+    fn same_worker_recovers_late_and_replaced_bus_with_latest_wins_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("late-bus");
+        std::fs::write(&root, "temporarily unavailable").expect("blocking file");
+        let fake = Arc::new(FakeProbe::new(vec![
+            Ok(ProbeResponse::Modified(CAPTURED_USGS.to_string())),
+            Ok(ProbeResponse::Modified(CAPTURED_USGS.to_string())),
+            Ok(ProbeResponse::NotModified),
+        ]));
+        let worker = worker().with_probe(fake).with_bus_root(Some(root.clone()));
+        let mut last_good = None;
+
+        assert_eq!(
+            worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good),
+            PollOutcome::Deferred
+        );
+        assert!(last_good.is_none(), "late Bus must not commit last-good");
+
+        std::fs::remove_file(&root).expect("remove blocking file");
+        assert_eq!(
+            worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good),
+            PollOutcome::Fresh
+        );
+        assert!(last_good.is_some());
+
+        let replacement = temp.path().join("replacement-bus");
+        drop(Persist::open(replacement.clone()).expect("replacement Bus"));
+        std::fs::rename(replacement.join("index.sqlite"), root.join("index.sqlite"))
+            .expect("replace Bus index");
+        assert_eq!(
+            worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good),
+            PollOutcome::Fresh
+        );
+
+        let rows = Persist::open(root)
+            .expect("replacement reader")
+            .list_since(&earthquake_state_topic("rig-1"), None)
+            .expect("replacement rows");
+        assert_eq!(rows.len(), 1, "state topic remains latest-wins per index");
+        assert_eq!(
+            resolve_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[test]
+    fn failed_publication_corrects_forward_without_state_or_cadence_advance() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        let fake = Arc::new(FakeProbe::new(vec![
+            Ok(ProbeResponse::Modified(CAPTURED_USGS.to_string())),
+            Ok(ProbeResponse::Modified(CAPTURED_USGS.to_string())),
+            Ok(ProbeResponse::NotModified),
+            Ok(ProbeResponse::NotModified),
+        ]));
+        let worker = worker().with_probe(fake).with_bus_root(Some(root.clone()));
+        let mut last_good = None;
+        let retry = Duration::from_secs(5);
+        let poll = Duration::from_secs(60);
+
+        FAIL_NEXT_PUBLICATION.with(|fail| fail.set(true));
+        let first = worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good);
+        assert_eq!(first, PollOutcome::Deferred);
+        assert!(last_good.is_none());
+        assert_eq!(cadence_after(first, retry, poll), (retry, retry));
+
+        assert_eq!(
+            worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good),
+            PollOutcome::Fresh
+        );
+        let committed = last_good.clone().expect("committed snapshot");
+
+        std::thread::sleep(Duration::from_millis(2));
+        FAIL_NEXT_PUBLICATION.with(|fail| fail.set(true));
+        let refresh = worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good);
+        assert_eq!(refresh, PollOutcome::Deferred);
+        assert_eq!(last_good.as_ref(), Some(&committed));
+        assert_eq!(cadence_after(refresh, retry, poll), (retry, retry));
+
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(
+            worker.poll_once(worker.probe.as_deref().expect("probe"), &mut last_good),
+            PollOutcome::Fresh
+        );
+        assert!(last_good.as_ref().expect("refreshed").fetched_at_ms > committed.fetched_at_ms);
+        assert_eq!(
+            Persist::open(root)
+                .expect("bus")
+                .list_since(&earthquake_state_topic("rig-1"), None)
+                .expect("rows")
+                .len(),
+            2,
+            "only successful modified and corrected-forward refresh publish"
+        );
     }
 
     #[tokio::test]

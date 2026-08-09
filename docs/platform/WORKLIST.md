@@ -480,10 +480,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
 - **CUPS action recovery checkpoint (2026-08-09):** both lanes activate atomically; failed replies retry in-process without repeating sync. Machine 193 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-cups-sync-bus-recovery-r46.md`.
-- **Weather-location recovery checkpoint (2026-08-09):** complete action/vehicle reads
-  precede effects; failed reads cannot look like absent fixes. Machine 9 passed seven exact tests:
+- **Weather-location recovery checkpoint (2026-08-09):** complete action/vehicle reads precede effects; failed reads cannot look absent. Machine 9 passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
-- **Health/Units/forecast recovery checkpoints (2026-08-09):** complete reads stage before effects and failed replies retry; machines 194/193 and BigBoy passed focused gates:
+- **Health/Units/forecast recovery checkpoints (2026-08-09):** reads stage before effects and failed replies retry; machines 194/193 and BigBoy passed focused gates:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
@@ -503,6 +502,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
@@ -874,6 +874,9 @@ behavioral evidence is not completion.
   staged across write faults and exact vehicle context is rechecked before
   commit. Machine 9 passed seven focused tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`.
+- **Earthquake transaction checkpoint (2026-08-09):** failed publication commits neither latest-wins state nor conditional validators/cadence;
+  BigBoy passed two exact late/replaced and corrected-forward tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
