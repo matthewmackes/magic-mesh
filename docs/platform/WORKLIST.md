@@ -1027,6 +1027,11 @@ behavioral evidence is not completion.
   including post-rename sync errors. Machine 9 passed three exact failure and
   corrected-forward fixtures:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-manual-source-transaction-r20.md`.
+- **Desktop Bus recovery checkpoint (2026-08-09):** late Bus storage no longer
+  permanently removes desktop discovery; startup retries are bounded, prime
+  cursors once, skip stale actions, and publish forward without restart.
+  Machine 9 passed three exact tests:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-desktop-bus-recovery-r21.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
