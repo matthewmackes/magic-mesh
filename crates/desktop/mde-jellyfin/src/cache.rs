@@ -585,9 +585,7 @@ impl OfflineCache {
             // A zero-byte file is never a playable media copy.  Keep this
             // invariant here as well as in `store`: a hostile or stale
             // manifest must not turn an empty file into an offline fallback.
-            metadata.file_type().is_file()
-                && metadata.len() > 0
-                && metadata.len() == entry.byte_len
+            metadata.file_type().is_file() && metadata.len() > 0 && metadata.len() == entry.byte_len
         })
     }
 }
@@ -670,16 +668,17 @@ impl MetadataCache {
             cached_at,
             items: items.into_iter().map(metadata_snapshot_item).collect(),
         };
-        if let Some(existing) = self
-            .snapshots
+        let mut next = self.snapshots.clone();
+        if let Some(existing) = next
             .iter_mut()
             .find(|entry| entry.source_id == snapshot.source_id)
         {
             *existing = snapshot.clone();
         } else {
-            self.snapshots.push(snapshot.clone());
+            next.push(snapshot.clone());
         }
-        self.persist()?;
+        self.persist_snapshots(&next)?;
+        self.snapshots = next;
         Ok(snapshot)
     }
 
@@ -712,13 +711,18 @@ impl MetadataCache {
     }
 
     fn persist(&self) -> Result<(), CacheError> {
+        self.persist_snapshots(&self.snapshots)
+    }
+
+    fn persist_snapshots(&self, snapshots: &[MetadataSnapshot]) -> Result<(), CacheError> {
         std::fs::create_dir_all(&self.root).map_err(|e| CacheError::Io(e.to_string()))?;
         let manifest = MetadataManifest {
-            snapshots: self.snapshots.clone(),
+            snapshots: snapshots.to_vec(),
         };
         let json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| CacheError::Parse(e.to_string()))?;
-        std::fs::write(self.manifest_path(), json).map_err(|e| CacheError::Io(e.to_string()))
+        write_atomic(&self.manifest_path(), json.as_bytes())
+            .map_err(|e| CacheError::Io(e.to_string()))
     }
 }
 
@@ -1099,5 +1103,59 @@ mod tests {
         assert_eq!(cache.snapshots().len(), 2);
         assert_eq!(cache.snapshot("gateway-a").expect("a").cached_at, 3);
         assert_eq!(cache.snapshot("gateway-b").expect("b").cached_at, 2);
+    }
+
+    #[test]
+    fn failed_metadata_snapshot_replacement_keeps_the_last_complete_projection() {
+        let dir = tempdir().expect("tempdir");
+        let mut cache = MetadataCache::with_root(dir.path());
+        cache
+            .store_snapshot(
+                "gateway-a",
+                "Gateway A",
+                "http://gateway-a.mesh",
+                vec![metadata_item()],
+                1,
+            )
+            .expect("initial snapshot");
+
+        let manifest = cache.manifest_path();
+        let last_good = dir.path().join("last-good.json");
+        std::fs::rename(&manifest, &last_good).expect("preserve manifest fixture");
+        std::fs::create_dir(&manifest).expect("block atomic replacement");
+
+        let error = cache
+            .store_snapshot(
+                "gateway-a",
+                "Gateway A",
+                "http://gateway-a.mesh",
+                Vec::new(),
+                2,
+            )
+            .expect_err("failed persistence must be reported");
+        assert!(matches!(error, CacheError::Io(_)));
+        assert_eq!(
+            cache.snapshot("gateway-a").expect("last good").cached_at,
+            1,
+            "an unpersisted provider refresh must not replace the live fallback"
+        );
+
+        std::fs::remove_dir(&manifest).expect("remove blocker");
+        std::fs::rename(&last_good, &manifest).expect("restore last good manifest");
+        let reloaded = MetadataCache::load_from(dir.path()).expect("reload last good");
+        assert_eq!(
+            reloaded
+                .snapshot("gateway-a")
+                .expect("persisted last good")
+                .cached_at,
+            1
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("cache root")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "failed atomic replacement must clean its temporary file"
+        );
     }
 }

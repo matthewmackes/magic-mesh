@@ -1095,9 +1095,8 @@ behavioral evidence is not completion.
 - Problem: Music has a direct Airsonic panel and incomplete daemon authority, media playback, library/Jellyfin, offline cache, discovery, casting, handoff, and live proof.
 - Required outcome: a near-Spotify workspace uses daemon-owned typed catalog, queue, playback, bookmarks, cache, and source authority; mde-media-core provides real mpv
   frame/audio playback; Media UI covers local/Jellyfin/library flows; discovery, DLNA/cast, peer handoff, and live visual/audio proof pass.
-- Current state: daemon-owned catalog/queue/cache, typed playback, artwork, browse/detail, and signed radio pass. Release 11 executes on all five seats;
-  named 38 Special, Black Ice, and Podcast details pass on Dell without the old
-  stale error; one daemon owns each seat; CPU/NWS and provider loss pass. Live renderer and handoff proof remain.
+- Current state: daemon catalog/queue/cache, typed playback, artwork, browse/detail, signed radio, and release 11 run on five seats; one daemon owns each seat.
+  Dell named-detail, CPU/NWS, and provider-loss proofs pass; live renderer, audible continuity, casting, and handoff proof remain.
 - **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
@@ -1116,9 +1115,10 @@ behavioral evidence is not completion.
 - **Search checkpoint (2026-08-06):** retained typed search renders; provider search is fallback; UI 45/45 `.50`; `evidence/WL-FUNC-021-2026-08-06-daemon-search-r1.md`.
 - **Drain guards (2026-08-06):** search replay and duplicate Jellyfin identities pass `.90`; live-seat RPM ownership self-test and read-only probe pass. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-search-replay-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-source-identity-r1.md`.
-- **Cache checkpoints (2026-08-07/09):** verified Jellyfin bytes refuse zero/truncated entries; daemon index replacement is synced, atomic, and preserves last-good.
-  BigBoy passed 2/2; mde-jellyfin 114/114 and Media UI 104/104 passed; `.50` cache passed 16/16. Live/package proof remains open.
-  `docs/platform/evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`.
+- **Cache checkpoints (2026-08-07/09):** Jellyfin bytes reject truncation; daemon index and Jellyfin metadata replacement are atomic and preserve last-good.
+  BigBoy passed 2/2 plus 1/1; mde-jellyfin 114/114, Media UI 104/104, and `.50` cache 16/16 passed. Live/package proof remains open.
+  `evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`,
+  `evidence/WL-FUNC-021-2026-08-09-jellyfin-metadata-atomic-r12.md`.
 - **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
   Live proof remains: `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`, `evidence/WL-FUNC-021-2026-08-09-mpv-playlist-continuation-r11.md`.
 - **Daemon Album/download/workerless checkpoint (2026-08-06):** Home, Library, and Search open retained albums; detail emits typed play without `LoadAlbum` worker requests.
