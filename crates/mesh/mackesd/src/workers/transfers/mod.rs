@@ -207,7 +207,7 @@ const V2_EXECUTOR_REGISTRY: [V2ExecutorRegistryRow; 11] = [
         kind: TransferKind::Clipboard,
         operation: V2OperationKind::PublishClipboard,
         admission: V2ExecutorAdmission::Blocked(
-            "clipboard Files publication executor provider is unavailable",
+            "clipboard profile registry cannot bind the payload to an authorized Files reference, target session, and generation receipt",
         ),
     },
 ];
@@ -1624,8 +1624,9 @@ mod tests {
     use mackes_mesh_types::cloud::CloudArmSigner;
     use mde_collab_core::{ActorLog, CollabEngine, Ed25519Signer, FileActorLog, RandomIds};
     use mde_collab_types::{
-        topics, ActorId, ChecksumPolicy, FileReferenceView, OpaqueNodeRef, SpaceId, SpaceKind,
-        TransferControlV2, TransferDirection, TransferEndpoint, TransferKind, TransferOperation,
+        topics, ActorId, ChecksumPolicy, FileReferenceView, OpaqueNodeRef, OpaqueProfileRef,
+        PayloadRef, SpaceId, SpaceKind, TransferControlV2, TransferDirection, TransferEndpoint,
+        TransferKind, TransferOperation,
     };
     use std::path::Path;
     use tokio::sync::watch;
@@ -1750,6 +1751,27 @@ mod tests {
                 direction: TransferDirection::Inbound,
             },
             ChecksumPolicy::verify(),
+            None,
+            100,
+        )
+        .unwrap()
+    }
+
+    fn v2_clipboard_job() -> TransferJobV2 {
+        TransferJobV2::new(
+            TransferId::from_uuid(Uuid::from_u128(0x821)),
+            TransferKind::Clipboard,
+            TransferEndpoint::new(
+                TransferLocation::Clipboard {
+                    profile: OpaqueProfileRef::new("clipboard-session").unwrap(),
+                    payload: PayloadRef::of_bytes(b"clipboard payload"),
+                },
+                TransferLocation::Local {
+                    object: FileRefId::from_uuid(Uuid::from_u128(0x822)),
+                },
+            ),
+            TransferOperation::PublishClipboard,
+            ChecksumPolicy::off(),
             None,
             100,
         )
@@ -2219,6 +2241,52 @@ mod tests {
         assert_eq!(
             error.detail.as_deref(),
             Some("authenticated mesh transport and remote acknowledgement provider is unavailable")
+        );
+        assert_eq!(failed.progress.bytes_done, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_clipboard_publish_refuses_unbound_profile_before_files_resolution() {
+        struct MustNotResolveClipboard;
+
+        impl FilesEndpointResolver for MustNotResolveClipboard {
+            fn resolve(
+                &self,
+                _identity: &TransferLocation,
+                _role: FilesEndpointRole,
+            ) -> Result<ResolvedFilesEndpoint, FilesResolveFailure> {
+                panic!("blocked Clipboard executor must not derive authority from a payload digest")
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with(tmp.path(), 1, Arc::new(GatedLaneRunner));
+        engine.files_resolver = Arc::new(MustNotResolveClipboard);
+        let job = v2_clipboard_job();
+        let id = job.transfer;
+        write_verb(tmp.path(), &TransferVerb::SubmitV2(job)).unwrap();
+        for _ in 0..100 {
+            engine.tick().await;
+            if engine
+                .v2_ledger
+                .get(id)
+                .is_some_and(|job| job.state == V2State::Failed)
+                && engine.v2_tasks.is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let failed = engine.v2_ledger.get(id).expect("durable blocked row");
+        let error = failed.progress.error.expect("named provider blocker");
+        assert_eq!(error.code, TransferErrorCode::Unsupported);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(
+                "clipboard profile registry cannot bind the payload to an authorized Files reference, target session, and generation receipt"
+            )
         );
         assert_eq!(failed.progress.bytes_done, 0);
     }
