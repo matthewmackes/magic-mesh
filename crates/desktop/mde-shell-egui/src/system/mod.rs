@@ -222,6 +222,61 @@ mod persisted_config_tests {
 
         assert!(read_bounded_local_config(dir.path()).is_none());
     }
+
+    #[test]
+    fn clock_config_migrates_only_the_five_legacy_zones_atomically() {
+        let cases = [
+            ("eastern_standard", "America/New_York"),
+            ("central_standard", "America/Chicago"),
+            ("mountain_standard", "America/Denver"),
+            ("pacific_standard", "America/Los_Angeles"),
+            ("utc", "UTC"),
+        ];
+
+        for (legacy, expected) in cases {
+            let dir = tempfile::tempdir().expect("clock config dir");
+            let path = dir.path().join(CLOCK_CONFIG_FILE);
+            fs::write(&path, format!(r#"{{"zone":"{legacy}"}}"#)).expect("legacy clock config");
+
+            let migrated = ClockConfig::load_from(&path);
+
+            assert_eq!(migrated.zone, expected);
+            let persisted: ClockConfig = serde_json::from_str(
+                &fs::read_to_string(&path).expect("persisted IANA clock config"),
+            )
+            .expect("valid persisted clock config");
+            assert_eq!(persisted.zone, expected);
+            assert!(!path.with_extension("json.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn clock_config_refuses_unknown_legacy_value_without_rewriting_or_importing_alarms() {
+        let dir = tempfile::tempdir().expect("clock config dir");
+        let path = dir.path().join(CLOCK_CONFIG_FILE);
+        let alarms = dir.path().join("timers-alarms.json");
+        let unknown = r#"{"zone":"atlantic_standard"}"#;
+        let legacy_alarms = br#"{"alarms":[{"label":"leave untouched"}]}"#;
+        fs::write(&path, unknown).expect("unknown legacy clock config");
+        fs::write(&alarms, legacy_alarms).expect("legacy alarms fixture");
+
+        assert_eq!(ClockConfig::load_from(&path), ClockConfig::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), unknown);
+        assert_eq!(fs::read(&alarms).unwrap(), legacy_alarms);
+    }
+
+    #[test]
+    fn clock_config_accepts_valid_iana_and_refuses_unavailable_zoneinfo() {
+        let dir = tempfile::tempdir().expect("clock config dir");
+        let path = dir.path().join(CLOCK_CONFIG_FILE);
+        fs::write(&path, r#"{"zone":"Europe/Paris"}"#).expect("IANA config");
+        assert_eq!(ClockConfig::load_from(&path).zone, "Europe/Paris");
+
+        let unavailable = r#"{"zone":"Mars/Olympus_Mons"}"#;
+        fs::write(&path, unavailable).expect("unavailable zone config");
+        assert_eq!(ClockConfig::load_from(&path), ClockConfig::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), unavailable);
+    }
 }
 
 // ──────────────────────────── the System state ────────────────────────────
@@ -554,7 +609,7 @@ impl SystemState {
         // live context every frame (poll runs unconditionally in both runners, so this
         // is honored globally + restored on start — not just while Settings is open).
         self.apply_appearance(ctx);
-        crate::timers::set_clock_zone(self.clock.zone);
+        crate::timers::set_clock_zone(&self.clock.zone);
         // Devices → Mouse & Touch: publish the persisted input policy to the bare DRM
         // seat and egui input options every frame, so a restart restores pointer speed
         // and double-click timing before the operator reopens Settings.
@@ -1586,8 +1641,8 @@ impl SystemState {
 
     /// The durable human-facing clock zone owned by the System provider.
     /// Machine, mesh, and audit timestamps remain UTC.
-    pub(crate) fn clock_zone_label(&self) -> &'static str {
-        self.clock.zone.label()
+    pub(crate) fn clock_zone_label(&self) -> &str {
+        &self.clock.zone
     }
 
     /// U12 Control Center deep-link seam: rest the Settings master-detail rail on
@@ -1699,7 +1754,7 @@ impl SystemState {
         // it can be detected + persisted afterwards (SETTINGS-5 — the same collect-
         // then-apply idiom `nav` uses; the live re-tint/zoom happens in the poll).
         let appearance_before = self.appearance;
-        let clock_before = self.clock;
+        let clock_before = self.clock.clone();
         let remote_proofing_before = self.remote_proofing;
         let mouse_touch_before = self.mouse_touch;
         let wallpaper_service_before = self.wallpaper_service.clone();
@@ -1834,7 +1889,7 @@ impl SystemState {
         }
         if self.clock != clock_before {
             self.clock.save();
-            crate::timers::set_clock_zone(self.clock.zone);
+            crate::timers::set_clock_zone(&self.clock.zone);
         }
         // Persist Remote Proofing policy changes from Mesh & System. The live
         // Sunshine/service bridge consumes this config; Settings owns the operator
@@ -4004,10 +4059,18 @@ const CLOCK_CONFIG_FILE: &str = "settings-clock.json";
 
 /// Persisted user-facing clock zone. Event, audit, and mesh timestamps remain
 /// UTC; only human-readable clocks and dates use this display preference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClockConfig {
-    #[serde(default)]
-    zone: crate::timers::ClockZone,
+    zone: String,
+}
+
+impl Default for ClockConfig {
+    fn default() -> Self {
+        Self {
+            zone: "America/New_York".to_owned(),
+        }
+    }
 }
 
 impl ClockConfig {
@@ -4016,30 +4079,55 @@ impl ClockConfig {
     }
 
     fn load() -> Self {
-        Self::default_path()
-            .and_then(|path| {
-                read_bounded_local_config(&path).and_then(|s| serde_json::from_str::<Self>(&s).ok())
-            })
-            .unwrap_or_default()
+        Self::default_path().map_or_else(Self::default, |path| Self::load_from(&path))
     }
 
-    fn save(self) {
+    fn load_from(path: &Path) -> Self {
+        let Some(raw) = read_bounded_local_config(path) else {
+            return Self::default();
+        };
+        let Ok(mut persisted) = serde_json::from_str::<Self>(&raw) else {
+            return Self::default();
+        };
+        let migrated = match persisted.zone.as_str() {
+            "eastern_standard" => Some("America/New_York"),
+            "central_standard" => Some("America/Chicago"),
+            "mountain_standard" => Some("America/Denver"),
+            "pacific_standard" => Some("America/Los_Angeles"),
+            "utc" => Some("UTC"),
+            _ => None,
+        };
+        if let Some(iana) = migrated {
+            persisted.zone = iana.to_owned();
+            if persisted.save_to(path).is_err() {
+                return Self::default();
+            }
+        } else if jiff::tz::TimeZone::get(&persisted.zone).is_err() {
+            return Self::default();
+        }
+        persisted
+    }
+
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        let Some(parent) = path.parent() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Clock config path has no parent",
+            ));
+        };
+        fs::create_dir_all(parent)?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(tmp, path)
+    }
+
+    fn save(&self) {
         let Some(path) = Self::default_path() else {
             return;
         };
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        let Ok(json) = serde_json::to_string_pretty(&self) else {
-            return;
-        };
-        let tmp = path.with_extension("json.tmp");
-        if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(tmp, path);
-        }
+        let _ = self.save_to(&path);
     }
 }
 
@@ -6315,17 +6403,17 @@ fn clock_section(ui: &mut egui::Ui, clock: &mut ClockConfig) {
             .strong(),
     );
     ui.add_space(Style::SP_XS);
-    across_grid(ui, &crate::timers::ClockZone::ALL, 2, |ui, &zone| {
-        let selected = clock.zone == zone;
+    across_grid(ui, &crate::timers::CLOCK_ZONE_CHOICES, 2, |ui, &zone| {
+        let selected = clock.zone == zone.iana;
         if settings_choice_tile(
             ui,
             selected,
-            zone.label(),
-            Some(zone.short_label()),
+            zone.label,
+            Some(zone.detail),
             SettingsGroup::Personalization.accent(),
             Style::SP_XL,
         ) {
-            clock.zone = zone;
+            clock.zone = zone.iana.to_owned();
         }
     });
     ui.add_space(Style::SP_S);
@@ -6334,7 +6422,7 @@ fn clock_section(ui: &mut egui::Ui, clock: &mut ClockConfig) {
         format!(
             "Construct defaults to Eastern Time (ET; daylight saving aware). Current: {}. \
              Mesh and audit timestamps remain UTC.",
-            clock.zone.short_label()
+            clock.zone
         ),
     );
 }

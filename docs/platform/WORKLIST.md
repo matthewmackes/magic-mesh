@@ -1333,6 +1333,8 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Display-zone migration checkpoint (2026-08-09):** five legacy values migrate atomically to IANA; unknown values and legacy alarms remain untouched; machine 9 passed 5/5.
+  Evidence: docs/platform/evidence/WL-FUNC-022-2026-08-09-display-zone-migration-s6-r14.md.
 - **Resolve/preview checkpoint:** typed isolated preview and governed local-file admission passed 13 focused tests on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-resolve-preview-s3-r1.md`.
 - **Clock/bell chrome checkpoint:** direct Clock routing, dedicated bell/unread lifecycle, and non-regressions passed 31 focused tests on `.50`:

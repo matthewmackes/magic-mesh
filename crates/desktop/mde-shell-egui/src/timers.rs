@@ -7,8 +7,7 @@
 //! scheduling I/O.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
@@ -26,90 +25,70 @@ use mde_bus::persist::Persist;
 use mde_egui::egui::{self, RichText};
 use mde_egui::nav_chrome::AppFrame;
 use mde_egui::Style;
-use serde::{Deserialize, Serialize};
-
 const DAY_SECS: i64 = 86_400;
 const POLL: Duration = Duration::from_millis(500);
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ClockZone {
-    EasternStandard,
-    CentralStandard,
-    MountainStandard,
-    PacificStandard,
-    Utc,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClockZoneChoice {
+    pub(crate) iana: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) detail: &'static str,
 }
 
-impl Default for ClockZone {
-    fn default() -> Self {
-        Self::EasternStandard
-    }
-}
+pub(crate) const CLOCK_ZONE_CHOICES: [ClockZoneChoice; 5] = [
+    ClockZoneChoice {
+        iana: "America/New_York",
+        label: "Eastern Time",
+        detail: "America/New_York",
+    },
+    ClockZoneChoice {
+        iana: "America/Chicago",
+        label: "Central Time",
+        detail: "America/Chicago",
+    },
+    ClockZoneChoice {
+        iana: "America/Denver",
+        label: "Mountain Time",
+        detail: "America/Denver",
+    },
+    ClockZoneChoice {
+        iana: "America/Los_Angeles",
+        label: "Pacific Time",
+        detail: "America/Los_Angeles",
+    },
+    ClockZoneChoice {
+        iana: "UTC",
+        label: "Coordinated Universal Time",
+        detail: "UTC",
+    },
+];
 
-impl ClockZone {
-    pub(crate) const ALL: [Self; 5] = [
-        Self::EasternStandard,
-        Self::CentralStandard,
-        Self::MountainStandard,
-        Self::PacificStandard,
-        Self::Utc,
-    ];
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::EasternStandard => "Eastern Time",
-            Self::CentralStandard => "Central Time",
-            Self::MountainStandard => "Mountain Time",
-            Self::PacificStandard => "Pacific Time",
-            Self::Utc => "Coordinated Universal Time",
-        }
-    }
-    pub(crate) const fn short_label(self) -> &'static str {
-        match self {
-            Self::EasternStandard => "ET (UTC−05:00/UTC−04:00)",
-            Self::CentralStandard => "CT (UTC−06:00/UTC−05:00)",
-            Self::MountainStandard => "MT (UTC−07:00/UTC−06:00)",
-            Self::PacificStandard => "PT (UTC−08:00/UTC−07:00)",
-            Self::Utc => "UTC (UTC±00:00)",
-        }
-    }
-    const fn iana_name(self) -> &'static str {
-        match self {
-            Self::EasternStandard => "America/New_York",
-            Self::CentralStandard => "America/Chicago",
-            Self::MountainStandard => "America/Denver",
-            Self::PacificStandard => "America/Los_Angeles",
-            Self::Utc => "Etc/UTC",
-        }
-    }
-    const fn from_index(index: u8) -> Self {
-        match index {
-            1 => Self::CentralStandard,
-            2 => Self::MountainStandard,
-            3 => Self::PacificStandard,
-            4 => Self::Utc,
-            _ => Self::EasternStandard,
-        }
-    }
-}
+static CLOCK_ZONE: LazyLock<RwLock<String>> =
+    LazyLock::new(|| RwLock::new("America/New_York".to_owned()));
 
-static CLOCK_ZONE: AtomicU8 = AtomicU8::new(ClockZone::EasternStandard as u8);
-pub(crate) fn set_clock_zone(zone: ClockZone) {
-    CLOCK_ZONE.store(zone as u8, Ordering::Relaxed);
+pub(crate) fn set_clock_zone(zone: &str) {
+    if TimeZone::get(zone).is_err() {
+        return;
+    }
+    if let Ok(mut configured) = CLOCK_ZONE.write() {
+        zone.clone_into(&mut configured);
+    }
 }
 pub(crate) fn display_unix() -> Result<i64, String> {
     let now = now_unix();
     display_offset_seconds_at(now).map(|offset| now.saturating_add(offset))
 }
 pub(crate) fn display_offset_seconds_at(unix_secs: i64) -> Result<i64, String> {
-    zone_offset_seconds_at(configured_clock_zone().iana_name(), unix_secs)
+    zone_offset_seconds_at(&configured_clock_zone()?, unix_secs)
 }
-pub(crate) fn display_zone_label() -> &'static str {
-    configured_clock_zone().label()
+pub(crate) fn display_zone_label() -> String {
+    configured_clock_zone().unwrap_or_else(|_| "unavailable".to_owned())
 }
-fn configured_clock_zone() -> ClockZone {
-    ClockZone::from_index(CLOCK_ZONE.load(Ordering::Relaxed))
+fn configured_clock_zone() -> Result<String, String> {
+    CLOCK_ZONE
+        .read()
+        .map(|zone| zone.clone())
+        .map_err(|_| "display time-zone state is unavailable".to_owned())
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExactZoneTime {
