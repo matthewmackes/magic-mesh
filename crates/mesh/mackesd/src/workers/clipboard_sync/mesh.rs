@@ -593,9 +593,11 @@ fn validate_cas_offers(
                 .map_err(|_| ClipboardMeshRefusal::CasMismatch)?;
             let references: FileReferences =
                 serde_json::from_str(body).map_err(|_| ClipboardMeshRefusal::CasMismatch)?;
-            for row in references.files.iter().filter(|row| {
-                row.file == *file_ref && row.linked_by.as_str() == source_peer
-            }) {
+            for row in references
+                .files
+                .iter()
+                .filter(|row| row.file == *file_ref && row.linked_by.as_str() == source_peer)
+            {
                 if row.reference.sha256_hex != expected_digest
                     || row.reference.size != offer.byte_count
                 {
@@ -623,14 +625,13 @@ fn verify_canonical_object(
     let shard = content_root.join(&digest[..2]);
     let path = shard.join(digest);
     for directory in [content_root, shard.as_path()] {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
+        let metadata =
+            fs::symlink_metadata(directory).map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ClipboardMeshRefusal::CasMismatch);
         }
     }
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| ClipboardMeshRefusal::CasUnavailable)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_size {
         return Err(ClipboardMeshRefusal::CasMismatch);
     }
@@ -717,10 +718,16 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use mde_collab_types::{
-        value::sha256_hex, ActorId, ClipboardClipId, ClipboardMimeKind,
-        ClipboardMimeOfferV2, ClipboardNodeId, ClipboardSessionId, ClipboardSourceV2,
-        ClipboardTargetV2, FileRef, FileRefId, FileReferenceView, SpaceId,
+        value::sha256_hex, ActorId, ClipboardClipId, ClipboardMimeKind, ClipboardMimeOfferV2,
+        ClipboardNodeId, ClipboardSessionId, ClipboardSourceV2, ClipboardTargetV2, FileRef,
+        FileRefId, FileReferenceView, SpaceId,
     };
+
+    const XPROC_ROLE_ENV: &str = "MCNF_CLIPBOARD_MESH_XPROC_ROLE";
+    const XPROC_ROOT_ENV: &str = "MCNF_CLIPBOARD_MESH_XPROC_ROOT";
+    const XPROC_TEST_FILTER: &str =
+        "mesh_cross_process_persist_sqlite_preserves_rich_payload_and_security_state";
+    const XPROC_RICH_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\0mesh-rich-clipboard\xff\x10exact";
 
     #[derive(Default)]
     struct TestDirectory(BTreeMap<String, MeshClipboardPeer>);
@@ -862,6 +869,289 @@ mod tests {
         .signed(key)
     }
 
+    fn xproc_rich_envelope(
+        key: &SigningKey,
+        sequence: u64,
+        created_unix_ms: u64,
+        expires_unix_ms: u64,
+    ) -> ClipboardEnvelopeV2 {
+        let digest = sha256_hex(XPROC_RICH_BYTES);
+        ClipboardEnvelopeV2::new(
+            ClipboardClipId::from_uuid(uuid::Uuid::from_u128(0xfeed)),
+            ClipboardSourceV2::new(
+                ClipboardNodeId::new("source").unwrap(),
+                mde_collab_types::ClipboardSeatId::new("seat0").unwrap(),
+            ),
+            ClipboardTargetV2::new(
+                ClipboardNodeId::new("target").unwrap(),
+                mde_collab_types::ClipboardSeatId::new("seat0").unwrap(),
+            ),
+            ClipboardSessionId::from_uuid(uuid::Uuid::from_u128(0xf00d)),
+            sequence,
+            created_unix_ms,
+            expires_unix_ms,
+            vec![
+                ClipboardMimeOfferV2::inline_text(
+                    ClipboardMimeKind::TextPlain,
+                    "exact mesh text\r\nwith unicode Ω",
+                )
+                .unwrap(),
+                ClipboardMimeOfferV2::inline_text(
+                    ClipboardMimeKind::TextHtml,
+                    "<p>exact <strong>rich</strong> mesh Ω</p>",
+                )
+                .unwrap(),
+                ClipboardMimeOfferV2::files_reference(
+                    ClipboardMimeKind::ImagePng,
+                    FileRefId::from_uuid(uuid::Uuid::from_u128(0xcafe)),
+                    XPROC_RICH_BYTES.len() as u64,
+                    digest,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+        .signed(key)
+    }
+
+    fn xproc_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let root = PathBuf::from(std::env::var_os(XPROC_ROOT_ENV).unwrap());
+        (
+            root.clone(),
+            root.join("peers.sqlite"),
+            root.join("receiver-cursor.json"),
+            root.join("collab/content"),
+        )
+    }
+
+    fn run_xproc_child(role: &str) {
+        let (bus_root, peers_db, cursor_path, content_root) = xproc_paths();
+        let persist = Persist::open(bus_root).unwrap();
+        let directory = SqliteMeshClipboardPeerDirectory::new(peers_db);
+        let topic = mesh_frame_topic("target");
+        match role {
+            "sender" => {
+                let request = persist.read_latest(MESH_SEND_TOPIC).unwrap().unwrap();
+                send_envelope(
+                    &persist,
+                    &directory,
+                    &content_root,
+                    "source",
+                    request.body.unwrap().as_bytes(),
+                    1_001,
+                )
+                .unwrap();
+            }
+            "receiver" => {
+                assert!(read_mesh_cursor(&cursor_path, &topic).is_none());
+                let frames = persist.list_since(&topic, None).unwrap();
+                assert_eq!(frames.len(), 1);
+                let mut ledger = ClipboardMeshReplayLedger::default();
+                ledger.seed_from_retained(&persist, 1_002);
+                let result = receive_frame(
+                    &persist,
+                    &directory,
+                    &content_root,
+                    "target",
+                    frames[0].body.as_deref().unwrap().as_bytes(),
+                    &mut ledger,
+                    1_002,
+                )
+                .unwrap();
+                assert_eq!(
+                    result,
+                    ClipboardMeshResultV1::Accepted {
+                        source_peer: "source".to_owned(),
+                        target_peer: "target".to_owned(),
+                        session: ClipboardSessionId::from_uuid(uuid::Uuid::from_u128(0xf00d))
+                            .to_string(),
+                        generation: 1,
+                    }
+                );
+                assert_eq!(
+                    fs::read(
+                        content_root
+                            .join(&sha256_hex(XPROC_RICH_BYTES)[..2])
+                            .join(sha256_hex(XPROC_RICH_BYTES)),
+                    )
+                    .unwrap(),
+                    XPROC_RICH_BYTES
+                );
+                write_mesh_cursor(&cursor_path, &topic, &frames[0].ulid).unwrap();
+            }
+            "replay" => {
+                let cursor = read_mesh_cursor(&cursor_path, &topic).unwrap();
+                assert!(persist
+                    .list_since(&topic, Some(&cursor))
+                    .unwrap()
+                    .is_empty());
+                let retained = persist.read_latest(&topic).unwrap().unwrap();
+                let mut ledger = ClipboardMeshReplayLedger::default();
+                ledger.seed_from_retained(&persist, 1_003);
+                assert_eq!(
+                    receive_frame(
+                        &persist,
+                        &directory,
+                        &content_root,
+                        "target",
+                        retained.body.as_deref().unwrap().as_bytes(),
+                        &mut ledger,
+                        1_003,
+                    ),
+                    Err(ClipboardMeshRefusal::Replayed)
+                );
+            }
+            "expired" | "identity" => {
+                let cursor = read_mesh_cursor(&cursor_path, &topic).unwrap();
+                let frames = persist.list_since(&topic, Some(&cursor)).unwrap();
+                assert_eq!(frames.len(), 1);
+                let mut ledger = ClipboardMeshReplayLedger::default();
+                ledger.seed_from_retained(&persist, 20_000);
+                let expected = if role == "expired" {
+                    ClipboardMeshRefusal::Stale
+                } else {
+                    ClipboardMeshRefusal::UnauthorizedPeer
+                };
+                assert_eq!(
+                    receive_frame(
+                        &persist,
+                        &directory,
+                        &content_root,
+                        "target",
+                        frames[0].body.as_deref().unwrap().as_bytes(),
+                        &mut ledger,
+                        20_000,
+                    ),
+                    Err(expected)
+                );
+                write_mesh_cursor(&cursor_path, &topic, &frames[0].ulid).unwrap();
+            }
+            "forward-only" => {
+                let cursor = read_mesh_cursor(&cursor_path, &topic).unwrap();
+                assert!(persist
+                    .list_since(&topic, Some(&cursor))
+                    .unwrap()
+                    .is_empty());
+                let delivered = persist
+                    .list_since(COLLAB_CLIPBOARD_ENVELOPE_V2_TOPIC, None)
+                    .unwrap();
+                assert_eq!(delivered.len(), 1);
+                let expected =
+                    xproc_rich_envelope(&SigningKey::from_bytes(&[7; 32]), 1, 1_000, 11_000);
+                assert_eq!(
+                    ClipboardEnvelopeV2::from_json_bytes(
+                        delivered[0].body.as_deref().unwrap().as_bytes()
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+            other => panic!("unknown cross-process clipboard role {other}"),
+        }
+    }
+
+    fn spawn_xproc_role(root: &Path, role: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(XPROC_TEST_FILTER)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(XPROC_ROLE_ENV, role)
+            .env(XPROC_ROOT_ENV, root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cross-process role {role} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn mesh_cross_process_persist_sqlite_preserves_rich_payload_and_security_state() {
+        if let Ok(role) = std::env::var(XPROC_ROLE_ENV) {
+            run_xproc_child(&role);
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let persist = Persist::open(root.path().to_path_buf()).unwrap();
+        let source = SigningKey::from_bytes(&[7; 32]);
+        let target = SigningKey::from_bytes(&[8; 32]);
+        let peers_db = root.path().join("peers.sqlite");
+        let peers = Connection::open(&peers_db).unwrap();
+        peers
+            .execute_batch(
+                "CREATE TABLE nodes (\
+                    node_id TEXT PRIMARY KEY, name TEXT NOT NULL, public_key TEXT NOT NULL, \
+                    role TEXT NOT NULL, health TEXT NOT NULL\
+                 );",
+            )
+            .unwrap();
+        for (node, key) in [("source", &source), ("target", &target)] {
+            peers
+                .execute(
+                    "INSERT INTO nodes (node_id, name, public_key, role, health) \
+                     VALUES (?1, ?2, ?3, 'peer', 'healthy')",
+                    (
+                        format!("peer:{node}"),
+                        node,
+                        hex(key.verifying_key().as_bytes()),
+                    ),
+                )
+                .unwrap();
+        }
+        drop(peers);
+        let (_content_root, file, digest) =
+            publish_cas_fixture(root.path(), &persist, XPROC_RICH_BYTES);
+        assert_eq!(file, FileRefId::from_uuid(uuid::Uuid::from_u128(0xcafe)));
+        assert_eq!(digest, sha256_hex(XPROC_RICH_BYTES));
+        let fresh = xproc_rich_envelope(&source, 1, 1_000, 11_000);
+        persist
+            .write(
+                MESH_SEND_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&fresh).unwrap()),
+            )
+            .unwrap();
+        drop(persist);
+
+        spawn_xproc_role(root.path(), "sender");
+        spawn_xproc_role(root.path(), "receiver");
+        spawn_xproc_role(root.path(), "replay");
+
+        let persist = Persist::open(root.path().to_path_buf()).unwrap();
+        let expired =
+            ClipboardMeshFrameV1::new(xproc_rich_envelope(&source, 2, 1_100, 1_200)).unwrap();
+        persist
+            .write(
+                &mesh_frame_topic("target"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&expired).unwrap()),
+            )
+            .unwrap();
+        drop(persist);
+        spawn_xproc_role(root.path(), "expired");
+
+        let persist = Persist::open(root.path().to_path_buf()).unwrap();
+        let attacker = SigningKey::from_bytes(&[9; 32]);
+        let forged =
+            ClipboardMeshFrameV1::new(xproc_rich_envelope(&attacker, 3, 19_000, 21_000)).unwrap();
+        persist
+            .write(
+                &mesh_frame_topic("target"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&forged).unwrap()),
+            )
+            .unwrap();
+        drop(persist);
+        spawn_xproc_role(root.path(), "identity");
+        spawn_xproc_role(root.path(), "forward-only");
+    }
+
     #[test]
     fn authenticated_sender_receiver_preserves_exact_canonical_bytes() {
         let (root, persist, directory, _source, envelope) = fixture();
@@ -916,15 +1206,7 @@ mod tests {
         let envelope = cas_envelope(&source, file, &digest, bytes.len() as u64, 1);
         let body = serde_json::to_vec(&envelope).unwrap();
 
-        send_envelope(
-            &persist,
-            &directory,
-            &content_root,
-            "source",
-            &body,
-            1_001,
-        )
-        .unwrap();
+        send_envelope(&persist, &directory, &content_root, "source", &body, 1_001).unwrap();
         let frame = persist
             .read_latest(&mesh_frame_topic("target"))
             .unwrap()
@@ -1060,8 +1342,16 @@ mod tests {
         let frame = ClipboardMeshFrameV1::new(admitted_envelope).unwrap();
         let body = serde_json::to_vec(&frame).unwrap();
         let mut ledger = ClipboardMeshReplayLedger::default();
-        receive_frame(&persist, &directory, root.path(), "target", &body, &mut ledger, 1_001)
-            .unwrap();
+        receive_frame(
+            &persist,
+            &directory,
+            root.path(),
+            "target",
+            &body,
+            &mut ledger,
+            1_001,
+        )
+        .unwrap();
         assert_eq!(
             receive_frame(
                 &persist,
