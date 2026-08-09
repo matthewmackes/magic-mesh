@@ -508,13 +508,23 @@ fn io_other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ApplyOutcome {
+    success: bool,
+    publication_committed: bool,
+    retry_after: Option<Duration>,
+    reload_key: bool,
+}
+
 /// Workstation-side credential-gated NASA FIRMS adapter.
 pub struct FirmsOverlayWorker {
     host: String,
     enabled: bool,
     probe: Option<Arc<dyn FirmsProbe>>,
     key_source: Arc<dyn ApiKeySource>,
-    bus_root: Option<PathBuf>,
+    /// Explicit override. Without one, each transaction resolves the current
+    /// user Bus root and falls back to the canonical system spool.
+    bus_root_override: Option<PathBuf>,
     source: String,
 }
 
@@ -529,7 +539,7 @@ impl FirmsOverlayWorker {
             enabled: env_default_enabled(ENABLED_ENV),
             probe: None,
             key_source: Arc::new(SealedApiKeySource),
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             source: std::env::var(SOURCE_ENV)
                 .ok()
                 .and_then(|value| validate_source(&value).ok())
@@ -545,30 +555,51 @@ impl FirmsOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override Bus access. `None` restores per-transaction production
+    /// resolution; it no longer freezes this worker in a disabled state.
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_root_override = root;
         self
     }
 
-    fn current_context(&self) -> Option<FirmsContext> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
-        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
-        validated_vehicle_context(&vehicle, &self.host, now_ms())
+    fn bus_root(&self) -> PathBuf {
+        firms_bus_root(self.bus_root_override.clone())
     }
 
-    fn publish(&self, snapshot: &FirmsSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
+    /// `Ok(None)` is reserved for a successfully read, genuinely absent or
+    /// stale vehicle fix. Bus/open/read/decode failures defer without an empty
+    /// status that could masquerade as valid context loss.
+    fn current_context(&self) -> io::Result<Option<FirmsContext>> {
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
+        let Some(message) = persist.read_latest(&topic).map_err(io_other)? else {
+            return Ok(None);
+        };
+        let body = message
+            .body
+            .ok_or_else(|| io::Error::other("vehicle context message has no body"))?;
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
+        Ok(validated_vehicle_context(&vehicle, &self.host, now_ms()))
+    }
+
+    fn publish(&self, snapshot: &FirmsSnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        self.publish_to(&persist, &body)
+    }
+
+    fn publish_to(&self, persist: &mde_bus::persist::Persist, body: &str) -> io::Result<()> {
+        persist
+            .write(
                 &firms_state_topic(&self.host),
-                snapshot,
-            );
-        }
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(body),
+            )
+            .map_err(io_other)?;
+        Ok(())
     }
 
     fn status_snapshot(
@@ -592,13 +623,28 @@ impl FirmsOverlayWorker {
         result: Result<FirmsSnapshot, ProbeFailure>,
         context: FirmsContext,
         last_good: &mut Option<FirmsSnapshot>,
-    ) -> (bool, Option<Duration>, bool) {
+    ) -> ApplyOutcome {
         match result {
-            Ok(snapshot) => {
-                self.publish(&snapshot);
-                *last_good = Some(snapshot);
-                (true, None, false)
-            }
+            Ok(snapshot) => match self.publish(&snapshot) {
+                Ok(()) => {
+                    *last_good = Some(snapshot);
+                    ApplyOutcome {
+                        success: true,
+                        publication_committed: true,
+                        retry_after: None,
+                        reload_key: false,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, %error, "FIRMS snapshot publication failed; refresh remains uncommitted");
+                    ApplyOutcome {
+                        success: false,
+                        publication_committed: false,
+                        retry_after: None,
+                        reload_key: false,
+                    }
+                }
+            },
             Err(error) => {
                 let previous_context = last_good.as_ref().and_then(|snapshot| {
                     Some(FirmsContext {
@@ -613,27 +659,107 @@ impl FirmsOverlayWorker {
                 } else {
                     format!("NASA FIRMS paused: refresh unavailable; hotspots withheld: {error}")
                 };
-                self.publish(&self.status_snapshot(
+                match self.publish(&self.status_snapshot(
                     FirmsAvailability::Ready,
                     Some(context),
                     reason,
-                ));
-                *last_good = None;
-                (false, error.retry_after, error.reload_key)
+                )) {
+                    Ok(()) => {
+                        *last_good = None;
+                        ApplyOutcome {
+                            success: false,
+                            publication_committed: true,
+                            retry_after: error.retry_after,
+                            reload_key: error.reload_key,
+                        }
+                    }
+                    Err(publish_error) => {
+                        tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, error = %publish_error, "FIRMS degraded publication failed; provider outcome remains uncommitted");
+                        ApplyOutcome {
+                            success: false,
+                            publication_committed: false,
+                            retry_after: None,
+                            reload_key: false,
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn publish_no_context_degraded(&self, last_good: &mut Option<FirmsSnapshot>, reason: &str) {
+    fn publish_no_context_degraded(
+        &self,
+        last_good: &mut Option<FirmsSnapshot>,
+        reason: &str,
+    ) -> io::Result<()> {
         self.publish(&self.status_snapshot(
             FirmsAvailability::Ready,
             None,
             format!("NASA FIRMS paused: {reason}"),
-        ));
+        ))?;
         // Thermal anomalies are vehicle-scoped. Once the same-host fix
         // disappears, keep the retained Bus topic present but do not allow a
         // later failure to replay hotspots from the stale prior query origin.
         *last_good = None;
+        Ok(())
+    }
+
+    /// A process-local suppression flag is only a hint to inspect the current
+    /// Bus. Suppress only while this exact status (apart from its publication
+    /// time) is retained in the current index; a cleared or replaced index
+    /// must receive its own row.
+    fn ensure_status_published(
+        &self,
+        snapshot: &FirmsSnapshot,
+        last_good: &mut Option<FirmsSnapshot>,
+        published: &mut bool,
+    ) -> io::Result<()> {
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        if *published {
+            let current = persist
+                .read_latest(&firms_state_topic(&self.host))
+                .map_err(io_other)?
+                .and_then(|message| message.body)
+                .map(|body| serde_json::from_str::<FirmsSnapshot>(&body).map_err(io_other))
+                .transpose()?;
+            if current.is_some_and(|current| same_status_except_published_at(&current, snapshot)) {
+                return Ok(());
+            }
+        }
+
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        self.publish_to(&persist, &body)?;
+        *last_good = None;
+        *published = true;
+        Ok(())
+    }
+
+    fn ensure_no_context_published(
+        &self,
+        last_good: &mut Option<FirmsSnapshot>,
+        no_fix_published: &mut bool,
+    ) -> io::Result<()> {
+        self.ensure_status_published(
+            &self.status_snapshot(
+                FirmsAvailability::Ready,
+                None,
+                "NASA FIRMS paused: fresh same-host vehicle fix unavailable",
+            ),
+            last_good,
+            no_fix_published,
+        )
+    }
+
+    fn ensure_unconfigured_published(
+        &self,
+        last_good: &mut Option<FirmsSnapshot>,
+        unconfigured_published: &mut bool,
+    ) -> io::Result<()> {
+        self.ensure_status_published(
+            &FirmsSnapshot::unconfigured(&self.host, now_ms(), &self.source),
+            last_good,
+            unconfigured_published,
+        )
     }
 
     async fn load_probe(
@@ -705,6 +831,20 @@ fn validated_vehicle_context(
     validate_context(context).ok().map(|()| context)
 }
 
+fn firms_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    firms_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn firms_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn same_status_except_published_at(current: &FirmsSnapshot, expected: &FirmsSnapshot) -> bool {
+    let mut current = current.clone();
+    current.published_at_ms = expected.published_at_ms;
+    current == *expected
+}
+
 #[async_trait::async_trait]
 impl Worker for FirmsOverlayWorker {
     fn name(&self) -> &'static str {
@@ -732,47 +872,80 @@ impl Worker for FirmsOverlayWorker {
                         unconfigured_published = false;
                     }
                     Ok(None) => {
-                        if !unconfigured_published {
-                            self.publish(&FirmsSnapshot::unconfigured(
-                                &self.host,
-                                now_ms(),
-                                &self.source,
-                            ));
-                            unconfigured_published = true;
-                        }
+                        let current_bus_has_unconfigured = match self.ensure_unconfigured_published(
+                            &mut last_good,
+                            &mut unconfigured_published,
+                        ) {
+                            Ok(()) => {
+                                retry = POLL;
+                                true
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, %error, "FIRMS unconfigured status transaction failed");
+                                false
+                            }
+                        };
+                        let delay = if current_bus_has_unconfigured {
+                            POLL
+                        } else {
+                            retry
+                        };
                         tokio::select! {
                             () = shutdown.wait() => break,
-                            () = tokio::time::sleep(POLL) => {}
+                            () = tokio::time::sleep(delay) => {}
                         }
                         continue;
                     }
                     Err(error) => {
-                        self.publish(&self.status_snapshot(
-                            FirmsAvailability::SecretStoreError,
-                            None,
-                            error.to_string(),
-                        ));
+                        let published = self
+                            .publish(&self.status_snapshot(
+                                FirmsAvailability::SecretStoreError,
+                                None,
+                                error.to_string(),
+                            ))
+                            .is_ok();
+                        if !published {
+                            tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, "FIRMS secret-store status publication failed");
+                        }
+                        let delay = if published { POLL } else { retry };
                         tokio::select! {
                             () = shutdown.wait() => break,
-                            () = tokio::time::sleep(POLL) => {}
+                            () = tokio::time::sleep(delay) => {}
                         }
                         continue;
                     }
                 }
             }
-            let Some(context) = self.current_context() else {
-                if !no_fix_published {
-                    self.publish_no_context_degraded(
-                        &mut last_good,
-                        "fresh same-host vehicle fix unavailable",
-                    );
-                    no_fix_published = true;
+            let context = match self.current_context() {
+                Ok(Some(context)) => context,
+                Ok(None) => {
+                    let current_bus_has_empty = match self
+                        .ensure_no_context_published(&mut last_good, &mut no_fix_published)
+                    {
+                        Ok(()) => {
+                            retry = POLL;
+                            true
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, %error, "FIRMS no-fix status transaction failed");
+                            false
+                        }
+                    };
+                    let delay = if current_bus_has_empty { POLL } else { retry };
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(POLL) => {}
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, %error, "vehicle context read failed; FIRMS pass deferred");
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(retry) => {}
+                    }
+                    continue;
                 }
-                continue;
             };
             no_fix_published = false;
             let Some(result) = self
@@ -785,20 +958,70 @@ impl Worker for FirmsOverlayWorker {
             else {
                 break;
             };
-            let (success, retry_after, reload_key) =
-                self.apply_result(result, context, &mut last_good);
-            if reload_key {
+            // The blocking FIRMS result is staged. Fresh-open and decode the
+            // exact context again before any write so movement, loss, Bus
+            // replacement, or read faults cannot admit stale-location data.
+            let outcome = match self.current_context() {
+                Ok(Some(current)) if current == context => {
+                    self.apply_result(result, current, &mut last_good)
+                }
+                Ok(Some(current)) => self.apply_result(
+                    Err(ProbeFailure::other(
+                        "vehicle context changed while FIRMS query was in flight",
+                    )),
+                    current,
+                    &mut last_good,
+                ),
+                Ok(None) => {
+                    match self.ensure_no_context_published(&mut last_good, &mut no_fix_published) {
+                        Ok(()) => ApplyOutcome {
+                            success: false,
+                            publication_committed: true,
+                            retry_after: None,
+                            reload_key: false,
+                        },
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, %error, "post-fetch FIRMS no-fix status publication failed");
+                            ApplyOutcome {
+                                success: false,
+                                publication_committed: false,
+                                retry_after: None,
+                                reload_key: false,
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::firms_overlay", host = %self.host, %error, "post-fetch vehicle context read failed; FIRMS result discarded");
+                    ApplyOutcome {
+                        success: false,
+                        publication_committed: false,
+                        retry_after: None,
+                        reload_key: false,
+                    }
+                }
+            };
+            if outcome.publication_committed {
+                unconfigured_published = false;
+            }
+            if outcome.reload_key && self.probe.is_none() {
                 probe = None;
             }
-            let delay = if success {
+            let delay = if outcome.success {
                 POLL
             } else {
-                retry_after.unwrap_or(retry).max(RETRY_MIN).min(RETRY_MAX)
+                outcome
+                    .retry_after
+                    .unwrap_or(retry)
+                    .max(RETRY_MIN)
+                    .min(RETRY_MAX)
             };
-            retry = if success {
+            retry = if outcome.success {
                 POLL
-            } else {
+            } else if outcome.publication_committed {
                 retry.saturating_mul(2).min(RETRY_MAX)
+            } else {
+                retry
             };
             tokio::select! {
                 () = shutdown.wait() => break,
@@ -829,14 +1052,51 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use mackes_mesh_types::vehicle::{GpsFix, VehicleState};
     use mde_bus::persist::Persist;
 
     use super::*;
 
     const CSV: &str = "latitude,longitude,bright_ti4,frp,acq_date,acq_time,satellite,confidence\n35.78,-78.64,331.2,18.4,2026-07-23,123456,N20,nominal\n35.80,-78.60,,,,2026-07-23,124000,N20,low\n";
+
+    fn context() -> FirmsContext {
+        FirmsContext {
+            latitude: 35.78,
+            longitude: -78.64,
+        }
+    }
+
+    fn vehicle_state(context: FirmsContext) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude: context.latitude,
+            longitude: context.longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn publish_vehicle(root: PathBuf, vehicle: &VehicleState) {
+        let body = serde_json::to_string(vehicle).expect("vehicle json");
+        Persist::open(root)
+            .expect("bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("vehicle write");
+    }
 
     #[test]
     fn query_url_is_keyed_path_without_query_leak() {
@@ -993,6 +1253,339 @@ mod tests {
     }
 
     #[test]
+    fn late_and_replaced_bus_are_reopened_per_transaction() {
+        assert_eq!(
+            firms_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker = FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        assert!(worker.current_context().is_err());
+
+        std::fs::remove_file(&root).expect("remove blocking file");
+        publish_vehicle(root.clone(), &vehicle_state(context()));
+        assert_eq!(worker.current_context().expect("late bus"), Some(context()));
+
+        let retired = temp.path().join("retired-bus");
+        std::fs::rename(&root, &retired).expect("replace bus");
+        let moved = FirmsContext {
+            latitude: 36.10,
+            longitude: -79.00,
+        };
+        publish_vehicle(root, &vehicle_state(moved));
+        assert_eq!(
+            worker.current_context().expect("replacement bus"),
+            Some(moved)
+        );
+    }
+
+    #[test]
+    fn repeated_no_fix_publishes_once_and_replacement_index_gets_one_row() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker = FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = parse_snapshot("rig-1", context(), CSV, 1_800_000_000_000, DEFAULT_SOURCE)
+            .expect("snapshot");
+        let mut last_good = Some(original.clone());
+        let mut no_fix_published = false;
+
+        assert!(worker
+            .ensure_no_context_published(&mut last_good, &mut no_fix_published)
+            .is_err());
+        assert!(!no_fix_published, "failed write cannot set suppression");
+        assert_eq!(
+            last_good
+                .as_ref()
+                .expect("last-good retained")
+                .hotspots
+                .len(),
+            1,
+            "failed write cannot clear last-good"
+        );
+
+        std::fs::remove_file(&root).expect("recover bus");
+        worker
+            .ensure_no_context_published(&mut last_good, &mut no_fix_published)
+            .expect("first no-fix publication");
+        assert!(no_fix_published);
+        assert!(last_good.is_none());
+        let first_bus = Persist::open(root.clone()).expect("first bus");
+        worker
+            .ensure_no_context_published(&mut last_good, &mut no_fix_published)
+            .expect("repeated no-fix check");
+        assert_eq!(
+            first_bus
+                .list_since(&firms_state_topic("rig-1"), None)
+                .expect("first bus rows")
+                .len(),
+            1,
+            "repeated no-fix checks must not append rows"
+        );
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", root.join("index.sqlite").display()));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(root.clone()).expect("replacement bus");
+        assert!(replacement_bus
+            .read_latest(&firms_state_topic("rig-1"))
+            .expect("replacement read")
+            .is_none());
+        last_good = Some(original);
+        worker
+            .ensure_no_context_published(&mut last_good, &mut no_fix_published)
+            .expect("replacement no-fix publication");
+        assert!(last_good.is_none());
+        worker
+            .ensure_no_context_published(&mut last_good, &mut no_fix_published)
+            .expect("replacement repeated check");
+        let rows = replacement_bus
+            .list_since(&firms_state_topic("rig-1"), None)
+            .expect("replacement rows");
+        assert_eq!(rows.len(), 1, "replacement index receives exactly one row");
+        let snapshot: FirmsSnapshot =
+            serde_json::from_str(rows[0].body.as_deref().expect("replacement body"))
+                .expect("replacement snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.hotspots.is_empty());
+        assert_eq!(snapshot.query_latitude, None);
+        assert_eq!(snapshot.query_longitude, None);
+    }
+
+    #[test]
+    fn repeated_unconfigured_publishes_once_and_replacement_index_gets_one_row() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        let worker = FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = parse_snapshot("rig-1", context(), CSV, 1_800_000_000_000, DEFAULT_SOURCE)
+            .expect("snapshot");
+        let mut last_good = Some(original.clone());
+        let mut unconfigured_published = false;
+
+        worker
+            .ensure_unconfigured_published(&mut last_good, &mut unconfigured_published)
+            .expect("first unconfigured publication");
+        assert!(unconfigured_published);
+        assert!(last_good.is_none());
+        let first_bus = Persist::open(root.clone()).expect("first bus");
+        worker
+            .ensure_unconfigured_published(&mut last_good, &mut unconfigured_published)
+            .expect("repeated unconfigured check");
+        assert_eq!(
+            first_bus
+                .list_since(&firms_state_topic("rig-1"), None)
+                .expect("first bus rows")
+                .len(),
+            1,
+            "repeated unconfigured checks must not append rows"
+        );
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", root.join("index.sqlite").display()));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(root.clone()).expect("replacement bus");
+        assert!(replacement_bus
+            .read_latest(&firms_state_topic("rig-1"))
+            .expect("replacement read")
+            .is_none());
+        last_good = Some(original);
+        worker
+            .ensure_unconfigured_published(&mut last_good, &mut unconfigured_published)
+            .expect("replacement unconfigured publication");
+        assert!(last_good.is_none());
+        worker
+            .ensure_unconfigured_published(&mut last_good, &mut unconfigured_published)
+            .expect("replacement repeated check");
+        let rows = replacement_bus
+            .list_since(&firms_state_topic("rig-1"), None)
+            .expect("replacement rows");
+        assert_eq!(rows.len(), 1, "replacement index receives exactly one row");
+        let snapshot: FirmsSnapshot =
+            serde_json::from_str(rows[0].body.as_deref().expect("replacement body"))
+                .expect("replacement snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert_eq!(snapshot.availability, FirmsAvailability::Unconfigured);
+        assert!(snapshot.hotspots.is_empty());
+        assert_eq!(snapshot.fetched_at_ms, None);
+        assert_eq!(snapshot.query_latitude, None);
+        assert_eq!(snapshot.query_longitude, None);
+    }
+
+    struct CountingProbe(Arc<AtomicUsize>);
+
+    impl FirmsProbe for CountingProbe {
+        fn fetch(
+            &self,
+            _context: FirmsContext,
+            _fetched_at_ms: i64,
+        ) -> Result<String, ProbeFailure> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(CSV.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_context_read_defers_without_fetch_or_publication() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        Persist::open(root.clone())
+            .expect("bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{malformed"),
+            )
+            .expect("malformed context write");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = FirmsOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()))
+            .with_probe(Arc::new(CountingProbe(calls.clone())));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(Persist::open(root)
+            .expect("bus")
+            .read_latest(&firms_state_topic("rig-1"))
+            .expect("FIRMS read")
+            .is_none());
+    }
+
+    struct BlockingProbe {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl FirmsProbe for BlockingProbe {
+        fn fetch(
+            &self,
+            _context: FirmsContext,
+            _fetched_at_ms: i64,
+        ) -> Result<String, ProbeFailure> {
+            self.started.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(CSV.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn post_fetch_context_change_withholds_stale_hotspot_result() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        publish_vehicle(root.clone(), &vehicle_state(context()));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let probe = BlockingProbe {
+            started: started.clone(),
+            release: release.clone(),
+        };
+        let mut worker = FirmsOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()))
+            .with_probe(Arc::new(probe));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "fetch did not start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let moved = FirmsContext {
+            latitude: 36.10,
+            longitude: -79.00,
+        };
+        publish_vehicle(root.clone(), &vehicle_state(moved));
+        release.store(true, Ordering::Release);
+
+        let snapshot = loop {
+            if let Some(body) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&firms_state_topic("rig-1"))
+                .expect("read")
+                .and_then(|message| message.body)
+            {
+                break serde_json::from_str::<FirmsSnapshot>(&body).expect("snapshot");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "post-fetch context result was not published"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+
+        assert!(snapshot.hotspots.is_empty());
+        assert_eq!(snapshot.fetched_at_ms, None);
+        assert_eq!(snapshot.query_latitude, Some(moved.latitude));
+        assert_eq!(snapshot.query_longitude, Some(moved.longitude));
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("context changed")));
+    }
+
+    #[test]
+    fn write_failure_defers_hotspot_clear_and_key_reload_then_corrects_forward() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker = FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let snapshot = parse_snapshot("rig-1", context(), CSV, 1_800_000_000_000, DEFAULT_SOURCE)
+            .expect("snapshot");
+        let mut last_good = Some(snapshot.clone());
+
+        let failed = worker.apply_result(
+            Err(ProbeFailure::authentication()),
+            context(),
+            &mut last_good,
+        );
+        assert!(!failed.success);
+        assert!(!failed.publication_committed);
+        assert_eq!(failed.retry_after, None);
+        assert!(!failed.reload_key);
+        assert_eq!(last_good.as_ref().expect("private state").hotspots.len(), 1);
+
+        std::fs::remove_file(&root).expect("recover bus");
+        let corrected = worker.apply_result(
+            Err(ProbeFailure::authentication()),
+            context(),
+            &mut last_good,
+        );
+        assert!(!corrected.success);
+        assert!(corrected.publication_committed);
+        assert_eq!(corrected.retry_after, Some(POLL));
+        assert!(corrected.reload_key);
+        assert!(last_good.is_none());
+        let rows = Persist::open(root)
+            .expect("bus")
+            .list_since(&firms_state_topic("rig-1"), None)
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        let corrected: FirmsSnapshot =
+            serde_json::from_str(rows[0].body.as_deref().expect("corrected-forward body"))
+                .expect("corrected-forward snapshot");
+        assert!(corrected.hotspots.is_empty());
+    }
+
+    #[test]
     fn failed_refresh_publishes_empty_degraded_snapshot_without_replaying_hotspots() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
@@ -1015,12 +1608,13 @@ mod tests {
         };
         let mut last_good = Some(original);
 
-        let (success, retry_after, reload_key) =
+        let outcome =
             worker.apply_result(Err(ProbeFailure::other("timeout")), moved, &mut last_good);
 
-        assert!(!success);
-        assert_eq!(retry_after, None);
-        assert!(!reload_key);
+        assert!(!outcome.success);
+        assert!(outcome.publication_committed);
+        assert_eq!(outcome.retry_after, None);
+        assert!(!outcome.reload_key);
         assert!(
             last_good.is_none(),
             "old vehicle-scoped FIRMS hotspot cache must not survive refresh failure"
@@ -1063,7 +1657,8 @@ mod tests {
         let mut last_good = Some(original);
 
         worker
-            .publish_no_context_degraded(&mut last_good, "fresh same-host vehicle fix unavailable");
+            .publish_no_context_degraded(&mut last_good, "fresh same-host vehicle fix unavailable")
+            .expect("publish retraction");
 
         assert!(
             last_good.is_none(),
