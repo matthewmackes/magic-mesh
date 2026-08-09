@@ -30,11 +30,24 @@ scan_shell() {
   local source_root="$1"
   if command -v rg >/dev/null 2>&1; then
     rg -n --glob '*.rs' --glob '!**/tests.rs' \
-      'action/(vm/lifecycle|container/lifecycle)|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest' \
+      'action/(vm/lifecycle|container/lifecycle)|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
       "$source_root"
   else
     grep -RInE --include='*.rs' --exclude='tests.rs' \
-      'action/(vm/lifecycle|container/lifecycle)|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest' \
+      'action/(vm/lifecycle|container/lifecycle)|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
+      "$source_root"
+  fi
+}
+
+scan_shell_runtime_commands() {
+  local source_root="$1"
+  if command -v rg >/dev/null 2>&1; then
+    rg -n --glob '*.rs' --glob '!**/tests.rs' \
+      '"(sudo[[:space:]]+)?(virsh|podman)[[:space:]]' \
+      "$source_root"
+  else
+    grep -RInE --include='*.rs' --exclude='tests.rs' \
+      '"(sudo[[:space:]]+)?(virsh|podman)[[:space:]]' \
       "$source_root"
   fi
 }
@@ -103,7 +116,17 @@ run_self_test() {
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — typed fixture was rejected' >&2
     return 1
   fi
-  for retired in 'action/container/lifecycle' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest'; do
+  printf '%s\n' 'EntryKind::Tab("virsh list --all")' >"$fixture/src/raw-runtime.rs"
+  if ! scan_shell_runtime_commands "$fixture/src" >/dev/null 2>&1; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — raw shell runtime command was not detected' >&2
+    return 1
+  fi
+  printf '%s\n' 'EntryKind::Link(Surface::InfraCode)' >"$fixture/src/raw-runtime.rs"
+  if scan_shell_runtime_commands "$fixture/src" >/dev/null 2>&1; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — typed Workloads link was rejected' >&2
+    return 1
+  fi
+  for retired in 'action/container/lifecycle' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest' 'is_nova_managed' 'CLOUD_MANAGED_TOOLTIP' 'Nova-managed'; do
     printf 'const RETIRED: &str = "%s";\n' "$retired" >"$fixture/src/legacy.rs"
     if ! scan_shell "$fixture/src" >/dev/null 2>&1; then
       printf 'lint-workload-authority.sh: self-test failed — retired fixture was not detected: %s\n' "$retired" >&2
@@ -179,6 +202,11 @@ fi
 
 if scan_shell "$shell_root"; then
   printf '%s\n' 'lint-workload-authority.sh: legacy lifecycle publisher found in shell' >&2
+  exit 1
+fi
+
+if scan_shell_runtime_commands "$shell_root"; then
+  printf '%s\n' 'lint-workload-authority.sh: shell bypasses the typed Workload projection with a raw runtime command' >&2
   exit 1
 fi
 

@@ -40,6 +40,8 @@ worklist. Repository paths are the durable owner identifiers.
 | cloud `console-attach` dispatch | typed Workload `Open` / `StartAndAttach` | cloud hostile test requires unknown-verb refusal before backend dispatch |
 | `console_broker` worker and `state/vdi/console` | authenticated Workload Display1 lease | source modules and shell reader were deleted; authority lint rejects either file/module/topic |
 | Browser transport attach JSON schema/example/verifier | Workload attachment lease contract | obsolete package artifacts were deleted; package contract no longer invokes the retired verifier |
+| Console `podman ps` / `virsh list` inventory shortcuts | `Surface::InfraCode` backed by `state/workloads/<node>` | authority lint rejects raw Podman/libvirt command literals in production shell sources |
+| Nova domain-name heuristic and Cloud-managed badge | typed backend and power dimensions in `WorkloadOperationStatus` | provider-specific detector, badge, and warning path were deleted from Datacenter |
 
 ## Known non-lifecycle runtime tools
 
@@ -47,6 +49,8 @@ Repository-wide `virsh`, Podman, and systemd searches include storage probes,
 host pool provisioning, migration, and unrelated service supervision. They are
 not automatically lifecycle authorities. Each is classified by effect:
 
+- the desktop shell offers no curated raw `virsh` or Podman command; operators
+  enter Workloads for authoritative VM/container inventory and lifecycle;
 - storage/runtime-probe calls are read-only;
 - compute-provision creates host storage pools, not domains;
 - service supervisors operate their named host services, not Workload units;

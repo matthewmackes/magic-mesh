@@ -58,8 +58,6 @@ const ADFILTER_STATE_PREFIX: &str = "state/adfilter/";
 /// forced ad-blocker / allowlist size / policy source + enforcement counters).
 const BROWSER_POLICY_STATE_PREFIX: &str = "state/browser-policy/";
 const DATACENTER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
-const CLOUD_MANAGED_TOOLTIP: &str =
-    "Managed by the Workloads surface - start/stop this instance there, not from the Fleet roster.";
 
 /// Poll cadence for the health and Workload projections — a node's health flip
 /// or a new VM/container
@@ -1200,43 +1198,13 @@ fn roster_shows_running(nodes: &[NodeView], host: &str, name: &str) -> bool {
     })
 }
 
-/// `true` when a VM's libvirt domain name matches OpenStack Nova's hardcoded
-/// libvirt-driver convention `instance-%08x` — the literal `instance-` prefix
-/// followed by **exactly eight lowercase hex digits**. This is the only Nova
-/// signal available to the Fleet plane: the roster's wire [`Instance`] carries
-/// just `{name, state}` (no `managed_by`/metadata field), and this plane does
-/// not consume the Workloads surface's Nova id list, so there is nothing to
-/// cross-reference — the name shape is the whole signal.
-///
-/// The anchoring is deliberate, not a fragile prefix match. The mesh's own VM
-/// provisioning names guests `vm-<id>` (`compute_provision`), `vdi-<session>`
-/// (`session_broker`), or a hostname (`xcp_provision`) — none can produce this
-/// exact `instance-` + 8-hex shape — so it reliably separates a Nova-managed
-/// guest (which surfaces here because `virsh list --all` on a Nova compute host
-/// sees Nova's own domains) from a mesh-native one. The single residual
-/// false-positive — an operator hand-naming a plain libvirt domain
-/// `instance-0000abcd` — is harmless by construction: this fix only ADDS a
-/// badge and a second confirm line, it never hides the row or removes the Stop
-/// control, so the Fleet view stays honest either way.
-fn is_nova_managed(name: &str) -> bool {
-    name.strip_prefix("instance-").is_some_and(|hex| {
-        hex.len() == 8 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
-}
-
-/// One VM roster row: a state pip + name + raw state, and a Start (when not
+/// One VM roster row from the typed Workload projection: a state pip + name +
+/// power state, and a Start (when not
 /// running) or a two-step Stop (when running) targeted at this node. Stopping a
 /// running VM is plausibly someone's live brokered desktop, so the Stop arms first
 /// — a DANGER "Confirm stop <name>" + Cancel — matching the typed-arm discipline
 /// the disk controls already require (shell-ux-5). Once confirmed, the row shows an
 /// optimistic "stopping…" until the roster reflects it (or `STOP_PENDING_TIMEOUT`).
-///
-/// docs-consistency-8 / review-608: a Nova-managed guest ([`is_nova_managed`])
-/// also appears here (unfiltered `virsh list --all`), where its lifecycle
-/// belongs to the Workloads surface. Such rows are badged "Cloud-managed" and their
-/// Stop confirm carries a "prefer Workloads" warning, so the Fleet plane
-/// cannot silently tear down a Nova instance out from under the Workloads surface's
-/// lifecycle — without hiding the row or removing the honest raw control.
 fn show_instance_row(
     ui: &mut egui::Ui,
     host: &str,
@@ -1246,10 +1214,6 @@ fn show_instance_row(
     stopping: &mut BTreeMap<(String, String), Instant>,
 ) {
     let running = inst.state.trim() == "running";
-    // review-608: a Nova-managed guest also surfaces in this raw `virsh list`
-    // roster, but its lifecycle belongs to the Workloads surface — badge it and
-    // warn on Stop so the Fleet plane can't silently tear it down.
-    let nova = is_nova_managed(&inst.name);
     let dot = if running { Style::OK } else { Style::TEXT_DIM };
     ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
     ui.add_space(Style::SP_XS);
@@ -1261,17 +1225,6 @@ fn show_instance_row(
     ui.add_space(Style::SP_S);
     mde_egui::muted_note(ui, &inst.state);
     ui.add_space(Style::SP_S);
-    if nova {
-        // Info-tone badge + a Workloads-surface cross-hint. This plane can't
-        // switch surfaces without reaching outside its scope, so it is a hover.
-        let nova_response = ui.label(
-            RichText::new("Cloud-managed")
-                .color(Style::ACCENT)
-                .size(Style::SMALL),
-        );
-        let _ = datacenter_hover_text(nova_response, CLOUD_MANAGED_TOOLTIP);
-        ui.add_space(Style::SP_S);
-    }
     if running {
         let key = (host.to_string(), inst.name.clone());
         if stopping.contains_key(&key) {
@@ -1281,17 +1234,6 @@ fn show_instance_row(
         } else if stop_arm.as_ref() == Some(&key) {
             // Armed — a DANGER Confirm (a disabled-by-arming echo isn't needed for a
             // one-VM stop; the explicit second click is the gate) + a Cancel.
-            if nova {
-                // review-608: extend the confirm copy for a Nova-managed guest so
-                // the operator is told the Workloads surface owns this lifecycle
-                // before the second (dispatching) click. The existing two-step arm
-                // is the gate; this only adds the warning line.
-                ui.label(
-                    RichText::new("Cloud-managed - prefer Workloads")
-                        .color(Style::WARN)
-                        .size(Style::SMALL),
-                );
-            }
             if ui
                 .button(
                     RichText::new(format!("Confirm stop {}", inst.name))
@@ -1669,13 +1611,14 @@ mod tests {
 
     #[test]
     fn datacenter_hover_tooltip_uses_themed_text_and_surface_in_light_mode() {
+        const SERVICE_TOOLTIP: &str = "virtqemud.service";
         let ctx = egui::Context::default();
         Style::install_color_scheme_with_density(
             &ctx,
             mde_egui::StyleColorScheme::Light,
             mde_egui::Density::Mouse,
         );
-        let out = render_datacenter_tooltip_frame(&ctx, CLOUD_MANAGED_TOOLTIP);
+        let out = render_datacenter_tooltip_frame(&ctx, SERVICE_TOOLTIP);
         let text_color = Style::resolve_color(&ctx, Style::TEXT);
         let surface = Style::resolve_color(&ctx, Style::SURFACE);
 
@@ -1683,7 +1626,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|(text, color)| text == CLOUD_MANAGED_TOOLTIP && *color == text_color),
+                .any(|(text, color)| text == SERVICE_TOOLTIP && *color == text_color),
             "Datacenter tooltip should paint themed text: {texts:?}"
         );
         assert!(
@@ -1806,34 +1749,6 @@ mod tests {
                 "Fleet container UI must not expose {forbidden:?}: {texts:?}"
             );
         }
-    }
-
-    #[test]
-    fn cloud_managed_vm_badge_uses_provider_neutral_copy() {
-        let mut state = DatacenterState {
-            bus_root: None,
-            nodes: project(
-                &[],
-                &[roster_body(
-                    "node-a",
-                    &[("instance-deadbeef", "running")],
-                    1,
-                )],
-                &[],
-            ),
-            ..DatacenterState::default()
-        };
-
-        let out = render_datacenter_state(&mut state);
-        let texts = painted_text(&out.shapes);
-        assert!(
-            texts.iter().any(|text| text == "Cloud-managed"),
-            "Cloud-managed badge should render for cloud-owned VM rows: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|text| text == "Nova-managed"),
-            "Fleet row should not expose provider-specific Nova branding: {texts:?}"
-        );
     }
 
     #[test]
@@ -1973,44 +1888,6 @@ mod tests {
         assert!(
             !roster_shows_running(&nodes, "other-host", "vm1"),
             "a VM on a different host is not this row"
-        );
-    }
-
-    #[test]
-    fn nova_managed_matches_only_the_exact_libvirt_instance_shape() {
-        // review-608: the Nova signal is the libvirt-driver's `instance-%08x`
-        // convention — `instance-` + EXACTLY eight lowercase hex digits.
-        assert!(
-            is_nova_managed("instance-0000002a"),
-            "canonical Nova domain"
-        );
-        assert!(is_nova_managed("instance-deadbeef"), "all-hex, 8 wide");
-        assert!(is_nova_managed("instance-00000000"), "min id");
-
-        // Mesh-native names never collide — the whole point of the anchor.
-        assert!(
-            !is_nova_managed("vm-01JANEXAMPLE"),
-            "compute_provision vm-<id>"
-        );
-        assert!(
-            !is_nova_managed("vdi-01hx7session"),
-            "session_broker vdi-<id>"
-        );
-        assert!(!is_nova_managed("eagle"), "a bare hostname");
-
-        // Near-misses that a fragile prefix match would wrongly badge/guard.
-        assert!(!is_nova_managed("instance-web"), "non-hex suffix");
-        assert!(!is_nova_managed("instance-0000002"), "7 hex — too short");
-        assert!(!is_nova_managed("instance-0000002ab"), "9 hex — too long");
-        assert!(!is_nova_managed("instance-0000002g"), "'g' is not hex");
-        assert!(
-            !is_nova_managed("instance-0000002A"),
-            "Nova is lowercase %08x"
-        );
-        assert!(!is_nova_managed("instance-"), "prefix only");
-        assert!(
-            !is_nova_managed("myinstance-0000002a"),
-            "prefix not at start"
         );
     }
 

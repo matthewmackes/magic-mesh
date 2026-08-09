@@ -1,5 +1,10 @@
 # WL-ARCH-001 Phase A — OpenStack delete/rewire blueprint
 
+> **HISTORICAL / SUPERSEDED:** This is the implementation blueprint used for the
+> completed OpenStack deletion. It is retained as provenance, not as current
+> architecture or an active worklist. Current VM/container authority is
+> `WL-ARCH-010` and `docs/platform/workload-authority-inventory.md`.
+
 Source: 3-agent footprint recon (`wf_edd2fe50-080`). Delete-immediately plan that keeps the WORKSPACE compiling. **Sequencing: (1) the `mackes_mesh_types::cloud` facade ABSORBS the neutral type/fn bodies from `openstack.rs` (becomes sole definition site) → (2) rewire every consumer to `cloud::*` → (3) delete the openstack worker tree + openstack.rs + fixtures + serde_yaml dep → (4) fix the census → (5) `cargo build --workspace` green.**
 
 ## Area: mackesd OpenStack WORKER/BACKEND tree (crates/mesh/mackesd/src/workers/openstack/ + mackes_mesh_types::openstack)

@@ -146,6 +146,17 @@ fn the_entry_table_matches_the_locked_taxonomy_and_holds_no_dead_rows() {
             .any(|e| e.kind == EntryKind::Link(Surface::InfraCode)),
         "the Containers & VMs group links to the Workloads surface"
     );
+    assert_eq!(
+        cvm.entries.len(),
+        1,
+        "Workloads is the sole VM/container inventory and lifecycle surface"
+    );
+    assert!(
+        cvm.entries
+            .iter()
+            .all(|entry| matches!(entry.kind, EntryKind::Link(Surface::InfraCode))),
+        "Console must not bypass the typed Workload projection with raw runtime commands"
+    );
     // The flat index space is coherent.
     assert_eq!(static_rows().count(), total_rows());
     assert_eq!(entry_at(0).label, "Terminal");

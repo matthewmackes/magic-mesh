@@ -105,6 +105,11 @@ behavioral evidence is not completion.
   reconciler execute cold-migration VM effects; restart journaling remains.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
+- **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and
+  libvirt inventory shortcuts and Datacenter's retired Nova-name heuristic were
+  deleted. One typed Workloads link/projection remains; the strengthened
+  authority guard and three focused BigBoy shell tests pass. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-shell-runtime-projection-hard-cut-r4.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and

@@ -120,11 +120,12 @@
 //!
 //! **CONSOLE-3** is the front door's CONTENT: the const [`ConsoleEntry`] table
 //! across every operational group (System / Network / Packages / Storage / Mesh
-//! / Containers & VMs / Shells), each row a real tool honest-gated on `$PATH`
+//! / Containers & VMs / Shells), each command row a real tool honest-gated on `$PATH`
 //! (§7) and carrying its own **domain glyph** (lock #33) — System / Storage /
 //! Mesh / Cloud / Signal / … — so the menu scans by domain rather than a
-//! wall of identical terminal icons. The Containers & VMs group's Cloud-plane
-//! row is the Workbench Cloud-plane link (the combined-group decision, Q41/Q50).
+//! wall of identical terminal icons. The Containers & VMs group has one typed
+//! Workloads link; it deliberately exposes no raw Podman or libvirt inventory
+//! command because the Workload projection is the sole presentation authority.
 //!
 //! This module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
@@ -384,7 +385,8 @@ const PINNED: [ConsoleEntry; 2] = [
 /// Packages / Storage / Mesh / Containers & VMs / Shells; Power joins the left
 /// rail and Custom the list tail under CONSOLE-4). Every command is a REAL tool
 /// grounded in the live Eagle evaluation (btop not htop, nmcli not nmtui,
-/// mtr / smartctl / podman / virsh present; ncdu to bundle) — no dead entries.
+/// mtr and smartctl present; ncdu to bundle) — no dead entries. Runtime inventory
+/// is routed to Workloads instead of bypassing its typed projection.
 const GROUPS: [ConsoleGroup; 7] = [
     ConsoleGroup {
         label: "System",
@@ -597,34 +599,17 @@ const GROUPS: [ConsoleGroup; 7] = [
     },
     ConsoleGroup {
         label: "Containers & VMs",
-        entries: &[
-            ConsoleEntry {
-                label: "Containers",
-                desc: "Every podman container, running or not",
-                tool: "podman",
-                provenance: Provenance::Fedora,
-                icon: IconId::Instances,
-                kind: EntryKind::Tab("podman ps --all"),
-            },
-            ConsoleEntry {
-                label: "Virtual Machines",
-                desc: "Every libvirt domain, running or not (virsh)",
-                tool: "virsh",
-                provenance: Provenance::Fedora,
-                icon: IconId::Instances,
-                kind: EntryKind::Tab("virsh list --all"),
-            },
-            ConsoleEntry {
-                // WL-ARCH-006 — the retired Cloud plane's GUI is the unified
-                // Workloads surface (Infra as Code) now; this row opens it.
-                label: "Cloud Workloads (GUI)",
-                desc: "Open the Workloads surface — the VM & cloud lifecycle GUI",
-                tool: "",
-                provenance: Provenance::Construct,
-                icon: IconId::Server,
-                kind: EntryKind::Link(Surface::InfraCode),
-            },
-        ],
+        entries: &[ConsoleEntry {
+            // WL-ARCH-010 — inventory and lifecycle share the authoritative
+            // typed Workload projection; Console must not provide a raw runtime
+            // command that can disagree with it.
+            label: "Workloads",
+            desc: "Open the authoritative VM and container inventory",
+            tool: "",
+            provenance: Provenance::Construct,
+            icon: IconId::Server,
+            kind: EntryKind::Link(Surface::InfraCode),
+        }],
     },
     ConsoleGroup {
         label: "Shells",
