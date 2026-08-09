@@ -26,9 +26,10 @@ Documentation=https://github.com/matthewmackes/magic-mesh
 # target below binds this unit into both normal boot targets.
 ConditionPathExists=/var/lib/mde/role.toml
 After=systemd-user-sessions.service plymouth-quit-wait.service magic-setup.service user@1000.service
-# The shell talks to mackesd over the shared bus spool; degrade gracefully if
-# the daemon is still coming up (panels show their honest empty states).
-After=mackesd.target
+# The shell talks to mackesd over the shared bus spool, but must not wait for
+# every daemon group before it can paint the Construct splash. Panels already
+# degrade gracefully while the target converges and replace their honest
+# loading/empty state as typed projections arrive.
 Wants=mackesd.target
 # The physical-audio policy session belongs to the persistent primary seat user.
 # The root DRM shell connects to that PipeWire graph for native media and RDP

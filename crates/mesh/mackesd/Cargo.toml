@@ -434,7 +434,10 @@ payload_compress = "xz"
 # maps the replacement binary and unit relationships.
 # -24 (2026-08-09): carry the typed probed-RDP resource projection and stamp
 # slow probe snapshots at completion so live Remote Sessions do not disappear.
-release = "24"
+# -25 (2026-08-09): show truthful systemd boot progress before Construct owns
+# DRM, start the splash independently of daemon convergence, and retire stale
+# host-Browser SELinux boot units during corrected-forward upgrades.
+release = "25"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -869,6 +872,26 @@ if [ -f /etc/systemd/system/mde-shell.service ] && \
         /etc/systemd/system/multi-user.target.wants/mde-shell.service || :
 fi
 systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
+# BOOT-STATUS-1 — the compositor-less shell cannot paint until it owns DRM.
+# Keep kernel chatter quiet, but retire Plymouth's `rhgb` cover and force
+# systemd's real unit/start-job progress onto tty1 during that interval. Once
+# mde-shell-egui starts, it takes DRM and replaces the text with the Construct
+# splash. Apply to every installed kernel so the correction survives fallback.
+if command -v grubby >/dev/null 2>&1; then
+  grubby --update-kernel=ALL --remove-args="rhgb" \
+    --args="systemd.show_status=1 rd.systemd.show_status=1" >/dev/null 2>&1 || :
+fi
+# The retired host Browser stack used boot-enabled SELinux setup oneshots.
+# Old RPMs can leave both unit files and enablement links behind after the host
+# Browser payload disappears; each semodule pass cost tens of blank-screen
+# seconds on Dell. Remove only these two known retired units/helpers.
+for retired_web_unit in mde-web-preview-selinux.service mde-web-cef-selinux.service; do
+  systemctl disable --now "$retired_web_unit" >/dev/null 2>&1 || :
+  rm -f "/etc/systemd/system/multi-user.target.wants/$retired_web_unit" \
+        "/usr/lib/systemd/system/$retired_web_unit" || :
+done
+rm -f /usr/libexec/mackesd/setup-selinux-web-preview \
+      /usr/libexec/mackesd/setup-selinux-web-cef || :
 # SELINUX-1 — policy loading can block in semodule on some fresh
 # VM images. Do NOT run it from dnf's %post, even with --no-block: starting the
 # oneshots can still race the open RPM transaction. Enable only; policy loading
