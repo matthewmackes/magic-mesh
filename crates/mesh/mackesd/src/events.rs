@@ -114,19 +114,20 @@ pub fn append_event(
 /// Append an event (see [`append_event`]) AND fire the configured
 /// 12.6.4 alert hooks for it, post-commit. Opens the store at
 /// `db_path` itself — convenience for callers (the mesh-router)
-/// that don't hold a connection. Best-effort end to end: failures
-/// are logged, never propagated.
+/// that don't hold a connection. Returns `true` only after the event row commits.
+/// Store failures are logged and return `false`; alert-hook delivery remains
+/// best-effort and is intentionally not represented by the return value.
 pub fn append_and_alert(
     db_path: &std::path::Path,
     node_id: &str,
     kind: EventKind,
     detail: serde_json::Value,
-) {
+) -> bool {
     let mut conn = match crate::store::open(db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "append_and_alert: store open failed; event dropped");
-            return;
+            return false;
         }
     };
     match append_event(&mut conn, node_id, kind, detail) {
@@ -135,9 +136,11 @@ pub fn append_and_alert(
             if !hooks.is_empty() {
                 dispatch_alerts(&event, &hooks);
             }
+            true
         }
         Err(e) => {
             tracing::warn!(error = %e, "append_and_alert: event append failed");
+            false
         }
     }
 }

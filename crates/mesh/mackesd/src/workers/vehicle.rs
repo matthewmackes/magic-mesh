@@ -3230,9 +3230,9 @@ impl VehicleWorker {
 
     /// `reboot` (MUTATION, destructive) — typed-armed on the gateway ESN. The body's
     /// `typed_name` MUST equal the live gateway ESN BEFORE the SSH `reboot` runs;
-    /// otherwise nothing is performed and the reply is honestly gated. A performed
-    /// reboot is audited on the events plane (so `audited: true` is truthful),
-    /// mirroring the `cloud` worker's destructive-op gate + audit.
+    /// otherwise nothing is performed and the reply is honestly gated. After a
+    /// performed reboot, `audited` reflects only a committed events-plane row;
+    /// alert-hook delivery remains best-effort.
     fn handle_reboot(
         &self,
         probe: &dyn VehicleProbe,
@@ -3255,12 +3255,14 @@ impl VehicleWorker {
         }
         match probe.run_ssh("reboot") {
             Ok(_) => {
-                self.audit_reboot(&esn);
+                let audited = self.audit_reboot(&esn);
                 VehicleReply {
                     ok: true,
                     verb: verb_name.to_string(),
                     applied: Some("reboot issued".to_string()),
-                    audited: true,
+                    audited,
+                    error: (!audited)
+                        .then(|| "reboot issued, but the audit event did not commit".to_string()),
                     ..Default::default()
                 }
             }
@@ -3286,9 +3288,10 @@ impl VehicleWorker {
     }
 
     /// Write one hash-chain audit row for a performed `reboot` through the EXISTING
-    /// events plane (best-effort — a store fault is logged, never fatal). Makes the
-    /// reply's `audited: true` truthful. Mirrors [`CloudWorker::audit`].
-    fn audit_reboot(&self, esn: &str) {
+    /// events plane. Returns `true` only when that row commits; hook delivery is not
+    /// part of this outcome. A store fault is logged and never changes the already
+    /// applied reboot result.
+    fn audit_reboot(&self, esn: &str) -> bool {
         crate::events::append_and_alert(
             &self.db_path,
             &format!("peer:{}", self.host),
@@ -3299,7 +3302,7 @@ impl VehicleWorker {
                 "host": self.host,
                 "esn": esn,
             }),
-        );
+        )
     }
 
     /// Drain every new `action/vehicle/*` request, advance the per-topic cursors, and
@@ -6226,21 +6229,66 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     #[test]
-    fn reboot_with_the_correct_esn_performs_and_audits() {
+    fn successful_reboot_reports_audited_only_after_event_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let auth_tmp = tempfile::tempdir().unwrap();
         let fake = FakeProbe::real();
+        let db_path = tmp.path().join("events.sqlite");
         let w = worker()
             .with_probe(Arc::new(fake.clone()))
-            .with_db_path(tmp.path().join("events.sqlite"))
+            .with_db_path(db_path.clone())
             .with_authorizer(test_authorizer(auth_tmp.path()));
         let body = authorized_reboot_body("vehicle-correct-name", "ND84720078011035");
         // The FakeProbe general.html reports ESN ND84720078011035.
         let reply = w.handle("reboot", &body);
         assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
-        assert!(reply.audited, "a performed reboot is audited");
+        assert!(reply.audited, "the committed audit row is reported");
+        assert!(reply.error.is_none());
         assert_eq!(reply.applied.as_deref(), Some("reboot issued"));
         assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+
+        let conn = crate::store::open(&db_path).expect("reopen committed audit store");
+        let (kind, actor, payload): (String, String, String) = conn
+            .query_row(
+                "SELECT kind, actor, payload_json FROM events ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("committed vehicle reboot audit row");
+        assert_eq!(kind, "admin_action");
+        assert_eq!(actor, "peer:rig-1");
+        let event: crate::events::Event = serde_json::from_str(&payload).expect("typed event");
+        assert_eq!(event.kind, crate::events::EventKind::AdminAction);
+        assert_eq!(event.detail["action"], "vehicle");
+        assert_eq!(event.detail["verb"], "reboot");
+        assert_eq!(event.detail["esn"], "ND84720078011035");
+    }
+
+    #[test]
+    fn successful_reboot_with_forced_audit_store_failure_is_not_fabricated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let blocked_parent = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"hostile audit parent").unwrap();
+        let db_path = blocked_parent.join("events.sqlite");
+        let fake = FakeProbe::real();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_db_path(db_path.clone())
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let body = authorized_reboot_body("vehicle-audit-failure", "ND84720078011035");
+
+        let reply = w.handle("reboot", &body);
+
+        assert!(reply.ok, "the SSH reboot succeeded: {reply:?}");
+        assert_eq!(reply.applied.as_deref(), Some("reboot issued"));
+        assert!(!reply.audited, "a failed store open cannot fabricate audit");
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("reboot issued, but the audit event did not commit")
+        );
+        assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+        assert!(!db_path.exists(), "the hostile store never materialized");
     }
 
     #[test]

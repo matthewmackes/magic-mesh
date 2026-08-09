@@ -726,6 +726,11 @@ behavioral evidence is not completion.
   interrupted calculations roll back their replay reservation so the original
   generation can retry. Machine 193 passed the exact hostile publication test:
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-action-retry-r7.md`.
+- **Vehicle audit-truth checkpoint (2026-08-09):** an MG90 reboot reports
+  `audited=true` only after its AdminAction row commits; audit failure preserves
+  the applied reboot while returning `audited=false` and a bounded error.
+  BigBoy passed both exact fixtures:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-09-vehicle-audit-truth-r8.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
