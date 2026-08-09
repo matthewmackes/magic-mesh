@@ -1451,6 +1451,8 @@ behavioral evidence is not completion.
   matrix remain.
 - **Farm expansion (2026-08-08):** XEN-196 is a verified fifth build node; topology is 5/5 with 10 slots and `.196` passed `mde-bus` 425/425:
   `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
+- **Artifact claim checkpoint (2026-08-09):** one capture cannot satisfy independent node/scenario claims; `.90` passed 2 positive and 18 negative fixtures:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-09-six-node-artifact-claim-r2.md`.
 - Remaining work:
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.

@@ -380,16 +380,26 @@ def validate(
     artifact_claims: dict[Path, tuple[str, str]] = {}
 
     def claim_artifact(record: dict[str, Any], node_id: str, claim: str) -> None:
-        """Prevent one capture from being presented as evidence for multiple nodes."""
+        """Prevent one capture from being presented as multiple acceptance events."""
 
         artifact_path = (artifact_root.resolve() / record["artifact"]).resolve()
         previous = artifact_claims.get(artifact_path)
-        if previous is not None and previous[0] != node_id:
+        if previous is not None:
+            # The required failover scenario is the summary view of the same
+            # detailed recovery.failover event.  No other cross-claim reuse is
+            # valid: join, loss, re-enrollment, corrected-forward, and state
+            # transitions each require their own capture.
+            failover_alias = {
+                f"{node_id}/failover",
+                f"{node_id}/recovery.failover",
+            }
+            if previous[0] == node_id and {previous[1], claim} == failover_alias:
+                return
             raise EvidenceError(
-                f"{claim}.artifact reuses evidence for {node_id} already claimed by "
+                f"{claim}.artifact reuses evidence already claimed by "
                 f"{previous[0]} at {previous[1]}"
             )
-        artifact_claims.setdefault(artifact_path, (node_id, claim))
+        artifact_claims[artifact_path] = (node_id, claim)
 
     for node in nodes:
         if not isinstance(node, dict):
@@ -712,10 +722,31 @@ def self_test() -> None:
                 artifact_root=root,
             )
         except EvidenceError as exc:
-            assert "reuses evidence for lh-2 already claimed by lh-1" in str(exc), exc
+            assert "reuses evidence already claimed by lh-1" in str(exc), exc
             negative_cases += 1
         else:
             raise AssertionError("one artifact satisfying multiple claims unexpectedly passed")
+        reused_same_node_artifact = _fixture()
+        _materialize_fixture(reused_same_node_artifact, root)
+        join = reused_same_node_artifact["nodes"][0]["scenarios"]["join"]
+        loss = reused_same_node_artifact["nodes"][0]["scenarios"]["loss"]
+        loss["artifact"] = join["artifact"]
+        loss["sha256"] = join["sha256"]
+        try:
+            validate(
+                reused_same_node_artifact,
+                now_ms=now,
+                max_age_ms=60_000,
+                require_live=False,
+                artifact_root=root,
+            )
+        except EvidenceError as exc:
+            assert "reuses evidence already claimed by lh-1 at lh-1/join" in str(exc), exc
+            negative_cases += 1
+        else:
+            raise AssertionError(
+                "one capture satisfying multiple same-node drills unexpectedly passed"
+            )
         tampered = json.loads(json.dumps(bundle))
         first_artifact = root / tampered["nodes"][0]["scenarios"]["join"]["artifact"]
         first_artifact.write_bytes(b"tampered")
