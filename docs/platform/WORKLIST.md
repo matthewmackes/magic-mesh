@@ -1874,6 +1874,8 @@ behavioral evidence is not completion.
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
   invoking lifecycle apply/cancel. `.90` passed 3/3; live first-frame proof
   remains: `docs/platform/evidence/WL-CRIT-007-2026-08-08-workload-session-recovery-s3-r1.md`.
+- **Dell boot-status release 25 (2026-08-09):** warned native-F44 upgrade removed blank boot gating; Construct became active at 28.434s, before mesh at 58.966s:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-dell-boot-status-release25-r18.md`.
 - **Corrected-forward Release 21 checkpoint (2026-08-08):** the Fedora 44
   package passed integrity, ABI, payload, transaction, and installed-file
   verification. Warned reboots on seat `.15` and Dell `.225` changed both boot
