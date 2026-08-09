@@ -177,6 +177,27 @@ fn metadata_cache_extra_key(extra: &[(&str, &str)]) -> String {
         .join("\u{1f}")
 }
 
+fn invalidate_cached_metadata(
+    base_url: &str,
+    view: &str,
+    extra: &[(&str, &str)],
+) -> Result<(), AirsonicError> {
+    let key = metadata_cache_extra_key(extra);
+    let path = crate::cache::metadata_cache_path(
+        &crate::cache::metadata_cache_dir(),
+        base_url,
+        view,
+        &key,
+    );
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AirsonicError::LocalState(format!(
+            "provider mutation was acknowledged, but stale {view} metadata could not be invalidated: {error}"
+        ))),
+    }
+}
+
 /// Client identifier sent as `c=` (shows up in the server's session
 /// list).
 pub const CLIENT_NAME: &str = "mde-music";
@@ -215,6 +236,9 @@ pub enum AirsonicError {
     },
     /// The envelope didn't parse / was missing expected fields.
     Parse(String),
+    /// A provider operation completed but required local durable state could not
+    /// be reconciled. Callers must not mistake this for a provider rejection.
+    LocalState(String),
 }
 
 impl fmt::Display for AirsonicError {
@@ -225,6 +249,7 @@ impl fmt::Display for AirsonicError {
                 write!(f, "airsonic API error {code}: {message}")
             }
             Self::Parse(e) => write!(f, "airsonic response parse error: {e}"),
+            Self::LocalState(e) => write!(f, "airsonic local state error: {e}"),
         }
     }
 }
@@ -805,7 +830,9 @@ impl Client {
     /// # Errors
     /// Transport or provider mutation failures.
     pub async fn star(&self, id: &str) -> Result<(), AirsonicError> {
-        self.get("star", &[("id", id)]).await.map(|_| ())
+        self.get("star", &[("id", id)]).await?;
+        invalidate_cached_metadata(&self.base_url, "getStarred2", &[])?;
+        Ok(())
     }
 
     /// Remove one admitted song, album, or artist from the provider stars.
@@ -813,7 +840,9 @@ impl Client {
     /// # Errors
     /// Transport or provider mutation failures.
     pub async fn unstar(&self, id: &str) -> Result<(), AirsonicError> {
-        self.get("unstar", &[("id", id)]).await.map(|_| ())
+        self.get("unstar", &[("id", id)]).await?;
+        invalidate_cached_metadata(&self.base_url, "getStarred2", &[])?;
+        Ok(())
     }
 
     /// Submit bounded playback progress through the Subsonic scrobble API.
@@ -844,8 +873,9 @@ impl Client {
             "createBookmark",
             &[("id", id), ("position", &position), ("comment", "")],
         )
-        .await
-        .map(|_| ())
+        .await?;
+        invalidate_cached_metadata(&self.base_url, "getBookmarks", &[])?;
+        Ok(())
     }
 
     /// Delete the provider bookmark for one admitted media identity.
@@ -853,7 +883,9 @@ impl Client {
     /// # Errors
     /// Transport or provider mutation failures.
     pub async fn delete_bookmark(&self, id: &str) -> Result<(), AirsonicError> {
-        self.get("deleteBookmark", &[("id", id)]).await.map(|_| ())
+        self.get("deleteBookmark", &[("id", id)]).await?;
+        invalidate_cached_metadata(&self.base_url, "getBookmarks", &[])?;
+        Ok(())
     }
 
     /// `getBookmarks` — the provider's retained resume positions.
@@ -1247,9 +1279,11 @@ impl Client {
     ) -> Result<(), AirsonicError> {
         let mut extra: Vec<(&str, &str)> = vec![("name", name)];
         extra.extend(song_ids.iter().map(|s| ("songId", s.as_str())));
-        self.get_at_base(&self.playlist_writer_base_url(), "createPlaylist", &extra)
-            .await
-            .map(|_| ())
+        let writer_base = self.playlist_writer_base_url();
+        self.get_at_base(&writer_base, "createPlaylist", &extra)
+            .await?;
+        invalidate_cached_metadata(&writer_base, "getPlaylists", &[])?;
+        Ok(())
     }
 
     /// MUSIC-RFX-3 — `updatePlaylist?playlistId=` — rename (`name`), add tracks
@@ -1274,9 +1308,12 @@ impl Client {
                 .iter()
                 .map(|s| ("songIndexToRemove", s.as_str())),
         );
-        self.get_at_base(&self.playlist_writer_base_url(), "updatePlaylist", &extra)
-            .await
-            .map(|_| ())
+        let writer_base = self.playlist_writer_base_url();
+        self.get_at_base(&writer_base, "updatePlaylist", &extra)
+            .await?;
+        invalidate_cached_metadata(&writer_base, "getPlaylists", &[])?;
+        invalidate_cached_metadata(&writer_base, "getPlaylist", &[("id", id)])?;
+        Ok(())
     }
 
     /// MUSIC-RFX-6b — reorder a playlist **in place**, preserving its id.
@@ -1310,13 +1347,12 @@ impl Client {
     /// # Errors
     /// Transport / API / parse failures.
     pub async fn delete_playlist(&self, id: &str) -> Result<(), AirsonicError> {
-        self.get_at_base(
-            &self.playlist_writer_base_url(),
-            "deletePlaylist",
-            &[("id", id)],
-        )
-        .await
-        .map(|_| ())
+        let writer_base = self.playlist_writer_base_url();
+        self.get_at_base(&writer_base, "deletePlaylist", &[("id", id)])
+            .await?;
+        invalidate_cached_metadata(&writer_base, "getPlaylists", &[])?;
+        invalidate_cached_metadata(&writer_base, "getPlaylist", &[("id", id)])?;
+        Ok(())
     }
 
     /// `getLyricsBySongId` (OpenSubsonic) — lyrics for a song, flattened to
@@ -2009,6 +2045,118 @@ mod tests {
         assert!(rt
             .block_on(delete_bookmark_client.delete_bookmark("episode-1"))
             .is_ok());
+    }
+
+    #[test]
+    fn acknowledged_provider_mutations_drop_stale_catalog_fallbacks() {
+        let _guard = env_lock();
+        let cache_dir = tempfile::tempdir().expect("metadata cache dir");
+        std::env::set_var("MDE_MUSIC_METADATA_CACHE_DIR", cache_dir.path());
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let stale = json!({"stale": true});
+
+        let star_base = one_shot_json_server(body);
+        crate::cache::write_cached_metadata(
+            cache_dir.path(),
+            &star_base,
+            "getStarred2",
+            "",
+            &stale,
+        );
+        let star_client = Client::with_salt(&star_base, "alice", "pw", "star-cache");
+        rt.block_on(star_client.star("song-1"))
+            .expect("provider accepted star");
+        assert!(crate::cache::read_cached_metadata(
+            cache_dir.path(),
+            &star_base,
+            "getStarred2",
+            ""
+        )
+        .is_none());
+
+        let bookmark_base = one_shot_json_server(body);
+        crate::cache::write_cached_metadata(
+            cache_dir.path(),
+            &bookmark_base,
+            "getBookmarks",
+            "",
+            &stale,
+        );
+        let bookmark_client = Client::with_salt(&bookmark_base, "alice", "pw", "bookmark-cache");
+        rt.block_on(bookmark_client.create_bookmark("episode-1", 42_000))
+            .expect("provider accepted bookmark");
+        assert!(crate::cache::read_cached_metadata(
+            cache_dir.path(),
+            &bookmark_base,
+            "getBookmarks",
+            ""
+        )
+        .is_none());
+
+        let playlist_base = one_shot_json_server(body);
+        let playlist_key = metadata_cache_extra_key(&[("id", "playlist-1")]);
+        for (view, key) in [("getPlaylists", ""), ("getPlaylist", playlist_key.as_str())] {
+            crate::cache::write_cached_metadata(
+                cache_dir.path(),
+                &playlist_base,
+                view,
+                key,
+                &stale,
+            );
+        }
+        let playlist_client = Client::with_salt(&playlist_base, "alice", "pw", "playlist-cache");
+        rt.block_on(playlist_client.update_playlist("playlist-1", Some("Updated"), &[], &[]))
+            .expect("provider accepted playlist update");
+        assert!(crate::cache::read_cached_metadata(
+            cache_dir.path(),
+            &playlist_base,
+            "getPlaylists",
+            ""
+        )
+        .is_none());
+        assert!(crate::cache::read_cached_metadata(
+            cache_dir.path(),
+            &playlist_base,
+            "getPlaylist",
+            &playlist_key
+        )
+        .is_none());
+
+        std::env::remove_var("MDE_MUSIC_METADATA_CACHE_DIR");
+    }
+
+    #[test]
+    fn acknowledged_provider_mutation_reports_failed_cache_invalidation() {
+        let _guard = env_lock();
+        let cache_dir = tempfile::tempdir().expect("metadata cache dir");
+        std::env::set_var("MDE_MUSIC_METADATA_CACHE_DIR", cache_dir.path());
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#;
+        let base = one_shot_json_server(body);
+        let stale_path =
+            crate::cache::metadata_cache_path(cache_dir.path(), &base, "getStarred2", "");
+        std::fs::create_dir_all(&stale_path).expect("directory-shaped stale entry");
+        let client = Client::with_salt(&base, "alice", "pw", "star-cache-failure");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let error = rt
+            .block_on(client.star("song-1"))
+            .expect_err("local invalidation failure must remain visible after provider ack");
+        assert!(matches!(error, AirsonicError::LocalState(message) if
+            message.contains("provider mutation was acknowledged") &&
+            message.contains("getStarred2")));
+        assert!(
+            stale_path.exists(),
+            "failed invalidation remains observable"
+        );
+
+        std::env::remove_var("MDE_MUSIC_METADATA_CACHE_DIR");
     }
 
     #[test]

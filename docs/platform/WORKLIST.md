@@ -1098,11 +1098,11 @@ behavioral evidence is not completion.
 - Current state: daemon-owned catalog/queue/cache, typed playback, artwork, browse/detail, and signed radio pass. Release 11 executes on all five seats;
   named 38 Special, Black Ice, and Podcast details pass on Dell without the old
   stale error; one daemon owns each seat; CPU/NWS and provider loss pass. Live renderer and handoff proof remain.
-- **Daemon projection validation checkpoint (2026-08-06):** invalid newer `MusicWorkspaceSnapshotV1` content is refused and the last valid projection is retained;
-  revision zero is rejected; Music UI 4/4 `.50`, daemon validation 1/1 `.90`. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
+- **Projection validation:** bad snapshots retain last-good; zero is refused; UI 4/4 `.50`, daemon 1/1 `.90`: `evidence/WL-FUNC-021-2026-08-06-projection-validation-r2.md`.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
-- **Provider restart (2026-08-09):** selected source survives restart with fallbacks; `.90` passed: `docs/platform/evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`.
+- **Provider consistency (2026-08-09):** source selection survives restart; acknowledged mutations invalidate stale fallbacks and report partial local failure (`.90` passed).
+  `evidence/WL-FUNC-021-2026-08-09-provider-restart-binding-r4.md`, `evidence/WL-FUNC-021-2026-08-09-provider-mutation-cache-r10.md`.
 - Remaining work:
 - **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
