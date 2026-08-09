@@ -12,6 +12,67 @@
 
 use super::*;
 
+/// Resolve the production `serve --group` selection without trusting an
+/// ambient mutable global. Clap has already validated this argument before
+/// `run_serve` reaches these helpers; this second, tiny parser lets raw OS
+/// threads enforce the same group boundary as supervised workers. It accepts
+/// both long-option spellings Clap supports and fails closed on absence,
+/// duplication, non-UTF-8 values, or unknown groups.
+fn process_group_from_args<I, S>(args: I) -> Result<mackesd_core::worker_role::WorkerGroup, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut selected = None;
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let argument = argument.as_ref();
+        let value = if argument == std::ffi::OsStr::new("--group") {
+            Some(
+                args.next()
+                    .ok_or_else(|| "--group requires a value".to_string())?
+                    .as_ref()
+                    .to_os_string(),
+            )
+        } else {
+            argument
+                .to_str()
+                .and_then(|argument| argument.strip_prefix("--group="))
+                .map(std::ffi::OsString::from)
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        if selected.is_some() {
+            return Err("--group may be specified only once".into());
+        }
+        let value = value
+            .to_str()
+            .ok_or_else(|| "--group value is not valid UTF-8".to_string())?;
+        selected = Some(mackesd_core::worker_role::WorkerGroup::parse(value)?);
+    }
+    selected.ok_or_else(|| "required --group selection is absent".into())
+}
+
+/// Fail-closed admission for responder/maintenance threads that bypass the
+/// async `Supervisor`. The canonical registry remains the ownership authority.
+fn responders_admitted(names: &[&str]) -> bool {
+    let group = match process_group_from_args(std::env::args_os()) {
+        Ok(group) => group,
+        Err(error) => {
+            tracing::error!(%error, ?names, "refusing responder starts without an exact process group");
+            return false;
+        }
+    };
+    let admitted = names
+        .iter()
+        .all(|name| mackesd_core::worker_role::belongs_to_group(name, group));
+    if !admitted {
+        tracing::debug!(%group, ?names, "responder starts belong to another process group");
+    }
+    admitted
+}
+
 /// WL-ARCH-004 — register one role-tiered worker from the single
 /// [`mackesd_core::worker_role::WORKER_REGISTRY`] table.
 ///
@@ -196,58 +257,60 @@ pub(crate) fn start_control_surface_bus_responders(
     // or a failed SQLite/Persist open logs + skips the thread
     // (the consumers fall back to their empty/diagnostic
     // rendering exactly as they did when the daemon was down).
-    match mde_bus::default_data_dir()
-        .ok_or_else(|| "no XDG data dir for bus".to_string())
-        .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
-    {
-        Ok(persist) => match mackesd_core::store::open(&db_path) {
-            Ok(conn) => {
-                let resp_store = Arc::new(tokio::sync::Mutex::new(conn));
-                let resp_svc = mackesd_core::ipc::nebula::NebulaStatusService::new(
-                    Arc::clone(&resp_store),
-                    node_id.clone(),
-                    host.clone(),
-                )
-                .with_workgroup_root(workgroup_root.clone());
-                let resp_shutdown = Arc::clone(&shutdown);
-                std::thread::Builder::new()
-                    .name("nebula-bus-responder".into())
-                    .spawn(move || {
-                        mackesd_core::ipc::nebula::serve_bus(&persist, &resp_svc, || {
-                            resp_shutdown.load(Ordering::Relaxed)
-                        });
-                    })
-                    .map(|_handle| {
-                        tracing::info!(
-                            "Nebula Bus responder spawned; serving \
+    if responders_admitted(&["nebula_bus_responder"]) {
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => match mackesd_core::store::open(&db_path) {
+                Ok(conn) => {
+                    let resp_store = Arc::new(tokio::sync::Mutex::new(conn));
+                    let resp_svc = mackesd_core::ipc::nebula::NebulaStatusService::new(
+                        Arc::clone(&resp_store),
+                        node_id.clone(),
+                        host.clone(),
+                    )
+                    .with_workgroup_root(workgroup_root.clone());
+                    let resp_shutdown = Arc::clone(&shutdown);
+                    std::thread::Builder::new()
+                        .name("nebula-bus-responder".into())
+                        .spawn(move || {
+                            mackesd_core::ipc::nebula::serve_bus(&persist, &resp_svc, || {
+                                resp_shutdown.load(Ordering::Relaxed)
+                            });
+                        })
+                        .map(|_handle| {
+                            tracing::info!(
+                                "Nebula Bus responder spawned; serving \
                                  action/nebula/{{status,self-node,list-peers}}"
-                        );
-                    })
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "Nebula Bus responder thread spawn failed; \
-                             NF-10..NF-18 consumers will see no peer data"
-                        );
-                    });
-                worker_names
-                    .lock()
-                    .expect("worker_names mutex")
-                    .push("nebula_bus_responder".into());
-            }
+                            );
+                        })
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                "Nebula Bus responder thread spawn failed; \
+                                 NF-10..NF-18 consumers will see no peer data"
+                            );
+                        });
+                    worker_names
+                        .lock()
+                        .expect("worker_names mutex")
+                        .push("nebula_bus_responder".into());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        db_path = %db_path.display(),
+                        "Nebula Bus responder: sqlite open failed; responder skipped"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    db_path = %db_path.display(),
-                    "Nebula Bus responder: sqlite open failed; responder skipped"
+                    "Nebula Bus responder: bus persist open failed; responder skipped"
                 );
             }
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "Nebula Bus responder: bus persist open failed; responder skipped"
-            );
         }
     }
     // E0.3.5 — Shell control surface (version/healthz/workers) on
@@ -257,52 +320,55 @@ pub(crate) fn start_control_surface_bus_responders(
     // the Shell builders are synchronous. Graceful-degrade: a
     // missing data-dir / failed Persist open logs + skips (the
     // Overview's mackesd-alive probe then reads offline).
-    match mde_bus::default_data_dir()
-        .ok_or_else(|| "no XDG data dir for bus".to_string())
-        .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
-    {
-        Ok(persist) => {
-            let shell_svc =
-                mackesd_core::ipc::shell::ShellService::new(mackesd_core::ipc::shell::ShellState {
-                    db_path: db_path.clone(),
-                    worker_names: Arc::clone(&worker_names),
-                    // EFF-24 — live worker status → healthz readiness.
-                    worker_status: Some(Arc::clone(&worker_status)),
-                    // OB6-FIX-4 — live mesh size + leadership in healthz.
-                    workgroup_root: workgroup_root.clone(),
-                    node_id: node_id.clone(),
-                });
-            let resp_shutdown = Arc::clone(&shutdown);
-            std::thread::Builder::new()
-                .name("shell-bus-responder".into())
-                .spawn(move || {
-                    mackesd_core::ipc::shell::serve_bus(&persist, &shell_svc, || {
-                        resp_shutdown.load(Ordering::Relaxed)
-                    });
-                })
-                .map(|_handle| {
-                    tracing::info!(
-                        "Shell Bus responder spawned; serving \
+    if responders_admitted(&["shell_bus_responder"]) {
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let shell_svc = mackesd_core::ipc::shell::ShellService::new(
+                    mackesd_core::ipc::shell::ShellState {
+                        db_path: db_path.clone(),
+                        worker_names: Arc::clone(&worker_names),
+                        // EFF-24 — live worker status → healthz readiness.
+                        worker_status: Some(Arc::clone(&worker_status)),
+                        // OB6-FIX-4 — live mesh size + leadership in healthz.
+                        workgroup_root: workgroup_root.clone(),
+                        node_id: node_id.clone(),
+                    },
+                );
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("shell-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::shell::serve_bus(&persist, &shell_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "Shell Bus responder spawned; serving \
                              action/shell/{{version,healthz,workers}}"
-                    );
-                })
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        "Shell Bus responder thread spawn failed; \
-                         Overview mackesd-alive probe will read offline"
-                    );
-                });
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("shell_bus_responder".into());
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "Shell Bus responder: bus persist open failed; responder skipped"
-            );
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "Shell Bus responder thread spawn failed; \
+                             Overview mackesd-alive probe will read offline"
+                        );
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("shell_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Shell Bus responder: bus persist open failed; responder skipped"
+                );
+            }
         }
     }
 }
@@ -316,6 +382,9 @@ pub(crate) fn start_bus_retention_gc(
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    if !responders_admitted(&["bus_retention_gc"]) {
+        return;
+    }
     // BULLETPROOF-1 — run the bus retention GC. The spool lives on `/run`
     // (tmpfs); the GC pass exists in mde-bus but only the standalone
     // `mde-bus` daemon ran it, and mackesd embeds the bus as a library and
@@ -410,6 +479,14 @@ pub(crate) fn start_connectivity_bus_responders(
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    if !responders_admitted(&[
+        "fleet_bus_responder",
+        "connect_bus_responder",
+        "route_bus_responder",
+        "clipboard_bus_responder",
+    ]) {
+        return;
+    }
     // NOTIFY-CHAT-6 — the standalone `alert-mirror` worker was RETIRED here.
     // It mirrored this node's alert-lane messages to `<workgroup>/.mesh-alerts/`
     // to feed the retired standalone Notifications panel (the old shared-alert
@@ -585,6 +662,14 @@ pub(crate) fn start_datacenter_bus_responders(
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    if !responders_admitted(&[
+        "dc_bus_responder",
+        "host_ops_bus_responder",
+        "dc_power_bus_responder",
+        "tofu_bus_responder",
+    ]) {
+        return;
+    }
     // DATACENTER (action layer) — the VM power-control responder:
     // action/dc/vm-power runs `xe vm-{start,shutdown,reboot}` over the
     // mesh-key SSH against an allowed dom0. Same dedicated-OS-thread shape.
@@ -739,14 +824,15 @@ pub(crate) fn start_egress_bus_responders(
     use std::sync::Arc;
     // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
     // openvpn bring-up over the per-node tunnel config. Same OS-thread shape.
-    match mde_bus::default_data_dir()
-        .ok_or_else(|| "no XDG data dir for bus".to_string())
-        .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
-    {
-        Ok(persist) => {
-            let vpn_svc = mackesd_core::ipc::vpn_gw::VpnService::new(workgroup_root.clone());
-            let resp_shutdown = Arc::clone(&shutdown);
-            std::thread::Builder::new()
+    if responders_admitted(&["vpn_bus_responder", "ddns_bus_responder"]) {
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let vpn_svc = mackesd_core::ipc::vpn_gw::VpnService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
                     .name("vpn-bus-responder".into())
                     .spawn(move || {
                         mackesd_core::ipc::vpn_gw::serve_bus(&persist, &vpn_svc, || {
@@ -762,47 +848,48 @@ pub(crate) fn start_egress_bus_responders(
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e, "VPN Bus responder thread spawn failed");
                     });
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("vpn_bus_responder".into());
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("vpn_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "VPN Bus responder: bus persist open failed; responder skipped");
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "VPN Bus responder: bus persist open failed; responder skipped");
-        }
-    }
-    // DDNS-EGRESS-3 — the DDNS config responder: action/ddns/* over the
-    // [ddns] config. Same OS-thread shape.
-    match mde_bus::default_data_dir()
-        .ok_or_else(|| "no XDG data dir for bus".to_string())
-        .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
-    {
-        Ok(persist) => {
-            let ddns_svc = mackesd_core::ipc::ddns::DdnsService::new(workgroup_root.clone());
-            let resp_shutdown = Arc::clone(&shutdown);
-            std::thread::Builder::new()
-                .name("ddns-bus-responder".into())
-                .spawn(move || {
-                    mackesd_core::ipc::ddns::serve_bus(&persist, &ddns_svc, || {
-                        resp_shutdown.load(Ordering::Relaxed)
-                    });
-                })
-                .map(|_handle| {
-                    tracing::info!(
-                        "DDNS Bus responder spawned; serving action/ddns/{{get-config,\
+        // DDNS-EGRESS-3 — the DDNS config responder: action/ddns/* over the
+        // [ddns] config. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let ddns_svc = mackesd_core::ipc::ddns::DdnsService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("ddns-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::ddns::serve_bus(&persist, &ddns_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DDNS Bus responder spawned; serving action/ddns/{{get-config,\
                              set-config,add-record,remove-record}} (DDNS-EGRESS-3)"
-                    );
-                })
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "DDNS Bus responder thread spawn failed");
-                });
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("ddns_bus_responder".into());
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "DDNS Bus responder: bus persist open failed; responder skipped");
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DDNS Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("ddns_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DDNS Bus responder: bus persist open failed; responder skipped");
+            }
         }
     }
     // DDNS-EGRESS-3 — the DDNS reconcile WORKER (engine half of the responder
@@ -812,42 +899,44 @@ pub(crate) fn start_egress_bus_responders(
     // (§9-safe fixed-arg curl; token from the mesh secret store). Same
     // dedicated-OS-thread shape as the responders. Additive — one localized
     // spawn block.
-    match mde_bus::default_data_dir()
-        .ok_or_else(|| "no XDG data dir for bus".to_string())
-        .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
-    {
-        Ok(persist) => {
-            let ddns_root = workgroup_root.clone();
-            let ddns_node = node_id.clone();
-            let resp_shutdown = Arc::clone(&shutdown);
-            std::thread::Builder::new()
-                .name("ddns-reconcile".into())
-                .spawn(move || {
-                    mackesd_core::workers::ddns::serve_reconcile(
-                        &persist,
-                        &ddns_root,
-                        &ddns_node,
-                        true,
-                        || resp_shutdown.load(Ordering::Relaxed),
-                    );
-                })
-                .map(|_handle| {
-                    tracing::info!(
-                        "DDNS reconcile worker spawned; subscribes event/vpn/signals + WAN \
+    if responders_admitted(&["ddns_reconcile"]) {
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let ddns_root = workgroup_root.clone();
+                let ddns_node = node_id.clone();
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("ddns-reconcile".into())
+                    .spawn(move || {
+                        mackesd_core::workers::ddns::serve_reconcile(
+                            &persist,
+                            &ddns_root,
+                            &ddns_node,
+                            true,
+                            || resp_shutdown.load(Ordering::Relaxed),
+                        );
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DDNS reconcile worker spawned; subscribes event/vpn/signals + WAN \
                              check, reconciles [ddns] records via the DigitalOcean DNS API \
                              (DDNS-EGRESS-3)"
-                    );
-                })
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "DDNS reconcile worker thread spawn failed");
-                });
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("ddns_reconcile".into());
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "DDNS reconcile worker: bus persist open failed; worker skipped");
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DDNS reconcile worker thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("ddns_reconcile".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DDNS reconcile worker: bus persist open failed; worker skipped");
+            }
         }
     }
 }
@@ -862,6 +951,9 @@ pub(crate) fn start_directory_jobs_bus_responders(
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    if !responders_admitted(&["directory_bus_responder", "jobs_bus_responder"]) {
+        return;
+    }
     // PD-1 — the peer-directory responder: action/mesh/directory
     // answers with the joined per-peer record (presence tier,
     // health, version, overlay ip/role, revision currency). Same
@@ -948,6 +1040,13 @@ pub(crate) fn start_platform_bus_responders(
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    if !responders_admitted(&[
+        "settings_bus_responder",
+        "voip_bus_responder",
+        "apps_bus_responder",
+    ]) {
+        return;
+    }
     // E0.3.4 — Settings store on the mesh Bus at
     // action/settings/<verb> (get/set/list-keys/snapshot/restore;
     // args in the request body), replacing the never-registered
@@ -1120,6 +1219,9 @@ pub(crate) fn start_files_bus_responder(
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    if !responders_admitted(&["files_bus_responder"]) {
+        return;
+    }
     // E0.3.2 — the five file-transfer surfaces moved off D-Bus onto
     // the mesh Bus: Fleet.Files (the live, store-backed mesh roster)
     // + the four Shell.* stubs (Inbox/Outbox/Downloads/
@@ -3503,4 +3605,61 @@ pub(crate) fn spawn_messaging_sync_workers(
         mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
             .with_workgroup_root(workgroup_root.clone())
     });
+}
+
+#[cfg(test)]
+mod process_group_thread_admission_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn process_group_argument_parser_accepts_clap_spellings() {
+        assert_eq!(
+            process_group_from_args(["mackesd", "serve", "--group", "control"]),
+            Ok(mackesd_core::worker_role::WorkerGroup::Control)
+        );
+        assert_eq!(
+            process_group_from_args(["mackesd", "serve", "--group=integrations"]),
+            Ok(mackesd_core::worker_role::WorkerGroup::Integrations)
+        );
+    }
+
+    #[test]
+    fn process_group_argument_parser_fails_closed_on_ambiguous_input() {
+        for args in [
+            vec!["mackesd", "serve"],
+            vec!["mackesd", "serve", "--group"],
+            vec!["mackesd", "serve", "--group", "unknown"],
+            vec!["mackesd", "serve", "--group", "actions", "--group=control"],
+        ] {
+            assert!(
+                process_group_from_args(args).is_err(),
+                "hostile argv was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn every_responder_registration_has_a_process_group_guard() {
+        let source = include_str!("spawn.rs");
+        let guard_marker = ["responders_", "admitted(&["].concat();
+        let guarded: BTreeSet<&str> = source
+            .split(&guard_marker)
+            .skip(1)
+            .filter_map(|tail| tail.split_once("])").map(|(arguments, _)| arguments))
+            .flat_map(|arguments| arguments.split('"').skip(1).step_by(2))
+            .collect();
+        let registered: BTreeSet<&str> = mackesd_core::worker_role::worker_specs()
+            .iter()
+            .filter(|worker| {
+                worker.spawn_binding == mackesd_core::worker_role::SpawnBinding::ResponderThread
+            })
+            .map(|worker| worker.name)
+            .collect();
+
+        assert_eq!(
+            guarded, registered,
+            "WL-ARCH-009 raw responder start sites must stay group-guarded"
+        );
+    }
 }

@@ -68,3 +68,23 @@ delete a prior entry; supersede it with a newer one.
   the 17-surface adoption sweep + Car surfaces. Engine model unchanged (one surface per
   frame, DRM-native). Curtain lock security behavior and the VDI full-native-resolution
   guarantee are explicitly sacred.
+
+## ADR-0007 — Workloads replaces replicated compute inventory (2026-08-09)
+
+- **Supersedes:** ADR-0005 and any substrate/design text that treats
+  `compute-inventory.json` or `compute/inventory/<peer>` as a live VM/container
+  authority.
+- **Symptom:** `compute_registry` was retired when `workload_compute` became the
+  sole actuator and `state/workloads/<node>` projection owner, but network
+  probing still read old replicated compute files. A stale file could therefore
+  inject a VM address into the scan scope after the runtime authority that wrote
+  and expired that state no longer existed.
+- **Decision:** VM/container lifecycle, readiness, and presentation come only
+  from the typed Workload contract. Overlay scan targets come from enrolled peer
+  identity bundles; bounded physical-LAN observations and explicit operator
+  targets remain separate network evidence. Retired compute inventories are
+  ignored and guarded absent. A workload that becomes an enrolled mesh peer is
+  discoverable through its peer identity, not through a second runtime roster.
+- **Scope:** runtime/projection authority and network target resolution. Probe
+  inventories remain file-based observed service evidence; this decision does
+  not move generic file synchronization or peer identity authority.

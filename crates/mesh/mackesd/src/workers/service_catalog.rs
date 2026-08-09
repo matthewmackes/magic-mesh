@@ -9,15 +9,20 @@
 
 use mackes_mesh_types::android_apps::AospStarterApp;
 use mackes_mesh_types::resources::*;
-use mackes_mesh_types::service_record::{ServiceHealth, ServiceRecord, ServicesState};
+use mackes_mesh_types::service_record::{
+    ServiceHealth, ServiceProvenance, ServiceRecord, ServicesState,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::desktop_sources::{resource_card_from_desktop_source, DesktopSourcesState};
+use super::desktop_sources::{
+    resource_card_from_desktop_source, DesktopProtocol, DesktopSource, DesktopSourcesState,
+    ProtocolOffer, Reachability, SourceOrigin,
+};
 use super::ssh_x11_sources::{append_ssh_x11_cards, SshX11SourcesState};
 use super::upnp_sources::{append_upnp_cards, UpnpSourcesState};
 
@@ -509,6 +514,10 @@ fn observed_card(
     publisher: &str,
     now: u64,
 ) -> Result<ResourceCard, ResourceValidationError> {
+    if let Some(card) = probed_rdp_card(record, publisher, now)? {
+        return Ok(card);
+    }
+
     let host = safe_id(&record.host);
     let kind = safe_id(&record.kind);
     let identity = ResourceIdentity::new(
@@ -604,6 +613,100 @@ fn observed_card(
             },
         }),
     })
+}
+
+/// Promote only a fresh, probe-attested trusted-LAN TCP/3389 observation into
+/// the universal desktop contract. `ServicesState` does not retain the nmap
+/// host-scope enum, so public, malformed, stale, and merely advertised
+/// endpoints deliberately remain generic non-connectable service cards.
+fn probed_rdp_card(
+    record: &ServiceRecord,
+    publisher: &str,
+    now: u64,
+) -> Result<Option<ResourceCard>, ResourceValidationError> {
+    if !record.attested_by(ServiceProvenance::Probe) {
+        return Ok(None);
+    }
+    let Some(observed_at_ms) = u64::try_from(record.last_seen_ms)
+        .ok()
+        .filter(|observed| *observed > 0 && *observed <= now)
+    else {
+        return Ok(None);
+    };
+    if now.saturating_sub(observed_at_ms) > CARD_MS {
+        return Ok(None);
+    }
+    let Some(address) = record
+        .endpoint
+        .as_deref()
+        .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        .filter(|address| address.port() == 3389 && is_trusted_lan_ip(address.ip()))
+    else {
+        return Ok(None);
+    };
+
+    let ip = address.ip().to_string();
+    let reachability = match record.health {
+        ServiceHealth::Up => Reachability::Reachable,
+        ServiceHealth::Down => Reachability::Unreachable,
+        ServiceHealth::Unknown | ServiceHealth::Stale => Reachability::Unknown,
+    };
+    let reason = match record.health {
+        ServiceHealth::Up => None,
+        ServiceHealth::Down => Some("bounded TCP/3389 probe reports unavailable".into()),
+        ServiceHealth::Unknown => Some("TCP/3389 observation is not probe-confirmed".into()),
+        ServiceHealth::Stale => Some("TCP/3389 observation is stale".into()),
+    };
+    let source_id = format!("probe-rdp:{ip}");
+    let source = DesktopSource {
+        id: source_id.clone(),
+        name: format!("Remote Desktop · {ip}"),
+        node: safe_id(&record.host),
+        host: ip.clone(),
+        protocols: vec![ProtocolOffer::new(DesktopProtocol::Rdp, Some(3389))],
+        // The compatibility converter's Manual policy is the fail-closed LAN
+        // policy: credentials are absent and Connect requires local approval.
+        origin: SourceOrigin::Manual,
+        reachability,
+        reason,
+        os_hint: None,
+        power_state: None,
+        thumbnail_ref: None,
+    };
+    let mut card = resource_card_from_desktop_source(&source, observed_at_ms)?;
+    card.identity = ResourceIdentity::new(
+        ResourceClass::Desktop,
+        IdentityAuthority::Dns,
+        format!("probe-rdp/{ip}"),
+        vec![ResourceAlias {
+            kind: ResourceAliasKind::LegacyId,
+            value: source_id,
+        }],
+    )?;
+    card.summary = Some("Bounded nmap RDP observation · local approval required".into());
+    card.provenance = vec![provenance(
+        // The universal catalog consumes this observation through the
+        // authenticated mesh service mirror. `ServiceRecord` does not retain
+        // the probing interface, so claiming direct LAN-source provenance here
+        // would fabricate the interface required by the resource contract.
+        DiscoverySource::MeshDirectory,
+        ResourceScope::Mesh,
+        ProvenanceTrust::AuthenticatedMesh,
+        format!("services/{}/probe-rdp/{}", safe_id(publisher), safe_id(&ip)),
+        observed_at_ms,
+    )];
+    card.validate()?;
+    Ok(Some(card))
+}
+
+fn is_trusted_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+        }
+    }
 }
 
 fn action(id: &str, verb: ResourceActionVerb, ready: bool, now: u64) -> ResourceAction {
@@ -1229,6 +1332,170 @@ mod tests {
             ssh.service.as_ref().expect("service").stack.hosting_nodes,
             ["dell"]
         );
+    }
+
+    fn observed_service(
+        host: &str,
+        kind: &str,
+        endpoint: &str,
+        provenance: Vec<ServiceProvenance>,
+        health: ServiceHealth,
+        last_seen_ms: i64,
+    ) -> ServiceRecord {
+        ServiceRecord {
+            host: host.into(),
+            kind: kind.into(),
+            endpoint: Some(endpoint.into()),
+            provenance,
+            health,
+            action: None,
+            last_seen_ms,
+        }
+    }
+
+    #[test]
+    fn rdp_bounded_nmap_tcp_3389_becomes_an_approval_gated_remote_session_card() {
+        const NOW: i64 = 1_700_000_000_000;
+        let catalog = catalog_from_services(&ServicesState {
+            host: "seat-15".into(),
+            records: vec![observed_service(
+                "windows-lab",
+                "ms-wbt-server",
+                "192.168.40.23:3389",
+                vec![ServiceProvenance::Probe],
+                ServiceHealth::Up,
+                NOW - 1_000,
+            )],
+            published_at_ms: NOW,
+        })
+        .expect("valid universal catalog");
+
+        let card = catalog
+            .cards
+            .iter()
+            .find(|card| card.identity.canonical_key == "probe-rdp/192.168.40.23")
+            .expect("remote session card");
+        assert_eq!(card.identity.class, ResourceClass::Desktop);
+        assert!(card.service.is_none(), "RDP is not a generic service card");
+        assert_eq!(card.auth.status, AuthStatus::Required);
+        assert_eq!(card.auth.accepted_methods, [AuthMethod::LocalApproval]);
+        assert!(card.transports.iter().any(|transport| {
+            transport.protocol == TransportProtocol::Rdp
+                && transport.scope == ResourceScope::TrustedLan
+                && matches!(
+                    &transport.endpoint,
+                    TransportEndpoint::Network { host, port: 3389, .. }
+                        if host == "192.168.40.23"
+                )
+        }));
+        let connect = card
+            .actions
+            .iter()
+            .find(|action| action.verb == ResourceActionVerb::Connect)
+            .expect("typed connect action");
+        assert_eq!(
+            connect.availability.status,
+            ActionAvailabilityStatus::RequiresApproval
+        );
+        assert_eq!(card.provenance[0].source, DiscoverySource::MeshDirectory);
+        assert_eq!(card.provenance[0].scope, ResourceScope::Mesh);
+        assert_eq!(card.provenance[0].trust, ProvenanceTrust::AuthenticatedMesh);
+        catalog.validate().expect("validated catalog");
+    }
+
+    #[test]
+    fn rdp_promotion_rejects_untrusted_ambiguous_and_stale_records() {
+        const NOW: i64 = 1_700_000_000_000;
+        let catalog = catalog_from_services(&ServicesState {
+            host: "seat-15".into(),
+            records: vec![
+                observed_service(
+                    "published-only",
+                    "rdp",
+                    "192.168.40.20:3389",
+                    vec![ServiceProvenance::Published],
+                    ServiceHealth::Unknown,
+                    NOW - 1_000,
+                ),
+                observed_service(
+                    "wrong-port",
+                    "rdp",
+                    "192.168.40.21:3390",
+                    vec![ServiceProvenance::Probe],
+                    ServiceHealth::Up,
+                    NOW - 1_000,
+                ),
+                observed_service(
+                    "malformed",
+                    "rdp",
+                    "192.168.40.22:not-a-port",
+                    vec![ServiceProvenance::Probe],
+                    ServiceHealth::Up,
+                    NOW - 1_000,
+                ),
+                observed_service(
+                    "public-target",
+                    "ms-wbt-server",
+                    "203.0.113.8:3389",
+                    vec![ServiceProvenance::Probe],
+                    ServiceHealth::Up,
+                    NOW - 1_000,
+                ),
+                observed_service(
+                    "stale-target",
+                    "port/3389",
+                    "192.168.40.24:3389",
+                    vec![ServiceProvenance::Probe],
+                    ServiceHealth::Up,
+                    NOW - i64::try_from(CARD_MS).unwrap() - 1,
+                ),
+            ],
+            published_at_ms: NOW,
+        })
+        .expect("invalid promotion candidates remain generic cards");
+
+        assert!(catalog
+            .cards
+            .iter()
+            .all(|card| card.identity.class != ResourceClass::Desktop));
+        assert!(catalog.cards.iter().all(|card| {
+            card.transports
+                .iter()
+                .all(|transport| transport.protocol != TransportProtocol::Rdp)
+        }));
+        catalog.validate().expect("validated fail-closed catalog");
+    }
+
+    #[test]
+    fn rdp_unavailable_probe_is_visible_but_never_connectable() {
+        const NOW: i64 = 1_700_000_000_000;
+        let catalog = catalog_from_services(&ServicesState {
+            host: "seat-15".into(),
+            records: vec![observed_service(
+                "windows-offline",
+                "port/3389",
+                "10.20.30.40:3389",
+                vec![ServiceProvenance::Probe],
+                ServiceHealth::Down,
+                NOW - 1_000,
+            )],
+            published_at_ms: NOW,
+        })
+        .expect("valid unavailable remote session");
+        let card = catalog
+            .cards
+            .iter()
+            .find(|card| card.identity.class == ResourceClass::Desktop)
+            .expect("unavailable desktop remains visible");
+        assert_eq!(card.health.status, HealthStatus::Unavailable);
+        assert!(card.actions.iter().any(|action| {
+            action.verb == ResourceActionVerb::Connect
+                && action.availability.status == ActionAvailabilityStatus::Unavailable
+        }));
+        assert!(!card.actions.iter().any(|action| {
+            action.verb == ResourceActionVerb::Connect
+                && action.availability.status == ActionAvailabilityStatus::Ready
+        }));
     }
 
     #[test]

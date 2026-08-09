@@ -21,6 +21,7 @@ workload_compute="$repo_root/crates/mesh/mackesd/src/workers/workload_compute.rs
 service_descriptors="$repo_root/crates/mesh/mackesd/src/descriptors.rs"
 peer_contracts="$repo_root/crates/mesh/mackes-mesh-types/src/peers.rs"
 desktop_sources="$repo_root/crates/mesh/mackesd/src/workers/desktop_sources.rs"
+probe_nmap="$repo_root/crates/mesh/mackesd/src/probe_nmap.rs"
 inventory="$repo_root/docs/platform/workload-authority-inventory.md"
 retired_console_worker="$repo_root/crates/mesh/mackesd/src/workers/console_broker.rs"
 retired_cloud_console="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs/console.rs"
@@ -186,6 +187,11 @@ EOF
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — raw descriptor runtime probe was not detected' >&2
     return 1
   fi
+  printf '%s\n' 'const RETIRED: &str = "compute-inventory.json";' >"$fixture/probe_nmap.rs"
+  if ! production_contains_literal 'compute-inventory.json' "$fixture/probe_nmap.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — retired compute inventory reader was not detected' >&2
+    return 1
+  fi
   printf '%s\n' 'lint-workload-authority.sh: self-test passed — lifecycle and presentation guards are fail-closed'
 }
 
@@ -204,7 +210,8 @@ fi
 }
 [ -f "$workers_mod" ] && [ -f "$cloud_verbs" ] && [ -f "$compute_migrate" ] \
   && [ -f "$workload_compute" ] && [ -f "$service_descriptors" ] \
-  && [ -f "$peer_contracts" ] && [ -f "$desktop_sources" ] && [ -f "$inventory" ] || {
+  && [ -f "$peer_contracts" ] && [ -f "$desktop_sources" ] \
+  && [ -f "$probe_nmap" ] && [ -f "$inventory" ] || {
   printf '%s\n' 'lint-workload-authority.sh: authority inventory or daemon registration surfaces are missing' >&2
   exit 1
 }
@@ -273,6 +280,12 @@ if production_contains_literal 'Command::new("virsh")' "$service_descriptors" \
   || contains_literal 'descriptors.vms' "$desktop_sources" \
   || contains_literal 'desc.vms' "$desktop_sources"; then
   printf '%s\n' 'lint-workload-authority.sh: heartbeat descriptors retain a competing VM/container runtime projection' >&2
+  exit 1
+fi
+
+if production_contains_literal 'compute-inventory.json' "$probe_nmap" \
+  || production_contains_literal 'vm_overlay_targets' "$probe_nmap"; then
+  printf '%s\n' 'lint-workload-authority.sh: network discovery still trusts the retired compute runtime projection' >&2
   exit 1
 fi
 

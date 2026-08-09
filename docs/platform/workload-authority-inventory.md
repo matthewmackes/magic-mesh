@@ -43,6 +43,7 @@ worklist. Repository paths are the durable owner identifiers.
 | Console `podman ps` / `virsh list` inventory shortcuts | `Surface::InfraCode` backed by `state/workloads/<node>` | authority lint rejects raw Podman/libvirt command literals in production shell sources |
 | Nova domain-name heuristic and Cloud-managed badge | typed backend and power dimensions in `WorkloadOperationStatus` | provider-specific detector, badge, and warning path were deleted from Datacenter |
 | Heartbeat `podman ps` / `virsh list` probes and `ServiceDescriptors::{containers,vms}` | local and replicated `state/workloads/<node>` projections | probe functions and peer fields were deleted; authority lint rejects their commands, fields, and desktop-source readers |
+| Replicated `compute-inventory.json` VM roster used as probe targets | enrolled peer identity bundles plus bounded LAN/operator targets | production resolver and legacy reader were deleted; authority lint rejects the retired file/symbol |
 
 ## Known non-lifecycle runtime tools
 
@@ -54,6 +55,8 @@ not automatically lifecycle authorities. Each is classified by effect:
   enter Workloads for authoritative VM/container inventory and lifecycle;
 - peer heartbeats probe only non-Workload services; remote desktop VM cards
   fold the serving peer's validated typed Workload snapshot;
+- network discovery accepts overlay targets only from enrolled peer identity;
+  stale retired compute inventories cannot inject VM addresses into scans;
 - storage/runtime-probe calls are read-only;
 - compute-provision creates host storage pools, not domains;
 - service supervisors operate their named host services, not Workload units;

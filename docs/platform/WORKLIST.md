@@ -116,6 +116,11 @@ behavioral evidence is not completion.
   readers discard retired fields, and focused farm/authority gates pass.
   Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-heartbeat-runtime-projection-hard-cut-r5.md`.
+- **Retired compute-inventory hard cut (2026-08-09):** network probing no
+  longer reads the retired per-peer VM roster or lets stale VM addresses alter
+  discovery scope. ADR-0007 and a fail-closed authority guard bind runtime
+  identity to typed Workloads; focused resolver and lint gates pass. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-compute-inventory-hard-cut-r6.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and
@@ -399,6 +404,11 @@ behavioral evidence is not completion.
   cancellation; the target-file format gate passed on machine 193. Other
   optional providers still require audit. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-android-catalog-quiescence-r4.md`.
+- **Responder group-isolation checkpoint (2026-08-09):** all 20 raw responder
+  and maintenance threads now fail closed outside the process group assigned by
+  the canonical registry. Exact/hostile argv and bidirectional registry guards
+  passed 4/4 focused farm tests. Live package/cgroup census remains. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-responder-group-isolation-r5.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
@@ -914,6 +924,13 @@ behavioral evidence is not completion.
   proof remains:
   `docs/platform/evidence/WL-FUNC-019-2026-08-08-wide-lan-rdp-discovery-s2-r1.md`,
   `docs/platform/evidence/WL-FUNC-019-2026-08-08-nodes-wide-lan-rdp-s2-r2.md`.
+- **Probed-RDP resource checkpoint (2026-08-09):** a fresh bounded TCP 3389
+  observation now becomes one approval-gated Desktop/RDP resource with an
+  authenticated-mirror provenance and trusted-LAN transport; public, malformed,
+  stale, and unconfirmed candidates remain non-connectable. Focused farm tests
+  passed 3/3. Live Windows address
+  discovery and installed connection proof remain. Evidence:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-probed-rdp-resource-card-s2-r3.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.

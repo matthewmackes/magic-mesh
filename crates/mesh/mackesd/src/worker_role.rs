@@ -1677,6 +1677,18 @@ pub fn specs_for_group(group: WorkerGroup) -> impl Iterator<Item = &'static Work
         .filter(move |worker| worker.group == group)
 }
 
+/// Admit a named runtime start only in the process group declared by the
+/// canonical registry.
+///
+/// Raw responder and maintenance threads do not pass through the `Supervisor`,
+/// so their launcher uses this same fail-closed predicate before opening a Bus
+/// cursor, SQLite handle, socket, or OS thread. Unknown names are rejected;
+/// they must never become an uncensused seventh process surface.
+#[must_use]
+pub fn belongs_to_group(worker: &str, group: WorkerGroup) -> bool {
+    spec(worker).is_some_and(|worker| worker.group == group)
+}
+
 /// Project one daemon registry row into the neutral worker-runtime contract.
 ///
 /// The daemon registry remains authoritative for spawn behavior and the exact
@@ -2629,6 +2641,27 @@ mod tests {
                 .count(),
             31
         );
+    }
+
+    #[test]
+    fn responder_threads_are_admitted_only_by_their_registered_group() {
+        for responder in WORKER_REGISTRY
+            .iter()
+            .filter(|worker| worker.spawn_binding == SpawnBinding::ResponderThread)
+        {
+            for group in WorkerGroup::ALL {
+                assert_eq!(
+                    belongs_to_group(responder.name, group),
+                    responder.group == group,
+                    "WL-ARCH-009 responder process admission drifted for {}",
+                    responder.name
+                );
+            }
+        }
+        assert!(!belongs_to_group(
+            "uncensused_responder",
+            WorkerGroup::Control
+        ));
     }
 
     #[test]
