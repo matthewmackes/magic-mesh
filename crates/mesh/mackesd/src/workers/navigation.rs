@@ -19,18 +19,23 @@ use mackes_mesh_types::navigation::{
     NAVIGATION_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use serde::{Deserialize, Serialize};
 
 use super::{ShutdownToken, Worker};
 
 const POLL: Duration = Duration::from_secs(1);
+const MIN_BUS_RETRY: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY: Duration = Duration::from_secs(2);
 const MAX_ACTION_AGE_MS: i64 = 10 * 60 * 1_000;
 const MAX_PERSISTED_BYTES: usize = 512 * 1024;
 const MAX_REPLAY_IDS: usize = 32;
 const DEFAULT_STATE_PATH: &str = "/var/lib/mackesd/navigation.json";
 const STATE_PATH_ENV: &str = "MDE_NAVIGATION_STATE_PATH";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> io::Result<Persist> + Send + Sync;
 
 trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -151,12 +156,14 @@ struct PendingAction {
 pub struct NavigationWorker {
     host: String,
     state_path: PathBuf,
-    bus_root: Option<PathBuf>,
+    bus_root: PathBuf,
     poll: Duration,
     clock: Arc<dyn Clock>,
     provider: Arc<dyn RouteProvider>,
     authority: Option<PersistedNavigation>,
     published_once: bool,
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
 }
 
 impl NavigationWorker {
@@ -168,13 +175,23 @@ impl NavigationWorker {
             state_path: std::env::var_os(STATE_PATH_ENV)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH)),
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root: navigation_bus_root(crate::bus_publish::default_bus_root()),
             poll: POLL,
             clock: Arc::new(SystemClock),
             provider: Arc::new(UnavailableRouteProvider),
             authority: None,
             published_once: false,
+            #[cfg(test)]
+            bus_open_override: None,
         }
+    }
+
+    fn open_bus(&self) -> io::Result<Persist> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(&self.bus_root);
+        }
+        Persist::open(self.bus_root.clone()).map_err(io_other)
     }
 
     fn ensure_loaded(&mut self) -> io::Result<()> {
@@ -221,6 +238,18 @@ impl NavigationWorker {
     }
 
     fn collect_actions(&self, persist: &Persist) -> io::Result<Vec<PendingAction>> {
+        self.collect_actions_with(|topic, cursor| {
+            persist.list_since(topic, cursor).map_err(io_other)
+        })
+    }
+
+    /// Stage every action lane before returning work. A failure on any lane
+    /// rejects the complete candidate set, so callers cannot apply effects from
+    /// a partial Bus view.
+    fn collect_actions_with<F>(&self, mut read: F) -> io::Result<Vec<PendingAction>>
+    where
+        F: FnMut(&str, Option<&str>) -> io::Result<Vec<StoredMessage>>,
+    {
         let authority = self.authority.as_ref().expect("authority loaded");
         let mut actions = Vec::new();
         for (topic, cursor, kind) in [
@@ -240,7 +269,7 @@ impl NavigationWorker {
                 ActionKind::Cancel,
             ),
         ] {
-            for message in persist.list_since(&topic, cursor).map_err(io_other)? {
+            for message in read(&topic, cursor)? {
                 actions.push(PendingAction {
                     ulid: message.ulid,
                     body: message.body.unwrap_or_default(),
@@ -265,6 +294,19 @@ impl NavigationWorker {
         }
     }
 
+    fn commit_cursor(&mut self, kind: &ActionKind, ulid: String) -> io::Result<()> {
+        let before = self.authority.as_ref().expect("authority loaded").clone();
+        self.advance_cursor(kind, ulid);
+        if let Err(error) = store_record(
+            &self.state_path,
+            self.authority.as_ref().expect("authority loaded"),
+        ) {
+            self.authority = Some(before);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn publish(&mut self, persist: &Persist) -> io::Result<()> {
         let snapshot = &self.authority.as_ref().expect("authority loaded").snapshot;
         let body = serde_json::to_string(snapshot).map_err(io_other)?;
@@ -278,14 +320,6 @@ impl NavigationWorker {
             .map_err(io_other)?;
         self.published_once = true;
         Ok(())
-    }
-
-    fn persist_and_publish(&mut self, persist: &Persist) -> io::Result<()> {
-        store_record(
-            &self.state_path,
-            self.authority.as_ref().expect("authority loaded"),
-        )?;
-        self.publish(persist)
     }
 
     fn request_is_current(
@@ -331,6 +365,7 @@ impl NavigationWorker {
                 return Ok(());
             }
         }
+        let pre_action = self.authority.as_ref().expect("authority loaded").clone();
         {
             let authority = self.authority.as_mut().expect("authority loaded");
             authority.snapshot.generation = authority
@@ -345,7 +380,23 @@ impl NavigationWorker {
             };
             authority.remember(request.request_id.clone());
         }
-        self.persist_and_publish(persist)?;
+        if let Err(error) = store_record(
+            &self.state_path,
+            self.authority.as_ref().expect("authority loaded"),
+        ) {
+            self.authority = Some(pre_action);
+            return Err(error);
+        }
+        if let Err(publication_error) = self.publish(persist) {
+            let rollback = store_record(&self.state_path, &pre_action);
+            self.authority = Some(pre_action);
+            return match rollback {
+                Ok(()) => Err(publication_error),
+                Err(rollback_error) => Err(io::Error::other(format!(
+                    "publish calculating navigation: {publication_error}; restore pre-action authority: {rollback_error}"
+                ))),
+            };
+        }
         let phase = match self.provider.calculate(&request, now_ms) {
             Ok(route)
                 if route.request_id == request.request_id && route.validate_at(now_ms).is_ok() =>
@@ -373,7 +424,7 @@ impl NavigationWorker {
         let authority = self.authority.as_mut().expect("authority loaded");
         authority.snapshot.produced_at_ms = now_ms;
         authority.snapshot.phase = phase;
-        Ok(())
+        store_record(&self.state_path, authority)
     }
 
     fn process_progress(&mut self, body: &[u8], now_ms: i64) {
@@ -454,35 +505,42 @@ impl NavigationWorker {
         authority.remember(request.request_id);
     }
 
-    fn tick_once(&mut self) -> io::Result<()> {
+    fn tick_with_persist(&mut self, persist: &mut Persist) -> io::Result<()> {
         self.ensure_loaded()?;
-        let Some(bus_root) = self.bus_root.clone() else {
-            return Ok(());
-        };
-        let persist = Persist::open(bus_root).map_err(io_other)?;
-        let actions = self.collect_actions(&persist)?;
+        persist.reopen_if_index_changed();
+        let actions = self.collect_actions(persist)?;
         if actions.is_empty() {
             if !self.published_once {
-                self.publish(&persist)?;
+                self.publish(persist)?;
             }
             return Ok(());
         }
         for action in actions {
             let now_ms = self.clock.now_ms();
             match action.kind {
-                ActionKind::Route => {
-                    self.process_route(&persist, action.body.as_bytes(), now_ms)?
-                }
+                ActionKind::Route => self.process_route(persist, action.body.as_bytes(), now_ms)?,
                 ActionKind::Progress => self.process_progress(action.body.as_bytes(), now_ms),
                 ActionKind::Cancel => self.process_cancel(action.body.as_bytes(), now_ms),
             }
-            // The cursor is the acknowledgement boundary. Commit it only after
-            // every governed effect above succeeds; otherwise a restart must
-            // replay the same action.
-            self.advance_cursor(&action.kind, action.ulid);
-            self.persist_and_publish(&persist)?;
+            // Persist final authority without acknowledging the action. If
+            // publication fails, the next pass republishes this checkpoint and
+            // does not repeat an already-completed provider calculation.
+            store_record(
+                &self.state_path,
+                self.authority.as_ref().expect("authority loaded"),
+            )?;
+            self.publish(persist)?;
+            // The cursor is the acknowledgement boundary. It advances only
+            // after all governed state and Bus effects complete successfully.
+            self.commit_cursor(&action.kind, action.ulid)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn tick_once(&mut self) -> io::Result<()> {
+        let mut persist = self.open_bus()?;
+        self.tick_with_persist(&mut persist)
     }
 }
 
@@ -493,14 +551,53 @@ impl Worker for NavigationWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        self.tick_once()?;
-        let mut tick = tokio::time::interval(self.poll);
-        tick.tick().await;
+        self.ensure_loaded()?;
+        let mut retry = MIN_BUS_RETRY;
+        let mut persist = loop {
+            match self.open_bus() {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    %error,
+                    bus_root = %self.bus_root.display(),
+                    "navigation: Bus open failed; startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry) => {}
+            }
+            retry = next_bus_retry(retry);
+        };
+        retry = MIN_BUS_RETRY;
         loop {
-            tokio::select! { _ = tick.tick() => self.tick_once()?, () = shutdown.wait() => break }
+            let delay = match self.tick_with_persist(&mut persist) {
+                Ok(()) => {
+                    retry = MIN_BUS_RETRY;
+                    self.poll
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "navigation: incomplete Bus transaction deferred");
+                    let delay = retry;
+                    retry = next_bus_retry(retry);
+                    delay
+                }
+            };
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(delay) => {}
+            }
         }
-        Ok(())
     }
+}
+
+fn navigation_bus_root(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY, MAX_BUS_RETRY)
 }
 
 fn load_record(path: &Path) -> io::Result<Option<PersistedNavigation>> {
@@ -618,6 +715,28 @@ mod tests {
         }
     }
 
+    struct CountingProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        sabotage_state_topic: Option<PathBuf>,
+    }
+
+    impl RouteProvider for CountingProvider {
+        fn calculate(
+            &self,
+            request: &RouteRequest,
+            now_ms: i64,
+        ) -> Result<RouteResult, RouteProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(path) = &self.sabotage_state_topic {
+                if path.is_dir() {
+                    fs::remove_dir_all(path).unwrap();
+                }
+                fs::write(path, b"hostile non-directory").unwrap();
+            }
+            FixtureProvider.calculate(request, now_ms)
+        }
+    }
+
     struct OutageProvider;
     impl RouteProvider for OutageProvider {
         fn calculate(
@@ -642,12 +761,13 @@ mod tests {
             let worker = NavigationWorker {
                 host: "seat-1".into(),
                 state_path: temp.path().join("navigation.json"),
-                bus_root: Some(bus.clone()),
+                bus_root: bus.clone(),
                 poll: POLL,
                 clock: Arc::new(FixedClock),
                 provider,
                 authority: None,
                 published_once: false,
+                bus_open_override: None,
             };
             Self {
                 _temp: temp,
@@ -693,6 +813,18 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn navigation_bus_root_falls_back_to_canonical_system_spool() {
+        assert_eq!(
+            navigation_bus_root(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            navigation_bus_root(Some(PathBuf::from("/tmp/navigation-explicit-bus"))),
+            PathBuf::from("/tmp/navigation-explicit-bus")
+        );
     }
 
     #[test]
@@ -856,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_calculating_publication_keeps_route_action_retryable() {
+    fn failed_calculating_publication_recovers_in_the_same_worker() {
         let mut fixture = Fixture::new(Arc::new(FixtureProvider));
         fixture.publish(
             &navigation_route_action_topic("seat-1"),
@@ -869,14 +1001,10 @@ mod tests {
         assert!(fixture.worker.tick_once().is_err());
         let interrupted = load_record(&fixture.worker.state_path).unwrap().unwrap();
         assert_eq!(interrupted.route_cursor, None);
-        assert!(matches!(
-            interrupted.snapshot.phase,
-            NavigationPhase::Calculating { .. }
-        ));
+        assert!(matches!(interrupted.snapshot.phase, NavigationPhase::Idle));
+        assert!(!interrupted.saw("req-retry"));
 
         fs::remove_file(state_topic_path).unwrap();
-        fixture.worker.authority = None;
-        fixture.worker.published_once = false;
         fixture.worker.tick_once().unwrap();
 
         let recovered = fixture.worker.authority.as_ref().unwrap();
@@ -886,6 +1014,205 @@ mod tests {
             recovered.snapshot.phase,
             NavigationPhase::Active { .. }
         ));
+    }
+
+    #[test]
+    fn failed_final_publication_republishes_without_repeating_provider_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus = temp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let state_topic_path = bus.join(navigation_state_topic("seat-1"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+            sabotage_state_topic: Some(state_topic_path.clone()),
+        });
+        let mut worker = NavigationWorker {
+            host: "seat-1".into(),
+            state_path: temp.path().join("navigation.json"),
+            bus_root: bus.clone(),
+            poll: POLL,
+            clock: Arc::new(FixedClock),
+            provider,
+            authority: None,
+            published_once: false,
+            bus_open_override: None,
+        };
+        let writer = Persist::open(bus).unwrap();
+        writer
+            .write(
+                &navigation_route_action_topic("seat-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request(0, "req-final-retry")).unwrap()),
+            )
+            .unwrap();
+
+        assert!(worker.tick_once().is_err());
+        let checkpoint = load_record(&worker.state_path).unwrap().unwrap();
+        assert_eq!(checkpoint.route_cursor, None);
+        assert!(matches!(
+            checkpoint.snapshot.phase,
+            NavigationPhase::Active { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        fs::remove_file(state_topic_path).unwrap();
+        worker.tick_once().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(worker.authority.as_ref().unwrap().route_cursor.is_some());
+    }
+
+    #[test]
+    fn incomplete_action_lane_read_defers_all_navigation_effects() {
+        let mut fixture = Fixture::new(Arc::new(FixtureProvider));
+        fixture.worker.ensure_loaded().unwrap();
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-partial"),
+        );
+        let before = fixture.worker.authority.as_ref().unwrap().clone();
+        let reader = Persist::open(fixture.bus.clone()).unwrap();
+        let reads = std::cell::Cell::new(0usize);
+
+        let result = fixture.worker.collect_actions_with(|topic, cursor| {
+            let index = reads.get();
+            reads.set(index + 1);
+            if index == 1 {
+                return Err(io::Error::other("injected progress-lane read failure"));
+            }
+            reader.list_since(topic, cursor).map_err(io_other)
+        });
+
+        assert!(result.is_err());
+        assert_eq!(reads.get(), 2);
+        let after = fixture.worker.authority.as_ref().unwrap();
+        assert_eq!(after.snapshot, before.snapshot);
+        assert_eq!(after.route_cursor, before.route_cursor);
+        assert_eq!(after.progress_cursor, before.progress_cursor);
+        assert_eq!(after.cancel_cursor, before.cancel_cursor);
+        assert_eq!(after.seen_request_ids, before.seen_request_ids);
+        assert!(load_record(&fixture.worker.state_path)
+            .unwrap()
+            .unwrap()
+            .route_cursor
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_and_observes_external_forward_write_until_shutdown() {
+        use std::sync::atomic::AtomicUsize;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let external_bus = Persist::open(bus_root.clone()).unwrap();
+        external_bus
+            .write(
+                &navigation_route_action_topic("seat-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request(0, "req-retained")).unwrap()),
+            )
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_open = Arc::clone(&attempts);
+        let bus_for_open = bus_root.clone();
+        let mut worker = NavigationWorker {
+            host: "seat-1".into(),
+            state_path: temp.path().join("navigation.json"),
+            bus_root,
+            poll: Duration::from_millis(5),
+            clock: Arc::new(FixedClock),
+            provider: Arc::new(FixtureProvider),
+            authority: None,
+            published_once: false,
+            bus_open_override: Some(Arc::new(move |_| {
+                match attempts_for_open.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(io::Error::new(io::ErrorKind::NotFound, "late Bus")),
+                    1 => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unopenable Bus",
+                    )),
+                    _ => Persist::open(bus_for_open.clone()).map_err(io_other),
+                }
+            })),
+        };
+        let state_topic = navigation_state_topic("seat-1");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited during late-Bus recovery"
+                );
+                let reached_retained = external_bus
+                    .list_since(&state_topic, None)
+                    .unwrap()
+                    .iter()
+                    .filter_map(|message| message.body.as_deref())
+                    .filter_map(|body| serde_json::from_str::<NavigationSnapshot>(body).ok())
+                    .any(|snapshot| {
+                        matches!(
+                            snapshot.phase,
+                            NavigationPhase::Active { ref route, .. }
+                                if route.request_id == "req-retained"
+                        )
+                    });
+                if reached_retained {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retained route must project after late Bus recovery");
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+
+        external_bus
+            .write(
+                &navigation_route_action_topic("seat-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request(1, "req-forward")).unwrap()),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                assert!(!task.is_finished(), "worker exited before forward route");
+                let reached_forward = external_bus
+                    .list_since(&state_topic, None)
+                    .unwrap()
+                    .iter()
+                    .filter_map(|message| message.body.as_deref())
+                    .filter_map(|body| serde_json::from_str::<NavigationSnapshot>(body).ok())
+                    .any(|snapshot| {
+                        matches!(
+                            snapshot.phase,
+                            NavigationPhase::Active { ref route, .. }
+                                if route.request_id == "req-forward"
+                        )
+                    });
+                if reached_forward {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("external post-activation route must be observed");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must interrupt navigation worker")
+            .expect("navigation task must join")
+            .expect("navigation worker must stop cleanly");
     }
 
     #[test]

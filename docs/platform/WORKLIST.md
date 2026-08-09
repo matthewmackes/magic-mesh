@@ -470,6 +470,9 @@ behavioral evidence is not completion.
 - **Scheduled-snapshot recovery checkpoint (2026-08-09):** complete durable
   schedule/history reads precede effects; same-process failed-result publication cannot repeat effects, while the crash outbox remains open. Machine 193 passed four exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-snap-scheduler-bus-recovery-r42.md`.
+- **Navigation transaction recovery checkpoint (2026-08-09):** complete
+  three-lane reads and durable final-state publication precede cursor commit; failed publication retries without another provider call. Machine 9 passed six exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
   mutations, admit forward commands, and defer effects on incomplete reads.
@@ -804,9 +807,10 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-weather-cache-identity-r6.md`.
 - **Navigation action retry checkpoint (2026-08-09):** route, progress, and
   cancellation cursors now acknowledge only after governed effects succeed;
-  interrupted calculations roll back their replay reservation so the original
-  generation can retry. Machine 193 passed the exact hostile publication test:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-action-retry-r7.md`.
+  interrupted calculations roll back their replay reservation, while final
+  publication retries without repeating route calculation. Machines 193/9 passed seven exact tests:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-action-retry-r7.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
 - **Vehicle audit-truth checkpoint (2026-08-09):** an MG90 reboot reports
   `audited=true` only after its AdminAction row commits; audit failure preserves
   the applied reboot while returning `audited=false` and a bounded error.
