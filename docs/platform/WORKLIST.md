@@ -1727,6 +1727,11 @@ behavioral evidence is not completion.
   of permanently terminating the readiness authority; machine 193 passed the
   exact fallback test:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-boot-readiness-bus-fallback-r18.md`.
+- **Host-state Bus recovery checkpoint (2026-08-09):** host control now retries
+  late storage, atomically skips retained mutations, folds durable seat state,
+  and defers actions when the authorization mirror is unreadable. Machine 193
+  passed two exact tests:
+  `docs/platform/evidence/WL-ARCH-009-WL-CRIT-007-2026-08-09-host-state-bus-recovery-r33.md`.
 - **Session Bus-loss checkpoint (2026-08-09):** an unreadable action log now
   defers convergence instead of fabricating an empty roster and deleting live
   sessions; machine 193 passed two exact safety/fallback tests:

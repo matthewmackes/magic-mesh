@@ -36,7 +36,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +86,11 @@ const AUTH_VERB: &str = "host-state";
 
 /// Poll cadence — responsive to a remote control action without hammering the Bus.
 pub const POLL: Duration = Duration::from_secs(2);
+
+/// Startup retries are bounded so a late shared Bus recovers without a daemon
+/// restart or a tight failure loop.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 const SUSPEND_EXPECTED_RETURN: Duration = Duration::from_secs(12 * 60 * 60);
 const REBOOT_EXPECTED_RETURN: Duration = Duration::from_secs(10 * 60);
@@ -620,6 +625,19 @@ impl HostStateWorker {
         self.drain_actions(persist);
     }
 
+    /// Open the Bus and tail-prime the fixed remote-control lane as one
+    /// activation boundary. Retained host mutations must never execute merely
+    /// because this worker or its storage started late; durable seat snapshots
+    /// remain unprimed and are folded by `poll_once`.
+    fn activate_bus(&mut self, root: &Path) -> Result<Persist, String> {
+        let persist = Persist::open(root.to_path_buf()).map_err(|error| error.to_string())?;
+        let tail = persist
+            .latest_ulid(&action_topic(&self.node_id))
+            .map_err(|error| format!("prime host action cursor: {error}"))?;
+        self.action_cursor = tail;
+        Ok(persist)
+    }
+
     /// Read the freshest local seat snapshot the shell published and re-publish it
     /// to the replicated `state/host/<node>/seat` topic so peers see this node.
     fn mirror_snapshot(&mut self, persist: &Persist) {
@@ -647,14 +665,16 @@ impl HostStateWorker {
     /// The current mirrored snapshot (this node's), for the interlock checks. Reads
     /// the replicated topic we just wrote so a display verb guards against the live
     /// state.
-    fn current_mirror(&self, persist: &Persist) -> SeatMirror {
-        persist
+    fn current_mirror(&self, persist: &Persist) -> Result<SeatMirror, String> {
+        let messages = persist
             .list_since(&mirror_topic(&self.node_id), None)
-            .ok()
-            .and_then(|msgs| msgs.into_iter().next_back())
-            .and_then(|m| m.body)
-            .and_then(|b| serde_json::from_str::<SeatMirror>(&b).ok())
-            .unwrap_or_default()
+            .map_err(|error| format!("read current host mirror: {error}"))?;
+        Ok(messages
+            .into_iter()
+            .next_back()
+            .and_then(|message| message.body)
+            .and_then(|body| serde_json::from_str::<SeatMirror>(&body).ok())
+            .unwrap_or_default())
     }
 
     fn availability_publisher(&self) -> Result<RuntimeAvailabilityPublisher, String> {
@@ -792,7 +812,17 @@ impl HostStateWorker {
         if msgs.is_empty() {
             return;
         }
-        let mirror = self.current_mirror(persist);
+        let mirror = match self.current_mirror(persist) {
+            Ok(mirror) => mirror,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mackesd::host_state",
+                    %error,
+                    "host mirror unavailable; deferring complete action sweep"
+                );
+                return;
+            }
+        };
         let leader = self.is_leader();
         let now = now_ms();
         self.gate.prune(now);
@@ -1112,6 +1142,10 @@ fn publish_return_after_stability(
     Ok(true)
 }
 
+fn host_state_bus_root(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 async fn wait_for_network_manager_stability(connection: &zbus::Connection) -> Result<bool, String> {
     let network_manager = zbus::Proxy::new(
         connection,
@@ -1150,15 +1184,32 @@ impl Worker for HostStateWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(root) = self.bus_root.clone() else {
-            tracing::debug!(target: "mackesd::host_state", "no bus root; worker idle");
-            return Ok(());
+        let root = host_state_bus_root(self.bus_root.clone());
+        self.bus_root = Some(root.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match self.activate_bus(&root) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::host_state",
+                    %error,
+                    "Bus activation failed; host-state startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = retry_interval
+                .saturating_mul(2)
+                .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
         };
         let lifecycle_publisher = self.availability_publisher().map_err(anyhow::Error::msg)?;
         let lifecycle_monitor = tokio::spawn(run_system_lifecycle_monitor(
             lifecycle_publisher,
             shutdown.clone(),
         ));
+        self.poll_once(&persist);
         loop {
             match Persist::open(root.clone()) {
                 Ok(persist) => self.poll_once(&persist),
@@ -1206,6 +1257,92 @@ mod tests {
             requester: "peer".into(),
             armed_token: None,
         }
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            host_state_bus_root(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            host_state_bus_root(Some(PathBuf::from("/tmp/host-state-explicit-bus"))),
+            PathBuf::from("/tmp/host-state-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_skips_retained_host_action_then_processes_forward_action() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_bus = temp.path().join("late-bus");
+        std::fs::write(&blocked_bus, b"not a directory").unwrap();
+
+        let prepared_bus = temp.path().join("prepared-bus");
+        let prepared = Persist::open(prepared_bus.clone()).expect("prepare Bus");
+        prepared
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(r#"{"schema_version":1,"verb":"retained-unknown"}"#),
+            )
+            .expect("write retained action");
+        drop(prepared);
+
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(blocked_bus.clone())
+            .with_poll(Duration::from_millis(5))
+            .with_availability_durable_path(temp.path().join("availability/current.json"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "late Bus must remain retryable");
+        std::fs::remove_file(&blocked_bus).unwrap();
+        std::fs::rename(&prepared_bus, &blocked_bus).unwrap();
+
+        let persist = Persist::open(blocked_bus.clone()).expect("open activated Bus");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            persist
+                .list_since(&result_topic("nodeA"), None)
+                .unwrap()
+                .is_empty(),
+            "startup-retained host mutation must be tail-skipped"
+        );
+
+        persist
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(r#"{"schema_version":1,"verb":"forward-unknown"}"#),
+            )
+            .expect("write forward action");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if persist
+                    .list_since(&result_topic("nodeA"), None)
+                    .is_ok_and(|messages| messages.len() == 1)
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before forward action");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forward host action must be handled by the recovered worker");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown completes")
+            .expect("worker joins")
+            .expect("worker exits cleanly");
     }
 
     fn armed_body(
