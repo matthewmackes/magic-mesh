@@ -50,6 +50,9 @@ const AUDIO_PROOF_PATH: &str = "/var/lib/mackesd/health/audio-proof.json";
 // every 10-second node-grade sample. A failed probe is cached too, preventing
 // a broken user session from becoming a synchronized process storm.
 const AUDIO_PROBE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_ACTION_STATE_ROOT: &str = "/var/lib/mackesd/node-grade-action-results";
+const MAX_ACTION_JOURNAL_BYTES: u64 = 256 * 1024;
+const MAX_PENDING_ACTION_RESULTS: usize = 128;
 
 // Keep the user-session audio evidence probe to one runuser/PAM transition.
 // The individual commands remain real providers, but launching each one
@@ -913,6 +916,279 @@ fn snapshot_path(workgroup_root: &Path, observer: &str) -> PathBuf {
         .join(format!("{observer}.json"))
 }
 
+fn action_journal_path(state_root: &Path, source_ulid: &str) -> PathBuf {
+    state_root.join(format!("{source_ulid}.json"))
+}
+
+fn valid_action_source_ulid(source_ulid: &str) -> bool {
+    source_ulid.len() == 26
+        && source_ulid
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum DurableHealthAction {
+    Claimed {
+        source_ulid: String,
+        request: HealthActionRequest,
+        snapshot_generation: u64,
+        claimed_at_ms: u64,
+    },
+    Complete {
+        source_ulid: String,
+        result: HealthActionResult,
+    },
+}
+
+fn validate_action_state_root(state_root: &Path, trusted_uid: u32) -> Result<bool, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = match std::fs::symlink_metadata(state_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("action state metadata unavailable: {error}")),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != trusted_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err("action state root has unsafe type, owner, or mode".into());
+    }
+    Ok(true)
+}
+
+fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("{label} directory sync failed: {error}"))
+}
+
+fn ensure_action_state_root(state_root: &Path, trusted_uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    if validate_action_state_root(state_root, trusted_uid)? {
+        return Ok(());
+    }
+    let parent = state_root
+        .parent()
+        .ok_or_else(|| "action state root has no parent".to_string())?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("action state parent metadata unavailable: {error}"))?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != trusted_uid
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("action state parent is not a trusted local boundary".into());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    let created = match builder.create(state_root) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(format!("action state root creation failed: {error}")),
+    };
+    let valid = validate_action_state_root(state_root, trusted_uid)?;
+    if created {
+        sync_directory(parent, "action state parent")?;
+    }
+    valid
+        .then_some(())
+        .ok_or_else(|| "action state root disappeared after creation".to_string())
+}
+
+fn read_action_journal(
+    state_root: &Path,
+    path: &Path,
+    trusted_uid: u32,
+) -> Result<Option<DurableHealthAction>, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if path.parent() != Some(state_root) {
+        return Err("health action journal escaped its local state root".into());
+    }
+    if !validate_action_state_root(state_root, trusted_uid)? {
+        return Ok(None);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != trusted_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.len() > MAX_ACTION_JOURNAL_BYTES
+    {
+        return Err("health action journal has unsafe type, owner, mode, or size".into());
+    }
+    let body = std::fs::read(path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn sync_action_state_root(state_root: &Path) -> Result<(), String> {
+    sync_directory(state_root, "action state")
+}
+
+fn pending_action_journals(state_root: &Path, trusted_uid: u32) -> Result<Vec<PathBuf>, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if !validate_action_state_root(state_root, trusted_uid)? {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(state_root)
+        .map_err(|error| format!("action state root read failed: {error}"))?;
+    let mut admitted = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("action state entry failed: {error}"))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| "action state contains a non-UTF-8 entry".to_string())?;
+        let is_journal = name
+            .strip_suffix(".json")
+            .is_some_and(valid_action_source_ulid);
+        let is_temp = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".tmp"))
+            .is_some_and(valid_action_source_ulid);
+        if !is_journal && !is_temp {
+            return Err("action state contains an unexpected entry".into());
+        }
+        if admitted.len() == MAX_PENDING_ACTION_RESULTS {
+            return Err(format!(
+                "action state exceeds its {}-entry bound",
+                MAX_PENDING_ACTION_RESULTS
+            ));
+        }
+        admitted.push((entry.path(), is_temp));
+    }
+    let mut paths = Vec::new();
+    let mut removed_temp = false;
+    for (path, is_temp) in admitted {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("action state entry metadata failed: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != trusted_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.len() > MAX_ACTION_JOURNAL_BYTES
+        {
+            return Err("action state contains an unsafe journal or temporary entry".into());
+        }
+        if is_temp {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("stale action journal cleanup failed: {error}"))?;
+            removed_temp = true;
+        } else {
+            paths.push(path);
+        }
+    }
+    if removed_temp {
+        sync_action_state_root(state_root)?;
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn cleanup_action_journal_temp(
+    state_root: &Path,
+    tmp: &Path,
+    trusted_uid: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = match std::fs::symlink_metadata(tmp) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("action journal temp metadata failed: {error}")),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != trusted_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err("refusing to clean an unsafe action journal temporary entry".into());
+    }
+    std::fs::remove_file(tmp)
+        .map_err(|error| format!("action journal temp cleanup failed: {error}"))?;
+    sync_action_state_root(state_root)
+}
+
+fn write_action_journal(
+    state_root: &Path,
+    source_ulid: &str,
+    record: &DurableHealthAction,
+    trusted_uid: u32,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    if !valid_action_source_ulid(source_ulid) {
+        return Err("health action source ULID is invalid".into());
+    }
+    ensure_action_state_root(state_root, trusted_uid)?;
+    let path = action_journal_path(state_root, source_ulid);
+    let pending = pending_action_journals(state_root, trusted_uid)?;
+    if !path.exists() && pending.len() >= MAX_PENDING_ACTION_RESULTS {
+        return Err(format!(
+            "action state reached its {}-entry admission bound",
+            MAX_PENDING_ACTION_RESULTS
+        ));
+    }
+    if read_action_journal(state_root, &path, trusted_uid).is_err() && path.exists() {
+        return Err("refusing to replace an unsafe action journal".into());
+    }
+    let body = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
+    if body.len() > usize::try_from(MAX_ACTION_JOURNAL_BYTES).unwrap_or(usize::MAX) {
+        return Err("health action journal exceeds its size bound".into());
+    }
+    let tmp = state_root.join(format!(".{source_ulid}.tmp"));
+    if let Ok(metadata) = std::fs::symlink_metadata(&tmp) {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != trusted_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err("health action journal temporary path is unsafe".into());
+        }
+        std::fs::remove_file(&tmp)
+            .map_err(|error| format!("stale action journal cleanup failed: {error}"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|error| format!("action journal temporary create failed: {error}"))?;
+    if let Err(error) = file.write_all(&body) {
+        drop(file);
+        let _ = cleanup_action_journal_temp(state_root, &tmp, trusted_uid);
+        return Err(format!("action journal write failed: {error}"));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = cleanup_action_journal_temp(state_root, &tmp, trusted_uid);
+        return Err(format!("action journal sync failed: {error}"));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        let _ = cleanup_action_journal_temp(state_root, &tmp, trusted_uid);
+        return Err(format!("action journal replace failed: {error}"));
+    }
+    sync_action_state_root(state_root)?;
+    match read_action_journal(state_root, &path, trusted_uid)? {
+        Some(_) => Ok(()),
+        None => Err("action journal disappeared after replacement".into()),
+    }
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -1370,11 +1646,18 @@ pub struct NodeGradeWorker {
     workgroup_root: PathBuf,
     sampler: Box<dyn HealthSampler>,
     bus_root: Option<PathBuf>,
+    action_state_root: PathBuf,
     poll: Duration,
     generation: u64,
     pressure: PressureWindow,
     action_cursor: Option<String>,
     last_snapshot: Option<SystemMeshHealthSnapshot>,
+    #[cfg(test)]
+    fail_terminal_result_writes: usize,
+    #[cfg(test)]
+    action_execution_count: usize,
+    #[cfg(test)]
+    trusted_action_owner_uid: u32,
 }
 
 impl NodeGradeWorker {
@@ -1390,12 +1673,187 @@ impl NodeGradeWorker {
             host,
             workgroup_root,
             bus_root: mde_bus::default_data_dir(),
+            action_state_root: PathBuf::from(DEFAULT_ACTION_STATE_ROOT),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            #[cfg(test)]
+            fail_terminal_result_writes: 0,
+            #[cfg(test)]
+            action_execution_count: 0,
+            #[cfg(test)]
+            trusted_action_owner_uid: 0,
         }
+    }
+
+    fn trusted_action_owner_uid(&self) -> u32 {
+        #[cfg(test)]
+        {
+            return self.trusted_action_owner_uid;
+        }
+        #[cfg(not(test))]
+        {
+            0
+        }
+    }
+
+    fn store_action_journal(
+        &mut self,
+        source_ulid: &str,
+        record: &DurableHealthAction,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        if matches!(record, DurableHealthAction::Complete { .. })
+            && self.fail_terminal_result_writes > 0
+        {
+            self.fail_terminal_result_writes -= 1;
+            return Err("injected terminal result storage failure".into());
+        }
+        write_action_journal(
+            &self.action_state_root,
+            source_ulid,
+            record,
+            self.trusted_action_owner_uid(),
+        )
+    }
+
+    fn publish_action_result(
+        &self,
+        persist: &Persist,
+        source_ulid: &str,
+        result: &HealthActionResult,
+    ) -> bool {
+        let topic = action_result_topic(&result.request_id);
+        let already_published = persist
+            .list_since(&topic, None)
+            .ok()
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .body
+                        .as_deref()
+                        .and_then(|body| serde_json::from_str::<HealthActionResult>(body).ok())
+                        .is_some_and(|published| published.audit_id == result.audit_id)
+                })
+            });
+        if !already_published {
+            let Ok(body) = serde_json::to_string(result) else {
+                return false;
+            };
+            if let Err(error) = persist.write(&topic, Priority::Default, None, Some(&body)) {
+                tracing::warn!(
+                    request_id = %result.request_id,
+                    source_ulid,
+                    error = %error,
+                    "node_grade: durable health action result publication deferred"
+                );
+                return false;
+            }
+        }
+        let path = action_journal_path(&self.action_state_root, source_ulid);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Err(error) = sync_action_state_root(&self.action_state_root) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error,
+                        "node_grade: published action journal directory sync failed"
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "node_grade: published action journal cleanup deferred"
+            ),
+        }
+        true
+    }
+
+    fn interrupted_action_result(
+        &self,
+        source_ulid: &str,
+        request: HealthActionRequest,
+        snapshot_generation: u64,
+    ) -> HealthActionResult {
+        HealthActionResult {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request.request_id,
+            condition_id: request.condition_id,
+            action: request.action,
+            outcome: HealthActionOutcome::Failed,
+            detail: "the prior remediation attempt ended after its durable execution claim; the action was not repeated, and current health must be refreshed before retrying".into(),
+            audit_id: format!("health:{}:{source_ulid}", self.host),
+            completed_at_ms: now_ms(),
+            snapshot_generation,
+            refreshed_evidence: None,
+        }
+    }
+
+    fn flush_action_results(&mut self, persist: &Persist) -> Option<String> {
+        let mut terminal_cursor: Option<String> = None;
+        let paths =
+            match pending_action_journals(&self.action_state_root, self.trusted_action_owner_uid())
+            {
+                Ok(paths) => paths,
+                Err(error) => {
+                    tracing::error!(error, "node_grade: local action state authority rejected");
+                    return None;
+                }
+            };
+        for path in paths {
+            let record = match read_action_journal(
+                &self.action_state_root,
+                &path,
+                self.trusted_action_owner_uid(),
+            ) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error, "node_grade: invalid action journal retained");
+                    continue;
+                }
+            };
+            let (source_ulid, result) = match record {
+                DurableHealthAction::Complete {
+                    source_ulid,
+                    result,
+                } => (source_ulid, result),
+                DurableHealthAction::Claimed {
+                    source_ulid,
+                    request,
+                    snapshot_generation,
+                    ..
+                } => {
+                    let result =
+                        self.interrupted_action_result(&source_ulid, request, snapshot_generation);
+                    let complete = DurableHealthAction::Complete {
+                        source_ulid: source_ulid.clone(),
+                        result: result.clone(),
+                    };
+                    if let Err(error) = self.store_action_journal(&source_ulid, &complete) {
+                        tracing::warn!(
+                            source_ulid,
+                            error,
+                            "node_grade: interrupted action remains durably claimed"
+                        );
+                        continue;
+                    }
+                    (source_ulid, result)
+                }
+            };
+            self.publish_action_result(persist, &source_ulid, &result);
+            if terminal_cursor
+                .as_ref()
+                .is_none_or(|cursor| source_ulid > *cursor)
+            {
+                terminal_cursor = Some(source_ulid);
+            }
+        }
+        terminal_cursor
     }
 
     fn cycle(&mut self, persist: Option<&Persist>) -> SystemMeshHealthSnapshot {
@@ -1486,6 +1944,15 @@ impl NodeGradeWorker {
     }
 
     fn drain_actions(&mut self, persist: &Persist) {
+        if let Some(cursor) = self.flush_action_results(persist) {
+            if self
+                .action_cursor
+                .as_ref()
+                .is_none_or(|current| cursor > *current)
+            {
+                self.action_cursor = Some(cursor);
+            }
+        }
         if self.last_snapshot.is_none() {
             return;
         }
@@ -1493,13 +1960,81 @@ impl NodeGradeWorker {
             return;
         };
         for message in messages {
-            self.action_cursor = Some(message.ulid.clone());
+            if !valid_action_source_ulid(&message.ulid) {
+                tracing::error!(source_ulid = %message.ulid, "node_grade: invalid action ULID refused");
+                self.action_cursor = Some(message.ulid);
+                continue;
+            }
             let Some(body) = message.body.as_deref() else {
+                self.action_cursor = Some(message.ulid);
                 continue;
             };
             let Ok(request) = serde_json::from_str::<HealthActionRequest>(body) else {
+                self.action_cursor = Some(message.ulid);
                 continue;
             };
+            let journal_path = action_journal_path(&self.action_state_root, &message.ulid);
+            match read_action_journal(
+                &self.action_state_root,
+                &journal_path,
+                self.trusted_action_owner_uid(),
+            ) {
+                Ok(Some(DurableHealthAction::Complete {
+                    source_ulid,
+                    result,
+                })) if source_ulid == message.ulid
+                    && result.request_id == request.request_id
+                    && result.condition_id == request.condition_id
+                    && result.action == request.action =>
+                {
+                    self.publish_action_result(persist, &source_ulid, &result);
+                    self.action_cursor = Some(message.ulid);
+                    continue;
+                }
+                Ok(Some(DurableHealthAction::Claimed {
+                    source_ulid,
+                    request: claimed_request,
+                    snapshot_generation,
+                    ..
+                })) if source_ulid == message.ulid && claimed_request == request => {
+                    let result = self.interrupted_action_result(
+                        &source_ulid,
+                        claimed_request,
+                        snapshot_generation,
+                    );
+                    let complete = DurableHealthAction::Complete {
+                        source_ulid: source_ulid.clone(),
+                        result: result.clone(),
+                    };
+                    if let Err(error) = self.store_action_journal(&source_ulid, &complete) {
+                        tracing::warn!(
+                            source_ulid,
+                            error,
+                            "node_grade: interrupted action remains recoverable"
+                        );
+                        break;
+                    }
+                    self.publish_action_result(persist, &source_ulid, &result);
+                    self.action_cursor = Some(message.ulid);
+                    continue;
+                }
+                Ok(Some(_)) => {
+                    tracing::error!(
+                        source_ulid = %message.ulid,
+                        "node_grade: action journal identity mismatch; refusing execution"
+                    );
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        source_ulid = %message.ulid,
+                        error,
+                        "node_grade: unreadable action journal; refusing execution"
+                    );
+                    break;
+                }
+            }
             let Some(snapshot) = self.last_snapshot.clone() else {
                 break;
             };
@@ -1509,6 +2044,22 @@ impl NodeGradeWorker {
                 .iter()
                 .find(|condition| condition.id == request.condition_id)
                 .map_or("", |condition| condition.source.as_str());
+            if decision == ActionDecision::Apply {
+                let claim = DurableHealthAction::Claimed {
+                    source_ulid: message.ulid.clone(),
+                    request: request.clone(),
+                    snapshot_generation: snapshot.generation,
+                    claimed_at_ms: now_ms(),
+                };
+                if let Err(error) = self.store_action_journal(&message.ulid, &claim) {
+                    tracing::warn!(
+                        source_ulid = %message.ulid,
+                        error,
+                        "node_grade: action execution deferred until its claim is durable"
+                    );
+                    break;
+                }
+            }
             let (outcome, detail) = match decision {
                 ActionDecision::Refuse(reason) => (HealthActionOutcome::Refused, reason.into()),
                 ActionDecision::Stale => (
@@ -1516,6 +2067,10 @@ impl NodeGradeWorker {
                     "snapshot generation changed; refresh before applying".into(),
                 ),
                 ActionDecision::Apply => {
+                    #[cfg(test)]
+                    {
+                        self.action_execution_count += 1;
+                    }
                     if matches!(
                         request.action,
                         HealthAction::Acknowledge | HealthAction::SnoozeOneHour
@@ -1558,7 +2113,20 @@ impl NodeGradeWorker {
                 snapshot_generation: result_generation,
                 refreshed_evidence,
             };
-            emit_json(persist, &action_result_topic(&request.request_id), &result);
+            let complete = DurableHealthAction::Complete {
+                source_ulid: message.ulid.clone(),
+                result: result.clone(),
+            };
+            if let Err(error) = self.store_action_journal(&message.ulid, &complete) {
+                tracing::warn!(
+                    source_ulid = %message.ulid,
+                    error,
+                    "node_grade: terminal result storage failed; durable claim retained"
+                );
+                break;
+            }
+            self.publish_action_result(persist, &message.ulid, &result);
+            self.action_cursor = Some(message.ulid);
         }
     }
 
@@ -1596,6 +2164,10 @@ impl Worker for NodeGradeWorker {
             .clone()
             .and_then(|root| Persist::open(root).ok());
         if let Some(persist) = persist.as_ref() {
+            // Finish exact results already made durable before skipping the
+            // retained action backlog. This preserves start-at-tail while a
+            // restart still corrects publication forward without re-executing.
+            self.flush_action_results(persist);
             // Health remediations are mutations, not replayable events. Begin at
             // the current tail so a daemon restart can never reapply a retained
             // confirmation from an earlier boot.
@@ -1821,16 +2393,12 @@ mod tests {
         sample.services.insert("workbench".into(), false);
         sample.audio = None;
         let conditions = evaluate_conditions("node", &sample, &PressureWindow::default(), 1, 100);
-        assert!(
-            conditions
-                .iter()
-                .any(|condition| condition.id == "node:required-service-workbench")
-        );
-        assert!(
-            conditions
-                .iter()
-                .any(|condition| condition.id == "node:workstation-audio")
-        );
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.id == "node:required-service-workbench"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.id == "node:workstation-audio"));
         assert_eq!(
             NodeGrade::evaluate("node", 99, factors(&sample), &conditions, 100).grade,
             mackes_mesh_types::health::GradeLetter::E
@@ -2028,11 +2596,15 @@ mod tests {
             workgroup_root: workgroup.path().to_path_buf(),
             sampler: Box::new(FixtureSampler(sample)),
             bus_root: None,
+            action_state_root: workgroup.path().join("local-action-state"),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            fail_terminal_result_writes: 0,
+            action_execution_count: 0,
+            trusted_action_owner_uid: rustix::process::geteuid().as_raw(),
         };
 
         worker.cycle(None);
@@ -2058,11 +2630,15 @@ mod tests {
             workgroup_root: workgroup.path().to_path_buf(),
             sampler: Box::new(FixtureSampler(sample)),
             bus_root: Some(bus.path().to_path_buf()),
+            action_state_root: workgroup.path().join("local-action-state"),
             poll: DEFAULT_POLL_INTERVAL,
             generation: 0,
             pressure: PressureWindow::default(),
             action_cursor: None,
             last_snapshot: None,
+            fail_terminal_result_writes: 0,
+            action_execution_count: 0,
+            trusted_action_owner_uid: rustix::process::geteuid().as_raw(),
         };
         let snapshot = worker.cycle(Some(&persist));
         let condition = snapshot
@@ -2132,5 +2708,242 @@ mod tests {
             .unwrap()
             .acknowledged_at_ms
             .is_some());
+    }
+
+    fn action_test_worker(workgroup_root: &Path, bus_root: &Path) -> NodeGradeWorker {
+        let mut sample = observations("workstation");
+        sample.services.insert("workbench".into(), false);
+        sample.device_inventory.as_mut().unwrap().published_at_ms = now_ms();
+        NodeGradeWorker {
+            host: "node".into(),
+            workgroup_root: workgroup_root.to_path_buf(),
+            sampler: Box::new(FixtureSampler(sample)),
+            bus_root: Some(bus_root.to_path_buf()),
+            action_state_root: workgroup_root.join("local-action-state"),
+            poll: DEFAULT_POLL_INTERVAL,
+            generation: 0,
+            pressure: PressureWindow::default(),
+            action_cursor: None,
+            last_snapshot: None,
+            fail_terminal_result_writes: 0,
+            action_execution_count: 0,
+            trusted_action_owner_uid: rustix::process::geteuid().as_raw(),
+        }
+    }
+
+    fn acknowledge_request(
+        snapshot: &SystemMeshHealthSnapshot,
+        request_id: &str,
+    ) -> HealthActionRequest {
+        let condition = snapshot
+            .active_conditions
+            .iter()
+            .find(|condition| condition.id.ends_with("required-service-workbench"))
+            .unwrap();
+        HealthActionRequest {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            request_id: request_id.into(),
+            condition_id: condition.id.clone(),
+            action: HealthAction::Acknowledge,
+            target: HealthScope::Node {
+                node: "node".into(),
+            },
+            expected_snapshot_generation: snapshot.generation,
+            requester: "node".into(),
+            authorization: "local-seat".into(),
+            confirmation: None,
+            requested_at_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn terminal_result_storage_failure_recovers_without_repeating_mutation() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = action_test_worker(workgroup.path(), bus.path());
+        let snapshot = worker.cycle(Some(&persist));
+        let request = acknowledge_request(&snapshot, "storage-failure-request");
+        let message = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request).unwrap()),
+            )
+            .unwrap();
+        worker.fail_terminal_result_writes = 1;
+        let journal_path = action_journal_path(&worker.action_state_root, &message.ulid);
+        let trusted_uid = worker.trusted_action_owner_uid();
+
+        worker.drain_actions(&persist);
+
+        assert_eq!(worker.action_execution_count, 1);
+        assert_eq!(worker.action_cursor, None);
+        assert!(matches!(
+            read_action_journal(&worker.action_state_root, &journal_path, trusted_uid),
+            Ok(Some(DurableHealthAction::Claimed { .. }))
+        ));
+        assert!(persist
+            .list_since(&action_result_topic(&request.request_id), None)
+            .unwrap()
+            .is_empty());
+
+        worker.drain_actions(&persist);
+
+        assert_eq!(worker.action_execution_count, 1);
+        assert_eq!(worker.action_cursor.as_deref(), Some(message.ulid.as_str()));
+        let results = persist
+            .list_since(&action_result_topic(&request.request_id), None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let result: HealthActionResult =
+            serde_json::from_str(results[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(result.outcome, HealthActionOutcome::Failed);
+        assert!(result.detail.contains("was not repeated"));
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn result_publication_failure_replays_durable_result_without_repeating_mutation() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = action_test_worker(workgroup.path(), bus.path());
+        let snapshot = worker.cycle(Some(&persist));
+        let request = acknowledge_request(&snapshot, "publication-failure-request");
+        let message = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request).unwrap()),
+            )
+            .unwrap();
+        let blocked_topic = bus.path().join(action_result_topic(&request.request_id));
+        std::fs::create_dir_all(blocked_topic.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_topic, b"hostile regular file").unwrap();
+        let journal_path = action_journal_path(&worker.action_state_root, &message.ulid);
+        let trusted_uid = worker.trusted_action_owner_uid();
+
+        worker.drain_actions(&persist);
+
+        assert_eq!(worker.action_execution_count, 1);
+        assert_eq!(worker.action_cursor.as_deref(), Some(message.ulid.as_str()));
+        assert!(matches!(
+            read_action_journal(&worker.action_state_root, &journal_path, trusted_uid),
+            Ok(Some(DurableHealthAction::Complete { .. }))
+        ));
+        assert!(persist
+            .list_since(&action_result_topic(&request.request_id), None)
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_file(&blocked_topic).unwrap();
+        worker.drain_actions(&persist);
+
+        assert_eq!(worker.action_execution_count, 1);
+        let results = persist
+            .list_since(&action_result_topic(&request.request_id), None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let result: HealthActionResult =
+            serde_json::from_str(results[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(result.outcome, HealthActionOutcome::Applied);
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn local_action_journal_rejects_symlink_and_unsafe_owner_or_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let parent = tempfile::tempdir().unwrap();
+        let state_root = parent.path().join("local-action-state");
+        let trusted_uid = rustix::process::geteuid().as_raw();
+        let source_ulid = "01K23F4Q6X8A0B2C4D6E8F0G2H";
+        let record = DurableHealthAction::Claimed {
+            source_ulid: source_ulid.into(),
+            request: request(HealthAction::Acknowledge),
+            snapshot_generation: 7,
+            claimed_at_ms: 100,
+        };
+        write_action_journal(&state_root, source_ulid, &record, trusted_uid).unwrap();
+        let path = action_journal_path(&state_root, source_ulid);
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o660);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(read_action_journal(&state_root, &path, trusted_uid).is_err());
+
+        std::fs::remove_file(&path).unwrap();
+        let victim = parent.path().join("victim.json");
+        std::fs::write(&victim, serde_json::to_vec(&record).unwrap()).unwrap();
+        symlink(&victim, &path).unwrap();
+        assert!(read_action_journal(&state_root, &path, trusted_uid).is_err());
+
+        assert!(pending_action_journals(&state_root, trusted_uid.saturating_add(1)).is_err());
+        let linked_root = parent.path().join("linked-action-state");
+        symlink(&state_root, &linked_root).unwrap();
+        assert!(pending_action_journals(&linked_root, trusted_uid).is_err());
+    }
+
+    #[test]
+    fn local_action_journal_enforces_cap_and_cleans_bounded_safe_temp() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let state_root = parent.path().join("capped-action-state");
+        let trusted_uid = rustix::process::geteuid().as_raw();
+        ensure_action_state_root(&state_root, trusted_uid).unwrap();
+        let record = DurableHealthAction::Claimed {
+            source_ulid: format!("{:026}", 0),
+            request: request(HealthAction::Acknowledge),
+            snapshot_generation: 7,
+            claimed_at_ms: 100,
+        };
+        let body = serde_json::to_vec(&record).unwrap();
+        for index in 0..MAX_PENDING_ACTION_RESULTS {
+            let source_ulid = format!("{index:026}");
+            let path = action_journal_path(&state_root, &source_ulid);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(&body).unwrap();
+        }
+        assert_eq!(
+            pending_action_journals(&state_root, trusted_uid)
+                .unwrap()
+                .len(),
+            MAX_PENDING_ACTION_RESULTS
+        );
+        let overflow_ulid = format!("{:026}", MAX_PENDING_ACTION_RESULTS);
+        let overflow = DurableHealthAction::Claimed {
+            source_ulid: overflow_ulid.clone(),
+            request: request(HealthAction::Acknowledge),
+            snapshot_generation: 7,
+            claimed_at_ms: 100,
+        };
+        assert!(write_action_journal(&state_root, &overflow_ulid, &overflow, trusted_uid).is_err());
+        assert!(!action_journal_path(&state_root, &overflow_ulid).exists());
+
+        let temp_root = parent.path().join("temp-action-state");
+        ensure_action_state_root(&temp_root, trusted_uid).unwrap();
+        let temp_path = temp_root.join(format!(".{:026}.tmp", 1));
+        let mut temp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .unwrap();
+        temp.write_all(&body).unwrap();
+        drop(temp);
+        assert!(pending_action_journals(&temp_root, trusted_uid)
+            .unwrap()
+            .is_empty());
+        assert!(!temp_path.exists());
     }
 }

@@ -1958,6 +1958,11 @@ behavioral evidence is not completion.
   target-bound request is durably published. Machine 196 passed the exact
   hostile publication fixture:
   `docs/platform/evidence/WL-UX-013-2026-08-09-health-action-publication-r9.md`.
+- **Health-result durability checkpoint (2026-08-09):** a root-owned bounded
+  local journal prevents repeated remediation and recovers exact terminal
+  replies across store, Bus, or restart faults. Machine 193 passed five focused
+  durability/security fixtures:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-health-result-durability-r10.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.
