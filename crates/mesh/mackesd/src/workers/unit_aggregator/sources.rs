@@ -186,6 +186,14 @@ pub trait CloudMirrorSource: Send + Sync {
     /// object id is the fold's job (see `super::fold`), so this returns the whole
     /// unioned set (possibly with cross-node duplicates).
     fn read(&self) -> Vec<CloudObjectRecord>;
+
+    /// Strict read used by the production aggregator. Implementations that
+    /// cannot fail inherit the infallible test/source behavior; Bus-backed
+    /// implementations override this so an unavailable or malformed retained
+    /// lane cannot be confused with an empty cloud inventory.
+    fn read_strict(&self) -> Result<Vec<CloudObjectRecord>, String> {
+        Ok(self.read())
+    }
 }
 
 /// The Bus topic prefix every node's provider-neutral cloud mirror publishes
@@ -367,44 +375,57 @@ impl BusCloudMirror {
     pub const fn new(bus_root: PathBuf) -> Self {
         Self { bus_root }
     }
-}
 
-impl CloudMirrorSource for BusCloudMirror {
-    fn read(&self) -> Vec<CloudObjectRecord> {
-        let persist = match mde_bus::persist::Persist::open(self.bus_root.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::units", error = %e, "cloud mirror: persist open failed");
-                return Vec::new();
-            }
-        };
-        let topics = match persist.list_topics() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::units", error = %e, "cloud mirror: list_topics failed");
-                return Vec::new();
-            }
-        };
+    /// Open and strictly read the configured Bus. Unlike the compatibility
+    /// trait method, every open/list/read/body/decode failure is returned.
+    pub fn read(&self) -> Result<Vec<CloudObjectRecord>, String> {
+        let persist = mde_bus::persist::Persist::open(self.bus_root.clone())
+            .map_err(|error| format!("cloud mirror: open Bus: {error}"))?;
+        self.read_from(&persist)
+    }
+
+    /// Read through an already activated Bus handle. This keeps cloud reads on
+    /// the same live/reopened index as mirror and RPC writes.
+    pub fn read_from(
+        &self,
+        persist: &mde_bus::persist::Persist,
+    ) -> Result<Vec<CloudObjectRecord>, String> {
+        let topics = persist
+            .list_topics()
+            .map_err(|error| format!("cloud mirror: list topics: {error}"))?;
         let mut out = Vec::new();
         for topic in topics {
             let Some(node) = cloud_topic_node(&topic) else {
                 continue;
             };
-            let Ok(msgs) = persist.list_since(&topic, None) else {
-                continue;
-            };
-            // The latest body on the topic is the live mirror row.
-            let Some(body_str) = msgs.into_iter().next_back().and_then(|m| m.body) else {
-                continue;
-            };
-            match serde_json::from_str::<CloudMirrorBody>(&body_str) {
-                Ok(body) => out.extend(records_from_body(node, &body)),
-                Err(e) => {
-                    tracing::debug!(target: "mackesd::units", topic = %topic, error = %e, "cloud mirror: body decode failed");
-                }
-            }
+            let messages = persist
+                .list_since(&topic, None)
+                .map_err(|error| format!("cloud mirror: read {topic}: {error}"))?;
+            let latest = messages
+                .into_iter()
+                .next_back()
+                .ok_or_else(|| format!("cloud mirror: listed topic {topic} has no retained row"))?;
+            let body_str = latest
+                .body
+                .ok_or_else(|| format!("cloud mirror: latest row on {topic} has no body"))?;
+            let body = serde_json::from_str::<CloudMirrorBody>(&body_str)
+                .map_err(|error| format!("cloud mirror: decode {topic}: {error}"))?;
+            out.extend(records_from_body(node, &body));
         }
-        out
+        Ok(out)
+    }
+}
+
+impl CloudMirrorSource for BusCloudMirror {
+    fn read(&self) -> Vec<CloudObjectRecord> {
+        BusCloudMirror::read(self).unwrap_or_else(|error| {
+            tracing::debug!(target: "mackesd::units", %error, "strict cloud mirror read failed");
+            Vec::new()
+        })
+    }
+
+    fn read_strict(&self) -> Result<Vec<CloudObjectRecord>, String> {
+        BusCloudMirror::read(self)
     }
 }
 
@@ -575,7 +596,7 @@ mod tests {
             .expect("publish cloud mirror");
 
         let reader = BusCloudMirror::new(bus.path().to_path_buf());
-        let records = CloudMirrorSource::read(&reader);
+        let records = reader.read().expect("strict cloud mirror read");
         assert_eq!(records.len(), 2);
         assert!(records.iter().any(|r| r.id == "i1" && r.node == "node-a"));
         assert!(records.iter().any(|r| r.id == "v1" && r.node == "node-b"));
@@ -592,6 +613,35 @@ mod tests {
         assert!(units
             .iter()
             .any(|u| u.id == "cloud:volume:v1" && u.kind == UnitKind::Volume));
+    }
+
+    #[test]
+    fn bus_cloud_source_returns_final_topic_decode_failure() {
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist =
+            mde_bus::persist::Persist::open(bus.path().to_path_buf()).expect("open temp bus");
+        persist
+            .write(
+                "state/cloud/node-a",
+                Priority::Default,
+                None,
+                Some(r#"{"objects":[]}"#),
+            )
+            .expect("valid first cloud lane");
+        persist
+            .write(
+                "state/cloud/node-z",
+                Priority::Default,
+                None,
+                Some("{malformed-final-lane"),
+            )
+            .expect("malformed final cloud lane");
+
+        let error = BusCloudMirror::new(bus.path().to_path_buf())
+            .read()
+            .expect_err("decode failure must not masquerade as an empty view");
+        assert!(error.contains("state/cloud/node-z"));
+        assert!(error.contains("decode"));
     }
 
     #[test]
