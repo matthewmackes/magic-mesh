@@ -511,8 +511,8 @@ behavioral evidence is not completion.
   office editing, and one executor replace all retired paths.
 - Current state: signed envelopes, projections, native Editor foundation, POSIX/CAS Files transfer, and shell mounting exist; Calls providers, cross-node executors,
   office transport, canonical Alerts, migration, and hard cut remain.
-- **Transfer wire checkpoint (2026-08-06):** duplicate `schema_version` fields are rejected at media transfer admission; `.50` passed 1/1.
-  Evidence: `docs/platform/evidence/WL-FUNC-011-2026-08-06-transfer-wire-boundary-r1.md`.
+- **Transfer executor checkpoint (2026-08-09):** an exhaustive 11-row registry permits only Local/Copy and names unavailable providers before effects; `.50` passed 2/2:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-transfer-executor-r7.md`.
 - **Hard-cut/atomicity checkpoints (2026-08-09):** retired collaboration routes fail closed, and failed SQLite projection preserves clocks/state; BigBoy and `.50` passed:
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-legacy-route-admission-r2.md`, `docs/platform/evidence/WL-FUNC-011-2026-08-09-collab-projection-atomicity-r3.md`.
 - **Live-event lane identity checkpoint (2026-08-09):** signed envelopes merge only on an exact space/actor Bus lane; mismatches fail closed. Machine 193 passed 1/1:
