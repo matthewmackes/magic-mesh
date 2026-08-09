@@ -119,6 +119,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-provision-hard-cut-r8.md`.
 - **Authority/contract hardening (2026-08-09):** lifecycle/provision bypasses were deleted; attachment identity, restart replay, and Display1 ownership fail closed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-contract-restart-display1-hardening-r12.md`.
+- **Production compile checkpoint (2026-08-09):** cloud authorization exports are reachable outside tests; BigBoy's locked async-services library check passed:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-production-compile-r14.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and
