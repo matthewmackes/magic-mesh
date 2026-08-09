@@ -119,6 +119,12 @@ const MAX_AUTH_TTL_MS: i64 = 30_000;
 /// imperceptible while bounding index-read churn (matches `copilot`).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
 
+/// Bounds for startup Bus recovery. The lower bound prevents a test or bad
+/// configuration from turning an unavailable Bus into a hot loop; the upper
+/// bound keeps a late-mounted system Bus recoverable without a daemon restart.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// A TYPED action request — an allowlisted KIND with typed params. There is
 /// deliberately **no `Command(String)` / `Shell(String)` variant**: §9 forbids a
 /// raw-shell / arbitrary-command channel, so the only way to add an action is to
@@ -608,6 +614,11 @@ fn wall_now_ms() -> i64 {
 /// The leader-only typed action worker. Drains [`ACTION_TOPIC`], dispatches each
 /// allowlisted typed action through the existing verb mechanism, audits it on the
 /// hash-chain plane, and replies. Best-effort + graceful degrade.
+#[cfg(test)]
+type BusOpenFn = dyn Fn() -> Result<Option<Persist>, String> + Send + Sync;
+#[cfg(test)]
+type CursorPrimeFn = dyn Fn(&Persist) -> Result<Option<String>, String> + Send + Sync;
+
 pub struct ActionWorker {
     /// Shared leader lock (`<workgroup_root>/.mackesd-leader.lock`) — the same
     /// file every leader-gated worker contends on.
@@ -634,6 +645,12 @@ pub struct ActionWorker {
     poll_interval: Duration,
     /// Override the Bus spool root. Tests point this at a tempdir.
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus resolve/open seam for startup-race tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    /// Dynamic cursor-tail seam for activation-failure tests.
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
     /// Bounded, workload-identity-keyed Android guest provider adapters. An
     /// empty registry is the honest production default: inventory stays
     /// pending and launches remain explicitly unavailable until a real guest
@@ -671,6 +688,10 @@ impl ActionWorker {
             db_path: crate::default_db_path(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
             android_guest_providers: AndroidGuestProviderRegistry::new(),
         }
     }
@@ -687,6 +708,23 @@ impl ActionWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Override dynamic Bus resolution/opening without changing production
+    /// retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override startup cursor priming without changing production activation.
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
         self
     }
 
@@ -736,6 +774,29 @@ impl ActionWorker {
             self.node_id.clone(),
         )
         .is_leader()
+    }
+
+    fn open_bus(&self) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open();
+        }
+
+        let root = action_bus_root(self.bus_root_override.clone());
+        Persist::open(root)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_action_cursor(&self, persist: &Persist) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        persist
+            .latest_ulid(ACTION_TOPIC)
+            .map_err(|error| error.to_string())
     }
 
     /// Write the hash-chain audit row for one action (request + outcome) through
@@ -952,15 +1013,7 @@ impl ActionWorker {
     fn dispatch(&self, ulid: &str, req: &ActionRequest) -> ActionReply {
         match req {
             ActionRequest::ServiceLifecycle { target_host, .. } => {
-                let root = self
-                    .bus_root_override
-                    .clone()
-                    .or_else(default_bus_root)
-                    .ok_or_else(|| "no Bus root is configured for Workload operations".to_string());
-                let root = match root {
-                    Ok(root) => root,
-                    Err(reason) => return ActionReply::rejected(reason),
-                };
+                let root = action_bus_root(self.bus_root_override.clone());
                 let persist = match Persist::open(root) {
                     Ok(persist) => persist,
                     Err(error) => {
@@ -1124,8 +1177,12 @@ impl ActionWorker {
     }
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn action_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    action_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn action_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 #[async_trait::async_trait]
@@ -1135,25 +1192,44 @@ impl Worker for ActionWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::debug!(target: "mackesd::action", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(
-                    target: "mackesd::action",
-                    error = %e,
-                    "persist open failed; worker idle",
-                );
-                return Ok(());
+        let retry_interval = self
+            .poll_interval
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let (persist, mut cursor) = loop {
+            match self.open_bus() {
+                Ok(Some(persist)) => match self.prime_action_cursor(&persist) {
+                    Ok(cursor) => break (persist, cursor),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "mackesd::action",
+                            %error,
+                            "action cursor priming failed; Bus activation will retry"
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "mackesd::action",
+                        "Bus root unavailable; action startup will retry"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::action",
+                        %error,
+                        "Bus open failed; action startup will retry"
+                    );
+                }
+            }
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         // Seed the cursor at the tail so a restart doesn't replay + re-execute
         // stale action requests (running an old action twice is worse than
         // dropping it on a restart).
-        let mut cursor: Option<String> = persist.latest_ulid(ACTION_TOPIC).ok().flatten();
         let mut tick = tokio::time::interval(self.poll_interval);
         // Burn the immediate first tick so we wait a full interval on startup.
         tick.tick().await;
@@ -1273,6 +1349,22 @@ mod tests {
         }
 
         fn launch(&self, _request: &AndroidGuestLaunchRequest) -> AndroidGuestLaunchOutcome {
+            AndroidGuestLaunchOutcome::Started
+        }
+    }
+
+    struct CountingActionProvider {
+        launches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AndroidGuestProvider for CountingActionProvider {
+        fn inventory(&self, request: &AndroidGuestInventoryRequest) -> AndroidAppInventory {
+            AndroidAppInventory::pending(request.workload_id.clone())
+        }
+
+        fn launch(&self, _request: &AndroidGuestLaunchRequest) -> AndroidGuestLaunchOutcome {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             AndroidGuestLaunchOutcome::Started
         }
     }
@@ -1677,6 +1769,222 @@ mod tests {
             .await
             .expect("worker must exit on shutdown");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn action_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/action-bus-test");
+        assert_eq!(action_bus_root(Some(explicit.clone())), explicit);
+        assert_eq!(
+            action_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_absence_wait_is_alive_and_shutdown_prompt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().expect("temp root");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_open = Arc::clone(&attempts);
+        let mut worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_poll_interval(Duration::from_secs(30))
+            .with_bus_opener(Arc::new(move || {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !task.is_finished(),
+            "a missing Bus root must leave the worker alive"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt the bounded Bus retry wait")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn bus_recovery_skips_history_and_executes_one_forward_action_once() {
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().expect("temp root");
+        let bus_root = tmp.path().join("bus");
+        let mode = Arc::new(AtomicU8::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let signer = Arc::new(HmacTokenSigner::new(b"action-bus-recovery-key".to_vec()));
+        let mode_for_open = Arc::clone(&mode);
+        let attempts_for_open = Arc::clone(&attempts);
+        let attempts_for_prime = Arc::clone(&prime_attempts);
+        let root_for_open = bus_root.clone();
+        let mut worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_poll_interval(Duration::from_millis(10))
+            .with_authorization(signer.clone(), tmp.path().join("auth"))
+            .with_android_guest_provider(
+                "android-t480",
+                Arc::new(CountingActionProvider {
+                    launches: Arc::clone(&launches),
+                }),
+            )
+            .expect("provider registration")
+            .with_bus_opener(Arc::new(move || {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                match mode_for_open.load(Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected Persist::open failure".to_string()),
+                    _ => Persist::open(root_for_open.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                let attempt = attempts_for_prime.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err("injected cursor-prime failure".to_string());
+                }
+                persist
+                    .latest_ulid(ACTION_TOPIC)
+                    .map_err(|error| error.to_string())
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!task.is_finished(), "root absence must not end the worker");
+
+        mode.store(1, Ordering::SeqCst);
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert!(
+            !task.is_finished(),
+            "Persist::open failure must not end the worker"
+        );
+
+        let persist = Persist::open(bus_root.clone()).expect("setup Bus history");
+        let stale = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some("hostile stale action"),
+            )
+            .expect("write stale action");
+        drop(persist);
+        mode.store(2, Ordering::SeqCst);
+
+        for _ in 0..50 {
+            if attempts.load(Ordering::SeqCst) >= 4 && prime_attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            4,
+            "missing root, open failure, failed prime, then activation"
+        );
+        assert_eq!(
+            prime_attempts.load(Ordering::SeqCst),
+            2,
+            "cursor failure must retry open and prime before activation"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let persist = Persist::open(bus_root.clone()).expect("reopen recovered Bus");
+        assert!(
+            persist
+                .list_since(&reply_topic(&stale.ulid), None)
+                .expect("stale reply query")
+                .is_empty(),
+            "startup history must not execute or receive a reply"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+        let unsigned = android_launch_req("t480", "android-t480", "browser");
+        let armed = armed_wire(&unsigned, "action-bus-recovery-forward", signer.as_ref());
+        let forward = persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&armed))
+            .expect("write forward action");
+        drop(persist);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let persist = Persist::open(bus_root.clone()).expect("poll Bus");
+                if !persist
+                    .list_since(&reply_topic(&forward.ulid), None)
+                    .expect("forward reply query")
+                    .is_empty()
+                {
+                    break;
+                }
+                drop(persist);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forward action must receive a reply after recovery");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let persist = Persist::open(bus_root.clone()).expect("verify Bus");
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&forward.ulid), None)
+                .expect("forward replies")
+                .len(),
+            1,
+            "one forward request must receive exactly one reply"
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            1,
+            "one forward request must execute exactly once"
+        );
+        let attempts_after_open = attempts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            attempts_after_open,
+            "Bus open and cursor priming must stop after first success"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("active shutdown must be prompt")
+            .expect("worker task")
+            .expect("clean worker shutdown");
     }
 
     #[test]
