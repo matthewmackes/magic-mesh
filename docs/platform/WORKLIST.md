@@ -1581,6 +1581,12 @@ behavioral evidence is not completion.
   fails watchdog health. Dell and seat 15 are live again; lighthouse `.1` repair
   and full-fleet convergence remain:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-peer-publication-failover-r16.md`.
+- **Health-generation restart checkpoint (2026-08-09):** Dell's restarted
+  producer reset to generation 0 while durable ingress retained 4,527, freezing
+  health history behind correct replay rejection. First-cycle generation now
+  recovers from the durable canonical publication floor; machine 193 passed the
+  exact rollback fixture:
+  `docs/platform/evidence/WL-CRIT-007-WL-UX-013-2026-08-09-health-generation-restart-r17.md`.
 - **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:
@@ -1868,6 +1874,11 @@ behavioral evidence is not completion.
   ingress now rejects replay/rollback and atomically preserves its bounded
   per-observer cursor/ledger across restart; `.170` passed 24/24:
   `docs/platform/evidence/WL-UX-013-2026-08-08-health-ingress-checkpoint-s2-r1.md`.
+- **Producer restart-generation checkpoint (2026-08-09):** a restarted health
+  producer now advances from its durable canonical publication floor instead of
+  resetting below ingress replay state; machine 193 passed the exact Dell
+  rollback fixture:
+  `docs/platform/evidence/WL-CRIT-007-WL-UX-013-2026-08-09-health-generation-restart-r17.md`.
 - **Projection freshness checkpoint (2026-08-09):** the roster fold cannot
   outlive its earliest admitted source or the ten-minute contract maximum;
   `.90` passed 14/14 health tests including hostile `u64::MAX` validity:

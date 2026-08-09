@@ -1400,11 +1400,25 @@ impl NodeGradeWorker {
 
     fn cycle(&mut self, persist: Option<&Persist>) -> SystemMeshHealthSnapshot {
         let now = now_ms();
-        self.generation = self.generation.saturating_add(1);
-        let observations = self.sampler.sample();
-        self.pressure.observe(observations.resources);
         let path = node_dir(&self.workgroup_root).join(format!("{}.json", self.host));
         let previous = read_state(&path);
+        // The in-memory counter used to restart at zero. Durable ingress then
+        // rejected every post-restart publication until the counter caught up
+        // with its retained high-water mark (hours on a long-running seat).
+        // A canonical row carries both the prior counter and its Unix-ms
+        // publication time; either is a safe monotonic floor when capped at the
+        // current clock. This also repairs nodes whose first broken restart
+        // already overwrote the row with a low counter but a fresh timestamp.
+        let durable_floor = previous.as_ref().map_or(0, |state| {
+            state.generation.max(state.published_at_ms).min(now)
+        });
+        self.generation = if self.generation == 0 {
+            durable_floor.saturating_add(1)
+        } else {
+            self.generation.saturating_add(1)
+        };
+        let observations = self.sampler.sample();
+        self.pressure.observe(observations.resources);
         let mut active = evaluate_conditions(
             &self.host,
             &observations,
@@ -1988,6 +2002,47 @@ mod tests {
         };
         write_json_atomic(&nodes.join("node.sync-conflict-1.json"), &state).unwrap();
         assert!(read_canonical_states(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn restart_generation_uses_durable_publication_floor_after_counter_rollback() {
+        let workgroup = tempfile::tempdir().unwrap();
+        let nodes = node_dir(workgroup.path());
+        std::fs::create_dir_all(&nodes).unwrap();
+        let now = now_ms();
+        let sample = observations("workstation");
+        let stale_counter = NodeHealthState {
+            schema_version: HEALTH_SCHEMA_VERSION,
+            publisher: "node".into(),
+            roster_revision: "r1".into(),
+            generation: 136,
+            published_at_ms: now.saturating_sub(1),
+            valid_until_ms: now.saturating_add(PUBLICATION_VALIDITY_MS),
+            grade: NodeGrade::evaluate("node", 100, factors(&sample), &[], now),
+            active_conditions: Vec::new(),
+            resolved_conditions: Vec::new(),
+        };
+        write_json_atomic(&nodes.join("node.json"), &stale_counter).unwrap();
+        let mut worker = NodeGradeWorker {
+            host: "node".into(),
+            workgroup_root: workgroup.path().to_path_buf(),
+            sampler: Box::new(FixtureSampler(sample)),
+            bus_root: None,
+            poll: DEFAULT_POLL_INTERVAL,
+            generation: 0,
+            pressure: PressureWindow::default(),
+            action_cursor: None,
+            last_snapshot: None,
+        };
+
+        worker.cycle(None);
+
+        let recovered = read_state(&nodes.join("node.json")).unwrap();
+        assert!(
+            recovered.generation > 4_527,
+            "a restarted producer must immediately clear the retained ingress high-water"
+        );
+        assert!(recovered.generation > stale_counter.generation);
     }
 
     #[test]
