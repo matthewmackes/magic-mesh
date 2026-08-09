@@ -46,6 +46,7 @@ impl CachePolicy {
 pub enum CacheError {
     Io(String),
     Index(String),
+    CorruptIndex(String),
     Policy(&'static str),
     NotApproved,
     Digest,
@@ -56,7 +57,9 @@ impl fmt::Display for CacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "cache I/O failed: {error}"),
-            Self::Index(error) => write!(f, "cache index is invalid: {error}"),
+            Self::Index(error) | Self::CorruptIndex(error) => {
+                write!(f, "cache index is invalid: {error}")
+            }
             Self::Policy(error) => f.write_str(error),
             Self::NotApproved => f.write_str("tile is not approved by the verified catalog"),
             Self::Digest => f.write_str("tile digest is malformed or does not match"),
@@ -135,7 +138,11 @@ impl OfflineTileCache {
     pub fn open(root: impl Into<PathBuf>, policy: CachePolicy) -> Result<Self, CacheError> {
         let root = root.into();
         ensure_root(&root)?;
-        let entries = load_index(&root, policy)?;
+        let entries = match load_index(&root, policy) {
+            Ok(entries) => entries,
+            Err(CacheError::CorruptIndex(_)) => recover_corrupt_regular_index(&root)?,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             root,
             policy,
@@ -401,18 +408,18 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
             "index exceeds its byte bound".to_string(),
         ));
     }
-    let header: CacheIndexHeader =
-        serde_json::from_slice(&bytes).map_err(|error| CacheError::Index(error.to_string()))?;
+    let header: CacheIndexHeader = serde_json::from_slice(&bytes)
+        .map_err(|error| CacheError::CorruptIndex(error.to_string()))?;
     if header.schema == 1 {
         return invalidate_legacy_index(root, &bytes);
     }
     if header.schema != INDEX_SCHEMA {
         return Err(CacheError::Index("index schema is unsupported".to_string()));
     }
-    let index: CacheIndex =
-        serde_json::from_slice(&bytes).map_err(|error| CacheError::Index(error.to_string()))?;
+    let index: CacheIndex = serde_json::from_slice(&bytes)
+        .map_err(|error| CacheError::CorruptIndex(error.to_string()))?;
     if index.entries.len() > MAX_ENTRIES {
-        return Err(CacheError::Index(
+        return Err(CacheError::CorruptIndex(
             "index entry count is invalid".to_string(),
         ));
     }
@@ -422,20 +429,20 @@ fn load_index(root: &Path, policy: CachePolicy) -> Result<Vec<CacheEntry>, Cache
         entry
             .tile
             .validate()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+            .map_err(|error| CacheError::CorruptIndex(error.to_string()))?;
         if !is_sha256_hex(&entry.catalog_sha256)
             || !is_sha256_hex(&entry.sha256)
             || entry.byte_len == 0
             || entry.byte_len > MAX_TILE_BYTES as u64
             || !identities.insert(entry.tile.clone())
         {
-            return Err(CacheError::Index(
+            return Err(CacheError::CorruptIndex(
                 "index entry is malformed or duplicated".to_string(),
             ));
         }
         total = total
             .checked_add(entry.byte_len)
-            .ok_or_else(|| CacheError::Index("index size overflow".to_string()))?;
+            .ok_or_else(|| CacheError::CorruptIndex("index size overflow".to_string()))?;
     }
     if total > policy.quota_bytes {
         return Err(CacheError::Index(
@@ -466,6 +473,36 @@ fn invalidate_legacy_index(root: &Path, bytes: &[u8]) -> Result<Vec<CacheEntry>,
             }
         }
     }
+    Ok(Vec::new())
+}
+
+fn recover_corrupt_regular_index(root: &Path) -> Result<Vec<CacheEntry>, CacheError> {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let path = root.join(INDEX_FILE);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| CacheError::Io(error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(CacheError::Index(
+            "corrupt index is not a regular file".to_string(),
+        ));
+    }
+
+    let quarantine = root.join(format!(
+        ".corrupt-index-{}-{}",
+        std::process::id(),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::rename(&path, &quarantine).map_err(|error| CacheError::Io(error.to_string()))?;
+    let empty = serde_json::to_vec(&CacheIndex {
+        schema: INDEX_SCHEMA,
+        entries: Vec::new(),
+    })
+    .map_err(|error| CacheError::Index(error.to_string()))?;
+    if let Err(error) = write_atomic(&path, &empty) {
+        let _ = std::fs::rename(&quarantine, &path);
+        return Err(error);
+    }
+    let _ = std::fs::remove_file(quarantine);
     Ok(Vec::new())
 }
 
@@ -806,5 +843,49 @@ mod tests {
             malformed.lookup(&catalog(), &malformed_id, 2),
             OfflineTile::Unavailable(UnavailableReason::NotIndexed)
         ));
+    }
+
+    #[test]
+    fn corrupt_current_index_recovers_empty_without_admitting_hostile_metadata() {
+        let hostile_indexes: [&[u8]; 2] = [
+            br#"{"schema":2,"entries":["#,
+            br#"{"schema":2,"entries":[{"tile":null}]}"#,
+        ];
+        let policy = CachePolicy::bounded(1024, 10_000).unwrap();
+
+        for hostile in hostile_indexes {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(INDEX_FILE), hostile).unwrap();
+
+            let mut cache = OfflineTileCache::open(dir.path(), policy).unwrap();
+            assert!(cache.is_empty());
+            let recovered: CacheIndex =
+                serde_json::from_slice(&std::fs::read(dir.path().join(INDEX_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(recovered.schema, INDEX_SCHEMA);
+            assert!(recovered.entries.is_empty());
+
+            let bytes = b"recovered";
+            cache
+                .store_verified(&catalog(), tile(0), bytes, &sha256_hex(bytes), 1)
+                .unwrap();
+            assert!(matches!(
+                cache.lookup(&catalog(), &tile(0), 2),
+                OfflineTile::Verified { bytes: found, .. } if found == bytes
+            ));
+        }
+
+        let future_dir = tempfile::tempdir().unwrap();
+        let future = br#"{"schema":65535,"entries":[]}"#;
+        std::fs::write(future_dir.path().join(INDEX_FILE), future).unwrap();
+        assert!(matches!(
+            OfflineTileCache::open(future_dir.path(), policy),
+            Err(CacheError::Index(error)) if error == "index schema is unsupported"
+        ));
+        assert_eq!(
+            std::fs::read(future_dir.path().join(INDEX_FILE)).unwrap(),
+            future,
+            "a future-generation index must not be destroyed by an older reader"
+        );
     }
 }

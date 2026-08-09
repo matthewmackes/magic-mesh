@@ -700,6 +700,11 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-catalog-binding-r3.md`.
 - **MG90 roster (2026-08-09):** approved selection owns v2 and loss stops claims; `.90` passed 15/15: `docs/platform/evidence/WL-FUNC-017-2026-08-09-mg90-roster-runtime-r5.md`.
 - Remaining work:
+- **Offline index corruption recovery (2026-08-09):** malformed current-schema
+  regular metadata is atomically replaced by an empty valid index without
+  admitting old bytes; future schemas remain untouched and non-regular paths
+  still fail closed. Machine 193 passed the exact hostile fixture:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-09-offline-index-corruption-recovery-r4.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
