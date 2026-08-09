@@ -953,6 +953,8 @@ behavioral evidence is not completion.
   a bounded idempotent oneshot before controlled shell restart. `.90` package
   and unit gates passed; live publisher-key distribution remains:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-activation-r4.md`.
+- **Catalog rollback checkpoint (2026-08-09):** same-publisher rollback/equivocation preserves last-good cards and revokes stale actions; `.50` passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-remote-sessions-catalog-rollback-r5.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
@@ -1542,6 +1544,8 @@ behavioral evidence is not completion.
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-role-admission-r3.md`.
+- **Lighthouse coordination checkpoint (2026-08-09):** missing etcd membership now refuses recovery before mutation; machine 194 passed the full fixture:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-coordination-admission-r4.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
@@ -1680,6 +1684,8 @@ behavioral evidence is not completion.
   driver; forged and foreign-host targets cannot reach mutation. `.90` passed
   16/16 focused tests:
   `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-ownership-r1.md`.
+- **Device-control generation checkpoint (2026-08-09):** stale inventory timestamps cannot reach mutation; `.90` passed 6 contract, 17 executor, and 1 shell test:
+  `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-generation-r2.md`.
 - Remaining work:
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
@@ -1869,6 +1875,8 @@ behavioral evidence is not completion.
 - Required outcome: one ToastHost renders six license-clean A-F health scenes and recovery transitions from UX-013 authority, with exact dwell/audio, grouping/ticker,
   safe deep links, live-3D/pre-rendered/static fallback, and no second renderer or sound owner.
 - Current state: ToastHost queue, sound bridge, motion, and DRM/GLES seams exist; A-F schema, assets, renderer, fallback, ticker, and live proof remain.
+- **F-grade backlog checkpoint (2026-08-09):** the hold-until-ack queue is capped at 64 waiters without displacing admitted critical FIFO; BigBoy passed 34/34:
+  `docs/platform/evidence/WL-UX-014-2026-08-09-f-grade-backlog-bound-r1.md`.
 - Remaining work:
   1. S1 Freeze authority, payload, and queue.
      - Objective: extend one ToastHost with bounded HealthKironAlert, grouping, severity order, dwell, acknowledgement, and redaction rules.

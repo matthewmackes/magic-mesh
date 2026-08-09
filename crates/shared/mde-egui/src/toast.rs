@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Align, Align2, Color32, Context, FontId, Rect, Sense, Ui, pos2, vec2};
+use egui::{pos2, vec2, Align, Align2, Color32, Context, FontId, Rect, Sense, Ui};
 
 use crate::carbon::paint_carbon;
 use crate::motion::Spring;
@@ -46,6 +46,13 @@ pub const DWELL_INFO: Duration = Duration::from_secs(5);
 pub const DWELL_WARNING: Duration = Duration::from_secs(5);
 /// Dwell for the centered OSD pill — a quick hardware-feedback flash.
 pub const DWELL_OSD: Duration = Duration::from_millis(1500);
+
+/// Maximum alerts retained behind the visible lower third.
+///
+/// Health grade F holds until acknowledgement, so a failed or hostile producer
+/// must not grow the shell process without bound while the operator is away.
+/// The visible alert is additional to this bounded backlog.
+pub const MAX_ALERT_BACKLOG: usize = 64;
 
 /// Stable flag for operator-originated AI deployment notices. These alerts use
 /// the centered, red, constrained presentation instead of the ambient banner.
@@ -363,6 +370,36 @@ impl ToastHost {
 
     // ── queue transitions (pure) ────────────────────────────────────────────
 
+    /// Retain one waiting alert without exceeding [`MAX_ALERT_BACKLOG`].
+    ///
+    /// Once saturated, a Critical may evict the newest non-critical waiter. A
+    /// non-critical, or a Critical facing an all-Critical backlog, is rejected:
+    /// already-admitted acknowledgement-required health alerts remain the
+    /// fail-closed source of truth.
+    fn retain_pending(&mut self, toast: Toast, front: bool) -> Result<(), Toast> {
+        if self.pending.len() == MAX_ALERT_BACKLOG {
+            let incoming_critical = matches!(toast.tier, Tier::Alert(Severity::Critical));
+            if !incoming_critical {
+                return Err(toast);
+            }
+            let Some(index) = self
+                .pending
+                .iter()
+                .rposition(|pending| !matches!(pending.tier, Tier::Alert(Severity::Critical)))
+            else {
+                return Err(toast);
+            };
+            self.pending.remove(index);
+        }
+
+        if front {
+            self.pending.push_front(toast);
+        } else {
+            self.pending.push_back(toast);
+        }
+        Ok(())
+    }
+
     /// Enqueue an alert. If nothing is showing it shows immediately; a **Critical**
     /// preempts a non-critical to the front (the displaced alert resumes after the
     /// Critical is acknowledged). An AI operator notice preempts every current alert,
@@ -389,11 +426,22 @@ impl ToastHost {
                         && !cur.toast.is_ai_generated_alert()) =>
             {
                 if let Some(displaced) = self.current.take() {
-                    self.pending.push_front(displaced.toast);
+                    let displaced_critical = displaced.is_critical();
+                    if let Err(displaced_toast) = self.retain_pending(displaced.toast, true) {
+                        if displaced_critical {
+                            // A full acknowledgement-required backlog must not lose
+                            // its visible Critical merely to show a newer alert.
+                            self.current = Some(Active::new(displaced_toast));
+                            let _ = self.retain_pending(toast, false);
+                            return;
+                        }
+                    }
                 }
                 self.current = Some(Active::new(toast));
             }
-            Some(_) => self.pending.push_back(toast),
+            Some(_) => {
+                let _ = self.retain_pending(toast, false);
+            }
         }
     }
 
@@ -1262,6 +1310,39 @@ mod tests {
             Some("lh1".into())
         );
         assert_eq!(host.backlog(), 1);
+    }
+
+    #[test]
+    fn held_health_storm_is_bounded_without_displacing_admitted_critical_alerts() {
+        let mut host = ToastHost::new();
+        host.enqueue(crit("visible-f-grade"));
+        for index in 0..MAX_ALERT_BACKLOG {
+            host.enqueue(crit(&format!("queued-f-grade-{index}")));
+        }
+        host.enqueue(crit("overflow-f-grade"));
+
+        assert_eq!(host.backlog(), MAX_ALERT_BACKLOG);
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some("visible-f-grade")
+        );
+
+        host.acknowledge();
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some("queued-f-grade-0"),
+            "the oldest admitted F-grade alert must remain first"
+        );
+        for _ in 1..MAX_ALERT_BACKLOG {
+            host.acknowledge();
+        }
+        let last_admitted = format!("queued-f-grade-{}", MAX_ALERT_BACKLOG - 1);
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some(last_admitted.as_str())
+        );
+        host.acknowledge();
+        assert!(host.current().is_none());
     }
 
     #[test]

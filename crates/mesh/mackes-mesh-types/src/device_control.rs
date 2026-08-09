@@ -140,6 +140,11 @@ pub struct DeviceControlRequest {
     pub target: DeviceTarget,
     /// The node whose hardware this acts on (the replicated dir it lands in).
     pub target_host: String,
+    /// Exact provider snapshot generation the operator inspected before arming.
+    /// The executor refuses zero, missing, or superseded generations so a
+    /// replicated/delayed request cannot mutate hardware after inventory changed.
+    #[serde(default)]
+    pub expected_inventory_published_at_ms: u64,
     /// The requesting seat/node id (the audit actor + the notify source).
     pub from: String,
 }
@@ -374,6 +379,7 @@ mod tests {
                 driver: Some("e1000e".into()),
             },
             target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1_720_000_000_000,
             from: "peer:laptop-mm".into(),
         }
     }

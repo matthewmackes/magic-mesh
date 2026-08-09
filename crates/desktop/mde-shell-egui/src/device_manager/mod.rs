@@ -2436,6 +2436,27 @@ impl DeviceManagerState {
             );
             return;
         }
+        // Bind the action to the exact provider snapshot the operator inspected.
+        // A rail row alone is insufficient: selection/refresh races must not mint
+        // an unbound mutation, and the node executor rejects this generation once
+        // a newer inventory has replaced it.
+        let Some(expected_inventory_published_at_ms) = self
+            .inventory
+            .as_ref()
+            .filter(|inventory| inventory.host == target_host)
+            .map(|inventory| inventory.published_at_ms)
+            .filter(|generation| *generation != 0)
+        else {
+            raise_toast(
+                "warning",
+                &format!(
+                    "{target_host} has no current provider generation \u{2014} cannot {} {}",
+                    op.as_str(),
+                    target.name
+                ),
+            );
+            return;
+        };
         // Keep the display fields before `target`/`target_host` move into the request.
         let device_name = target.name.clone();
         let req = DeviceControlRequest {
@@ -2443,6 +2464,7 @@ impl DeviceManagerState {
             op,
             target,
             target_host: target_host.clone(),
+            expected_inventory_published_at_ms,
             from: format!("peer:{}", self.local_host),
         };
         match device_control::write_request(&self.workgroup_root, &req) {

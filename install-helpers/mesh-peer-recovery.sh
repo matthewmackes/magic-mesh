@@ -31,12 +31,20 @@ publish() {
 valid_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) [ "$1" -gt 0 ];; esac; }
 bounded_systemctl() { /usr/bin/timeout "$COMMAND_TIMEOUT" "$SYSTEMCTL" "$@"; }
 
-supported_role() {
+admitted_role() {
     [ "$(/usr/bin/grep -Ec '^[[:space:]]*role[[:space:]]*=' "$ROLE_FILE")" -eq 1 ] \
         || return 1
-    /usr/bin/grep -Eq \
-        '^[[:space:]]*role[[:space:]]*=[[:space:]]*("workstation"|"lighthouse"|workstation|lighthouse)[[:space:]]*$' \
-        "$ROLE_FILE"
+    if /usr/bin/grep -Eq \
+        '^[[:space:]]*role[[:space:]]*=[[:space:]]*("workstation"|workstation)[[:space:]]*$' \
+        "$ROLE_FILE"; then
+        printf '%s\n' workstation
+    elif /usr/bin/grep -Eq \
+        '^[[:space:]]*role[[:space:]]*=[[:space:]]*("lighthouse"|lighthouse)[[:space:]]*$' \
+        "$ROLE_FILE"; then
+        printf '%s\n' lighthouse
+    else
+        return 1
+    fi
 }
 
 physical_network_online() {
@@ -139,7 +147,7 @@ restore_configured_service() {
 }
 
 main() {
-    local attempt=1 delay=1
+    local attempt=1 delay=1 role
     [ "$(id -u)" -eq 0 ] || { publish "refused-not-root"; return 1; }
     valid_uint "$MAX_ATTEMPTS" && [ "$MAX_ATTEMPTS" -le 6 ] \
         || { publish "refused-invalid-attempt-bound"; return 2; }
@@ -153,8 +161,15 @@ main() {
         return 0
     fi
     [ -f "$ROLE_FILE" ] || { publish "refused-no-role"; return 0; }
-    supported_role \
+    role="$(admitted_role)" \
         || { publish "refused-invalid-role"; return 2; }
+    # Lighthouses are coordination members, never client-only peers. Missing
+    # member configuration must stop recovery before network or service
+    # mutation instead of taking the Workstation's intentional etcd-skip path.
+    if [ "$role" = lighthouse ] && [ ! -s "$ETCD_MEMBER_FILE" ]; then
+        publish "refused-lighthouse-etcd-unconfigured"
+        return 2
+    fi
     if ! physical_network_online; then
         publish "offline-no-mutation"
         return 0

@@ -1413,6 +1413,11 @@ fn dispatch_to_a_fresh_host_writes_the_request_to_the_targets_replicated_dir() {
     assert_eq!(reqs[0].target_host, "edge-2");
     assert_eq!(reqs[0].target.name, "Intel I219-V");
     assert_eq!(
+        reqs[0].expected_inventory_published_at_ms,
+        s.inventory.as_ref().unwrap().published_at_ms,
+        "the mutation is bound to the exact provider snapshot the operator inspected"
+    );
+    assert_eq!(
         reqs[0].from, "peer:laptop-mm",
         "the requesting seat is recorded"
     );

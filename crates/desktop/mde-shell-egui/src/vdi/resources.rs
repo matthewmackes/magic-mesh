@@ -239,16 +239,27 @@ impl RemoteSessionsModel {
             .map_err(|error| format!("Resource catalog projection rejected: {error}"))?;
 
         if let Some(previous) = &self.projection {
+            let same_publisher = previous.publisher == projection.publisher;
             let same_generation = previous.publisher == projection.publisher
                 && previous.revision == projection.revision;
             let different_content = previous.catalog_content_digest
                 != projection.catalog_content_digest
                 || previous.entries != projection.entries;
-            if same_generation && different_content {
+            let publisher_rollback =
+                same_publisher && projection.generated_at_ms < previous.generated_at_ms;
+            let publisher_equivocation = same_publisher
+                && projection.generated_at_ms == previous.generated_at_ms
+                && (previous.revision != projection.revision || different_content);
+            if (same_generation && different_content)
+                || publisher_rollback
+                || publisher_equivocation
+            {
                 self.feed_state = FeedState::Conflict(format!(
-                    "Publisher {} supplied conflicting content for revision {}. The last admitted snapshot remains visible and actionless.",
+                    "Publisher {} supplied a conflicting or non-monotonic catalog at revision {}. The last admitted snapshot remains visible and actionless.",
                     projection.publisher, projection.revision
                 ));
+                self.android_starts.clear();
+                self.cancellable_actions.clear();
                 return Err("conflicting resource catalog revision".into());
             }
             if !same_generation
@@ -1426,6 +1437,49 @@ mod tests {
         assert!(error.contains("conflicting"));
         assert!(matches!(model.feed_state, FeedState::Conflict(_)));
         assert_eq!(model.visible_entries(NOW).len(), 2);
+    }
+
+    #[test]
+    fn remote_sessions_rejects_same_publisher_rollback_and_revokes_action_handles() {
+        let mut newer = android_catalog("android-app/node-a/android-vm-a/com.android.browser");
+        newer.revision = "revision-android-8".into();
+        newer.generated_at_ms = NOW + 1_000;
+        newer.content_digest = Some(newer.computed_content_digest());
+        newer.validate().expect("newer catalog");
+
+        let mut older = newer.clone();
+        older.revision = "revision-android-7".into();
+        older.generated_at_ms = NOW;
+        older.content_digest = Some(older.computed_content_digest());
+        older
+            .validate()
+            .expect("older catalog remains structurally valid");
+
+        let resource_id = newer.cards[0].resource_id().to_owned();
+        let mut model = RemoteSessionsModel::default();
+        model
+            .install_catalog(newer)
+            .expect("newer catalog admitted");
+        assert!(model.android_starts.contains_key(&resource_id));
+        model
+            .cancellable_actions
+            .insert(resource_id.clone(), accepted_workload_receipt());
+
+        let error = model
+            .install_catalog(older)
+            .expect_err("same-publisher rollback must fail closed");
+        assert!(error.contains("conflicting"));
+        assert!(matches!(model.feed_state, FeedState::Conflict(_)));
+        assert_eq!(
+            model
+                .projection
+                .as_ref()
+                .expect("last good snapshot")
+                .revision,
+            "revision-android-8"
+        );
+        assert!(model.android_starts.is_empty());
+        assert!(model.cancellable_actions.is_empty());
     }
 
     #[test]

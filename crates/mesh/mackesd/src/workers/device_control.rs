@@ -323,19 +323,21 @@ impl DeviceControlExecWorker {
     /// substituting another category, display name, or kernel module. A host that
     /// has published no inventory yet refuses everything (conservative +
     /// self-healing once it publishes).
-    fn offered(&self, target: &DeviceTarget) -> bool {
+    fn offered(&self, target: &DeviceTarget, expected_published_at_ms: u64) -> bool {
         let Some(inv) = device_inventory::read_inventory(&self.workgroup_root, &self.self_hostname)
         else {
             return false;
         };
-        inv.categories.iter().any(|category| {
-            category.key == target.category
-                && category.devices.iter().any(|device| {
-                    device.name == target.name
-                        && device.sysfs_path == target.sysfs_path
-                        && device.driver == target.driver
-                })
-        })
+        expected_published_at_ms != 0
+            && inv.published_at_ms == expected_published_at_ms
+            && inv.categories.iter().any(|category| {
+                category.key == target.category
+                    && category.devices.iter().any(|device| {
+                        device.name == target.name
+                            && device.sysfs_path == target.sysfs_path
+                            && device.driver == target.driver
+                    })
+            })
     }
 
     /// Handle one request: gate → plan → execute. Returns the typed result WITHOUT
@@ -351,12 +353,14 @@ impl DeviceControlExecWorker {
                 ),
             );
         }
-        if !self.offered(&req.target) {
+        if !self.offered(&req.target, req.expected_inventory_published_at_ms) {
             return DeviceControlResult::failed(
                 &req.id,
                 format!(
-                    "device `{}` is not in {}'s published inventory — refused (L9 rail)",
-                    req.target.name, self.self_hostname
+                    "device `{}` is not in {}'s expected inventory generation {} — refused (L9 rail)",
+                    req.target.name,
+                    self.self_hostname,
+                    req.expected_inventory_published_at_ms,
                 ),
             );
         }
@@ -393,6 +397,7 @@ impl DeviceControlExecWorker {
             "action": "device-control",
             "op": req.op.as_str(),
             "target_host": req.target_host,
+            "expected_inventory_published_at_ms": req.expected_inventory_published_at_ms,
             "device": req.target.name,
             "sysfs_path": req.target.sysfs_path,
             "driver": req.target.driver,
@@ -673,10 +678,15 @@ mod tests {
 
     // ── the offered gate + audit fire, without touching real hardware ──────────
 
-    fn write_inventory(root: &Path, host: &str, devices: Vec<DeviceRecord>) {
+    fn write_inventory_at(
+        root: &Path,
+        host: &str,
+        published_at_ms: u64,
+        devices: Vec<DeviceRecord>,
+    ) {
         let inv = DeviceInventory {
             host: host.to_string(),
-            published_at_ms: 1,
+            published_at_ms,
             summary: HostSummary::default(),
             tools: ToolAvailability::default(),
             categories: vec![DeviceCategory::new(category::NETWORK_ADAPTERS, devices)],
@@ -688,6 +698,10 @@ mod tests {
             serde_json::to_string_pretty(&inv).unwrap(),
         )
         .unwrap();
+    }
+
+    fn write_inventory(root: &Path, host: &str, devices: Vec<DeviceRecord>) {
+        write_inventory_at(root, host, 1, devices);
     }
 
     #[tokio::test]
@@ -714,6 +728,7 @@ mod tests {
                 driver: Some("ghost".into()),
             },
             target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1,
             from: "peer:laptop-mm".into(),
         };
         let result = w.process(&req).await;
@@ -771,6 +786,7 @@ mod tests {
                 driver: None,
             },
             target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1,
             from: "peer:laptop-mm".into(),
         };
         let result = w.process(&req).await;
@@ -785,6 +801,65 @@ mod tests {
         assert!(
             persist.list_since(NOTIFY_TOPIC, None).unwrap().is_empty(),
             "a successful op raises no failure notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_provider_generation_cannot_reach_the_mutation_seam() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+        let device = DeviceRecord {
+            sysfs_path: Some(sysfs_path.clone()),
+            ..DeviceRecord::new("Logitech Webcam", DeviceStatus::Ok)
+        };
+
+        // Generation 7 is what the seat inspected. Before its replicated request
+        // arrives, the provider replaces that snapshot with generation 8. Even
+        // though every device identity field still matches, the old action must
+        // fail closed before the sysfs write.
+        write_inventory_at(tmp.path(), "edge-2", 8, vec![device]);
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_db_path(tmp.path().join("audit.db"))
+        .with_bus_root(tmp.path().join("bus"));
+        let stale = DeviceControlRequest {
+            id: "01STALE".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget {
+                name: "Logitech Webcam".into(),
+                category: category::NETWORK_ADAPTERS.into(),
+                sysfs_path: Some(sysfs_path),
+                driver: None,
+            },
+            target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 7,
+            from: "peer:laptop-mm".into(),
+        };
+
+        let result = worker.process(&stale).await;
+        assert!(
+            !result.ok,
+            "a superseded provider generation must fail closed"
+        );
+        assert!(result.error.contains("expected inventory generation 7"));
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "stale provider state must not reach the hardware mutation seam"
+        );
+        let conn = crate::store::open(&tmp.path().join("audit.db")).unwrap();
+        let rows = crate::store::load_audit_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "the stale refusal remains in audit history");
+        let payload = String::from_utf8_lossy(&rows[0].payload);
+        assert!(
+            payload.contains("expected_inventory_published_at_ms"),
+            "{payload}"
         );
     }
 
@@ -820,12 +895,13 @@ mod tests {
                 driver: Some("arbitrary-module".into()),
             },
             target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1,
             from: "peer:hostile-seat".into(),
         };
 
         let result = worker.handle_request(&hostile).await;
         assert!(!result.ok, "forged provider properties must fail closed");
-        assert!(result.error.contains("not in edge-2's published inventory"));
+        assert!(result.error.contains("expected inventory generation 1"));
         assert_eq!(
             std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
             "1",
@@ -865,6 +941,7 @@ mod tests {
                 driver: Some("uvcvideo".into()),
             },
             target_host: "edge-9".into(),
+            expected_inventory_published_at_ms: 1,
             from: "peer:hostile-seat".into(),
         };
 
@@ -903,6 +980,7 @@ mod tests {
                     driver: None,
                 },
                 target_host: "edge-2".into(),
+                expected_inventory_published_at_ms: 1,
                 from: "peer:laptop-mm".into(),
             },
         )

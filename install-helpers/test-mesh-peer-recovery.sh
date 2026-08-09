@@ -161,6 +161,19 @@ printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
 echo 'PASS role fixture: unsupported, malformed, and duplicate identity fail before service mutation'
 
 : >"$STATE/notifies"
+printf '%s\n' 'role = "lighthouse"' >"$ROOT/role.toml"
+: >"$ROOT/etcd.env"
+if run_helper; then
+    echo 'unconfigured lighthouse unexpectedly reported recovery success' >&2
+    exit 1
+fi
+[ ! -s "$STATE/mutations" ]
+grep -Fq 'status=refused-lighthouse-etcd-unconfigured' "$STATE/notifies"
+printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
+printf '%s\n' member >"$ROOT/etcd.env"
+echo 'PASS lighthouse fixture: missing coordination membership fails before service mutation'
+
+: >"$STATE/notifies"
 run_helper
 cat >"$STATE/expected-mutations" <<'EOF'
 nebula.service
