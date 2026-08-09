@@ -73,7 +73,6 @@ use android_provider::{
     configured_image_path, preflight, AndroidHostProbe, AndroidPreflightInput,
     ProductionAndroidHostProbe,
 };
-#[cfg(test)]
 pub(crate) use gate::{
     claim_nonce, placement_match, verify_token, HmacTokenSigner, NullSigner, Placement,
     TokenSigner, TokenVerdict, DEFAULT_AUTH_ROOT,
