@@ -173,6 +173,27 @@ printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
 printf '%s\n' member >"$ROOT/etcd.env"
 echo 'PASS lighthouse fixture: missing coordination membership fails before service mutation'
 
+# A configured Lighthouse has no desktop seat or communal XDG binds. Even when
+# every shared recovery dependency is healthy, a return event must not start a
+# Workstation-only helper or make Lighthouse convergence depend on it.
+printf '%s\n' 'role = "lighthouse"' >"$ROOT/role.toml"
+: >"$STATE/active-nebula.service"
+: >"$STATE/active-etcd.service"
+: >"$STATE/active-syncthing.service"
+for group in control observation actions data compute integrations; do
+    : >"$STATE/active-mackesd-$group.service"
+done
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+run_helper
+[ ! -s "$STATE/mutations" ]
+grep -Fq 'status=skipped-workstation-xdg-lighthouse' "$STATE/notifies"
+grep -Fq 'status=already-recovered' "$STATE/notifies"
+rm -f "$STATE"/active-nebula.service "$STATE"/active-etcd.service \
+    "$STATE"/active-syncthing.service "$STATE"/active-mackesd-*.service
+printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
+echo 'PASS lighthouse role fixture: peer return skips Workstation-only XDG mutation'
+
 : >"$STATE/notifies"
 run_helper
 cat >"$STATE/expected-mutations" <<'EOF'

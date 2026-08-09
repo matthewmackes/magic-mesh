@@ -1559,6 +1559,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-role-admission-r3.md`.
 - **Lighthouse coordination checkpoint (2026-08-09):** missing etcd membership now refuses recovery before mutation; machine 194 passed the full fixture:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-coordination-admission-r4.md`.
+- **Lighthouse desktop-scope checkpoint (2026-08-09):** healthy peer return skips Workstation-only XDG restoration with zero service mutation; BigBoy and machine 194
+  passed the complete fixture: `docs/platform/evidence/WL-CRIT-007-2026-08-09-lighthouse-desktop-scope-r5.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without

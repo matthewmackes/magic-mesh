@@ -117,6 +117,19 @@ restore_xdg_binds() {
     bounded_systemctl start mcnf-xdg-bind-recovery.service >/dev/null 2>&1
 }
 
+restore_role_desktop_state() {
+    local role="$1"
+    if [ "$role" = lighthouse ]; then
+        publish "skipped-workstation-xdg-lighthouse"
+        return 0
+    fi
+    publish "restoring-workstation-xdg-binds"
+    if ! restore_xdg_binds; then
+        publish "failed-workstation-xdg-binds"
+        return 1
+    fi
+}
+
 configured_substrate_ready() {
     if [ -s "$ETCD_MEMBER_FILE" ]; then
         bounded_systemctl is-active --quiet etcd.service >/dev/null 2>&1 || return 1
@@ -186,13 +199,10 @@ main() {
     # recovery (link, DHCP, connectivity, reapply). Never restart an already
     # healthy overlay for each event: doing so can exhaust nebula.service's
     # bounded start limit and turn a healthy return into an outage. The XDG
-    # helper remains an idempotent verification/repair step for Workstations.
+    # helper remains an idempotent verification/repair step for Workstations;
+    # Lighthouses must not start that role-inapplicable unit.
     if nebula_ready && configured_substrate_ready && grouped_mackesd_ready; then
-        publish "verifying-workstation-xdg-binds"
-        if ! restore_xdg_binds; then
-            publish "failed-workstation-xdg-binds"
-            return 1
-        fi
+        restore_role_desktop_state "$role" || return 1
         publish "already-recovered"
         return 0
     fi
@@ -235,11 +245,7 @@ main() {
         publish "skipped-syncthing-unconfigured"
     fi
 
-    publish "restoring-workstation-xdg-binds"
-    if ! restore_xdg_binds; then
-        publish "failed-workstation-xdg-binds"
-        return 1
-    fi
+    restore_role_desktop_state "$role" || return 1
 
     publish "restoring-grouped-mackesd"
     # During boot the target can already be activating its six notify children;
