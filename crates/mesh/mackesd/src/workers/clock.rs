@@ -34,6 +34,8 @@ use super::{ShutdownToken, Worker};
 use crate::store::writer::{self, ClockAuthorityRecord, WriteOp};
 
 const POLL: Duration = Duration::from_millis(250);
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const VERIFYING_KEY_ENV: &str = "MDE_CLOCK_VERIFYING_KEY_FILE";
 const SIGNING_KEY_ENV: &str = "MDE_CLOCK_SIGNING_KEY_FILE";
 const SIGNER_ID_ENV: &str = "MDE_CLOCK_SIGNER_ID";
@@ -178,6 +180,16 @@ pub struct ClockWorker {
     peer_last_sent_ms: BTreeMap<String, i64>,
 }
 
+#[derive(Clone)]
+struct ClockMemoryCheckpoint {
+    snapshot: Option<ClockSnapshotV1>,
+    action_cursor: Option<String>,
+    published_once: bool,
+    audio_status_cursor: Option<String>,
+    audio_last_sent_ms: BTreeMap<String, i64>,
+    peer_last_sent_ms: BTreeMap<String, i64>,
+}
+
 impl ClockWorker {
     #[must_use]
     pub fn new(node_id: String, db_path: PathBuf) -> Self {
@@ -189,7 +201,10 @@ impl ClockWorker {
         });
         Self {
             node_id,
-            bus_root: crate::bus_publish::default_bus_root(),
+            // `None` is intentionally unresolved here. A daemon launched
+            // before its user/XDG root exists must still select the canonical
+            // system spool when this same worker activates.
+            bus_root: None,
             poll: POLL,
             clock: Arc::new(SystemWallClock),
             store: Arc::new(SqliteClockStore { db_path }),
@@ -214,6 +229,30 @@ impl ClockWorker {
             monotonic_ms: 1,
             zone_exists: &zone_exists,
         }
+    }
+
+    fn bus_root(&self) -> PathBuf {
+        clock_bus_root(self.bus_root.clone())
+    }
+
+    fn checkpoint(&self) -> ClockMemoryCheckpoint {
+        ClockMemoryCheckpoint {
+            snapshot: self.snapshot.clone(),
+            action_cursor: self.action_cursor.clone(),
+            published_once: self.published_once,
+            audio_status_cursor: self.audio_status_cursor.clone(),
+            audio_last_sent_ms: self.audio_last_sent_ms.clone(),
+            peer_last_sent_ms: self.peer_last_sent_ms.clone(),
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: ClockMemoryCheckpoint) {
+        self.snapshot = checkpoint.snapshot;
+        self.action_cursor = checkpoint.action_cursor;
+        self.published_once = checkpoint.published_once;
+        self.audio_status_cursor = checkpoint.audio_status_cursor;
+        self.audio_last_sent_ms = checkpoint.audio_last_sent_ms;
+        self.peer_last_sent_ms = checkpoint.peer_last_sent_ms;
     }
 
     fn initial_snapshot(&self, now_ms: i64) -> ClockSnapshotV1 {
@@ -306,6 +345,10 @@ impl ClockWorker {
             );
             self.action_cursor = record.action_cursor;
             self.snapshot = Some(snapshot);
+            // A prior attempt may have committed and then failed to publish.
+            // Replaying that same command reloads the durable winner and must
+            // repair the required state publication before it is complete.
+            self.publish(persist)?;
         }
         Ok(applied)
     }
@@ -722,59 +765,100 @@ impl ClockWorker {
 
     fn tick_once(&mut self) -> anyhow::Result<()> {
         self.ensure_loaded()?;
-        let Some(bus_root) = self.bus_root.clone() else {
-            return Ok(());
-        };
-        let persist = Persist::open(bus_root)?;
+        let mut persist = Persist::open(self.bus_root())?;
+        self.tick_with_persist(&mut persist)
+    }
+
+    fn tick_with_persist(&mut self, persist: &mut Persist) -> anyhow::Result<()> {
+        self.ensure_loaded()?;
+        // Long-held handles otherwise remain attached to an unlinked SQLite
+        // inode after another Bus participant atomically replaces the index.
+        persist.reopen_if_index_changed();
         let now_ms = self.clock.now_ms();
-        self.consume_audio_status(&persist, now_ms)?;
-        let prior_snapshot = self
-            .snapshot
-            .as_ref()
-            .expect("Clock snapshot loaded")
-            .clone();
-        if self.advance_deadlines(now_ms)? {
-            let expected = self
+        // Complete every relevant Bus read before acknowledging audio,
+        // advancing deadlines, applying commands, or publishing convergence.
+        // A read failure therefore defers the complete effect sweep.
+        let actions = self.collect_actions(persist)?;
+        let audio_statuses = self.collect_audio_status(persist)?;
+        self.consume_audio_status(audio_statuses, now_ms)?;
+
+        let deadline_checkpoint = self.checkpoint();
+        let deadline_result = (|| {
+            let prior_snapshot = self
                 .snapshot
                 .as_ref()
                 .expect("Clock snapshot loaded")
-                .revision;
-            let snapshot = self.snapshot.as_mut().expect("Clock snapshot loaded");
-            snapshot.revision = expected
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("Clock revision exhausted"))?;
-            snapshot.produced_at_utc_ms = now_ms;
-            stamp_revision(snapshot);
-            preserve_unchanged_occurrence_revisions(snapshot, &prior_snapshot);
-            let audio_requests =
-                clock_audio_transitions(&prior_snapshot, snapshot, now_ms, &self.node_id)?;
-            self.commit_then_publish(&persist, expected, None, None, &audio_requests)?;
+                .clone();
+            if self.advance_deadlines(now_ms)? {
+                let expected = self
+                    .snapshot
+                    .as_ref()
+                    .expect("Clock snapshot loaded")
+                    .revision;
+                let snapshot = self.snapshot.as_mut().expect("Clock snapshot loaded");
+                snapshot.revision = expected
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Clock revision exhausted"))?;
+                snapshot.produced_at_utc_ms = now_ms;
+                stamp_revision(snapshot);
+                preserve_unchanged_occurrence_revisions(snapshot, &prior_snapshot);
+                let audio_requests =
+                    clock_audio_transitions(&prior_snapshot, snapshot, now_ms, &self.node_id)?;
+                self.commit_then_publish(persist, expected, None, None, &audio_requests)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = deadline_result {
+            self.restore_checkpoint(deadline_checkpoint);
+            return Err(error);
         }
-        for (cursor, body) in self.collect_actions(&persist)? {
+
+        for (cursor, body) in actions {
+            let checkpoint = self.checkpoint();
             self.action_cursor = Some(cursor);
-            self.process_command(&persist, body.as_bytes(), self.clock.now_ms())?;
+            if let Err(error) = self.process_command(persist, body.as_bytes(), self.clock.now_ms())
+            {
+                self.restore_checkpoint(checkpoint);
+                return Err(error);
+            }
         }
         if !self.published_once {
-            self.publish(&persist)?;
+            self.publish(persist)?;
         }
-        self.publish_peer_convergence(&persist, self.clock.now_ms())?;
-        self.publish_pending_audio(&persist, self.clock.now_ms())?;
+        self.publish_peer_convergence(persist, self.clock.now_ms())?;
+        self.publish_pending_audio(persist, self.clock.now_ms())?;
         Ok(())
     }
 
-    fn consume_audio_status(&mut self, persist: &Persist, now_ms: i64) -> anyhow::Result<()> {
+    fn collect_audio_status(
+        &self,
+        persist: &Persist,
+    ) -> anyhow::Result<Vec<mde_bus::persist::StoredMessage>> {
         let topic = clock_audio_status_topic(&self.node_id)?;
-        for message in persist.list_since_limit(
+        Ok(persist.list_since_limit(
             &topic,
             self.audio_status_cursor.as_deref(),
             MAX_AUDIO_STATUS_PER_TICK,
-        )? {
-            self.audio_status_cursor = Some(message.ulid);
-            let Some(body) = message.body else { continue };
+        )?)
+    }
+
+    fn consume_audio_status(
+        &mut self,
+        messages: Vec<mde_bus::persist::StoredMessage>,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        for message in messages {
+            let cursor = message.ulid;
+            let Some(body) = message.body else {
+                self.audio_status_cursor = Some(cursor);
+                continue;
+            };
             if mackes_mesh_types::workloads::reject_duplicate_json_keys(&body).is_err() {
+                self.audio_status_cursor = Some(cursor);
                 continue;
             }
             let Ok(status) = serde_json::from_str::<ClockAudioStatusV1>(&body) else {
+                self.audio_status_cursor = Some(cursor);
                 continue;
             };
             if status.validate_at(now_ms).is_ok()
@@ -782,6 +866,9 @@ impl ClockWorker {
             {
                 self.audio_last_sent_ms.remove(&status.request_id);
             }
+            // A durable acknowledgement failure returns before this cursor
+            // advances, so the same status is retried by this worker.
+            self.audio_status_cursor = Some(cursor);
         }
         Ok(())
     }
@@ -1008,17 +1095,58 @@ impl Worker for ClockWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        self.tick_once()?;
+        // Durable Clock state is independent of Bus availability and must be
+        // restored before waiting for a late spool.
+        self.ensure_loaded()?;
+        let bus_root = self.bus_root();
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let mut persist = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::clock",
+                    %error,
+                    bus_root = %bus_root.display(),
+                    "Clock Bus unavailable; startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
+        };
+        if let Err(error) = self.tick_with_persist(&mut persist) {
+            tracing::warn!(target: "mackesd::clock", %error, "Clock sweep deferred");
+        }
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await;
         loop {
             tokio::select! {
-                _ = tick.tick() => self.tick_once()?,
+                _ = tick.tick() => {
+                    if let Err(error) = self.tick_with_persist(&mut persist) {
+                        tracing::warn!(target: "mackesd::clock", %error, "Clock sweep deferred");
+                    }
+                },
                 () = shutdown.wait() => break,
             }
         }
         Ok(())
     }
+}
+
+fn clock_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    clock_bus_root_or_system(override_root.or_else(crate::bus_publish::default_bus_root))
+}
+
+fn clock_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 fn read_peer_snapshot(
@@ -1939,7 +2067,7 @@ mod tests {
     use mackes_mesh_types::music_auth;
     use rusqlite::Connection;
     use std::process::Command;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -1948,6 +2076,62 @@ mod tests {
     impl WallClock for AdjustableClock {
         fn now_ms(&self) -> i64 {
             self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    struct FailNextCommitStore {
+        inner: SqliteClockStore,
+        fail_next: AtomicBool,
+        fail_next_acknowledge: AtomicBool,
+        acknowledge_calls: AtomicUsize,
+    }
+
+    impl ClockStore for FailNextCommitStore {
+        fn load(&self, node_id: &str) -> anyhow::Result<Option<ClockAuthorityRecord>> {
+            self.inner.load(node_id)
+        }
+
+        fn commit(
+            &self,
+            node_id: &str,
+            expected_revision: u64,
+            snapshot: &ClockSnapshotV1,
+            request_id: Option<&str>,
+            request_fingerprint: Option<&str>,
+            action_cursor: Option<&str>,
+            audio_requests: &[writer::ClockAudioOutboxWrite],
+        ) -> anyhow::Result<bool> {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected Clock commit failure");
+            }
+            self.inner.commit(
+                node_id,
+                expected_revision,
+                snapshot,
+                request_id,
+                request_fingerprint,
+                action_cursor,
+                audio_requests,
+            )
+        }
+
+        fn pending_audio(
+            &self,
+            node_id: &str,
+        ) -> anyhow::Result<Vec<writer::ClockAudioOutboxRecord>> {
+            self.inner.pending_audio(node_id)
+        }
+
+        fn acknowledge_audio(
+            &self,
+            node_id: &str,
+            status: &ClockAudioStatusV1,
+        ) -> anyhow::Result<bool> {
+            self.acknowledge_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_acknowledge.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected Clock audio acknowledgement failure");
+            }
+            self.inner.acknowledge_audio(node_id, status)
         }
     }
 
@@ -2212,6 +2396,255 @@ mod tests {
                 .map(|message| message.body.unwrap())
                 .collect()
         }
+    }
+
+    #[test]
+    fn clock_bus_root_honors_override_and_falls_back_to_system_spool() {
+        assert_eq!(
+            clock_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            clock_bus_root_or_system(Some(PathBuf::from("/tmp/clock-explicit-bus"))),
+            PathBuf::from("/tmp/clock-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_same_worker_and_observes_external_forward_command() {
+        let Fixture {
+            _temp,
+            bus,
+            db,
+            clock: _,
+            signing_key,
+            mut worker,
+        } = Fixture::new();
+        worker.poll = Duration::from_millis(5);
+        let command = ClockCommandV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: "late-forward".into(),
+            origin_node_id: "seat-1".into(),
+            expected_revision: 1,
+            issued_at_utc_ms: NOW - 100,
+            expires_at_utc_ms: NOW - 100 + MAX_CLOCK_COMMAND_TTL_MS,
+            body: ClockCommandKindV1::UpsertSchedule {
+                schedule: ClockScheduleV1 {
+                    schedule_id: "timer-late-forward".into(),
+                    origin_node_id: "seat-1".into(),
+                    revision: 1,
+                    label: "Tea".into(),
+                    selected_target_ids: vec!["seat-1".into()],
+                    schedule: ClockScheduleKindV1::Timer(ClockTimerV1 {
+                        original_duration_ms: 60_000,
+                        phase: ClockTimerPhase::Running,
+                        absolute_deadline_utc_ms: Some(NOW + 60_000),
+                        paused_remaining_ms: None,
+                        expired_at_utc_ms: None,
+                        sound: ClockAudioRef::Bundled {
+                            tone_id: "bell".into(),
+                        },
+                        vibrate: false,
+                    }),
+                },
+            },
+            signer_id: String::new(),
+            signature: String::new(),
+        }
+        .sign(
+            "seat-1-key",
+            &signing_key,
+            &ClockValidationContext {
+                wall_utc_ms: NOW,
+                monotonic_ms: 1,
+                zone_exists: &zone_exists,
+            },
+        )
+        .unwrap();
+
+        std::fs::write(&bus, b"blocks Persist::open").unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            !task.is_finished(),
+            "late Bus must not terminate the worker"
+        );
+        assert!(
+            SqliteClockStore { db_path: db }
+                .load("seat-1")
+                .unwrap()
+                .is_some(),
+            "durable Clock authority must load before Bus recovery"
+        );
+
+        std::fs::remove_file(&bus).unwrap();
+        let external = Persist::open(bus.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if external
+                    .read_latest(&clock_state_topic("seat-1").unwrap())
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Clock worker did not activate on the late Bus");
+
+        external
+            .write(
+                &clock_command_topic("seat-1").unwrap(),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&command).unwrap()),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = external
+                    .read_latest(&clock_state_topic("seat-1").unwrap())
+                    .unwrap()
+                    .and_then(|message| message.body)
+                    .map(|body| serde_json::from_str::<ClockSnapshotV1>(&body).unwrap());
+                if state.is_some_and(|snapshot| {
+                    snapshot
+                        .schedules
+                        .iter()
+                        .any(|schedule| schedule.schedule_id == "timer-late-forward")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("external forward command was not applied");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown timed out")
+            .expect("Clock task panicked")
+            .expect("Clock worker returned an error");
+    }
+
+    #[test]
+    fn commit_and_publication_failures_retain_action_for_same_worker_retry() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let fail_store = Arc::new(FailNextCommitStore {
+            inner: SqliteClockStore {
+                db_path: fixture.db.clone(),
+            },
+            fail_next: AtomicBool::new(false),
+            fail_next_acknowledge: AtomicBool::new(false),
+            acknowledge_calls: AtomicUsize::new(0),
+        });
+        fixture.worker.store = fail_store.clone();
+
+        let first = fixture.timer_command("commit-retry", 1, NOW + 60_000);
+        fixture.publish(&first);
+        fail_store.fail_next.store(true, Ordering::SeqCst);
+        assert!(fixture.worker.tick_once().is_err());
+        assert_eq!(fixture.worker.action_cursor, None);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 1);
+        assert!(fixture
+            .worker
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .schedules
+            .is_empty());
+
+        fixture.worker.tick_once().unwrap();
+        let first_cursor = fixture.worker.action_cursor.clone();
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 2);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().schedules.len(), 1);
+
+        let second = fixture.timer_command("publish-retry", 2, NOW + 120_000);
+        fixture.publish(&second);
+        let state_root = fixture.bus.join("state");
+        std::fs::remove_dir_all(&state_root).unwrap();
+        std::fs::write(&state_root, b"blocks Clock state publication").unwrap();
+        assert!(fixture.worker.tick_once().is_err());
+        assert_eq!(fixture.worker.action_cursor, first_cursor);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 2);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().schedules.len(), 1);
+
+        std::fs::remove_file(&state_root).unwrap();
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().revision, 3);
+        assert_eq!(fixture.worker.snapshot.as_ref().unwrap().schedules.len(), 2);
+        assert!(fixture.worker.action_cursor > first_cursor);
+        let published: ClockSnapshotV1 = serde_json::from_str(
+            &Persist::open(fixture.bus.clone())
+                .unwrap()
+                .read_latest(&clock_state_topic("seat-1").unwrap())
+                .unwrap()
+                .unwrap()
+                .body
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published.revision, 3);
+    }
+
+    #[test]
+    fn audio_acknowledgement_failure_retains_status_for_same_worker_retry() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let fail_store = Arc::new(FailNextCommitStore {
+            inner: SqliteClockStore {
+                db_path: fixture.db.clone(),
+            },
+            fail_next: AtomicBool::new(false),
+            fail_next_acknowledge: AtomicBool::new(true),
+            acknowledge_calls: AtomicUsize::new(0),
+        });
+        fixture.worker.store = fail_store.clone();
+
+        let status = ClockAudioStatusV1 {
+            schema_version: CLOCK_SCHEMA_VERSION,
+            request_id: "audio-ack-retry".into(),
+            occurrence_id: "occurrence-audio-ack-retry".into(),
+            global_event_id: "global-audio-ack-retry".into(),
+            occurrence_generation: 1,
+            observed_at_utc_ms: NOW,
+            phase: ClockAudioPlaybackPhase::PlayingBundled,
+            provider_status: ClockAudioProviderStatus::NotApplicable,
+            fallback_tone_id: None,
+            acknowledgement_id: None,
+            reason_code: None,
+        };
+        status.validate_at(NOW).unwrap();
+        let message = Persist::open(fixture.bus.clone())
+            .unwrap()
+            .write(
+                &clock_audio_status_topic("seat-1").unwrap(),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&status).unwrap()),
+            )
+            .unwrap();
+
+        assert!(fixture.worker.tick_once().is_err());
+        assert_eq!(fixture.worker.audio_status_cursor, None);
+        assert_eq!(fail_store.acknowledge_calls.load(Ordering::SeqCst), 1);
+
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            fixture.worker.audio_status_cursor.as_deref(),
+            Some(message.ulid.as_str())
+        );
+        assert_eq!(fail_store.acknowledge_calls.load(Ordering::SeqCst), 2);
     }
 
     struct PeerNode {
