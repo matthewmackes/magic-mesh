@@ -201,7 +201,25 @@ struct ResourceActionInvocation {
     deadline_at_ms: u64,
     authority_request: TypedAuthorityRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    vdi_open_receipt: Option<VdiAuthorityCompletionReply>,
+    /// Explicit, short-lived operator approval for an immutable catalog action.
+    /// The outer root-mutation signature covers this exact binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_approval: Option<LocalApprovalBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     armed_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalApprovalBinding {
+    catalog_revision: String,
+    catalog_content_digest: String,
+    resource_id: String,
+    action_id: String,
+    target: ResourceActionTarget,
+    approved_at_ms: u64,
+    expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -452,48 +470,55 @@ impl ResourceActionWorker {
         {
             return refused(invocation.request_id, RefusalCode::Unauthorized);
         }
-        let Some(catalog) = persist
-            .read_latest(RESOURCE_CATALOG_TOPIC)
-            .ok()
-            .flatten()
-            .and_then(|message| message.body)
-            .and_then(|body| ResourceCatalog::from_json(&body).ok())
-        else {
-            return refused(invocation.request_id, RefusalCode::AuthorityUnavailable);
-        };
-        let attestation = persist
-            .read_latest(&resource_publisher_attestation_topic(&catalog.publisher))
-            .ok()
-            .flatten()
-            .and_then(|message| message.body)
-            .and_then(|body| serde_json::from_str::<ResourcePublisherAttestation>(&body).ok());
-        let publisher_key = self
-            .publisher_store
-            .get(super::RESOURCE_PUBLISHER_KEY_REF)
-            .ok()
-            .flatten();
-        if attestation
-            .as_ref()
-            .zip(publisher_key.as_ref())
-            .is_none_or(|(attestation, key)| {
-                catalog
-                    .validate_publisher_attestation(attestation, key.as_bytes(), now_ms)
-                    .is_err()
-            })
-        {
-            return refused(invocation.request_id, RefusalCode::Unauthorized);
-        }
         let signer = match self.signer.as_ref() {
             Some(signer) => signer,
             None => return refused(invocation.request_id, RefusalCode::AuthorityUnavailable),
         };
-        let planned = match plan(&catalog, &invocation, signer, now_ms) {
-            Ok(planned) => planned,
-            Err(RefusalCode::CancellationUnsupported) => {
-                return unsupported_clipboard_cancellation_reply(&invocation, signer, now_ms)
-                    .unwrap_or_else(|code| refused(invocation.request_id.clone(), code));
+        let planned = if invocation.vdi_open_receipt.is_some() {
+            match plan_receipt_bound_vdi_close(&invocation, signer, now_ms) {
+                Ok(planned) => planned,
+                Err(code) => return refused(invocation.request_id, code),
             }
-            Err(code) => return refused(invocation.request_id, code),
+        } else {
+            let Some(catalog) = persist
+                .read_latest(RESOURCE_CATALOG_TOPIC)
+                .ok()
+                .flatten()
+                .and_then(|message| message.body)
+                .and_then(|body| ResourceCatalog::from_json(&body).ok())
+            else {
+                return refused(invocation.request_id, RefusalCode::AuthorityUnavailable);
+            };
+            let attestation = persist
+                .read_latest(&resource_publisher_attestation_topic(&catalog.publisher))
+                .ok()
+                .flatten()
+                .and_then(|message| message.body)
+                .and_then(|body| serde_json::from_str::<ResourcePublisherAttestation>(&body).ok());
+            let publisher_key = self
+                .publisher_store
+                .get(super::RESOURCE_PUBLISHER_KEY_REF)
+                .ok()
+                .flatten();
+            if attestation
+                .as_ref()
+                .zip(publisher_key.as_ref())
+                .is_none_or(|(attestation, key)| {
+                    catalog
+                        .validate_publisher_attestation(attestation, key.as_bytes(), now_ms)
+                        .is_err()
+                })
+            {
+                return refused(invocation.request_id, RefusalCode::Unauthorized);
+            }
+            match plan(&catalog, &invocation, signer, now_ms) {
+                Ok(planned) => planned,
+                Err(RefusalCode::CancellationUnsupported) => {
+                    return unsupported_clipboard_cancellation_reply(&invocation, signer, now_ms)
+                        .unwrap_or_else(|code| refused(invocation.request_id.clone(), code));
+                }
+                Err(code) => return refused(invocation.request_id, code),
+            }
         };
         let downstream =
             match persist.write(&planned.topic, Priority::Default, None, Some(&planned.body)) {
@@ -619,9 +644,6 @@ fn plan(
     if !matches!(
         card.health.status,
         HealthStatus::Available | HealthStatus::Degraded
-    ) || !matches!(
-        card.auth.status,
-        AuthStatus::NotRequired | AuthStatus::Authorized
     ) {
         return Err(RefusalCode::Unavailable);
     }
@@ -633,11 +655,22 @@ fn plan(
     if action.verb != invocation.verb || action.target != invocation.target {
         return Err(RefusalCode::TargetMismatch);
     }
-    if action.availability.status != ActionAvailabilityStatus::Ready
-        || action.expires_at_ms <= now_ms
-        || invocation.deadline_at_ms > action.expires_at_ms
+    let locally_approved = local_approval_admits(card, action, invocation, now_ms);
+    if (!matches!(
+        card.auth.status,
+        AuthStatus::NotRequired | AuthStatus::Authorized
+    ) || action.availability.status != ActionAvailabilityStatus::Ready)
+        && !locally_approved
     {
         return Err(RefusalCode::Unavailable);
+    }
+    if action.expires_at_ms <= now_ms || invocation.deadline_at_ms > action.expires_at_ms {
+        return Err(RefusalCode::Unavailable);
+    }
+    if action.availability.status == ActionAvailabilityStatus::Ready
+        && invocation.local_approval.is_some()
+    {
+        return Err(RefusalCode::CapabilityMismatch);
     }
 
     match &invocation.authority_request {
@@ -671,6 +704,164 @@ fn plan(
             plan_android(card, invocation, request.clone(), signer)
         }
     }
+}
+
+fn plan_receipt_bound_vdi_close(
+    invocation: &ResourceActionInvocation,
+    signer: &CloudArmSigner,
+    now_ms: u64,
+) -> Result<PlannedAction, RefusalCode> {
+    let receipt = invocation
+        .vdi_open_receipt
+        .as_ref()
+        .ok_or(RefusalCode::CapabilityMismatch)?;
+    let TypedAuthorityRequest::Vdi(StrictSessionRequest::Close { id }) =
+        &invocation.authority_request
+    else {
+        return Err(RefusalCode::CapabilityMismatch);
+    };
+    if invocation.schema_version != SCHEMA_VERSION
+        || invocation.verb != ResourceActionVerb::Connect
+        || invocation.local_approval.is_some()
+        || invocation.armed_token.is_some()
+        || !safe_id(&invocation.request_id)
+        || !safe_id(&invocation.cancellation_id)
+        || invocation.cancels_request_id.as_deref() != Some(id.as_str())
+        || !safe_id(id)
+        || id == &invocation.request_id
+        || invocation.issued_at_ms == 0
+        || invocation.issued_at_ms > now_ms
+        || invocation.deadline_at_ms <= now_ms
+        || invocation.deadline_at_ms.saturating_sub(now_ms)
+            > u64::try_from(MAX_AUTH_TTL_MS).unwrap_or(30_000)
+    {
+        return Err(RefusalCode::StaleCatalog);
+    }
+    let original = &receipt.binding;
+    if receipt.schema_version != SCHEMA_VERSION
+        || receipt.request_id != *id
+        || receipt.session_id != *id
+        || receipt.outcome != VdiCompletionOutcome::DispatchAccepted
+        || receipt.completed_at_ms == 0
+        || receipt.completed_at_ms > now_ms
+        || !safe_id(&receipt.downstream_message_id)
+        || receipt.downstream_request_digest.len() != 64
+        || !receipt
+            .downstream_request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || receipt.authority_verb != "vdi-session-open"
+        || receipt.authority_node != "vdi-session"
+        || receipt.authority_target != format!("session:{id}")
+        || !safe_id(&receipt.serving_peer)
+        || original.catalog_revision != invocation.catalog_revision
+        || original.catalog_content_digest != invocation.catalog_content_digest
+        || original.resource_id != invocation.resource_id
+        || original.action_id != invocation.action_id
+        || original.verb != invocation.verb
+        || original.target != invocation.target
+        || original.expected_generation != invocation.expected_generation
+        || original.cancels_request_id.is_some()
+        || !safe_id(&original.cancellation_id)
+        || !signer.verify_payload(&receipt.signing_payload()?, &receipt.authority_signature)
+    {
+        return Err(RefusalCode::Unauthorized);
+    }
+
+    let shared = SessionRequest::Close { id: id.clone() };
+    let mut document = serde_json::to_value(shared).map_err(|_| RefusalCode::Malformed)?;
+    let object = document.as_object_mut().ok_or(RefusalCode::Malformed)?;
+    object.insert(
+        "schema_version".into(),
+        serde_json::Value::from(CLOUD_SCHEMA_VERSION),
+    );
+    object.insert(
+        "resource_request_id".into(),
+        serde_json::Value::String(invocation.request_id.clone()),
+    );
+    object.insert(
+        "resource_id".into(),
+        serde_json::Value::String(invocation.resource_id.clone()),
+    );
+    object.insert(
+        "resource_action_id".into(),
+        serde_json::Value::String(invocation.action_id.clone()),
+    );
+    object.insert(
+        "resource_action_verb".into(),
+        serde_json::to_value(invocation.verb).map_err(|_| RefusalCode::Malformed)?,
+    );
+    object.insert(
+        "resource_expected_generation".into(),
+        serde_json::Value::from(invocation.expected_generation),
+    );
+    object.insert(
+        "resource_catalog_revision".into(),
+        serde_json::Value::String(invocation.catalog_revision.clone()),
+    );
+    object.insert(
+        "resource_catalog_content_digest".into(),
+        serde_json::Value::String(invocation.catalog_content_digest.clone()),
+    );
+    object.insert(
+        "resource_cancels_request_id".into(),
+        serde_json::Value::String(id.clone()),
+    );
+    let target = format!("session:{id}");
+    let body = arm_document(
+        signer,
+        document,
+        &invocation.cancellation_id,
+        invocation.deadline_at_ms,
+        "vdi-session-close",
+        "vdi-session",
+        &target,
+    )?;
+    Ok(PlannedAction {
+        topic: crate::workers::session_broker::ACTION_TOPIC.to_owned(),
+        body,
+        reply_topic: Some(String::new()),
+        reply_kind: Some(DownstreamReplyKind::VdiAuthorityCompletion),
+        verb: "vdi-session-close",
+        node: receipt.serving_peer.clone(),
+        target,
+        vdi_completion: Some(PlannedVdiCompletion {
+            session_id: id.clone(),
+            serving_peer: receipt.serving_peer.clone(),
+        }),
+    })
+}
+
+fn local_approval_admits(
+    card: &mackes_mesh_types::resources::ResourceCard,
+    action: &mackes_mesh_types::resources::ResourceAction,
+    invocation: &ResourceActionInvocation,
+    now_ms: u64,
+) -> bool {
+    let Some(approval) = invocation.local_approval.as_ref() else {
+        return false;
+    };
+    card.identity.class == ResourceClass::Desktop
+        && card.auth.status == AuthStatus::Required
+        && card.auth.accepted_methods == [mackes_mesh_types::resources::AuthMethod::LocalApproval]
+        && card.auth.active_method.is_none()
+        && action.verb == ResourceActionVerb::Connect
+        && invocation.cancels_request_id.is_none()
+        && action.availability.status == ActionAvailabilityStatus::RequiresApproval
+        && approval.catalog_revision == invocation.catalog_revision
+        && approval.catalog_content_digest == invocation.catalog_content_digest
+        && approval.resource_id == invocation.resource_id
+        && approval.action_id == invocation.action_id
+        && approval.target == invocation.target
+        && approval.approved_at_ms != 0
+        && approval.approved_at_ms <= invocation.issued_at_ms
+        && invocation
+            .issued_at_ms
+            .saturating_sub(approval.approved_at_ms)
+            <= u64::try_from(MAX_AUTH_TTL_MS).unwrap_or(30_000)
+        && approval.approved_at_ms <= now_ms
+        && approval.expires_at_ms >= invocation.deadline_at_ms
+        && approval.expires_at_ms <= action.expires_at_ms
 }
 
 fn plan_workload(
@@ -763,7 +954,11 @@ fn plan_vdi(
             (
                 id.clone(),
                 serving_peer.clone(),
-                format!("vdi/{serving_peer}/{vm_id}"),
+                if invocation.local_approval.is_some() {
+                    card.identity.canonical_key.clone()
+                } else {
+                    format!("vdi/{serving_peer}/{vm_id}")
+                },
                 "vdi-session-open",
                 false,
             )
@@ -811,6 +1006,11 @@ fn plan_vdi(
             card.identity.class,
             ResourceClass::Desktop | ResourceClass::Application
         )
+    {
+        return Err(RefusalCode::TargetMismatch);
+    }
+    if invocation.local_approval.is_some()
+        && !approved_external_vdi_route(card, invocation, request)
     {
         return Err(RefusalCode::TargetMismatch);
     }
@@ -900,6 +1100,60 @@ fn plan_vdi(
             serving_peer,
         }),
     })
+}
+
+fn approved_external_vdi_route(
+    card: &mackes_mesh_types::resources::ResourceCard,
+    invocation: &ResourceActionInvocation,
+    request: &StrictSessionRequest,
+) -> bool {
+    let route_identity_matches = match request {
+        StrictSessionRequest::Open {
+            serving_peer,
+            vm_id,
+            profile,
+            ..
+        } => {
+            profile.is_none()
+                && vm_id == &card.identity.canonical_key
+                && admitted_external_vdi_card_route(card, invocation)
+                    .is_ok_and(|(host, _)| host == *serving_peer)
+        }
+        StrictSessionRequest::Close { .. } => false,
+        StrictSessionRequest::OpenApp { .. } => false,
+    };
+    if !route_identity_matches {
+        return false;
+    }
+    true
+}
+
+fn admitted_external_vdi_card_route(
+    card: &mackes_mesh_types::resources::ResourceCard,
+    invocation: &ResourceActionInvocation,
+) -> Result<(String, String), RefusalCode> {
+    let ResourceActionTarget::TransportClient {
+        transport_fingerprint,
+        capability_fingerprint,
+    } = &invocation.target
+    else {
+        return Err(RefusalCode::TargetMismatch);
+    };
+    let Some(transport) = card
+        .transports
+        .iter()
+        .find(|candidate| &candidate.fingerprint == transport_fingerprint)
+    else {
+        return Err(RefusalCode::TargetMismatch);
+    };
+    if transport.client_capability_fingerprint.as_ref() != Some(capability_fingerprint) {
+        return Err(RefusalCode::TargetMismatch);
+    }
+    let mackes_mesh_types::resources::TransportEndpoint::Network { host, .. } = &transport.endpoint
+    else {
+        return Err(RefusalCode::TargetMismatch);
+    };
+    Ok((host.clone(), card.identity.canonical_key.clone()))
 }
 
 fn admitted_vdi_card_route(
@@ -1441,6 +1695,8 @@ mod tests {
             issued_at_ms: NOW,
             deadline_at_ms: NOW + 20_000,
             authority_request: TypedAuthorityRequest::Workload(workload()),
+            vdi_open_receipt: None,
+            local_approval: None,
             armed_token: None,
         }
     }
@@ -1521,6 +1777,103 @@ mod tests {
             profile: None,
         });
         invocation
+    }
+
+    fn approval_gated_vdi() -> (ResourceCatalog, ResourceActionInvocation) {
+        let mut catalog = vdi_catalog();
+        let capability = ClientCapability::new(
+            "construct.mde-vdi-rdp",
+            "1",
+            TransportProtocol::Rdp,
+            "1",
+            ClientBoundary::ShellNative,
+            vec![AuthMethod::MeshIdentity, AuthMethod::LocalApproval],
+            vec![
+                ClientFeature::Display,
+                ClientFeature::KeyboardInput,
+                ClientFeature::PointerInput,
+            ],
+            ClientCapabilityLimits {
+                max_width: Some(3_840),
+                max_height: Some(2_160),
+                max_fps: Some(60),
+                max_audio_channels: None,
+                max_parallel_sessions: 1,
+            },
+            vec![ResourceActionVerb::Connect],
+        )
+        .expect("external RDP capability");
+        let transport = TransportCandidate::new(
+            TransportProtocol::Rdp,
+            TransportEndpoint::Network {
+                host: "172.20.146.54".into(),
+                port: 3_389,
+                base_path: None,
+            },
+            ResourceScope::TrustedLan,
+            0,
+            NOW,
+            NOW + 60_000,
+            catalog.cards[0].health.clone(),
+            Some(capability.fingerprint.clone()),
+        )
+        .expect("external RDP transport");
+        catalog.cards[0].identity = ResourceIdentity::new(
+            ResourceClass::Desktop,
+            IdentityAuthority::Device,
+            "mdns:172.20.146.54:3389:rdp",
+            vec![],
+        )
+        .expect("external desktop identity");
+        catalog.cards[0].auth = AuthState {
+            schema_version: RESOURCE_CONTRACT_VERSION,
+            status: AuthStatus::Required,
+            accepted_methods: vec![AuthMethod::LocalApproval],
+            active_method: None,
+            credential_ref: None,
+            updated_at_ms: NOW,
+            expires_at_ms: None,
+            failure: None,
+        };
+        catalog.cards[0].actions[0].target = ResourceActionTarget::TransportClient {
+            transport_fingerprint: transport.fingerprint.clone(),
+            capability_fingerprint: capability.fingerprint.clone(),
+        };
+        catalog.cards[0].actions[0].availability = ActionAvailability {
+            status: ActionAvailabilityStatus::RequiresApproval,
+            failure: Some(FailureReason {
+                code: FailureCode::ApprovalRequired,
+                message: "desktop source requires local approval".into(),
+            }),
+        };
+        catalog.cards[0].transports = vec![transport];
+        catalog.cards[0].client_capabilities = vec![capability];
+        catalog.cards[0].provenance[0].source_id = "mdns:172.20.146.54:3389:rdp".into();
+        catalog.content_digest = None;
+        catalog.content_digest = Some(catalog.computed_content_digest());
+        catalog.validate().expect("approval-gated catalog");
+
+        let mut invocation = vdi_invocation(&catalog);
+        invocation.catalog_content_digest = catalog.computed_content_digest();
+        invocation.resource_id = catalog.cards[0].resource_id().into();
+        invocation.target = catalog.cards[0].actions[0].target.clone();
+        invocation.authority_request = TypedAuthorityRequest::Vdi(StrictSessionRequest::Open {
+            id: invocation.request_id.clone(),
+            serving_peer: "172.20.146.54".into(),
+            vm_id: catalog.cards[0].identity.canonical_key.clone(),
+            client_peer: "seat-a".into(),
+            profile: None,
+        });
+        invocation.local_approval = Some(LocalApprovalBinding {
+            catalog_revision: invocation.catalog_revision.clone(),
+            catalog_content_digest: invocation.catalog_content_digest.clone(),
+            resource_id: invocation.resource_id.clone(),
+            action_id: invocation.action_id.clone(),
+            target: invocation.target.clone(),
+            approved_at_ms: NOW,
+            expires_at_ms: NOW + 20_000,
+        });
+        (catalog, invocation)
     }
 
     fn vdi_cancellation(catalog: &ResourceCatalog) -> ResourceActionInvocation {
@@ -1906,6 +2259,99 @@ mod tests {
         );
         assert!(body["armed_token"].as_str().is_some());
         serde_json::from_value::<SessionRequest>(body).expect("session authority wire");
+    }
+
+    #[test]
+    fn approval_gated_vdi_requires_and_preserves_the_exact_local_binding() {
+        let (catalog, invocation) = approval_gated_vdi();
+        let authority_signer = signer();
+        let planned = plan(&catalog, &invocation, &authority_signer, NOW + 1)
+            .expect("exact locally approved RDP route");
+        assert_eq!(planned.topic, crate::workers::session_broker::ACTION_TOPIC);
+        assert_eq!(planned.node, "172.20.146.54");
+
+        let mut absent = invocation.clone();
+        absent.local_approval = None;
+        assert_eq!(
+            plan(&catalog, &absent, &signer(), NOW + 1),
+            Err(RefusalCode::Unavailable)
+        );
+
+        let mut substituted = invocation;
+        substituted
+            .local_approval
+            .as_mut()
+            .expect("approval")
+            .action_id = "other-action".into();
+        assert_eq!(
+            plan(&catalog, &substituted, &signer(), NOW + 1),
+            Err(RefusalCode::Unavailable)
+        );
+
+        let (_, open) = approval_gated_vdi();
+        let completion = planned.vdi_completion.as_ref().expect("VDI completion");
+        let receipt = vdi_completion_reply(
+            &open,
+            &planned,
+            completion,
+            "01OPENMESSAGE",
+            &authority_signer,
+            NOW + 1,
+        )
+        .expect("signed Open completion");
+        let mut close = open.clone();
+        close.request_id = "resource-rdp-close-1".into();
+        close.cancellation_id = "cancel-resource-rdp-close-1".into();
+        close.cancels_request_id = Some(open.request_id.clone());
+        close.issued_at_ms = NOW + 2;
+        close.deadline_at_ms = NOW + 20_000;
+        close.authority_request = TypedAuthorityRequest::Vdi(StrictSessionRequest::Close {
+            id: open.request_id.clone(),
+        });
+        close.local_approval = None;
+        close.vdi_open_receipt = Some(receipt.clone());
+        let planned_close = plan_receipt_bound_vdi_close(&close, &authority_signer, NOW + 3)
+            .expect("signed-receipt RDP close route without a current catalog");
+        assert_eq!(
+            planned_close.topic,
+            crate::workers::session_broker::ACTION_TOPIC
+        );
+        assert_eq!(planned_close.verb, "vdi-session-close");
+        assert_eq!(planned_close.target, format!("session:{}", open.request_id));
+        assert_eq!(planned_close.node, "172.20.146.54");
+
+        let mut unsigned_close = close.clone();
+        unsigned_close.vdi_open_receipt = None;
+        assert_eq!(
+            plan(&catalog, &unsigned_close, &authority_signer, NOW + 3),
+            Err(RefusalCode::Unavailable),
+            "ordinary external VDI Close must not be weakened"
+        );
+
+        let mut wrong_target = close.clone();
+        wrong_target.cancels_request_id = Some("other-open".into());
+        assert_eq!(
+            plan_receipt_bound_vdi_close(&wrong_target, &authority_signer, NOW + 3),
+            Err(RefusalCode::StaleCatalog)
+        );
+
+        let mut substituted_binding = close.clone();
+        substituted_binding.action_id = "other-action".into();
+        assert_eq!(
+            plan_receipt_bound_vdi_close(&substituted_binding, &authority_signer, NOW + 3),
+            Err(RefusalCode::Unauthorized)
+        );
+
+        let mut forged_receipt = close;
+        forged_receipt
+            .vdi_open_receipt
+            .as_mut()
+            .expect("receipt")
+            .authority_signature = "forged".into();
+        assert_eq!(
+            plan_receipt_bound_vdi_close(&forged_receipt, &authority_signer, NOW + 3),
+            Err(RefusalCode::Unauthorized)
+        );
     }
 
     #[test]

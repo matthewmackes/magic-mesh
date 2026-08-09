@@ -259,6 +259,8 @@ pub(crate) enum SourceOrigin {
     MeshPeer,
     /// Discovered on the local LAN via mDNS.
     Mdns,
+    /// Admitted from the authenticated resource catalog after an accepted action receipt.
+    CatalogAuthority,
     /// A local libvirt/KVM guest console.
     LocalVm,
     /// Operator-added.
@@ -274,6 +276,7 @@ impl SourceOrigin {
         match self {
             Self::MeshPeer => "mesh peer",
             Self::Mdns => "LAN (mDNS)",
+            Self::CatalogAuthority => "resource authority",
             Self::LocalVm => "local VM",
             Self::Manual => "manual",
             Self::Unknown => "discovered",
@@ -1221,6 +1224,9 @@ pub(crate) struct ChooserState {
     /// Validated universal service/resource catalog rendered in the same browser
     /// as desktop cards.
     resources: ResourceBrowserState,
+    /// One authenticated catalog desktop admitted by the resource authority.
+    /// It is never persisted as a Manual source and vanishes on catalog revocation.
+    catalog_source: Option<(String, DesktopSource)>,
     /// This node's peer name — the session's `client_peer` (resolved once).
     client_peer: String,
     /// The last published roster, if any.
@@ -1296,8 +1302,7 @@ impl Default for ChooserState {
         // exact host-bound systemd credential. Tests and injected chooser
         // states continue to use `ResourceBrowserState::new`, which is the
         // explicit untrusted read-only compatibility constructor.
-        state.resources =
-            ResourceBrowserState::from_systemd_publisher_credential(bus_root);
+        state.resources = ResourceBrowserState::from_systemd_publisher_credential(bus_root);
         state
     }
 }
@@ -1318,6 +1323,7 @@ impl ChooserState {
             client,
             creds,
             resources: ResourceBrowserState::new(bus_root.clone()),
+            catalog_source: None,
             bus_root,
             client_peer,
             state: None,
@@ -1647,6 +1653,11 @@ impl ChooserState {
             .as_ref()
             .map(|s| s.sources.clone())
             .unwrap_or_default();
+        if let Some((_, source)) = &self.catalog_source {
+            if !out.iter().any(|candidate| candidate.id == source.id) {
+                out.push(source.clone());
+            }
+        }
         for entry in &self.manual_cache {
             if self.roster_has(&entry.id) {
                 continue;
@@ -2367,6 +2378,45 @@ enum CardAction {
 /// affordance when raised, and the degraded-lane notes.
 pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     let has_resources = state.resources.show(ui);
+    if let Some((resource_id, source)) = state.catalog_source.as_ref() {
+        if !state.resources.vdi_card_is_current(resource_id) {
+            state.resources.cancel_active_vdi();
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|draft| draft.source_id == source.id)
+            {
+                state.pending = None;
+            }
+            state.catalog_source = None;
+            state.note = Some(
+                "Catalog RDP approval was revoked or expired; the Windows login handoff was cancelled."
+                    .to_owned(),
+            );
+        }
+    }
+    if let Some(handoff) = state.resources.take_vdi_handoff() {
+        let source_id = format!("catalog:{}", handoff.resource_id);
+        let source = DesktopSource {
+            id: source_id.clone(),
+            name: handoff.display_name,
+            node: handoff.host.clone(),
+            host: handoff.host,
+            protocols: vec![ProtocolOffer {
+                protocol: Protocol::Rdp,
+                port: Some(handoff.port),
+            }],
+            origin: SourceOrigin::CatalogAuthority,
+            reachability: Reachability::Reachable,
+            reason: None,
+            os_hint: Some("Windows".to_owned()),
+            power_state: None,
+            thumbnail_ref: None,
+        };
+        state.catalog_source = Some((handoff.resource_id, source));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, &source_id);
+    }
     if has_resources {
         ui.add_space(Style::SP_M);
         ui.separator();
@@ -2500,7 +2550,12 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     match action {
         Some(CardAction::Activate(id)) => state.activate(&sources, &id),
         Some(CardAction::Confirm) => state.confirm_connect(&sources),
-        Some(CardAction::Cancel) => state.cancel_connect(),
+        Some(CardAction::Cancel) => {
+            if state.catalog_source.is_some() {
+                state.resources.cancel_active_vdi();
+            }
+            state.cancel_connect();
+        }
         Some(CardAction::Power { id, op }) => state.power_action(&sources, &id, op),
         Some(CardAction::ToggleFavorite(id)) => state.toggle_favorite(&id),
         Some(CardAction::Retry(id)) => state.retry_discovery(&sources, &id),
