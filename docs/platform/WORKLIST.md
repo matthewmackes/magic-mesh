@@ -1462,6 +1462,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-006-2026-08-09-farm-sync-capacity-r3.md`.
 - **Live collector binding checkpoint (2026-08-09):** rehashed arbitrary pass bytes and split role candidates now fail closed; BigBoy and `.90` passed verifier and release
   self-tests: `docs/platform/evidence/WL-CRIT-006-2026-08-09-live-collector-binding-r4.md`.
+- **Governed candidate checkpoint (2026-08-09):** CI now derives exact role/runtime digests from immutable final RPMs; the stale `jiff` lock edge is repaired.
+  BigBoy gates passed, but the current candidate remains unbuilt: `docs/platform/evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`.
 - Remaining work:
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
