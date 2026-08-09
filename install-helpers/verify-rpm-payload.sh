@@ -31,6 +31,7 @@
 #   install-helpers/verify-rpm-payload.sh all            # same as no args
 #   install-helpers/verify-rpm-payload.sh payload        # RPM-payload check, dry-run (no RPM)
 #   install-helpers/verify-rpm-payload.sh payload a.rpm  # validate a REAL built RPM's file list (also size-checks it)
+#                                                        # and reject retired Timers payload
 #   install-helpers/verify-rpm-payload.sh requirements            # pin source metadata for base VDI-host hard Requires
 #   install-helpers/verify-rpm-payload.sh requirements a.rpm      # also inspect a built RPM's actual Requires header
 #   install-helpers/verify-rpm-payload.sh size a.rpm     # size-only: fail if a.rpm exceeds the channel ceiling
@@ -1067,7 +1068,15 @@ main() {
   case "$cmd" in
     -h|--help|help) usage; exit 0 ;;
     --self-test|self-test) self_test; exit $? ;;
-    payload)  shift; check_payload "${1:-}" ;;
+    payload)
+      shift
+      check_payload "${1:-}"
+      if [ -n "${1:-}" ]; then
+        "$REPO_ROOT/install-helpers/lint-clock-cutover.sh" --rpm "$1" || FAILS=$((FAILS + 1))
+      else
+        "$REPO_ROOT/install-helpers/lint-clock-cutover.sh" || FAILS=$((FAILS + 1))
+      fi
+      ;;
     requirements)
       shift
       check_vdi_host_requires
@@ -1078,7 +1087,11 @@ main() {
     candidate-payload) check_candidate_credential_assets ;;
     size)     shift; check_rpm_size "${1:?usage: verify-rpm-payload.sh size <rpm>}" ;;
     surfaces) check_surfaces ;;
-    all|"")   check_payload_dryrun; check_surfaces ;;
+    all|"")
+      check_payload_dryrun
+      check_surfaces
+      "$REPO_ROOT/install-helpers/lint-clock-cutover.sh" || FAILS=$((FAILS + 1))
+      ;;
     *) printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 2 ;;
   esac
 

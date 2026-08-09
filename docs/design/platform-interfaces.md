@@ -1,7 +1,8 @@
 # PLATFORM-INTERFACES — Construct + Car, the two platform interfaces (Apple-HIG-principled)
 
 > **THE interface design authority.** Design locks from the 50-question operator
-> survey, 2026-07-22, amended by the 2026-07-26/30 authority cleanup. This
+> survey, 2026-07-22, amended by the 2026-07-26/30 authority cleanup and the
+> 2026-08-09 Construct Clock cutover. This
 > document defines the requirements for the platform's
 > only two interfaces — **Construct** (the workstation) and **Car** — under the
 > platform design standard, **Apple's Human Interface Guidelines applied as
@@ -158,7 +159,8 @@ Light is a production first-class appearance, both share azure accent
 | App switcher | bottom-edge swipe up + hold | **Super+Tab** (hold to browse) |
 | Spotlight | pull-down on home grid | **Super** (on home) / type-to-search |
 | Control Center | top-right pull-down | click status-bar right cluster |
-| Notification Center | top-left/center pull-down | click status-bar clock |
+| Clock | — | click the visible status/taskbar clock |
+| Notification Center | top-left/center pull-down | click the dedicated bell |
 
   One contract table, one drain site (`gestures.rs` edge-swipe channel). The
   taskbar-reveal hot edge retires. Over a focused VDI session, edge gestures
@@ -177,6 +179,11 @@ Light is a production first-class appearance, both share azure accent
   transport, while condition state and remediation remain solely in the health
   authority/modal.
   *(Notifications)*
+- **Q14b — Clock is not notification chrome.** The visible clock opens the
+  canonical **Clock** surface directly. The dedicated bell is the sole
+  persistent pointer target for Notification Center. Clock alarm/timer banners
+  may fold into Notification Center history, but that does not merge either
+  route or either authority.
 - **Q15 — Spotlight:** the Front Door engine (producers, ranking, keyboard
   flow **byte-identical**) reskinned as a centered floating search field.
   *(Searching)*
@@ -236,6 +243,14 @@ record is WL-FUNC-021.
   *(Virtual keyboards)*
 - **Q27 — System = HIG Settings:** grouped sidebar → detail pane, inline
   search; built from the Q19 components. Profile picker shows the two profiles.
+- **Q27b — Construct Clock:** `Surface::Clock` is the only Clock route and owns
+  World Clock, Alarms, Timers, and Stopwatch presentation. `mackesd` owns
+  persisted schedules, deadline evaluation, ringing, and replicated stopwatch
+  state; the shell only projects daemon state and emits typed commands. The
+  retired Timers surface and shell-side alarm store/scheduler are removed.
+  Legacy `timers-alarms.json` is never read or imported and remains untouched
+  for manual rollback. Display-zone migration applies only to the five known
+  legacy zone values in the Clock settings file.
 - **Q28 — VDI session = an app.** Full-screen in the switcher, home gesture
   leaves it, status bar auto-hides over it. **The full-native-resolution
   guarantee is SACRED** (zero reserved chrome over a focused session). The
