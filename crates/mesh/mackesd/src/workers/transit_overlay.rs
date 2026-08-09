@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +21,9 @@ use mackes_mesh_types::transit::{
 use prost::Message;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
 
@@ -72,13 +75,23 @@ pub enum ProbeResponse {
 pub trait TransitProbe: Send + Sync {
     /// Fetch the full MBTA vehicle-position snapshot.
     fn fetch(&self, point: TransitPoint) -> io::Result<ProbeResponse>;
+
+    /// Commit any conditional validators staged by the successful fetch.
+    /// Fixture probes and probes without validators need no action.
+    fn commit(&self, _point: TransitPoint) {}
+}
+
+#[derive(Debug, Clone)]
+struct PointValidators {
+    point: TransitPoint,
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct Validators {
-    point: Option<TransitPoint>,
-    etag: Option<String>,
-    last_modified: Option<String>,
+    committed: Option<PointValidators>,
+    staged: Option<PointValidators>,
 }
 
 /// Production rustls probe.
@@ -121,15 +134,16 @@ impl TransitProbe for MbtaHttpProbe {
                 .validators
                 .lock()
                 .map_err(|_| io::Error::other("MBTA validator lock poisoned"))?;
-            if validators
-                .point
-                .is_some_and(|prior| point_near(prior, point))
+            if let Some(committed) = validators
+                .committed
+                .as_ref()
+                .filter(|validators| point_near(validators.point, point))
             {
-                if let Some(value) = &validators.etag {
+                if let Some(value) = &committed.etag {
                     request = request.header(IF_NONE_MATCH, value);
                     sent_validator = true;
                 }
-                if let Some(value) = &validators.last_modified {
+                if let Some(value) = &committed.last_modified {
                     request = request.header(IF_MODIFIED_SINCE, value);
                     sent_validator = true;
                 }
@@ -178,15 +192,29 @@ impl TransitProbe for MbtaHttpProbe {
         let last_modified = header_string(&response, LAST_MODIFIED);
         let mut response = response;
         let body = read_bounded_body(&mut response)?;
-        *self
-            .validators
+        self.validators
             .lock()
-            .map_err(|_| io::Error::other("MBTA validator lock poisoned"))? = Validators {
-            point: Some(point),
+            .map_err(|_| io::Error::other("MBTA validator lock poisoned"))?
+            .staged = Some(PointValidators {
+            point,
             etag,
             last_modified,
-        };
+        });
         Ok(ProbeResponse::Modified(body))
+    }
+
+    fn commit(&self, point: TransitPoint) {
+        let mut validators = self
+            .validators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if validators
+            .staged
+            .as_ref()
+            .is_some_and(|staged| staged.point == point)
+        {
+            validators.committed = validators.staged.take();
+        }
     }
 }
 
@@ -656,16 +684,59 @@ fn push_gap(gaps: &mut Vec<String>, gap: String) {
     }
 }
 
+#[derive(Clone)]
 enum PreparedResponse {
     Modified(TransitSnapshot),
     NotModified,
+}
+
+enum RefreshCommit {
+    Applied {
+        success: bool,
+        commit_validators: bool,
+    },
+    PointChanged,
+    NoPoint,
+}
+
+trait TransitBus {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>>;
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &TransitSnapshot) -> io::Result<()>;
+}
+
+impl TransitBus for Persist {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+        self.reopen_if_index_changed();
+        self.read_latest(topic)
+            .map_err(io_other)?
+            .map(|message| {
+                message
+                    .body
+                    .ok_or_else(|| io::Error::other("transit Bus row has no body"))
+            })
+            .transpose()
+    }
+
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &TransitSnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(|error| {
+            crate::metrics::record_bus_publish_error();
+            io_other(error)
+        })?;
+        self.reopen_if_index_changed();
+        self.write(topic, Priority::Default, None, Some(&body))
+            .map(|_| ())
+            .map_err(|error| {
+                crate::metrics::record_bus_publish_error();
+                io_other(error)
+            })
+    }
 }
 
 /// Workstation-side MBTA transit adapter.
 pub struct TransitOverlayWorker {
     host: String,
     probe: Option<Arc<dyn TransitProbe>>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -694,7 +765,7 @@ impl TransitOverlayWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -706,10 +777,11 @@ impl TransitOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override the Bus root. Production resolves the current user/system root
+    /// for every transaction when no override is configured.
     #[must_use]
-    pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+    pub fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
         self
     }
 
@@ -720,23 +792,28 @@ impl TransitOverlayWorker {
         self
     }
 
-    fn current_point(&self) -> Option<TransitPoint> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
+    fn open_bus(&self) -> io::Result<Persist> {
+        let root = transit_bus_root(
+            self.bus_root_override.as_deref(),
+            crate::bus_publish::default_bus_root(),
+        );
+        let mut persist = Persist::open(root).map_err(io_other)?;
+        persist.reopen_if_index_changed();
+        Ok(persist)
+    }
+
+    fn current_point(&self, bus: &mut impl TransitBus) -> io::Result<Option<TransitPoint>> {
         let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
+        let Some(body) = bus.read_latest_body(&topic)? else {
+            return Ok(None);
+        };
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
         validated_vehicle_point(&vehicle, &self.host, now_ms())
     }
 
-    fn publish(&self, snapshot: &TransitSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &transit_state_topic(&self.host),
-                snapshot,
-            );
-        }
+    fn publish(&self, bus: &mut impl TransitBus, snapshot: &TransitSnapshot) -> io::Result<()> {
+        bus.publish_snapshot(&transit_state_topic(&self.host), snapshot)
     }
 
     fn no_context_snapshot(&self, reason: &str) -> TransitSnapshot {
@@ -747,18 +824,19 @@ impl TransitOverlayWorker {
 
     fn apply_result(
         &self,
-        result: io::Result<PreparedResponse>,
+        bus: &mut impl TransitBus,
+        result: Result<PreparedResponse, String>,
         point: TransitPoint,
         last_good: &mut Option<TransitSnapshot>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         match result {
             Ok(PreparedResponse::Modified(snapshot)) => {
-                self.publish(&snapshot);
+                self.publish(bus, &snapshot)?;
                 *last_good = Some(snapshot);
-                true
+                Ok(true)
             }
             Ok(PreparedResponse::NotModified) => {
-                if let Some(snapshot) = last_good {
+                if let Some(snapshot) = last_good.as_ref() {
                     if !point_near(
                         TransitPoint {
                             latitude: snapshot.query_latitude,
@@ -767,35 +845,44 @@ impl TransitOverlayWorker {
                         point,
                     ) {
                         self.publish_failure(
+                            bus,
                             last_good,
                             point,
                             "MBTA 304 point does not match last-good",
-                        );
-                        return false;
+                        )?;
+                        return Ok(false);
                     }
-                    snapshot.fetched_at_ms = now_ms();
-                    snapshot
+                    let mut refreshed = snapshot.clone();
+                    refreshed.fetched_at_ms = now_ms();
+                    refreshed
                         .gaps
                         .retain(|gap| !gap.starts_with("MBTA refresh failed:"));
-                    self.publish(snapshot);
-                    true
+                    self.publish(bus, &refreshed)?;
+                    *last_good = Some(refreshed);
+                    Ok(true)
                 } else {
-                    false
+                    Ok(false)
                 }
             }
             Err(error) => {
-                self.publish_failure(last_good, point, &format!("MBTA refresh failed: {error}"));
-                false
+                self.publish_failure(
+                    bus,
+                    last_good,
+                    point,
+                    &format!("MBTA refresh failed: {error}"),
+                )?;
+                Ok(false)
             }
         }
     }
 
     fn publish_failure(
         &self,
+        bus: &mut impl TransitBus,
         last_good: &mut Option<TransitSnapshot>,
         point: TransitPoint,
         gap: &str,
-    ) {
+    ) -> io::Result<()> {
         // A failed refresh after the vehicle has moved must not republish the
         // old nearby set under the new query context. Publish an empty,
         // degraded shell to retract the retained markers from the Bus, then
@@ -809,7 +896,7 @@ impl TransitOverlayWorker {
                 point,
             )
         }) {
-            let previous = last_good.take().expect("last-good checked above");
+            let previous = last_good.as_ref().expect("last-good checked above");
             let mut cleared = TransitSnapshot::empty(
                 &self.host,
                 now_ms(),
@@ -822,26 +909,85 @@ impl TransitOverlayWorker {
                 &mut cleared.gaps,
                 format!("MBTA retained snapshot cleared after query point changed: {gap}"),
             );
-            self.publish(&cleared);
-            return;
+            self.publish(bus, &cleared)?;
+            *last_good = None;
+            return Ok(());
         }
-        if let Some(snapshot) = last_good {
-            snapshot
+        if let Some(snapshot) = last_good.as_ref() {
+            let mut degraded = snapshot.clone();
+            degraded
                 .gaps
                 .retain(|existing| !existing.starts_with("MBTA refresh failed:"));
-            push_gap(&mut snapshot.gaps, gap.to_string());
-            self.publish(snapshot);
+            push_gap(&mut degraded.gaps, gap.to_string());
+            self.publish(bus, &degraded)?;
+            *last_good = Some(degraded);
         }
+        Ok(())
     }
 
-    fn publish_no_context_degraded(&self, last_good: &mut Option<TransitSnapshot>, reason: &str) {
+    fn publish_no_context_degraded(
+        &self,
+        bus: &mut impl TransitBus,
+        last_good: &mut Option<TransitSnapshot>,
+        reason: &str,
+    ) -> io::Result<()> {
         tracing::warn!(target: "mackesd::transit_overlay", host = %self.host, error = reason, "MBTA refresh has no fresh same-host vehicle context; publishing empty degraded snapshot");
         let snapshot = self.no_context_snapshot(reason);
-        self.publish(&snapshot);
+        self.publish(bus, &snapshot)?;
         // Vehicle-scoped transit rows are invalid once the same-host fix
         // disappears. Keep the retained Bus topic present and licensed, but do
         // not let a later failure or 304 replay vehicles from the stale point.
         *last_good = None;
+        Ok(())
+    }
+
+    fn ensure_no_context_published(
+        &self,
+        bus: &mut impl TransitBus,
+        last_good: &mut Option<TransitSnapshot>,
+        no_context_published: &mut bool,
+    ) -> io::Result<()> {
+        if *no_context_published {
+            let current = bus
+                .read_latest_body(&transit_state_topic(&self.host))?
+                .map(|body| serde_json::from_str::<TransitSnapshot>(&body).map_err(io_other))
+                .transpose()?;
+            if current.is_some_and(|snapshot| {
+                snapshot.host == self.host
+                    && snapshot.feed_generated_at_ms == 0
+                    && snapshot.query_latitude == 0.0
+                    && snapshot.query_longitude == 0.0
+                    && snapshot.vehicles.is_empty()
+                    && snapshot
+                        .gaps
+                        .iter()
+                        .any(|gap| gap.contains("vehicle fix unavailable"))
+            }) {
+                return Ok(());
+            }
+        }
+        self.publish_no_context_degraded(
+            bus,
+            last_good,
+            "MBTA refresh failed: fresh same-host MG90 vehicle fix unavailable",
+        )?;
+        *no_context_published = true;
+        Ok(())
+    }
+
+    fn current_point_or_clear(
+        &self,
+        bus: &mut impl TransitBus,
+        last_good: &mut Option<TransitSnapshot>,
+        no_context_published: &mut bool,
+    ) -> io::Result<Option<TransitPoint>> {
+        let point = self.current_point(bus)?;
+        if point.is_some() {
+            *no_context_published = false;
+        } else {
+            self.ensure_no_context_published(bus, last_good, no_context_published)?;
+        }
+        Ok(point)
     }
 
     async fn fetch_async(
@@ -849,7 +995,7 @@ impl TransitOverlayWorker {
         probe: Arc<dyn TransitProbe>,
         point: TransitPoint,
         shutdown: &mut ShutdownToken,
-    ) -> Option<io::Result<PreparedResponse>> {
+    ) -> Option<Result<PreparedResponse, String>> {
         let host = self.host.clone();
         let task = tokio::task::spawn_blocking(move || match probe.fetch(point)? {
             ProbeResponse::Modified(body) => build_snapshot(&host, point, &body, now_ms())
@@ -860,39 +1006,54 @@ impl TransitOverlayWorker {
         tokio::select! {
             () = shutdown.wait() => None,
             joined = task => Some(match joined {
-                Ok(result) => result,
-                Err(error) => Err(io::Error::other(format!("MBTA fetch task failed: {error}"))),
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("MBTA fetch task failed: {error}")),
             }),
         }
     }
+}
+
+fn transit_bus_root(explicit: Option<&Path>, current: Option<PathBuf>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or(current)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 fn validated_vehicle_point(
     vehicle: &mackes_mesh_types::vehicle::VehicleState,
     expected_host: &str,
     now: i64,
-) -> Option<TransitPoint> {
+) -> io::Result<Option<TransitPoint>> {
     let mirror_age = now.saturating_sub(vehicle.published_at_ms).max(0);
     let future_skew = vehicle.published_at_ms.saturating_sub(now).max(0);
     let gps = &vehicle.gps;
-    if vehicle.host != expected_host
-        || !vehicle.online
-        || !gps.has_fix()
-        || !gps.latitude.is_finite()
+    if vehicle.host != expected_host {
+        return Err(io::Error::other(
+            "vehicle Bus row host does not match topic",
+        ));
+    }
+    if !vehicle.online || !gps.has_fix() {
+        return Ok(None);
+    }
+    if !gps.latitude.is_finite()
         || !gps.longitude.is_finite()
         || !(-90.0..=90.0).contains(&gps.latitude)
         || !(-180.0..=180.0).contains(&gps.longitude)
         || !gps.age_s.is_finite()
         || gps.age_s < 0.0
-        || future_skew > VEHICLE_MAX_FUTURE_SKEW_MS
+    {
+        return Err(io::Error::other("vehicle Bus row contains an invalid fix"));
+    }
+    if future_skew > VEHICLE_MAX_FUTURE_SKEW_MS
         || mirror_age as f64 + f64::from(gps.age_s) * 1_000.0 > VEHICLE_FIX_MAX_AGE_MS as f64
     {
-        return None;
+        return Ok(None);
     }
-    Some(TransitPoint {
+    Ok(Some(TransitPoint {
         latitude: gps.latitude,
         longitude: gps.longitude,
-    })
+    }))
 }
 
 #[async_trait::async_trait]
@@ -909,26 +1070,124 @@ impl Worker for TransitOverlayWorker {
         let mut last_good = None;
         let mut retry = self.poll;
         let mut no_fix_published = false;
+        let mut pending: Option<(TransitPoint, Result<PreparedResponse, String>)> = None;
         loop {
-            let Some(point) = self.current_point() else {
-                if !no_fix_published {
-                    self.publish_no_context_degraded(
-                        &mut last_good,
-                        "MBTA refresh failed: fresh same-host MG90 vehicle fix unavailable",
+            let point = match self.open_bus().and_then(|mut bus| {
+                self.current_point_or_clear(&mut bus, &mut last_good, &mut no_fix_published)
+            }) {
+                Ok(Some(point)) => point,
+                Ok(None) => {
+                    pending = None;
+                    retry = self.poll;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::transit_overlay",
+                        host = %self.host,
+                        %error,
+                        "MBTA vehicle context transaction deferred"
                     );
-                    no_fix_published = true;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(retry.min(self.poll)) => {}
+                    }
+                    continue;
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+            };
+            if pending
+                .as_ref()
+                .is_some_and(|(pending_point, _)| *pending_point != point)
+            {
+                pending = None;
+            }
+            if pending.is_none() {
+                let Some(result) = self.fetch_async(probe.clone(), point, &mut shutdown).await
+                else {
+                    break;
+                };
+                pending = Some((point, result));
+            }
+
+            // MBTA I/O and protobuf normalization run off-thread without a Bus
+            // handle. Re-open and re-read the exact vehicle point before any
+            // projection or private-state commit. Keep the prepared result
+            // across storage faults so retry does not duplicate provider work
+            // or advance conditional validators before publication succeeds.
+            let commit = self.open_bus().and_then(|mut bus| {
+                let latest = self.current_point(&mut bus)?;
+                let Some(latest) = latest else {
+                    self.ensure_no_context_published(
+                        &mut bus,
+                        &mut last_good,
+                        &mut no_fix_published,
+                    )?;
+                    return Ok(RefreshCommit::NoPoint);
+                };
+                no_fix_published = false;
+                if latest != point {
+                    self.publish_failure(
+                        &mut bus,
+                        &mut last_good,
+                        latest,
+                        "MBTA vehicle point changed during refresh",
+                    )?;
+                    return Ok(RefreshCommit::PointChanged);
                 }
-                continue;
+                let result = pending.as_ref().expect("prepared MBTA result").1.clone();
+                let commit_validators = matches!(result, Ok(PreparedResponse::Modified(_)));
+                self.apply_result(&mut bus, result, point, &mut last_good)
+                    .map(|success| RefreshCommit::Applied {
+                        success,
+                        commit_validators,
+                    })
+            });
+            let success = match commit {
+                Ok(RefreshCommit::Applied {
+                    success,
+                    commit_validators,
+                }) => {
+                    if commit_validators {
+                        probe.commit(point);
+                    }
+                    pending = None;
+                    success
+                }
+                Ok(RefreshCommit::PointChanged) => {
+                    pending = None;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(retry.min(self.poll)) => {}
+                    }
+                    continue;
+                }
+                Ok(RefreshCommit::NoPoint) => {
+                    pending = None;
+                    retry = self.poll;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::transit_overlay",
+                        host = %self.host,
+                        %error,
+                        "MBTA refresh transaction deferred"
+                    );
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(retry.min(self.poll)) => {}
+                    }
+                    continue;
+                }
             };
-            no_fix_published = false;
-            let Some(result) = self.fetch_async(probe.clone(), point, &mut shutdown).await else {
-                break;
-            };
-            let success = self.apply_result(result, point, &mut last_good);
             let delay = if success { self.poll } else { retry };
             retry = if success {
                 self.poll
@@ -966,10 +1225,10 @@ fn now_ms() -> i64 {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use mackes_mesh_types::vehicle::{GpsFix, VehicleState};
-    use mde_bus::persist::Persist;
 
     use super::*;
 
@@ -1020,6 +1279,122 @@ mod tests {
             ],
         }
         .encode_to_vec()
+    }
+
+    fn live_feed() -> Vec<u8> {
+        let mut feed = FeedMessage::decode(captured_feed().as_slice()).expect("captured feed");
+        let seconds = u64::try_from(now_ms() / 1_000).expect("current seconds");
+        feed.header.as_mut().expect("header").timestamp = Some(seconds);
+        for entity in &mut feed.entity {
+            entity.vehicle.as_mut().expect("vehicle").timestamp = Some(seconds);
+        }
+        feed.encode_to_vec()
+    }
+
+    fn vehicle(point: TransitPoint) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude: point.latitude,
+            longitude: point.longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn write_vehicle(persist: &Persist, vehicle: &VehicleState) {
+        persist
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(vehicle).expect("vehicle JSON")),
+            )
+            .expect("vehicle publication");
+    }
+
+    #[derive(Default)]
+    struct FixtureBus {
+        vehicle_body: Option<String>,
+        output_body: Option<String>,
+        read_fails: bool,
+        failed_writes_remaining: usize,
+        published: Vec<TransitSnapshot>,
+    }
+
+    impl TransitBus for FixtureBus {
+        fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+            if self.read_fails {
+                Err(io::Error::other("injected transit Bus read failure"))
+            } else if topic == transit_state_topic("rig-1") {
+                Ok(self.output_body.clone())
+            } else {
+                Ok(self.vehicle_body.clone())
+            }
+        }
+
+        fn publish_snapshot(&mut self, _topic: &str, snapshot: &TransitSnapshot) -> io::Result<()> {
+            if self.failed_writes_remaining > 0 {
+                self.failed_writes_remaining -= 1;
+                return Err(io::Error::other("injected transit Bus write failure"));
+            }
+            self.output_body = Some(serde_json::to_string(snapshot).expect("snapshot JSON"));
+            self.published.push(snapshot.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct LiveProbe {
+        fetches: AtomicUsize,
+        commits: AtomicUsize,
+    }
+
+    impl TransitProbe for LiveProbe {
+        fn fetch(&self, _point: TransitPoint) -> io::Result<ProbeResponse> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(ProbeResponse::Modified(live_feed()))
+        }
+
+        fn commit(&self, _point: TransitPoint) {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct RaceProbe {
+        started: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+        fetches: AtomicUsize,
+        commits: AtomicUsize,
+    }
+
+    impl TransitProbe for RaceProbe {
+        fn fetch(&self, _point: TransitPoint) -> io::Result<ProbeResponse> {
+            let call = self.fetches.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    started
+                        .send(())
+                        .map_err(|_| io::Error::other("race observer dropped"))?;
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| io::Error::other("race release missing"))?
+                        .recv()
+                        .map_err(|_| io::Error::other("race release dropped"))?;
+                }
+            }
+            Ok(ProbeResponse::Modified(live_feed()))
+        }
+
+        fn commit(&self, _point: TransitPoint) {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -1165,13 +1540,259 @@ mod tests {
             age_s: 1.0,
             ..GpsFix::default()
         };
-        assert!(validated_vehicle_point(&vehicle, "rig-1", 110_000).is_some());
-        assert!(validated_vehicle_point(&vehicle, "other", 110_000).is_none());
+        assert!(validated_vehicle_point(&vehicle, "rig-1", 110_000)
+            .unwrap()
+            .is_some());
+        assert!(validated_vehicle_point(&vehicle, "other", 110_000).is_err());
         vehicle.gps.age_s = 25.0;
-        assert!(validated_vehicle_point(&vehicle, "rig-1", 110_001).is_none());
+        assert!(validated_vehicle_point(&vehicle, "rig-1", 110_001)
+            .unwrap()
+            .is_none());
         vehicle.gps.age_s = 0.0;
         vehicle.gps.latitude = f64::NAN;
-        assert!(validated_vehicle_point(&vehicle, "rig-1", 100_000).is_none());
+        assert!(validated_vehicle_point(&vehicle, "rig-1", 100_000).is_err());
+    }
+
+    #[test]
+    fn context_read_or_decode_fault_is_effect_free() {
+        let worker = TransitOverlayWorker::new("rig-1".to_string());
+        let original =
+            build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("last-good snapshot");
+        for mut bus in [
+            FixtureBus {
+                read_fails: true,
+                ..FixtureBus::default()
+            },
+            FixtureBus {
+                vehicle_body: Some("{not vehicle JSON".to_string()),
+                ..FixtureBus::default()
+            },
+        ] {
+            let mut last_good = Some(original.clone());
+            let mut no_context_published = false;
+            assert!(worker
+                .current_point_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+                .is_err());
+            assert_eq!(last_good.as_ref().unwrap().vehicles, original.vehicles);
+            assert!(!no_context_published);
+            assert!(bus.published.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_write_retries_prepared_result_without_refetch_or_early_validator_commit() {
+        let worker = TransitOverlayWorker::new("rig-1".to_string());
+        let probe = LiveProbe::default();
+        let response = probe.fetch(point()).expect("single provider fetch");
+        let prepared = match response {
+            ProbeResponse::Modified(body) => Ok(PreparedResponse::Modified(
+                build_snapshot("rig-1", point(), &body, now_ms()).expect("prepared snapshot"),
+            )),
+            ProbeResponse::NotModified => panic!("fixture unexpectedly returned 304"),
+        };
+        let mut bus = FixtureBus {
+            failed_writes_remaining: 1,
+            ..FixtureBus::default()
+        };
+        let mut last_good = None;
+
+        assert!(worker
+            .apply_result(&mut bus, prepared.clone(), point(), &mut last_good)
+            .is_err());
+        assert!(last_good.is_none());
+        assert_eq!(probe.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.commits.load(Ordering::SeqCst), 0);
+        assert!(bus.published.is_empty());
+
+        assert!(worker
+            .apply_result(&mut bus, prepared, point(), &mut last_good)
+            .expect("corrected-forward publication"));
+        probe.commit(point());
+        assert_eq!(probe.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.commits.load(Ordering::SeqCst), 1);
+        assert!(last_good.is_some());
+        assert_eq!(bus.published.len(), 1);
+        assert!(bus.published[0].vehicles.len() <= MAX_RETAINED_VEHICLES);
+
+        let mut no_context_published = false;
+        bus.failed_writes_remaining = 1;
+        assert!(worker
+            .current_point_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .is_err());
+        assert!(last_good.is_some());
+        assert!(!no_context_published);
+        assert_eq!(bus.published.len(), 1);
+
+        assert!(worker
+            .current_point_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .expect("corrected-forward no-context publication")
+            .is_none());
+        assert!(last_good.is_none());
+        assert!(no_context_published);
+        assert_eq!(bus.published.len(), 2);
+        assert!(bus.published.last().unwrap().vehicles.is_empty());
+
+        assert!(worker
+            .current_point_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .expect("suppressed repeated no-context publication")
+            .is_none());
+        assert_eq!(bus.published.len(), 2);
+        bus.output_body = None;
+        assert!(worker
+            .current_point_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .expect("replacement output publication")
+            .is_none());
+        assert_eq!(bus.published.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn late_and_replaced_bus_recovers_in_the_same_worker() {
+        assert_eq!(
+            transit_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let root = tempfile::tempdir().expect("root");
+        let bus_root = root.path().join("bus");
+        std::fs::write(&bus_root, b"blocks Persist::open").expect("late Bus blocker");
+        let probe = Arc::new(LiveProbe::default());
+        let mut worker = TransitOverlayWorker::new("rig-1".to_string())
+            .with_probe(probe.clone())
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(!task.is_finished(), "late Bus terminated the worker");
+        std::fs::remove_file(&bus_root).expect("unblock Bus root");
+        let first_bus = Persist::open(bus_root.clone()).expect("activate Bus");
+        write_vehicle(&first_bus, &vehicle(point()));
+        let topic = transit_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = first_bus.read_latest(&topic) {
+                    let snapshot: TransitSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == point().latitude {
+                        assert!(snapshot.vehicles.len() <= MAX_RETAINED_VEHICLES);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("late Bus publication");
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{suffix}",
+                bus_root.join("index.sqlite").display()
+            ));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(bus_root.clone()).expect("replacement Bus");
+        let moved = TransitPoint {
+            latitude: 42.4,
+            longitude: -71.2,
+        };
+        write_vehicle(&replacement_bus, &vehicle(moved));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = replacement_bus.read_latest(&topic) {
+                    let snapshot: TransitSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == moved.latitude {
+                        assert!(snapshot.vehicles.len() <= MAX_RETAINED_VEHICLES);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus publication");
+
+        assert!(probe.fetches.load(Ordering::SeqCst) >= 2);
+        assert!(probe.commits.load(Ordering::SeqCst) >= 2);
+        tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("worker join")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn post_fetch_point_race_discards_old_feed_before_publication() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let old_point = point();
+        write_vehicle(&persist, &vehicle(old_point));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let probe = Arc::new(RaceProbe {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(Some(release_rx)),
+            fetches: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+        });
+        let mut worker = TransitOverlayWorker::new("rig-1".to_string())
+            .with_probe(probe.clone())
+            .with_bus_root(bus.path().to_path_buf())
+            .with_poll(Duration::from_millis(5));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("race observer join")
+            .expect("provider did not start");
+        let moved = TransitPoint {
+            latitude: 42.4,
+            longitude: -71.2,
+        };
+        write_vehicle(&persist, &vehicle(moved));
+        release_tx.send(()).expect("release provider");
+
+        let topic = transit_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = persist.read_latest(&topic) {
+                    let snapshot: TransitSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == moved.latitude {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("moved-point publication");
+        for row in persist.list_since(&topic, None).expect("transit rows") {
+            let snapshot: TransitSnapshot =
+                serde_json::from_str(row.body.as_deref().unwrap_or_default()).unwrap();
+            assert_ne!(snapshot.query_latitude, old_point.latitude);
+            assert!(snapshot.vehicles.len() <= MAX_RETAINED_VEHICLES);
+        }
+        let fetches = probe.fetches.load(Ordering::SeqCst);
+        let commits = probe.commits.load(Ordering::SeqCst);
+        assert!(fetches >= 2);
+        assert!(fetches > commits, "discarded old-point fetch was committed");
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("worker join")
+            .expect("worker result");
     }
 
     #[test]
@@ -1202,6 +1823,48 @@ mod tests {
         ] {
             assert!(validate_endpoint(hostile).is_err(), "accepted {hostile}");
         }
+    }
+
+    #[test]
+    fn http_validators_remain_staged_until_publication_commit() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let body = captured_feed();
+        let body_len = body.len();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nETag: \"feed-v1\"\r\nLast-Modified: Sun, 09 Aug 2026 12:00:00 GMT\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("headers");
+            stream.write_all(&body).expect("body");
+        });
+        let probe =
+            MbtaHttpProbe::new_for_test(format!("http://{address}/vehicles.pb")).expect("probe");
+
+        assert!(matches!(
+            probe.fetch(point()).expect("fetch"),
+            ProbeResponse::Modified(_)
+        ));
+        {
+            let validators = probe.validators.lock().expect("validators");
+            assert!(validators.committed.is_none());
+            let staged = validators.staged.as_ref().expect("staged validators");
+            assert_eq!(staged.etag.as_deref(), Some("\"feed-v1\""));
+            assert_eq!(staged.point, point());
+        }
+        probe.commit(point());
+        {
+            let validators = probe.validators.lock().expect("validators");
+            assert!(validators.staged.is_none());
+            let committed = validators.committed.as_ref().expect("committed validators");
+            assert_eq!(committed.etag.as_deref(), Some("\"feed-v1\""));
+            assert_eq!(committed.point, point());
+        }
+        server.join().expect("server join");
     }
 
     #[test]
@@ -1251,12 +1914,21 @@ mod tests {
     fn failed_refresh_keeps_timestamp_and_publishes_degraded_latest_snapshot() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original = build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("parse");
         let mut last = None;
-        assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), point(), &mut last));
-        assert!(!worker.apply_result(Err(io::Error::other("timeout")), point(), &mut last));
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                point(),
+                &mut last,
+            )
+            .expect("fresh publication"));
+        assert!(!worker
+            .apply_result(&mut bus, Err("timeout".to_string()), point(), &mut last,)
+            .expect("degraded publication"));
         assert_eq!(last.as_ref().expect("last").fetched_at_ms, NOW_MS);
         assert!(last
             .as_ref()
@@ -1273,14 +1945,23 @@ mod tests {
 
     #[test]
     fn not_modified_cannot_relabel_a_moved_points_snapshot() {
-        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
+        let worker = TransitOverlayWorker::new("rig-1".to_string());
         let original = build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("parse");
         let mut last = Some(original);
+        let temp = tempfile::tempdir().expect("bus");
+        let mut bus = Persist::open(temp.path().to_path_buf()).expect("persist");
         let moved = TransitPoint {
             latitude: point().latitude + 1.0,
             longitude: point().longitude,
         };
-        assert!(!worker.apply_result(Ok(PreparedResponse::NotModified), moved, &mut last));
+        assert!(!worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::NotModified),
+                moved,
+                &mut last,
+            )
+            .expect("retraction"));
         assert!(
             last.is_none(),
             "moved query must clear the retained snapshot"
@@ -1291,17 +1972,26 @@ mod tests {
     fn failed_refresh_retracts_retained_vehicles_after_query_point_moves() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original = build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("parse");
         let mut last = None;
-        assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), point(), &mut last));
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                point(),
+                &mut last,
+            )
+            .expect("fresh publication"));
         let moved = TransitPoint {
             latitude: point().latitude + 1.0,
             longitude: point().longitude,
         };
 
-        assert!(!worker.apply_result(Err(io::Error::other("timeout")), moved, &mut last,));
+        assert!(!worker
+            .apply_result(&mut bus, Err("timeout".to_string()), moved, &mut last,)
+            .expect("retraction publication"));
         assert!(last.is_none(), "the old snapshot must not remain in memory");
 
         let row = Persist::open(root)
@@ -1325,17 +2015,21 @@ mod tests {
     fn no_fresh_vehicle_fix_publishes_empty_state_before_first_fetch() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root));
+        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let mut private_cache = None;
+        let mut bus = Persist::open(root.clone()).expect("bus");
 
-        worker.publish_no_context_degraded(
-            &mut private_cache,
-            "MBTA refresh failed: fresh same-host MG90 vehicle fix unavailable",
-        );
+        worker
+            .publish_no_context_degraded(
+                &mut bus,
+                &mut private_cache,
+                "MBTA refresh failed: fresh same-host MG90 vehicle fix unavailable",
+            )
+            .expect("empty publication");
 
         assert!(private_cache.is_none());
         let snapshot: TransitSnapshot = serde_json::from_str(
-            Persist::open(worker.bus_root.clone().expect("root"))
+            Persist::open(root)
                 .expect("bus")
                 .read_latest(&transit_state_topic("rig-1"))
                 .expect("read")
@@ -1365,23 +2059,29 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let seed_worker =
-            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original = build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("parse");
         assert!(!original.vehicles.is_empty());
         let mut seed_cache = None;
-        assert!(seed_worker.apply_result(
-            Ok(PreparedResponse::Modified(original.clone())),
-            point(),
-            &mut seed_cache,
-        ));
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        assert!(seed_worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original.clone())),
+                point(),
+                &mut seed_cache,
+            )
+            .expect("seed publication"));
 
-        let restarted =
-            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let restarted = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let mut private_cache = Some(original);
-        restarted.publish_no_context_degraded(
-            &mut private_cache,
-            "MBTA refresh failed: no fresh vehicle fix after restart",
-        );
+        restarted
+            .publish_no_context_degraded(
+                &mut bus,
+                &mut private_cache,
+                "MBTA refresh failed: no fresh vehicle fix after restart",
+            )
+            .expect("empty publication");
 
         assert!(
             private_cache.is_none(),
@@ -1421,7 +2121,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_wins_while_blocking_http_is_in_flight() {
-        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
+        let worker = TransitOverlayWorker::new("rig-1".to_string());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut shutdown = ShutdownToken::from_receiver(rx);
         let sender = tokio::spawn(async move {
@@ -1439,25 +2139,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+    async fn repeated_no_context_polls_publish_once_and_replacement_retries() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let mut worker = TransitOverlayWorker::new("rig-1".to_string())
             .with_probe(Arc::new(SlowProbe))
-            .with_bus_root(Some(root.clone()))
-            .with_poll(Duration::from_millis(50));
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { worker.run(token).await });
 
         let topic = transit_state_topic("rig-1");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let first_bus = Persist::open(root.clone()).expect("bus");
         let body = loop {
-            if let Some(row) = Persist::open(root.clone())
-                .expect("bus")
-                .read_latest(&topic)
-                .expect("read")
-            {
+            if let Some(row) = first_bus.read_latest(&topic).expect("read") {
                 break row.body.expect("body");
             }
             assert!(
@@ -1466,6 +2163,48 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            first_bus
+                .list_since(&topic, None)
+                .expect("first Bus rows")
+                .len(),
+            1,
+            "repeated no-context polls appended duplicate snapshots"
+        );
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", root.join("index.sqlite").display()));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(root.clone()).expect("replacement Bus");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if replacement_bus
+                    .read_latest(&topic)
+                    .expect("replacement read")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement no-context publication");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            replacement_bus
+                .list_since(&topic, None)
+                .expect("replacement rows")
+                .len(),
+            1,
+            "replacement Bus received duplicate no-context snapshots"
+        );
 
         tx.send(true).expect("shutdown");
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;

@@ -464,8 +464,7 @@ behavioral evidence is not completion.
   now folds durable request/reply history, and unreadable replies cannot regress
   terminal jobs to false pending state. Machine 196 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-jobs-bus-recovery-r37.md`.
-- **Datacenter audit recovery checkpoint (2026-08-09):** complete request/output
-  snapshots recover late storage and prevent duplicate projections across restart. Machine 9 passed three exact tests:
+- **Datacenter audit recovery checkpoint (2026-08-09):** request/output snapshots recover late storage and prevent duplicate projections; machine 9 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-auditor-bus-recovery-r39.md`.
 - **Scheduled-snapshot recovery checkpoint (2026-08-09):** complete durable
   schedule/history reads precede effects; same-process failed-result publication cannot repeat effects, while the crash outbox remains open. Machine 193 passed four exact tests:
@@ -503,6 +502,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-transit-overlay-bus-recovery-r63.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
@@ -862,21 +862,13 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
-- **Air-quality transaction checkpoint (2026-08-09):** context is freshly
-  rechecked after provider I/O and failed reads/writes commit no state. Machine
-  193 passed six exact recovery and withholding tests:
+- **Environmental-overlay transaction checkpoints (2026-08-09):** exact post-I/O context, late/replaced storage, failed writes, validators, and transition suppression
+  now gate Air Quality, IEM radar, NWS alerts, Earthquake, and Transit; machines 193/194/9 and BigBoy passed focused hostile recovery tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`.
-- **IEM radar transaction checkpoint (2026-08-09):** late/replaced storage,
-  exact post-I/O context, failed writes, and no-fix transition suppression
-  passed eleven focused tests on machine 194:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`.
-- **NWS alert transaction checkpoint (2026-08-09):** provider results remain
-  staged across write faults and exact vehicle context is rechecked before
-  commit. Machine 9 passed seven focused tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`.
-- **Earthquake transaction checkpoint (2026-08-09):** failed publication commits neither latest-wins state nor conditional validators/cadence;
-  BigBoy passed two exact late/replaced and corrected-forward tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`.
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-transit-overlay-bus-recovery-r63.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
