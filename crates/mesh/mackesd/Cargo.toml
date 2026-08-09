@@ -41,6 +41,7 @@ path = "src/bin/meshctl.rs"
 
 [dependencies]
 mackes-mesh-types = { path = "../mackes-mesh-types" }
+jiff = { workspace = true }
 magic-fleet = { path = "../magic-fleet" }
 # NF-1 (v2.5) — covert TCP/443 transport. mackesd consumes the
 # activation state machine + framing + rustls listener/dialer

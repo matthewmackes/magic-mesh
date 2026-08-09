@@ -1308,11 +1308,11 @@ behavioral evidence is not completion.
 - Required outcome: one egui-native Clock surface provides World Clock, Alarms, Timers, and Stopwatch with AOSP DeskClock-derived procedures under Quazar styling. The
   visible clock opens Clock, a dedicated bell opens Notification Center, mackesd owns persisted scheduling and signed multi-peer execution, and mde-musicd remains the
   only Music/radio/NPR source and playback authority.
-- Current state: signed contracts, durable scheduling/convergence, governed NPR/local-file audio, and distinct Clock/bell chrome exist; multi-process faults, remaining
-  audio/UI behavior, packaging, and live proof remain.
-- **Clock contract checkpoint (2026-08-08):** 5/5 focused and 473/473 complete tests passed on `.196`; evidence:
-  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`. **Local scheduler checkpoint:** persistence/replay/recovery passed on `.50`;
-  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-scheduler-s2-r1.md`.
+- Current state: Signed contracts, durable scheduling/convergence, governed audio, and Clock/bell chrome exist; multi-process/UI/package/live proof remains.
+- **Clock contract checkpoint (2026-08-08):** 5/5 focused and 473/473 complete tests passed on `.196`:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`.
+- **Scheduler checkpoint (2026-08-09):** persistence/recovery plus weekday/DST execution passed the 6/6 Clock suite on BigBoy:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-scheduler-s2-r1.md`; `docs/platform/evidence/WL-FUNC-022-2026-08-09-weekday-alarm-dst-r2.md`.
 - **Peer convergence checkpoint (2026-08-08):** delivery/loss/rejoin, replay/reordering, local removal, global Stop, and missed-late passed 3/3 on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
 - **Clock audio checkpoint (2026-08-08):** durable signed Start/Stop/Snooze replay and the 3,000 ms audibility fallback passed 7/7 on `.196`:

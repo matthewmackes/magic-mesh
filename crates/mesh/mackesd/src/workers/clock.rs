@@ -14,13 +14,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use jiff::{civil::Weekday as JiffWeekday, tz::TimeZone, Timestamp, ToSpan as _};
 use mackes_mesh_types::clock::{
     clock_audio_status_topic, clock_command_topic, clock_state_topic, ClockAcknowledgementV1,
     ClockAlarmRecurrenceV1, ClockAudioActionV1, ClockAudioRequestV1, ClockAudioStatusV1,
-    ClockCommandKindV1, ClockCommandV1, ClockOccurrencePhase, ClockOccurrenceV1,
+    ClockCommandKindV1, ClockCommandV1, ClockFoldPolicy, ClockOccurrencePhase, ClockOccurrenceV1,
     ClockScheduleKindV1, ClockScheduleV1, ClockSettingsV1, ClockSnapshotV1, ClockStopwatchV1,
     ClockTargetDisposition, ClockTargetState, ClockTimerPhase, ClockValidationContext,
-    CLOCK_AUDIO_ACTION_TOPIC, CLOCK_SCHEMA_VERSION, MAX_CLOCK_AUDIO_REQUEST_TTL_MS,
+    ClockWeekday, CLOCK_AUDIO_ACTION_TOPIC, CLOCK_SCHEMA_VERSION, MAX_CLOCK_AUDIO_REQUEST_TTL_MS,
     MAX_CLOCK_COMMAND_TTL_MS, MAX_CLOCK_OCCURRENCES,
 };
 use mackes_mesh_types::music_auth::{self, MusicAuthContext, MUSIC_AUTH_CREDENTIAL_NAME};
@@ -483,7 +484,19 @@ impl ClockWorker {
                 } else {
                     None
                 };
-                let late_due = due_now_or_before(&schedule, now_ms);
+                // A recurring alarm has no creation watermark in its wire
+                // contract. Admitting one must therefore start with its next
+                // selected civil day, not manufacture a missed occurrence for
+                // the previous week. The durable snapshot timestamp becomes
+                // its evaluation watermark after this command commits.
+                let late_due = match &schedule.schedule {
+                    ClockScheduleKindV1::Alarm(alarm)
+                        if matches!(alarm.recurrence, ClockAlarmRecurrenceV1::Weekdays { .. }) =>
+                    {
+                        None
+                    }
+                    _ => due_now_or_before(&schedule, now_ms)?,
+                };
                 if let Some(due_at) = late_due {
                     expire_schedule(&mut schedule, due_at);
                     add_occurrence(
@@ -614,8 +627,24 @@ impl ClockWorker {
         let snapshot = self.snapshot.as_mut().expect("Clock snapshot loaded");
         let mut due = Vec::new();
         for schedule in &snapshot.schedules {
-            if let Some(due_at) = due_now_or_before(schedule, now_ms) {
-                due.push((schedule.schedule_id.clone(), due_at));
+            let due_at = due_now_or_before(schedule, now_ms)?.filter(|due_at| {
+                !matches!(
+                    &schedule.schedule,
+                    ClockScheduleKindV1::Alarm(mackes_mesh_types::clock::ClockAlarmV1 {
+                        recurrence: ClockAlarmRecurrenceV1::Weekdays { .. },
+                        ..
+                    })
+                ) || *due_at > snapshot.produced_at_utc_ms
+            });
+            if let Some(due_at) = due_at {
+                let occurrence_id = format!("{}:{due_at}", schedule.schedule_id);
+                if !snapshot
+                    .occurrences
+                    .iter()
+                    .any(|value| value.occurrence_id == occurrence_id)
+                {
+                    due.push((schedule.schedule_id.clone(), due_at));
+                }
             }
         }
         let scheduled_occurrences = snapshot
@@ -1004,24 +1033,86 @@ fn peer_request_id(
     format!("clock-peer-{kind}-{}", &hex_bytes(&digest.finalize())[..32])
 }
 
-fn due_now_or_before(schedule: &ClockScheduleV1, now_ms: i64) -> Option<i64> {
+fn due_now_or_before(schedule: &ClockScheduleV1, now_ms: i64) -> anyhow::Result<Option<i64>> {
     match &schedule.schedule {
         ClockScheduleKindV1::Alarm(alarm) if alarm.enabled => match alarm.recurrence {
             ClockAlarmRecurrenceV1::OneTime { due_at_utc_ms } if due_at_utc_ms <= now_ms => {
-                Some(due_at_utc_ms)
+                Ok(Some(due_at_utc_ms))
             }
-            _ => None,
+            ClockAlarmRecurrenceV1::Weekdays {
+                ref local_time,
+                ref weekdays,
+            } => weekday_due_now_or_before(local_time, weekdays, now_ms),
+            _ => Ok(None),
         },
         ClockScheduleKindV1::Timer(timer) if timer.phase == ClockTimerPhase::Running => timer
             .absolute_deadline_utc_ms
-            .filter(|deadline| *deadline <= now_ms),
-        _ => None,
+            .filter(|deadline| *deadline <= now_ms)
+            .map_or(Ok(None), |deadline| Ok(Some(deadline))),
+        _ => Ok(None),
+    }
+}
+
+fn weekday_due_now_or_before(
+    local_time: &mackes_mesh_types::clock::ClockCivilTimeV1,
+    weekdays: &[ClockWeekday],
+    now_ms: i64,
+) -> anyhow::Result<Option<i64>> {
+    let time_zone = TimeZone::get(&local_time.time_zone)
+        .with_context(|| format!("Clock IANA zone {} is unavailable", local_time.time_zone))?;
+    let now = Timestamp::from_millisecond(now_ms)
+        .context("Clock wall time is outside Jiff's supported range")?
+        .to_zoned(time_zone.clone());
+
+    for days_ago in 0_i64..7 {
+        let date = now
+            .date()
+            .checked_sub(days_ago.days())
+            .context("Clock weekday date arithmetic overflowed")?;
+        if !weekdays.contains(&clock_weekday(date.weekday())) {
+            continue;
+        }
+        let hour = i8::try_from(local_time.hour).context("Clock civil hour is out of range")?;
+        let minute =
+            i8::try_from(local_time.minute).context("Clock civil minute is out of range")?;
+        let second =
+            i8::try_from(local_time.second).context("Clock civil second is out of range")?;
+        let civil = date.at(hour, minute, second, 0);
+        let ambiguous = time_zone.to_ambiguous_zoned(civil);
+        let zoned = match local_time.fold {
+            // Compatible chooses the earlier instant in a fold and the next
+            // valid instant after a gap, exactly matching the Clock contract.
+            ClockFoldPolicy::Earlier => ambiguous.compatible(),
+            ClockFoldPolicy::Later => ambiguous.later(),
+        }
+        .context("Clock civil alarm could not be resolved in its IANA zone")?;
+        let due_at = zoned.timestamp().as_millisecond();
+        if due_at <= now_ms {
+            return Ok(Some(due_at));
+        }
+    }
+    Ok(None)
+}
+
+const fn clock_weekday(weekday: JiffWeekday) -> ClockWeekday {
+    match weekday {
+        JiffWeekday::Monday => ClockWeekday::Monday,
+        JiffWeekday::Tuesday => ClockWeekday::Tuesday,
+        JiffWeekday::Wednesday => ClockWeekday::Wednesday,
+        JiffWeekday::Thursday => ClockWeekday::Thursday,
+        JiffWeekday::Friday => ClockWeekday::Friday,
+        JiffWeekday::Saturday => ClockWeekday::Saturday,
+        JiffWeekday::Sunday => ClockWeekday::Sunday,
     }
 }
 
 fn expire_schedule(schedule: &mut ClockScheduleV1, due_at: i64) {
     match &mut schedule.schedule {
-        ClockScheduleKindV1::Alarm(alarm) => alarm.enabled = false,
+        ClockScheduleKindV1::Alarm(alarm) => {
+            if matches!(alarm.recurrence, ClockAlarmRecurrenceV1::OneTime { .. }) {
+                alarm.enabled = false;
+            }
+        }
         ClockScheduleKindV1::Timer(timer) => {
             timer.phase = ClockTimerPhase::Expired;
             timer.absolute_deadline_utc_ms = Some(due_at);
@@ -1795,7 +1886,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use mackes_mesh_types::clock::{
         ClockAlarmV1, ClockAudioPlaybackPhase, ClockAudioProviderStatus, ClockAudioRef,
-        ClockTimerV1, MAX_CLOCK_COMMAND_TTL_MS,
+        ClockGapPolicy, ClockTimerV1, MAX_CLOCK_COMMAND_TTL_MS,
     };
     use mackes_mesh_types::music_auth;
     use rusqlite::Connection;
@@ -2181,6 +2272,94 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn weekday_alarm_schedule(
+        schedule_id: &str,
+        hour: u8,
+        minute: u8,
+        fold: ClockFoldPolicy,
+    ) -> ClockScheduleV1 {
+        ClockScheduleV1 {
+            schedule_id: schedule_id.into(),
+            origin_node_id: "seat-1".into(),
+            revision: 1,
+            label: "DST alarm".into(),
+            selected_target_ids: vec!["seat-1".into()],
+            schedule: ClockScheduleKindV1::Alarm(ClockAlarmV1 {
+                enabled: true,
+                label: "DST alarm".into(),
+                recurrence: ClockAlarmRecurrenceV1::Weekdays {
+                    local_time: mackes_mesh_types::clock::ClockCivilTimeV1 {
+                        hour,
+                        minute,
+                        second: 0,
+                        time_zone: "America/New_York".into(),
+                        fold,
+                        gap: ClockGapPolicy::NextValid,
+                    },
+                    weekdays: vec![ClockWeekday::Sunday],
+                },
+                sound: ClockAudioRef::Bundled {
+                    tone_id: "bell".into(),
+                },
+                vibrate: false,
+            }),
+        }
+    }
+
+    fn timestamp_ms(value: &str) -> i64 {
+        value.parse::<Timestamp>().unwrap().as_millisecond()
+    }
+
+    #[test]
+    fn weekday_alarm_resolves_dst_and_advances_once_per_selected_civil_day() {
+        let spring_due = timestamp_ms("2024-03-10T07:30:00Z");
+        let spring = weekday_alarm_schedule("weekly-spring", 2, 30, ClockFoldPolicy::Earlier);
+        assert_eq!(
+            due_now_or_before(&spring, spring_due).unwrap(),
+            Some(spring_due),
+            "a gap must advance to the next valid local instant"
+        );
+
+        let fall_earlier_due = timestamp_ms("2024-11-03T05:30:00Z");
+        let fall_later_due = timestamp_ms("2024-11-03T06:30:00Z");
+        let fall_earlier =
+            weekday_alarm_schedule("weekly-fold-early", 1, 30, ClockFoldPolicy::Earlier);
+        let fall_later = weekday_alarm_schedule("weekly-fold-late", 1, 30, ClockFoldPolicy::Later);
+        assert_eq!(
+            due_now_or_before(&fall_earlier, fall_earlier_due).unwrap(),
+            Some(fall_earlier_due)
+        );
+        assert_eq!(
+            due_now_or_before(&fall_later, fall_later_due).unwrap(),
+            Some(fall_later_due)
+        );
+
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let snapshot = fixture.worker.snapshot.as_mut().unwrap();
+        snapshot.schedules.push(spring);
+        snapshot.produced_at_utc_ms = spring_due - 1;
+
+        assert!(fixture.worker.advance_deadlines(spring_due).unwrap());
+        assert!(!fixture.worker.advance_deadlines(spring_due).unwrap());
+        let snapshot = fixture.worker.snapshot.as_mut().unwrap();
+        assert_eq!(snapshot.occurrences.len(), 1);
+        assert_eq!(snapshot.occurrences[0].due_at_utc_ms, spring_due);
+        let ClockScheduleKindV1::Alarm(alarm) = &snapshot.schedules[0].schedule else {
+            panic!("weekday schedule changed kind");
+        };
+        assert!(alarm.enabled, "a recurring alarm must remain armed");
+
+        snapshot.produced_at_utc_ms = spring_due;
+        let next_due = timestamp_ms("2024-03-17T06:30:00Z");
+        assert!(fixture.worker.advance_deadlines(next_due).unwrap());
+        assert_eq!(
+            fixture.worker.snapshot.as_ref().unwrap().occurrences.len(),
+            2,
+            "the next selected civil Sunday must create exactly one new occurrence"
+        );
     }
 
     fn signed_ack_for(
