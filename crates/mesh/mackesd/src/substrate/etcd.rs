@@ -15,6 +15,7 @@
 //! cert TLS is a deferred follow-on before any non-overlay exposure.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use etcd_client::{Client, ConnectOptions, Error, WatchOptions, WatchStream};
@@ -57,6 +58,17 @@ pub const SESSION_LEASE_TTL_S: i64 = 30;
 /// In particular, enrollment must never hold its short-lived TLS connection
 /// indefinitely while probing an unavailable overlay anchor.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+// `etcd_client::Client::connect` accepts several endpoints, but its first RPC
+// can still be routed to a reachable member that cannot commit.  Remember the
+// last endpoint that completed a linearizable probe so every short-lived MCNF
+// client starts with a known-good member instead of repeatedly stalling on the
+// first configured URL.
+static PREFERRED_ENDPOINT: AtomicUsize = AtomicUsize::new(0);
+
+fn endpoint_attempt_order(len: usize, preferred: usize) -> Vec<usize> {
+    (0..len).map(|offset| (preferred + offset) % len).collect()
+}
 
 /// etcd key for a peer's directory entry.
 #[must_use]
@@ -121,15 +133,44 @@ pub fn default_endpoints() -> Vec<String> {
 /// # Errors
 /// An [`etcd_client::Error`] when no endpoint is reachable.
 pub async fn connect(endpoints: &[String]) -> Result<Client, Error> {
-    Client::connect(
-        endpoints,
-        Some(
-            ConnectOptions::default()
-                .with_connect_timeout(CLIENT_TIMEOUT)
-                .with_timeout(CLIENT_TIMEOUT),
-        ),
-    )
-    .await
+    if endpoints.is_empty() {
+        return Client::connect(
+            endpoints,
+            Some(
+                ConnectOptions::default()
+                    .with_connect_timeout(CLIENT_TIMEOUT)
+                    .with_timeout(CLIENT_TIMEOUT),
+            ),
+        )
+        .await;
+    }
+
+    let preferred = PREFERRED_ENDPOINT.load(Ordering::Relaxed) % endpoints.len();
+    let mut last_error = None;
+    for index in endpoint_attempt_order(endpoints.len(), preferred) {
+        let endpoint = &endpoints[index];
+        let candidate = Client::connect(
+            std::slice::from_ref(endpoint),
+            Some(
+                ConnectOptions::default()
+                    .with_connect_timeout(CLIENT_TIMEOUT)
+                    .with_timeout(CLIENT_TIMEOUT),
+            ),
+        )
+        .await;
+        match candidate {
+            Ok(mut client) => match client.get("__mcnf_connect_probe__", None).await {
+                Ok(_) => {
+                    PREFERRED_ENDPOINT.store(index, Ordering::Relaxed);
+                    return Ok(client);
+                }
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.expect("a non-empty endpoint list produced at least one attempt"))
 }
 
 /// Open an etcd v3 **watch stream** on `key` with `options`. The returned
@@ -180,6 +221,13 @@ mod tests {
                 "http://10.42.0.3:2379".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn endpoint_failover_starts_at_last_committing_member_and_wraps_once() {
+        assert_eq!(endpoint_attempt_order(3, 0), vec![0, 1, 2]);
+        assert_eq!(endpoint_attempt_order(3, 1), vec![1, 2, 0]);
+        assert_eq!(endpoint_attempt_order(3, 2), vec![2, 0, 1]);
     }
 
     #[test]

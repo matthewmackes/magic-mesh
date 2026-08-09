@@ -61,6 +61,9 @@ restart() {
 #    Syncthing daemon.
 ETCD_ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
 SYNCTHING_FOLDER_ID="${MCNF_SYNCTHING_FOLDER_ID:-mcnf-mesh}"
+PEER_PUBLICATION_STAMP="${MCNF_PEER_PUBLICATION_STAMP:-$HEALTH_RUN_DIR/peer-publication.ok}"
+PEER_PUBLICATION_MAX_AGE_S="${MCNF_PEER_PUBLICATION_MAX_AGE_S:-120}"
+publication_failed=0
 if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
     # etcd coordination plane: quorum health (any reachable client endpoint).
     EPS="$(tr '\n' ',' < "$ETCD_ENDPOINTS_FILE" | sed 's/,$//')"
@@ -175,6 +178,22 @@ for mackesd_group_unit in "${MACKESD_GROUP_UNITS[@]}"; do
     fi
 done
 
+# A running heartbeat worker is not healthy unless its lease-backed own-row
+# transaction is actually committing.  The previous watchdog accepted one
+# reachable etcd endpoint and therefore reported `ok` while a non-committing
+# first endpoint made every peer publication fail.  The heartbeat refreshes
+# this stamp only after the peer row + overlay claim transaction succeeds.
+publication_now="$(date +%s 2>/dev/null || true)"
+publication_mtime="$(stat -c %Y "$PEER_PUBLICATION_STAMP" 2>/dev/null || true)"
+if [ -s "$ETCD_ENDPOINTS_FILE" ] && {
+    [ -z "$publication_now" ] || [ -z "$publication_mtime" ] \
+        || [ "$((publication_now - publication_mtime))" -gt "$PEER_PUBLICATION_MAX_AGE_S" ];
+}; then
+    publication_failed=1
+    restart mackesd-observation.service \
+        "own peer publication missing or stale (lease-backed directory transaction not committing)"
+fi
+
 # 2. nebula must be active AND own the overlay interface.
 if ! systemctl is-active --quiet nebula.service; then
     restart nebula.service "not active"
@@ -198,5 +217,9 @@ else
     fi
 fi
 
+if [ "$publication_failed" -ne 0 ]; then
+    log "DEGRADED: own peer publication is stale; recovery requested"
+    exit 1
+fi
 log "ok"
 exit 0

@@ -1574,6 +1574,13 @@ behavioral evidence is not completion.
   mutation. `.90` fault/systemd checks passed. Live laptop/fleet convergence
   remains. Evidence:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`.
+- **Peer-publication failover checkpoint (2026-08-09):** Dell exposed a false
+  healthy state when one reachable etcd voter could not commit. Client
+  operations now remember and fail over to a committing member, heartbeat
+  success is stamped only after the own-row transaction, and stale publication
+  fails watchdog health. Dell and seat 15 are live again; lighthouse `.1` repair
+  and full-fleet convergence remain:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-peer-publication-failover-r16.md`.
 - **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:

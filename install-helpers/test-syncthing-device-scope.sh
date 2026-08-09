@@ -260,6 +260,7 @@ run_health_case() {
     : > "$case_root/nebula/host.crt"
     printf 'lighthouse:\n  am_lighthouse: true\n' > "$case_root/nebula/config.yaml"
     printf 'role = "Workstation"\n' > "$case_root/role.toml"
+    printf 'ok\n' > "$case_root/run/peer-publication.ok"
     : > "$calls"
     TEST_CALL_LOG="$calls" TEST_ETCD_MODE=authoritative \
     TEST_GLOBAL_DEVICES_FILE="$GLOBAL_DEVICES_FILE" \
@@ -304,6 +305,7 @@ mkdir -p "$HEALTH_ENDPOINT_CASE/nebula" "$HEALTH_ENDPOINT_CASE/run" "$HEALTH_END
 : > "$HEALTH_ENDPOINT_CASE/nebula/host.crt"
 printf 'lighthouse:\n  am_lighthouse: true\n' > "$HEALTH_ENDPOINT_CASE/nebula/config.yaml"
 printf 'role = "Workstation"\n' > "$HEALTH_ENDPOINT_CASE/role.toml"
+printf 'ok\n' > "$HEALTH_ENDPOINT_CASE/run/peer-publication.ok"
 ENDPOINT_CALLS="$HEALTH_ENDPOINT_CASE/calls.log"
 : > "$ENDPOINT_CALLS"
 TEST_CALL_LOG="$ENDPOINT_CALLS" TEST_ETCD_MODE=authoritative TEST_ETCD_HEALTH=first-down \
@@ -318,6 +320,25 @@ if grep -q 'systemctl restart etcd.service' "$ENDPOINT_CALLS"; then
     exit 1
 fi
 printf 'ok: health leaves etcd alone when any coordination endpoint is healthy\n'
+
+# A running observation group without a fresh successful own-row transaction is
+# degraded even when 2/3 coordination members can answer. This is the Dell
+# failure mode: service-active and quorum-ready must not mask stale presence.
+touch -d '5 minutes ago' "$HEALTH_ENDPOINT_CASE/run/peer-publication.ok"
+: > "$ENDPOINT_CALLS"
+if TEST_CALL_LOG="$ENDPOINT_CALLS" TEST_ETCD_MODE=authoritative TEST_ETCD_HEALTH=first-down \
+TEST_GLOBAL_DEVICES_FILE="$GLOBAL_DEVICES_FILE" TEST_FOLDER_DEVICES_FILE="$FOLDER_DEVICES_FILE" \
+TEST_SYSTEM_FILE="$SYSTEM_FILE" TEST_CONNECTIONS_FILE="$HEALTHY_CONNECTIONS" \
+MCNF_NEBULA_DIR="$HEALTH_ENDPOINT_CASE/nebula" MCNF_ROLE_FILE="$HEALTH_ENDPOINT_CASE/role.toml" \
+MCNF_HEALTH_RUN_DIR="$HEALTH_ENDPOINT_CASE/run" MCNF_ETCD_ENDPOINTS_FILE="$ENDPOINTS_MULTI" \
+MCNF_SYNCTHING_HOME="$HEALTH_ENDPOINT_CASE/home" MESH_ALERT_BIN="$MOCK_BIN/mesh-alert" \
+    "$HEALTH" >"$HEALTH_ENDPOINT_CASE/stale.stdout" 2>"$HEALTH_ENDPOINT_CASE/stale.stderr"; then
+    printf 'watchdog reported success with a stale own-peer publication\n' >&2
+    exit 1
+fi
+grep -q 'systemctl restart mackesd-observation.service' "$ENDPOINT_CALLS"
+grep -q 'DEGRADED: own peer publication is stale' "$HEALTH_ENDPOINT_CASE/stale.stdout"
+printf 'ok: stale own-peer publication fails health and requests bounded observation recovery\n'
 
 RECONCILE_GLOBAL="$TEST_ROOT/reconcile-global.txt"
 RECONCILE_FOLDER="$TEST_ROOT/reconcile-folder.txt"

@@ -823,6 +823,9 @@ pub fn spawn_heartbeat_worker(
                                 ) =>
                             {
                                 last_peer_write = Some(std::time::Instant::now());
+                                record_peer_publication_success(Path::new(
+                                    "/run/mesh-health/peer-publication.ok",
+                                ));
                             }
                             Ok(_) => tracing::warn!(
                                 "peer-record: lease-backed peer/claim transaction failed; will retry next heartbeat"
@@ -849,6 +852,18 @@ pub fn spawn_heartbeat_worker(
             }
         }
     })
+}
+
+fn record_peer_publication_success(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let temporary = path.with_extension("tmp");
+    if std::fs::write(&temporary, b"ok\n").is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
 }
 
 /// This node's installed `mde-core` RPM version (PEERVER-2), or
@@ -1296,6 +1311,17 @@ mod tests {
     fn heartbeat_path_shape() {
         let p = heartbeat_path(Path::new("/tmp/qnm"), "peer:anvil");
         assert!(p.ends_with("peer:anvil/mackesd/heartbeat.json"));
+    }
+
+    #[test]
+    fn successful_peer_publication_stamp_is_atomic_and_refreshable() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("peer-publication.ok");
+        record_peer_publication_success(&stamp);
+        assert_eq!(std::fs::read(&stamp).unwrap(), b"ok\n");
+        assert!(!stamp.with_extension("tmp").exists());
+        record_peer_publication_success(&stamp);
+        assert_eq!(std::fs::read(&stamp).unwrap(), b"ok\n");
     }
 
     #[test]
