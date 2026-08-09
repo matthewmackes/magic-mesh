@@ -434,6 +434,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
 - **Session broker replacement recovery (2026-08-09):** roster-preserving dual-tail activation skips retained lifecycle/runtime rows; machine 196 passed exact gates:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`.
+  Session Roaming also preserves its fold and skips retained replacement policy:
+  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-roaming-bus-replacement-r78.md`.
 - **Vehicle transaction recovery (2026-08-09):** late/replaced Bus storage preserves staged state; a privileged-reboot journal prevents repeated effects.
   BigBoy passed four exact gates:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-vehicle-bus-transaction-recovery-r67.md`.
@@ -1847,6 +1849,7 @@ behavioral evidence is not completion.
   convergence whenever the action log is unreadable. BigBoy passed three exact
   recovery tests:
   `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-roaming-bus-recovery-r21.md`.
+  Same-path replacement proof: `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-roaming-bus-replacement-r78.md`.
 - **Compute-migration Bus checkpoint (2026-08-09):** late startup now folds
   outage-queued migration state from durable cursors, and all four Bus lanes
   must read before any migrate/apply/relinquish/rollback effect. BigBoy passed

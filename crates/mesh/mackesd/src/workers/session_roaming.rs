@@ -69,7 +69,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 
 use super::scheduler::NodeId;
 use super::session_broker::{
@@ -1326,7 +1326,7 @@ pub enum RoamingRequest {
 /// The mesh-replicated fold of the roaming request log every node maintains, so any
 /// node has a warm policy view ready to converge if it wins the election. Each map
 /// is latest-wins by key, exactly like the broker's roster fold.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct RoamingFold {
     /// Latest arrival target per driving peer (`from` → `workstation`).
     arrivals: BTreeMap<NodeId, NodeId>,
@@ -1424,6 +1424,14 @@ fn read_new_actions_from(
     let msgs = persist
         .list_since(ACTION_TOPIC, cursor.as_deref())
         .map_err(|error| error.to_string())?;
+    Ok(apply_action_messages(msgs, cursor, authorizer))
+}
+
+fn apply_action_messages(
+    msgs: Vec<StoredMessage>,
+    cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+) -> Vec<RoamingRequest> {
     let mut out = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
@@ -1453,7 +1461,7 @@ fn read_new_actions_from(
             }
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -1518,20 +1526,6 @@ fn drain(
     }
 }
 
-/// Strict production drain: an unreadable Bus is not an empty desired-state
-/// log, so callers can withhold convergence until a read has actually succeeded.
-fn drain_opened(
-    persist: &Persist,
-    cursor: &mut Option<String>,
-    fold: &mut RoamingFold,
-    authorizer: &ActionAuthorizer,
-) -> Result<(), String> {
-    for req in read_new_actions_from(persist, cursor, authorizer)? {
-        fold.apply(req);
-    }
-    Ok(())
-}
-
 fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
 }
@@ -1541,7 +1535,45 @@ fn session_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
 }
 
 #[cfg(test)]
-type BusOpenFn = dyn Fn() -> Result<Option<(PathBuf, Persist)>, String> + Send + Sync;
+type BusOpenFn =
+    dyn Fn() -> Result<Option<(PathBuf, Persist, RoamingBusIdentity)>, String> + Send + Sync;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoamingBusIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn roaming_bus_identity(root: &Path) -> Result<RoamingBusIdentity, String> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))
+        .map_err(|error| format!("inspect roaming Bus index: {error}"))?;
+    if !metadata.is_file() {
+        return Err("roaming Bus index is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(RoamingBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(RoamingBusIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+}
+
+fn verify_roaming_bus_identity(root: &Path, expected: RoamingBusIdentity) -> Result<(), String> {
+    if roaming_bus_identity(root)? != expected {
+        return Err("roaming Bus index changed during transaction".to_string());
+    }
+    Ok(())
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1654,16 +1686,16 @@ impl SessionRoamingWorker {
         session_bus_root_or_system(self.bus_root_override.clone().or_else(default_bus_root))
     }
 
-    fn open_bus(&self) -> Result<Option<(PathBuf, Persist)>, String> {
+    fn open_bus(&self) -> Result<Option<(PathBuf, Persist, RoamingBusIdentity)>, String> {
         #[cfg(test)]
         if let Some(open) = self.bus_open_override.as_ref() {
             return open();
         }
 
         let root = self.bus_root();
-        Persist::open(root.clone())
-            .map(|persist| Some((root, persist)))
-            .map_err(|error| error.to_string())
+        let persist = Persist::open(root.clone()).map_err(|error| error.to_string())?;
+        let identity = roaming_bus_identity(&root)?;
+        Ok(Some((root, persist, identity)))
     }
 
     /// Warm the roaming fold from the replicated layout plane. This is what makes a
@@ -1767,9 +1799,39 @@ impl Worker for SessionRoamingWorker {
         let retry_interval = self
             .poll
             .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
-        let (_bus_root, persist) = loop {
+        let mut fold = RoamingFold::default();
+        self.preload_layouts(&mut fold);
+        let (mut active_identity, mut cursor) = loop {
             match self.open_bus() {
-                Ok(Some(opened)) => break opened,
+                Ok(Some((root, persist, identity))) => {
+                    // First activation rebuilds the complete policy fold. Read
+                    // and verify the index before authorization mutates its
+                    // replay ledger or any request reaches convergence.
+                    match persist
+                        .list_since(ACTION_TOPIC, None)
+                        .map_err(|error| error.to_string())
+                        .and_then(|messages| {
+                            verify_roaming_bus_identity(&root, identity)?;
+                            Ok(messages)
+                        }) {
+                        Ok(messages) => {
+                            let mut staged_cursor = None;
+                            let requests = apply_action_messages(
+                                messages,
+                                &mut staged_cursor,
+                                self.authorizer.as_ref(),
+                            );
+                            for request in requests {
+                                fold.apply(request);
+                            }
+                            break (identity, staged_cursor);
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "session_roaming: initial Bus fold failed; startup will retry"
+                        ),
+                    }
+                }
                 Ok(None) => {
                     tracing::debug!("session_roaming: Bus root unavailable; startup will retry");
                 }
@@ -1785,21 +1847,71 @@ impl Worker for SessionRoamingWorker {
                 () = tokio::time::sleep(retry_interval) => {}
             }
         };
-        // Read the FULL request log from the start (like the broker): the policy view
-        // is a fold of the whole log, so a (re)start rebuilds it before converging.
-        let mut cursor: Option<String> = None;
-        let mut fold = RoamingFold::default();
-        self.preload_layouts(&mut fold);
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    match drain_opened(&persist, &mut cursor, &mut fold, self.authorizer.as_ref()) {
-                        Ok(()) => self.converge(&fold),
+                    match self.open_bus() {
+                        Ok(Some((root, persist, identity))) if identity != active_identity => {
+                            // A replacement is a new transient action lane.
+                            // Atomically tail-prime it while preserving the
+                            // already folded policy/layout view; retained
+                            // commands must not repeat shared-plane effects.
+                            match persist
+                                .latest_ulid(ACTION_TOPIC)
+                                .map_err(|error| error.to_string())
+                                .and_then(|tail| {
+                                    verify_roaming_bus_identity(&root, identity)?;
+                                    Ok(tail)
+                                }) {
+                                Ok(tail) => {
+                                    active_identity = identity;
+                                    cursor = tail;
+                                    self.converge(&fold);
+                                }
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "session_roaming: replacement Bus activation deferred"
+                                ),
+                            }
+                        }
+                        Ok(Some((root, persist, identity))) => {
+                            let staged = persist
+                                .list_since(ACTION_TOPIC, cursor.as_deref())
+                                .map_err(|error| error.to_string())
+                                .and_then(|messages| {
+                                    verify_roaming_bus_identity(&root, identity)?;
+                                    Ok(messages)
+                                });
+                            match staged {
+                                Ok(messages) => {
+                                    let mut staged_cursor = cursor.clone();
+                                    let requests = apply_action_messages(
+                                        messages,
+                                        &mut staged_cursor,
+                                        self.authorizer.as_ref(),
+                                    );
+                                    let mut staged_fold = fold.clone();
+                                    for request in requests {
+                                        staged_fold.apply(request);
+                                    }
+                                    cursor = staged_cursor;
+                                    fold = staged_fold;
+                                    self.converge(&fold);
+                                }
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "session_roaming: Bus read failed; convergence deferred"
+                                ),
+                            }
+                        }
+                        Ok(None) => tracing::debug!(
+                            "session_roaming: Bus unavailable; convergence deferred"
+                        ),
                         Err(error) => tracing::warn!(
                             %error,
-                            "session_roaming: Bus read failed; convergence deferred"
+                            "session_roaming: Bus open failed; convergence deferred"
                         ),
                     }
                 }
@@ -3404,8 +3516,12 @@ mod tests {
                         0 => Ok(None),
                         1 => Err("injected Persist::open failure".to_string()),
                         _ => Persist::open(root_for_open.clone())
-                            .map(|persist| Some((root_for_open.clone(), persist)))
-                            .map_err(|error| error.to_string()),
+                            .map_err(|error| error.to_string())
+                            .and_then(|persist| {
+                                roaming_bus_identity(&root_for_open).map(|identity| {
+                                    Some((root_for_open.clone(), persist, identity))
+                                })
+                            }),
                     }
                 }));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -3475,6 +3591,100 @@ mod tests {
 
         shutdown_tx.send(true).expect("signal shutdown");
         tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("worker shutdown")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn same_path_bus_replacement_skips_retained_policy_and_runs_forward_policy_once() {
+        use mde_bus::hooks::config::Priority;
+        use std::sync::atomic::Ordering;
+
+        let temp = tempfile::tempdir().expect("temp root");
+        let bus_root = temp.path().join("bus");
+        let retired_root = temp.path().join("retired-bus");
+        let workgroup = temp.path().join("workgroup");
+        std::fs::create_dir_all(&workgroup).expect("workgroup");
+        let initial = Persist::open(bus_root.clone()).expect("initial Bus");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            temp.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let store = CountingStore::default();
+        store
+            .publish(&sess(
+                "s-replacement",
+                "peer:client",
+                "peer:live",
+                SessionState::Disconnected,
+            ))
+            .expect("seed session");
+        let rows = Arc::clone(&store.rows);
+        let removes = Arc::clone(&store.removes);
+        let mut worker = SessionRoamingWorker::new(workgroup, "peer:a".to_string())
+            .with_store(Box::new(store))
+            .with_layout_store(Box::new(FakeLayoutStore::default()))
+            .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["live"]))))
+            .with_authorizer(Arc::clone(&authorizer))
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(20));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!task.is_finished(), "initial Bus must keep worker alive");
+        drop(initial);
+
+        std::fs::rename(&bus_root, &retired_root).expect("retire initial Bus");
+        let replacement = Persist::open(bus_root.clone()).expect("replacement Bus");
+        let policy = RoamingRequest::SetPolicy {
+            vm_id: "uuid-s-replacement".to_string(),
+            policy: DisconnectPolicy::Shutdown,
+        };
+        replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_body(&policy, "retained-on-replacement")),
+            )
+            .expect("retained replacement policy");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            rows.lock()
+                .expect("rows mutex")
+                .contains_key("s-replacement"),
+            "replacement activation must skip its retained policy"
+        );
+        assert_eq!(removes.load(Ordering::SeqCst), 0);
+
+        replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_body(&policy, "forward-on-replacement")),
+            )
+            .expect("forward replacement policy");
+        for _ in 0..40 {
+            if removes.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            removes.load(Ordering::SeqCst),
+            1,
+            "the first forward replacement policy must run exactly once"
+        );
+
+        shutdown_tx.send(true).expect("signal shutdown");
+        tokio::time::timeout(Duration::from_millis(300), task)
             .await
             .expect("worker shutdown")
             .expect("worker task")
