@@ -476,19 +476,14 @@ behavioral evidence is not completion.
 - **Clock transaction recovery checkpoint (2026-08-09):** durable command and
   audio acknowledgement cursors survive late storage, commit failure, and publication failure in the same worker. Machine 194 passed four exact tests:
   `docs/platform/evidence/WL-FUNC-022-WL-ARCH-009-2026-08-09-clock-bus-commit-recovery-r43.md`.
-- **Service-catalog projection recovery checkpoint (2026-08-09):** retained
-  source reads and all derivations now complete before output; write failure remains immediately retryable. BigBoy passed seven exact tests:
+- **Service-catalog projection recovery checkpoint (2026-08-09):** reads/derivations complete before output; write failure remains retryable. BigBoy passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-service-aggregator-bus-recovery-r45.md`.
-- **CUPS action recovery checkpoint (2026-08-09):** both transient lanes now
-  tail-prime/read atomically; failed replies retain same-process retry without repeating sync, while the crash outbox remains open. Machine 193 passed three exact tests:
+- **CUPS action recovery checkpoint (2026-08-09):** both lanes activate atomically; failed replies retry in-process without repeating sync. Machine 193 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-cups-sync-bus-recovery-r46.md`.
-- **Weather-location recovery checkpoint (2026-08-09):** complete action and
-  vehicle-lane reads now precede authority effects; late/replaced Bus storage
-  recovers without treating failed reads as absent fixes. Machine 9 passed seven exact tests:
+- **Weather-location recovery checkpoint (2026-08-09):** complete action/vehicle reads
+  precede effects; failed reads cannot look like absent fixes. Machine 9 passed seven exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
-- **Health/Units/forecast recovery checkpoints (2026-08-09):** complete health
-  and cloud-source reads now precede cursor/seen effects, request replies retry,
-  and weather pairs stage before publication; machines 194/193 and BigBoy passed the focused gates:
+- **Health/Units/forecast recovery checkpoints (2026-08-09):** complete reads stage before effects and failed replies retry; machines 194/193 and BigBoy passed focused gates:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
@@ -498,13 +493,17 @@ behavioral evidence is not completion.
 - **Airspace publication recovery checkpoint (2026-08-09):** failed Bus writes
   retain one MG90 survey for retry without reprobing. Machine 196 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
-- **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
-  target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
-  mutations, admit forward commands, and defer effects on incomplete reads. Machines 9/194 and BigBoy passed eight exact tests:
+- **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add, target apply, Voice, and lighthouse recover late storage and skip retained mutations;
+  incomplete reads defer effects. Machines 9/194 and BigBoy passed eight exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-service-onboard-bus-recovery-r34.md`,
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-onboard-apply-bus-recovery-r35.md`,
   `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-voice-provision-bus-recovery-r36.md`,
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-spawn-lighthouse-onboard-bus-recovery-r40.md`.
+- **Catalog/overlay recovery checkpoints (2026-08-09):** staged state and exact context rechecks now gate publication; BigBoy and machines 193/194/9 passed focused tests:
+  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
@@ -856,6 +855,11 @@ behavioral evidence is not completion.
   and a failed write retries the same bounded survey without another MG90
   probe. Machine 196 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
+- **Vehicle-overlay transaction checkpoints (2026-08-09):** aircraft, Caltrans,
+  and NCDOT recheck context after provider I/O; failed reads/writes commit no state:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
@@ -1022,6 +1026,10 @@ behavioral evidence is not completion.
   authority until its retraction publishes. Machine 194 passed the exact
   failure/retry regression:
   `docs/platform/evidence/WL-FUNC-018-2026-08-09-catalog-side-effect-retry-s1-r5.md`.
+- **App Catalog Bus transaction checkpoint (2026-08-09):** cursor, catalog,
+  watermark, status, recovery, and Bus identity stage until required writes
+  succeed. BigBoy passed 10 module tests plus two exact recovery cases:
+  `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`.
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
      - Inputs: catalog projection and trust policy.
