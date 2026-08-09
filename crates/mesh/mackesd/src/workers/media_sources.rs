@@ -67,6 +67,10 @@ use crate::mesh_media::{
 /// discovered source visible without spinning the peers plane.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Bounds for service-context Bus startup recovery.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Republish heartbeat.
 ///
 /// Between heartbeats the roster publishes only when the fold changed; once
@@ -641,19 +645,22 @@ impl Worker for MediaSourcesWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::media_sources", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::media_sources", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let bus_root = media_sources_bus_root(self.bus_root_override.clone());
+        let retry_interval = self
+            .tick
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let persist = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::debug!(
+                    target: "mackesd::media_sources",
+                    %error,
+                    "Bus open failed; media-source startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         let browse = self.start_mdns_browsers();
@@ -684,6 +691,14 @@ impl Worker for MediaSourcesWorker {
         }
         Ok(())
     }
+}
+
+fn media_sources_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    media_sources_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn media_sources_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 /// Wall-clock epoch millis for the published record.
@@ -1164,6 +1179,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let persist = Persist::open(dir.path().to_path_buf()).unwrap();
         (dir, persist)
+    }
+
+    #[test]
+    fn media_sources_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/media-sources-bus");
+        assert_eq!(media_sources_bus_root(Some(explicit.clone())), explicit);
+        assert_eq!(
+            media_sources_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_and_publishes_sources_without_worker_restart() {
+        let holder = tempfile::tempdir().expect("media-source recovery root");
+        let bus = holder.path().join("bus");
+        std::fs::write(&bus, b"block Persist::open").expect("install Bus blocker");
+        let workgroup = tempfile::tempdir().expect("media-source workgroup");
+        let mut worker =
+            MediaSourcesWorker::new("node-recovery".to_string(), workgroup.path().to_path_buf())
+                .with_bus_root(bus.clone())
+                .with_tick(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            !task.is_finished(),
+            "an unopenable Bus must not permanently end media discovery"
+        );
+
+        std::fs::remove_file(&bus).expect("remove Bus blocker");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let published = Persist::open(bus.clone())
+                    .and_then(|persist| persist.read_latest(MEDIA_SOURCES_TOPIC))
+                    .map(|message| message.is_some())
+                    .unwrap_or(false);
+                if published {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the same worker must publish immediately after Bus recovery");
+        assert!(!task.is_finished(), "recovered worker must remain active");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt media polling")
+            .expect("worker task")
+            .expect("clean worker shutdown");
     }
 
     fn latest_state(persist: &Persist) -> MediaSourcesState {

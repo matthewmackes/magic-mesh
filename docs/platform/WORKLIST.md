@@ -434,6 +434,11 @@ behavioral evidence is not completion.
   retained asks, and answers one forward signed ask exactly once. Machine 196
   passed three exact recovery tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
+- **Media-source Bus recovery checkpoint (2026-08-09):** discovery now waits
+  through late shared storage, then starts mDNS and immediately publishes the
+  honest merged roster without daemon restart. Machine 193 passed two exact
+  recovery/fallback tests:
+  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
