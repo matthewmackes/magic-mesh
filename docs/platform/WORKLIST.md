@@ -1168,6 +1168,8 @@ behavioral evidence is not completion.
   Release 23 still lacks the typed Desktop/RDP projection and needs corrected
   deployment:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-rdp-scan-completion-freshness-r18.md`.
+- **Quiet-Windows RDP checkpoint (2026-08-09):** the bounded local `/24` scan now admits ping-silent hosts only after TCP 3389 succeeds, then independently fingerprints RDP.
+  BigBoy passed three exact gates: `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
 - **Seat 15 Release 24 checkpoint (2026-08-09):** the clean Fedora 44 artifact
   passed real-RPM gates and a dry-run, then installed after the visible warning.
   All daemon groups and publisher credential activation passed; consecutive
@@ -2179,6 +2181,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-013-2026-08-09-health-result-durability-r10.md`.
 - **Node-grade transaction checkpoint (2026-08-09):** late/replaced Bus recovery, durable remediation results, and strictly forward canonical/Bus generations passed
   five focused machine-194 gates: `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-node-grade-bus-recovery-r66.md`.
+- **Quiet-Windows discovery checkpoint (2026-08-09):** ping-silent local hosts reach bounded TCP 3389 fingerprinting without widening the `/24`; BigBoy passed:
+  `docs/platform/evidence/WL-FUNC-019-WL-UX-013-2026-08-09-rdp-lan-detection-r74.md`.
 - **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
   bounded/redacted support bundle through a private no-follow path and a synced
   atomic transaction, with honest failures and bounded top-N materialization.

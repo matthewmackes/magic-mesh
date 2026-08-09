@@ -11,9 +11,10 @@
 //!    [`crate::surrounding_hosts::collect_mdns`] avahi parse).
 //! 2. **ARP / neighbour-table read** — silent hosts + the stable MAC key
 //!    (reusing [`crate::surrounding_hosts::arp_neigh_map`]).
-//! 3. **A bounded ping-sweep + light TCP port fingerprint** — the /24 is
-//!    ping-swept (`ping -c1 -W1`, fanned out under a thread bound), and each live
-//!    candidate is fingerprinted against [`FINGERPRINT_PORTS`]
+//! 3. **A bounded ping/RDP-sweep + light TCP port fingerprint** — the /24 is
+//!    ping-swept (`ping -c1 -W1`) and checked once for TCP 3389 under the same
+//!    thread bound. This admits quiet Windows hosts that reject ICMP but accept
+//!    RDP. Each resulting candidate is fingerprinted against [`FINGERPRINT_PORTS`]
 //!    (22/80/443/3389/5900/5930/5985 → SSH/HTTP/HTTPS/RDP/VNC/Spice/WinRM) via a
 //!    short bounded `TcpStream::connect_timeout`. The open-service set feeds the
 //!    E5 fingerprint + a coarse type guess.
@@ -121,8 +122,15 @@ pub trait ScanEnv: Send + Sync {
     fn mdns(&self) -> Vec<MdnsService>;
     /// Whether `ip` answers an ICMP echo within the bounded budget.
     fn ping(&self, ip: Ipv4Addr) -> bool;
+    /// Whether one approved fingerprint `port` accepts a bounded TCP connection.
+    fn port_open(&self, ip: Ipv4Addr, port: u16) -> bool;
     /// Which [`FINGERPRINT_PORTS`] accept a bounded TCP connection on `ip`.
-    fn open_ports(&self, ip: Ipv4Addr) -> Vec<u16>;
+    fn open_ports(&self, ip: Ipv4Addr) -> Vec<u16> {
+        FINGERPRINT_PORTS
+            .iter()
+            .filter_map(|(port, _)| self.port_open(ip, *port).then_some(*port))
+            .collect()
+    }
     /// Reverse-DNS name for `ip`, when the resolver answers.
     fn rdns(&self, ip: Ipv4Addr) -> Option<String>;
 }
@@ -171,15 +179,12 @@ impl ScanEnv for LiveScanEnv {
             .unwrap_or(false)
     }
 
-    fn open_ports(&self, ip: Ipv4Addr) -> Vec<u16> {
-        FINGERPRINT_PORTS
-            .iter()
-            .filter(|(port, _)| {
-                let addr = SocketAddr::new(IpAddr::V4(ip), *port);
-                TcpStream::connect_timeout(&addr, PORT_CONNECT_TIMEOUT).is_ok()
-            })
-            .map(|(port, _)| *port)
-            .collect()
+    fn port_open(&self, ip: Ipv4Addr, port: u16) -> bool {
+        if label_for_port(port).is_none() {
+            return false;
+        }
+        let addr = SocketAddr::new(IpAddr::V4(ip), port);
+        TcpStream::connect_timeout(&addr, PORT_CONNECT_TIMEOUT).is_ok()
     }
 
     fn rdns(&self, ip: Ipv4Addr) -> Option<String> {
@@ -352,13 +357,15 @@ pub fn build_records(env: &dyn ScanEnv) -> Vec<LanHostRecord> {
     let self_set: HashSet<Ipv4Addr> = locals.iter().copied().collect();
     let bases: HashSet<[u8; 3]> = locals.iter().map(|ip| slash24_base(*ip)).collect();
 
-    // 1. Bounded ping-sweep of the local /24(s) for silent (non-advertising)
-    //    hosts, fanned out under the thread bound — straight into the candidate
-    //    set (no intermediate Vec).
+    // 1. Bounded ping + RDP-presence sweep of the local /24(s). Windows commonly
+    //    rejects ICMP while accepting RDP, so ping cannot be the gate to the
+    //    protocol probe. This adds exactly one approved TCP connect per
+    //    ping-silent address; it does not widen the subnet or classify the host.
+    //    `probe_one` below must independently observe 3389 before emitting RDP.
     let hosts = sweep_hosts(&locals);
     let mut candidates: BTreeSet<Ipv4Addr> =
         parallel_map(&hosts, MAX_SCAN_THREADS, &|ip: &Ipv4Addr| {
-            if env.ping(*ip) {
+            if env.ping(*ip) || env.port_open(*ip, 3389) {
                 Some(*ip)
             } else {
                 None
@@ -550,9 +557,11 @@ mod tests {
             self.ping_calls.fetch_add(1, Ordering::Relaxed);
             self.alive.contains(&ip)
         }
-        fn open_ports(&self, ip: Ipv4Addr) -> Vec<u16> {
+        fn port_open(&self, ip: Ipv4Addr, port: u16) -> bool {
             self.port_calls.fetch_add(1, Ordering::Relaxed);
-            self.ports.get(&ip).cloned().unwrap_or_default()
+            self.ports
+                .get(&ip)
+                .is_some_and(|ports| ports.contains(&port))
         }
         fn rdns(&self, ip: Ipv4Addr) -> Option<String> {
             self.rdns.get(&ip).cloned()
@@ -636,6 +645,42 @@ mod tests {
         assert_eq!(desktop.open_ports, vec![3389]);
         assert_eq!(desktop.type_guess.as_deref(), Some("computer"));
         assert_eq!(desktop.key, "aa:bb:cc:dd:ee:77");
+    }
+
+    #[test]
+    fn ping_silent_same_subnet_rdp_host_is_probed_and_classified() {
+        let windows = ip("192.168.1.54");
+        let mut env = FakeScanEnv {
+            locals: vec![ip("192.168.1.15")],
+            ..Default::default()
+        };
+        // No ping, ARP, mDNS, mesh-peer, or wide-neighbour signal: only a
+        // successful protocol-port probe makes this quiet Windows host visible.
+        env.ports.insert(windows, vec![3389]);
+
+        let records = build_records(&env);
+        let desktop = find(&records, "192.168.1.54");
+        assert_eq!(desktop.services, vec!["rdp".to_string()]);
+        assert_eq!(desktop.open_ports, vec![3389]);
+        assert_eq!(desktop.type_guess.as_deref(), Some("computer"));
+        assert_eq!(desktop.key, "192.168.1.54");
+        assert!(env.port_calls.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn failed_rdp_probe_does_not_admit_or_classify_ping_silent_host() {
+        let env = FakeScanEnv {
+            locals: vec![ip("192.168.1.15")],
+            ..Default::default()
+        };
+
+        let records = build_records(&env);
+        assert!(records.is_empty());
+        assert_eq!(
+            env.port_calls.load(Ordering::Relaxed),
+            253,
+            "one bounded RDP probe per ping-silent address"
+        );
     }
 
     #[test]
