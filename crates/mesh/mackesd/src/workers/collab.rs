@@ -106,6 +106,15 @@ const SYSTEM_SPACE_NAME: &str = "System";
 /// The default poll cadence (tests override with a short value; the loop is
 /// entirely edge-driven off the Bus so the interval only bounds latency).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Keep startup recovery responsive without spinning on a missing/unopenable Bus.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn() -> Result<Option<Persist>, String> + Send + Sync;
+#[cfg(test)]
+type CursorPrimeFn =
+    dyn Fn(&Persist) -> Result<BTreeMap<String, Option<String>>, String> + Send + Sync;
 
 /// Worker-side merge slices stay comfortably below the collaboration core's
 /// fail-closed 4,096-envelope admission cap. The core still owns the hard
@@ -208,6 +217,12 @@ pub struct CollabWorker {
     poll_interval: Duration,
     /// Bus root override (tests point it at a tempdir Persist).
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus resolve/open seam for startup-race tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    /// Fail-closed transient-lane cursor-prime seam for startup-race tests.
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
     /// Verifier for the root-only capability on the mutable command lanes.
     authorizer: Arc<ActionAuthorizer>,
     /// Whether global hosted-AI consent has been granted for this seat.
@@ -238,6 +253,10 @@ impl CollabWorker {
             log_root,
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
             ai_cloud_consent: false,
             call_media_providers: super::collab_media::CallMediaProviderRegistry::empty(),
@@ -248,6 +267,23 @@ impl CollabWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Override dynamic Bus resolution/opening without changing production
+    /// retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override transient-lane cursor priming for deterministic failure tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
         self
     }
 
@@ -289,6 +325,29 @@ impl CollabWorker {
     pub fn with_poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
         self
+    }
+
+    fn open_bus(&self) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open();
+        }
+
+        Persist::open(collab_bus_root(self.bus_root_override.clone()))
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_transient_cursors(
+        &self,
+        persist: &Persist,
+    ) -> Result<BTreeMap<String, Option<String>>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_transient_cursors(persist)
     }
 
     /// One poll pass — the headless-testable core (drives the whole worker with
@@ -428,12 +487,25 @@ impl CollabWorker {
         touched: &mut BTreeSet<SpaceId>,
         changed: &mut bool,
     ) {
-        let all_topics = persist.list_topics().unwrap_or_default();
+        let all_topics = match persist.list_topics() {
+            Ok(topics) => topics,
+            Err(error) => {
+                tracing::warn!(target: "mackesd::collab", %error, "alert topic discovery failed; transient lanes left untouched");
+                return;
+            }
+        };
         for topic in &all_topics {
             if !is_alert_lane(topic) {
                 continue;
             }
-            for m in take_new_forward(persist, &mut state.cursors, topic) {
+            let messages = match take_new_forward(persist, &mut state.cursors, topic) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::collab", topic, %error, "alert lane read failed; cursor left unchanged");
+                    continue;
+                }
+            };
+            for m in messages {
                 let Some(body) = m.body.as_deref() else {
                     continue;
                 };
@@ -472,7 +544,15 @@ impl CollabWorker {
         touched: &mut BTreeSet<SpaceId>,
         changed: &mut bool,
     ) {
-        for m in take_new_forward(persist, &mut state.cursors, CLIPBOARD_CAPTURE_TOPIC) {
+        let messages = match take_new_forward(persist, &mut state.cursors, CLIPBOARD_CAPTURE_TOPIC)
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(target: "mackesd::collab", %error, "clipboard lane read failed; cursor left unchanged");
+                return;
+            }
+        };
+        for m in messages {
             let Some(body) = m.body.as_deref() else {
                 continue;
             };
@@ -509,9 +589,26 @@ impl CollabWorker {
         changed: &mut bool,
     ) {
         let signer = Ed25519Signer::new(self.signing_key.clone());
+        // Read the complete fixed command-lane set against a temporary cursor
+        // map first. If any Bus read fails, commit neither cursor movement nor
+        // command effects: the next tick retries from the same known boundary.
+        let mut next_cursors = state.cursors.clone();
+        let mut pending = Vec::with_capacity(COMMAND_VERBS.len());
         for verb in COMMAND_VERBS {
             let topic = topics::command_topic(verb);
-            for m in take_new_forward(persist, &mut state.cursors, &topic) {
+            let messages = match take_new_forward(persist, &mut next_cursors, &topic) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::collab", verb, %error, "command lane read failed; command sweep left untouched");
+                    return;
+                }
+            };
+            pending.push((*verb, messages));
+        }
+        state.cursors = next_cursors;
+
+        for (verb, messages) in pending {
+            for m in messages {
                 let Some(body) = m.body.as_deref() else {
                     tracing::warn!(target: "mackesd::collab", verb, "action/collab command with empty body");
                     continue;
@@ -521,7 +618,7 @@ impl CollabWorker {
                     MutationContext {
                         verb: COLLAB_AUTH_VERB,
                         node: self.self_actor.as_str(),
-                        target: *verb,
+                        target: verb,
                     },
                 ) {
                     tracing::warn!(
@@ -552,10 +649,10 @@ impl CollabWorker {
                         continue;
                     }
                 };
-                if cmd.verb() != *verb {
+                if cmd.verb() != verb {
                     tracing::warn!(
                         target: "mackesd::collab",
-                        topic_verb = *verb,
+                        topic_verb = verb,
                         command_verb = cmd.verb(),
                         "refused action/collab command routed on the wrong verb lane",
                     );
@@ -648,7 +745,13 @@ impl CollabWorker {
         touched: &mut BTreeSet<SpaceId>,
         changed: &mut bool,
     ) {
-        let all_topics = persist.list_topics().unwrap_or_default();
+        let all_topics = match persist.list_topics() {
+            Ok(topics) => topics,
+            Err(error) => {
+                tracing::warn!(target: "mackesd::collab", %error, "collab event topic discovery failed; durable lanes left untouched");
+                return;
+            }
+        };
         let mut incoming: Vec<CollabEventEnvelope> =
             Vec::with_capacity(MAX_WORKER_MERGE_BATCH_EVENTS);
         for topic in &all_topics {
@@ -665,7 +768,14 @@ impl CollabWorker {
             // Events are idempotent under merge, so drain the full lane on first
             // sight (a foreign lane only appears once it carries events) and
             // forward thereafter.
-            for m in take_new_all(persist, &mut state.cursors, topic) {
+            let messages = match take_new_all(persist, &mut state.cursors, topic) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::collab", topic, %error, "collab event lane read failed; cursor left unchanged");
+                    continue;
+                }
+            };
+            for m in messages {
                 let Some(body) = m.body.as_deref() else {
                     continue;
                 };
@@ -1220,25 +1330,24 @@ fn take_new_forward(
     persist: &Persist,
     cursors: &mut BTreeMap<String, Option<String>>,
     topic: &str,
-) -> Vec<StoredMessage> {
+) -> Result<Vec<StoredMessage>, String> {
     match cursors.get(topic) {
         None => {
             let head = persist
-                .list_since(topic, None)
-                .ok()
-                .and_then(|m| m.last().map(|x| x.ulid.clone()));
+                .latest_ulid(topic)
+                .map_err(|error| error.to_string())?;
             cursors.insert(topic.to_string(), head);
-            Vec::new()
+            Ok(Vec::new())
         }
         Some(cur) => {
             let cur = cur.clone();
             let msgs = persist
                 .list_since(topic, cur.as_deref())
-                .unwrap_or_default();
+                .map_err(|error| error.to_string())?;
             if let Some(last) = msgs.last() {
                 cursors.insert(topic.to_string(), Some(last.ulid.clone()));
             }
-            msgs
+            Ok(msgs)
         }
     }
 }
@@ -1251,17 +1360,47 @@ fn take_new_all(
     persist: &Persist,
     cursors: &mut BTreeMap<String, Option<String>>,
     topic: &str,
-) -> Vec<StoredMessage> {
+) -> Result<Vec<StoredMessage>, String> {
     let since = cursors.get(topic).cloned().flatten();
     let msgs = persist
         .list_since(topic, since.as_deref())
-        .unwrap_or_default();
+        .map_err(|error| error.to_string())?;
     if let Some(last) = msgs.last() {
         cursors.insert(topic.to_string(), Some(last.ulid.clone()));
     } else {
         cursors.entry(topic.to_string()).or_insert(None);
     }
-    msgs
+    Ok(msgs)
+}
+
+/// Prime every forward-only transient lane at its current tail as one
+/// activation transaction. Durable `collab/event/*` lanes are deliberately not
+/// included: they must replay retained signed history into the projection.
+fn prime_transient_cursors(persist: &Persist) -> Result<BTreeMap<String, Option<String>>, String> {
+    let mut cursors = BTreeMap::new();
+    for verb in COMMAND_VERBS {
+        let topic = topics::command_topic(verb);
+        let head = persist
+            .latest_ulid(&topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?;
+        cursors.insert(topic, head);
+    }
+
+    let clipboard_head = persist
+        .latest_ulid(CLIPBOARD_CAPTURE_TOPIC)
+        .map_err(|error| format!("prime {CLIPBOARD_CAPTURE_TOPIC}: {error}"))?;
+    cursors.insert(CLIPBOARD_CAPTURE_TOPIC.to_string(), clipboard_head);
+
+    let all_topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover transient lanes: {error}"))?;
+    for topic in all_topics.into_iter().filter(|topic| is_alert_lane(topic)) {
+        let head = persist
+            .latest_ulid(&topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?;
+        cursors.insert(topic, head);
+    }
+    Ok(cursors)
 }
 
 /// Serialize + publish a read model, skipping the write when the body is
@@ -1801,18 +1940,12 @@ fn clip_preview(text: &str) -> String {
     }
 }
 
-fn resolve_default_bus_root(
-    env_root: Option<std::ffi::OsString>,
-    data_dir: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(root) = env_root.filter(|root| !root.is_empty()) {
-        return Some(PathBuf::from(root));
-    }
-    Some(data_dir?.join("mde").join("bus"))
+fn collab_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    collab_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    resolve_default_bus_root(std::env::var_os("MDE_BUS_ROOT"), dirs::data_dir())
+fn collab_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 fn now_unix_ms() -> i64 {
@@ -1829,22 +1962,43 @@ impl Worker for CollabWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::debug!(target: "mackesd::collab", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::collab", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let retry_interval = self
+            .poll_interval
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let (persist, mut state) = loop {
+            match self.open_bus() {
+                Ok(Some(persist)) => match self.prime_transient_cursors(&persist) {
+                    Ok(cursors) => match CollabState::new(self.self_actor.clone()) {
+                        Ok(mut state) => {
+                            state.cursors = cursors;
+                            break (persist, state);
+                        }
+                        Err(error) => tracing::warn!(
+                            target: "mackesd::collab",
+                            %error,
+                            "projection activation failed; collab startup will retry"
+                        ),
+                    },
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::collab",
+                        %error,
+                        "transient cursor priming failed; collab startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::collab",
+                    "Bus root unavailable; collab startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::collab",
+                    %error,
+                    "Persist open failed; collab startup will retry"
+                ),
             }
-        };
-        let mut state = match CollabState::new(self.self_actor.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(target: "mackesd::collab", error = %e, "projection open failed; worker idle");
-                return Ok(());
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         // Rebuild the projection from the durable actor logs (own + replicated)
@@ -2060,11 +2214,13 @@ mod tests {
             .write("t/forward", Priority::Default, None, Some("old"))
             .unwrap();
         // First sight seeds to head → the pre-existing message is NOT replayed.
-        assert!(take_new_forward(&persist, &mut cursors, "t/forward").is_empty());
+        assert!(take_new_forward(&persist, &mut cursors, "t/forward")
+            .expect("seed cursor")
+            .is_empty());
         persist
             .write("t/forward", Priority::Default, None, Some("new"))
             .unwrap();
-        let got = take_new_forward(&persist, &mut cursors, "t/forward");
+        let got = take_new_forward(&persist, &mut cursors, "t/forward").expect("drain new");
         assert_eq!(
             got.len(),
             1,
@@ -2084,10 +2240,12 @@ mod tests {
         persist
             .write("t/all", Priority::Default, None, Some("b"))
             .unwrap();
-        let got = take_new_all(&persist, &mut cursors, "t/all");
+        let got = take_new_all(&persist, &mut cursors, "t/all").expect("drain backlog");
         assert_eq!(got.len(), 2, "the full backlog drains on first sight");
         // Forward thereafter.
-        assert!(take_new_all(&persist, &mut cursors, "t/all").is_empty());
+        assert!(take_new_all(&persist, &mut cursors, "t/all")
+            .expect("drain forward")
+            .is_empty());
     }
 
     #[test]
@@ -3574,6 +3732,136 @@ mod tests {
             "collab/event/{}/eagle",
             SpaceId::new()
         )));
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            collab_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            collab_bus_root_or_system(Some(PathBuf::from("/tmp/collab-explicit-bus"))),
+            PathBuf::from("/tmp/collab-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_and_cursor_prime_recover_without_replay_or_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus_root = dir.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        let mut w = worker(dir.path(), "eagle").with_poll_interval(Duration::from_millis(10));
+
+        let stale = CollabCommand::CreateSpace {
+            kind: SpaceKind::Team,
+            name: "retained-must-not-replay".into(),
+        };
+        let stale_body =
+            authorized_command_body(&w, &stale, "collab-late-bus-stale-00000000000000000001");
+        persist
+            .write(
+                &topics::command_topic(stale.verb()),
+                Priority::Default,
+                None,
+                Some(&stale_body),
+            )
+            .expect("write retained command");
+
+        let fresh = CollabCommand::CreateSpace {
+            kind: SpaceKind::Team,
+            name: "fresh-after-recovery".into(),
+        };
+        let fresh_body =
+            authorized_command_body(&w, &fresh, "collab-late-bus-fresh-00000000000000000001");
+        let fresh_topic = topics::command_topic(fresh.verb());
+
+        let open_attempts = Arc::new(AtomicU64::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        w = w.with_bus_opener(Arc::new(move || {
+            match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(None),
+                1 => Err("injected unopenable Bus".into()),
+                _ => Persist::open(bus_root_for_worker.clone())
+                    .map(Some)
+                    .map_err(|error| error.to_string()),
+            }
+        }));
+
+        let prime_attempts = Arc::new(AtomicU64::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        w = w.with_cursor_primer(Arc::new(move |persist| {
+            if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("injected cursor list failure".into());
+            }
+            prime_transient_cursors(persist)
+        }));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let worker_task = tokio::spawn(async move { w.run(token).await });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    !worker_task.is_finished(),
+                    "worker exited during startup recovery"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must activate after late Bus and prime failure");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+
+        persist
+            .write(&fresh_topic, Priority::Default, None, Some(&fresh_body))
+            .expect("write fresh command after activation");
+
+        let directory_topic = topics::state_topic(proj::SPACE_DIRECTORY);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(message) = persist
+                    .read_latest(&directory_topic)
+                    .expect("read projected directory")
+                {
+                    let directory: SpaceDirectory =
+                        serde_json::from_str(message.body.as_deref().expect("directory body"))
+                            .expect("decode projected directory");
+                    if directory.spaces.len() == 1 {
+                        assert_eq!(directory.spaces[0].name, "fresh-after-recovery");
+                        break;
+                    }
+                }
+                assert!(
+                    !worker_task.is_finished(),
+                    "worker exited before fresh command"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fresh command must project after late Bus without restart");
+
+        // Let additional polls run: neither the retained startup command nor the
+        // fresh command may execute again.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let event_count = persist
+            .list_topics()
+            .expect("list event topics")
+            .into_iter()
+            .filter(|topic| topic.starts_with(topics::EVENT_PREFIX))
+            .map(|topic| persist.list_since(&topic, None).expect("list events").len())
+            .sum::<usize>();
+        assert_eq!(event_count, 2, "one CreateSpace emits exactly two events");
+
+        tx.send(true).expect("signal shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(3), worker_task)
+            .await
+            .expect("worker shutdown timeout")
+            .expect("worker task panicked");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

@@ -548,6 +548,11 @@ behavioral evidence is not completion.
   late Bus availability without daemon restart and folds valid trust actions
   queued during startup exactly once. Machine 194 passed three exact tests:
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-federation-bus-recovery-r15.md`.
+- **Collaboration Bus recovery checkpoint (2026-08-09):** activation now
+  retries Bus open and atomically primes every transient lane while preserving
+  durable event/log replay; one forward command projects exactly once. Machine
+  193 passed three exact recovery/backfill tests:
+  `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-collab-bus-recovery-r22.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
