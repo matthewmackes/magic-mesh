@@ -33,9 +33,9 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -50,7 +50,7 @@ use mde_collab_types::{
     TransferId, TransferJobV2, TransferKind, TransferLocation, TransferOperation, TransferPhase,
     TransferState as V2State,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 
@@ -103,6 +103,90 @@ const MAX_V2_LEDGER_RECORD_BYTES: usize = 1024 * 1024;
 const COLLAB_FILES_COMMIT_VERB: &str = "collab-command";
 const FILES_PROJECTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const FILES_PROJECTION_CONFIRM_POLL: Duration = Duration::from_millis(20);
+const NOTIFICATION_OUTBOX_DIR: &str = "notification-outbox";
+const NOTIFICATION_RECEIPTS_DIR: &str = "notification-receipts";
+const NOTIFICATION_BASELINE_DIR: &str = "notification-activation-baseline";
+const MAX_NOTIFICATION_OUTBOX_RECORDS: usize = 4_096;
+const MAX_NOTIFICATION_RECORD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone)]
+enum TransferBusRoot {
+    Dynamic,
+    Explicit(PathBuf),
+    Disabled,
+}
+
+impl TransferBusRoot {
+    fn from_override(root: Option<PathBuf>) -> Self {
+        root.map_or(Self::Disabled, Self::Explicit)
+    }
+
+    fn resolve(&self) -> io::Result<PathBuf> {
+        transfer_bus_root(self, crate::bus_publish::default_bus_root())
+    }
+
+    fn enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+type TransferBusHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+struct TransferBusTransaction {
+    root: PathBuf,
+    persist: Persist,
+    identity: BusIndexIdentity,
+}
+
+impl TransferBusTransaction {
+    fn open(selection: &TransferBusRoot, after_open: Option<&TransferBusHook>) -> io::Result<Self> {
+        let root = selection.resolve()?;
+        let before = bus_index_identity(&root).ok();
+        let mut persist =
+            Persist::open(root.clone()).map_err(|error| io::Error::other(error.to_string()))?;
+        persist.reopen_if_index_changed();
+        if let Some(hook) = after_open {
+            hook(&root);
+        }
+        let identity = bus_index_identity(&root)?;
+        if before.is_some_and(|before| before != identity)
+            || persist.index_inode() != Some(identity.inode)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer Bus index changed while opening a transaction",
+            ));
+        }
+        Ok(Self {
+            root,
+            persist,
+            identity,
+        })
+    }
+
+    fn verify_current(&self) -> io::Result<BusIndexIdentity> {
+        if bus_index_identity(&self.root)? != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer Bus index was replaced during a transaction",
+            ));
+        }
+        Ok(self.identity)
+    }
+}
+
+fn transfer_bus_root(selection: &TransferBusRoot, current: Option<PathBuf>) -> io::Result<PathBuf> {
+    match selection {
+        TransferBusRoot::Dynamic => {
+            Ok(current.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)))
+        }
+        TransferBusRoot::Explicit(root) => Ok(root.clone()),
+        TransferBusRoot::Disabled => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "transfer Bus access explicitly disabled",
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum V2OperationKind {
@@ -265,17 +349,33 @@ pub fn default_cap() -> usize {
 /// node token are never parsed as a host path or URL.
 #[derive(Clone)]
 struct CollabFilesResolver {
-    bus_root: Option<PathBuf>,
+    bus_root: TransferBusRoot,
     content_root: PathBuf,
     action_signer: Option<CloudArmSigner>,
     actor: Option<String>,
     projection_confirm_timeout: Duration,
     #[cfg(test)]
     fail_publications: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    after_bus_open: Option<TransferBusHook>,
+    #[cfg(test)]
+    after_registry_read: Option<TransferBusHook>,
+    #[cfg(test)]
+    after_command_write: Option<TransferBusHook>,
+    #[cfg(test)]
+    after_projection_read: Option<TransferBusHook>,
 }
 
 impl CollabFilesResolver {
     fn new(bus_root: Option<PathBuf>, content_root: PathBuf) -> Self {
+        Self::with_bus_selection(TransferBusRoot::from_override(bus_root), content_root)
+    }
+
+    fn production(content_root: PathBuf) -> Self {
+        Self::with_bus_selection(TransferBusRoot::Dynamic, content_root)
+    }
+
+    fn with_bus_selection(bus_root: TransferBusRoot, content_root: PathBuf) -> Self {
         Self {
             bus_root,
             content_root,
@@ -286,6 +386,14 @@ impl CollabFilesResolver {
             projection_confirm_timeout: FILES_PROJECTION_CONFIRM_TIMEOUT,
             #[cfg(test)]
             fail_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            after_bus_open: None,
+            #[cfg(test)]
+            after_registry_read: None,
+            #[cfg(test)]
+            after_command_write: None,
+            #[cfg(test)]
+            after_projection_read: None,
         }
     }
 
@@ -308,18 +416,45 @@ impl CollabFilesResolver {
         self
     }
 
+    #[cfg(test)]
+    fn with_after_bus_open(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_bus_open = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_registry_read(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_registry_read = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_command_write(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_command_write = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_projection_read(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_projection_read = Some(Arc::new(hook));
+        self
+    }
+
     fn reference(
         &self,
         object: FileRefId,
         mesh_node: Option<&str>,
     ) -> Result<(SpaceId, FileRef, u64), FilesResolveFailure> {
-        let bus_root = self
-            .bus_root
-            .as_ref()
-            .ok_or(FilesResolveFailure::Unavailable)?;
-        let persist =
-            Persist::open(bus_root.clone()).map_err(|_| FilesResolveFailure::RegistryFailure)?;
-        let topics = persist
+        let transaction = TransferBusTransaction::open(
+            &self.bus_root,
+            #[cfg(test)]
+            self.after_bus_open.as_ref(),
+            #[cfg(not(test))]
+            None,
+        )
+        .map_err(|_| FilesResolveFailure::RegistryFailure)?;
+        let topics = transaction
+            .persist
             .list_topics()
             .map_err(|_| FilesResolveFailure::RegistryFailure)?;
         if topics.len() > MAX_FILES_IDENTITY_TOPICS {
@@ -337,7 +472,8 @@ impl CollabFilesResolver {
             else {
                 continue;
             };
-            let Some(message) = persist
+            let Some(message) = transaction
+                .persist
                 .read_latest(topic)
                 .map_err(|_| FilesResolveFailure::RegistryFailure)?
             else {
@@ -369,6 +505,13 @@ impl CollabFilesResolver {
                 }
             }
         }
+        #[cfg(test)]
+        if let Some(hook) = &self.after_registry_read {
+            hook(&transaction.root);
+        }
+        transaction
+            .verify_current()
+            .map_err(|_| FilesResolveFailure::RegistryFailure)?;
         found.ok_or(FilesResolveFailure::Unavailable)
     }
 
@@ -473,10 +616,6 @@ impl CollabFilesResolver {
             return Err(FilesCommitFailure::Publication);
         }
 
-        let bus_root = self
-            .bus_root
-            .as_ref()
-            .ok_or(FilesCommitFailure::Publication)?;
         let mut unsigned =
             serde_json::to_value(command).map_err(|_| FilesCommitFailure::Publication)?;
         unsigned
@@ -510,15 +649,35 @@ impl CollabFilesResolver {
             .ok_or(FilesCommitFailure::Publication)?
             .insert("armed_token".to_string(), serde_json::Value::String(token));
         let body = serde_json::to_string(&body).map_err(|_| FilesCommitFailure::Publication)?;
-        Persist::open(bus_root.clone())
-            .and_then(|persist| {
-                persist.write(
-                    &mde_collab_types::topics::command_topic(command.verb()),
-                    Priority::Default,
-                    None,
-                    Some(&body),
-                )
-            })
+        self.publish_current_command_body(
+            &mde_collab_types::topics::command_topic(command.verb()),
+            &body,
+        )
+    }
+
+    fn publish_current_command_body(
+        &self,
+        topic: &str,
+        body: &str,
+    ) -> Result<(), FilesCommitFailure> {
+        let transaction = TransferBusTransaction::open(
+            &self.bus_root,
+            #[cfg(test)]
+            self.after_bus_open.as_ref(),
+            #[cfg(not(test))]
+            None,
+        )
+        .map_err(|_| FilesCommitFailure::Publication)?;
+        transaction
+            .persist
+            .write(topic, Priority::Default, None, Some(body))
+            .map_err(|_| FilesCommitFailure::Publication)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.after_command_write {
+            hook(&transaction.root);
+        }
+        transaction
+            .verify_current()
             .map(|_| ())
             .map_err(|_| FilesCommitFailure::Publication)
     }
@@ -531,10 +690,6 @@ impl CollabFilesResolver {
         expected: &ResolvedFilesEndpoint,
         replacement: &FileRef,
     ) -> Result<(), FilesCommitFailure> {
-        let bus_root = self
-            .bus_root
-            .as_ref()
-            .ok_or(FilesCommitFailure::PublicationUnconfirmed)?;
         let deadline = Instant::now()
             .checked_add(self.projection_confirm_timeout)
             .ok_or(FilesCommitFailure::PublicationUnconfirmed)?;
@@ -543,8 +698,21 @@ impl CollabFilesResolver {
             space,
         );
         loop {
-            if let Ok(persist) = Persist::open(bus_root.clone()) {
-                if let Ok(Some(message)) = persist.read_latest(&topic) {
+            if let Ok(transaction) = TransferBusTransaction::open(
+                &self.bus_root,
+                #[cfg(test)]
+                self.after_bus_open.as_ref(),
+                #[cfg(not(test))]
+                None,
+            ) {
+                if let Ok(Some(message)) = transaction.persist.read_latest(&topic) {
+                    #[cfg(test)]
+                    if let Some(hook) = &self.after_projection_read {
+                        hook(&transaction.root);
+                    }
+                    if transaction.verify_current().is_err() {
+                        continue;
+                    }
                     if let Some(body) = message.body.as_deref() {
                         if let Ok(rows) = serde_json::from_str::<FileReferences>(body) {
                             match rows.files.iter().find(|row| row.file == file) {
@@ -732,10 +900,11 @@ impl FilesEndpointResolver for CollabFilesResolver {
 /// tasks, and fills up to the cap each tick.
 pub struct TransfersWorker {
     store_root: PathBuf,
-    bus_root: Option<PathBuf>,
+    bus_root: TransferBusRoot,
     cap: usize,
     lane: Arc<dyn LaneRunner>,
     files_resolver: Arc<dyn FilesEndpointResolver>,
+    default_files_resolver: bool,
     poll: Duration,
 }
 
@@ -744,10 +913,8 @@ impl TransfersWorker {
     /// dispatcher (HTTP wired; future lanes still honestly gated).
     #[must_use]
     pub fn new(store_root: PathBuf) -> Self {
-        let bus_root =
-            mde_bus::default_data_dir().or_else(|| Some(PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)));
-        let files_resolver = Arc::new(CollabFilesResolver::new(
-            bus_root.clone(),
+        let bus_root = TransferBusRoot::Dynamic;
+        let files_resolver = Arc::new(CollabFilesResolver::production(
             crate::default_qnm_shared_root()
                 .join("collab")
                 .join("content"),
@@ -758,6 +925,7 @@ impl TransfersWorker {
             cap: default_cap(),
             lane: Arc::new(TransferLaneRunner),
             files_resolver,
+            default_files_resolver: true,
             poll: POLL,
         }
     }
@@ -781,13 +949,22 @@ impl TransfersWorker {
     #[must_use]
     pub fn with_files_resolver(mut self, resolver: Arc<dyn FilesEndpointResolver>) -> Self {
         self.files_resolver = resolver;
+        self.default_files_resolver = false;
         self
     }
 
     /// Override the Bus root used for terminal notification tests.
     #[must_use]
     pub fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
-        self.bus_root = bus_root;
+        self.bus_root = TransferBusRoot::from_override(bus_root);
+        if self.default_files_resolver {
+            self.files_resolver = Arc::new(CollabFilesResolver::with_bus_selection(
+                self.bus_root.clone(),
+                crate::default_qnm_shared_root()
+                    .join("collab")
+                    .join("content"),
+            ));
+        }
         self
     }
 
@@ -803,10 +980,44 @@ impl TransfersWorker {
     /// # Errors
     /// Fails if the ledger directory can't be opened.
     fn engine(&self) -> std::io::Result<Engine> {
+        let queue = TransferQueue::open(&self.store_root, self.cap)?;
+        let v2_ledger = V2Ledger::open(&self.store_root)?;
+        let sync_pairs = SyncPairStore::open(&self.store_root)?;
+        let notify = self
+            .bus_root
+            .enabled()
+            .then(|| TransferNotifier::with_bus_selection(self.bus_root.clone()));
+        let notification_outbox = notify
+            .as_ref()
+            .map(|_| TransferNotificationOutbox::open(&self.store_root))
+            .transpose()?;
+        if let Some(outbox) = &notification_outbox {
+            let retained = queue
+                .list()
+                .into_iter()
+                .filter(|job| job.state.is_terminal())
+                .map(|job| legacy_notification_receipt(&job))
+                .chain(
+                    v2_ledger
+                        .load_all()
+                        .into_iter()
+                        .filter(|job| {
+                            matches!(
+                                job.state,
+                                V2State::Completed | V2State::Failed | V2State::Canceled
+                            )
+                        })
+                        .map(|job| v2_notification_receipt(&job)),
+                );
+            // Existing terminal history is state, not a fresh mutation. Prime
+            // its receipts atomically against any crash-surviving outbox rows
+            // so activation never replays retained notifications.
+            outbox.prime_existing(retained)?;
+        }
         Ok(Engine {
-            queue: TransferQueue::open(&self.store_root, self.cap)?,
-            v2_ledger: V2Ledger::open(&self.store_root)?,
-            sync_pairs: SyncPairStore::open(&self.store_root)?,
+            queue,
+            v2_ledger,
+            sync_pairs,
             tasks: HashMap::new(),
             v2_tasks: HashMap::new(),
             lane: Arc::clone(&self.lane),
@@ -814,7 +1025,8 @@ impl TransfersWorker {
             v2_ledger_lock: Arc::new(Mutex::new(())),
             cap: self.cap,
             store_root: self.store_root.clone(),
-            notify: self.bus_root.clone().map(TransferNotifier::new),
+            notify,
+            notification_outbox,
         })
     }
 }
@@ -855,6 +1067,7 @@ struct Engine {
     cap: usize,
     store_root: PathBuf,
     notify: Option<TransferNotifier>,
+    notification_outbox: Option<TransferNotificationOutbox>,
 }
 
 struct V2Task {
@@ -873,12 +1086,97 @@ enum V2TaskResult {
 impl Engine {
     /// One scheduler pass: apply inbox verbs, reap finished tasks, fill to the cap.
     async fn tick(&mut self) {
+        if let Err(error) = self.reconcile_terminal_notifications() {
+            tracing::warn!(target: "mackesd::transfers", %error, "transfer terminal recovery deferred");
+            return;
+        }
+        if let Err(error) = self.flush_notifications() {
+            tracing::warn!(target: "mackesd::transfers", %error, "transfer notification transaction deferred");
+            return;
+        }
         self.drain_inbox();
         self.schedule_sync_pairs_at(now_ms());
         self.reap().await;
         self.reap_v2().await;
+        if let Err(error) = self.flush_notifications() {
+            tracing::warn!(target: "mackesd::transfers", %error, "transfer result publication deferred");
+            return;
+        }
         self.fill_v2();
         self.fill();
+    }
+
+    fn reconcile_terminal_notifications(&self) -> io::Result<()> {
+        let Some(notify) = &self.notify else {
+            return Ok(());
+        };
+        let Some(outbox) = &self.notification_outbox else {
+            return Ok(());
+        };
+        let legacy = self
+            .queue
+            .list()
+            .into_iter()
+            .filter(|job| job.state.is_terminal())
+            .collect::<Vec<_>>();
+        let v2 = self
+            .v2_ledger
+            .load_all()
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    V2State::Completed | V2State::Failed | V2State::Canceled
+                )
+            })
+            .collect::<Vec<_>>();
+        let needs_identity = legacy
+            .iter()
+            .map(legacy_notification_receipt)
+            .chain(v2.iter().map(v2_notification_receipt))
+            .any(|key| !outbox.baseline_exists(&key));
+        let current_identity = needs_identity
+            .then(|| notify.current_index_identity())
+            .transpose()?;
+        for job in legacy {
+            let receipt = legacy_notification_receipt(&job);
+            if outbox.baseline_exists(&receipt)
+                || current_identity.is_some_and(|identity| outbox.delivered_to(&receipt, identity))
+            {
+                continue;
+            }
+            self.stage_notification(notify.prepare_terminal(&job)?)?;
+        }
+        for job in v2 {
+            let receipt = v2_notification_receipt(&job);
+            if outbox.baseline_exists(&receipt)
+                || current_identity.is_some_and(|identity| outbox.delivered_to(&receipt, identity))
+            {
+                continue;
+            }
+            self.stage_notification(notify.prepare_v2_terminal(&job, None)?)?;
+        }
+        Ok(())
+    }
+
+    fn stage_notification(&self, notification: PendingTransferNotification) -> io::Result<()> {
+        if let Some(outbox) = &self.notification_outbox {
+            outbox.stage(&notification)?;
+        }
+        Ok(())
+    }
+
+    fn flush_notifications(&self) -> io::Result<()> {
+        let (Some(notify), Some(outbox)) = (&self.notify, &self.notification_outbox) else {
+            return Ok(());
+        };
+        let pending = outbox.read_complete()?;
+        for notification in pending {
+            let publication = notify.publish(&notification.body)?;
+            let identity = publication.verify_current()?;
+            outbox.mark_delivered(&notification, identity)?;
+        }
+        Ok(())
     }
 
     /// Fire every due saved sync pair by enqueueing a normal rsync job.
@@ -1051,7 +1349,16 @@ impl Engine {
             }
         }
         if let (Some(notify), false) = (&self.notify, terminal.is_empty()) {
-            notify.emit_terminal_batch(&terminal);
+            match notify.prepare_terminal_batch(&terminal) {
+                Ok(notification) => {
+                    if let Err(error) = self.stage_notification(notification) {
+                        tracing::warn!(target: "mackesd::transfers", %error, "legacy terminal notification staging failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::transfers", %error, "legacy terminal notification serialization failed")
+                }
+            }
         }
     }
 
@@ -1073,7 +1380,16 @@ impl Engine {
                     checksum_sha256,
                 }) => {
                     if let Some(notify) = &self.notify {
-                        notify.emit_v2_terminal(&job, checksum_sha256.as_deref());
+                        match notify.prepare_v2_terminal(&job, checksum_sha256.as_deref()) {
+                            Ok(notification) => {
+                                if let Err(error) = self.stage_notification(notification) {
+                                    tracing::warn!(target: "mackesd::transfers", %error, "V2 terminal notification staging failed");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::transfers", %error, "V2 terminal notification serialization failed")
+                            }
+                        }
                     }
                 }
                 Ok(V2TaskResult::Superseded) => {}
@@ -1087,7 +1403,16 @@ impl Engine {
                         finish_v2_failed(&self.v2_ledger, &self.v2_ledger_lock, id, None, error)
                     {
                         if let Some(notify) = &self.notify {
-                            notify.emit_v2_terminal(&job, None);
+                            match notify.prepare_v2_terminal(&job, None) {
+                                Ok(notification) => {
+                                    if let Err(error) = self.stage_notification(notification) {
+                                        tracing::warn!(target: "mackesd::transfers", %error, "failed-task notification staging failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(target: "mackesd::transfers", %error, "failed-task notification serialization failed")
+                                }
+                            }
                         }
                     }
                 }
@@ -1469,18 +1794,96 @@ fn run_v2_copy_attempt(
 
 #[derive(Clone)]
 struct TransferNotifier {
-    bus_root: PathBuf,
+    bus_root: TransferBusRoot,
+    #[cfg(test)]
+    after_bus_open: Option<TransferBusHook>,
+    #[cfg(test)]
+    after_publish: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    #[cfg(test)]
+    after_validation: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIndexIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct TransferBusPublication {
+    root: PathBuf,
+    index_identity: BusIndexIdentity,
+    #[cfg(test)]
+    after_validation: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+}
+
+impl TransferBusPublication {
+    fn verify_current(&self) -> io::Result<BusIndexIdentity> {
+        if bus_index_identity(&self.root)? != self.index_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer notification Bus index was replaced during publication",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.after_validation {
+            hook(&self.root);
+        }
+        Ok(self.index_identity)
+    }
 }
 
 impl TransferNotifier {
     fn new(bus_root: PathBuf) -> Self {
-        Self { bus_root }
+        Self::with_bus_selection(TransferBusRoot::Explicit(bus_root))
     }
 
-    fn emit_terminal_batch(&self, jobs: &[TransferJob]) {
+    fn with_bus_selection(bus_root: TransferBusRoot) -> Self {
+        Self {
+            bus_root,
+            #[cfg(test)]
+            after_bus_open: None,
+            #[cfg(test)]
+            after_publish: None,
+            #[cfg(test)]
+            after_validation: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_bus_open(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_bus_open = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_publish(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_publish = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_validation(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.after_validation = Some(Arc::new(hook));
+        self
+    }
+
+    fn current_index_identity(&self) -> io::Result<BusIndexIdentity> {
+        TransferBusTransaction::open(
+            &self.bus_root,
+            #[cfg(test)]
+            self.after_bus_open.as_ref(),
+            #[cfg(not(test))]
+            None,
+        )
+        .map(|transaction| transaction.identity)
+    }
+
+    fn prepare_terminal_batch(
+        &self,
+        jobs: &[TransferJob],
+    ) -> io::Result<PendingTransferNotification> {
         if let [job] = jobs {
-            self.emit_terminal(job);
-            return;
+            return self.prepare_terminal(job);
         }
         let done = jobs
             .iter()
@@ -1496,10 +1899,12 @@ impl TransferNotifier {
             (0, failed) => format!("{failed} transfers failed"),
             (done, failed) => format!("{done} transfers completed, {failed} failed"),
         };
-        self.emit_body(severity, summary, None, None, None, None, None);
+        let body = self.body_json(severity, summary, None, None, None, None, None)?;
+        let receipts = jobs.iter().map(legacy_notification_receipt).collect();
+        Ok(PendingTransferNotification::new(body, receipts))
     }
 
-    fn emit_terminal(&self, job: &TransferJob) {
+    fn prepare_terminal(&self, job: &TransferJob) -> io::Result<PendingTransferNotification> {
         let (severity, summary) = match job.state {
             TransferState::Done => (
                 "info",
@@ -1517,9 +1922,14 @@ impl TransferNotifier {
                         .map_or_else(String::new, |e| format!(": {e}"))
                 ),
             ),
-            _ => return,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transfer notification requires terminal state",
+                ));
+            }
         };
-        self.emit_body(
+        let body = self.body_json(
             severity,
             summary,
             Some(&job.id),
@@ -1527,18 +1937,31 @@ impl TransferNotifier {
             Some(job.method.as_str()),
             None,
             None,
-        );
+        )?;
+        Ok(PendingTransferNotification::new(
+            body,
+            vec![legacy_notification_receipt(job)],
+        ))
     }
 
-    fn emit_v2_terminal(&self, job: &TransferJobV2, checksum_sha256: Option<&str>) {
+    fn prepare_v2_terminal(
+        &self,
+        job: &TransferJobV2,
+        checksum_sha256: Option<&str>,
+    ) -> io::Result<PendingTransferNotification> {
         let (severity, status) = match job.state {
             V2State::Completed => ("info", "completed"),
             V2State::Failed => ("warning", "failed"),
             V2State::Canceled => ("info", "canceled"),
-            _ => return,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "V2 transfer notification requires terminal state",
+                ));
+            }
         };
         let id = job.transfer.to_string();
-        self.emit_body(
+        let body = self.body_json(
             severity,
             format!(
                 "transfer {} {status} ({})",
@@ -1550,10 +1973,14 @@ impl TransferNotifier {
             Some(job.kind.as_str()),
             Some(job.progress.bytes_done),
             checksum_sha256,
-        );
+        )?;
+        Ok(PendingTransferNotification::new(
+            body,
+            vec![v2_notification_receipt(job)],
+        ))
     }
 
-    fn emit_body(
+    fn body_json(
         &self,
         severity: &str,
         summary: String,
@@ -1562,7 +1989,7 @@ impl TransferNotifier {
         method: Option<&str>,
         bytes_done: Option<u64>,
         checksum_sha256: Option<&str>,
-    ) {
+    ) -> io::Result<String> {
         let body = TransferNotifyBody {
             severity,
             source: "transfers",
@@ -1575,22 +2002,388 @@ impl TransferNotifier {
             bytes_done,
             checksum_sha256,
         };
-        let Ok(json) = serde_json::to_string(&body) else {
-            return;
-        };
-        match Persist::open(self.bus_root.clone()) {
-            Ok(persist) => {
-                if let Err(e) =
-                    persist.write(TRANSFER_NOTIFY_TOPIC, Priority::Default, None, Some(&json))
-                {
-                    tracing::debug!(target: "mackesd::transfers", error = %e, "transfer notify publish failed");
-                }
-            }
-            Err(e) => {
-                tracing::debug!(target: "mackesd::transfers", error = %e, "transfer notify persist open failed");
-            }
+        serde_json::to_string(&body).map_err(io::Error::other)
+    }
+
+    fn publish(&self, body: &str) -> io::Result<TransferBusPublication> {
+        let transaction = TransferBusTransaction::open(
+            &self.bus_root,
+            #[cfg(test)]
+            self.after_bus_open.as_ref(),
+            #[cfg(not(test))]
+            None,
+        )?;
+        transaction
+            .persist
+            .write(TRANSFER_NOTIFY_TOPIC, Priority::Default, None, Some(body))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        #[cfg(test)]
+        if let Some(hook) = &self.after_publish {
+            hook(&transaction.root);
+        }
+        Ok(TransferBusPublication {
+            root: transaction.root,
+            index_identity: transaction.identity,
+            #[cfg(test)]
+            after_validation: self.after_validation.clone(),
+        })
+    }
+}
+
+fn bus_index_identity(root: &Path) -> io::Result<BusIndexIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer Bus index is not a regular file",
+        ));
+    }
+    Ok(BusIndexIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingTransferNotification {
+    id: String,
+    receipt_keys: Vec<String>,
+    body: String,
+}
+
+impl PendingTransferNotification {
+    fn new(body: String, mut receipt_keys: Vec<String>) -> Self {
+        receipt_keys.sort();
+        receipt_keys.dedup();
+        let mut digest = Sha256::new();
+        digest.update(body.as_bytes());
+        for key in &receipt_keys {
+            digest.update([0]);
+            digest.update(key.as_bytes());
+        }
+        Self {
+            id: format!("{:x}", digest.finalize()),
+            receipt_keys,
+            body,
         }
     }
+
+    fn validate(&self) -> io::Result<()> {
+        if !is_sha256_name(&self.id)
+            || self.body.len() > MAX_NOTIFICATION_RECORD_BYTES
+            || self.receipt_keys.is_empty()
+            || self.receipt_keys.iter().any(|key| !is_sha256_name(key))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer notification outbox record is invalid",
+            ));
+        }
+        let rebuilt = Self::new(self.body.clone(), self.receipt_keys.clone());
+        if rebuilt.id != self.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer notification outbox identity mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct TransferNotificationOutbox {
+    pending_dir: PathBuf,
+    receipts_dir: PathBuf,
+    baseline_dir: PathBuf,
+}
+
+impl TransferNotificationOutbox {
+    fn open(store_root: &Path) -> io::Result<Self> {
+        let pending_dir = store_root.join(NOTIFICATION_OUTBOX_DIR);
+        let receipts_dir = store_root.join(NOTIFICATION_RECEIPTS_DIR);
+        let baseline_dir = store_root.join(NOTIFICATION_BASELINE_DIR);
+        std::fs::create_dir_all(&pending_dir)?;
+        std::fs::create_dir_all(&receipts_dir)?;
+        std::fs::create_dir_all(&baseline_dir)?;
+        require_safe_directory(&pending_dir)?;
+        require_safe_directory(&receipts_dir)?;
+        require_safe_directory(&baseline_dir)?;
+        Ok(Self {
+            pending_dir,
+            receipts_dir,
+            baseline_dir,
+        })
+    }
+
+    fn stage(&self, notification: &PendingTransferNotification) -> io::Result<()> {
+        notification.validate()?;
+        if notification
+            .receipt_keys
+            .iter()
+            .all(|key| self.baseline_exists(key))
+        {
+            return Ok(());
+        }
+        let pending_receipts: HashSet<String> = self
+            .read_complete()?
+            .into_iter()
+            .flat_map(|pending| pending.receipt_keys)
+            .collect();
+        if notification
+            .receipt_keys
+            .iter()
+            .all(|key| pending_receipts.contains(key))
+        {
+            return Ok(());
+        }
+        let path = self.pending_dir.join(format!("{}.json", notification.id));
+        if path.exists() {
+            return Ok(());
+        }
+        let body = serde_json::to_vec(notification).map_err(io::Error::other)?;
+        if body.len() > MAX_NOTIFICATION_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer notification outbox record exceeds limit",
+            ));
+        }
+        atomic_write_file(&path, &body)
+    }
+
+    fn read_complete(&self) -> io::Result<Vec<PendingTransferNotification>> {
+        require_safe_directory(&self.pending_dir)?;
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&self.pending_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transfer notification outbox filename is invalid",
+                ));
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transfer notification outbox contains an unknown row",
+                ));
+            }
+            paths.push(path);
+        }
+        if paths.len() > MAX_NOTIFICATION_OUTBOX_RECORDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer notification outbox exceeds record limit",
+            ));
+        }
+        paths.sort();
+        let mut notifications = Vec::with_capacity(paths.len());
+        for path in paths {
+            let body = read_bounded_regular_file(&path, MAX_NOTIFICATION_RECORD_BYTES)?;
+            let notification: PendingTransferNotification =
+                serde_json::from_slice(&body).map_err(io::Error::other)?;
+            notification.validate()?;
+            let expected_name = format!("{}.json", notification.id);
+            if path.file_name().and_then(|name| name.to_str()) != Some(&expected_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transfer notification outbox filename does not match identity",
+                ));
+            }
+            notifications.push(notification);
+        }
+        Ok(notifications)
+    }
+
+    fn mark_delivered(
+        &self,
+        notification: &PendingTransferNotification,
+        identity: BusIndexIdentity,
+    ) -> io::Result<()> {
+        for key in &notification.receipt_keys {
+            let receipt = self.receipts_dir.join(key);
+            let body = format!("{}\n", bus_identity_digest(identity));
+            atomic_write_file(&receipt, body.as_bytes())?;
+        }
+        let pending = self.pending_dir.join(format!("{}.json", notification.id));
+        match std::fs::remove_file(pending) {
+            Ok(()) => sync_directory(&self.pending_dir),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn prime_existing(&self, receipt_keys: impl IntoIterator<Item = String>) -> io::Result<()> {
+        let pending_keys: HashSet<String> = self
+            .read_complete()?
+            .into_iter()
+            .flat_map(|notification| notification.receipt_keys)
+            .collect();
+        for key in receipt_keys {
+            if !pending_keys.contains(&key)
+                && !self.baseline_exists(&key)
+                && !self.has_any_delivery(&key)?
+            {
+                atomic_write_file(&self.baseline_dir.join(&key), b"retained\n")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn baseline_exists(&self, key: &str) -> bool {
+        self.baseline_dir
+            .join(key)
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    }
+
+    fn delivered_to(&self, key: &str, identity: BusIndexIdentity) -> bool {
+        read_bounded_regular_file(&self.receipts_dir.join(key), 65)
+            .ok()
+            .and_then(|body| String::from_utf8(body).ok())
+            .is_some_and(|body| body.trim() == bus_identity_digest(identity))
+    }
+
+    fn has_any_delivery(&self, key: &str) -> io::Result<bool> {
+        require_safe_directory(&self.receipts_dir)?;
+        let path = self.receipts_dir.join(key);
+        let body = match read_bounded_regular_file(&path, 65) {
+            Ok(body) => body,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let identity = String::from_utf8(body).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer notification receipt is not UTF-8",
+            )
+        })?;
+        if !is_sha256_name(identity.trim()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer notification receipt identity is invalid",
+            ));
+        }
+        Ok(true)
+    }
+}
+
+fn require_safe_directory(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transfer notification storage is not a safe directory",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer notification row is not a bounded regular file",
+        ));
+    }
+    let mut body = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)?
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut body)?;
+    if body.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer notification row grew beyond its limit",
+        ));
+    }
+    Ok(body)
+}
+
+fn atomic_write_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("transfer notification path has no parent"))?;
+    require_safe_directory(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("transfer notification filename is invalid"))?,
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(0o400000);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        file.write_all(body)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn is_sha256_name(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn notification_receipt(kind: &str, id: &str, update: u64, state: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(kind.as_bytes());
+    digest.update([0]);
+    digest.update(id.as_bytes());
+    digest.update([0]);
+    digest.update(update.to_le_bytes());
+    digest.update([0]);
+    digest.update(state.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn bus_identity_digest(identity: BusIndexIdentity) -> String {
+    let mut digest = Sha256::new();
+    digest.update(identity.device.to_le_bytes());
+    digest.update(identity.inode.to_le_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn legacy_notification_receipt(job: &TransferJob) -> String {
+    notification_receipt("legacy", &job.id, job.updated_ms, job.state.as_str())
+}
+
+fn v2_notification_receipt(job: &TransferJobV2) -> String {
+    notification_receipt(
+        "v2",
+        &job.transfer.to_string(),
+        job.updated_unix_ms,
+        match job.state {
+            V2State::Completed => "completed",
+            V2State::Failed => "failed",
+            V2State::Canceled => "canceled",
+            _ => "nonterminal",
+        },
+    )
 }
 
 #[derive(Serialize)]
@@ -1629,6 +2422,7 @@ mod tests {
         TransferKind, TransferOperation,
     };
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::watch;
     use uuid::Uuid;
 
@@ -1652,6 +2446,11 @@ mod tests {
         outcome: LaneOutcome,
     }
 
+    struct CountingLane {
+        calls: Arc<AtomicUsize>,
+        outcome: LaneOutcome,
+    }
+
     struct UnavailableFilesResolver;
 
     impl FilesEndpointResolver for UnavailableFilesResolver {
@@ -1671,6 +2470,14 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl LaneRunner for CountingLane {
+        async fn run(&self, _job: &TransferJob, _progress: ProgressSink) -> LaneOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone()
+        }
+    }
+
     fn engine_with(store: &Path, cap: usize, lane: Arc<dyn LaneRunner>) -> Engine {
         Engine {
             queue: TransferQueue::open(store, cap).unwrap(),
@@ -1684,6 +2491,7 @@ mod tests {
             cap,
             store_root: store.to_path_buf(),
             notify: None,
+            notification_outbox: None,
         }
     }
 
@@ -1705,6 +2513,7 @@ mod tests {
             cap,
             store_root: store.to_path_buf(),
             notify: Some(TransferNotifier::new(bus.to_path_buf())),
+            notification_outbox: Some(TransferNotificationOutbox::open(store).unwrap()),
         }
     }
 
@@ -1824,6 +2633,15 @@ mod tests {
             )
             .unwrap();
         space
+    }
+
+    fn replace_bus_index(root: &Path) -> BusIndexIdentity {
+        let index = root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        Persist::open(root.to_path_buf()).expect("create replacement Bus index");
+        bus_index_identity(root).expect("replacement Bus identity")
     }
 
     fn seed_collab_file_log(
@@ -2010,6 +2828,176 @@ mod tests {
         let body = notification.body.expect("terminal body");
         assert!(body.contains("\"bytes_done\":0"));
         assert!(!body.contains("checksum_sha256"));
+    }
+
+    #[test]
+    fn incomplete_files_registry_view_defers_before_filesystem_effects() {
+        let bus = tempfile::tempdir().unwrap();
+        let mesh = tempfile::tempdir().unwrap();
+        let content_root = mesh.path().join("collab/content");
+        std::fs::create_dir_all(&content_root).unwrap();
+        let source_bytes = b"canonical source generation";
+        let destination_bytes = b"destination must remain unchanged";
+        let (source, _source_path) = canonical_file(&content_root, "source.bin", source_bytes);
+        let (destination, destination_path) =
+            canonical_file(&content_root, "destination.bin", destination_bytes);
+        publish_file_identities(bus.path(), source, destination);
+
+        let unreadable_space = SpaceId::from_uuid(Uuid::from_u128(0x8f1));
+        Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .write(
+                &topics::space_state_topic(topics::projection::FILE_REFERENCES, unreadable_space),
+                Priority::Default,
+                None,
+                Some("{not a complete registry projection"),
+            )
+            .unwrap();
+
+        let resolver = CollabFilesResolver::new(Some(bus.path().to_path_buf()), content_root);
+        let source_identity = TransferLocation::Local {
+            object: FileRefId::from_uuid(Uuid::from_u128(0x802)),
+        };
+        assert_eq!(
+            resolver.resolve(&source_identity, FilesEndpointRole::Source),
+            Err(FilesResolveFailure::RegistryFailure),
+            "one unreadable admitted registry lane invalidates the complete snapshot"
+        );
+        assert_eq!(
+            std::fs::read(destination_path).unwrap(),
+            destination_bytes,
+            "registry failure occurs before any destination filesystem effect"
+        );
+    }
+
+    #[test]
+    fn files_registry_replacement_after_complete_read_defers_before_filesystem_effects() {
+        let bus = tempfile::tempdir().unwrap();
+        let mesh = tempfile::tempdir().unwrap();
+        let content_root = mesh.path().join("collab/content");
+        std::fs::create_dir_all(&content_root).unwrap();
+        let source_bytes = b"canonical source generation";
+        let destination_bytes = b"destination must remain unchanged";
+        let (source, _source_path) = canonical_file(&content_root, "source.bin", source_bytes);
+        let (destination, destination_path) =
+            canonical_file(&content_root, "destination.bin", destination_bytes);
+        publish_file_identities(bus.path(), source, destination);
+
+        let replaced = Arc::new(AtomicBool::new(false));
+        let replace_once = Arc::clone(&replaced);
+        let resolver = CollabFilesResolver::new(Some(bus.path().to_path_buf()), content_root)
+            .with_after_registry_read(move |root| {
+                if !replace_once.swap(true, Ordering::SeqCst) {
+                    replace_bus_index(root);
+                }
+            });
+        let source_identity = TransferLocation::Local {
+            object: FileRefId::from_uuid(Uuid::from_u128(0x802)),
+        };
+        assert_eq!(
+            resolver.resolve(&source_identity, FilesEndpointRole::Source),
+            Err(FilesResolveFailure::RegistryFailure),
+            "a registry snapshot from a retired index must not return authority"
+        );
+        assert!(replaced.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(destination_path).unwrap(),
+            destination_bytes,
+            "replacement is rejected before any destination filesystem effect"
+        );
+    }
+
+    #[test]
+    fn files_command_and_projection_transactions_reject_retired_index() {
+        let bus = tempfile::tempdir().unwrap();
+        let mesh = tempfile::tempdir().unwrap();
+        let content_root = mesh.path().join("collab/content");
+        std::fs::create_dir_all(&content_root).unwrap();
+        Persist::open(bus.path().to_path_buf()).unwrap();
+
+        let command_replaced = Arc::new(AtomicBool::new(false));
+        let replace_command = Arc::clone(&command_replaced);
+        let command_resolver =
+            CollabFilesResolver::new(Some(bus.path().to_path_buf()), content_root.clone())
+                .with_after_command_write(move |root| {
+                    if !replace_command.swap(true, Ordering::SeqCst) {
+                        replace_bus_index(root);
+                    }
+                });
+        let command_topic = topics::command_topic("commit-file-generation");
+        assert_eq!(
+            command_resolver.publish_current_command_body(&command_topic, "{}"),
+            Err(FilesCommitFailure::Publication)
+        );
+        assert!(command_replaced.load(Ordering::SeqCst));
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .read_latest(&command_topic)
+            .unwrap()
+            .is_none());
+
+        let space = SpaceId::from_uuid(Uuid::from_u128(0x8f2));
+        let file = FileRefId::from_uuid(Uuid::from_u128(0x803));
+        let replacement = FileRef {
+            name: "destination.bin".into(),
+            size: 9,
+            sha256_hex: "a".repeat(64),
+            mime: None,
+        };
+        let body = serde_json::to_string(&FileReferences {
+            space,
+            files: vec![FileReferenceView {
+                file,
+                reference: replacement.clone(),
+                linked_by: ActorId::new("local-seat"),
+                linked_unix_ms: 301,
+            }],
+        })
+        .unwrap();
+        let projection_topic =
+            topics::space_state_topic(topics::projection::FILE_REFERENCES, space);
+        Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .write(&projection_topic, Priority::Default, None, Some(&body))
+            .unwrap();
+        let projection_replaced = Arc::new(AtomicBool::new(false));
+        let replace_projection = Arc::clone(&projection_replaced);
+        let projection_resolver =
+            CollabFilesResolver::new(Some(bus.path().to_path_buf()), content_root)
+                .with_commit_authority(
+                    CloudArmSigner::new(b"projection-transaction-test".to_vec()).unwrap(),
+                    "local-seat",
+                    Duration::from_millis(5),
+                )
+                .with_after_projection_read(move |root| {
+                    if !replace_projection.swap(true, Ordering::SeqCst) {
+                        replace_bus_index(root);
+                    }
+                });
+        let expected = ResolvedFilesEndpoint {
+            identity: TransferLocation::Local { object: file },
+            canonical_root: std::fs::canonicalize(mesh.path().join("collab/content")).unwrap(),
+            relative_path: PathBuf::from("bb").join("b".repeat(64)),
+            generation: 300,
+            sha256_hex: "b".repeat(64),
+            size_bytes: 8,
+            object_type: FilesObjectType::RegularFile,
+            available: true,
+            readable: true,
+            writable: true,
+        };
+        assert_eq!(
+            projection_resolver.await_generation_projection(
+                space,
+                file,
+                300,
+                &expected,
+                &replacement,
+            ),
+            Err(FilesCommitFailure::PublicationUnconfirmed),
+            "a success projection read from a retired index must not confirm the commit"
+        );
+        assert!(projection_replaced.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2382,6 +3370,444 @@ mod tests {
             done_count(&engine),
             3,
             "every job — incl. the one held behind the cap — drained"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_and_replaced_bus_recovers_identity_bound_forward_notifications() {
+        assert_eq!(
+            transfer_bus_root(
+                &TransferBusRoot::Explicit(PathBuf::from("/explicit")),
+                Some(PathBuf::from("/current")),
+            )
+            .unwrap(),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            transfer_bus_root(&TransferBusRoot::Dynamic, Some(PathBuf::from("/current")),).unwrap(),
+            PathBuf::from("/current")
+        );
+        assert_eq!(
+            transfer_bus_root(&TransferBusRoot::Dynamic, None).unwrap(),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert!(transfer_bus_root(&TransferBusRoot::Disabled, None).is_err());
+
+        let store = tempfile::tempdir().unwrap();
+        let bus_parent = tempfile::tempdir().unwrap();
+        let bus = bus_parent.path().join("late-bus");
+        std::fs::write(&bus, b"block transfer Bus").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = TransfersWorker::new(store.path().to_path_buf())
+            .with_lane(Arc::new(CountingLane {
+                calls: Arc::clone(&calls),
+                outcome: LaneOutcome::Done,
+            }))
+            .with_bus_root(Some(bus.clone()))
+            .with_poll(Duration::from_millis(10));
+        let first = job();
+        let first_id = first.id.clone();
+        write_verb(store.path(), &TransferVerb::Submit(first)).unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) != 1 {
+                assert!(!task.is_finished(), "late Bus terminated transfer worker");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first transfer effect");
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_file(&bus).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let published = Persist::open(bus.clone())
+                    .ok()
+                    .and_then(|persist| persist.read_latest(TRANSFER_NOTIFY_TOPIC).ok().flatten())
+                    .and_then(|row| row.body)
+                    .is_some_and(|body| body.contains(&first_id));
+                if published {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before late Bus recovery"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("late notification recovery");
+
+        let index = bus.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let second = job();
+        let second_id = second.id.clone();
+        write_verb(store.path(), &TransferVerb::Submit(second)).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = Persist::open(bus.clone())
+                    .map(|persist| {
+                        persist
+                            .list_since(TRANSFER_NOTIFY_TOPIC, None)
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let first_rows = rows
+                    .iter()
+                    .filter(|row| {
+                        row.body
+                            .as_deref()
+                            .is_some_and(|body| body.contains(&first_id))
+                    })
+                    .count();
+                let second_rows = rows
+                    .iter()
+                    .filter(|row| {
+                        row.body
+                            .as_deref()
+                            .is_some_and(|body| body.contains(&second_id))
+                    })
+                    .count();
+                if rows.len() == 2 && first_rows == 1 && second_rows == 1 {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited after index replacement");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement index forward notification");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn unreadable_outbox_defers_inbox_and_lane_effects() {
+        let store = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = engine_with_notify(
+            store.path(),
+            bus.path(),
+            1,
+            Arc::new(CountingLane {
+                calls: Arc::clone(&calls),
+                outcome: LaneOutcome::Done,
+            }),
+        );
+        let corrupt = store.path().join(NOTIFICATION_OUTBOX_DIR).join("bad.json");
+        std::fs::write(&corrupt, b"not an outbox record").unwrap();
+        let submitted = job();
+        let id = submitted.id.clone();
+        write_verb(store.path(), &TransferVerb::Submit(submitted)).unwrap();
+
+        engine.tick().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(engine.queue.get(&id).is_none());
+        assert_eq!(take_verbs(store.path()).len(), 1, "inbox was not consumed");
+
+        std::fs::remove_file(corrupt).unwrap();
+        let replacement = job();
+        let replacement_id = replacement.id.clone();
+        write_verb(store.path(), &TransferVerb::Submit(replacement)).unwrap();
+        for _ in 0..20 {
+            engine.tick().await;
+            if engine
+                .queue
+                .get(&replacement_id)
+                .is_some_and(|job| job.state.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_result_publication_corrects_forward_without_repeating_lane() {
+        let store = tempfile::tempdir().unwrap();
+        let bus_parent = tempfile::tempdir().unwrap();
+        let bus = bus_parent.path().join("blocked-bus");
+        std::fs::write(&bus, b"block transfer Bus open").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut engine = engine_with_notify(
+            store.path(),
+            &bus,
+            1,
+            Arc::new(CountingLane {
+                calls: Arc::clone(&calls),
+                outcome: LaneOutcome::failed("fixture result"),
+            }),
+        );
+        let submitted = job();
+        let id = submitted.id.clone();
+        write_verb(store.path(), &TransferVerb::Submit(submitted)).unwrap();
+
+        for _ in 0..20 {
+            engine.tick().await;
+            if engine
+                .queue
+                .get(&id)
+                .is_some_and(|job| job.state == TransferState::Failed)
+                && engine.tasks.is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for _ in 0..3 {
+            engine.tick().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .read_complete()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_file(&bus).unwrap();
+        engine.tick().await;
+        engine.tick().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let rows = Persist::open(bus)
+            .unwrap()
+            .list_since(TRANSFER_NOTIFY_TOPIC, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one corrected-forward result publication");
+        assert!(rows[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains(&id)));
+        assert!(engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .read_complete()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn notification_replacement_during_open_rejects_retired_connection_identity() {
+        let bus = tempfile::tempdir().unwrap();
+        Persist::open(bus.path().to_path_buf()).unwrap();
+        let original = bus_index_identity(bus.path()).unwrap();
+        let replaced = Arc::new(AtomicBool::new(false));
+        let replace_once = Arc::clone(&replaced);
+        let notifier =
+            TransferNotifier::new(bus.path().to_path_buf()).with_after_bus_open(move |root| {
+                if !replace_once.swap(true, Ordering::SeqCst) {
+                    replace_bus_index(root);
+                }
+            });
+
+        let error = match notifier.publish(r#"{"source":"transfers"}"#) {
+            Ok(_) => panic!("open spanning a replacement must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(replaced.load(Ordering::SeqCst));
+        assert_ne!(original, bus_index_identity(bus.path()).unwrap());
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .list_since(TRANSFER_NOTIFY_TOPIC, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_after_validation_restart_corrects_to_current_index() {
+        let store = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        Persist::open(bus.path().to_path_buf()).unwrap();
+        let retired_identity = bus_index_identity(bus.path()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let replaced_during_publish = Arc::new(AtomicBool::new(false));
+        let replace_during_publish = Arc::clone(&replaced_during_publish);
+        let replaced_after_validation = Arc::new(AtomicBool::new(false));
+        let replace_after_validation = Arc::clone(&replaced_after_validation);
+        let mut engine = engine_with_notify(
+            store.path(),
+            bus.path(),
+            1,
+            Arc::new(CountingLane {
+                calls: Arc::clone(&calls),
+                outcome: LaneOutcome::Done,
+            }),
+        );
+        engine.notify = Some(
+            TransferNotifier::new(bus.path().to_path_buf())
+                .with_after_publish(move |root| {
+                    if replace_during_publish.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let index = root.join("index.sqlite");
+                    for suffix in ["", "-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+                    }
+                    Persist::open(root.to_path_buf()).expect("create replacement Bus index");
+                })
+                .with_after_validation(move |root| {
+                    if replace_after_validation.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let index = root.join("index.sqlite");
+                    for suffix in ["", "-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+                    }
+                    Persist::open(root.to_path_buf()).expect("create post-validation Bus index");
+                }),
+        );
+        let submitted = job();
+        let id = submitted.id.clone();
+        write_verb(store.path(), &TransferVerb::Submit(submitted)).unwrap();
+
+        for _ in 0..20 {
+            engine.tick().await;
+            if replaced_during_publish.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(replaced_during_publish.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let terminal = engine.queue.get(&id).expect("durable terminal transfer");
+        let receipt = legacy_notification_receipt(&terminal);
+        let during_publish_identity = bus_index_identity(bus.path()).unwrap();
+        assert_ne!(retired_identity, during_publish_identity);
+        assert_eq!(
+            engine
+                .notification_outbox
+                .as_ref()
+                .unwrap()
+                .read_complete()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, retired_identity));
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, during_publish_identity));
+
+        engine.tick().await;
+        assert!(replaced_after_validation.load(Ordering::SeqCst));
+        let replacement_identity = bus_index_identity(bus.path()).unwrap();
+        assert_ne!(during_publish_identity, replacement_identity);
+        assert!(engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .read_complete()
+            .unwrap()
+            .is_empty());
+        assert!(engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, during_publish_identity));
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, replacement_identity));
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .list_since(TRANSFER_NOTIFY_TOPIC, None)
+            .unwrap()
+            .is_empty());
+
+        drop(engine);
+        let worker = TransfersWorker::new(store.path().to_path_buf())
+            .with_lane(Arc::new(CountingLane {
+                calls: Arc::clone(&calls),
+                outcome: LaneOutcome::Done,
+            }))
+            .with_bus_root(Some(bus.path().to_path_buf()));
+        let mut engine = worker.engine().unwrap();
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .baseline_exists(&receipt));
+        engine.tick().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let rows = Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .list_since(TRANSFER_NOTIFY_TOPIC, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains(&id)));
+        assert!(engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .read_complete()
+            .unwrap()
+            .is_empty());
+        assert!(engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, replacement_identity));
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, retired_identity));
+        assert!(!engine
+            .notification_outbox
+            .as_ref()
+            .unwrap()
+            .delivered_to(&receipt, during_publish_identity));
+
+        drop(engine);
+        let worker = TransfersWorker::new(store.path().to_path_buf())
+            .with_lane(Arc::new(CountingLane {
+                calls: Arc::clone(&calls),
+                outcome: LaneOutcome::Done,
+            }))
+            .with_bus_root(Some(bus.path().to_path_buf()));
+        let mut engine = worker.engine().unwrap();
+        engine.tick().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Persist::open(bus.path().to_path_buf())
+                .unwrap()
+                .list_since(TRANSFER_NOTIFY_TOPIC, None)
+                .unwrap()
+                .len(),
+            1,
+            "same-index restart is suppressed by its identity-bound receipt"
         );
     }
 

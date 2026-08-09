@@ -445,10 +445,10 @@ behavioral evidence is not completion.
   serving, aggregation, and publication remain behind recoverable Bus startup;
   machine 193 passed two exact activation/fallback tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-recovery-r28.md`.
-- **Notification Bus recovery checkpoint (2026-08-09):** lifecycle notification
-  monitoring now survives late Bus storage, while failed durable Cloud-lane
-  reads retain their cursor and rollup. Machine 193 passed two exact tests:
-  `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`.
+- **Notification/transfer Bus recovery checkpoint (2026-08-09):** monitoring and transfer effects survive late/replaced storage; complete registry reads and durable
+  identity-bound result receipts prevent lost acknowledgements or repeated transfer effects. Focused farm gates:
+  `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`,
+  `docs/platform/evidence/WL-FUNC-016-WL-FUNC-019-WL-ARCH-009-2026-08-09-transfer-bus-transaction-recovery-r69.md`.
 - **Clipboard-sync recovery checkpoint (2026-08-09):** six lanes now activate
   and read atomically across late/replaced Bus storage without replaying retained mutations. BigBoy passed four exact tests:
   `docs/platform/evidence/WL-FUNC-016-WL-ARCH-009-2026-08-09-clipboard-sync-bus-recovery-r38.md`.
@@ -746,6 +746,8 @@ behavioral evidence is not completion.
 - **Clipboard sync Bus checkpoint (2026-08-09):** startup preserves durable
   receive checkpoints, skips retained mutation lanes, and defers every effect after an incomplete six-lane read. BigBoy passed four exact tests:
   `docs/platform/evidence/WL-FUNC-016-WL-ARCH-009-2026-08-09-clipboard-sync-bus-recovery-r38.md`.
+- **Transfer transaction checkpoint (2026-08-09):** complete Files registry reads and generation-bound durable result receipts recover replacement without repeated copy.
+  Machine 9 passed 12 exact gates: `docs/platform/evidence/WL-FUNC-016-WL-FUNC-019-WL-ARCH-009-2026-08-09-transfer-bus-transaction-recovery-r69.md`.
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
      - Inputs: collab types and existing clipboard v2.
@@ -1177,6 +1179,8 @@ behavioral evidence is not completion.
   scans retained `172.20.146.54:3389` as an available typed Desktop/RDP card
   with an approval-gated connect action. Authenticated login/render remains:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-seat15-release24-r19.md`.
+- **Transfer-backed Files checkpoint (2026-08-09):** stable registry snapshots and durable corrected-forward results bind transfer actions across Bus replacement.
+  Machine 9 passed 12 exact gates: `docs/platform/evidence/WL-FUNC-016-WL-FUNC-019-WL-ARCH-009-2026-08-09-transfer-bus-transaction-recovery-r69.md`.
 - **Manual-source transaction checkpoint (2026-08-09):** RDP/VNC additions and
   removals commit to the live roster only when the strict bounded store agrees,
   including post-rename sync errors. Machine 9 passed three exact failure and
