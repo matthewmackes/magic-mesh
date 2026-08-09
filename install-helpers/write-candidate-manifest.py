@@ -140,22 +140,26 @@ def sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def rpm_header(snapshot: RpmSnapshot, role: str) -> tuple[str, str]:
-    query = "%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\\n%{PAYLOADDIGESTALGO} %{PAYLOADDIGEST}\\n"
+def rpm_header(snapshot: RpmSnapshot, role: str) -> tuple[str, str, str, str]:
+    query = "%{NAME}\\t%{VERSION}\\t%{RELEASE}\\t%{ARCH}\\n%{PAYLOADDIGESTALGO} %{PAYLOADDIGEST}\\n"
     lines = run(["rpm", "-qp", "--qf", query, str(snapshot.path)]).decode("utf-8").splitlines()
     verify_snapshot(snapshot, role)
     if len(lines) != 2:
         fail(f"{role} RPM returned an incomplete identity header")
-    package = lines[0]
-    if package.split(" ", 1)[0] != ROLE_PACKAGE[role]:
+    identity = lines[0].split("\t")
+    if len(identity) != 4:
+        fail(f"{role} RPM returned a malformed package identity")
+    name, version, release, architecture = identity
+    if name != ROLE_PACKAGE[role]:
         fail(f"{role} RPM package name is not {ROLE_PACKAGE[role]}")
+    package = f"{name} {version}-{release}.{architecture}"
     algorithm, separator, payload_digest = lines[1].partition(" ")
     if separator != " " or algorithm not in {"8", "SHA256", "sha256"}:
         fail(f"{role} RPM payload digest is not SHA-256")
     payload_digest = payload_digest.lower()
     if DIGEST_RE.fullmatch(payload_digest) is None:
         fail(f"{role} RPM payload digest is malformed")
-    return package, payload_digest
+    return package, payload_digest, version, architecture
 
 
 def rpm_paths(snapshot: RpmSnapshot, role: str) -> set[str]:
@@ -173,7 +177,7 @@ def rpm_paths(snapshot: RpmSnapshot, role: str) -> set[str]:
 
 def rpm_member(snapshot: RpmSnapshot, member: str, role: str) -> bytes:
     archive = run(["rpm2cpio", str(snapshot.path)])
-    raw = run(["cpio", "--quiet", "--to-stdout", member], input_bytes=archive)
+    raw = run(["cpio", "-i", "--quiet", "--to-stdout", member], input_bytes=archive)
     verify_snapshot(snapshot, role)
     if not raw:
         fail(f"{role} RPM runtime binary is empty: {member}")
@@ -253,8 +257,10 @@ def validate_collector_schema(raw: bytes, revision: str, repo: Path) -> None:
         )
 
 
-def describe_rpm(snapshot: RpmSnapshot, role: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    package, payload_digest = rpm_header(snapshot, role)
+def describe_rpm(
+    snapshot: RpmSnapshot, role: str
+) -> tuple[dict[str, Any], dict[str, Any], tuple[str, str]]:
+    package, payload_digest, version, architecture = rpm_header(snapshot, role)
     rpm_paths(snapshot, role)
     binaries = {
         name: sha256(rpm_member(snapshot, member, role))
@@ -274,7 +280,7 @@ def describe_rpm(snapshot: RpmSnapshot, role: str) -> tuple[dict[str, Any], dict
             "size_bytes": snapshot.size_bytes,
         },
     }
-    return candidate, receipt
+    return candidate, receipt, (version, architecture)
 
 
 def self_test(repo: Path) -> None:
@@ -385,13 +391,14 @@ def main() -> int:
         }
         candidates: dict[str, Any] = {}
         receipts: dict[str, Any] = {}
+        compatibility: set[tuple[str, str]] = set()
         for role in ROLES:
-            candidates[role], receipts[role] = describe_rpm(rpm_inputs[role], role)
-    release_identities = {
-        candidate["package"].split(" ", 1)[1] for candidate in candidates.values()
-    }
-    if len(release_identities) != 1:
-        fail("candidate role RPMs do not share one version-release-architecture identity")
+            candidate, receipt, role_compatibility = describe_rpm(rpm_inputs[role], role)
+            candidates[role] = candidate
+            receipts[role] = receipt
+            compatibility.add(role_compatibility)
+    if len(compatibility) != 1:
+        fail("candidate role RPMs do not share one version and architecture")
     manifest = {
         "kind": "mcnf-candidate-digest-manifest-v1",
         "revision": revision,
