@@ -30,6 +30,12 @@
 //! - `MDE_VEHICLE_GATEWAY` — the gateway endpoint, an IP or `ip:sshport`. **When
 //!   unset the worker is a no-op** (logs once, publishes nothing) — most nodes have
 //!   no vehicle gateway attached.
+//! - `MDE_VEHICLE_SOURCE_ID` — optional governed MG90 ESN. When omitted, the
+//!   first successful local identity poll establishes the source; an endpoint is
+//!   never accepted as identity.
+//! - `MDE_VEHICLE_MANAGERS` — optional comma-separated approved manager node IDs.
+//!   The local node is included by the configured gateway and the bounded roster
+//!   remains the sole v2 selection/publication authority.
 //! - `MDE_VEHICLE_ROOT_PW_FILE` — preferred root-only file containing the gateway's
 //!   `root` SSH password (default `/etc/mackesd/mg90-root-password`). The legacy
 //!   `MDE_VEHICLE_ROOT_PW` value remains a compatibility fallback only. The SSH
@@ -66,10 +72,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
-    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, DeviceProbeStatus, GpsFix,
-    ImuSample, ManagerSetState, SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState,
-    VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
-    VEHICLE_STATE_V2_SCHEMA_VERSION,
+    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, ApprovalState, CellLink,
+    DeviceProbeStatus, GpsFix, ImuSample, ManagerSet, ManagerSetState, SnapshotProvenance,
+    SnapshotSource, VehicleReply, VehicleState, VehicleStateV2, VehicleTelem, WanStatus,
+    VEHICLE_ACTION_PREFIX, VEHICLE_STATE_V2_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -81,6 +87,15 @@ use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Env: the gateway endpoint (an IP or `ip:sshport`). Unset ⇒ the worker is a no-op.
 pub const GATEWAY_ENV: &str = "MDE_VEHICLE_GATEWAY";
+
+/// Optional governed MG90 ESN. When absent, the local probe's first confirmed
+/// ESN establishes the sole roster source; it is never inferred from an endpoint.
+pub const SOURCE_ID_ENV: &str = "MDE_VEHICLE_SOURCE_ID";
+
+/// Optional comma-separated approved manager node IDs for this MG90. The local
+/// node is always included when a gateway is configured, preserving the existing
+/// single-manager deployment through the same roster authority.
+pub const MANAGERS_ENV: &str = "MDE_VEHICLE_MANAGERS";
 
 /// Env: the gateway `root` SSH password (later mde-seal; env is fine for now).
 pub const ROOT_PW_ENV: &str = "MDE_VEHICLE_ROOT_PW";
@@ -1198,6 +1213,11 @@ pub enum VehicleRosterSelection {
 /// Why a typed snapshot was not eligible for manager-routed publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VehicleManagerRouteRejection {
+    /// The snapshot is pending or unknown rather than explicitly approved.
+    ApprovalNotApproved {
+        /// Exact non-approved state carried by the snapshot.
+        state: ApprovalState,
+    },
     /// The gateway revoked management approval after this snapshot was emitted.
     ApprovalRevoked,
     /// The snapshot carries an authoritative manager set that excludes the
@@ -1273,11 +1293,13 @@ fn manager_route_rejection(
     snapshot: &VehicleStateV2,
     manager_id: &str,
 ) -> Option<VehicleManagerRouteRejection> {
-    if matches!(
-        snapshot.approval,
-        mackes_mesh_types::vehicle::ApprovalState::Revoked
-    ) {
+    if snapshot.approval == ApprovalState::Revoked {
         return Some(VehicleManagerRouteRejection::ApprovalRevoked);
+    }
+    if snapshot.approval != ApprovalState::Approved {
+        return Some(VehicleManagerRouteRejection::ApprovalNotApproved {
+            state: snapshot.approval,
+        });
     }
     // An unknown manager set is not proof that this manager is enrolled. Keep
     // the route fail-closed during legacy/partial snapshots rather than
@@ -1467,6 +1489,7 @@ struct VehicleRosterAssignment {
     next_heartbeat: Instant,
     enrichment_in_flight: bool,
     latest: Option<VehicleRosterSnapshot>,
+    latest_received_at: Option<Instant>,
 }
 
 /// Bounded scheduler and latest-wins read model around one or more
@@ -1546,6 +1569,7 @@ impl VehicleRoster {
                 next_heartbeat: self.started_at,
                 enrichment_in_flight: false,
                 latest: None,
+                latest_received_at: None,
             },
         );
         Ok(())
@@ -1609,6 +1633,45 @@ impl VehicleRoster {
                 .then_with(|| a.manager_id.cmp(&b.manager_id))
                 .then_with(|| a.kind.cmp(&b.kind))
         });
+        due
+    }
+
+    fn take_due_kind(
+        &mut self,
+        now: Instant,
+        kind: VehicleScheduleKind,
+    ) -> Vec<VehicleScheduledWork> {
+        let mut due = Vec::new();
+        for assignment in self.assignments.values_mut() {
+            let deadline = match kind {
+                VehicleScheduleKind::CurrentStatus => &mut assignment.next_status,
+                VehicleScheduleKind::Heartbeat => &mut assignment.next_heartbeat,
+                VehicleScheduleKind::Enrichment => {
+                    if assignment.enrichment_in_flight {
+                        continue;
+                    }
+                    assignment.enrichment_in_flight = true;
+                    &mut assignment.next_enrichment
+                }
+            };
+            if now < *deadline {
+                if kind == VehicleScheduleKind::Enrichment {
+                    assignment.enrichment_in_flight = false;
+                }
+                continue;
+            }
+            let interval = match kind {
+                VehicleScheduleKind::CurrentStatus => assignment.source.plan.poll,
+                VehicleScheduleKind::Heartbeat => assignment.source.plan.heartbeat,
+                VehicleScheduleKind::Enrichment => assignment.source.plan.enrichment,
+            };
+            *deadline = next_deadline(now, interval);
+            due.push(VehicleScheduledWork {
+                source_id: assignment.source.source_id.clone(),
+                manager_id: assignment.source.manager_id.clone(),
+                kind,
+            });
+        }
         due
     }
 
@@ -1677,6 +1740,14 @@ impl VehicleRoster {
     /// Older observations never replace a newer one for the same assignment.
     /// Returns whether the retained assignment snapshot changed.
     pub fn ingest(&mut self, snapshot: VehicleRosterSnapshot) -> Result<bool, VehicleRosterError> {
+        self.ingest_at(snapshot, Instant::now())
+    }
+
+    fn ingest_at(
+        &mut self,
+        snapshot: VehicleRosterSnapshot,
+        received_at: Instant,
+    ) -> Result<bool, VehicleRosterError> {
         let key = (snapshot.source_id.clone(), snapshot.manager_id.clone());
         let Some(assignment) = self.assignments.get_mut(&key) else {
             return Err(VehicleRosterError::UnregisteredAssignment {
@@ -1690,8 +1761,57 @@ impl VehicleRoster {
             .is_none_or(|current| snapshot.freshness_cmp(current).is_gt());
         if replace {
             assignment.latest = Some(snapshot);
+            assignment.latest_received_at = Some(received_at);
         }
         Ok(replace)
+    }
+
+    /// Revoke one manager row immediately after an authoritative poll failure.
+    /// Retained telemetry must not continue to claim that a lost manager is live.
+    pub fn mark_unavailable(
+        &mut self,
+        source_id: &VehicleSourceId,
+        manager_id: &str,
+    ) -> Result<(), VehicleRosterError> {
+        let key = (source_id.clone(), manager_id.to_string());
+        let Some(assignment) = self.assignments.get_mut(&key) else {
+            return Err(VehicleRosterError::UnregisteredAssignment {
+                source_id: source_id.clone(),
+                manager_id: manager_id.to_string(),
+            });
+        };
+        assignment.latest = None;
+        assignment.latest_received_at = None;
+        self.published.remove(source_id);
+        Ok(())
+    }
+
+    /// Expire manager rows that have stopped delivering their declared bounded
+    /// heartbeat. Three missed intervals matches the vehicle consumer contract.
+    pub fn expire_unavailable(&mut self, now: Instant) {
+        let mut lost_sources = Vec::new();
+        for assignment in self.assignments.values_mut() {
+            let Some(received_at) = assignment.latest_received_at else {
+                continue;
+            };
+            let expiry = assignment
+                .latest
+                .as_ref()
+                .map(|snapshot| {
+                    Duration::from_millis(snapshot.snapshot.expected_interval_ms.max(1))
+                        .min(MAX_ROSTER_HEARTBEAT)
+                        .saturating_mul(3)
+                })
+                .unwrap_or(assignment.source.plan.heartbeat.saturating_mul(3));
+            if now.saturating_duration_since(received_at) > expiry {
+                lost_sources.push(assignment.source.source_id.clone());
+                assignment.latest = None;
+                assignment.latest_received_at = None;
+            }
+        }
+        for source_id in lost_sources {
+            self.published.remove(&source_id);
+        }
     }
 
     /// Select the freshest valid snapshot across all registered managers for one
@@ -1825,18 +1945,25 @@ impl VehicleRoster {
             .collect()
     }
 
-    /// Select change-driven publications plus an unchanged heartbeat no slower
-    /// than each source's configured (and validated) interval.
+    /// Select approved/enrolled change-driven publications plus an unchanged
+    /// heartbeat no slower than each source's configured interval.
     ///
-    /// Multiple managers for one MG90 collapse through [`Self::select_latest`];
+    /// Multiple managers for one MG90 collapse through [`Self::route_latest`];
     /// multiple MG90 identities retain independent clocks and are returned in
     /// stable source-id order. A source with no accepted snapshot emits nothing.
     pub fn take_publications(&mut self, now: Instant) -> Vec<VehicleRosterPublication> {
         let mut ready = Vec::new();
         for source_id in self.source_ids() {
-            let VehicleRosterSelection::Selected(selected) = self.select_latest(&source_id) else {
+            let VehicleManagerRouteSelection::Routed(route) = self.route_latest(&source_id) else {
+                self.published.remove(&source_id);
                 continue;
             };
+            let selected = VehicleRosterSnapshot::from_v2(
+                source_id.clone(),
+                route.manager_id.clone(),
+                route.snapshot,
+            )
+            .expect("roster route preserves its admitted identity");
             let heartbeat = self
                 .assignments
                 .iter()
@@ -2191,6 +2318,196 @@ fn cell_link_has_observation(link: &CellLink) -> bool {
 }
 
 // ─────────────────────────── the worker ───────────────────────────
+
+/// Sole runtime owner of manager registration, accepted snapshots, manager
+/// selection, and publication clocks. `VehicleWorker::run` feeds every local and
+/// remote observation through this object; there is no second v2 cache.
+struct VehicleRuntimeRoster {
+    roster: VehicleRoster,
+    local_manager: String,
+    managers: Vec<String>,
+    source_id: Option<VehicleSourceId>,
+    remote_cursors: HashMap<String, String>,
+    plan: VehiclePollPlan,
+}
+
+impl VehicleRuntimeRoster {
+    fn from_env(
+        local_manager: &str,
+        started_at: Instant,
+        plan: VehiclePollPlan,
+    ) -> Result<Self, VehicleRosterError> {
+        let source_id = std::env::var(SOURCE_ID_ENV)
+            .ok()
+            .map(|value| VehicleSourceId::new(value.trim().to_string()))
+            .transpose()?;
+        let configured = std::env::var(MANAGERS_ENV).unwrap_or_default();
+        Self::new(local_manager, source_id, &configured, started_at, plan)
+    }
+
+    fn new(
+        local_manager: &str,
+        source_id: Option<VehicleSourceId>,
+        configured_managers: &str,
+        started_at: Instant,
+        plan: VehiclePollPlan,
+    ) -> Result<Self, VehicleRosterError> {
+        plan.validate()?;
+        let local_manager = validate_manager_id(local_manager)?;
+        let mut managers = vec![local_manager.clone()];
+        for raw in configured_managers.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let manager = validate_manager_id(raw)?;
+            if !managers.contains(&manager) {
+                managers.push(manager);
+            }
+        }
+        if managers.len() > MAX_VEHICLE_ROSTER_MANAGERS {
+            return Err(VehicleRosterError::ManagerCapacity);
+        }
+        let mut runtime = Self {
+            roster: VehicleRoster::new(started_at),
+            local_manager,
+            managers,
+            source_id: None,
+            remote_cursors: HashMap::new(),
+            plan,
+        };
+        if let Some(source_id) = source_id {
+            runtime.register_source(source_id)?;
+        }
+        Ok(runtime)
+    }
+
+    fn register_source(&mut self, source_id: VehicleSourceId) -> Result<(), VehicleRosterError> {
+        if let Some(current) = self.source_id.as_ref() {
+            if current != &source_id {
+                return Err(VehicleRosterError::IdentityMismatch {
+                    expected: current.clone(),
+                    reported: source_id.to_string(),
+                    manager_id: self.local_manager.clone(),
+                });
+            }
+            return Ok(());
+        }
+        for manager in &self.managers {
+            self.roster.register(VehicleRosterSource::remote(
+                source_id.clone(),
+                manager.clone(),
+                self.plan,
+            )?)?;
+        }
+        self.source_id = Some(source_id);
+        Ok(())
+    }
+
+    fn ingest_local(
+        &mut self,
+        worker: &VehicleWorker,
+        state: &VehicleState,
+        received_at: Instant,
+    ) -> Result<bool, VehicleRosterError> {
+        let reported = state.esn.trim();
+        if reported.is_empty() || !state.online {
+            self.mark_local_unavailable();
+            return Ok(false);
+        }
+        let source_id = VehicleSourceId::new(reported.to_string())?;
+        self.register_source(source_id.clone())?;
+        let mut snapshot = worker.snapshot_v2_with_interval(state, ROSTER_HEARTBEAT);
+        snapshot.approval = ApprovalState::Approved;
+        snapshot.managers = ManagerSet::approved(self.managers.clone())
+            .map_err(|error| VehicleRosterError::InvalidManagerId(error.to_string()))?;
+        let admitted =
+            VehicleRosterSnapshot::from_v2(source_id, self.local_manager.clone(), snapshot)?;
+        self.roster.ingest_at(admitted, received_at)
+    }
+
+    fn mark_local_unavailable(&mut self) {
+        if let Some(source_id) = self.source_id.clone() {
+            let _ = self
+                .roster
+                .mark_unavailable(&source_id, &self.local_manager);
+        }
+    }
+
+    fn ingest_remote(&mut self, bus_root: Option<PathBuf>, received_at: Instant) {
+        let Some(source_id) = self.source_id.clone() else {
+            return;
+        };
+        let Some(root) = bus_root else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return;
+        };
+        for manager in self
+            .managers
+            .iter()
+            .filter(|manager| *manager != &self.local_manager)
+        {
+            let topic = vehicle_state_v2_topic(manager, source_id.as_str());
+            let cursor = self.remote_cursors.get(&topic).map(String::as_str);
+            let Ok(messages) = persist.list_since(&topic, cursor) else {
+                continue;
+            };
+            for message in messages {
+                self.remote_cursors
+                    .insert(topic.clone(), message.ulid.clone());
+                let Some(body) = message.body.as_deref() else {
+                    continue;
+                };
+                let Ok(snapshot) = serde_json::from_str::<VehicleStateV2>(body) else {
+                    tracing::warn!(
+                        target: "mackesd::vehicle",
+                        manager = %manager,
+                        source = %source_id,
+                        "rejected malformed remote vehicle snapshot"
+                    );
+                    continue;
+                };
+                match VehicleRosterSnapshot::from_v2(source_id.clone(), manager.clone(), snapshot) {
+                    Ok(admitted) => {
+                        let _ = self.roster.ingest_at(admitted, received_at);
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::vehicle",
+                        manager = %manager,
+                        source = %source_id,
+                        %error,
+                        "rejected identity-mismatched remote vehicle snapshot"
+                    ),
+                }
+            }
+        }
+    }
+
+    fn take_publications(&mut self, now: Instant) -> Vec<VehicleRosterPublication> {
+        self.roster.expire_unavailable(now);
+        self.roster.take_publications(now)
+    }
+
+    fn local_due(&mut self, now: Instant, kind: VehicleScheduleKind) -> bool {
+        if self.source_id.is_none() {
+            return kind == VehicleScheduleKind::CurrentStatus;
+        }
+        self.roster
+            .take_due_kind(now, kind)
+            .into_iter()
+            .any(|work| work.manager_id == self.local_manager)
+    }
+
+    fn finish_local_enrichment(&mut self) {
+        if let Some(source_id) = self.source_id.clone() {
+            let _ = self
+                .roster
+                .finish_enrichment(&source_id, &self.local_manager);
+        }
+    }
+}
 
 /// The `vehicle` worker (per-node, rank-0 universal — but a genuine no-op on the
 /// overwhelming majority of nodes that have no gateway). Mirrors the `cloud`
@@ -2727,6 +3044,7 @@ impl VehicleWorker {
     /// Publish the v1 compatibility mirror and, when the gateway ESN is
     /// confirmed, the identity-addressed v2 mirror. An unknown ESN is never
     /// replaced with a synthetic topic segment.
+    #[cfg(test)]
     fn publish_pair(&self, legacy: &VehicleState, observed: &VehicleState, interval: Duration) {
         if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
             crate::bus_publish::publish_json(
@@ -2751,17 +3069,60 @@ impl VehicleWorker {
         }
     }
 
+    #[cfg(test)]
     fn publish(&self, state: &VehicleState) {
         self.publish_pair(state, state, self.poll);
     }
 
-    /// Republish a cached observation without pretending that the gateway was
-    /// polled again. The v1 compatibility mirror receives a current transport
-    /// stamp, while v2 retains the original observation timestamp for freshness.
-    fn publish_heartbeat(&self, observed: &VehicleState) {
-        let mut legacy = observed.clone();
-        legacy.published_at_ms = now_ms();
-        self.publish_pair(&legacy, observed, self.heartbeat);
+    fn publish_roster_updates(
+        &self,
+        roster: &mut VehicleRuntimeRoster,
+        local_state: &VehicleState,
+        now: Instant,
+    ) {
+        let publications = roster.take_publications(now);
+        let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) else {
+            return;
+        };
+        for publication in publications {
+            // A remote manager's accepted row is already present on its exact Bus
+            // lane. Re-emitting it here would create an amplification loop. The
+            // roster still selects it as authoritative and suppresses this node's
+            // competing claim until the remote row expires.
+            if publication.manager_id != self.host {
+                continue;
+            }
+            crate::bus_publish::publish_json(
+                &mut persist,
+                &vehicle_state_v2_topic(&publication.manager_id, publication.source_id.as_str()),
+                &publication.snapshot,
+            );
+            if local_state.online && local_state.esn == publication.source_id.as_str() {
+                let mut legacy = local_state.clone();
+                legacy.published_at_ms = now_ms();
+                crate::bus_publish::publish_json(
+                    &mut persist,
+                    &vehicle_state_topic(&self.host),
+                    &legacy,
+                );
+            }
+        }
+    }
+
+    /// Preserve the one-release legacy availability signal without creating a
+    /// v2 source or manager claim. Callers may use this only for explicit
+    /// pending/unavailable state.
+    fn publish_legacy_unavailable(&self, state: &VehicleState) {
+        debug_assert!(!state.online);
+        let mut state = state.clone();
+        state.published_at_ms = now_ms();
+        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
+            crate::bus_publish::publish_json(
+                &mut persist,
+                &vehicle_state_topic(&self.host),
+                &state,
+            );
+        }
     }
 
     // ─────────────────────── Phase 4 · action/vehicle/* control drain ───────────────────────
@@ -3085,16 +3446,22 @@ impl Worker for VehicleWorker {
             shutdown.wait().await;
             return Ok(());
         };
+        let roster_plan = VehiclePollPlan {
+            poll: self.poll,
+            enrichment: ENRICHMENT_POLL,
+            heartbeat: self.heartbeat,
+        };
+        let mut roster = VehicleRuntimeRoster::from_env(&self.host, Instant::now(), roster_plan)
+            .map_err(|error| anyhow::anyhow!("invalid vehicle roster configuration: {error}"))?;
         // Seed the action cursors so a (re)start doesn't replay a backlog of verbs.
         let mut cursors: HashMap<String, String> = HashMap::new();
         self.prime_cursors(&mut cursors);
-        // Publish an honest pending snapshot and start the heartbeat before any
-        // potentially blocking gateway operation. A missing ESN withholds only
-        // the v2 identity topic; the legacy current-status lane still heartbeats.
+        // Until a poll confirms the configured MG90 identity, the roster has no
+        // accepted source and publishes no v2 manager claim.
         self.drain_actions(&mut cursors);
         let mut runtime = VehicleRuntimeSnapshot::pending(&self.host);
         let mut cached = runtime.render();
-        self.publish(&cached);
+        self.publish_legacy_unavailable(&cached);
         let now = tokio::time::Instant::now();
         let phase = initial_phase_for(&self.host, self.poll);
         let mut current_tick = tokio::time::interval_at(now + phase, self.poll);
@@ -3118,9 +3485,11 @@ impl Worker for VehicleWorker {
                 () = shutdown.wait() => return Ok(()),
                 _ = current_tick.tick() => {
                     self.drain_actions(&mut cursors);
+                    roster.ingest_remote(self.bus_root.clone(), Instant::now());
                     let retry_ready = current_not_before
                         .map_or(true, |not_before| tokio::time::Instant::now() >= not_before);
-                    if current_task.is_none() && retry_ready {
+                    let poll_due = roster.local_due(Instant::now(), VehicleScheduleKind::CurrentStatus);
+                    if current_task.is_none() && retry_ready && poll_due {
                         current_not_before = None;
                         current_task = Some(self.spawn_current_status(probe.clone()));
                         current_deadline =
@@ -3129,14 +3498,22 @@ impl Worker for VehicleWorker {
                     }
                 }
                 _ = enrichment_tick.tick() => {
-                    if runtime.online && enrichment_task.is_none() {
+                    let enrichment_due = runtime.online
+                        && roster.local_due(Instant::now(), VehicleScheduleKind::Enrichment);
+                    if runtime.online && enrichment_task.is_none() && enrichment_due {
                         enrichment_task = Some(self.spawn_enrichment(probe.clone()));
                         enrichment_deadline = Some(Box::pin(tokio::time::sleep(ENRICHMENT_TIMEOUT)));
                         enrichment_timed_out = false;
                     }
                 }
                 _ = heartbeat_tick.tick() => {
-                    self.publish_heartbeat(&cached);
+                    roster.ingest_remote(self.bus_root.clone(), Instant::now());
+                    if roster.local_due(Instant::now(), VehicleScheduleKind::Heartbeat) {
+                        self.publish_roster_updates(&mut roster, &cached, Instant::now());
+                    }
+                    if !cached.online {
+                        self.publish_legacy_unavailable(&cached);
+                    }
                 }
                 result = async {
                     current_task.as_mut().expect("guarded current-status task").await
@@ -3157,8 +3534,23 @@ impl Worker for VehicleWorker {
                         let next = runtime.render();
                         let changed = !vehicle_state_content_eq(&cached, &next);
                         cached = next;
-                        if changed {
-                            self.publish(&cached);
+                        if healthy {
+                            if let Err(error) = roster.ingest_local(self, &cached, Instant::now()) {
+                                tracing::warn!(
+                                    target: "mackesd::vehicle",
+                                    %error,
+                                    "local vehicle snapshot rejected by runtime roster"
+                                );
+                                roster.mark_local_unavailable();
+                            }
+                        } else {
+                            roster.mark_local_unavailable();
+                        }
+                        if changed || healthy {
+                            self.publish_roster_updates(&mut roster, &cached, Instant::now());
+                            if !cached.online {
+                                self.publish_legacy_unavailable(&cached);
+                            }
                         }
                         if !was_online && runtime.online && enrichment_task.is_none() {
                             enrichment_task = Some(self.spawn_enrichment(probe.clone()));
@@ -3189,17 +3581,17 @@ impl Worker for VehicleWorker {
                     current_retry = current_retry.saturating_mul(2).min(FAILURE_RETRY_MAX);
                     runtime.mark_current_unavailable("current-status timeout");
                     let next = runtime.render();
-                    let changed = !vehicle_state_content_eq(&cached, &next);
                     cached = next;
-                    if changed {
-                        self.publish(&cached);
-                    }
+                    roster.mark_local_unavailable();
+                    self.publish_roster_updates(&mut roster, &cached, Instant::now());
+                    self.publish_legacy_unavailable(&cached);
                 }
                 result = async {
                     enrichment_task.as_mut().expect("guarded enrichment task").await
                 }, if enrichment_task.is_some() => {
                     enrichment_task = None;
                     enrichment_deadline = None;
+                    roster.finish_local_enrichment();
                     if enrichment_timed_out {
                         enrichment_timed_out = false;
                     } else {
@@ -3212,8 +3604,18 @@ impl Worker for VehicleWorker {
                         let next = runtime.render();
                         let changed = !vehicle_state_content_eq(&cached, &next);
                         cached = next;
+                        if runtime.online {
+                            if let Err(error) = roster.ingest_local(self, &cached, Instant::now()) {
+                                tracing::warn!(
+                                    target: "mackesd::vehicle",
+                                    %error,
+                                    "enriched vehicle snapshot rejected by runtime roster"
+                                );
+                                roster.mark_local_unavailable();
+                            }
+                        }
                         if changed {
-                            self.publish(&cached);
+                            self.publish_roster_updates(&mut roster, &cached, Instant::now());
                         }
                     }
                 }
@@ -3226,12 +3628,23 @@ impl Worker for VehicleWorker {
                 }, if enrichment_deadline.is_some() => {
                     enrichment_deadline = None;
                     enrichment_timed_out = true;
+                    roster.finish_local_enrichment();
                     runtime.mark_enrichment_unavailable("enrichment timeout");
                     let next = runtime.render();
                     let changed = !vehicle_state_content_eq(&cached, &next);
                     cached = next;
                     if changed {
-                        self.publish(&cached);
+                        if runtime.online {
+                            if let Err(error) = roster.ingest_local(self, &cached, Instant::now()) {
+                                tracing::warn!(
+                                    target: "mackesd::vehicle",
+                                    %error,
+                                    "vehicle timeout snapshot rejected by runtime roster"
+                                );
+                                roster.mark_local_unavailable();
+                            }
+                        }
+                        self.publish_roster_updates(&mut roster, &cached, Instant::now());
                     }
                 }
             }
@@ -3925,6 +4338,59 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 released = wake.wait(released).unwrap();
             }
             self.inner.read_lci_general()
+        }
+
+        fn read_lci_wan(&self) -> io::Result<String> {
+            self.inner.read_lci_wan()
+        }
+
+        fn read_status_beacon(&self) -> io::Result<Option<String>> {
+            self.inner.read_status_beacon()
+        }
+
+        fn read_obd_status(&self) -> io::Result<Option<String>> {
+            self.inner.read_obd_status()
+        }
+
+        fn run_ssh(&self, cmd: &str) -> io::Result<String> {
+            self.inner.run_ssh(cmd)
+        }
+    }
+
+    #[derive(Clone)]
+    struct SwitchableCurrentProbe {
+        inner: FakeProbe,
+        available: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SwitchableCurrentProbe {
+        fn new() -> Self {
+            Self {
+                inner: FakeProbe::real(),
+                available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+
+        fn set_available(&self, available: bool) {
+            self.available
+                .store(available, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl VehicleProbe for SwitchableCurrentProbe {
+        fn read_gps_nmea(&self) -> io::Result<String> {
+            self.inner.read_gps_nmea()
+        }
+
+        fn read_lci_general(&self) -> io::Result<String> {
+            if self.available.load(std::sync::atomic::Ordering::SeqCst) {
+                self.inner.read_lci_general()
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "scripted manager loss",
+                ))
+            }
         }
 
         fn read_lci_wan(&self) -> io::Result<String> {
@@ -4779,6 +5245,153 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     #[tokio::test]
+    async fn worker_runtime_roster_stops_claims_on_loss_and_reconnects_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(SwitchableCurrentProbe::new());
+        let mut worker = worker()
+            .with_bus_root(Some(tmp.path().to_path_buf()))
+            .with_probe(probe.clone())
+            .with_poll(Duration::from_millis(10))
+            .with_heartbeat(Duration::from_millis(10));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle =
+            tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let topic = vehicle_state_v2_topic("rig-1", "ND84720078011035");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !persist.list_since(&topic, None).unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reachable manager must publish through the runtime roster");
+        let first: VehicleStateV2 = serde_json::from_str(
+            persist.list_since(&topic, None).unwrap()[0]
+                .body
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.approval, ApprovalState::Approved);
+        assert_eq!(
+            first.managers,
+            ManagerSet::approved(vec!["rig-1".to_string()]).unwrap()
+        );
+
+        probe.set_available(false);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let legacy = persist
+                    .list_since(&vehicle_state_topic("rig-1"), None)
+                    .unwrap();
+                let lost = legacy.last().is_some_and(|message| {
+                    serde_json::from_str::<VehicleState>(message.body.as_deref().unwrap())
+                        .is_ok_and(|state| !state.online)
+                });
+                if lost {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("manager loss must become explicit on the legacy availability lane");
+        let count_after_loss = persist.list_since(&topic, None).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(
+            persist.list_since(&topic, None).unwrap().len(),
+            count_after_loss,
+            "a lost manager must stop identity-bound v2 heartbeats"
+        );
+
+        probe.set_available(true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if persist.list_since(&topic, None).unwrap().len() > count_after_loss {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reconnected manager must resume with a new Changed epoch");
+
+        tx.send(true).expect("signal shutdown");
+        assert!(tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("worker shutdown")
+            .expect("worker join")
+            .is_ok());
+    }
+
+    #[test]
+    fn worker_runtime_roster_never_republishes_or_impersonates_remote_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = worker().with_bus_root(Some(tmp.path().to_path_buf()));
+        let source = roster_source_id();
+        let t0 = Instant::now();
+        let mut runtime = VehicleRuntimeRoster::new(
+            "rig-1",
+            Some(source.clone()),
+            "manager-b",
+            t0,
+            VehiclePollPlan::default(),
+        )
+        .unwrap();
+        let local = worker.build_state(&FakeProbe::real());
+        runtime.ingest_local(&worker, &local, t0).unwrap();
+        worker.publish_roster_updates(&mut runtime, &local, t0);
+
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let local_topic = vehicle_state_v2_topic("rig-1", source.as_str());
+        assert_eq!(persist.list_since(&local_topic, None).unwrap().len(), 1);
+
+        let mut remote = worker.build_state_v2(&FakeProbe::real());
+        remote.management_node_id = "manager-b".to_string();
+        remote.approval = ApprovalState::Approved;
+        remote.managers =
+            ManagerSet::approved(vec!["rig-1".to_string(), "manager-b".to_string()]).unwrap();
+        remote.observed_at_ms = local.published_at_ms.saturating_add(1_000);
+        remote.published_at_ms = remote.observed_at_ms;
+        let remote_topic = vehicle_state_v2_topic("manager-b", source.as_str());
+        persist
+            .write(
+                &remote_topic,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&remote).unwrap()),
+            )
+            .unwrap();
+        runtime.ingest_remote(Some(tmp.path().to_path_buf()), t0);
+        worker.publish_roster_updates(&mut runtime, &local, t0);
+        assert_eq!(
+            persist.list_since(&remote_topic, None).unwrap().len(),
+            1,
+            "selected remote state must not be republished under the remote identity"
+        );
+        assert_eq!(
+            persist.list_since(&local_topic, None).unwrap().len(),
+            1,
+            "fresh approved remote selection suppresses the local competing claim"
+        );
+
+        runtime
+            .ingest_local(&worker, &local, t0 + Duration::from_secs(5))
+            .unwrap();
+        worker.publish_roster_updates(&mut runtime, &local, t0 + Duration::from_secs(7));
+        assert_eq!(
+            persist.list_since(&local_topic, None).unwrap().len(),
+            2,
+            "remote loss selects the still-live local manager as a new Changed epoch"
+        );
+        assert_eq!(persist.list_since(&remote_topic, None).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn heartbeat_continues_while_initial_current_probe_is_blocked() {
         let tmp = tempfile::tempdir().unwrap();
         let probe = Arc::new(BlockingCurrentProbe::new());
@@ -4862,6 +5475,8 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         snapshot.observed_at_ms = observed_at_ms;
         snapshot.published_at_ms = published_at_ms;
         snapshot.sequence = sequence;
+        snapshot.approval = ApprovalState::Approved;
+        snapshot.managers = ManagerSet::approved(vec![manager_id.to_string()]).unwrap();
         VehicleRosterSnapshot::from_v2(source_id.clone(), manager_id, snapshot).unwrap()
     }
 
@@ -5261,6 +5876,36 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     #[test]
+    fn roster_requires_explicit_approval_even_with_complete_manager_set() {
+        for approval in [ApprovalState::Pending, ApprovalState::Unknown] {
+            let source = roster_source_id();
+            let mut roster = VehicleRoster::new(Instant::now());
+            roster
+                .register(
+                    VehicleRosterSource::remote(
+                        source.clone(),
+                        "manager-a",
+                        VehiclePollPlan::default(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut snapshot = roster_snapshot(&source, "manager-a", 350, 350, 3);
+            snapshot.snapshot.approval = approval;
+            roster.ingest(snapshot).unwrap();
+
+            assert_eq!(
+                roster.route_latest(&source),
+                VehicleManagerRouteSelection::Rejected {
+                    source_id: source,
+                    manager_id: "manager-a".to_string(),
+                    reason: VehicleManagerRouteRejection::ApprovalNotApproved { state: approval },
+                }
+            );
+        }
+    }
+
+    #[test]
     fn roster_rejects_manager_when_enrollment_is_not_authoritative() {
         let source = roster_source_id();
         let mut roster = VehicleRoster::new(Instant::now());
@@ -5275,11 +5920,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             )
             .unwrap();
 
-        // The default v2 snapshot has an unknown manager set. That must not
-        // be treated as implicit enrollment for manager-routed publication.
-        roster
-            .ingest(roster_snapshot(&source, "manager-a", 400, 400, 4))
-            .unwrap();
+        let mut snapshot = roster_snapshot(&source, "manager-a", 400, 400, 4);
+        snapshot.snapshot.managers = ManagerSet::default();
+        roster.ingest(snapshot).unwrap();
 
         assert_eq!(
             roster.route_latest(&source),
