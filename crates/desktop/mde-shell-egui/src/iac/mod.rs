@@ -3232,9 +3232,10 @@ fn vm_lifecycle_actions(
         state.issue_console_attach(&row.node, &row.name, &row.name);
     }
     if row_button(ui, "Start", false).clicked() {
+        let (action, attachment) = vm_start_intent(console);
         state.issue_workload_operation(
-            WorkloadOperationAction::StartAndAttach,
-            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+            action,
+            attachment,
             &row.node,
             &row.name,
             row.delivery_type,
@@ -3252,9 +3253,10 @@ fn vm_lifecycle_actions(
         );
     }
     if row_button(ui, "Reboot\u{2026}", true).clicked() {
+        let (action, attachment) = vm_restart_intent(console);
         state.issue_workload_operation(
-            WorkloadOperationAction::Restart,
-            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+            action,
+            attachment,
             &row.node,
             &row.name,
             row.delivery_type,
@@ -3271,6 +3273,26 @@ fn vm_lifecycle_actions(
             &row.name,
         );
     }
+}
+
+fn vm_start_intent(console: bool) -> (WorkloadOperationAction, Option<WorkloadAttachmentProtocol>) {
+    if console {
+        (
+            WorkloadOperationAction::StartAndAttach,
+            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+        )
+    } else {
+        (WorkloadOperationAction::Start, None)
+    }
+}
+
+fn vm_restart_intent(
+    console: bool,
+) -> (WorkloadOperationAction, Option<WorkloadAttachmentProtocol>) {
+    (
+        WorkloadOperationAction::Restart,
+        console.then_some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+    )
 }
 
 fn plan_expanded_row(

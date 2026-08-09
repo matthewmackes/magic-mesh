@@ -93,8 +93,8 @@ behavioral evidence is not completion.
   refused because mackesd, role pin, and Bus were absent. Live HostCapacity,
   restart/crash, native attachment, and Dell/seat proof remain open.
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`.
-- **Typed live-proof checkpoint (2026-08-06):** the verifier consumes only typed Workload operations/projections; self-test passed. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-live-proof-typed-operation-r1.md`.
+- **Native attachment route checkpoint (2026-08-09):** invalid container/protocol attachment fails before effects and live headless Service VMs emit no attachment;
+  BigBoy passed 38/38 plus the reachable shell regression: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
 - **Console authority removal checkpoint (2026-08-08):** the raw console relay,
   cloud console dispatch, shell endpoint reader, obsolete Browser attach
   envelope, and matching live verifier were deleted. Typed Workload Open plus

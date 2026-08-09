@@ -401,6 +401,26 @@ fn every_lifecycle_route_renders_headless() {
 }
 
 #[test]
+fn live_headless_service_vm_lifecycle_intent_has_no_attachment() {
+    assert_eq!(
+        vm_start_intent(false),
+        (WorkloadOperationAction::Start, None)
+    );
+    assert_eq!(
+        vm_restart_intent(false),
+        (WorkloadOperationAction::Restart, None)
+    );
+
+    assert_eq!(
+        vm_start_intent(true),
+        (
+            WorkloadOperationAction::StartAndAttach,
+            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
+        )
+    );
+}
+
+#[test]
 fn provision_route_renders_ordered_guided_flow_with_one_next_action() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);

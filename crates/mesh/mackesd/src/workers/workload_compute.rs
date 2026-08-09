@@ -1766,6 +1766,7 @@ impl WorkloadActuator for SystemWorkloadActuator {
                 attachment: None,
             });
         }
+        validate_native_attachment_route(request)?;
         // Bind the expiring node-local broker before any libvirt/systemd side
         // effect. The journal already crossed the Defining boundary, so a
         // broker failure remains retryable without ever claiming attachment.
@@ -2103,6 +2104,27 @@ impl WorkloadActuator for SystemWorkloadActuator {
         };
         Ok(Some(outcome))
     }
+}
+
+fn validate_native_attachment_route(
+    request: &WorkloadOperationRequest,
+) -> Result<(), WorkloadActuatorError> {
+    if request.action != WorkloadOperationAction::StartAndAttach {
+        return Ok(());
+    }
+    if request.backend != WorkloadBackend::LibvirtVirtqemud {
+        return Err(WorkloadActuatorError::Permanent(
+            "StartAndAttach is available only for libvirt VM workloads; headless containers must use Start"
+                .into(),
+        ));
+    }
+    if request.preferred_attachment != Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf) {
+        return Err(WorkloadActuatorError::Permanent(
+            "the local Workload actuator supports StartAndAttach only through QEMU Display1 DMA-BUF"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn queued_status(request: &WorkloadOperationRequest) -> WorkloadOperationStatus {
@@ -3975,7 +3997,7 @@ mod tests {
             action: WorkloadOperationAction::StartAndAttach,
             target_request_id: None,
             deadline_at_ms: now_ms() + 20_000,
-            preferred_attachment: None,
+            preferred_attachment: Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
             armed_token: None,
         }
     }
@@ -4056,6 +4078,29 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("managed storage pool")));
+    }
+
+    #[test]
+    fn invalid_start_and_attach_routes_fail_before_runtime_effects() {
+        let mut request = request();
+        request.backend = WorkloadBackend::QuadletSystemd;
+        request.preferred_attachment = Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf);
+        assert!(matches!(
+            validate_native_attachment_route(&request),
+            Err(WorkloadActuatorError::Permanent(reason))
+                if reason.contains("headless containers must use Start")
+        ));
+
+        request.backend = WorkloadBackend::LibvirtVirtqemud;
+        request.preferred_attachment = Some(WorkloadAttachmentProtocol::Vnc);
+        assert!(matches!(
+            validate_native_attachment_route(&request),
+            Err(WorkloadActuatorError::Permanent(reason))
+                if reason.contains("only through QEMU Display1 DMA-BUF")
+        ));
+
+        request.preferred_attachment = Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf);
+        assert!(validate_native_attachment_route(&request).is_ok());
     }
 
     #[test]
