@@ -72,6 +72,10 @@ pub const MAX_HEALTH_PUBLICATION_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum encoded size of the restart checkpoint. This bounds startup memory
 /// and disk consumption independently from the Bus spool.
 pub const MAX_HEALTH_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
+/// Lower bound for retrying a Bus that is unavailable during a reconcile pass.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+/// Upper bound for unavailable-Bus retries; normal ingress cadence remains bounded.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 const HEALTH_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 const HEALTH_CHECKPOINT_DIR: &str = ".health-reconciler-checkpoints";
@@ -134,7 +138,7 @@ impl std::error::Error for HealthPublicationRejection {}
 /// can therefore keep projecting the last truthful state (subject to its
 /// explicit freshness timestamps) instead of turning a replay, rollback, or
 /// malformed replacement into a fabricated outage.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HealthPublicationLedger {
     retained: BTreeMap<String, NodeHealthState>,
 }
@@ -197,7 +201,7 @@ impl HealthPublicationLedger {
 }
 
 /// Stateful persisted-ingress cursor and last-good publication authority.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct HealthIngressState {
     ledger: HealthPublicationLedger,
     bus_cursors: BTreeMap<String, String>,
@@ -230,6 +234,8 @@ struct HealthIngressReport {
 enum HealthIngressError {
     TooManyPublishers { count: usize, max: usize },
     RegistryUnavailable,
+    BusUnavailable,
+    BusLaneUnavailable,
 }
 
 /// Worker handle. Cheap to construct; the SQLite handle is
@@ -255,9 +261,9 @@ pub struct HealthReconcilerWorker {
     /// computation in tests. Production leaves this `None` and
     /// the worker reads `SystemTime::now()`.
     now_ms_override: Option<i64>,
-    /// Exact persisted Bus root resolved once at construction. `None` disables
-    /// only the Bus lane; canonical bounded files remain ingestible.
-    bus_root: Option<PathBuf>,
+    /// Explicit Bus-root override. `None` resolves the current user root on
+    /// every pass and falls back to the canonical system spool.
+    bus_root_override: Option<PathBuf>,
     /// Retained publications and cursors survive every worker tick.
     ingress: Arc<Mutex<HealthIngressState>>,
 }
@@ -279,7 +285,7 @@ impl HealthReconcilerWorker {
             signal_slot,
             tick: TICK_INTERVAL,
             now_ms_override: None,
-            bus_root: mde_bus::default_data_dir(),
+            bus_root_override: None,
             ingress: Arc::new(Mutex::new(HealthIngressState::default())),
         }
     }
@@ -303,8 +309,8 @@ impl HealthReconcilerWorker {
     /// Override the exact persisted Bus root. Tests use this to avoid resolving
     /// process environment or touching the production spool.
     #[must_use]
-    pub fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
-        self.bus_root = bus_root;
+    pub fn with_bus_root(mut self, bus_root: PathBuf) -> Self {
+        self.bus_root_override = Some(bus_root);
         self
     }
 }
@@ -327,6 +333,7 @@ impl Worker for HealthReconcilerWorker {
             _ = tokio::time::sleep(first_delay) => {}
         }
         let mut interval = tokio::time::interval(self.tick);
+        let mut bus_retry_interval = MIN_BUS_RETRY_INTERVAL;
         loop {
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
@@ -340,20 +347,41 @@ impl Worker for HealthReconcilerWorker {
                     let local = self.local_node_id.clone();
                     let now_override = self.now_ms_override;
                     let slot = self.signal_slot.clone();
-                    let bus_root = self.bus_root.clone();
+                    let bus_root = health_reconciler_bus_root(self.bus_root_override.clone());
                     let ingress = Arc::clone(&self.ingress);
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let task = tokio::task::spawn_blocking(move || {
                         tick_once_with_ingress(
                             &qnm,
                             &db,
                             &local,
                             now_override,
                             &slot,
-                            bus_root.as_deref(),
+                            &bus_root,
                             &ingress,
-                        );
-                    })
-                    .await;
+                        )
+                    });
+                    let ingress_result = tokio::select! {
+                        () = shutdown.wait() => return Ok(()),
+                        result = task => result,
+                    };
+                    match ingress_result {
+                        Ok(Ok(())) => bus_retry_interval = MIN_BUS_RETRY_INTERVAL,
+                        Ok(Err(HealthIngressError::BusUnavailable | HealthIngressError::BusLaneUnavailable)) => {
+                            tokio::select! {
+                                () = shutdown.wait() => return Ok(()),
+                                () = tokio::time::sleep(bus_retry_interval) => {}
+                            }
+                            bus_retry_interval = next_bus_retry_interval(bus_retry_interval);
+                        }
+                        Ok(Err(_)) => bus_retry_interval = MIN_BUS_RETRY_INTERVAL,
+                        Err(error) => {
+                            tracing::error!(
+                                target: "mackesd::health_reconciler",
+                                %error,
+                                "health-reconciler blocking task failed; retained ingress state preserved"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -371,7 +399,7 @@ pub fn tick_once(
     now_ms_override: Option<i64>,
     signal_slot: &SignalSenderSlot,
 ) {
-    tick_once_inner(
+    let _ = tick_once_inner(
         workgroup_root,
         db_path,
         local_node_id,
@@ -381,15 +409,29 @@ pub fn tick_once(
     );
 }
 
+fn health_reconciler_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    health_reconciler_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn health_reconciler_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
 fn tick_once_with_ingress(
     workgroup_root: &Path,
     db_path: &Path,
     local_node_id: &str,
     now_ms_override: Option<i64>,
     signal_slot: &SignalSenderSlot,
-    bus_root: Option<&Path>,
+    bus_root: &Path,
     ingress: &Arc<Mutex<HealthIngressState>>,
-) {
+) -> Result<(), HealthIngressError> {
     tick_once_inner(
         workgroup_root,
         db_path,
@@ -397,7 +439,7 @@ fn tick_once_with_ingress(
         now_ms_override,
         signal_slot,
         Some((bus_root, ingress)),
-    );
+    )
 }
 
 fn tick_once_inner(
@@ -406,8 +448,8 @@ fn tick_once_inner(
     local_node_id: &str,
     now_ms_override: Option<i64>,
     signal_slot: &SignalSenderSlot,
-    ingress: Option<(Option<&Path>, &Arc<Mutex<HealthIngressState>>)>,
-) {
+    ingress: Option<(&Path, &Arc<Mutex<HealthIngressState>>)>,
+) -> Result<(), HealthIngressError> {
     let conn = match crate::store::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -416,7 +458,7 @@ fn tick_once_inner(
                 db_path = %db_path.display(),
                 "health-reconciler: sqlite open failed; skipping tick",
             );
-            return;
+            return Ok(());
         }
     };
     if let Some((bus_root, ingress)) = ingress {
@@ -453,6 +495,28 @@ fn tick_once_inner(
             Err(HealthIngressError::RegistryUnavailable) => tracing::warn!(
                 "health-reconciler: approved-publisher registry unavailable; retaining last valid state",
             ),
+            Err(HealthIngressError::BusUnavailable) => {
+                tracing::warn!("health-reconciler: Bus unavailable; combined ingress deferred");
+                reconcile_with_conn(
+                    &conn,
+                    workgroup_root,
+                    local_node_id,
+                    now_ms_override,
+                    signal_slot,
+                );
+                return Err(HealthIngressError::BusUnavailable);
+            }
+            Err(HealthIngressError::BusLaneUnavailable) => {
+                tracing::warn!("health-reconciler: required Bus lane unreadable; combined ingress deferred");
+                reconcile_with_conn(
+                    &conn,
+                    workgroup_root,
+                    local_node_id,
+                    now_ms_override,
+                    signal_slot,
+                );
+                return Err(HealthIngressError::BusLaneUnavailable);
+            }
         }
     }
     reconcile_with_conn(
@@ -462,109 +526,157 @@ fn tick_once_inner(
         now_ms_override,
         signal_slot,
     );
+    Ok(())
 }
 
 fn ingest_health_publications(
     conn: &rusqlite::Connection,
     workgroup_root: &Path,
     local_node_id: &str,
-    bus_root: Option<&Path>,
+    bus_root: &Path,
     state: &mut HealthIngressState,
     now_ms: u64,
 ) -> Result<HealthIngressReport, HealthIngressError> {
+    ingest_health_publications_with_reader(
+        conn,
+        workgroup_root,
+        local_node_id,
+        state,
+        now_ms,
+        || {
+            let mut persist = Persist::open(bus_root.to_path_buf()).map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    bus_root = %bus_root.display(),
+                    "health-reconciler: persisted Bus unavailable; combined ingress deferred",
+                );
+                HealthIngressError::BusUnavailable
+            })?;
+            persist.reopen_if_index_changed();
+            Ok(
+                move |publisher: &str, topic: &str, cursor: Option<&str>, limit: usize| {
+                    persist
+                        .list_since_limit(topic, cursor, limit)
+                        .map_err(|error| {
+                            tracing::warn!(
+                                error = %error,
+                                publisher,
+                                topic,
+                                "health-reconciler: exact health topic read failed; combined ingress deferred",
+                            );
+                            HealthIngressError::BusLaneUnavailable
+                        })
+                },
+            )
+        },
+    )
+}
+
+fn ingest_health_publications_with_reader<Open, Reader>(
+    conn: &rusqlite::Connection,
+    workgroup_root: &Path,
+    local_node_id: &str,
+    state: &mut HealthIngressState,
+    now_ms: u64,
+    open_reader: Open,
+) -> Result<HealthIngressReport, HealthIngressError>
+where
+    Open: FnOnce() -> Result<Reader, HealthIngressError>,
+    Reader: FnMut(
+        &str,
+        &str,
+        Option<&str>,
+        usize,
+    ) -> Result<Vec<mde_bus::persist::StoredMessage>, HealthIngressError>,
+{
     let publishers = approved_health_publishers(conn, local_node_id)?;
     let mut report = HealthIngressReport {
         publishers: publishers.len(),
         ..HealthIngressReport::default()
     };
+
+    // Prepare against a clone. Checkpoint restoration and publisher pruning are
+    // candidate state until every bounded file and every required exact Bus
+    // lane has been read successfully.
+    let mut candidate_state = state.clone();
     restore_health_checkpoint(
         workgroup_root,
         local_node_id,
         &publishers,
-        state,
+        &mut candidate_state,
         &mut report,
     );
-    state
+    candidate_state
         .ledger
         .retained
         .retain(|publisher, _| publishers.contains(publisher));
-    state
+    candidate_state
         .bus_cursors
         .retain(|publisher, _| publishers.contains(publisher));
 
-    for publisher in &publishers {
-        ingest_health_file(
-            workgroup_root,
-            publisher,
-            &mut state.ledger,
-            now_ms,
-            &mut report,
-        );
-    }
+    let staged_files = publishers
+        .iter()
+        .map(|publisher| {
+            (
+                publisher.clone(),
+                read_bounded_health_file(&health_projection_path(workgroup_root, publisher)),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    let Some(bus_root) = bus_root else {
-        persist_health_checkpoint(workgroup_root, local_node_id, state, &mut report);
-        return Ok(report);
-    };
-    let mut persist = match Persist::open(bus_root.to_path_buf()) {
-        Ok(persist) => persist,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                bus_root = %bus_root.display(),
-                "health-reconciler: persisted Bus unavailable; retaining file/last-valid state",
-            );
-            persist_health_checkpoint(workgroup_root, local_node_id, state, &mut report);
-            return Ok(report);
-        }
-    };
-    persist.reopen_if_index_changed();
+    // Bus discovery/open happens only after every bounded file candidate is in
+    // memory. No live state has changed if opening or any later lane read fails.
+    let mut reader = open_reader()?;
 
     let mut remaining = MAX_HEALTH_MESSAGES_PER_TICK;
     let fair_topic_limit = (MAX_HEALTH_MESSAGES_PER_TICK / publishers.len().max(1))
         .max(1)
         .min(MAX_HEALTH_MESSAGES_PER_TOPIC);
+    let mut staged_bus = Vec::with_capacity(publishers.len());
     for publisher in &publishers {
-        if remaining == 0 {
-            break;
-        }
         let topic = node_health_topic(publisher);
-        let cursor = state.bus_cursors.get(publisher).cloned();
+        let cursor = candidate_state.bus_cursors.get(publisher).cloned();
         let limit = remaining.min(fair_topic_limit);
-        let messages = match persist.list_since_limit(&topic, cursor.as_deref(), limit) {
-            Ok(messages) => messages,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    publisher,
-                    topic,
-                    "health-reconciler: exact health topic read failed",
-                );
-                continue;
-            }
-        };
+        let messages = reader(publisher, &topic, cursor.as_deref(), limit)?;
+        remaining = remaining.saturating_sub(messages.len());
+        staged_bus.push((publisher.clone(), topic, messages));
+    }
 
+    // Every ingress source is now readable and bounded. Only this phase may
+    // mutate the candidate ledger/cursors or publish canonical projections.
+    for (publisher, file) in staged_files {
+        ingest_staged_health_file(
+            workgroup_root,
+            &publisher,
+            file,
+            &mut candidate_state.ledger,
+            now_ms,
+            &mut report,
+        );
+    }
+
+    for (publisher, topic, messages) in staged_bus {
         for message in messages {
-            remaining = remaining.saturating_sub(1);
             report.bus_messages += 1;
             let advance = ingest_health_bus_message(
                 workgroup_root,
-                publisher,
+                &publisher,
                 &topic,
                 &message,
-                &mut state.ledger,
+                &mut candidate_state.ledger,
                 now_ms,
                 &mut report,
             );
             if !advance {
                 break;
             }
-            state
+            candidate_state
                 .bus_cursors
                 .insert(publisher.clone(), message.ulid.clone());
         }
     }
-    persist_health_checkpoint(workgroup_root, local_node_id, state, &mut report);
+    persist_health_checkpoint(workgroup_root, local_node_id, &candidate_state, &mut report);
+    *state = candidate_state;
     Ok(report)
 }
 
@@ -781,15 +893,15 @@ fn read_bounded_health_file(path: &Path) -> BoundedHealthFile {
     read_bounded_regular_file(path, MAX_HEALTH_PUBLICATION_BYTES)
 }
 
-fn ingest_health_file(
+fn ingest_staged_health_file(
     workgroup_root: &Path,
     publisher: &str,
+    file: BoundedHealthFile,
     ledger: &mut HealthPublicationLedger,
     now_ms: u64,
     report: &mut HealthIngressReport,
 ) {
-    let path = health_projection_path(workgroup_root, publisher);
-    let bytes = match read_bounded_health_file(&path) {
+    let bytes = match file {
         BoundedHealthFile::Missing => return,
         BoundedHealthFile::Rejected => {
             report.rejected += 1;
@@ -1300,7 +1412,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1330,7 +1442,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1379,7 +1491,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1418,7 +1530,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1432,7 +1544,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1468,7 +1580,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut before_restart,
             500,
         )
@@ -1484,7 +1596,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut after_restart,
             500,
         )
@@ -1516,7 +1628,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut restarted,
             500,
         )
@@ -1534,6 +1646,7 @@ mod tests {
     #[test]
     fn health_ingress_rejects_oversized_checkpoint_before_allocation() {
         let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
         let conn = fresh_store();
         seed_node(&conn, "node-a");
         let checkpoint = health_checkpoint_path(workgroup.path(), "local").expect("valid observer");
@@ -1544,9 +1657,15 @@ mod tests {
             .expect("oversize checkpoint");
 
         let mut restarted = HealthIngressState::default();
-        let report =
-            ingest_health_publications(&conn, workgroup.path(), "local", None, &mut restarted, 500)
-                .expect("bounded restart ingress");
+        let report = ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "local",
+            bus.path(),
+            &mut restarted,
+            500,
+        )
+        .expect("bounded restart ingress");
         assert!(!report.checkpoint_restored);
         assert_eq!(report.checkpoint_failures, 1);
         assert!(restarted.ledger.retained("node-a").is_none());
@@ -1592,7 +1711,7 @@ mod tests {
             &bounded_conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1603,7 +1722,7 @@ mod tests {
             &bounded_conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1634,7 +1753,7 @@ mod tests {
             &conn,
             workgroup.path(),
             "local",
-            Some(bus.path()),
+            bus.path(),
             &mut ingress,
             500,
         )
@@ -1647,6 +1766,214 @@ mod tests {
             Some(message.ulid.as_str())
         );
         assert!(!health_projection_path(workgroup.path(), "node-a").exists());
+    }
+
+    #[test]
+    fn health_reconciler_bus_root_honors_override_and_system_fallback() {
+        assert_eq!(
+            health_reconciler_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            health_reconciler_bus_root_or_system(Some(PathBuf::from(
+                "/tmp/health-reconciler-explicit-bus",
+            ))),
+            PathBuf::from("/tmp/health-reconciler-explicit-bus")
+        );
+    }
+
+    #[test]
+    fn final_publisher_read_failure_preserves_complete_ingress_checkpoint() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let bus = tempfile::tempdir().expect("bus");
+        let conn = fresh_store();
+        seed_node(&conn, "node-a");
+        seed_node(&conn, "zz-node");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let first = health_publication("node-a", 1, 100);
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).unwrap()),
+            )
+            .unwrap();
+        let mut ingress = HealthIngressState::default();
+        ingest_health_publications(
+            &conn,
+            workgroup.path(),
+            "observer",
+            bus.path(),
+            &mut ingress,
+            500,
+        )
+        .expect("seed last-good ingress");
+
+        let checkpoint = health_checkpoint_path(workgroup.path(), "observer").unwrap();
+        let checkpoint_before = std::fs::read(&checkpoint).unwrap();
+        let projection_before =
+            std::fs::read(health_projection_path(workgroup.path(), "node-a")).unwrap();
+        let ingress_before = ingress.clone();
+        let staged_file = health_publication("zz-node", 1, 150);
+        std::fs::write(
+            health_projection_path(workgroup.path(), "zz-node"),
+            serde_json::to_vec(&staged_file).unwrap(),
+        )
+        .unwrap();
+        let second = health_publication("node-a", 2, 200);
+        persist
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&second).unwrap()),
+            )
+            .unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_for_reader = Arc::clone(&reads);
+        let failed = ingest_health_publications_with_reader(
+            &conn,
+            workgroup.path(),
+            "observer",
+            &mut ingress,
+            500,
+            || {
+                Ok(
+                    move |publisher: &str, topic: &str, cursor: Option<&str>, limit: usize| {
+                        reads_for_reader.fetch_add(1, Ordering::SeqCst);
+                        if publisher == "zz-node" {
+                            return Err(HealthIngressError::BusLaneUnavailable);
+                        }
+                        persist
+                            .list_since_limit(topic, cursor, limit)
+                            .map_err(|_| HealthIngressError::BusLaneUnavailable)
+                    },
+                )
+            },
+        );
+        assert_eq!(failed, Err(HealthIngressError::BusLaneUnavailable));
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "final lane was read");
+        assert_eq!(ingress, ingress_before);
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), checkpoint_before);
+        assert_eq!(
+            std::fs::read(health_projection_path(workgroup.path(), "node-a")).unwrap(),
+            projection_before
+        );
+    }
+
+    #[tokio::test]
+    async fn late_and_replaced_bus_recovers_external_forward_state_and_shutdown() {
+        let workgroup = tempfile::tempdir().expect("workgroup");
+        let root = tempfile::tempdir().expect("root");
+        let bus_root = root.path().join("bus");
+        let db_path = root.path().join("mackesd.db");
+        let conn = crate::store::open(&db_path).expect("store");
+        seed_node(&conn, "node-a");
+        drop(conn);
+        std::fs::write(&bus_root, b"blocks Persist::open").unwrap();
+
+        let mut worker = HealthReconcilerWorker::new(
+            workgroup.path().to_path_buf(),
+            db_path,
+            "observer".into(),
+            new_signal_sender_slot(),
+        )
+        .with_bus_root(bus_root.clone())
+        .with_tick(Duration::from_millis(5))
+        .with_now_ms(500);
+        let ingress = Arc::clone(&worker.ingress);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(!task.is_finished(), "late Bus terminated the worker");
+        assert_eq!(*ingress.lock().unwrap(), HealthIngressState::default());
+
+        std::fs::remove_file(&bus_root).unwrap();
+        let external = Persist::open(bus_root.clone()).unwrap();
+        let checkpoint = health_checkpoint_path(workgroup.path(), "observer").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !checkpoint.is_file() {
+                assert!(!task.is_finished(), "worker exited before Bus activation");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("late Bus did not activate");
+
+        let first = health_publication("node-a", 1, 100);
+        external
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).unwrap()),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if ingress
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .retained("node-a")
+                    .is_some_and(|state| state.generation == 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("external forward publication was not ingested");
+
+        drop(external);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{suffix}",
+                bus_root.join("index.sqlite").display()
+            ));
+            if let Err(error) = std::fs::remove_file(&path) {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
+        let replacement = Persist::open(bus_root.clone()).unwrap();
+        let second = health_publication("node-a", 2, 200);
+        replacement
+            .write(
+                &node_health_topic("node-a"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&second).unwrap()),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if ingress
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .retained("node-a")
+                    .is_some_and(|state| state.generation == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus index was not observed");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown was not prompt")
+            .expect("worker task panicked")
+            .expect("worker returned an error");
     }
 
     #[test]
