@@ -609,7 +609,7 @@ behavioral evidence is not completion.
   with explicit permission, limits, and cleanup.
 - Current state: bounded rich contracts and DRM/mesh/VDI scaffolding exist; live adapters, permissions, cleanup, and proof remain.
 - **S1 rich contract (2026-08-08):** V2 offers, generations, secret policy, and denials passed 72/72: `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
-- **S3 mesh transport (2026-08-08):** signed target frames passed 7/7; cross-node/CAS proof remains: `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
+- **S3 mesh xproc (2026-08-09):** Persist/SQLite/CAS/replay passed 1/1; live nodes remain: `docs/platform/evidence/WL-FUNC-016-2026-08-09-mesh-cross-process-r11.md`.
 - **S2 DRM authority (2026-08-08/09):** seat authority passed 19/19; focus-bound asynchronous paste expiry passed 12/12; live proof remains:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`, `docs/platform/evidence/WL-FUNC-016-2026-08-09-drm-paste-ownership-r10.md`.
 - **VDI transport/permission checkpoints (2026-08-08):** bounded VNC/RDP/SPICE text, one-use/replay/revocation, modal, and redacted audit passed; live guest proof remains:
