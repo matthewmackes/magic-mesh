@@ -514,14 +514,12 @@ behavioral evidence is not completion.
   office transport, canonical Alerts, migration, and hard cut remain.
 - **Transfer wire checkpoint (2026-08-06):** duplicate `schema_version` fields are rejected at media transfer admission; `.50` passed 1/1.
   Evidence: `docs/platform/evidence/WL-FUNC-011-2026-08-06-transfer-wire-boundary-r1.md`.
-- **Legacy route hard-cut checkpoint (2026-08-09):** retired Chat, Voice,
-  Editor, Code, Teams, and Mesh Teams navigation contracts now fail closed;
-  canonical Collaboration routes remain. BigBoy passed 25/25 bridge tests:
-  `docs/platform/evidence/WL-FUNC-011-2026-08-09-legacy-route-admission-r2.md`.
-- **Projection atomicity checkpoint (2026-08-09):** failed SQLite projection leaves local and replicated clocks/state unchanged; `.50` passed 98/98:
-  `docs/platform/evidence/WL-FUNC-011-2026-08-09-collab-projection-atomicity-r3.md`.
+- **Hard-cut/atomicity checkpoints (2026-08-09):** retired collaboration routes fail closed, and failed SQLite projection preserves clocks/state; BigBoy and `.50` passed:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-legacy-route-admission-r2.md`, `docs/platform/evidence/WL-FUNC-011-2026-08-09-collab-projection-atomicity-r3.md`.
 - **Live-event lane identity checkpoint (2026-08-09):** signed envelopes merge only on an exact space/actor Bus lane; mismatches fail closed. Machine 193 passed 1/1:
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-live-event-lane-identity-r4.md`.
+- **Native-office admission checkpoint (2026-08-09):** office containers no longer fall through to lossy text editing; unsafe paths and the absent non-VCL adapter fail
+  closed without opening or changing bytes. BigBoy passed 5/5: `docs/platform/evidence/WL-FUNC-011-2026-08-09-native-office-admission-r5.md`.
 - Remaining work:
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.

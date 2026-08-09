@@ -838,6 +838,12 @@ impl EditorSurface {
     /// Returns any [`io::Error`] from reading `path` (missing file, permissions).
     pub fn open_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
+        if let Some(kind) = crate::office_session::office_kind(path) {
+            if let Err(error) = crate::office_session::admit_office_path(path, kind) {
+                self.notice = Some(error.to_string());
+                return Err(error);
+            }
+        }
         let focus = self.focus;
         if let Some(pane) = self.panes.get_mut(&focus) {
             if let Some(idx) = pane.find_path(path) {

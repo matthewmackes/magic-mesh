@@ -101,6 +101,32 @@ fn tessellate_panel_at(surface: &mut EditorSurface, width: f32) -> usize {
 }
 
 #[test]
+fn office_container_open_fails_closed_without_mutating_bytes_or_opening_a_tab() {
+    let d = TempDir::new("office-admission");
+    let file = d.join("hostile.XLSX");
+    let original = b"PK\x03\x04\0\xffoffice-container-not-utf8";
+    std::fs::write(&file, original).expect("seed office container");
+    let mut surface = real_editor();
+
+    let error = surface
+        .open_path(&file)
+        .expect_err("office adapter is absent");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(std::fs::read(&file).expect("read unchanged file"), original);
+    assert!(
+        surface.current_text().is_none(),
+        "no fake text tab was opened"
+    );
+    assert!(
+        surface.notice.as_deref().is_some_and(|notice| {
+            notice.contains("LibreOfficeKit") && notice.contains("not packaged")
+        }),
+        "the production surface explains the exact unavailable boundary"
+    );
+}
+
+#[test]
 fn empty_state_panel_mounts_and_renders_headless() {
     let mut surface = real_editor();
     assert!(!surface.is_open(), "a fresh surface opens no document");

@@ -143,6 +143,7 @@ pub mod lsp_ui;
 pub mod markdown;
 pub mod md_actions;
 mod menu_bar;
+pub mod office_session;
 pub mod outline;
 mod palette;
 pub mod panel;
