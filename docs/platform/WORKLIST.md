@@ -419,6 +419,11 @@ behavioral evidence is not completion.
   fails closed and atomic temporary files are cleaned on failure. Machine 194
   passed 3/3 focused tests; Dell deployment proof remains:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
+- **Compute Bus recovery checkpoint (2026-08-09):** firewall exposure now
+  survives late Bus storage with bounded shutdown-aware retries, while a
+  statically absent firewall provider quiesces without churn. Machine 194
+  passed four exact startup/activation tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a

@@ -41,7 +41,8 @@
 //! ## Silent no-op
 //!
 //! When `firewall-cmd` is absent on PATH (containerised CI peer,
-//! lighthouse profile), the worker logs and exits without retrying.
+//! lighthouse profile), the worker logs once and quiesces until shutdown
+//! without repeatedly probing a statically unavailable provider.
 
 #![cfg(feature = "async-services")]
 
@@ -504,6 +505,39 @@ fn binary_present(bin: &str) -> bool {
     Command::new(bin).arg("--version").output().is_ok()
 }
 
+trait ComputeExposeRuntime: Send + Sync {
+    fn firewall_provider_available(&self) -> bool;
+
+    fn resolve_bus_root(&self, override_root: Option<&Path>) -> Option<PathBuf>;
+
+    fn open_bus(&self, root: PathBuf) -> Result<Persist, String>;
+}
+
+struct SystemComputeExposeRuntime;
+
+impl ComputeExposeRuntime for SystemComputeExposeRuntime {
+    fn firewall_provider_available(&self) -> bool {
+        binary_present("firewall-cmd")
+    }
+
+    fn resolve_bus_root(&self, override_root: Option<&Path>) -> Option<PathBuf> {
+        Some(compute_bus_root(
+            override_root.map(Path::to_path_buf),
+            default_bus_root(),
+        ))
+    }
+
+    fn open_bus(&self, root: PathBuf) -> Result<Persist, String> {
+        Persist::open(root).map_err(|error| error.to_string())
+    }
+}
+
+fn compute_bus_root(override_root: Option<PathBuf>, default_root: Option<PathBuf>) -> PathBuf {
+    override_root
+        .or(default_root)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 fn run_firewall_cmd(args: &[String]) -> bool {
     Command::new("firewall-cmd")
         .args(args)
@@ -618,6 +652,7 @@ pub struct ComputeExposeWorker {
     nebula_addr_hint: String,
     poll_interval: Duration,
     bus_root_override: Option<PathBuf>,
+    runtime: Arc<dyn ComputeExposeRuntime>,
     authorizer: Arc<ActionAuthorizer>,
     mutation_runner: Arc<dyn FirewallMutationRunner>,
     result_writer: Arc<dyn ActionResultWriter>,
@@ -640,6 +675,7 @@ impl ComputeExposeWorker {
             nebula_addr_hint: String::new(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            runtime: Arc::new(SystemComputeExposeRuntime),
             authorizer: Arc::new(ActionAuthorizer::production()),
             mutation_runner: Arc::new(SystemFirewallMutationRunner),
             result_writer: Arc::new(PersistActionResultWriter),
@@ -660,6 +696,14 @@ impl ComputeExposeWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Inject deterministic provider and Bus availability boundaries.
+    #[cfg(test)]
+    #[must_use]
+    fn with_runtime(mut self, runtime: Arc<dyn ComputeExposeRuntime>) -> Self {
+        self.runtime = runtime;
         self
     }
 
@@ -1369,22 +1413,36 @@ impl Worker for ComputeExposeWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        if !binary_present("firewall-cmd") {
-            tracing::debug!("compute_expose: firewall-cmd absent; worker idle");
+        if !self.runtime.firewall_provider_available() {
+            tracing::debug!("compute_expose: firewall-cmd absent; worker quiescent");
+            shutdown.wait().await;
             return Ok(());
         }
-        let bus_root = match self.bus_root_override.clone().or_else(default_bus_root) {
-            Some(r) => r,
-            None => {
-                tracing::debug!("compute_expose: no bus root; worker idle");
-                return Ok(());
+
+        let retry_interval = self
+            .poll_interval
+            .clamp(Duration::from_millis(10), DEFAULT_POLL_INTERVAL);
+        let persist = loop {
+            if let Some(bus_root) = self
+                .runtime
+                .resolve_bus_root(self.bus_root_override.as_deref())
+            {
+                match self.runtime.open_bus(bus_root) {
+                    Ok(persist) => break persist,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "compute_expose: persist open failed; retrying"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!("compute_expose: no bus root; retrying");
             }
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "compute_expose: persist open failed; worker idle");
-                return Ok(());
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         let wan_zone = detect_wan_zone();
@@ -1479,9 +1537,225 @@ mod tests {
         }
     }
 
+    struct ScriptedRuntime {
+        firewall_available: bool,
+        resolved_root: Option<PathBuf>,
+        unresolved_attempts: AtomicUsize,
+        open_failures: AtomicUsize,
+        resolve_calls: AtomicUsize,
+        open_calls: AtomicUsize,
+    }
+
+    impl ScriptedRuntime {
+        fn consume(counter: &AtomicUsize) -> bool {
+            counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }
+    }
+
+    impl ComputeExposeRuntime for ScriptedRuntime {
+        fn firewall_provider_available(&self) -> bool {
+            self.firewall_available
+        }
+
+        fn resolve_bus_root(&self, override_root: Option<&Path>) -> Option<PathBuf> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            if Self::consume(&self.unresolved_attempts) {
+                return None;
+            }
+            override_root
+                .map(Path::to_path_buf)
+                .or_else(|| self.resolved_root.clone())
+        }
+
+        fn open_bus(&self, root: PathBuf) -> Result<Persist, String> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            if Self::consume(&self.open_failures) {
+                return Err("injected transient open failure".to_string());
+            }
+            Persist::open(root).map_err(|error| error.to_string())
+        }
+    }
+
     #[test]
     fn default_bus_root_uses_the_shared_mde_bus_resolver() {
         assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+        assert_eq!(
+            compute_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            compute_bus_root(Some(PathBuf::from("/tmp/compute-bus")), None),
+            PathBuf::from("/tmp/compute-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_firewall_provider_quiesces_until_prompt_shutdown() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let unconfigured_root = temp.path().join("must-not-materialize");
+        let runtime = Arc::new(ScriptedRuntime {
+            firewall_available: false,
+            resolved_root: Some(unconfigured_root.clone()),
+            unresolved_attempts: AtomicUsize::new(0),
+            open_failures: AtomicUsize::new(0),
+            resolve_calls: AtomicUsize::new(0),
+            open_calls: AtomicUsize::new(0),
+        });
+        let runtime_seam: Arc<dyn ComputeExposeRuntime> = runtime.clone();
+        let mut worker = ComputeExposeWorker::new()
+            .with_runtime(runtime_seam)
+            .with_poll_interval(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(!task.is_finished(), "static provider absence must quiesce");
+        assert_eq!(runtime.resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.open_calls.load(Ordering::SeqCst), 0);
+        assert!(!unconfigured_root.exists());
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must be prompt")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn unresolved_bus_root_retries_without_early_exit_and_stops_promptly() {
+        let runtime = Arc::new(ScriptedRuntime {
+            firewall_available: true,
+            resolved_root: None,
+            unresolved_attempts: AtomicUsize::new(usize::MAX),
+            open_failures: AtomicUsize::new(0),
+            resolve_calls: AtomicUsize::new(0),
+            open_calls: AtomicUsize::new(0),
+        });
+        let runtime_seam: Arc<dyn ComputeExposeRuntime> = runtime.clone();
+        let mut worker = ComputeExposeWorker::new()
+            .with_runtime(runtime_seam)
+            .with_poll_interval(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            !task.is_finished(),
+            "missing Bus root must remain retryable"
+        );
+        assert!(runtime.resolve_calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(runtime.open_calls.load(Ordering::SeqCst), 0);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt retry sleep")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn transient_bus_resolution_and_open_failure_recovers_forward_without_restart() {
+        let bus_root = tempfile::tempdir().expect("bus root");
+        let persist = Persist::open(bus_root.path().to_path_buf()).expect("setup persist");
+        let unsigned = r#"{"vm_nebula_ip":"10.42.128.1","guest_port":8080,"proto":"tcp","networks":["mesh"],"schema_version":1}"#;
+        let request = parse_expose_request(unsigned).expect("valid expose request");
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &expose_auth_target(&request),
+            },
+            "compute-expose-bus-recovery-once",
+            AUTH_NOW + 30_000,
+        );
+        let request_message = persist
+            .write(
+                "compute/expose/10.42.0.15",
+                Priority::Default,
+                None,
+                Some(&armed),
+            )
+            .expect("request write");
+        drop(persist);
+
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let journal_root = tempfile::tempdir().expect("journal root");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        ));
+        let firewall = Arc::new(RecordingFirewall::default());
+        let runtime = Arc::new(ScriptedRuntime {
+            firewall_available: true,
+            resolved_root: Some(bus_root.path().to_path_buf()),
+            unresolved_attempts: AtomicUsize::new(1),
+            open_failures: AtomicUsize::new(1),
+            resolve_calls: AtomicUsize::new(0),
+            open_calls: AtomicUsize::new(0),
+        });
+        let runtime_seam: Arc<dyn ComputeExposeRuntime> = runtime.clone();
+        let firewall_seam: Arc<dyn FirewallMutationRunner> = firewall.clone();
+        let mut worker = ComputeExposeWorker::new()
+            .with_runtime(runtime_seam)
+            .with_authorizer(authorizer)
+            .with_mutation_runner(firewall_seam)
+            .with_journal_path(journal_root.path().join("action-journal.json"))
+            .with_nebula_addr_hint("10.42.0.15".to_string())
+            .with_poll_interval(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let persist = Persist::open(bus_root.path().to_path_buf()).expect("poll persist");
+                if !persist
+                    .list_since(&action_result_topic(&request_message.ulid), None)
+                    .expect("result query")
+                    .is_empty()
+                {
+                    break;
+                }
+                drop(persist);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must activate after Bus recovery");
+
+        assert!(runtime.resolve_calls.load(Ordering::SeqCst) >= 3);
+        assert_eq!(runtime.open_calls.load(Ordering::SeqCst), 2);
+        let calls = firewall.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 2, "one add plus one reload expected");
+        assert!(calls[0]
+            .iter()
+            .any(|arg| arg.starts_with("--add-rich-rule=")));
+        assert_eq!(calls[1], vec!["--reload"]);
+        drop(calls);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("active worker shutdown must be prompt")
+            .expect("worker task")
+            .expect("worker result");
     }
 
     #[test]
