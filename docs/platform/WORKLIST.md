@@ -87,12 +87,9 @@ behavioral evidence is not completion.
   refusing unrelated virtqemud failures. Workload `workload_compute` passed
   23/23 on `.90` in `workload-cleanup-idempotence-20260806-r1`.
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
-- **Admission/recovery proof checkpoint (2026-08-06):**
-  `verify-workloads-live-proof.py` validates bounded typed state, placement,
-  resources, retry state, and lease safety; its strict live command honestly
-  refused because mackesd, role pin, and Bus were absent. Live HostCapacity,
-  restart/crash, native attachment, and Dell/seat proof remain open.
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`.
+- **Admission/live proof checkpoints (2026-08-06/09):** the strict helper validates typed placement, resources, retry, and lease safety. Dell was unreachable; seat 15 lacked
+  a revision receipt, typed projection, operation, and attachment generation, so acceptance refused:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
 - **Native attachment route checkpoint (2026-08-09):** invalid container/protocol attachment fails before effects and live headless Service VMs emit no attachment;
   BigBoy passed 38/38 plus the reachable shell regression: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
 - **Console authority removal checkpoint (2026-08-08):** the raw console relay,
