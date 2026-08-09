@@ -632,11 +632,12 @@ impl CollabWorker {
             if !topic.starts_with(topics::EVENT_PREFIX) {
                 continue;
             }
-            match topics::parse_event_topic(topic) {
-                // Skip our own authored lane — those events are already ingested.
-                Some((_space, actor)) if actor == self.self_actor => continue,
-                Some(_) => {}
-                None => continue,
+            let Some((topic_space, topic_actor)) = topics::parse_event_topic(topic) else {
+                continue;
+            };
+            // Skip our own authored lane — those events are already ingested.
+            if topic_actor == self.self_actor {
+                continue;
             }
             // Events are idempotent under merge, so drain the full lane on first
             // sight (a foreign lane only appears once it carries events) and
@@ -656,7 +657,7 @@ impl CollabWorker {
                     continue;
                 }
                 match serde_json::from_str::<CollabEventEnvelope>(body) {
-                    Ok(env) => {
+                    Ok(env) if env.space_id == topic_space && env.actor == topic_actor => {
                         incoming.push(env);
                         if incoming.len() == MAX_WORKER_MERGE_BATCH_EVENTS {
                             self.merge_batch(
@@ -669,6 +670,15 @@ impl CollabWorker {
                             incoming.reserve(MAX_WORKER_MERGE_BATCH_EVENTS);
                         }
                     }
+                    Ok(env) => tracing::warn!(
+                        target: "mackesd::collab",
+                        topic = topic.as_str(),
+                        topic_space = %topic_space,
+                        topic_actor = %topic_actor,
+                        envelope_space = %env.space_id,
+                        envelope_actor = %env.actor,
+                        "refused collab/event envelope routed on a mismatched identity lane",
+                    ),
                     Err(e) => tracing::warn!(
                         target: "mackesd::collab",
                         topic = topic.as_str(),
@@ -3216,6 +3226,59 @@ mod tests {
                 .iter()
                 .any(|e| e.event_id == forged_id),
             "the forged event was dropped, not ingested",
+        );
+    }
+
+    #[test]
+    fn valid_signed_event_requires_exact_space_and_actor_lane_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        let signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("nyc3")).expect("engine");
+        let mut ids = RandomIds;
+        let created = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "remote".into(),
+                },
+                &signer,
+                &mut ids,
+                50,
+            )
+            .expect("foreign create");
+        let space = created[0].space_id;
+        for env in &created {
+            let body = serde_json::to_string(env).expect("serialize event");
+            write_raw(
+                &persist,
+                &topics::event_topic(space, &ActorId::new("impostor")),
+                &body,
+            );
+            write_raw(
+                &persist,
+                &topics::event_topic(SpaceId::new(), &env.actor),
+                &body,
+            );
+        }
+
+        w.tick_once(&persist, &mut state, 200);
+        assert!(
+            state.engine.all_events().is_empty(),
+            "valid signatures on mismatched actor or space lanes must fail closed",
+        );
+
+        for env in &created {
+            write_event(&persist, env);
+        }
+        w.tick_once(&persist, &mut state, 300);
+        assert!(
+            state.engine.state().space(space).is_some(),
+            "the same signed events remain admissible on their exact canonical lane",
         );
     }
 

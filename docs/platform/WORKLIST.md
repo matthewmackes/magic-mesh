@@ -523,6 +523,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-legacy-route-admission-r2.md`.
 - **Projection atomicity checkpoint (2026-08-09):** failed SQLite projection leaves local and replicated clocks/state unchanged; `.50` passed 98/98:
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-collab-projection-atomicity-r3.md`.
+- **Live-event lane identity checkpoint (2026-08-09):** signed envelopes merge only on an exact space/actor Bus lane; mismatches fail closed. Machine 193 passed 1/1:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-live-event-lane-identity-r4.md`.
 - Remaining work:
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
