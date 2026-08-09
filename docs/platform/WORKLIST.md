@@ -1946,6 +1946,11 @@ behavioral evidence is not completion.
   representative choice is deterministic under reversed input and history
   still materializes at most eight rows. BigBoy passed the exact hostile test:
   `docs/platform/evidence/WL-UX-013-2026-08-09-recurrence-aggregation-r7.md`.
+- **History-window checkpoint (2026-08-09):** the bounded recurrence page now
+  admits only resolved same-node records inside the snapshot's inclusive
+  24-hour window; future, unresolved, and older high-severity rows cannot
+  displace valid history. BigBoy passed the exact hostile filter test:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-history-window-filter-r8.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.

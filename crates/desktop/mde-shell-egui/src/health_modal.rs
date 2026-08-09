@@ -22,6 +22,7 @@ const SEATS: [(&str, &[&str]); 5] = [
 ];
 const MESH_SELECTION: &str = "__mesh_wide__";
 const HISTORY_PAGE_SIZE: usize = 8;
+const HISTORY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 pub(crate) fn mount(
     ctx: &egui::Context,
@@ -399,7 +400,11 @@ fn detail(
     }
 
     if let Some(snapshot) = snapshot {
-        let resolved = recurrence_history(&snapshot.resolved_conditions, &node);
+        let resolved = recurrence_history(
+            &snapshot.resolved_conditions,
+            &node,
+            snapshot.generated_at_ms,
+        );
         if !resolved.is_empty() {
             ui.separator();
             ui.strong("Recent History");
@@ -597,19 +602,27 @@ struct HistoryRecurrence<'a> {
 }
 
 /// Aggregate stable lifecycle identities without materializing the complete
-/// history in the modal. The first pass retains only the strongest eight
-/// identities; the second pass counts recurrences for those retained rows.
-/// This keeps paint-time memory fixed even if an untrusted caller bypasses the
-/// snapshot's wire-level collection bound.
+/// history in the modal. Only genuinely resolved records in the snapshot's
+/// inclusive 24-hour window participate. The first pass retains only the
+/// strongest eight identities; the second pass counts recurrences for those
+/// retained rows. This keeps paint-time memory fixed even if an untrusted
+/// caller bypasses the snapshot's wire-level collection bound.
 fn recurrence_history<'a>(
     conditions: &'a [HealthCondition],
     node: &str,
+    as_of_ms: u64,
 ) -> Vec<HistoryRecurrence<'a>> {
-    let applies_to_node = |condition: &HealthCondition| matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node);
+    let window_start_ms = as_of_ms.saturating_sub(HISTORY_WINDOW_MS);
+    let applies_to_page = |condition: &HealthCondition| {
+        matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
+            && condition.resolved_at_ms.is_some_and(|resolved_at_ms| {
+                (window_start_ms..=as_of_ms).contains(&resolved_at_ms)
+            })
+    };
     let mut resolved: Vec<HistoryRecurrence<'a>> = Vec::with_capacity(HISTORY_PAGE_SIZE);
     for condition in conditions
         .iter()
-        .filter(|condition| applies_to_node(condition))
+        .filter(|condition| applies_to_page(condition))
     {
         if let Some(recurrence) = resolved
             .iter_mut()
@@ -640,7 +653,7 @@ fn recurrence_history<'a>(
     }
     for condition in conditions
         .iter()
-        .filter(|condition| applies_to_node(condition))
+        .filter(|condition| applies_to_page(condition))
     {
         if let Some(recurrence) = resolved
             .iter_mut()
@@ -1119,7 +1132,7 @@ mod tests {
         long_warning.resolved_at_ms = Some(20_000);
         let conditions = vec![long_warning, short_critical, long_critical];
 
-        let ordered = recurrence_history(&conditions, "node");
+        let ordered = recurrence_history(&conditions, "node", 20_000);
         assert_eq!(
             ordered
                 .iter()
@@ -1200,7 +1213,7 @@ mod tests {
         other.resolved_at_ms = Some(9_999);
         conditions.push(other);
 
-        let page = recurrence_history(&conditions, "node");
+        let page = recurrence_history(&conditions, "node", 100_000);
         assert_eq!(page.len(), 8, "one paint materializes at most eight rows");
         assert_eq!(
             page.iter()
@@ -1267,8 +1280,8 @@ mod tests {
 
         let mut reversed_conditions = conditions.clone();
         reversed_conditions.reverse();
-        let forward = recurrence_history(&conditions, "node");
-        let reversed = recurrence_history(&reversed_conditions, "node");
+        let forward = recurrence_history(&conditions, "node", 20_000);
+        let reversed = recurrence_history(&reversed_conditions, "node", 20_000);
         let summarize = |page: &[HistoryRecurrence<'_>]| {
             page.iter()
                 .map(|recurrence| {
@@ -1301,6 +1314,59 @@ mod tests {
                 .count(),
             1,
             "a stable lifecycle identity occupies exactly one bounded row"
+        );
+    }
+
+    #[test]
+    fn history_filter_rejects_out_of_window_future_and_unresolved_records() {
+        let as_of_ms = HISTORY_WINDOW_MS + 10_000;
+        let mut at_boundary = condition(
+            "node:at-boundary",
+            "node",
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        at_boundary.resolved_at_ms = Some(as_of_ms - HISTORY_WINDOW_MS);
+
+        let mut current = condition(
+            "node:current",
+            "node",
+            HealthSeverity::Warning,
+            HealthComponent::System,
+        );
+        current.resolved_at_ms = Some(as_of_ms);
+
+        let mut too_old = condition(
+            "node:too-old-critical",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        too_old.resolved_at_ms = Some(as_of_ms - HISTORY_WINDOW_MS - 1);
+
+        let mut future = condition(
+            "node:future-critical",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        future.resolved_at_ms = Some(as_of_ms + 1);
+
+        let unresolved = condition(
+            "node:unresolved-critical",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+
+        let conditions = vec![too_old, future, unresolved, at_boundary, current];
+        let page = recurrence_history(&conditions, "node", as_of_ms);
+        assert_eq!(
+            page.iter()
+                .map(|recurrence| recurrence.condition.id.as_str())
+                .collect::<Vec<_>>(),
+            ["node:current", "node:at-boundary"],
+            "only genuinely resolved records inside the inclusive 24-hour window belong on the page"
         );
     }
 
