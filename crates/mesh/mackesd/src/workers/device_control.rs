@@ -35,17 +35,19 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::device_control::{
-    take_requests, write_result, DeviceControlOp, DeviceControlRequest, DeviceControlResult,
-    DeviceTarget,
+    authorization_target, take_requests, write_result, DeviceControlOp, DeviceControlRequest,
+    DeviceControlResult, DeviceTarget, DEVICE_CONTROL_AUTH_VERB,
 };
 use mackes_mesh_types::device_inventory;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Request poll cadence — an op lands within ~3 s of replication (as `lifecycle_exec`).
 pub const POLL: Duration = Duration::from_secs(3);
@@ -286,6 +288,9 @@ pub struct DeviceControlExecWorker {
     db_path: PathBuf,
     /// Override the Bus spool root for the failure notify. Tests point at a tempdir.
     bus_root_override: Option<PathBuf>,
+    /// Canonical exact-body privileged-action verifier. Missing credentials
+    /// install a fail-closed verifier; the worker never mints capabilities.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl DeviceControlExecWorker {
@@ -299,6 +304,7 @@ impl DeviceControlExecWorker {
             node_id,
             db_path: crate::default_db_path(),
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -313,6 +319,14 @@ impl DeviceControlExecWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Inject deterministic verifier/nonce-ledger state for hostile tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -368,6 +382,32 @@ impl DeviceControlExecWorker {
             Ok(s) => s,
             Err(reason) => return DeviceControlResult::failed(&req.id, reason),
         };
+        let target = match authorization_target(&req.id) {
+            Ok(target) => target,
+            Err(reason) => return DeviceControlResult::failed(&req.id, reason),
+        };
+        let body = match serde_json::to_string(req) {
+            Ok(body) => body,
+            Err(_) => {
+                return DeviceControlResult::failed(
+                    &req.id,
+                    "device-control request could not be authorized",
+                );
+            }
+        };
+        if let Err(reason) = self.authorizer.authorize(
+            &body,
+            MutationContext {
+                verb: DEVICE_CONTROL_AUTH_VERB,
+                node: &self.self_hostname,
+                target: &target,
+            },
+        ) {
+            return DeviceControlResult::failed(
+                &req.id,
+                format!("device-control authorization refused: {reason}"),
+            );
+        }
         match execute_plan(&steps).await {
             Ok(note) => DeviceControlResult::ok(
                 &req.id,
@@ -522,11 +562,40 @@ impl Worker for DeviceControlExecWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use mackes_mesh_types::device_control::write_request;
     use mackes_mesh_types::device_inventory::{
         category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
         ToolAvailability,
     };
+
+    const AUTH_KEY: &[u8] = b"device-control-shared-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    fn test_authorizer(root: &Path) -> Arc<ActionAuthorizer> {
+        Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            root.join("auth"),
+            AUTH_NOW,
+        ))
+    }
+
+    fn authorize_request(req: &DeviceControlRequest, nonce: &str) -> DeviceControlRequest {
+        let unsigned = serde_json::to_string(req).unwrap();
+        let target = authorization_target(&req.id).unwrap();
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: DEVICE_CONTROL_AUTH_VERB,
+                node: &req.target_host,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        );
+        serde_json::from_str(&armed).unwrap()
+    }
 
     // ── command_plan: each op maps to its real command / sysfs seam ────────────
 
@@ -719,6 +788,8 @@ mod tests {
         .with_bus_root(tmp.path().join("bus"));
 
         let req = DeviceControlRequest {
+            schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
             id: "01REF".into(),
             op: DeviceControlOp::Disable,
             target: DeviceTarget {
@@ -774,21 +845,27 @@ mod tests {
             "peer:edge-2".into(),
         )
         .with_db_path(db.clone())
-        .with_bus_root(tmp.path().join("bus"));
+        .with_bus_root(tmp.path().join("bus"))
+        .with_authorizer(test_authorizer(tmp.path()));
 
-        let req = DeviceControlRequest {
-            id: "01USB".into(),
-            op: DeviceControlOp::Disable,
-            target: DeviceTarget {
-                name: "Logitech Webcam".into(),
-                category: category::NETWORK_ADAPTERS.into(),
-                sysfs_path: Some(sysfs_path),
-                driver: None,
+        let req = authorize_request(
+            &DeviceControlRequest {
+                schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+                armed_token: None,
+                id: "01USB".into(),
+                op: DeviceControlOp::Disable,
+                target: DeviceTarget {
+                    name: "Logitech Webcam".into(),
+                    category: category::NETWORK_ADAPTERS.into(),
+                    sysfs_path: Some(sysfs_path),
+                    driver: None,
+                },
+                target_host: "edge-2".into(),
+                expected_inventory_published_at_ms: 1,
+                from: "peer:laptop-mm".into(),
             },
-            target_host: "edge-2".into(),
-            expected_inventory_published_at_ms: 1,
-            from: "peer:laptop-mm".into(),
-        };
+            "offered-usb-device",
+        );
         let result = w.process(&req).await;
         assert!(result.ok, "{}", result.error);
         // The kernel control file was written for real.
@@ -801,6 +878,81 @@ mod tests {
         assert!(
             persist.list_since(NOTIFY_TOPIC, None).unwrap().is_empty(),
             "a successful op raises no failure notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_altered_and_replayed_authority_never_reaches_hardware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+        write_inventory(
+            tmp.path(),
+            "edge-2",
+            vec![DeviceRecord {
+                sysfs_path: Some(sysfs_path.clone()),
+                ..DeviceRecord::new("Logitech Webcam", DeviceStatus::Ok)
+            }],
+        );
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        )
+        .with_authorizer(test_authorizer(tmp.path()));
+        let unsigned = DeviceControlRequest {
+            schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
+            id: "01AUTH".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget {
+                name: "Logitech Webcam".into(),
+                category: category::NETWORK_ADAPTERS.into(),
+                sysfs_path: Some(sysfs_path),
+                driver: None,
+            },
+            target_host: "edge-2".into(),
+            expected_inventory_published_at_ms: 1,
+            from: "peer:laptop-mm".into(),
+        };
+
+        let missing = worker.handle_request(&unsigned).await;
+        assert!(!missing.ok);
+        assert!(missing.error.contains("authorization refused"));
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "missing authority cannot mutate"
+        );
+
+        let armed = authorize_request(&unsigned, "exact-body-device-control");
+        let mut altered = armed.clone();
+        altered.from = "peer:forged-seat".into();
+        let refused = worker.handle_request(&altered).await;
+        assert!(!refused.ok);
+        assert!(refused.error.contains("authorization refused"));
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "an altered signed body cannot mutate"
+        );
+
+        let applied = worker.handle_request(&armed).await;
+        assert!(applied.ok, "{}", applied.error);
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "0"
+        );
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let replayed = worker.handle_request(&armed).await;
+        assert!(!replayed.ok);
+        assert!(replayed.error.contains("already used"));
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "a replayed capability cannot mutate"
         );
     }
 
@@ -829,6 +981,8 @@ mod tests {
         .with_db_path(tmp.path().join("audit.db"))
         .with_bus_root(tmp.path().join("bus"));
         let stale = DeviceControlRequest {
+            schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
             id: "01STALE".into(),
             op: DeviceControlOp::Disable,
             target: DeviceTarget {
@@ -886,6 +1040,8 @@ mod tests {
             "peer:edge-2".into(),
         );
         let hostile = DeviceControlRequest {
+            schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
             id: "01FORGED".into(),
             op: DeviceControlOp::Disable,
             target: DeviceTarget {
@@ -932,6 +1088,8 @@ mod tests {
             "peer:edge-2".into(),
         );
         let hostile = DeviceControlRequest {
+            schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
             id: "01FOREIGN".into(),
             op: DeviceControlOp::Disable,
             target: DeviceTarget {
@@ -971,6 +1129,8 @@ mod tests {
         write_request(
             tmp.path(),
             &DeviceControlRequest {
+                schema_version: mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION,
+                armed_token: None,
                 id: "01DR".into(),
                 op: DeviceControlOp::RescanBus,
                 target: DeviceTarget {

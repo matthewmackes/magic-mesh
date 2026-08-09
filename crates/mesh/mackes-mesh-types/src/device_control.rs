@@ -29,6 +29,25 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Current device-control request schema. Privileged consumers require this
+/// exact version through the shared action-authority verifier.
+pub const DEVICE_CONTROL_SCHEMA_VERSION: u64 = 1;
+
+/// Shared privileged-action verb for device controls.
+pub const DEVICE_CONTROL_AUTH_VERB: &str = "device-control";
+
+/// Build the stable capability target for one device-control request.
+///
+/// The exact request body additionally binds operation, host, generation, and
+/// device identity; this target keeps the shared nonce ledger request-scoped.
+pub fn authorization_target(request_id: &str) -> Result<String, &'static str> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() || request_id.len() > 240 || request_id.contains('|') {
+        return Err("device-control request id is not capability-safe");
+    }
+    Ok(format!("request:{request_id}"))
+}
+
 /// A privileged hardware-mutation op (design #12).
 ///
 /// The Linux-real equivalents of Windows Device-Manager's Enable / Disable /
@@ -95,6 +114,7 @@ impl DeviceControlOp {
 /// needs, carried by value so the request is self-contained (§9 — typed params,
 /// never a command).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceTarget {
     /// The device display name (audit/notify text + the arming echo target).
     pub name: String,
@@ -131,7 +151,13 @@ impl DeviceTarget {
 /// An op KIND + the typed [`DeviceTarget`], the target host, the requesting seat,
 /// and a correlation id. The executor maps the op onto a FIXED seam or refuses it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceControlRequest {
+    /// Shared privileged-action envelope schema.
+    pub schema_version: u64,
+    /// Exact-body, short-lived, single-use capability minted by the root shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_token: Option<String>,
     /// Correlation id (the requester matches the eventual result on it).
     pub id: String,
     /// The privileged op to run.
@@ -370,6 +396,8 @@ mod tests {
 
     fn sample_request() -> DeviceControlRequest {
         DeviceControlRequest {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
             id: "01HZX".into(),
             op: DeviceControlOp::Disable,
             target: DeviceTarget {
@@ -408,6 +436,35 @@ mod tests {
         let bare_json = serde_json::to_string(&bare).unwrap();
         assert!(!bare_json.contains("null"), "{bare_json}");
         assert!(!bare_json.contains("sysfs_path"), "{bare_json}");
+    }
+
+    #[test]
+    fn authorization_target_is_request_scoped_and_fail_closed() {
+        assert_eq!(authorization_target(" 01HZX ").unwrap(), "request:01HZX");
+        assert!(authorization_target("").is_err());
+        assert!(authorization_target("hostile|scope").is_err());
+        assert!(authorization_target(&"x".repeat(241)).is_err());
+    }
+
+    #[test]
+    fn request_contract_rejects_execution_shaped_or_secret_fields() {
+        let mut request = serde_json::to_value(sample_request()).unwrap();
+        for (field, value) in [
+            ("command", serde_json::json!("sh -c id")),
+            ("path", serde_json::json!("/tmp/hostile")),
+            ("password", serde_json::json!("not-a-contract-field")),
+        ] {
+            request[field] = value;
+            let error = serde_json::from_value::<DeviceControlRequest>(request.clone())
+                .expect_err("unknown execution and secret fields must fail closed");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+            request.as_object_mut().unwrap().remove(field);
+        }
+        request["target"]["command"] = serde_json::json!("modprobe arbitrary");
+        assert!(
+            serde_json::from_value::<DeviceControlRequest>(request).is_err(),
+            "nested execution fields must also fail closed"
+        );
     }
 
     #[test]

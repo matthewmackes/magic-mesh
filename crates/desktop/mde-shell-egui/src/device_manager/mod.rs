@@ -144,7 +144,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::device_control::{
-    self, DeviceControlOp, DeviceControlRequest, DeviceTarget,
+    self, authorization_target, DeviceControlOp, DeviceControlRequest, DeviceTarget,
+    DEVICE_CONTROL_AUTH_VERB, DEVICE_CONTROL_SCHEMA_VERSION,
 };
 use mackes_mesh_types::device_inventory::{
     self, category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
@@ -2460,12 +2461,50 @@ impl DeviceManagerState {
         // Keep the display fields before `target`/`target_host` move into the request.
         let device_name = target.name.clone();
         let req = DeviceControlRequest {
+            schema_version: DEVICE_CONTROL_SCHEMA_VERSION,
+            armed_token: None,
             id: next_request_id(),
             op,
             target,
             target_host: target_host.clone(),
             expected_inventory_published_at_ms,
             from: format!("peer:{}", self.local_host),
+        };
+        let capability_target = match authorization_target(&req.id) {
+            Ok(target) => target,
+            Err(error) => {
+                raise_toast("warning", error);
+                return;
+            }
+        };
+        let unsigned = match serde_json::to_string(&req) {
+            Ok(body) => body,
+            Err(error) => {
+                raise_toast(
+                    "warning",
+                    &format!("Could not encode {} for {target_host}: {error}", op.as_str()),
+                );
+                return;
+            }
+        };
+        let req = match crate::iac::authorize_root_mutation_body(
+            &unsigned,
+            DEVICE_CONTROL_AUTH_VERB,
+            &target_host,
+            &capability_target,
+        )
+        .and_then(|body| {
+            serde_json::from_str(&body)
+                .map_err(|error| format!("authorized device-control body was invalid: {error}"))
+        }) {
+            Ok(req) => req,
+            Err(error) => {
+                raise_toast(
+                    "warning",
+                    &format!("Could not authorize {} for {target_host}: {error}", op.as_str()),
+                );
+                return;
+            }
         };
         match device_control::write_request(&self.workgroup_root, &req) {
             Ok(_) => raise_toast(

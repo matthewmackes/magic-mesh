@@ -1709,6 +1709,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-ownership-r1.md`.
 - **Device-control generation checkpoint (2026-08-09):** stale inventory timestamps cannot reach mutation; `.90` passed 6 contract, 17 executor, and 1 shell test:
   `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-generation-r2.md`.
+- **Device-control authorization checkpoint (2026-08-09):** exact-body, short-lived, single-use root-shell capabilities now gate the fixed executor; machine 9 passed
+  contract, executor, and shell hostile regressions: `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-authorization-r3.md`.
 - Remaining work:
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.

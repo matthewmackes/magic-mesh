@@ -1413,6 +1413,18 @@ fn dispatch_to_a_fresh_host_writes_the_request_to_the_targets_replicated_dir() {
     assert_eq!(reqs[0].target_host, "edge-2");
     assert_eq!(reqs[0].target.name, "Intel I219-V");
     assert_eq!(
+        reqs[0].schema_version,
+        mackes_mesh_types::device_control::DEVICE_CONTROL_SCHEMA_VERSION
+    );
+    assert!(
+        reqs[0]
+            .armed_token
+            .as_deref()
+            .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
+            .is_some(),
+        "the root shell must bind the exact request before replication"
+    );
+    assert_eq!(
         reqs[0].expected_inventory_published_at_ms,
         s.inventory.as_ref().unwrap().published_at_ms,
         "the mutation is bound to the exact provider snapshot the operator inspected"
