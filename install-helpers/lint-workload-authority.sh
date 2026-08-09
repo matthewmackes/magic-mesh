@@ -131,8 +131,8 @@ scan_runtime_inventory_candidates() {
   done
 }
 
-# S1 still records bounded read-only inventory debt in Cloud/Cuttlefish and
-# storage. Keep that debt count-limited and line-exact: removal is accepted,
+# S1 still records bounded read-only inventory debt in Cloud and storage. Keep
+# that debt count-limited and line-exact: removal is accepted,
 # while a duplicate or differently-shaped command is a new authority bypass.
 # The libvirt `version` health probe and the Podman volume runner are not
 # inventory, but are pinned here because the deliberately broad candidate scan
@@ -148,13 +148,7 @@ is_reviewed_runtime_inventory_candidate() {
       [ "$ordinal" -le 1 ] ;;
     'crates/mesh/mackesd/src/image_build.rs|run("podman", &["save", "-o", &art.to_string_lossy(), &tag])?;')
       [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/cloud/verbs/cuttlefish.rs|.list_instances()')
-      [ "$ordinal" -le 1 ] ;;
     'crates/mesh/mackesd/src/workers/cloud/runner.rs|TOOL_LIBVIRT => ("virsh", vec!["-c", uri.as_str(), "version"], uri.as_str()),')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/cloud/runner.rs|"virsh",')
-      [ "$ordinal" -le 1 ] ;;
-    'crates/mesh/mackesd/src/workers/cloud/runner.rs|let status = match Self::run("virsh", &["-c", &self.libvirt_uri, "domstate", name]) {')
       [ "$ordinal" -le 1 ] ;;
     'crates/mesh/mackesd/src/workers/storage.rs|if let Some(uuids) = virsh_output(&["list", "--state-running", "--uuid"]) {')
       [ "$ordinal" -le 1 ] ;;

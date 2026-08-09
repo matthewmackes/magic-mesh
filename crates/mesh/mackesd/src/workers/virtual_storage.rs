@@ -28,11 +28,11 @@
 //!   [`LivePodman`] shells `podman` bounded by the EFF-20 timeout; absent ⇒ a typed
 //!   [`PodmanError::Unavailable`]). Volume create/remove/**prune** + the
 //!   `system df` usage views.
-//! - **The in-use walls reuse E12-20's sources**: running VMs from libvirt
-//!   `virsh domblklist` (via [`super::compute_registry`]) and podman container
-//!   mounts — an image backing a running VM or a volume mounted by a running
-//!   container is a hard [`VirtualWallRefusal`], with the same **assume-in-use**
-//!   safe default when the probe can't verify.
+//! - **The in-use walls consume the typed Workloads projection**. The projection
+//!   deliberately carries catalog identity rather than host paths, so an active
+//!   backend conservatively makes every existing image/volume unverifiable. A
+//!   missing, stale, malformed, or wrong-node projection has the same
+//!   **assume-in-use** safe default.
 
 #![cfg(feature = "async-services")]
 
@@ -42,6 +42,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::workloads::{
+    reject_duplicate_json_keys, workload_state_topic, WorkloadBackend, WorkloadPowerState,
+    WorkloadStateSnapshot, MAX_WORKLOAD_WIRE_BYTES,
+};
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
@@ -74,6 +78,10 @@ pub fn progress_topic(node: &str) -> String {
 /// `podman system df` are not free, so they stay off the hot path (between
 /// action-triggered republishes).
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// A Workloads projection older than two publication heartbeats cannot prove a
+/// destructive virtual-storage target is free.
+const WORKLOAD_PROJECTION_MAX_AGE_MS: u64 = 120_000;
 
 // ───────────────────────────── qemu-img seam ─────────────────────────────
 
@@ -1062,10 +1070,16 @@ pub struct VirtualInUseSnapshot {
     pub vm_images: BTreeMap<String, String>,
     /// volume name → the container mounting it.
     pub container_volumes: BTreeMap<String, String>,
-    /// Whether a VM source (virsh) could be queried at all.
-    pub vm_tool: bool,
-    /// Whether podman could be queried at all.
-    pub container_tool: bool,
+    /// Whether current typed VM authority was available.
+    pub vm_authority: bool,
+    /// Whether current typed container authority was available.
+    pub container_authority: bool,
+    /// One active VM identity proves that no specific image is known free. The
+    /// projection intentionally does not expose host image paths.
+    pub active_vm: Option<String>,
+    /// One active container identity proves that no specific volume is known
+    /// free. The projection intentionally does not expose mount details.
+    pub active_container: Option<String>,
 }
 
 impl VirtualInUseSnapshot {
@@ -1076,7 +1090,10 @@ impl VirtualInUseSnapshot {
         if let Some(vm) = self.vm_images.get(&disp(path)) {
             return VirtualInUseStatus::InUseByVm(vm.clone());
         }
-        if self.vm_tool {
+        if self.active_vm.is_some() {
+            return VirtualInUseStatus::Unknown;
+        }
+        if self.vm_authority {
             VirtualInUseStatus::Free
         } else {
             VirtualInUseStatus::Unknown
@@ -1089,7 +1106,10 @@ impl VirtualInUseSnapshot {
         if let Some(c) = self.container_volumes.get(name) {
             return VirtualInUseStatus::InUseByContainer(c.clone());
         }
-        if self.container_tool {
+        if self.active_container.is_some() {
+            return VirtualInUseStatus::Unknown;
+        }
+        if self.container_authority {
             VirtualInUseStatus::Free
         } else {
             VirtualInUseStatus::Unknown
@@ -1109,7 +1129,7 @@ pub enum VirtualWallRefusal {
         vm: String,
     },
     /// Image in-use state couldn't be verified — refused under assume-in-use.
-    #[error("refused: cannot verify image {0} is free (no VM tooling) — assuming in-use")]
+    #[error("refused: cannot verify image {0} is free (Workloads authority unavailable or active) — assuming in-use")]
     ImageInUseUnknown(String),
     /// The volume is mounted by a running container.
     #[error("refused: volume {name} is mounted by running container {container}")]
@@ -1120,16 +1140,15 @@ pub enum VirtualWallRefusal {
         container: String,
     },
     /// Volume in-use state couldn't be verified — refused under assume-in-use.
-    #[error("refused: cannot verify volume {0} is free (no podman) — assuming in-use")]
+    #[error("refused: cannot verify volume {0} is free (Workloads authority unavailable or active) — assuming in-use")]
     VolumeInUseUnknown(String),
 }
 
-/// The in-use probe seam: snapshot which images/volumes back running units.
-/// Production [`ComputeVirtualInUse`] reuses virsh + podman; tests inject a
-/// fixed snapshot.
+/// The in-use probe seam: conservatively snapshot whether typed Workloads
+/// authority proves images/volumes free. Tests inject a fixed snapshot.
 pub trait VirtualInUseProbe: Send + Sync {
     /// Snapshot the live in-use image/volume sets.
-    fn snapshot(&self) -> VirtualInUseSnapshot;
+    fn snapshot(&self, bus_root: Option<&Path>) -> VirtualInUseSnapshot;
 }
 
 /// Check one op against the virtual in-use walls, given a pre-taken `snap`. `Ok(())`
@@ -1175,85 +1194,85 @@ pub fn check_wall(
     Ok(())
 }
 
-/// Production [`VirtualInUseProbe`] over virsh + podman.
+/// Production [`VirtualInUseProbe`] over the sole typed Workloads projection.
 ///
-/// Snapshots which image paths back running libvirt VMs (E12-20's VM source) and
-/// which volumes are mounted by running podman containers.
-#[derive(Debug, Clone, Default)]
-pub struct ComputeVirtualInUse;
+/// Workloads does not leak adapter paths into its contract. Consequently a
+/// current projection can prove a backend free only when it has no active or
+/// failed workloads. Otherwise destructive operations fail closed as Unknown.
+#[derive(Debug, Clone)]
+pub struct ComputeVirtualInUse {
+    node_id: String,
+}
 
 impl ComputeVirtualInUse {
     /// The production probe.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new(node_id: String) -> Self {
+        Self { node_id }
+    }
+
+    fn snapshot_at(&self, bus_root: Option<&Path>, observed_now: u64) -> VirtualInUseSnapshot {
+        let Some(root) = bus_root
+            .map(Path::to_path_buf)
+            .or_else(crate::bus_publish::default_bus_root)
+        else {
+            return VirtualInUseSnapshot::default();
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return VirtualInUseSnapshot::default();
+        };
+        let Ok(Some(message)) = persist.read_latest(&workload_state_topic(&self.node_id)) else {
+            return VirtualInUseSnapshot::default();
+        };
+        let Some(body) = message.body.as_deref() else {
+            return VirtualInUseSnapshot::default();
+        };
+        if body.len() > MAX_WORKLOAD_WIRE_BYTES || reject_duplicate_json_keys(body).is_err() {
+            return VirtualInUseSnapshot::default();
+        }
+        let Ok(snapshot) = serde_json::from_str::<WorkloadStateSnapshot>(body) else {
+            return VirtualInUseSnapshot::default();
+        };
+        if snapshot.node != self.node_id
+            || snapshot.validate(observed_now).is_err()
+            || snapshot.observed_at_ms > observed_now
+            || observed_now.saturating_sub(snapshot.observed_at_ms) > WORKLOAD_PROJECTION_MAX_AGE_MS
+        {
+            return VirtualInUseSnapshot::default();
+        }
+
+        let mut result = VirtualInUseSnapshot {
+            vm_authority: true,
+            container_authority: true,
+            ..VirtualInUseSnapshot::default()
+        };
+        for workload in snapshot.workloads {
+            let active = !matches!(
+                workload.power,
+                WorkloadPowerState::Defined | WorkloadPowerState::Stopped
+            );
+            if !active {
+                continue;
+            }
+            let identity = workload.workload_id.into_string();
+            match workload.backend {
+                WorkloadBackend::LibvirtVirtqemud if result.active_vm.is_none() => {
+                    result.active_vm = Some(identity);
+                }
+                WorkloadBackend::QuadletSystemd if result.active_container.is_none() => {
+                    result.active_container = Some(identity);
+                }
+                _ => {}
+            }
+        }
+        result
     }
 }
 
 impl VirtualInUseProbe for ComputeVirtualInUse {
-    fn snapshot(&self) -> VirtualInUseSnapshot {
-        let mut snap = VirtualInUseSnapshot::default();
-
-        // ── virsh: running libvirt domains → their disk source (E12-20 source) ──
-        if let Some(uuids) = bounded_stdout("virsh", &["list", "--state-running", "--uuid"]) {
-            snap.vm_tool = true;
-            for uuid in super::runtime_probe::parse_virsh_uuid_list(&uuids) {
-                if let Some(blk) = bounded_stdout("virsh", &["domblklist", "--details", &uuid]) {
-                    if let Some(src) = super::runtime_probe::parse_virsh_domblklist(&blk) {
-                        let name = bounded_stdout("virsh", &["domname", &uuid])
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(uuid);
-                        snap.vm_images.entry(src).or_insert(name);
-                    }
-                }
-            }
-        }
-
-        // ── podman: running containers → their mounted named volumes ──
-        if let Some(json) = bounded_stdout(
-            "podman",
-            &["ps", "--format", "json", "--filter", "status=running"],
-        ) {
-            snap.container_tool = true;
-            for c in super::runtime_probe::parse_podman_ps_json(&json) {
-                if let Some(mounts) = bounded_stdout(
-                    "podman",
-                    &[
-                        "inspect",
-                        "--format",
-                        "{{range .Mounts}}{{.Type}} {{.Name}}\n{{end}}",
-                        &c.name,
-                    ],
-                ) {
-                    for line in mounts.lines() {
-                        let mut it = line.split_whitespace();
-                        if it.next() == Some("volume") {
-                            if let Some(vol) = it.next() {
-                                snap.container_volumes
-                                    .entry(vol.to_string())
-                                    .or_insert_with(|| c.name.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        snap
+    fn snapshot(&self, bus_root: Option<&Path>) -> VirtualInUseSnapshot {
+        self.snapshot_at(bus_root, now_ms())
     }
-}
-
-/// Run `<program> <args>` bounded (EFF-20), returning stdout on success or `None`
-/// when the tool is absent / errors — so a missing tool degrades to the assume-in-use
-/// default (mirrors [`super::storage`]'s bounded probe).
-fn bounded_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    let out = output_with_timeout(cmd, DEFAULT_CMD_TIMEOUT).ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 // ───────────────────────────── typed arming (lock 8) ─────────────────────────────
@@ -1835,8 +1854,8 @@ pub struct VirtualStorage {
 }
 
 impl VirtualStorage {
-    /// The production sub-worker: the live `qemu-img` + podman runners, the
-    /// virsh/podman in-use probe, and the `~/Local` image directory.
+    /// The production sub-worker: the live `qemu-img` + podman storage runners,
+    /// the typed Workloads in-use authority, and the `~/Local` image directory.
     #[must_use]
     pub fn production(node_id: String) -> Self {
         let qemu: Arc<dyn QemuImgRunner> = Arc::new(LiveQemuImg::new());
@@ -1846,10 +1865,10 @@ impl VirtualStorage {
             Arc::clone(&podman),
         ));
         Self {
-            node_id,
+            node_id: node_id.clone(),
             qemu,
             podman,
-            in_use: Arc::new(ComputeVirtualInUse::new()),
+            in_use: Arc::new(ComputeVirtualInUse::new(node_id)),
             executor,
             local_dir: default_local_dir(),
             heartbeat: PUBLISH_HEARTBEAT,
@@ -1882,7 +1901,14 @@ impl VirtualStorage {
     /// Enumerate the live virtual topology + per-subsystem availability.
     #[must_use]
     pub fn enumerate(&self) -> (VirtualTopology, BackendAvail, BackendAvail) {
-        let snap = self.in_use.snapshot();
+        self.enumerate_with_bus_root(None)
+    }
+
+    fn enumerate_with_bus_root(
+        &self,
+        bus_root: Option<&Path>,
+    ) -> (VirtualTopology, BackendAvail, BackendAvail) {
+        let snap = self.in_use.snapshot(bus_root);
         let (images, qemu_avail) = self.enumerate_images(&snap);
         let (volumes, df, podman_avail) = self.enumerate_podman(&snap);
         (
@@ -1984,7 +2010,7 @@ impl VirtualStorage {
         if !due {
             return;
         }
-        let (topology, qemu_img, podman) = self.enumerate();
+        let (topology, qemu_img, podman) = self.enumerate_with_bus_root(Some(bus_root));
         let state = VirtualStorageState {
             host: self.node_id.clone(),
             qemu_img,
@@ -2014,8 +2040,8 @@ impl VirtualStorage {
                 return false;
             }
         };
-        let (live, _, _) = self.enumerate();
-        let snap = self.in_use.snapshot();
+        let (live, _, _) = self.enumerate_with_bus_root(Some(bus_root));
+        let snap = self.in_use.snapshot(Some(bus_root));
         let total = queue.ops.len();
         let host = self.node_id.clone();
         let topic = progress_topic(&self.node_id);
@@ -2382,8 +2408,9 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
-            vm_tool: tools,
-            container_tool: tools,
+            vm_authority: tools,
+            container_authority: tools,
+            ..VirtualInUseSnapshot::default()
         }
     }
 
@@ -2407,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn wall_assumes_in_use_when_no_vm_tool() {
+    fn wall_assumes_in_use_without_vm_authority() {
         let snap = snap_with(&[], &[], false);
         let op = VirtualStorageOp::ImageDelete {
             path: "/home/op/Local/web1.qcow2".into(),
@@ -2419,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn wall_lets_create_through_even_when_no_vm_tool() {
+    fn wall_lets_create_through_even_without_vm_authority() {
         // create writes a new file → no image wall even with no tooling.
         let snap0 = snap_with(&[], &[], false);
         let create = VirtualStorageOp::ImageCreate {
@@ -2441,6 +2468,148 @@ mod tests {
             check_wall(&op, &snap),
             Err(VirtualWallRefusal::VolumeInUseByContainer { .. })
         ));
+    }
+
+    fn workload_projection_body(
+        node: &str,
+        observed_at_ms: u64,
+        rows: &[(&str, WorkloadBackend, WorkloadPowerState)],
+    ) -> String {
+        let workloads = rows
+            .iter()
+            .map(|(id, backend, power)| {
+                let failed = matches!(power, WorkloadPowerState::Failed);
+                serde_json::json!({
+                    "schema_version": 1,
+                    "request_id": format!("request-{id}"),
+                    "workload_id": id,
+                    "backend": backend,
+                    "resources": {"vcpu": 1, "memory_mb": 512, "disk_gb": 1},
+                    "generation": 1,
+                    "phase": if failed { "failed" } else { "completed" },
+                    "power": power,
+                    "readiness": "unavailable",
+                    "retryable": false,
+                    "reason": if failed { Some("adapter state uncertain") } else { None },
+                    "remediation": null,
+                    "attachment": null
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "schema_version": 1,
+            "node": node,
+            "observed_at_ms": observed_at_ms,
+            "workloads": workloads
+        })
+        .to_string()
+    }
+
+    fn publish_workload_body(root: &Path, body: &str) {
+        let persist = Persist::open(root.to_path_buf()).expect("test Bus");
+        persist
+            .write(
+                &workload_state_topic("seat15"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(body),
+            )
+            .expect("publish Workloads projection");
+    }
+
+    #[test]
+    fn typed_workloads_authority_is_conservative_and_hostile_rows_fail_closed() {
+        const NOW: u64 = 1_700_000_000_000;
+        let root = tempfile::tempdir().expect("Bus root");
+        let probe = ComputeVirtualInUse::new("seat15".into());
+        let image = Path::new("/home/operator/Local/browser.qcow2");
+
+        let absent = probe.snapshot_at(Some(root.path()), NOW);
+        assert_eq!(absent.image_status(image), VirtualInUseStatus::Unknown);
+        assert_eq!(
+            absent.volume_status("database"),
+            VirtualInUseStatus::Unknown
+        );
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body(
+                "seat15",
+                NOW,
+                &[
+                    (
+                        "browser-vm",
+                        WorkloadBackend::LibvirtVirtqemud,
+                        WorkloadPowerState::Running,
+                    ),
+                    (
+                        "database-container",
+                        WorkloadBackend::QuadletSystemd,
+                        WorkloadPowerState::Failed,
+                    ),
+                ],
+            ),
+        );
+        let active = probe.snapshot_at(Some(root.path()), NOW);
+        assert!(active.vm_images.is_empty() && active.container_volumes.is_empty());
+        assert_eq!(active.active_vm.as_deref(), Some("browser-vm"));
+        assert_eq!(
+            active.active_container.as_deref(),
+            Some("database-container")
+        );
+        assert_eq!(active.image_status(image), VirtualInUseStatus::Unknown);
+        assert_eq!(
+            active.volume_status("database"),
+            VirtualInUseStatus::Unknown
+        );
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body(
+                "seat15",
+                NOW,
+                &[
+                    (
+                        "browser-vm",
+                        WorkloadBackend::LibvirtVirtqemud,
+                        WorkloadPowerState::Stopped,
+                    ),
+                    (
+                        "database-container",
+                        WorkloadBackend::QuadletSystemd,
+                        WorkloadPowerState::Defined,
+                    ),
+                ],
+            ),
+        );
+        let stopped = probe.snapshot_at(Some(root.path()), NOW);
+        assert_eq!(stopped.image_status(image), VirtualInUseStatus::Free);
+        assert_eq!(stopped.volume_status("database"), VirtualInUseStatus::Free);
+
+        publish_workload_body(
+            root.path(),
+            &workload_projection_body(
+                "seat15",
+                NOW.saturating_sub(WORKLOAD_PROJECTION_MAX_AGE_MS + 1),
+                &[],
+            ),
+        );
+        let stale = probe.snapshot_at(Some(root.path()), NOW);
+        assert_eq!(stale.image_status(image), VirtualInUseStatus::Unknown);
+
+        publish_workload_body(
+            root.path(),
+            r#"{"schema_version":1,"schema_version":1,"node":"seat15","observed_at_ms":1700000000000,"workloads":[]}"#,
+        );
+        let duplicate_key = probe.snapshot_at(Some(root.path()), NOW);
+        assert_eq!(
+            duplicate_key.image_status(image),
+            VirtualInUseStatus::Unknown
+        );
+        assert_eq!(
+            duplicate_key.volume_status("database"),
+            VirtualInUseStatus::Unknown
+        );
     }
 
     // ── arming ──
@@ -2651,8 +2820,8 @@ mod tests {
                 &queue,
                 &VirtualTopology::default(),
                 &VirtualInUseSnapshot {
-                    vm_tool: true,
-                    container_tool: true,
+                    vm_authority: true,
+                    container_authority: true,
                     ..VirtualInUseSnapshot::default()
                 },
                 Some(root.path()),
@@ -2851,7 +3020,7 @@ mod tests {
 
     struct FixedInUse(VirtualInUseSnapshot);
     impl VirtualInUseProbe for FixedInUse {
-        fn snapshot(&self) -> VirtualInUseSnapshot {
+        fn snapshot(&self, _bus_root: Option<&Path>) -> VirtualInUseSnapshot {
             self.0.clone()
         }
     }
@@ -2892,8 +3061,9 @@ mod tests {
                 "web1".to_string(),
             )]),
             container_volumes: BTreeMap::from([("pgdata".to_string(), "pg".to_string())]),
-            vm_tool: true,
-            container_tool: true,
+            vm_authority: true,
+            container_authority: true,
+            ..VirtualInUseSnapshot::default()
         };
         let vs = VirtualStorage::with_seams(
             "node".into(),

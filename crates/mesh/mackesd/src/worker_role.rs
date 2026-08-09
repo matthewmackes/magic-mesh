@@ -1530,6 +1530,37 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         "nebula_observation_signal_dispatcher",
         WorkerGroup::Observation,
     ),
+    // WL-ARCH-009 — each isolated process owns one honestly group-scoped
+    // supervisor projection. Observation alone folds those six inputs into the
+    // node-global Bus/file aggregate.
+    WorkerSpec::responder(
+        "worker_runtime_status_control_publisher",
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::responder(
+        "worker_runtime_status_observation_publisher",
+        WorkerGroup::Observation,
+    ),
+    WorkerSpec::responder(
+        "worker_runtime_status_actions_publisher",
+        WorkerGroup::Actions,
+    ),
+    WorkerSpec::responder(
+        "worker_runtime_status_data_publisher",
+        WorkerGroup::Data,
+    ),
+    WorkerSpec::responder(
+        "worker_runtime_status_compute_publisher",
+        WorkerGroup::Compute,
+    ),
+    WorkerSpec::responder(
+        "worker_runtime_status_integrations_publisher",
+        WorkerGroup::Integrations,
+    ),
+    WorkerSpec::responder(
+        "worker_runtime_status_aggregate_publisher",
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::direct(
         "nebula_ca_backup",
         RestartPolicy::OnFailure,
@@ -2876,7 +2907,7 @@ mod tests {
     fn canonical_registry_inventory_hash_covers_every_runtime_field() {
         let hash = registry_inventory_sha256(WORKER_REGISTRY);
         assert_eq!(
-            hash, "2a444300c05136dbdbe08420d7fce51efc7e9cc418b7adf1031ceed41e6588c4",
+            hash, "160560f2ca1712cdc685ab2a646892c38267b0ba83e17cd5fe47b36dc85b77a6",
             "WL-ARCH-009: canonical registration inventory drifted"
         );
 
@@ -3046,7 +3077,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 145);
+        assert_eq!(WORKER_REGISTRY.len(), 152);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3366,8 +3397,8 @@ mod tests {
         // gateway proxies brought the real pre-cutover count to 90. The current
         // canonical roster contains 82 tiered/dynamic registrations plus 63
         // direct supervisors/responders; all retired VM authorities are absent.
-        assert_eq!(lh.len(), 107);
-        assert_eq!(ws.len(), 145);
+        assert_eq!(lh.len(), 114);
+        assert_eq!(ws.len(), 152);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -284,7 +285,7 @@ impl WorkerRuntimeNodeStatus {
             if worker.snapshot.node_id != self.node_id {
                 return Err(WorkerRuntimeStatusError::NodeSnapshot("workers.node_id"));
             }
-            if worker.snapshot.observed_at_ms != self.observed_at_ms {
+            if worker.snapshot.observed_at_ms > self.observed_at_ms {
                 return Err(WorkerRuntimeStatusError::NodeSnapshot(
                     "workers.observed_at_ms",
                 ));
@@ -322,6 +323,107 @@ impl WorkerRuntimeNodeStatus {
         status.validate_at(now_ms)?;
         Ok(status)
     }
+}
+
+/// Return the isolated runtime-status file owned by one process group.
+///
+/// Group-local supervisor maps must never be written under the node-global
+/// aggregate path. The closed group enum makes traversal or aliasing
+/// impossible.
+#[must_use]
+pub fn group_status_path(root: &Path, group: runtime::WorkerGroup) -> std::path::PathBuf {
+    root.join(format!("{}.json", group.as_str()))
+}
+
+/// Read one bounded, regular group status file without following a final-path
+/// symlink.
+pub fn read_runtime_status_file(
+    path: &Path,
+    now_ms: u64,
+) -> Result<WorkerRuntimeNodeStatus, WorkerRuntimeStatusError> {
+    let source = std::fs::symlink_metadata(path)
+        .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("metadata"))?;
+    if source.file_type().is_symlink() || !source.is_file() {
+        return Err(WorkerRuntimeStatusError::RuntimeFile(
+            "source_type_or_capacity",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    let file = options
+        .open(path)
+        .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("open"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("metadata"))?;
+    if !metadata.is_file() || metadata.len() > MAX_NODE_STATUS_WIRE_BYTES as u64 {
+        return Err(WorkerRuntimeStatusError::RuntimeFile(
+            "source_type_or_capacity",
+        ));
+    }
+    let mut body = String::new();
+    file.take((MAX_NODE_STATUS_WIRE_BYTES + 1) as u64)
+        .read_to_string(&mut body)
+        .map_err(|_| WorkerRuntimeStatusError::RuntimeFile("read"))?;
+    if body.len() > MAX_NODE_STATUS_WIRE_BYTES {
+        return Err(WorkerRuntimeStatusError::RuntimeFile("source_capacity"));
+    }
+    WorkerRuntimeNodeStatus::from_json(body.trim(), now_ms)
+}
+
+/// Fold exactly one snapshot from each isolated process group into the
+/// node-global runtime projection.
+///
+/// Group files retain their own observation clocks. The aggregate clock is the
+/// fold time, so stale group rows remain stale instead of being refreshed by
+/// an unrelated process. Missing, duplicated, foreign-group, or cross-node
+/// inputs reject the whole fold and preserve the previous aggregate.
+pub fn fold_group_statuses(
+    node_id: &str,
+    now_ms: u64,
+    groups: &[(runtime::WorkerGroup, WorkerRuntimeNodeStatus)],
+) -> Result<WorkerRuntimeNodeStatus, WorkerRuntimeStatusError> {
+    node_status_topic(node_id)?;
+    if now_ms == 0 {
+        return Err(WorkerRuntimeStatusError::NodeSnapshot("observed_at_ms"));
+    }
+    let mut seen_groups = BTreeSet::new();
+    let mut workers = Vec::new();
+    for (group, snapshot) in groups {
+        if !seen_groups.insert(*group) {
+            return Err(WorkerRuntimeStatusError::NodeSnapshot("groups.duplicate"));
+        }
+        snapshot.validate_at(now_ms)?;
+        if snapshot.node_id != node_id {
+            return Err(WorkerRuntimeStatusError::NodeSnapshot("groups.node_id"));
+        }
+        if snapshot
+            .workers
+            .iter()
+            .any(|worker| worker.contract.group != *group || worker.snapshot.group != *group)
+        {
+            return Err(WorkerRuntimeStatusError::NodeSnapshot("groups.owner"));
+        }
+        workers.extend(snapshot.workers.iter().cloned());
+    }
+    if seen_groups != runtime::WorkerGroup::ALL.into_iter().collect() {
+        return Err(WorkerRuntimeStatusError::NodeSnapshot("groups.incomplete"));
+    }
+    if workers.len() > MAX_NODE_STATUS_WORKERS {
+        return Err(WorkerRuntimeStatusError::NodeSnapshot("workers.capacity"));
+    }
+    workers.sort_by(|left, right| {
+        (left.contract.group, left.contract.worker_id.as_str())
+            .cmp(&(right.contract.group, right.contract.worker_id.as_str()))
+    });
+    let aggregate = WorkerRuntimeNodeStatus {
+        schema_version: runtime::WORKER_RUNTIME_SCHEMA_VERSION,
+        node_id: node_id.to_owned(),
+        observed_at_ms: now_ms,
+        workers,
+    };
+    aggregate.validate_at(now_ms)?;
+    Ok(aggregate)
 }
 
 /// The fields that describe a worker's meaning, excluding publication clock
@@ -768,6 +870,42 @@ pub fn publish_node_status(
         node_topic,
         node_message_id: node_message.ulid,
     })
+}
+
+/// Retain only the group-owned per-worker rows from one local supervisor
+/// sample. The node-global lane is deliberately absent; it belongs to the
+/// aggregate authority after all six group files have been admitted.
+pub fn publish_worker_status_rows(
+    persist: &mut Persist,
+    node: &WorkerRuntimeNodeStatus,
+) -> Result<Vec<(String, String)>, WorkerRuntimeStatusError> {
+    node.validate_at(node.observed_at_ms)?;
+    let mut message_ids = Vec::with_capacity(node.workers.len());
+    for worker in &node.workers {
+        let topic = worker.topic()?;
+        let body = worker.to_json()?;
+        let message = crate::bus_publish::publish_body(persist, &topic, &body).ok_or(
+            WorkerRuntimeStatusError::Publication(WorkerRuntimeStatusLane::Worker),
+        )?;
+        message_ids.push((worker.contract.worker_id.clone(), message.ulid));
+    }
+    Ok(message_ids)
+}
+
+/// Retain the already-folded node-global aggregate without rewriting its
+/// group-owned worker rows.
+pub fn publish_node_aggregate(
+    persist: &mut Persist,
+    node: &WorkerRuntimeNodeStatus,
+) -> Result<String, WorkerRuntimeStatusError> {
+    node.validate_at(node.observed_at_ms)?;
+    let topic = node_status_topic(&node.node_id)?;
+    let body = node.to_json()?;
+    crate::bus_publish::publish_body(persist, &topic, &body)
+        .map(|message| message.ulid)
+        .ok_or(WorkerRuntimeStatusError::Publication(
+            WorkerRuntimeStatusLane::Node,
+        ))
 }
 
 /// Atomically replace the credential-free runtime status file. Parent and
@@ -1677,6 +1815,83 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(target).expect("read target"),
                 "unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn six_group_fold_preserves_source_clocks_and_rejects_hostile_ownership() {
+        let empty_group = || WorkerRuntimeNodeStatus {
+            schema_version: runtime::WORKER_RUNTIME_SCHEMA_VERSION,
+            node_id: "node-a".to_owned(),
+            observed_at_ms: 2_000,
+            workers: Vec::new(),
+        };
+        let mut groups = runtime::WorkerGroup::ALL
+            .into_iter()
+            .map(|group| (group, empty_group()))
+            .collect::<Vec<_>>();
+        groups[0].1.workers =
+            vec![project_status(&contract(), snapshot(), 2_500).expect("control worker status")];
+
+        let aggregate =
+            fold_group_statuses("node-a", 3_000, &groups).expect("complete six-group fold");
+        assert_eq!(aggregate.observed_at_ms, 3_000);
+        assert_eq!(aggregate.workers.len(), 1);
+        assert_eq!(
+            aggregate.workers[0].snapshot.observed_at_ms, 2_000,
+            "aggregate authority must not refresh another group's observation clock"
+        );
+
+        let missing = &groups[..groups.len() - 1];
+        assert_eq!(
+            fold_group_statuses("node-a", 3_000, missing),
+            Err(WorkerRuntimeStatusError::NodeSnapshot("groups.incomplete"))
+        );
+
+        let mut foreign = groups.clone();
+        foreign[0].0 = runtime::WorkerGroup::Observation;
+        foreign[1].0 = runtime::WorkerGroup::Control;
+        assert_eq!(
+            fold_group_statuses("node-a", 3_000, &foreign),
+            Err(WorkerRuntimeStatusError::NodeSnapshot("groups.owner"))
+        );
+    }
+
+    #[test]
+    fn group_runtime_files_are_disjoint_and_bounded_on_read() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let paths = runtime::WorkerGroup::ALL
+            .into_iter()
+            .map(|group| group_status_path(root.path(), group))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths.len(), runtime::WorkerGroup::ALL.len());
+        assert!(!paths.contains(&root.path().join("mackesd-status.json")));
+
+        let path = group_status_path(root.path(), runtime::WorkerGroup::Control);
+        let node = WorkerRuntimeNodeStatus {
+            schema_version: runtime::WORKER_RUNTIME_SCHEMA_VERSION,
+            node_id: "node-a".to_owned(),
+            observed_at_ms: 2_000,
+            workers: vec![
+                project_status(&contract(), snapshot(), 2_500).expect("control worker status")
+            ],
+        };
+        write_runtime_status_file(&path, &node).expect("write group file");
+        assert_eq!(
+            read_runtime_status_file(&path, 2_500).expect("read group file"),
+            node
+        );
+
+        #[cfg(unix)]
+        {
+            let link = root.path().join("hostile.json");
+            std::os::unix::fs::symlink(&path, &link).expect("group file symlink");
+            assert_eq!(
+                read_runtime_status_file(&link, 2_500),
+                Err(WorkerRuntimeStatusError::RuntimeFile(
+                    "source_type_or_capacity"
+                ))
             );
         }
     }

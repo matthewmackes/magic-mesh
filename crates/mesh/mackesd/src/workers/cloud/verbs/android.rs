@@ -48,8 +48,8 @@ mod cuttlefish;
 mod cuttlefish_guest;
 
 pub(crate) use cuttlefish::{
-    CuttlefishProviderAdapter, CuttlefishProviderClient, CuttlefishProviderError,
-    LibvirtCuttlefishProviderClient,
+    CuttlefishOuterWorkloadObservation, CuttlefishProviderAdapter, CuttlefishProviderClient,
+    CuttlefishProviderError, WorkloadCuttlefishProviderClient,
 };
 
 /// Cuttlefish L1-VM minimum virtual CPUs (nested-KVM Android needs headroom).

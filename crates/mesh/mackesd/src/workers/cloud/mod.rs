@@ -90,7 +90,7 @@ use runner::{
 use verbs::AndroidInventoryLedgerError;
 pub(crate) use verbs::{
     AndroidGuestProvider, AndroidGuestProviderRegistry, AndroidGuestProviderRegistryError,
-    LibvirtCuttlefishProviderClient,
+    CuttlefishOuterWorkloadObservation, WorkloadCuttlefishProviderClient,
 };
 use verbs::{AndroidInventoryLedger, AndroidInventoryLedgerAdmission, CloudActionBody, CloudVerb};
 
@@ -1092,9 +1092,8 @@ impl CloudWorker {
         }
     }
 
-    /// Read the sole authoritative local runtime roster. Cloud is a desired-state
-    /// and planning surface; it must not rediscover VM power state with `virsh`.
-    fn workload_instances(&self) -> Result<Vec<CloudInstance>, String> {
+    /// Read and validate the sole authoritative local runtime projection.
+    fn workload_snapshot(&self) -> Result<WorkloadStateSnapshot, String> {
         let Some((persist, _)) = self
             .open_bus()
             .map_err(|error| format!("Workload projection Bus unavailable: {error}"))?
@@ -1129,7 +1128,14 @@ impl CloudWorker {
         {
             return Err("authoritative Workload projection is stale or future-dated".to_string());
         }
-        Ok(snapshot
+        Ok(snapshot)
+    }
+
+    /// Project the sole authoritative Workloads snapshot into Cloud's legacy
+    /// read-only row shape. Cloud must not rediscover VM power with `virsh`.
+    fn workload_instances(&self) -> Result<Vec<CloudInstance>, String> {
+        Ok(self
+            .workload_snapshot()?
             .workloads
             .into_iter()
             .filter(|status| status.backend.is_vm())
@@ -1162,6 +1168,11 @@ impl CloudWorker {
     fn ensure_configured_cuttlefish_providers(&mut self) {
         let catalog = self.load_admitted_android_catalog();
         let artifact = configured_image_path();
+        // One validated typed snapshot feeds every Cuttlefish adapter in this
+        // refresh. `Err` is authority loss and must not be converted to an
+        // absent outer VM; an available snapshot with no matching row is the
+        // only honest absence signal.
+        let workload_snapshot = self.workload_snapshot();
         let provider_healthy =
             self.runner.probe_tool(runner::TOOL_LIBVIRT).state == HealthState::Up;
         let observed_at = u64::try_from(now_ms()).unwrap_or(1).max(1);
@@ -1225,8 +1236,25 @@ impl CloudWorker {
             else {
                 continue;
             };
-            let Ok(client) = LibvirtCuttlefishProviderClient::with_guest_contract(
-                self.runner.clone(),
+            let outer_workload = match workload_snapshot.as_ref() {
+                Err(_) => None,
+                Ok(snapshot) => match snapshot
+                    .workloads
+                    .iter()
+                    .find(|status| status.workload_id.as_str() == spec.name)
+                {
+                    None => Some(CuttlefishOuterWorkloadObservation::absent(&spec.name)),
+                    Some(status) => match CuttlefishOuterWorkloadObservation::from_status(status) {
+                        Ok(observation) => Some(observation),
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::cloud", workload = %spec.name, ?error, "non-VM Workload row refused by Cuttlefish provider");
+                            continue;
+                        }
+                    },
+                },
+            };
+            let Ok(client) = WorkloadCuttlefishProviderClient::with_guest_contract(
+                outer_workload,
                 manifest.clone(),
                 catalog_digest,
             ) else {
@@ -1889,6 +1917,22 @@ mod tests {
             assert_eq!(instances[1].status, "SHUTOFF");
             assert!(instances.iter().all(|row| row.name != "backend-bypass"));
         }
+    }
+
+    #[test]
+    fn cuttlefish_outer_observation_refuses_a_same_id_quadlet_row() {
+        use mackes_mesh_types::workloads::WorkloadBackend;
+        let status = workload_status(
+            "android-t480",
+            WorkloadBackend::QuadletSystemd,
+            WorkloadPowerState::Running,
+        );
+
+        assert_eq!(
+            CuttlefishOuterWorkloadObservation::from_status(&status),
+            Err(verbs::CuttlefishProviderError::ProviderRejected),
+            "a container row must not become Android outer-VM readiness"
+        );
     }
 
     #[test]

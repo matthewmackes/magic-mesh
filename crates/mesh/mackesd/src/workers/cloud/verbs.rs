@@ -78,7 +78,7 @@ mod inventory; // U10 · inventory + output
 pub(crate) use android::{
     AndroidGuestProvider, AndroidGuestProviderRegistry, AndroidGuestProviderRegistryError,
     AndroidInventoryLedger, AndroidInventoryLedgerAdmission, AndroidInventoryLedgerError,
-    LibvirtCuttlefishProviderClient,
+    CuttlefishOuterWorkloadObservation, CuttlefishProviderError, WorkloadCuttlefishProviderClient,
 };
 
 impl CloudWorker {
@@ -661,10 +661,7 @@ mod tests {
         use super::super::runner::fake::FakeRunner;
         use super::super::CloudWorker;
 
-        let read_runner = Arc::new(FakeRunner {
-            roster_err: Some("roster handler must not run".to_string()),
-            ..Default::default()
-        });
+        let read_runner = Arc::new(FakeRunner::default());
         let read_worker = CloudWorker::new(
             "me".into(),
             "peer:me".into(),

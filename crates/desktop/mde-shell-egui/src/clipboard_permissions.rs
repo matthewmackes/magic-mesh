@@ -885,9 +885,17 @@ impl ClipboardPermissionController {
     /// path. This performs no Bus, clock, persistence, or payload work.
     pub(crate) fn poll_ingress(&mut self, now_ms: u64) {
         let mut updates = Vec::new();
+        let mut transport_disconnected = false;
         if let Some(gate) = &self.active_gate {
-            while let Ok(update) = gate.update_rx.try_recv() {
-                updates.push(update);
+            loop {
+                match gate.update_rx.try_recv() {
+                    Ok(update) => updates.push(update),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        transport_disconnected = true;
+                        break;
+                    }
+                }
             }
         }
         for update in updates {
@@ -902,6 +910,21 @@ impl ClipboardPermissionController {
                     let _ = self.model.fail(failure, recorded_at_ms);
                 }
             }
+        }
+        // The ticket owns the only update sender. If its transport worker dies
+        // during approval/materialization, keeping the receiver as an active
+        // gate strands every reconnect submission behind `Busy` until expiry.
+        // Convert that orphan into an explicit terminal failure before
+        // releasing the payload-free gate. The replay mark is retained, so a
+        // reconnect cannot duplicate the abandoned sequence; a newer command
+        // can be admitted immediately.
+        if transport_disconnected
+            && self
+                .model
+                .active_state()
+                .is_some_and(|state| !terminal_state(state))
+        {
+            let _ = self.model.fail(ClipboardFailure::Transport, now_ms);
         }
         self.sync_gate_state();
         self.release_terminal_gate();
@@ -1570,6 +1593,86 @@ mod tests {
             ticket.try_begin_materialization(),
             ClipboardGateReadiness::Refused
         );
+    }
+
+    #[test]
+    fn rich_vdi_transport_drop_releases_gate_without_replaying_on_reconnect() {
+        let mut controller = ClipboardPermissionController::default();
+        let ingress = controller.ingress();
+        let (lease, first_message) = vdi_message(31, "text/html", "text/plain;charset=utf-8");
+        let first_ticket = ingress
+            .submit_vdi(
+                &first_message,
+                &lease,
+                None,
+                target(ClipboardTargetKind::Guest),
+                NOW,
+            )
+            .expect("first rich transport ingress");
+
+        controller.poll_ingress(NOW);
+        let token = match controller.model.active_state() {
+            Some(ClipboardTransferState::AwaitingApproval { token }) => *token,
+            state => panic!("rich transfer was not approval-gated: {state:?}"),
+        };
+        controller
+            .apply_operator_action(ClipboardOperatorAction::Approve(token), NOW + 1)
+            .expect("approve first rich transfer");
+        assert_eq!(
+            first_ticket.try_begin_materialization(),
+            ClipboardGateReadiness::Materialize
+        );
+
+        // Hostile reconnect boundary: the worker disappears after consuming
+        // its one-use approval but before reporting payload completion.
+        drop(first_ticket);
+        controller.poll_ingress(NOW + 2);
+        assert_eq!(
+            controller.model.active_state(),
+            Some(&ClipboardTransferState::Failed(ClipboardFailure::Transport)),
+            "an orphaned materialization must become a visible terminal failure"
+        );
+        assert!(
+            controller.active_gate.is_none(),
+            "the dead worker must not retain the bounded transport gate"
+        );
+
+        let stale_ticket = ingress
+            .submit_vdi(
+                &first_message,
+                &lease,
+                None,
+                target(ClipboardTargetKind::Guest),
+                NOW + 3,
+            )
+            .expect("stale reconnect submission reaches controller");
+        controller.poll_ingress(NOW + 3);
+        assert_eq!(
+            stale_ticket.try_begin_materialization(),
+            ClipboardGateReadiness::Refused,
+            "reconnect must not duplicate the abandoned sequence"
+        );
+
+        let (_, newer_message) = vdi_message(32, "text/html", "text/plain;charset=utf-8");
+        let newer_ticket = ingress
+            .submit_vdi(
+                &newer_message,
+                &lease,
+                None,
+                target(ClipboardTargetKind::Guest),
+                NOW + 4,
+            )
+            .expect("newer reconnect submission");
+        controller.poll_ingress(NOW + 4);
+        assert_eq!(
+            newer_ticket.readiness_before_materialization(),
+            ClipboardGateReadiness::Pending,
+            "a newer rich payload must reach approval instead of remaining Busy"
+        );
+        assert!(matches!(
+            controller.model.active_state(),
+            Some(ClipboardTransferState::AwaitingApproval { .. })
+        ));
     }
 
     #[test]

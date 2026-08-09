@@ -264,6 +264,9 @@ COPY packaging/bootc/install/50-magic-mesh.toml /usr/lib/bootc/install/50-magic-
 # Virtualization/VDI kernel args (IOMMU + VFIO passthrough + nested virt) baked
 # into the image so install + every upgrade carries them (BOOTC-COMPLETENESS).
 COPY packaging/bootc/kargs.d/00-mcnf-virt.toml /usr/lib/bootc/kargs.d/00-mcnf-virt.toml
+# Match the corrected-forward RPM boot contract in immutable-image installs:
+# show real initrd/systemd progress until the DRM shell can paint Construct.
+COPY packaging/bootc/kargs.d/10-mcnf-boot-status.toml /usr/lib/bootc/kargs.d/10-mcnf-boot-status.toml
 
 # Workstation-role wiring. The RPM post-install already enabled the all-roles
 # set (mackesd, nebula, mesh-health.timer, mesh-status.timer, the first-boot

@@ -123,11 +123,11 @@ pub(crate) fn spawn_tiered<W, F>(
         .push(name.into());
 }
 
-/// WL-ARCH-009 — publish the supervisor's real lifecycle map as bounded
-/// per-worker Bus rows, one aggregate node record, and the canonical runtime
-/// file. The sampler consumes only explicit supervisor transitions; it never
-/// probes PIDs or treats a missing worker as healthy.
+/// WL-ARCH-009 — publish this process's real lifecycle map under its isolated
+/// group file/per-worker Bus lanes. Observation is the sole authority that
+/// admits all six group files before replacing the node-global aggregate.
 pub(crate) fn start_worker_runtime_status_publisher(
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     worker_status: &mackesd_core::workers::WorkerStatusMap,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     node_id: &str,
@@ -138,7 +138,57 @@ pub(crate) fn start_worker_runtime_status_publisher(
     const STATUS_POLL: std::time::Duration =
         mackesd_core::workers::worker_runtime_status::STATUS_POLL_INTERVAL;
 
-    let status_path = PathBuf::from("/run/mde/mackesd-status.json");
+    let group = if responders_admitted(&["worker_runtime_status_control_publisher"]) {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_control_publisher".into());
+        mackes_mesh_types::worker_runtime::WorkerGroup::Control
+    } else if responders_admitted(&["worker_runtime_status_observation_publisher"]) {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_observation_publisher".into());
+        mackes_mesh_types::worker_runtime::WorkerGroup::Observation
+    } else if responders_admitted(&["worker_runtime_status_actions_publisher"]) {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_actions_publisher".into());
+        mackes_mesh_types::worker_runtime::WorkerGroup::Actions
+    } else if responders_admitted(&["worker_runtime_status_data_publisher"]) {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_data_publisher".into());
+        mackes_mesh_types::worker_runtime::WorkerGroup::Data
+    } else if responders_admitted(&["worker_runtime_status_compute_publisher"]) {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_compute_publisher".into());
+        mackes_mesh_types::worker_runtime::WorkerGroup::Compute
+    } else if responders_admitted(&["worker_runtime_status_integrations_publisher"]) {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_integrations_publisher".into());
+        mackes_mesh_types::worker_runtime::WorkerGroup::Integrations
+    } else {
+        return;
+    };
+    let aggregate_owner = responders_admitted(&["worker_runtime_status_aggregate_publisher"]);
+    if aggregate_owner {
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("worker_runtime_status_aggregate_publisher".into());
+    }
+
+    let group_status_root = PathBuf::from("/run/mde/mackesd-status-groups");
+    let group_status_path =
+        mackesd_core::workers::worker_runtime_status::group_status_path(&group_status_root, group);
+    let aggregate_status_path = PathBuf::from("/run/mde/mackesd-status.json");
     if mackesd_core::workers::worker_runtime_status::node_status_topic(node_id).is_err() {
         tracing::warn!(
             node_id,
@@ -155,7 +205,9 @@ pub(crate) fn start_worker_runtime_status_publisher(
         .spawn(move || {
             let mut sampler =
                 mackesd_core::workers::worker_runtime_status::WorkerRuntimeSampler::default();
-            let mut coalescer =
+            let mut group_coalescer =
+                mackesd_core::workers::worker_runtime_status::WorkerRuntimeStatusCoalescer::default();
+            let mut aggregate_coalescer =
                 mackesd_core::workers::worker_runtime_status::WorkerRuntimeStatusCoalescer::default();
             let mut persist = mde_bus::default_data_dir()
                 .and_then(|root| mde_bus::persist::Persist::open(root).ok());
@@ -167,13 +219,13 @@ pub(crate) fn start_worker_runtime_status_publisher(
                     .unwrap_or(0);
                 let delay = match sampler.sample(&status, &node_id, now_ms) {
                     Ok(snapshot) => {
-                        if coalescer.should_publish(&snapshot, now_ms) {
+                        if group_coalescer.should_publish(&snapshot, now_ms) {
                             let mut publication_ok = true;
                             if let Err(error) = mackesd_core::workers::worker_runtime_status::write_runtime_status_file(
-                                &status_path,
+                                &group_status_path,
                                 &snapshot,
                             ) {
-                                tracing::warn!(%error, "worker runtime status file write failed");
+                                tracing::warn!(%error, group = group.as_str(), "group worker runtime status file write failed");
                                 publication_ok = false;
                             }
                             if persist.is_none() {
@@ -181,19 +233,75 @@ pub(crate) fn start_worker_runtime_status_publisher(
                                     .and_then(|root| mde_bus::persist::Persist::open(root).ok());
                             }
                             if let Some(bus) = persist.as_mut() {
-                                if let Err(error) = mackesd_core::workers::worker_runtime_status::publish_node_status(
+                                if let Err(error) = mackesd_core::workers::worker_runtime_status::publish_worker_status_rows(
                                     bus,
                                     &snapshot,
                                 ) {
-                                    tracing::warn!(%error, "worker runtime Bus publication failed");
+                                    tracing::warn!(%error, group = group.as_str(), "group worker runtime Bus publication failed");
                                     publication_ok = false;
                                 }
                             }
                             if publication_ok {
-                                coalescer.mark_published(&snapshot, now_ms);
+                                group_coalescer.mark_published(&snapshot, now_ms);
                             }
                         } else {
-                            tracing::trace!("worker runtime status sample coalesced");
+                            tracing::trace!(group = group.as_str(), "group worker runtime status sample coalesced");
+                        }
+
+                        if aggregate_owner {
+                            let group_snapshots = mackes_mesh_types::worker_runtime::WorkerGroup::ALL
+                                .into_iter()
+                                .map(|source_group| {
+                                    let path = mackesd_core::workers::worker_runtime_status::group_status_path(
+                                        &group_status_root,
+                                        source_group,
+                                    );
+                                    mackesd_core::workers::worker_runtime_status::read_runtime_status_file(
+                                        &path,
+                                        now_ms,
+                                    )
+                                    .map(|status| (source_group, status))
+                                })
+                                .collect::<Result<Vec<_>, _>>();
+                            match group_snapshots.and_then(|groups| {
+                                mackesd_core::workers::worker_runtime_status::fold_group_statuses(
+                                    &node_id,
+                                    now_ms,
+                                    &groups,
+                                )
+                            }) {
+                                Ok(aggregate)
+                                    if aggregate_coalescer.should_publish(&aggregate, now_ms) =>
+                                {
+                                    let mut publication_ok = true;
+                                    if let Err(error) = mackesd_core::workers::worker_runtime_status::write_runtime_status_file(
+                                        &aggregate_status_path,
+                                        &aggregate,
+                                    ) {
+                                        tracing::warn!(%error, "aggregate worker runtime status file write failed");
+                                        publication_ok = false;
+                                    }
+                                    if persist.is_none() {
+                                        persist = mde_bus::default_data_dir().and_then(|root| {
+                                            mde_bus::persist::Persist::open(root).ok()
+                                        });
+                                    }
+                                    if let Some(bus) = persist.as_mut() {
+                                        if let Err(error) = mackesd_core::workers::worker_runtime_status::publish_node_aggregate(
+                                            bus,
+                                            &aggregate,
+                                        ) {
+                                            tracing::warn!(%error, "aggregate worker runtime Bus publication failed");
+                                            publication_ok = false;
+                                        }
+                                    }
+                                    if publication_ok {
+                                        aggregate_coalescer.mark_published(&aggregate, now_ms);
+                                    }
+                                }
+                                Ok(_) => tracing::trace!("aggregate worker runtime status sample coalesced"),
+                                Err(error) => tracing::warn!(%error, "aggregate worker runtime status fold rejected; preserving last good projection"),
+                            }
                         }
                         failure_retry = STATUS_POLL;
                         let now_ms = std::time::SystemTime::now()
@@ -3626,6 +3734,44 @@ mod process_group_thread_admission_tests {
                 group == WorkerGroup::Observation,
                 "observation dispatcher escaped into {group}"
             );
+        }
+    }
+
+    #[test]
+    fn runtime_status_aggregate_has_one_canonical_process_owner() {
+        use mackesd_core::worker_role::WorkerGroup;
+
+        let aggregate = "worker_runtime_status_aggregate_publisher";
+        for group in WorkerGroup::ALL {
+            assert_eq!(
+                mackesd_core::worker_role::belongs_to_group(aggregate, group),
+                group == WorkerGroup::Observation,
+                "hostile {group} process acquired the node-global runtime-status writer"
+            );
+        }
+
+        let publishers = [
+            ("worker_runtime_status_control_publisher", WorkerGroup::Control),
+            (
+                "worker_runtime_status_observation_publisher",
+                WorkerGroup::Observation,
+            ),
+            ("worker_runtime_status_actions_publisher", WorkerGroup::Actions),
+            ("worker_runtime_status_data_publisher", WorkerGroup::Data),
+            ("worker_runtime_status_compute_publisher", WorkerGroup::Compute),
+            (
+                "worker_runtime_status_integrations_publisher",
+                WorkerGroup::Integrations,
+            ),
+        ];
+        for (publisher, owner) in publishers {
+            for group in WorkerGroup::ALL {
+                assert_eq!(
+                    mackesd_core::worker_role::belongs_to_group(publisher, group),
+                    group == owner,
+                    "{publisher} escaped from {owner} into {group}"
+                );
+            }
         }
     }
 }

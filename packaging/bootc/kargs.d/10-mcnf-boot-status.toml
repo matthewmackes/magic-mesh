@@ -1,0 +1,12 @@
+# BOOT-STATUS-1 — the compositor-less Construct shell cannot paint until it
+# owns DRM.  Keep noisy kernel messages quiet, disable Plymouth's opaque cover,
+# and let initrd + host systemd report the unit or start job that is actually
+# delaying the seat.  These additive arguments also defeat a base image that
+# still supplies `rhgb`; the RPM upgrade lane removes `rhgb` with grubby.
+kargs = [
+    "plymouth.enable=0",
+    "rd.plymouth=0",
+    "systemd.show_status=1",
+    "rd.systemd.show_status=1",
+]
+

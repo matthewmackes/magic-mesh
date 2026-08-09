@@ -21,13 +21,12 @@ use mackes_mesh_types::android_provider::{
     CuttlefishVmObservation, CuttlefishVmTarget,
 };
 
-use super::super::super::runner::CloudRunner;
 use super::cuttlefish_guest::{
     CuttlefishGuestTransport, GuestSnapshot, UnixCuttlefishGuestTransport,
 };
 use super::AndroidGuestProvider;
 use mackes_mesh_types::android_provider::AndroidVdiSource;
-use mackes_mesh_types::cloud::CloudInstance;
+use mackes_mesh_types::workloads::{WorkloadOperationStatus, WorkloadPowerState};
 
 /// Closed failures returned by the Cuttlefish adapter or its backend client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,32 +113,77 @@ struct GuestContract {
     transport: Arc<dyn CuttlefishGuestTransport>,
 }
 
-/// Production read-only outer-VM observer for a Cuttlefish-backed Android workload.
+/// The bounded outer-VM fact copied from the authoritative Workloads snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CuttlefishOuterWorkloadObservation {
+    workload_id: String,
+    lifecycle_state: CuttlefishVmLifecycleState,
+    generation: u64,
+}
+
+impl CuttlefishOuterWorkloadObservation {
+    /// Convert an already-validated Workloads row without consulting libvirt.
+    pub(crate) fn from_status(
+        status: &WorkloadOperationStatus,
+    ) -> Result<Self, CuttlefishProviderError> {
+        if !status.backend.is_vm() {
+            return Err(CuttlefishProviderError::ProviderRejected);
+        }
+        let lifecycle_state = match status.power {
+            WorkloadPowerState::Running => CuttlefishVmLifecycleState::Running,
+            WorkloadPowerState::Stopped | WorkloadPowerState::Defined => {
+                CuttlefishVmLifecycleState::Stopped
+            }
+            WorkloadPowerState::Starting => CuttlefishVmLifecycleState::Starting,
+            WorkloadPowerState::Stopping | WorkloadPowerState::Paused => {
+                CuttlefishVmLifecycleState::Unavailable
+            }
+            WorkloadPowerState::Failed => CuttlefishVmLifecycleState::Failed,
+        };
+        Ok(Self {
+            workload_id: status.workload_id.as_str().to_owned(),
+            lifecycle_state,
+            generation: status.generation,
+        })
+    }
+
+    /// Represent a workload absent from an available authoritative snapshot.
+    #[must_use]
+    pub(crate) fn absent(workload_id: impl Into<String>) -> Self {
+        Self {
+            workload_id: workload_id.into(),
+            lifecycle_state: CuttlefishVmLifecycleState::Absent,
+            generation: 0,
+        }
+    }
+}
+
+/// Production outer-VM observer for a Cuttlefish-backed Android workload.
 ///
-/// Lifecycle is owned by typed Workloads. This client only observes the L1
-/// libvirt roster while the inner Android guest remains explicitly unready until
-/// guest-owned package-manager/session evidence satisfies the Cuttlefish contract.
-pub(crate) struct LibvirtCuttlefishProviderClient {
-    runner: Arc<dyn CloudRunner>,
-    generation: Mutex<u64>,
+/// Lifecycle is owned by typed Workloads. This client consumes only the
+/// validated row supplied by Cloud's Workloads projection reader; the inner
+/// Android guest remains explicitly unready until guest-owned package-manager/
+/// session evidence satisfies the Cuttlefish contract.
+pub(crate) struct WorkloadCuttlefishProviderClient {
+    outer_workload: Option<CuttlefishOuterWorkloadObservation>,
     guest: Option<GuestContract>,
     guest_snapshot: Mutex<Option<(u64, GuestSnapshot)>>,
 }
 
-impl LibvirtCuttlefishProviderClient {
-    /// Bind one workload-scoped provider client to the canonical cloud runner.
+impl WorkloadCuttlefishProviderClient {
+    /// Bind one workload-scoped provider client to a typed outer observation.
+    /// `None` means the Workloads authority itself is unavailable, not absence.
     #[must_use]
-    pub(crate) fn new(runner: Arc<dyn CloudRunner>) -> Self {
+    pub(crate) fn new(outer_workload: Option<CuttlefishOuterWorkloadObservation>) -> Self {
         Self {
-            runner,
-            generation: Mutex::new(0),
+            outer_workload,
             guest: None,
             guest_snapshot: Mutex::new(None),
         }
     }
 
     pub(crate) fn with_guest_contract(
-        runner: Arc<dyn CloudRunner>,
+        outer_workload: Option<CuttlefishOuterWorkloadObservation>,
         package_manifest: AndroidImagePackageManifest,
         catalog_digest: String,
     ) -> Result<Self, CuttlefishProviderError> {
@@ -150,8 +194,7 @@ impl LibvirtCuttlefishProviderClient {
             return Err(CuttlefishProviderError::ProviderRejected);
         }
         Ok(Self {
-            runner,
-            generation: Mutex::new(0),
+            outer_workload,
             guest: Some(GuestContract {
                 package_manifest,
                 catalog_digest,
@@ -159,19 +202,6 @@ impl LibvirtCuttlefishProviderClient {
             }),
             guest_snapshot: Mutex::new(None),
         })
-    }
-
-    fn stable_generation(&self, present: bool) -> Result<u64, CuttlefishProviderError> {
-        let mut generation = self
-            .generation
-            .lock()
-            .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
-        if present {
-            *generation = (*generation).max(1);
-        } else if *generation == 0 {
-            return Ok(0);
-        }
-        Ok(*generation)
     }
 
     fn observation(
@@ -222,23 +252,9 @@ impl LibvirtCuttlefishProviderClient {
         )
         .map_err(CuttlefishProviderError::Contract)
     }
-
-    fn instance<'a>(
-        instances: &'a [CloudInstance],
-        target: &CuttlefishVmTarget,
-    ) -> Option<&'a CloudInstance> {
-        instances
-            .iter()
-            .find(|instance| instance.id == target.vm_id.as_str())
-            .or_else(|| {
-                instances
-                    .iter()
-                    .find(|instance| instance.name == target.vm_id.as_str())
-            })
-    }
 }
 
-impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
+impl CuttlefishProviderClient for WorkloadCuttlefishProviderClient {
     fn observe(
         &self,
         target: &CuttlefishVmTarget,
@@ -252,28 +268,16 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
             .guest_snapshot
             .lock()
             .map_err(|_| CuttlefishProviderError::StatePoisoned)? = None;
-        let instances = self
-            .runner
-            .list_instances()
-            .map_err(|_| CuttlefishProviderError::ProviderUnavailable)?;
-        let Some(instance) = Self::instance(&instances, target) else {
-            let generation = self.stable_generation(false)?;
-            return Self::observation(
-                target,
-                if generation == 0 {
-                    CuttlefishVmLifecycleState::Absent
-                } else {
-                    CuttlefishVmLifecycleState::Unavailable
-                },
-                generation,
-                (generation > 0).then_some(CuttlefishUnavailableReason::ProviderUnavailable),
-            );
-        };
-
-        let status = instance.status.trim();
-        let generation = self.stable_generation(true)?;
-        match status.to_ascii_uppercase().as_str() {
-            "ACTIVE" | "RUNNING" => Self::observation(
+        let outer = self
+            .outer_workload
+            .as_ref()
+            .ok_or(CuttlefishProviderError::ProviderUnavailable)?;
+        if outer.workload_id != target.vm_id.as_str() {
+            return Err(CuttlefishProviderError::InvalidWorkloadIdentity);
+        }
+        let generation = outer.generation;
+        match outer.lifecycle_state {
+            CuttlefishVmLifecycleState::Running => Self::observation(
                 target,
                 if let Some(guest) = &self.guest {
                     match guest.transport.observe(
@@ -299,19 +303,27 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
                 generation,
                 None,
             ),
-            "SHUTOFF" | "SHUT OFF" | "STOPPED" => Self::observation(
+            CuttlefishVmLifecycleState::Stopped => Self::observation(
                 target,
                 CuttlefishVmLifecycleState::Stopped,
                 generation,
                 None,
             ),
-            "ERROR" | "FAILED" => Self::observation(
+            CuttlefishVmLifecycleState::Failed => Self::observation(
                 target,
                 CuttlefishVmLifecycleState::Failed,
                 generation,
                 Some(CuttlefishUnavailableReason::GuestBootFailed),
             ),
-            _ => Self::observation(
+            CuttlefishVmLifecycleState::Absent => {
+                Self::observation(target, CuttlefishVmLifecycleState::Absent, 0, None)
+            }
+            CuttlefishVmLifecycleState::Provisioning
+            | CuttlefishVmLifecycleState::Starting
+            | CuttlefishVmLifecycleState::Rebooting => {
+                Self::observation(target, outer.lifecycle_state, generation, None)
+            }
+            CuttlefishVmLifecycleState::Unavailable => Self::observation(
                 target,
                 CuttlefishVmLifecycleState::Unavailable,
                 generation,
@@ -325,10 +337,11 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
         target: &CuttlefishVmTarget,
         request: &AndroidGuestLaunchRequest,
     ) -> Result<AndroidGuestLaunchOutcome, CuttlefishProviderError> {
-        let generation = *self
-            .generation
-            .lock()
-            .map_err(|_| CuttlefishProviderError::StatePoisoned)?;
+        let generation = self
+            .outer_workload
+            .as_ref()
+            .ok_or(CuttlefishProviderError::ProviderUnavailable)?
+            .generation;
         self.launch_at(target, request, generation)
     }
 
@@ -1062,19 +1075,13 @@ mod tests {
     }
 
     #[test]
-    fn libvirt_client_projects_active_outer_vm_as_booting_not_guest_ready() {
-        let runner = crate::workers::cloud::runner::fake::FakeRunner {
-            roster: vec![CloudInstance {
-                id: "android-t480".to_owned(),
-                name: "android-t480".to_owned(),
-                status: "ACTIVE".to_owned(),
-                flavor: None,
-                image: None,
-                networks: None,
-            }],
-            ..Default::default()
-        };
-        let client = LibvirtCuttlefishProviderClient::new(Arc::new(runner));
+    fn workload_client_projects_running_outer_vm_as_booting_not_guest_ready() {
+        let client =
+            WorkloadCuttlefishProviderClient::new(Some(CuttlefishOuterWorkloadObservation {
+                workload_id: "android-t480".to_owned(),
+                lifecycle_state: CuttlefishVmLifecycleState::Running,
+                generation: 7,
+            }));
 
         let observed = client.observe(&target()).expect("outer VM observation");
         assert_eq!(
@@ -1087,18 +1094,12 @@ mod tests {
 
     #[test]
     fn outer_vm_readiness_loss_revokes_retained_vdi_source() {
-        let runner = crate::workers::cloud::runner::fake::FakeRunner {
-            roster: vec![CloudInstance {
-                id: "android-t480".to_owned(),
-                name: "android-t480".to_owned(),
-                status: "STOPPED".to_owned(),
-                flavor: None,
-                image: None,
-                networks: None,
-            }],
-            ..Default::default()
-        };
-        let client = LibvirtCuttlefishProviderClient::new(Arc::new(runner));
+        let client =
+            WorkloadCuttlefishProviderClient::new(Some(CuttlefishOuterWorkloadObservation {
+                workload_id: "android-t480".to_owned(),
+                lifecycle_state: CuttlefishVmLifecycleState::Stopped,
+                generation: 7,
+            }));
         let now = now_unix_ms();
         *client.guest_snapshot.lock().expect("guest snapshot") = Some((
             1,
@@ -1127,5 +1128,15 @@ mod tests {
             CuttlefishVmLifecycleState::Stopped
         );
         assert!(client.vdi_source(1).is_none());
+    }
+
+    #[test]
+    fn unavailable_workload_authority_never_fabricates_outer_vm_absence() {
+        let client = WorkloadCuttlefishProviderClient::new(None);
+
+        assert_eq!(
+            client.observe(&target()),
+            Err(CuttlefishProviderError::ProviderUnavailable)
+        );
     }
 }

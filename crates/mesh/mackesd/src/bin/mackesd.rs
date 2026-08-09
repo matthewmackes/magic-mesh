@@ -3198,7 +3198,12 @@ fn run_serve(
         spawn_tiered(&mut sup, &worker_names, role_rank, "reconcile", || {
             ReconcileWorker::new(workgroup_root.clone(), node_id.clone(), db_path.clone())
         });
-        start_worker_runtime_status_publisher(&worker_status, &shutdown, &node_id);
+        start_worker_runtime_status_publisher(
+            &worker_names,
+            &worker_status,
+            &shutdown,
+            &node_id,
+        );
 
         // BULLETPROOF-2 — the daemon is up (supervisor + all responders +
         // workers spawned). Tell systemd we're READY (Type=notify gate) and

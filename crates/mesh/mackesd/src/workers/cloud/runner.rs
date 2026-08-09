@@ -3,7 +3,7 @@
 //!
 //! Split out of the pre-U2 monolith (behavior-preserving relocation): the runner
 //! trait, its production [`ShellCloudRunner`], the [`CloudRunOutcome`] result, the
-//! per-tool health probe, the roster fold, and the injectable test fake all live
+//! per-tool health probe, resource-table fold, and the injectable test fake all live
 //! here so the drain / gate / reply paths (in the sibling modules) are exercised
 //! WITHOUT a live hypervisor. Nothing here changed in U2 — only its home did.
 
@@ -225,8 +225,7 @@ pub struct ToolRun {
     pub stderr: String,
 }
 
-/// The backend-execution seam for read-only/dry-run OpenTofu, armed Ansible, and
-/// read-only libvirt inventory.
+/// The backend-execution seam for read-only/dry-run OpenTofu and armed Ansible.
 ///
 /// Production is [`ShellCloudRunner`]; tests inject a fake so the drain, gate,
 /// reply, audit, and state-publish paths are exercised WITHOUT a live hypervisor
@@ -236,10 +235,6 @@ pub trait CloudRunner: Send + Sync {
     /// reachable, as a [`ServiceHealth`] row (`Up` / `Down` / `Absent`, never a
     /// fabricated up).
     fn probe_tool(&self, tool: &str) -> ServiceHealth;
-
-    /// List the local cloud instances (a READ — `virsh list`). `Err` when the
-    /// backend can't be reached (an honest gate, never a fabricated empty roster).
-    fn list_instances(&self) -> Result<Vec<CloudInstance>, String>;
 
     /// Configure via Ansible. This seam always performs the playbook; the caller
     /// must consume mutation authority before invoking it.
@@ -285,20 +280,6 @@ pub trait CloudRunner: Send + Sync {
     /// The tool's failure/absence, as an honest message.
     fn tofu_outputs(&self) -> Result<String, String> {
         Err("tofu outputs not supported by this runner".to_string())
-    }
-}
-
-/// Normalize a libvirt domain state to the OpenStack-style status token the
-/// neutral [`CloudInstance`] carries (the roster the KDC client filters on
-/// `ACTIVE`/`SHUTOFF`). Unknown states pass through upper-cased (honest).
-#[must_use]
-pub(crate) fn normalize_domain_state(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "running" => "ACTIVE".to_string(),
-        "shut off" | "shutoff" => "SHUTOFF".to_string(),
-        "paused" => "PAUSED".to_string(),
-        "" => "UNKNOWN".to_string(),
-        other => other.to_ascii_uppercase(),
     }
 }
 
@@ -428,33 +409,6 @@ impl CloudRunner for ShellCloudRunner {
         }
     }
 
-    fn list_instances(&self) -> Result<Vec<CloudInstance>, String> {
-        let (ok, out, err) = Self::run(
-            "virsh",
-            &["-c", &self.libvirt_uri, "list", "--all", "--name"],
-        )
-        .map_err(|e| format!("libvirt unavailable: {e}"))?;
-        if !ok {
-            return Err(format!("virsh list failed: {}", summary_line(&err)));
-        }
-        let mut instances = Vec::new();
-        for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let status = match Self::run("virsh", &["-c", &self.libvirt_uri, "domstate", name]) {
-                Ok((true, sout, _)) => normalize_domain_state(&sout),
-                _ => "UNKNOWN".to_string(),
-            };
-            instances.push(CloudInstance {
-                id: name.to_string(),
-                name: name.to_string(),
-                status,
-                flavor: None,
-                image: None,
-                networks: None,
-            });
-        }
-        Ok(instances)
-    }
-
     fn configure(&self) -> CloudRunOutcome {
         let playbook = self.ansible_dir.join("playbooks").join("site.yml");
         let playbook_str = playbook.display().to_string();
@@ -579,12 +533,12 @@ pub(crate) mod fake {
     use std::sync::Mutex;
 
     /// A scripted fake runner: records the `apply` flag each mutation was called
-    /// with, returns canned outcomes, and serves a fixed roster. Shared by the
+    /// with and returns canned outcomes. The hostile roster fields prove that
+    /// direct backend inventory cannot leak into typed Workloads reads.
     /// sibling modules' tests (the drain / gate / verb paths).
     #[derive(Default)]
     pub(crate) struct FakeRunner {
         pub roster: Vec<CloudInstance>,
-        pub roster_err: Option<String>,
         pub tofu_up: bool,
         /// (verb, apply) calls the worker made — proves the gate.
         pub calls: Mutex<Vec<(String, bool)>>,
@@ -643,12 +597,6 @@ pub(crate) mod fake {
                 microversion: None,
                 version_id: None,
                 detail: Some("fake".to_string()),
-            }
-        }
-        fn list_instances(&self) -> Result<Vec<CloudInstance>, String> {
-            match &self.roster_err {
-                Some(e) => Err(e.clone()),
-                None => Ok(self.roster.clone()),
             }
         }
         fn configure(&self) -> CloudRunOutcome {
@@ -729,15 +677,6 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_domain_state_maps_libvirt_states_to_neutral_status() {
-        assert_eq!(normalize_domain_state("running"), "ACTIVE");
-        assert_eq!(normalize_domain_state("shut off"), "SHUTOFF");
-        assert_eq!(normalize_domain_state("paused"), "PAUSED");
-        assert_eq!(normalize_domain_state("pmsuspended"), "PMSUSPENDED");
-        assert_eq!(normalize_domain_state(""), "UNKNOWN");
-    }
 
     #[test]
     fn instances_table_folds_name_and_status_cells() {

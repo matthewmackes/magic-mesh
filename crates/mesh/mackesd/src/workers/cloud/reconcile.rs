@@ -1085,8 +1085,7 @@ mod tests {
             // is unavailable.
             roster: vec![instance("web", "ACTIVE")],
             plan_ndjson: Some(
-                r#"{"type":"change_summary","changes":{"add":0,"change":0,"remove":0}}"#
-                    .into(),
+                r#"{"type":"change_summary","changes":{"add":0,"change":0,"remove":0}}"#.into(),
             ),
             ..Default::default()
         };

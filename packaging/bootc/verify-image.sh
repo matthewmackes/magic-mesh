@@ -48,6 +48,15 @@ ovs-vsctl --version >/dev/null 2>&1 \
 grep -q 'type = "xfs"' /usr/lib/bootc/install/50-magic-mesh.toml 2>/dev/null \
     && ok "bootc install rootfs default = xfs" \
     || bad "bootc install rootfs default is not xfs"
+boot_status_kargs=/usr/lib/bootc/kargs.d/10-mcnf-boot-status.toml
+[ -f "$boot_status_kargs" ] \
+    && ok "truthful pre-Construct boot-status kargs present" \
+    || bad "truthful pre-Construct boot-status kargs missing"
+for arg in plymouth.enable=0 rd.plymouth=0 systemd.show_status=1 rd.systemd.show_status=1; do
+    grep -Fq "\"$arg\"" "$boot_status_kargs" 2>/dev/null \
+        && ok "boot-status karg present: $arg" \
+        || bad "boot-status karg missing: $arg"
+done
 grep -q 'datasource_list: \[ NoCloud, None \]' /etc/cloud/cloud.cfg.d/90-mcnf-nocloud.cfg 2>/dev/null \
     && ok "cloud-init constrained to NoCloud/None" \
     || bad "cloud-init NoCloud datasource config missing"
