@@ -1768,8 +1768,8 @@ behavioral evidence is not completion.
 - Required outcome: a 48px full-width taskbar supports Bottom/Left placement, icon-only Start/Search/Back/Home, user-managed centered pins, right-side placement control,
   clock/tray semantics, and Bing-wallpaper Home with no second launcher.
 - Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and five-seat proof remain.
-- **Live battery (2026-08-08):** the primary UPower percentage/icon is immediately left of the clock in both placements; `.90` passed 24/24 focused status tests:
-  `docs/platform/evidence/WL-UX-012-2026-08-08-live-battery-left-clock-r1.md`.
+- **Live battery (2026-08-08/09):** the primary UPower percentage/icon is immediately left of the clock in both placements; `.90` passed the two exact source/geometry tests:
+  `docs/platform/evidence/WL-UX-012-2026-08-09-live-battery-r13.md`.
 - **Taskbar identity checkpoint (2026-08-09):** connected sessions and pinned desktops now have disjoint typed egui identities and hit regions; BigBoy passed 49/49:
   `docs/platform/evidence/WL-UX-012-2026-08-09-taskbar-control-identity-r2.md`.
 - **Narrow geometry checkpoint (2026-08-09):** center controls are admitted only when a physical 40px slot exists, preserving More at 480px and preventing Home overlap at
