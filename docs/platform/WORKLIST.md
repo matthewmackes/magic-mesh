@@ -120,8 +120,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-provision-hard-cut-r8.md`.
 - **Authority/contract hardening (2026-08-09):** lifecycle/provision bypasses were deleted; attachment identity, restart replay, and Display1 ownership fail closed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-contract-restart-display1-hardening-r12.md`.
-- **Production compile checkpoint (2026-08-09):** cloud authorization exports are reachable outside tests; BigBoy's locked async-services library check passed:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-production-compile-r14.md`.
+- **Cloud production/recovery checkpoints (2026-08-09):** authorization exports compile outside tests; late/replaced Bus activation and durable mutation outbox
+  recovery passed focused BigBoy/machine-193 gates: `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-production-compile-r14.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and
@@ -133,9 +134,8 @@ behavioral evidence is not completion.
   relinquish/rollback retries before external effects. BigBoy passed 53/53.
   Live libvirt crash injection and seat lifecycle proof remain. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-distributed-migration-ledger-r3.md`.
-- **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON
-  admission rejects duplicate top-level and nested keys; `.50` passed 9/9.
-  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
+- **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON rejects duplicate keys; `.50` passed 9/9. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
 - **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness,
   relay state, and stale sockets; BigBoy passed 7/7. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
@@ -423,11 +423,9 @@ behavioral evidence is not completion.
   fails closed and atomic temporary files are cleaned on failure. Machine 194
   passed 3/3 focused tests; Dell deployment proof remains:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
-- **Compute Bus recovery checkpoint (2026-08-09):** firewall exposure now
-  survives late Bus storage with bounded shutdown-aware retries, while a
-  statically absent firewall provider quiesces without churn. Machine 194
-  passed four exact startup/activation tests:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`.
+- **Compute/Cloud Bus recovery checkpoints (2026-08-09):** firewall exposure and Cloud transactions survive late/replaced storage; Cloud stages reads and durably
+  recovers mutation replies without repeating effects. Machines 194/193 passed focused gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`.
 - **Action Bus recovery checkpoint (2026-08-09):** privileged action startup
   now retries Bus open and tail-cursor priming as one fail-closed activation,
   skips retained actions, and executes one forward signed action exactly once.

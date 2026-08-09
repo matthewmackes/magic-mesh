@@ -43,6 +43,7 @@ mod verbs;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,6 +120,66 @@ pub const ANDROID_INVENTORY_POLL: Duration = Duration::from_secs(30);
 /// staler than this (or absent) is honestly gated as "not reachable".
 const PLACEMENT_STALE_AFTER_MS: i64 = 3 * 60 * 1000;
 
+const CLOUD_ACTION_TXN_PREFIX: &str = "state/cloud/action-transaction/";
+const CLOUD_ACTION_TXN_SCHEMA: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CloudActionTxnPhase {
+    Claimed,
+    Completed,
+    Delivered,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CloudActionTxn {
+    schema_version: u16,
+    host: String,
+    request_ulid: String,
+    action_topic: String,
+    verb: String,
+    phase: CloudActionTxnPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply: Option<CloudReply>,
+}
+
+struct CloudBusActivation {
+    identity: BusIdentity,
+    cursors: HashMap<String, String>,
+    pending_transactions: Vec<CloudActionTxn>,
+}
+
+enum StagedActionKind {
+    Handle {
+        body: String,
+        mutation: bool,
+        transaction: Option<CloudActionTxn>,
+    },
+    Reply(CloudReply),
+    Skip,
+}
+
+struct StagedAction {
+    topic: String,
+    verb: String,
+    ulid: String,
+    kind: StagedActionKind,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CloudBusFaults {
+    fail_action_read_topic: std::sync::Mutex<Option<String>>,
+    fail_reply_writes: std::sync::atomic::AtomicUsize,
+    fail_state_writes: std::sync::atomic::AtomicUsize,
+}
+
 // ─────────────────────────── the worker ───────────────────────────
 
 /// The `cloud` worker (per-node, rank-0 universal). The action drain is
@@ -167,9 +228,16 @@ pub struct CloudWorker {
     /// Durable host-scoped Android observation snapshot, if the host identity
     /// can be represented as one safe filename component.
     android_inventory_path: Option<PathBuf>,
-    /// The Bus root the mirror publish targets + the action drain reads (`None` ⇒
-    /// publish/drain is a no-op — a pre-RPM dev box with no bus).
+    /// Explicit Bus-root override. Production resolves the current user root on
+    /// every transaction and falls back to the canonical system spool.
+    bus_root_override: Option<PathBuf>,
+    /// Compatibility mirror consumed by the in-module App VM declaration
+    /// handler. It contains only an explicit override; production's `None`
+    /// cannot freeze the Cloud run loop's dynamic Bus resolution.
     bus_root: Option<PathBuf>,
+    /// Compatibility seam for tests/offline callers that explicitly select
+    /// `with_bus_root(None)` to disable Bus work.
+    bus_disabled: bool,
     /// Fold/publish cadence.
     poll: Duration,
     /// Mirror republish heartbeat.
@@ -185,6 +253,8 @@ pub struct CloudWorker {
     /// [`DriftSummary`] the throttled tick ([`Self::refresh_drift`]) computed, folded
     /// into every `state/cloud/<node>` mirror. Empty until the first tick.
     drift: std::sync::Mutex<(Vec<WorkloadRow>, DriftSummary)>,
+    #[cfg(test)]
+    bus_faults: Arc<CloudBusFaults>,
 }
 
 impl CloudWorker {
@@ -276,13 +346,17 @@ impl CloudWorker {
             android_lifecycle_lock: std::sync::Mutex::new(()),
             android_vdi_sources: std::sync::Mutex::new(Vec::new()),
             android_inventory_path,
-            bus_root: default_bus_root(),
+            bus_root_override: None,
+            bus_root: None,
+            bus_disabled: false,
             poll: POLL,
             heartbeat: PUBLISH_HEARTBEAT,
             reachable_override: None,
             drift_interval: DRIFT_POLL,
             android_inventory_interval: ANDROID_INVENTORY_POLL,
             drift: std::sync::Mutex::new((Vec::new(), DriftSummary::default())),
+            #[cfg(test)]
+            bus_faults: Arc::new(CloudBusFaults::default()),
         }
     }
 
@@ -354,7 +428,15 @@ impl CloudWorker {
     /// Override the Bus root (tests point it at a tempdir; `None` disables it).
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_disabled = root.is_none();
+        self.bus_root = root.clone();
+        self.bus_root_override = root;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_bus_faults(mut self, faults: Arc<CloudBusFaults>) -> Self {
+        self.bus_faults = faults;
         self
     }
 
@@ -520,58 +602,253 @@ impl CloudWorker {
         }
     }
 
-    /// Whether placement node `node` is reachable — the test override when set,
-    /// else a fresh `state/cloud/<node>` mirror on the bus (a node publishing its
-    /// mirror is up and running its cloud worker).
-    fn node_reachable(&self, persist: &Persist, node: &str) -> bool {
-        if let Some(set) = &self.reachable_override {
-            return set.contains(node);
+    fn bus_root(&self) -> Option<PathBuf> {
+        if self.bus_disabled {
+            return None;
         }
-        match persist.read_latest(&cloud_state_topic(node)) {
-            Ok(Some(msg)) => msg
-                .body
-                .as_deref()
-                .and_then(|b| serde_json::from_str::<CloudState>(b).ok())
-                .is_some_and(|st| {
-                    now_ms().saturating_sub(st.published_at_ms) <= PLACEMENT_STALE_AFTER_MS
-                }),
-            _ => false,
-        }
+        Some(cloud_bus_root_or_system(
+            self.bus_root_override.clone().or_else(default_bus_root),
+        ))
     }
 
-    /// Write a typed reply to `reply/<request-ulid>` (best-effort).
-    fn write_reply(&self, persist: &Persist, req_ulid: &str, reply: &CloudReply) {
-        let body = serde_json::to_string(reply).unwrap_or_default();
-        if let Err(e) = persist.write(&reply_topic(req_ulid), Priority::Default, None, Some(&body))
+    fn open_bus(&self) -> io::Result<Option<(Persist, BusIdentity)>> {
+        let Some(root) = self.bus_root() else {
+            return Ok(None);
+        };
+        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        let identity = bus_identity(&root)?;
+        Ok(Some((persist, identity)))
+    }
+
+    fn transaction_topic(&self, request_ulid: &str) -> String {
+        format!("{CLOUD_ACTION_TXN_PREFIX}{}/{request_ulid}", self.host)
+    }
+
+    fn read_transaction(
+        &self,
+        persist: &Persist,
+        action_topic: &str,
+        verb: &str,
+        request_ulid: &str,
+    ) -> io::Result<Option<CloudActionTxn>> {
+        let Some(message) = persist
+            .read_latest(&self.transaction_topic(request_ulid))
+            .map_err(io_other)?
+        else {
+            return Ok(None);
+        };
+        let body = message
+            .body
+            .ok_or_else(|| io::Error::other("cloud action transaction has no body"))?;
+        let transaction: CloudActionTxn = serde_json::from_str(&body).map_err(io_other)?;
+        if transaction.schema_version != CLOUD_ACTION_TXN_SCHEMA
+            || transaction.host != self.host
+            || transaction.request_ulid != request_ulid
+            || transaction.action_topic != action_topic
+            || transaction.verb != verb
         {
-            tracing::warn!(target: "mackesd::cloud", ulid = %req_ulid, error = %e, "cloud reply write failed");
+            return Err(io::Error::other(
+                "cloud action transaction identity does not match request",
+            ));
         }
+        Ok(Some(transaction))
     }
 
-    /// Drain every new `action/cloud/*` request, advance the per-topic cursors, and
-    /// route each by PLACEMENT (not leadership):
-    ///
-    /// - list/status reads are served locally; node-local inventory/output/plan
-    ///   reads and every mutation require explicit placement;
-    /// - a placement-scoped action is handled iff `body.node` is this host;
-    /// - a scoped action without placement is refused (never fanned out);
-    /// - an action for another node is skipped when that node is reachable (it
-    ///   performs + replies), and honestly gated (`placement node <N> not
-    ///   reachable`) when it is not — never a silent swallow.
-    ///
-    /// Returns `true` when any request was handled (so the caller force-republishes
-    /// the fresh roster).
-    fn drain_actions(&self, cursors: &mut HashMap<String, String>) -> bool {
-        let Some(root) = self.bus_root.clone() else {
-            return false;
+    fn write_transaction(&self, persist: &Persist, transaction: &CloudActionTxn) -> io::Result<()> {
+        let body = serde_json::to_string(transaction).map_err(io_other)?;
+        persist
+            .write(
+                &self.transaction_topic(&transaction.request_ulid),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
+    }
+
+    /// Whether placement node `node` is reachable — the test override when set,
+    /// else a fresh `state/cloud/<node>` mirror on the bus. Read/open/decode
+    /// failures defer the complete action pass rather than becoming a false
+    /// unreachable decision.
+    fn node_reachable(&self, persist: &Persist, node: &str) -> io::Result<bool> {
+        if let Some(set) = &self.reachable_override {
+            return Ok(set.contains(node));
+        }
+        let Some(message) = persist
+            .read_latest(&cloud_state_topic(node))
+            .map_err(io_other)?
+        else {
+            return Ok(false);
         };
-        let Ok(persist) = Persist::open(root) else {
-            return false;
+        let body = message
+            .body
+            .ok_or_else(|| io::Error::other("cloud reachability mirror has no body"))?;
+        let state: CloudState = serde_json::from_str(&body).map_err(io_other)?;
+        Ok(now_ms().saturating_sub(state.published_at_ms) <= PLACEMENT_STALE_AFTER_MS)
+    }
+
+    fn write_reply(
+        &self,
+        persist: &Persist,
+        request_ulid: &str,
+        reply: &CloudReply,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_reply_writes) {
+            return Err(io::Error::other("injected cloud reply write failure"));
+        }
+        let body = serde_json::to_string(reply).map_err(io_other)?;
+        persist
+            .write(
+                &reply_topic(request_ulid),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
+    }
+
+    fn reply_already_published(
+        &self,
+        persist: &Persist,
+        request_ulid: &str,
+        reply: &CloudReply,
+    ) -> io::Result<bool> {
+        let Some(message) = persist
+            .read_latest(&reply_topic(request_ulid))
+            .map_err(io_other)?
+        else {
+            return Ok(false);
         };
-        let Ok(topics) = persist.list_topics() else {
-            return false;
-        };
-        let mut acted = false;
+        let body = message
+            .body
+            .ok_or_else(|| io::Error::other("cloud reply row has no body"))?;
+        Ok(body == serde_json::to_string(reply).map_err(io_other)?)
+    }
+
+    fn deliver_transaction(
+        &self,
+        persist: &Persist,
+        transaction: &mut CloudActionTxn,
+    ) -> io::Result<()> {
+        if transaction.phase == CloudActionTxnPhase::Claimed {
+            transaction.reply = Some(CloudReply {
+                ok: false,
+                verb: transaction.verb.clone(),
+                gated: Some(
+                    "cloud mutation outcome is unavailable after recovery; the claimed action was not repeated"
+                        .to_string(),
+                ),
+                ..Default::default()
+            });
+            transaction.phase = CloudActionTxnPhase::Completed;
+            self.write_transaction(persist, transaction)?;
+        }
+        if transaction.phase == CloudActionTxnPhase::Completed {
+            let reply = transaction
+                .reply
+                .as_ref()
+                .ok_or_else(|| io::Error::other("completed cloud transaction has no reply"))?;
+            if !self.reply_already_published(persist, &transaction.request_ulid, reply)? {
+                self.write_reply(persist, &transaction.request_ulid, reply)?;
+            }
+            transaction.phase = CloudActionTxnPhase::Delivered;
+            self.write_transaction(persist, transaction)?;
+        }
+        Ok(())
+    }
+
+    fn activate_bus(
+        &self,
+        persist: &Persist,
+        identity: BusIdentity,
+    ) -> io::Result<CloudBusActivation> {
+        let mut topics = persist.list_topics().map_err(io_other)?;
+        topics.sort_unstable();
+        let mut cursors = HashMap::new();
+        let mut pending_transactions = Vec::new();
+        let transaction_prefix = format!("{CLOUD_ACTION_TXN_PREFIX}{}/", self.host);
+        for topic in topics {
+            if topic.starts_with(CLOUD_ACTION_PREFIX) {
+                #[cfg(test)]
+                if self
+                    .bus_faults
+                    .fail_action_read_topic
+                    .lock()
+                    .is_ok_and(|fault| fault.as_deref() == Some(topic.as_str()))
+                {
+                    return Err(io::Error::other("injected cloud activation tail failure"));
+                }
+                if let Some(ulid) = persist.latest_ulid(&topic).map_err(io_other)? {
+                    cursors.insert(topic, ulid);
+                }
+            } else if topic.starts_with(&transaction_prefix) {
+                let message = persist
+                    .read_latest(&topic)
+                    .map_err(io_other)?
+                    .ok_or_else(|| io::Error::other("listed cloud transaction disappeared"))?;
+                let body = message
+                    .body
+                    .ok_or_else(|| io::Error::other("cloud transaction row has no body"))?;
+                let transaction: CloudActionTxn = serde_json::from_str(&body).map_err(io_other)?;
+                if transaction.schema_version != CLOUD_ACTION_TXN_SCHEMA
+                    || transaction.host != self.host
+                    || self.transaction_topic(&transaction.request_ulid) != topic
+                {
+                    return Err(io::Error::other(
+                        "invalid cloud transaction during activation",
+                    ));
+                }
+                if transaction.phase != CloudActionTxnPhase::Delivered {
+                    if transaction.phase == CloudActionTxnPhase::Completed {
+                        let reply = transaction.reply.as_ref().ok_or_else(|| {
+                            io::Error::other("completed cloud transaction has no reply")
+                        })?;
+                        let _ = persist
+                            .read_latest(&reply_topic(&transaction.request_ulid))
+                            .map_err(io_other)?;
+                        let _ = serde_json::to_string(reply).map_err(io_other)?;
+                    }
+                    pending_transactions.push(transaction);
+                }
+            }
+        }
+        Ok(CloudBusActivation {
+            identity,
+            cursors,
+            pending_transactions,
+        })
+    }
+
+    fn recover_pending_transactions(
+        &self,
+        persist: &Persist,
+        pending: &mut Vec<CloudActionTxn>,
+    ) -> io::Result<()> {
+        let mut retained = Vec::new();
+        let mut first_error = None;
+        for mut transaction in std::mem::take(pending) {
+            if let Err(error) = self.deliver_transaction(persist, &mut transaction) {
+                retained.push(transaction);
+                first_error.get_or_insert(error);
+            }
+        }
+        *pending = retained;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Stage every topic, message, transaction record, and required reachability
+    /// mirror before dispatching any backend work.
+    fn stage_actions(
+        &self,
+        persist: &Persist,
+        cursors: &HashMap<String, String>,
+    ) -> io::Result<Vec<StagedAction>> {
+        let mut topics = persist.list_topics().map_err(io_other)?;
+        topics.sort_unstable();
+        let mut staged = Vec::new();
         for topic in topics {
             let Some(verb_name) = topic.strip_prefix(CLOUD_ACTION_PREFIX) else {
                 continue;
@@ -580,43 +857,57 @@ impl CloudWorker {
             let classified = CloudVerb::from_verb(&verb_name);
             let placement_scoped = classified.is_some_and(CloudVerb::requires_placement);
             let cursor = cursors.get(&topic).cloned();
-            let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
-                continue;
-            };
-            for msg in msgs {
-                cursors.insert(topic.clone(), msg.ulid.clone());
-                let Some(body) = msg.body.as_deref() else {
-                    let reply = CloudReply {
-                        ok: false,
+            #[cfg(test)]
+            if self
+                .bus_faults
+                .fail_action_read_topic
+                .lock()
+                .is_ok_and(|fault| fault.as_deref() == Some(topic.as_str()))
+            {
+                return Err(io::Error::other("injected cloud action read failure"));
+            }
+            let messages = persist
+                .list_since(&topic, cursor.as_deref())
+                .map_err(io_other)?;
+            for message in messages {
+                let ulid = message.ulid;
+                let Some(body) = message.body else {
+                    staged.push(StagedAction {
+                        topic: topic.clone(),
                         verb: verb_name.clone(),
-                        error: Some("cloud action body is missing".to_string()),
-                        ..Default::default()
-                    };
-                    self.write_reply(&persist, &msg.ulid, &reply);
-                    acted = true;
-                    continue;
-                };
-                let parsed = CloudActionBody::parse(body);
-                if let Some(verb) = classified {
-                    if let Some(error) = parsed.schema_error_for(verb) {
-                        let reply = CloudReply {
+                        ulid,
+                        kind: StagedActionKind::Reply(CloudReply {
                             ok: false,
                             verb: verb_name.clone(),
-                            error: Some(error),
+                            error: Some("cloud action body is missing".to_string()),
                             ..Default::default()
-                        };
-                        self.write_reply(&persist, &msg.ulid, &reply);
-                        acted = true;
+                        }),
+                    });
+                    continue;
+                };
+                let parsed = CloudActionBody::parse(&body);
+                if let Some(verb) = classified {
+                    if let Some(error) = parsed.schema_error_for(verb) {
+                        staged.push(StagedAction {
+                            topic: topic.clone(),
+                            verb: verb_name.clone(),
+                            ulid,
+                            kind: StagedActionKind::Reply(CloudReply {
+                                ok: false,
+                                verb: verb_name.clone(),
+                                error: Some(error),
+                                ..Default::default()
+                            }),
+                        });
                         continue;
                     }
                 }
-                // Placement routing: reads stay local; a mutation goes to its node.
                 let route = if placement_scoped {
                     match placement_match(&parsed.node, &self.host) {
                         Placement::Local => Route::Handle,
                         Placement::Missing => Route::GateMissing,
                         Placement::Remote(n) => {
-                            if self.node_reachable(&persist, &n) {
+                            if self.node_reachable(persist, &n)? {
                                 Route::Skip
                             } else {
                                 Route::GateUnreachable(n)
@@ -626,71 +917,141 @@ impl CloudWorker {
                 } else {
                     Route::Handle
                 };
-
-                match route {
+                let kind = match route {
                     Route::Handle => {
-                        let reply = self.handle(&verb_name, body);
-                        tracing::info!(
-                            target: "mackesd::cloud",
-                            ulid = %msg.ulid, verb = %verb_name, ok = reply.ok,
-                            audited = reply.audited, "cloud action handled (placement-local)"
-                        );
-                        self.write_reply(&persist, &msg.ulid, &reply);
-                        acted = true;
-                    }
-                    Route::Skip => {}
-                    Route::GateMissing => {
-                        let reply = CloudReply {
-                            ok: false,
-                            verb: verb_name.clone(),
-                            gated: Some(
-                                "cloud action requires an explicit placement node".to_string(),
-                            ),
-                            ..Default::default()
+                        let mutation = classified.is_some_and(CloudVerb::is_mutation);
+                        let transaction = if mutation {
+                            self.read_transaction(persist, &topic, &verb_name, &ulid)?
+                        } else {
+                            None
                         };
-                        self.write_reply(&persist, &msg.ulid, &reply);
-                        acted = true;
+                        StagedActionKind::Handle {
+                            body,
+                            mutation,
+                            transaction,
+                        }
                     }
-                    Route::GateUnreachable(n) => {
-                        let reply = CloudReply {
-                            ok: false,
-                            verb: verb_name.clone(),
-                            gated: Some(format!("placement node {n} not reachable")),
-                            ..Default::default()
+                    Route::Skip => StagedActionKind::Skip,
+                    Route::GateMissing => StagedActionKind::Reply(CloudReply {
+                        ok: false,
+                        verb: verb_name.clone(),
+                        gated: Some("cloud action requires an explicit placement node".to_string()),
+                        ..Default::default()
+                    }),
+                    Route::GateUnreachable(node) => StagedActionKind::Reply(CloudReply {
+                        ok: false,
+                        verb: verb_name.clone(),
+                        gated: Some(format!("placement node {node} not reachable")),
+                        ..Default::default()
+                    }),
+                };
+                staged.push(StagedAction {
+                    topic: topic.clone(),
+                    verb: verb_name.clone(),
+                    ulid,
+                    kind,
+                });
+            }
+        }
+        Ok(staged)
+    }
+
+    fn apply_staged_actions(
+        &self,
+        persist: &Persist,
+        cursors: &mut HashMap<String, String>,
+        staged: Vec<StagedAction>,
+    ) -> io::Result<bool> {
+        let mut acted = false;
+        for action in staged {
+            match action.kind {
+                StagedActionKind::Skip => {
+                    cursors.insert(action.topic, action.ulid);
+                }
+                StagedActionKind::Reply(reply) => {
+                    self.write_reply(persist, &action.ulid, &reply)?;
+                    cursors.insert(action.topic, action.ulid);
+                    acted = true;
+                }
+                StagedActionKind::Handle {
+                    body,
+                    mutation,
+                    transaction,
+                } => {
+                    if mutation {
+                        let mut transaction = if let Some(transaction) = transaction {
+                            transaction
+                        } else {
+                            let transaction = CloudActionTxn {
+                                schema_version: CLOUD_ACTION_TXN_SCHEMA,
+                                host: self.host.clone(),
+                                request_ulid: action.ulid.clone(),
+                                action_topic: action.topic.clone(),
+                                verb: action.verb.clone(),
+                                phase: CloudActionTxnPhase::Claimed,
+                                reply: None,
+                            };
+                            self.write_transaction(persist, &transaction)?;
+                            let reply = self.handle(&action.verb, &body);
+                            let completed = CloudActionTxn {
+                                phase: CloudActionTxnPhase::Completed,
+                                reply: Some(reply),
+                                ..transaction
+                            };
+                            self.write_transaction(persist, &completed)?;
+                            completed
                         };
-                        tracing::info!(
-                            target: "mackesd::cloud",
-                            ulid = %msg.ulid, verb = %verb_name, node = %n,
-                            "cloud mutation honestly gated — placement target unreachable"
-                        );
-                        self.write_reply(&persist, &msg.ulid, &reply);
-                        acted = true;
+                        self.deliver_transaction(persist, &mut transaction)?;
+                    } else {
+                        let reply = self.handle(&action.verb, &body);
+                        self.write_reply(persist, &action.ulid, &reply)?;
                     }
+                    tracing::info!(
+                        target: "mackesd::cloud",
+                        ulid = %action.ulid,
+                        verb = %action.verb,
+                        "cloud action transaction committed"
+                    );
+                    cursors.insert(action.topic, action.ulid);
+                    acted = true;
                 }
             }
         }
-        acted
+        Ok(acted)
     }
 
-    /// Seed each existing `action/cloud/*` topic's cursor to its newest message so
-    /// a (re)start doesn't replay a backlog of verbs.
+    fn drain_actions_on(
+        &self,
+        persist: &Persist,
+        cursors: &mut HashMap<String, String>,
+    ) -> io::Result<bool> {
+        let staged = self.stage_actions(persist, cursors)?;
+        self.apply_staged_actions(persist, cursors, staged)
+    }
+
+    /// Compatibility seam retained for focused tests and direct adapters.
+    fn drain_actions(&self, cursors: &mut HashMap<String, String>) -> bool {
+        let result = self.open_bus().and_then(|opened| match opened {
+            Some((persist, _)) => self.drain_actions_on(&persist, cursors),
+            None => Ok(false),
+        });
+        match result {
+            Ok(acted) => acted,
+            Err(error) => {
+                tracing::warn!(target: "mackesd::cloud", %error, "cloud action transaction deferred");
+                false
+            }
+        }
+    }
+
+    /// Atomically seed all existing Cloud action lanes. A failure leaves the
+    /// caller's prior cursor set untouched.
     fn prime_cursors(&self, cursors: &mut HashMap<String, String>) {
-        let Some(root) = self.bus_root.clone() else {
+        let Ok(Some((persist, identity))) = self.open_bus() else {
             return;
         };
-        let Ok(persist) = Persist::open(root) else {
-            return;
-        };
-        let Ok(topics) = persist.list_topics() else {
-            return;
-        };
-        for topic in topics {
-            if !topic.starts_with(CLOUD_ACTION_PREFIX) {
-                continue;
-            }
-            if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
-                cursors.insert(topic, ulid);
-            }
+        if let Ok(activation) = self.activate_bus(&persist, identity) {
+            *cursors = activation.cursors;
         }
     }
 
@@ -812,8 +1173,8 @@ impl CloudWorker {
 
     fn load_admitted_android_catalog(&self) -> Option<AndroidSignedCatalog> {
         const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
-        let root = self.bus_root.as_ref()?;
-        let persist = Persist::open(root.clone()).ok()?;
+        let root = self.bus_root()?;
+        let persist = Persist::open(root).ok()?;
         let topic = android_catalog_state_topic(&self.host).ok()?;
         let body = persist.read_latest(&topic).ok()??.body?;
         if body.is_empty() || body.len() > MAX_CATALOG_BYTES {
@@ -952,14 +1313,24 @@ impl CloudWorker {
         }
     }
 
-    /// Publish the current mirror to `state/cloud/<host>` (best-effort).
-    fn publish_state(&self) {
-        let state = self.build_state();
-        if let Some(mut persist) =
-            crate::bus_publish::open_bus(self.bus_root.as_ref().map(PathBuf::clone))
-        {
-            crate::bus_publish::publish_json(&mut persist, &cloud_state_topic(&self.host), &state);
+    /// Publish the current mirror. Callers retain dirty state and retry until
+    /// this complete write succeeds.
+    fn publish_state(&self, persist: &Persist) -> io::Result<()> {
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_state_writes) {
+            return Err(io::Error::other("injected cloud state write failure"));
         }
+        let state = self.build_state();
+        let body = serde_json::to_string(&state).map_err(io_other)?;
+        persist
+            .write(
+                &cloud_state_topic(&self.host),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
     }
 }
 
@@ -1075,35 +1446,85 @@ impl Worker for CloudWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let mut cursors: HashMap<String, String> = HashMap::new();
-        // Don't replay a backlog of verbs across a restart.
-        self.prime_cursors(&mut cursors);
-        // Publish an initial mirror so a surface doesn't wait a full tick.
-        self.publish_state();
+        let mut activation: Option<CloudBusActivation> = None;
+        let mut state_dirty = true;
         let mut last_pub = Instant::now();
-        // The drift plan runs on its own (heavier) cadence, decoupled from the
-        // health heartbeat; a fresh snapshot forces an out-of-band republish.
         let mut last_drift = Instant::now();
         let mut last_android_inventory = Instant::now();
         loop {
-            let acted = self.drain_actions(&mut cursors);
-            let drift_due = last_drift.elapsed() >= self.drift_interval;
-            if drift_due {
-                self.refresh_drift();
-                last_drift = Instant::now();
-            }
-            let inventory_due = !self.android_guest_providers.is_empty()
-                && (drift_due
-                    || last_android_inventory.elapsed() >= self.android_inventory_interval);
-            let inventory_changed = if inventory_due {
-                last_android_inventory = Instant::now();
-                self.refresh_android_inventories()
-            } else {
-                false
-            };
-            if acted || drift_due || inventory_changed || last_pub.elapsed() >= self.heartbeat {
-                self.publish_state();
-                last_pub = Instant::now();
+            match self.open_bus() {
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::cloud", %error, "cloud Bus unavailable; worker will retry");
+                    activation = None;
+                }
+                Ok(None) => {}
+                Ok(Some((persist, identity))) => {
+                    let needs_activation = activation
+                        .as_ref()
+                        .is_none_or(|active| active.identity != identity);
+                    if needs_activation {
+                        match self.activate_bus(&persist, identity) {
+                            Ok(active) => {
+                                activation = Some(active);
+                                state_dirty = true;
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::cloud", %error, "cloud Bus activation deferred");
+                                activation = None;
+                            }
+                        }
+                    }
+
+                    if let Some(active) = activation.as_mut() {
+                        let recovery_ready = match self.recover_pending_transactions(
+                            &persist,
+                            &mut active.pending_transactions,
+                        ) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::cloud", %error, "cloud action outbox recovery deferred");
+                                false
+                            }
+                        };
+                        if recovery_ready {
+                            let cursors_before = active.cursors.clone();
+                            match self.drain_actions_on(&persist, &mut active.cursors) {
+                                Ok(acted) => state_dirty |= acted,
+                                Err(error) => {
+                                    state_dirty |= active.cursors != cursors_before;
+                                    tracing::warn!(target: "mackesd::cloud", %error, "cloud action sweep deferred");
+                                }
+                            }
+                        }
+
+                        let drift_due = last_drift.elapsed() >= self.drift_interval;
+                        if drift_due {
+                            self.refresh_drift();
+                            last_drift = Instant::now();
+                            state_dirty = true;
+                        }
+                        let inventory_due = !self.android_guest_providers.is_empty()
+                            && (drift_due
+                                || last_android_inventory.elapsed()
+                                    >= self.android_inventory_interval);
+                        if inventory_due {
+                            last_android_inventory = Instant::now();
+                            state_dirty |= self.refresh_android_inventories();
+                        }
+                        if state_dirty || last_pub.elapsed() >= self.heartbeat {
+                            match self.publish_state(&persist) {
+                                Ok(()) => {
+                                    state_dirty = false;
+                                    last_pub = Instant::now();
+                                }
+                                Err(error) => {
+                                    state_dirty = true;
+                                    tracing::warn!(target: "mackesd::cloud", %error, "cloud state publication failed; corrected-forward retry retained");
+                                }
+                            }
+                        }
+                    }
+                }
             }
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
@@ -1124,6 +1545,48 @@ pub(crate) fn now_ms() -> i64 {
 
 fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
+}
+
+fn cloud_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+fn bus_identity(root: &Path) -> io::Result<BusIdentity> {
+    let metadata = fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("cloud Bus index is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(BusIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+}
+
+#[cfg(test)]
+fn take_fault(counter: &std::sync::atomic::AtomicUsize) -> bool {
+    counter
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
 }
 
 /// Host-local Android package manifests are staged by the image/placement
@@ -1951,6 +2414,10 @@ mod tests {
     #[test]
     fn default_bus_root_uses_the_shared_mde_bus_resolver() {
         assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+        assert_eq!(
+            cloud_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
     }
 
     // ── the U5 drift tick folds workloads + rollup into the mirror ──
@@ -2299,6 +2766,319 @@ mod tests {
             runner.calls.lock().unwrap().is_empty(),
             "no stale provision fired"
         );
+    }
+
+    fn armed_configure_body(node: &str) -> String {
+        let base = format!(r#"{{"schema_version":1,"node":"{node}"}}"#);
+        let token = valid_token(
+            "configure",
+            node,
+            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+            &base,
+        );
+        format!(r#"{{"schema_version":1,"node":"{node}","armed_token":"{token}"}}"#)
+    }
+
+    async fn wait_for_bus_message(root: &Path, topic: &str) -> mde_bus::persist::StoredMessage {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(persist) = Persist::open(root.to_path_buf()) {
+                    if let Ok(Some(message)) = persist.read_latest(topic) {
+                        break message;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Bus message")
+    }
+
+    #[tokio::test]
+    async fn run_recovers_late_and_replaced_bus_without_replaying_retained_actions() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        fs::write(&root, "blocking file").expect("block Bus root");
+        let faults = Arc::new(CloudBusFaults::default());
+        faults
+            .fail_state_writes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let mut worker = CloudWorker::new("me".into(), "peer:me".into(), temp.path().join("state"))
+            .with_runner(Arc::new(FakeRunner {
+                roster: vec![instance("web", "ACTIVE")],
+                ..Default::default()
+            }))
+            .with_bus_root(Some(root.clone()))
+            .with_bus_faults(faults)
+            .with_poll(Duration::from_millis(10))
+            .with_drift_interval(Duration::from_secs(3_600));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        let staged = temp.path().join("staged-bus");
+        let staged_bus = Persist::open(staged.clone()).expect("staged Bus");
+        let retained = staged_bus
+            .write("action/cloud/status", Priority::Default, None, Some("{}"))
+            .expect("retained action");
+        drop(staged_bus);
+        fs::remove_file(&root).expect("unblock Bus root");
+        fs::rename(&staged, &root).expect("install late Bus");
+        wait_for_bus_message(&root, &cloud_state_topic("me")).await;
+        let bus = Persist::open(root.clone()).expect("late Bus");
+        assert!(bus
+            .read_latest(&reply_topic(&retained.ulid))
+            .expect("retained reply read")
+            .is_none());
+        let forward = bus
+            .write(
+                "action/cloud/list-instances",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("forward action");
+        wait_for_bus_message(&root, &reply_topic(&forward.ulid)).await;
+        drop(bus);
+
+        let replacement = temp.path().join("replacement-bus");
+        let replacement_bus = Persist::open(replacement.clone()).expect("replacement staging");
+        let replacement_retained = replacement_bus
+            .write("action/cloud/status", Priority::Default, None, Some("{}"))
+            .expect("replacement retained action");
+        drop(replacement_bus);
+        fs::rename(&root, temp.path().join("retired-bus")).expect("retire Bus");
+        fs::rename(&replacement, &root).expect("install replacement Bus");
+        wait_for_bus_message(&root, &cloud_state_topic("me")).await;
+        let bus = Persist::open(root.clone()).expect("replacement Bus");
+        assert!(bus
+            .read_latest(&reply_topic(&replacement_retained.ulid))
+            .expect("replacement retained reply read")
+            .is_none());
+        let replacement_forward = bus
+            .write(
+                "action/cloud/list-instances",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("replacement forward action");
+        wait_for_bus_message(&root, &reply_topic(&replacement_forward.ulid)).await;
+
+        shutdown_tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+    }
+
+    #[test]
+    fn activation_tail_prime_is_atomic_and_dynamic_first_action_executes_once() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        let persist = Persist::open(root.clone()).expect("Bus");
+        persist
+            .write(
+                "action/cloud/configure",
+                Priority::Default,
+                None,
+                Some(&armed_configure_body("me")),
+            )
+            .expect("retained configure");
+        persist
+            .write("action/cloud/status", Priority::Default, None, Some("{}"))
+            .expect("retained status");
+        let faults = Arc::new(CloudBusFaults::default());
+        *faults.fail_action_read_topic.lock().expect("fault lock") =
+            Some("action/cloud/status".to_string());
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), temp.path().join("state"))
+            .with_runner(Arc::new(FakeRunner::default()))
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(Some(root.clone()))
+            .with_bus_faults(faults.clone());
+        let mut cursors = HashMap::from([("sentinel".to_string(), "cursor".to_string())]);
+        worker.prime_cursors(&mut cursors);
+        assert_eq!(
+            cursors,
+            HashMap::from([("sentinel".to_string(), "cursor".to_string())]),
+            "partial activation cannot replace the prior cursor set"
+        );
+        *faults.fail_action_read_topic.lock().expect("fault lock") = None;
+        worker.prime_cursors(&mut cursors);
+        assert!(!worker.drain_actions(&mut cursors));
+
+        let first = persist
+            .write(
+                "action/cloud/list-instances",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("dynamic first action");
+        assert!(worker.drain_actions(&mut cursors));
+        assert!(!worker.drain_actions(&mut cursors));
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&first.ulid), None)
+                .expect("first replies")
+                .len(),
+            1
+        );
+        let second = persist
+            .write(
+                "action/cloud/list-instances",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("second action");
+        assert!(worker.drain_actions(&mut cursors));
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&second.ulid), None)
+                .expect("second replies")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn final_lane_and_reachability_read_failures_defer_all_backend_effects() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        let persist = Persist::open(root.clone()).expect("Bus");
+        persist
+            .write(
+                "action/cloud/configure",
+                Priority::Default,
+                None,
+                Some(&armed_configure_body("me")),
+            )
+            .expect("local mutation");
+        persist
+            .write("action/cloud/status", Priority::Default, None, Some("{}"))
+            .expect("final lane");
+        let faults = Arc::new(CloudBusFaults::default());
+        *faults.fail_action_read_topic.lock().expect("fault lock") =
+            Some("action/cloud/status".to_string());
+        let runner = Arc::new(FakeRunner::default());
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), temp.path().join("state"))
+            .with_runner(runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(Some(root.clone()))
+            .with_bus_faults(faults.clone());
+        let mut cursors = HashMap::new();
+        assert!(!worker.drain_actions(&mut cursors));
+        assert!(cursors.is_empty());
+        assert!(runner.calls.lock().expect("calls").is_empty());
+
+        *faults.fail_action_read_topic.lock().expect("fault lock") = None;
+        persist
+            .write(
+                &cloud_state_topic("ghost"),
+                Priority::Default,
+                None,
+                Some("not-json"),
+            )
+            .expect("malformed reachability mirror");
+        persist
+            .write(
+                "action/cloud/set-desired",
+                Priority::Default,
+                None,
+                Some(r#"{"schema_version":1,"node":"ghost"}"#),
+            )
+            .expect("remote mutation");
+        assert!(!worker.drain_actions(&mut cursors));
+        assert!(cursors.is_empty());
+        assert!(runner.calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
+    fn reply_failure_recovers_durable_mutation_without_repeating_effect() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        let persist = Persist::open(root.clone()).expect("Bus");
+        let request = persist
+            .write(
+                "action/cloud/configure",
+                Priority::Default,
+                None,
+                Some(&armed_configure_body("me")),
+            )
+            .expect("mutation");
+        let faults = Arc::new(CloudBusFaults::default());
+        faults
+            .fail_reply_writes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let runner = Arc::new(FakeRunner::default());
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), temp.path().join("state"))
+            .with_runner(runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(Some(root.clone()))
+            .with_bus_faults(faults);
+        let mut cursors = HashMap::new();
+        assert!(!worker.drain_actions(&mut cursors));
+        assert_eq!(runner.calls.lock().expect("calls").len(), 1);
+        assert!(!cursors.contains_key("action/cloud/configure"));
+        assert!(persist
+            .read_latest(&reply_topic(&request.ulid))
+            .expect("reply read")
+            .is_none());
+
+        let restarted = CloudWorker::new("me".into(), "peer:me".into(), temp.path().join("state"))
+            .with_runner(runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(Some(root.clone()));
+        let (reopened, identity) = restarted.open_bus().expect("open").expect("enabled");
+        let mut activation = restarted
+            .activate_bus(&reopened, identity)
+            .expect("restart activation");
+        assert_eq!(activation.pending_transactions.len(), 1);
+        restarted
+            .recover_pending_transactions(&reopened, &mut activation.pending_transactions)
+            .expect("outbox recovery");
+        assert!(activation.pending_transactions.is_empty());
+        assert_eq!(runner.calls.lock().expect("calls").len(), 1);
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&request.ulid), None)
+                .expect("recovered replies")
+                .len(),
+            1
+        );
+
+        let malformed = persist
+            .write("action/cloud/list-instances", Priority::Default, None, None)
+            .expect("malformed request");
+        let retry_faults = Arc::new(CloudBusFaults::default());
+        retry_faults
+            .fail_reply_writes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let retrying = CloudWorker::new(
+            "me".into(),
+            "peer:me".into(),
+            temp.path().join("retry-state"),
+        )
+        .with_runner(runner.clone())
+        .with_bus_root(Some(root.clone()))
+        .with_bus_faults(retry_faults);
+        assert!(!retrying
+            .drain_actions_on(&reopened, &mut activation.cursors)
+            .unwrap_or(false));
+        assert!(!activation
+            .cursors
+            .contains_key("action/cloud/list-instances"));
+        assert!(retrying
+            .drain_actions_on(&reopened, &mut activation.cursors)
+            .expect("malformed reply retry"));
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&malformed.ulid), None)
+                .expect("malformed replies")
+                .len(),
+            1
+        );
+        assert_eq!(runner.calls.lock().expect("calls").len(), 1);
     }
 
     #[tokio::test]
