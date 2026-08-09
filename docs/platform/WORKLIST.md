@@ -120,13 +120,12 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-provision-hard-cut-r8.md`.
 - **Authority/contract hardening (2026-08-09):** lifecycle/provision bypasses were deleted; attachment identity, restart replay, and Display1 ownership fail closed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-contract-restart-display1-hardening-r12.md`.
-- **Cloud production/recovery checkpoints (2026-08-09):** authorization exports compile outside tests; late/replaced Bus activation and durable mutation outbox
-  recovery passed focused BigBoy/machine-193 gates: `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-production-compile-r14.md`,
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`.
-- **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
-  migration commands are atomically journaled before effects, replay pending
-  records after restart, clean applied records without repeating effects, and
-  pace retryable recovery. Evidence:
+- **Cloud/Workload recovery checkpoints (2026-08-09):** production authorization and late/replaced Bus activation preserve durable mutation/reply output:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-production-compile-r14.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`.
+- **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
+  repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
 - **Distributed migration recovery checkpoint (2026-08-08):** one bounded
   atomic authority now persists all migration cursors, admitted source/target
@@ -426,15 +425,15 @@ behavioral evidence is not completion.
 - **Compute/Cloud/Storage Bus recovery checkpoints (2026-08-09):** late/replaced storage now preserves firewall, Cloud, and physical-storage transaction truth;
   complete reads precede effects; authorization/pending output prevents repeats. Gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
-  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`.
+  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`.
 - **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open and tail priming as one fail-closed activation, skips retained actions, and executes one
   forward signed action exactly once; BigBoy passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
 - **Copilot Bus recovery checkpoint (2026-08-09):** late activation skips retained asks and answers one forward signed ask exactly once; machine 196 passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
-- **Session broker replacement recovery (2026-08-09):** roster-preserving dual-tail activation skips retained lifecycle/runtime rows; machine 196 passed exact gates:
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`.
-  Session Roaming also preserves its fold and skips retained replacement policy:
+- **Session replacement recovery (2026-08-09):** broker dual-tail and Roaming fold preserve state while skipping retained replacement rows. Machine 196 gates:
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-roaming-bus-replacement-r78.md`.
 - **Vehicle transaction recovery (2026-08-09):** late/replaced Bus storage preserves staged state; a privileged-reboot journal prevents repeated effects.
   BigBoy passed four exact gates:

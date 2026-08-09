@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
+use std::io;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -31,7 +32,7 @@ use mackes_mesh_types::workloads::{
     MAX_WORKLOAD_WIRE_BYTES, WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use mde_bus::rpc::reply_topic;
 use sha2::{Digest, Sha256};
 
@@ -81,6 +82,85 @@ const MAX_PENDING_MIGRATION_COMMANDS: usize = 32;
 const MAX_MIGRATION_VM_ID_BYTES: usize = 256;
 const MAX_MIGRATION_DOMAIN_XML_BYTES: usize = 1024 * 1024;
 const MAX_MIGRATION_COMMAND_RECORD_BYTES: u64 = (MAX_MIGRATION_DOMAIN_XML_BYTES + 4096) as u64;
+const REPLY_OUTBOX_DIR: &str = "reply-outbox";
+const MAX_REPLY_OUTBOX_RECORDS: usize = 128;
+const MAX_REPLY_OUTBOX_RECORD_BYTES: u64 = 128 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReplyOutboxPhase {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReplyOutboxRecord {
+    schema_version: u16,
+    message_ulid: String,
+    request_id: String,
+    phase: ReplyOutboxPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply: Option<WorkloadOperationReply>,
+}
+
+/// Host-local durable barrier between a Workload effect and its required Bus
+/// reply. It survives worker/daemon restart, so reply failure never re-enters
+/// the actuator. It does not make the backend effect and its post-effect ledger
+/// transition crash-atomic; recovery from the journaled `Defining` boundary
+/// continues to rely on each supported actuator's idempotent reconciliation.
+struct ReplyOutbox {
+    root: PathBuf,
+}
+
+struct BusActivation {
+    identity: BusIdentity,
+    tail: Option<String>,
+    pending_replies: Vec<StagedOutboxRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct BusTransaction<'a> {
+    persist: &'a Persist,
+    root: &'a Path,
+    identity: BusIdentity,
+}
+
+impl BusTransaction<'_> {
+    fn verify_current(self) -> io::Result<()> {
+        if bus_identity(self.root)? != self.identity {
+            return Err(io::Error::other(
+                "Workload Bus index changed during transaction",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct StagedOutboxRecord {
+    record: ReplyOutboxRecord,
+    existing_reply_body: Option<String>,
+}
+
+struct StagedOperationMessage {
+    message: StoredMessage,
+    outbox: Option<StagedOutboxRecord>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WorkloadBusFaults {
+    fail_action_reads: AtomicU64,
+    fail_reply_writes: AtomicU64,
+    fail_state_writes: AtomicU64,
+    replace_reply_index_after_write: Mutex<Option<PathBuf>>,
+    replace_index_after_open: Mutex<Option<PathBuf>>,
+}
 
 /// Workload placement is intentionally an exact role check, not a rank floor.
 /// A Lighthouse is rank 0 today, but accepting every nonzero rank would turn a
@@ -428,6 +508,149 @@ impl WorkloadMigrationJournal {
                 .map_err(|error| format!("sync migration command journal cleanup: {error}")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("remove migration command journal record: {error}")),
+        }
+    }
+}
+
+impl ReplyOutbox {
+    fn open(state_root: &Path) -> Result<Self, String> {
+        fs::create_dir_all(state_root)
+            .map_err(|error| format!("create Workload state root: {error}"))?;
+        let root = state_root.join(REPLY_OUTBOX_DIR);
+        fs::create_dir_all(&root).map_err(|error| format!("create reply outbox: {error}"))?;
+        let metadata = fs::symlink_metadata(&root)
+            .map_err(|error| format!("inspect reply outbox: {error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("reply outbox is not a regular directory".into());
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure reply outbox: {error}"))?;
+        Ok(Self { root })
+    }
+
+    fn record_path(&self, message_ulid: &str) -> PathBuf {
+        self.root.join(format!("{message_ulid}.json"))
+    }
+
+    fn validate(record: &ReplyOutboxRecord) -> Result<(), String> {
+        if record.schema_version != WORKLOAD_CONTRACT_SCHEMA_VERSION
+            || record.message_ulid.len() != 26
+            || !record
+                .message_ulid
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            || record.request_id.is_empty()
+            || record.request_id.len() > mackes_mesh_types::workloads::MAX_WORKLOAD_IDENTIFIER_BYTES
+            || record.request_id.chars().any(char::is_control)
+            || (record.phase == ReplyOutboxPhase::Pending && record.reply.is_some())
+            || (record.phase == ReplyOutboxPhase::Completed && record.reply.is_none())
+        {
+            return Err("reply outbox record failed validation".into());
+        }
+        Ok(())
+    }
+
+    fn store(&self, record: &ReplyOutboxRecord) -> Result<(), String> {
+        Self::validate(record)?;
+        let destination = self.record_path(&record.message_ulid);
+        if !destination.exists() {
+            let retained = fs::read_dir(&self.root)
+                .map_err(|error| format!("list reply outbox: {error}"))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|value| value == "json")
+                })
+                .count();
+            if retained >= MAX_REPLY_OUTBOX_RECORDS {
+                return Err("reply outbox is at capacity".into());
+            }
+        }
+        let body = serde_json::to_vec(record)
+            .map_err(|error| format!("encode reply outbox record: {error}"))?;
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_REPLY_OUTBOX_RECORD_BYTES {
+            return Err("reply outbox record is oversized".into());
+        }
+        let temporary = self.root.join(format!(
+            ".{}.{}.{}.tmp",
+            record.message_ulid,
+            std::process::id(),
+            now_ms()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("create reply outbox record: {error}"))?;
+        if let Err(error) = file.write_all(&body).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("persist reply outbox record: {error}"));
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("commit reply outbox record: {error}"));
+        }
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync reply outbox directory: {error}"))?;
+        Ok(())
+    }
+
+    fn decode_path(&self, path: &Path) -> Result<ReplyOutboxRecord, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("inspect reply outbox record: {error}"))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_REPLY_OUTBOX_RECORD_BYTES
+        {
+            return Err("reply outbox contains an unsafe record".into());
+        }
+        let body = fs::read(path).map_err(|error| format!("read reply outbox record: {error}"))?;
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| "reply outbox record is not UTF-8".to_string())?;
+        reject_duplicate_json_keys(text)
+            .map_err(|_| "reply outbox record has duplicate keys".to_string())?;
+        let record: ReplyOutboxRecord = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode reply outbox record: {error}"))?;
+        Self::validate(&record)?;
+        if self.record_path(&record.message_ulid) != path {
+            return Err("reply outbox filename does not match its record".into());
+        }
+        Ok(record)
+    }
+
+    fn load(&self, message_ulid: &str) -> Result<Option<ReplyOutboxRecord>, String> {
+        let path = self.record_path(message_ulid);
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.decode_path(&path).map(Some)
+    }
+
+    fn pending(&self) -> Result<Vec<ReplyOutboxRecord>, String> {
+        let mut paths = fs::read_dir(&self.root)
+            .map_err(|error| format!("list reply outbox: {error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|value| value == "json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.len() > MAX_REPLY_OUTBOX_RECORDS {
+            return Err("reply outbox exceeds its bounded capacity".into());
+        }
+        paths.iter().map(|path| self.decode_path(path)).collect()
+    }
+
+    fn remove(&self, message_ulid: &str) -> Result<(), String> {
+        match fs::remove_file(self.record_path(message_ulid)) {
+            Ok(()) => fs::File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync reply outbox cleanup: {error}")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove reply outbox record: {error}")),
         }
     }
 }
@@ -2276,7 +2499,9 @@ impl HandleResult {
 pub struct WorkloadComputeWorker {
     node_id: String,
     role_rank: u8,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
+    bus_disabled: bool,
+    bus_identity: Option<BusIdentity>,
     state_root: PathBuf,
     poll_interval: Duration,
     actuator: Box<dyn WorkloadActuator>,
@@ -2288,6 +2513,8 @@ pub struct WorkloadComputeWorker {
     migration_sender: SyncSender<WorkloadMigrationEnvelope>,
     migration_commands: Receiver<WorkloadMigrationEnvelope>,
     migration_replay_due_ms: AtomicU64,
+    #[cfg(test)]
+    bus_faults: Arc<WorkloadBusFaults>,
 }
 
 impl WorkloadComputeWorker {
@@ -2306,7 +2533,9 @@ impl WorkloadComputeWorker {
         Self {
             node_id,
             role_rank,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
+            bus_disabled: false,
+            bus_identity: None,
             state_root,
             poll_interval: DEFAULT_POLL_INTERVAL,
             actuator: Box::new(SystemWorkloadActuator::new(
@@ -2326,7 +2555,181 @@ impl WorkloadComputeWorker {
             migration_sender: migration_tx,
             migration_commands,
             migration_replay_due_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            bus_faults: Arc::new(WorkloadBusFaults::default()),
         }
+    }
+
+    fn bus_root(&self) -> Option<PathBuf> {
+        if self.bus_disabled {
+            return None;
+        }
+        Some(workload_bus_root_or_system(
+            self.bus_root_override
+                .clone()
+                .or_else(mde_bus::default_data_dir),
+        ))
+    }
+
+    fn open_bus(&self) -> io::Result<Option<(PathBuf, Persist, BusIdentity)>> {
+        let Some(root) = self.bus_root() else {
+            return Ok(None);
+        };
+        let identity_before = match bus_identity(&root) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Persist may legitimately create a late Bus. Discard that
+                // initializer connection, then bracket the connection we
+                // actually return with identity-before/after proof.
+                drop(Persist::open(root.clone()).map_err(io_other)?);
+                bus_identity(&root)?
+            }
+            Err(error) => return Err(error),
+        };
+        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        #[cfg(test)]
+        if let Some(replacement) = self
+            .bus_faults
+            .replace_index_after_open
+            .lock()
+            .expect("open replacement fault mutex")
+            .take()
+        {
+            install_replacement_index(&root, &replacement)?;
+        }
+        let identity_after = bus_identity(&root)?;
+        if identity_before != identity_after {
+            return Err(io::Error::other(
+                "Workload Bus index changed while opening transaction",
+            ));
+        }
+        Ok(Some((root, persist, identity_after)))
+    }
+
+    fn stage_activation(
+        &self,
+        transaction: BusTransaction<'_>,
+        outbox: &ReplyOutbox,
+    ) -> io::Result<BusActivation> {
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_action_reads) {
+            return Err(io::Error::other(
+                "injected Workload activation tail failure",
+            ));
+        }
+        let tail = transaction
+            .persist
+            .latest_ulid(ACTION_TOPIC)
+            .map_err(io_other)?;
+        let pending = outbox.pending().map_err(io::Error::other)?;
+        let mut pending_replies = Vec::with_capacity(pending.len());
+        for record in pending {
+            let existing_reply_body = transaction
+                .persist
+                .read_latest(&reply_topic(&record.message_ulid))
+                .map_err(io_other)?
+                .and_then(|message| message.body);
+            if let Some(reply) = &record.reply {
+                let _ = serde_json::to_string(reply).map_err(io_other)?;
+            }
+            pending_replies.push(StagedOutboxRecord {
+                record,
+                existing_reply_body,
+            });
+        }
+        transaction.verify_current()?;
+        Ok(BusActivation {
+            identity: transaction.identity,
+            tail,
+            pending_replies,
+        })
+    }
+
+    fn complete_pending_reply(
+        &self,
+        outbox: &ReplyOutbox,
+        ledger: &WorkloadOperationLedger,
+        mut record: ReplyOutboxRecord,
+    ) -> io::Result<ReplyOutboxRecord> {
+        if record.phase == ReplyOutboxPhase::Pending {
+            let reply = ledger.status(&record.request_id).cloned().map_or_else(
+                || {
+                    HandleResult::Rejected(WorkloadOperationErrorCode::JournalUnavailable)
+                        .reply(record.request_id.clone())
+                },
+                |status| HandleResult::Accepted(status).reply(record.request_id.clone()),
+            );
+            record.phase = ReplyOutboxPhase::Completed;
+            record.reply = Some(reply);
+            outbox.store(&record).map_err(io::Error::other)?;
+        }
+        Ok(record)
+    }
+
+    fn deliver_outbox_reply(
+        &self,
+        transaction: BusTransaction<'_>,
+        outbox: &ReplyOutbox,
+        record: &ReplyOutboxRecord,
+        existing_reply_body: Option<&str>,
+    ) -> io::Result<()> {
+        let reply = record
+            .reply
+            .as_ref()
+            .ok_or_else(|| io::Error::other("completed Workload outbox record has no reply"))?;
+        let expected = serde_json::to_string(reply).map_err(io_other)?;
+        let already_published = existing_reply_body.is_some_and(|body| body == expected);
+        if !already_published {
+            self.write_operation_reply(transaction, &record.message_ulid, reply)?;
+        }
+        // The write above uses an already-open SQLite connection. External
+        // replacement can move that connection onto a retired index, so prove
+        // the path still names the staged index before deleting the only
+        // durable retry record.
+        transaction.verify_current()?;
+        outbox
+            .remove(&record.message_ulid)
+            .map_err(io::Error::other)?;
+        if let Err(error) = transaction.verify_current() {
+            // Replacement can race the unlink after the pre-cleanup identity
+            // check. Restore the completed record so the current index still
+            // has a durable corrected-forward path.
+            outbox.store(record).map_err(io::Error::other)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn recover_activation_replies(
+        &self,
+        transaction: BusTransaction<'_>,
+        outbox: &ReplyOutbox,
+        ledger: &WorkloadOperationLedger,
+        records: Vec<StagedOutboxRecord>,
+    ) -> io::Result<Vec<ReplyOutboxRecord>> {
+        let mut delivered = Vec::new();
+        for staged in records {
+            let record = self.complete_pending_reply(outbox, ledger, staged.record)?;
+            if let Err(error) = self.deliver_outbox_reply(
+                transaction,
+                outbox,
+                &record,
+                staged.existing_reply_body.as_deref(),
+            ) {
+                for prior in &delivered {
+                    outbox.store(prior).map_err(io::Error::other)?;
+                }
+                return Err(error);
+            }
+            delivered.push(record);
+        }
+        if let Err(error) = transaction.verify_current() {
+            for record in &delivered {
+                outbox.store(record).map_err(io::Error::other)?;
+            }
+            return Err(error);
+        }
+        Ok(delivered)
     }
 
     fn register_migration_executor(&self) {
@@ -2459,7 +2862,14 @@ impl WorkloadComputeWorker {
     /// Override the Bus root for tests or a node-local service instance.
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_disabled = root.is_none();
+        self.bus_root_override = root;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_bus_faults(mut self, faults: Arc<WorkloadBusFaults>) -> Self {
+        self.bus_faults = faults;
         self
     }
 
@@ -3360,10 +3770,10 @@ impl WorkloadComputeWorker {
 
     fn publish(
         &mut self,
-        persist: Option<&mut Persist>,
+        transaction: Option<BusTransaction<'_>>,
         ledger: &WorkloadOperationLedger,
         now_ms: u64,
-    ) {
+    ) -> io::Result<()> {
         let mut latest = BTreeMap::<String, WorkloadOperationStatus>::new();
         for status in ledger.statuses() {
             let key = status.workload_id.as_str().to_string();
@@ -3388,7 +3798,7 @@ impl WorkloadComputeWorker {
             }
         }
         if self.last_projection.as_ref() == Some(&statuses) {
-            return;
+            return Ok(());
         }
         let snapshot = WorkloadStateSnapshot {
             schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
@@ -3398,105 +3808,240 @@ impl WorkloadComputeWorker {
         };
         if let Err(error) = snapshot.validate(now_ms) {
             tracing::error!(%error, "workload state projection refused");
-            return;
+            return Err(io::Error::other(error.to_string()));
         }
-        if let Some(persist) = persist {
-            crate::bus_publish::publish_json(
-                persist,
-                &workload_state_topic(&self.node_id),
-                &snapshot,
-            );
+        if let Some(transaction) = transaction {
+            #[cfg(test)]
+            if take_fault(&self.bus_faults.fail_state_writes) {
+                return Err(io::Error::other(
+                    "injected Workload state publication failure",
+                ));
+            }
+            let body = serde_json::to_string(&snapshot).map_err(io_other)?;
+            transaction
+                .persist
+                .write(
+                    &workload_state_topic(&self.node_id),
+                    Priority::Default,
+                    None,
+                    Some(&body),
+                )
+                .map_err(io_other)?;
+            transaction.verify_current()?;
+            self.last_projection = Some(statuses);
         }
-        self.last_projection = Some(statuses);
+        Ok(())
     }
 
     fn write_operation_reply(
         &self,
-        persist: &Persist,
+        transaction: BusTransaction<'_>,
         message_ulid: &str,
         reply: &WorkloadOperationReply,
-    ) {
-        let body = serde_json::to_string(reply).unwrap_or_else(|_| {
-            r#"{"schema_version":1,"request_id":"invalid-request","accepted":false,"status":null,"error_code":"journal_unavailable"}"#
-                .to_string()
-        });
-        if let Err(error) = persist.write(
-            &reply_topic(message_ulid),
-            Priority::Default,
-            None,
-            Some(&body),
-        ) {
-            tracing::warn!(
-                target: "mackesd::workload_compute",
-                message_ulid,
-                %error,
-                "workload operation reply write failed"
-            );
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_reply_writes) {
+            return Err(io::Error::other(
+                "injected Workload operation reply failure",
+            ));
         }
+        let body = serde_json::to_string(reply).map_err(io_other)?;
+        transaction
+            .persist
+            .write(
+                &reply_topic(message_ulid),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        #[cfg(test)]
+        if let Some(replacement) = self
+            .bus_faults
+            .replace_reply_index_after_write
+            .lock()
+            .expect("replacement fault mutex")
+            .take()
+        {
+            install_replacement_index(transaction.root, &replacement)?;
+        }
+        Ok(())
+    }
+
+    fn stage_operation_messages(
+        &self,
+        persist: &Persist,
+        outbox: &ReplyOutbox,
+    ) -> io::Result<Vec<StagedOperationMessage>> {
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_action_reads) {
+            return Err(io::Error::other("injected Workload action read failure"));
+        }
+        let messages = persist
+            .list_since_limit(
+                ACTION_TOPIC,
+                self.cursor.as_deref(),
+                MAX_OPERATION_MESSAGES_PER_TICK,
+            )
+            .map_err(io_other)?;
+        let mut staged = Vec::with_capacity(messages.len());
+        for message in messages {
+            let outbox_record = outbox.load(&message.ulid).map_err(io::Error::other)?;
+            let outbox = if let Some(record) = outbox_record {
+                let existing_reply_body = persist
+                    .read_latest(&reply_topic(&record.message_ulid))
+                    .map_err(io_other)?
+                    .and_then(|reply| reply.body);
+                Some(StagedOutboxRecord {
+                    record,
+                    existing_reply_body,
+                })
+            } else {
+                None
+            };
+            staged.push(StagedOperationMessage { message, outbox });
+        }
+        Ok(staged)
+    }
+
+    fn completed_outbox_record(
+        message_ulid: String,
+        reply: WorkloadOperationReply,
+    ) -> ReplyOutboxRecord {
+        ReplyOutboxRecord {
+            schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+            message_ulid,
+            request_id: reply.request_id.clone(),
+            phase: ReplyOutboxPhase::Completed,
+            reply: Some(reply),
+        }
+    }
+
+    fn process_staged_messages(
+        &mut self,
+        ledger: &mut WorkloadOperationLedger,
+        transaction: BusTransaction<'_>,
+        outbox: &ReplyOutbox,
+        staged: Vec<StagedOperationMessage>,
+        now: u64,
+    ) -> io::Result<()> {
+        for staged_message in staged {
+            let message = staged_message.message;
+            if let Some(staged_outbox) = staged_message.outbox {
+                let record = self.complete_pending_reply(outbox, ledger, staged_outbox.record)?;
+                self.deliver_outbox_reply(
+                    transaction,
+                    outbox,
+                    &record,
+                    staged_outbox.existing_reply_body.as_deref(),
+                )?;
+                self.cursor = Some(message.ulid);
+                continue;
+            }
+
+            let body = message.body.as_deref().unwrap_or("");
+            if body.len() > MAX_WORKLOAD_WIRE_BYTES {
+                tracing::warn!("oversized workload operation refused");
+                let record = Self::completed_outbox_record(
+                    message.ulid.clone(),
+                    HandleResult::Rejected(WorkloadOperationErrorCode::PayloadTooLarge)
+                        .reply(safe_request_id(body)),
+                );
+                outbox.store(&record).map_err(io::Error::other)?;
+                self.deliver_outbox_reply(transaction, outbox, &record, None)?;
+                self.cursor = Some(message.ulid);
+                continue;
+            }
+            let request = match WorkloadOperationRequest::from_json(body, now) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, "malformed workload operation refused");
+                    let code = match error {
+                        mackes_mesh_types::workloads::WorkloadContractError::PayloadTooLarge => {
+                            WorkloadOperationErrorCode::PayloadTooLarge
+                        }
+                        _ => WorkloadOperationErrorCode::MalformedRequest,
+                    };
+                    let record = Self::completed_outbox_record(
+                        message.ulid.clone(),
+                        HandleResult::Rejected(code).reply(safe_request_id(body)),
+                    );
+                    outbox.store(&record).map_err(io::Error::other)?;
+                    self.deliver_outbox_reply(transaction, outbox, &record, None)?;
+                    self.cursor = Some(message.ulid);
+                    continue;
+                }
+            };
+            if request.target_node != self.node_id {
+                transaction.verify_current()?;
+                self.cursor = Some(message.ulid);
+                continue;
+            }
+            let request_id = request.request_id.clone();
+            let pending = ReplyOutboxRecord {
+                schema_version: WORKLOAD_CONTRACT_SCHEMA_VERSION,
+                message_ulid: message.ulid.clone(),
+                request_id: request_id.clone(),
+                phase: ReplyOutboxPhase::Pending,
+                reply: None,
+            };
+            outbox.store(&pending).map_err(io::Error::other)?;
+            let result = self.handle_request(ledger, body, request, now);
+            let completed =
+                Self::completed_outbox_record(message.ulid.clone(), result.reply(request_id));
+            outbox.store(&completed).map_err(io::Error::other)?;
+            self.deliver_outbox_reply(transaction, outbox, &completed, None)?;
+            self.cursor = Some(message.ulid);
+        }
+        Ok(())
+    }
+
+    fn tick_once_result(
+        &mut self,
+        ledger: &mut WorkloadOperationLedger,
+        transaction: Option<BusTransaction<'_>>,
+        outbox: &ReplyOutbox,
+    ) -> io::Result<()> {
+        let staged = transaction
+            .map(|transaction| self.stage_operation_messages(transaction.persist, outbox))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(transaction) = transaction {
+            transaction.verify_current()?;
+        }
+        self.drain_migration_commands();
+        let now = now_ms();
+        if let Some(transaction) = transaction {
+            self.process_staged_messages(ledger, transaction, outbox, staged, now)?;
+        }
+        self.reconcile_inflight(ledger, now);
+        self.reconcile_recovered_attachments(ledger, now);
+        self.actuator.reap_expired(now);
+        self.publish(transaction, ledger, now)
     }
 
     fn tick_once(
         &mut self,
         ledger: &mut WorkloadOperationLedger,
-        mut persist: Option<&mut Persist>,
+        persist: Option<(&Persist, &Path)>,
     ) {
-        self.drain_migration_commands();
-        let now = now_ms();
-        if let Some(persist_ref) = persist.as_deref_mut() {
-            let messages = persist_ref.list_since_limit(
-                ACTION_TOPIC,
-                self.cursor.as_deref(),
-                MAX_OPERATION_MESSAGES_PER_TICK,
-            );
-            if let Ok(messages) = messages {
-                for message in messages {
-                    self.cursor = Some(message.ulid.clone());
-                    let body = message.body.as_deref().unwrap_or("");
-                    if body.len() > MAX_WORKLOAD_WIRE_BYTES {
-                        tracing::warn!("oversized workload operation refused");
-                        self.write_operation_reply(
-                            persist_ref,
-                            &message.ulid,
-                            &HandleResult::Rejected(WorkloadOperationErrorCode::PayloadTooLarge)
-                                .reply(safe_request_id(body)),
-                        );
-                        continue;
-                    }
-                    let request = match WorkloadOperationRequest::from_json(body, now) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            tracing::warn!(%error, "malformed workload operation refused");
-                            let code = match error {
-                                mackes_mesh_types::workloads::WorkloadContractError::PayloadTooLarge => {
-                                    WorkloadOperationErrorCode::PayloadTooLarge
-                                }
-                                _ => WorkloadOperationErrorCode::MalformedRequest,
-                            };
-                            self.write_operation_reply(
-                                persist_ref,
-                                &message.ulid,
-                                &HandleResult::Rejected(code).reply(safe_request_id(body)),
-                            );
-                            continue;
-                        }
-                    };
-                    if request.target_node != self.node_id {
-                        continue;
-                    }
-                    let request_id = request.request_id.clone();
-                    let result = self.handle_request(ledger, body, request, now);
-                    self.write_operation_reply(
-                        persist_ref,
-                        &message.ulid,
-                        &result.reply(request_id),
-                    );
-                }
-            }
+        let result = ReplyOutbox::open(&self.state_root)
+            .map_err(io::Error::other)
+            .and_then(|outbox| {
+                let transaction = persist
+                    .map(|(persist, root)| {
+                        bus_identity(root).map(|identity| BusTransaction {
+                            persist,
+                            root,
+                            identity,
+                        })
+                    })
+                    .transpose()?;
+                self.tick_once_result(ledger, transaction, &outbox)
+            });
+        if let Err(error) = result {
+            tracing::warn!(target: "mackesd::workload_compute", %error, "Workload transaction deferred");
         }
-        self.reconcile_inflight(ledger, now);
-        self.reconcile_recovered_attachments(ledger, now);
-        self.actuator.reap_expired(now);
-        self.publish(persist, ledger, now);
     }
 }
 
@@ -3510,21 +4055,123 @@ impl Worker for WorkloadComputeWorker {
         self.register_migration_executor();
         let mut ledger = WorkloadOperationLedger::open(&self.state_root)
             .map_err(|error| anyhow::anyhow!("open workload operation journal: {error}"))?;
-        let mut persist = self
-            .bus_root
-            .clone()
-            .and_then(|root| Persist::open(root).ok());
-        self.tick_once(&mut ledger, persist.as_mut());
+        let outbox = ReplyOutbox::open(&self.state_root)
+            .map_err(|error| anyhow::anyhow!("open workload reply outbox: {error}"))?;
         loop {
+            match self.open_bus() {
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::workload_compute", %error, "Workload Bus unavailable; worker will retry");
+                }
+                Ok(None) => {
+                    if let Err(error) = self.tick_once_result(&mut ledger, None, &outbox) {
+                        tracing::warn!(target: "mackesd::workload_compute", %error, "disabled-Bus Workload reconciliation deferred");
+                    }
+                }
+                Ok(Some((root, persist, identity))) => {
+                    let transaction = BusTransaction {
+                        persist: &persist,
+                        root: &root,
+                        identity,
+                    };
+                    let activated = if self.bus_identity == Some(identity) {
+                        true
+                    } else {
+                        match self.stage_activation(transaction, &outbox) {
+                            Ok(activation) => {
+                                match self.recover_activation_replies(
+                                    transaction,
+                                    &outbox,
+                                    &ledger,
+                                    activation.pending_replies,
+                                ) {
+                                    Ok(delivered) => match transaction.verify_current() {
+                                        Ok(()) => {
+                                            self.cursor = activation.tail;
+                                            self.bus_identity = Some(activation.identity);
+                                            self.last_projection = None;
+                                            true
+                                        }
+                                        Err(error) => {
+                                            for record in &delivered {
+                                                if let Err(restore_error) = outbox.store(record) {
+                                                    tracing::error!(target: "mackesd::workload_compute", %restore_error, "Workload reply outbox restore failed after activation replacement");
+                                                }
+                                            }
+                                            tracing::warn!(target: "mackesd::workload_compute", %error, "Workload Bus changed before activation commit");
+                                            false
+                                        }
+                                    },
+                                    Err(error) => {
+                                        tracing::warn!(target: "mackesd::workload_compute", %error, "Workload reply recovery deferred activation");
+                                        false
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "mackesd::workload_compute", %error, "Workload Bus activation deferred");
+                                false
+                            }
+                        }
+                    };
+                    if activated {
+                        if let Err(error) =
+                            self.tick_once_result(&mut ledger, Some(transaction), &outbox)
+                        {
+                            tracing::warn!(target: "mackesd::workload_compute", %error, "Workload Bus transaction deferred");
+                        }
+                    }
+                }
+            }
             tokio::select! {
                 () = shutdown.wait() => break,
-                () = tokio::time::sleep(self.poll_interval) => {
-                    self.tick_once(&mut ledger, persist.as_mut());
-                }
+                () = tokio::time::sleep(self.poll_interval) => {}
             }
         }
         Ok(())
     }
+}
+
+fn workload_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn bus_identity(root: &Path) -> io::Result<BusIdentity> {
+    let metadata = fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("Workload Bus index is not a regular file"));
+    }
+    use std::os::unix::fs::MetadataExt;
+    Ok(BusIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(test)]
+fn install_replacement_index(root: &Path, replacement: &Path) -> io::Result<()> {
+    // A test replacement models an external installer publishing one complete
+    // SQLite generation. Retired WAL state must not leak into that generation.
+    for sidecar in ["index.sqlite-wal", "index.sqlite-shm"] {
+        match fs::remove_file(root.join(sidecar)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::rename(replacement, root.join("index.sqlite"))
+}
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+fn take_fault(counter: &AtomicU64) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
 }
 
 fn live_capacity<'a>(
@@ -5208,11 +5855,428 @@ mod tests {
         );
     }
 
+    async fn wait_for_bus_row(root: &Path, topic: &str) -> StoredMessage {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(persist) = Persist::open(root.to_path_buf()) {
+                    if let Ok(Some(message)) = persist.read_latest(topic) {
+                        return message;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Workload Bus row")
+    }
+
+    fn bus_transaction<'a>(persist: &'a Persist, root: &'a Path) -> BusTransaction<'a> {
+        BusTransaction {
+            persist,
+            root,
+            identity: bus_identity(root).expect("Bus identity"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_late_and_replaced_bus_without_replaying_retained_actions() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        fs::write(&bus_root, b"Bus unavailable").expect("blocking Bus path");
+        let staged_root = temp.path().join("staged-bus");
+        let staged = Persist::open(staged_root.clone()).expect("staged Bus");
+        let mut retained = request();
+        retained.request_id = "retained-initial".into();
+        let retained_action = staged
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&retained).expect("retained wire")),
+            )
+            .expect("retained action");
+        drop(staged);
+
+        let calls = Arc::new(Mutex::new(0));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_bus_root(Some(bus_root.clone()))
+            .with_state_root(temp.path().join("state"))
+            .with_poll_interval(Duration::from_millis(10))
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task.is_finished(),
+            "missing Bus terminated Workload worker"
+        );
+
+        fs::remove_file(&bus_root).expect("remove blocker");
+        fs::rename(&staged_root, &bus_root).expect("install Bus");
+        wait_for_bus_row(&bus_root, &workload_state_topic("seat15")).await;
+        let bus = Persist::open(bus_root.clone()).expect("active Bus");
+        assert!(bus
+            .list_since(&reply_topic(&retained_action.ulid), None)
+            .expect("retained reply query")
+            .is_empty());
+        assert_eq!(*calls.lock().expect("calls"), 0);
+
+        let first = request();
+        let first_action = bus
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).expect("first wire")),
+            )
+            .expect("first forward action");
+        wait_for_bus_row(&bus_root, &reply_topic(&first_action.ulid)).await;
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        drop(bus);
+
+        let replacement_root = temp.path().join("replacement-bus");
+        let replacement = Persist::open(replacement_root.clone()).expect("replacement Bus");
+        let mut retained_replacement = request();
+        retained_replacement.request_id = "retained-replacement".into();
+        retained_replacement.workload_id =
+            WorkloadId::new("retained-seat15").expect("replacement workload id");
+        let retained_replacement_action = replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&retained_replacement)
+                        .expect("replacement retained wire"),
+                ),
+            )
+            .expect("replacement retained action");
+        drop(replacement);
+        fs::rename(
+            replacement_root.join("index.sqlite"),
+            bus_root.join("index.sqlite"),
+        )
+        .expect("replace Bus index");
+        wait_for_bus_row(&bus_root, &workload_state_topic("seat15")).await;
+        let replacement = Persist::open(bus_root.clone()).expect("reopened replacement Bus");
+        assert!(replacement
+            .list_since(&reply_topic(&retained_replacement_action.ulid), None)
+            .expect("replacement retained reply query")
+            .is_empty());
+        assert_eq!(*calls.lock().expect("calls"), 1);
+
+        let mut second = request();
+        second.request_id = "forward-replacement".into();
+        second.workload_id = WorkloadId::new("second-seat15").expect("second workload id");
+        let second_action = replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&second).expect("second wire")),
+            )
+            .expect("replacement forward action");
+        wait_for_bus_row(&bus_root, &reply_topic(&second_action.ulid)).await;
+        assert_eq!(*calls.lock().expect("calls"), 2);
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("Workload worker shutdown timeout")
+            .expect("Workload worker joins")
+            .expect("Workload worker shutdown succeeds");
+        assert_eq!(
+            workload_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert!(WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_bus_root(None)
+            .bus_root()
+            .is_none());
+    }
+
+    #[test]
+    fn atomic_activation_and_durable_reply_recovery_never_repeat_the_effect() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("bus");
+        let retained = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"request_id":"retained","unknown":true}"#),
+            )
+            .expect("retained action");
+        let state_root = temp.path().join("state");
+        let calls = Arc::new(Mutex::new(0));
+        let faults = Arc::new(WorkloadBusFaults::default());
+        faults.fail_action_reads.store(1, Ordering::SeqCst);
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(state_root.clone())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }))
+            .with_bus_faults(Arc::clone(&faults));
+        let mut ledger = WorkloadOperationLedger::open(&state_root).expect("ledger");
+        let outbox = ReplyOutbox::open(&state_root).expect("outbox");
+        let transaction = bus_transaction(&persist, &bus_root);
+
+        assert!(worker.stage_activation(transaction, &outbox).is_err());
+        assert!(worker.cursor.is_none());
+        assert!(worker.bus_identity.is_none());
+        let activation = worker
+            .stage_activation(transaction, &outbox)
+            .expect("atomic activation retry");
+        worker
+            .recover_activation_replies(transaction, &outbox, &ledger, activation.pending_replies)
+            .expect("activation reply recovery");
+        worker.cursor = activation.tail;
+        worker.bus_identity = Some(activation.identity);
+        assert_eq!(worker.cursor.as_deref(), Some(retained.ulid.as_str()));
+        assert!(persist
+            .list_since(&reply_topic(&retained.ulid), None)
+            .expect("retained reply query")
+            .is_empty());
+
+        let forward = request();
+        let forward_action = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&forward).expect("forward wire")),
+            )
+            .expect("forward action");
+        faults.fail_action_reads.store(1, Ordering::SeqCst);
+        assert!(worker
+            .tick_once_result(&mut ledger, Some(transaction), &outbox)
+            .is_err());
+        assert_eq!(*calls.lock().expect("calls"), 0);
+        assert_eq!(worker.cursor.as_deref(), Some(retained.ulid.as_str()));
+
+        faults.fail_reply_writes.store(1, Ordering::SeqCst);
+        assert!(worker
+            .tick_once_result(&mut ledger, Some(transaction), &outbox)
+            .is_err());
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert_eq!(worker.cursor.as_deref(), Some(retained.ulid.as_str()));
+        assert!(persist
+            .list_since(&reply_topic(&forward_action.ulid), None)
+            .expect("failed reply query")
+            .is_empty());
+        drop(ledger);
+
+        let restarted_faults = Arc::new(WorkloadBusFaults::default());
+        let mut restarted = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(state_root.clone())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }))
+            .with_bus_faults(Arc::clone(&restarted_faults));
+        let mut ledger = WorkloadOperationLedger::open(&state_root).expect("reopened ledger");
+        let activation = restarted
+            .stage_activation(transaction, &outbox)
+            .expect("restart activation");
+        restarted
+            .recover_activation_replies(transaction, &outbox, &ledger, activation.pending_replies)
+            .expect("durable reply recovery");
+        restarted.cursor = activation.tail;
+        restarted.bus_identity = Some(activation.identity);
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&forward_action.ulid), None)
+                .expect("recovered reply")
+                .len(),
+            1
+        );
+
+        let mut second = request();
+        second.request_id = "state-retry".into();
+        second.workload_id = WorkloadId::new("state-retry-seat15").expect("workload id");
+        let second_action = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&second).expect("second wire")),
+            )
+            .expect("second action");
+        restarted_faults
+            .fail_state_writes
+            .store(1, Ordering::SeqCst);
+        assert!(restarted
+            .tick_once_result(&mut ledger, Some(transaction), &outbox)
+            .is_err());
+        assert_eq!(*calls.lock().expect("calls"), 2);
+        assert_eq!(
+            restarted.cursor.as_deref(),
+            Some(second_action.ulid.as_str())
+        );
+        assert!(restarted.last_projection.is_none());
+        restarted
+            .tick_once_result(&mut ledger, Some(transaction), &outbox)
+            .expect("corrected-forward state publication");
+        assert_eq!(*calls.lock().expect("calls"), 2);
+        assert!(restarted.last_projection.is_some());
+    }
+
+    #[test]
+    fn replacement_during_reply_keeps_outbox_and_recovers_into_current_index() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        let retired_connection = Persist::open(bus_root.clone()).expect("initial Bus");
+        let state_root = temp.path().join("state");
+        let calls = Arc::new(Mutex::new(0));
+        let faults = Arc::new(WorkloadBusFaults::default());
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(state_root.clone())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(FakeActuator {
+                calls: Arc::clone(&calls),
+            }))
+            .with_bus_faults(Arc::clone(&faults));
+        let mut ledger = WorkloadOperationLedger::open(&state_root).expect("ledger");
+        let outbox = ReplyOutbox::open(&state_root).expect("outbox");
+        let request = request();
+        let action = retired_connection
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&request).expect("request wire")),
+            )
+            .expect("action");
+        let retired_transaction = bus_transaction(&retired_connection, &bus_root);
+
+        let replacement_root = temp.path().join("replacement-bus");
+        drop(Persist::open(replacement_root.clone()).expect("replacement Bus"));
+        *faults
+            .replace_reply_index_after_write
+            .lock()
+            .expect("replacement fault mutex") = Some(replacement_root.join("index.sqlite"));
+
+        let error = worker
+            .tick_once_result(&mut ledger, Some(retired_transaction), &outbox)
+            .expect_err("replacement must invalidate reply transaction");
+        assert!(error.to_string().contains("index changed"));
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert!(worker.cursor.is_none());
+        assert!(outbox.load(&action.ulid).expect("outbox read").is_some());
+        assert_eq!(
+            retired_connection
+                .list_since(&reply_topic(&action.ulid), None)
+                .expect("retired reply")
+                .len(),
+            1,
+            "the stale connection received the reply before replacement"
+        );
+        let current = Persist::open(bus_root.clone()).expect("current Bus");
+        assert!(current
+            .list_since(&reply_topic(&action.ulid), None)
+            .expect("current reply before recovery")
+            .is_empty());
+
+        let current_transaction = bus_transaction(&current, &bus_root);
+        let activation = worker
+            .stage_activation(current_transaction, &outbox)
+            .expect("replacement activation stages durable reply");
+        worker
+            .recover_activation_replies(
+                current_transaction,
+                &outbox,
+                &ledger,
+                activation.pending_replies,
+            )
+            .expect("reply recovers into current index");
+        current_transaction
+            .verify_current()
+            .expect("current index before activation commit");
+        worker.cursor = activation.tail;
+        worker.bus_identity = Some(activation.identity);
+
+        assert_eq!(*calls.lock().expect("calls"), 1);
+        assert!(outbox.load(&action.ulid).expect("outbox cleanup").is_none());
+        assert_eq!(
+            current
+                .list_since(&reply_topic(&action.ulid), None)
+                .expect("current recovered reply")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn replacement_during_open_is_rejected_and_reopens_current_index() {
+        const GENERATION_TOPIC: &str = "test/workload/open-generation";
+
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        let retired = Persist::open(bus_root.clone()).expect("retired Bus");
+        retired
+            .write(GENERATION_TOPIC, Priority::Default, None, Some("retired"))
+            .expect("retired generation marker");
+        drop(retired);
+
+        let replacement_root = temp.path().join("replacement-bus");
+        let replacement = Persist::open(replacement_root.clone()).expect("replacement Bus");
+        replacement
+            .write(GENERATION_TOPIC, Priority::Default, None, Some("current"))
+            .expect("current generation marker");
+        drop(replacement);
+
+        let faults = Arc::new(WorkloadBusFaults::default());
+        *faults
+            .replace_index_after_open
+            .lock()
+            .expect("open replacement fault mutex") = Some(replacement_root.join("index.sqlite"));
+        let worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_bus_root(Some(bus_root.clone()))
+            .with_bus_faults(faults);
+
+        let error = match worker.open_bus() {
+            Err(error) => error,
+            Ok(_) => panic!("an open spanning two Bus generations must be rejected"),
+        };
+        assert!(error.to_string().contains("changed while opening"));
+
+        let (opened_root, current, identity) = worker
+            .open_bus()
+            .expect("current generation opens")
+            .expect("Bus enabled");
+        assert_eq!(opened_root, bus_root);
+        assert_eq!(
+            identity,
+            bus_identity(&opened_root).expect("current identity")
+        );
+        assert_eq!(
+            current
+                .read_latest(GENERATION_TOPIC)
+                .expect("current generation read")
+                .and_then(|message| message.body)
+                .as_deref(),
+            Some("current")
+        );
+    }
+
     #[test]
     fn operation_requests_receive_typed_correlated_replies() {
         let temp = tempfile::tempdir().expect("temp");
         let bus_root = temp.path().join("bus");
-        let mut persist = Persist::open(bus_root).expect("bus");
+        let persist = Persist::open(bus_root.clone()).expect("bus");
         let calls = Arc::new(Mutex::new(0));
         let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
             .with_state_root(temp.path().join("state"))
@@ -5228,7 +6292,7 @@ mod tests {
             .write(ACTION_TOPIC, Priority::Default, None, Some(&raw))
             .expect("action");
 
-        worker.tick_once(&mut ledger, Some(&mut persist));
+        worker.tick_once(&mut ledger, Some((&persist, &bus_root)));
 
         let replies = persist
             .list_since(&reply_topic(&action.ulid), None)
@@ -5253,7 +6317,7 @@ mod tests {
                 Some(r#"{"request_id":"bad","unknown":true}"#),
             )
             .expect("malformed action");
-        worker.tick_once(&mut ledger, Some(&mut persist));
+        worker.tick_once(&mut ledger, Some((&persist, &bus_root)));
         let malformed_reply = persist
             .list_since(&reply_topic(&malformed.ulid), None)
             .expect("malformed reply")
@@ -5275,7 +6339,7 @@ mod tests {
     fn action_recovery_reads_a_bounded_page_and_advances_the_cursor() {
         let temp = tempfile::tempdir().expect("temp");
         let bus_root = temp.path().join("bus");
-        let mut persist = Persist::open(bus_root).expect("bus");
+        let persist = Persist::open(bus_root.clone()).expect("bus");
         let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
             .with_state_root(temp.path().join("state"))
             .with_authorizer(Box::new(AllowAuthorizer))
@@ -5295,7 +6359,7 @@ mod tests {
             );
         }
 
-        worker.tick_once(&mut ledger, Some(&mut persist));
+        worker.tick_once(&mut ledger, Some((&persist, &bus_root)));
         let page_last = MAX_OPERATION_MESSAGES_PER_TICK - 1;
         assert_eq!(
             worker.cursor.as_deref(),
@@ -5316,7 +6380,7 @@ mod tests {
             .expect("reply")
             .is_empty());
 
-        worker.tick_once(&mut ledger, Some(&mut persist));
+        worker.tick_once(&mut ledger, Some((&persist, &bus_root)));
         assert_eq!(
             worker.cursor.as_deref(),
             Some(actions[MAX_OPERATION_MESSAGES_PER_TICK].ulid.as_str())
