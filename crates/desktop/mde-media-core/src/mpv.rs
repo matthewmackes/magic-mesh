@@ -174,8 +174,10 @@ const fn end_reason(reason: libmpv2::EndFileReason) -> EndReason {
         EndReason::Eof
     } else if reason == mpv_end_file_reason::Error {
         EndReason::Error
+    } else if reason == mpv_end_file_reason::Redirect {
+        EndReason::Redirect
     } else {
-        // Stop / Quit / Redirect all read as an intentional stop for the player.
+        // Stop / Quit both terminate the current player load.
         EndReason::Stopped
     }
 }

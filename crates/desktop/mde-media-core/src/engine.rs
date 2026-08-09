@@ -94,6 +94,9 @@ pub enum EndReason {
     Eof,
     /// Playback was stopped on request (our `stop()`, a new `loadfile`, …).
     Stopped,
+    /// The loaded resource redirected to playlist contents. mpv continues with
+    /// the resolved entry; this is not a terminal player state.
+    Redirect,
     /// The file stopped because of an error (decode/network/…).
     Error,
 }

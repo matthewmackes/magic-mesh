@@ -166,3 +166,42 @@ fn fixture_decodes_through_real_mpv_with_a_nonblank_frame() {
         );
     }
 }
+
+#[test]
+fn real_mpv_playlist_redirect_continues_into_decoded_media() {
+    assert_is_not_fake_mpv::<MpvEngine>();
+
+    let dir = tempfile::tempdir().expect("playlist scratch directory");
+    let playlist = dir.path().join("fixture.m3u");
+    std::fs::write(&playlist, format!("#EXTM3U\n{}\n", fixture_path()))
+        .expect("write bounded local playlist");
+
+    let engine = MpvEngine::new().expect("real mpv engine");
+    let mut player = Player::new(engine);
+    player
+        .load(playlist.to_string_lossy().into_owned())
+        .expect("load local playlist");
+
+    let continued = pump_until(&mut player, |p| {
+        matches!(p.state(), PlayerState::Playing | PlayerState::Ended)
+    });
+    assert!(
+        continued,
+        "playlist redirect did not continue into decoded media within {WAIT_BUDGET:?}; state={:?}",
+        player.state()
+    );
+
+    let mut frame = None;
+    let deadline = Instant::now() + WAIT_BUDGET;
+    while frame.is_none() && Instant::now() < deadline {
+        frame = player.engine_mut().latest_frame();
+        if frame.is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let frame = frame.expect("redirected playlist entry must produce a decoded frame");
+    assert!(
+        !frame.is_blank(),
+        "redirected playback must decode real pixels"
+    );
+}

@@ -820,10 +820,21 @@ impl<E: MediaEngine> Player<E> {
             }
             EngineSignal::EndFile(EndReason::Stopped) => {
                 // Our own stop() already transitioned; only react to an
-                // engine-originated stop that we did not drive.
-                if self.state != PlayerState::Stopped && self.state != PlayerState::Idle {
+                // engine-originated stop that we did not drive. A replacement
+                // `loadfile` can deliver the superseded file's Stop after the
+                // new request entered Loading; that stale event must not cancel
+                // the replacement before its FileLoaded arrives.
+                if !matches!(
+                    self.state,
+                    PlayerState::Idle | PlayerState::Loading | PlayerState::Stopped
+                ) {
                     self.set_state(PlayerState::Stopped);
                 }
+            }
+            EngineSignal::EndFile(EndReason::Redirect) => {
+                // mpv resolved a playlist/container redirect and continues by
+                // loading its entry. Keep the current load authoritative until
+                // the resolved entry's FileLoaded event arrives.
             }
             EngineSignal::EndFile(EndReason::Error) => {
                 let Some(media) = self.media.clone() else {
@@ -1240,6 +1251,39 @@ mod tests {
         assert!(p.position().abs() < f64::EPSILON);
         p.pump();
         assert_eq!(p.state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn continuation_replacement_load_ignores_superseded_stop_before_file_loaded() {
+        let mut p = player();
+        p.load("first").expect("first load");
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+
+        // Real mpv emits EndFile(Stop) for the old entry while replacing it.
+        // Queue that event before the replacement's FileLoaded signal.
+        p.engine_mut()
+            .push_signal(EngineSignal::EndFile(EndReason::Stopped));
+        p.load("second").expect("replacement load");
+        p.pump();
+
+        assert_eq!(p.state(), PlayerState::Playing);
+        assert_eq!(p.media(), Some("second"));
+    }
+
+    #[test]
+    fn continuation_playlist_redirect_is_not_a_stop() {
+        let mut p = player();
+        p.load("mix.m3u").expect("playlist load");
+        p.engine_mut()
+            .push_signal(EngineSignal::EndFile(EndReason::Redirect));
+        p.pump();
+
+        assert_eq!(p.state(), PlayerState::Playing);
+        assert_eq!(p.media(), Some("mix.m3u"));
+        assert!(!p
+            .drain_events()
+            .contains(&PlayerEvent::StateChanged(PlayerState::Stopped)));
     }
 
     #[test]

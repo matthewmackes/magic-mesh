@@ -1119,7 +1119,8 @@ behavioral evidence is not completion.
 - **Cache checkpoints (2026-08-07/09):** verified Jellyfin bytes refuse zero/truncated entries; daemon index replacement is synced, atomic, and preserves last-good.
   BigBoy passed 2/2; mde-jellyfin 114/114 and Media UI 104/104 passed; `.50` cache passed 16/16. Live/package proof remains open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-07-jellyfin-current-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-cache-index-atomic-r8.md`.
-- **mpv/recovery (2026-08-06):** BigBoy fixture 1/1 nonblank; media-core 239/239 retry/resume; `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`; live proof remains.
+- **mpv/recovery checkpoints:** retry/resume passed 239/239; real nonblank playback plus playlist/replacement continuation passed 3/3 on BigBoy.
+  Live proof remains: `evidence/WL-FUNC-021-2026-08-06-media-recovery-r1.md`, `evidence/WL-FUNC-021-2026-08-09-mpv-playlist-continuation-r11.md`.
 - **Daemon Album/download/workerless checkpoint (2026-08-06):** Home, Library, and Search open retained albums; detail emits typed play without `LoadAlbum` worker requests.
   Library, Album, and Downloads publish bounded actions; daemon is 168/168 on `.90`, Music UI is 47/47 on `.50`, and embedded construction starts no worker.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-managed-download-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-embedded-workerless-r1.md`.
@@ -1149,10 +1150,9 @@ behavioral evidence is not completion.
   Live DLNA/Chromecast, mesh-owner, and seat-handoff proof remain open.
   `install-helpers/verify-music-cast-loopback.sh`;
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
-- **Roaming admission (2026-08-06):** 11/11; live two-seat proof open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`.
-- **Two-seat handoff checkpoints (2026-08-08/09):** fixtures prove exact-once transfer; physical preflight refused mismatch/stale peers, and records are atomic/authority-first.
+- **Two-seat handoff checkpoints (2026-08-08/09):** roaming passed 11/11; fixtures prove exact-once transfer; preflight refuses mismatch/stale peers; records are atomic.
   `.50`/`.90` passed; `.170` passed 19/19: `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-09-physical-two-seat-handoff-preflight-r5.md`,
+  `evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-physical-two-seat-handoff-preflight-r5.md`,
   `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
 - **Cast runtime audit checkpoint (2026-08-06):** read-only seat inspection
   found no physical UPnP renderer, usable Chromecast discovery path, target
