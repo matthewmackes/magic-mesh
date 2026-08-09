@@ -4661,6 +4661,7 @@ version = "12.1.6"
 dependencies = [
  "libmpv2",
  "mackes-mesh-types",
+ "mdns-sd",
  "png 0.18.1",
  "reqwest",
  "serde",

@@ -207,7 +207,7 @@ pub use capture::{
 pub use cast::{
     discover_all, dlna_control_url, mesh_render_targets, parse_chromecast_records,
     parse_ssdp_responses, CastError, CastKind, CastOutcome, CastRequest, CastTarget, Caster,
-    MeshRoster, NetworkCaster, RendererDiscovery, SsdpProbe,
+    ChromecastProbe, MeshRoster, NetworkCaster, RendererDiscovery, SsdpProbe,
 };
 pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind, VideoFrame};

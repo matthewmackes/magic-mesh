@@ -176,9 +176,12 @@ impl App for MediaApp {
         // The PiP mini-player (design Q31/Q32) floats above whatever view is active.
         pip_window(ctx, &mut self.controller);
 
-        // Keep the frame loop ticking while playing so the core's live clock advances.
+        // Keep the frame loop ticking while playing, and schedule bounded polls
+        // while renderer discovery runs off-thread.
         if self.controller.is_playing() {
             ctx.request_repaint();
+        } else if self.controller.cast_discovery_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 }

@@ -11,8 +11,9 @@
 //!   roster into the media-capable nodes; [`parse_ssdp_responses`] projects an SSDP
 //!   `M-SEARCH` reply into DLNA/UPnP [`CastTarget`]s; [`parse_chromecast_records`]
 //!   projects an mDNS `_googlecast._tcp` listing into Chromecast targets. All three are
-//!   pure + fixture-tested, and the live probes ([`MeshRoster`] / [`SsdpProbe`]) return
-//!   an **empty** list when nothing answers — never a fabricated renderer.
+//!   pure + fixture-tested, and the live probes ([`MeshRoster`] / [`SsdpProbe`] /
+//!   [`ChromecastProbe`]) return an **empty** list when nothing answers — never a
+//!   fabricated renderer.
 //! * **The throw is honest-gated.** [`NetworkCaster`] casts to a live **DLNA/UPnP**
 //!   renderer for real (a `SetAVTransportURI` + `Play` SOAP push over `std::net`, built
 //!   by the pure [`soap_set_av_transport_uri`] / [`http_request`] helpers and parsed by
@@ -27,6 +28,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 
 use mackes_mesh_types::peers::{default_mesh_home, peers_dir, read_peers, PeerRecord};
@@ -42,6 +44,8 @@ pub const CAST_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_CAST_TARGETS: usize = 64;
 /// Maximum SSDP response bytes collected from one probe.
 pub const MAX_SSDP_RESPONSE_BYTES: usize = 64 * 1024;
+/// Fully-qualified mDNS service type used by Google Cast receivers.
+const GOOGLECAST_SERVICE_TYPE: &str = "_googlecast._tcp.local.";
 /// Maximum bytes retained for one discovery field.
 const MAX_DISCOVERY_FIELD_BYTES: usize = 1024;
 /// Maximum input parsed by a pure discovery fold.
@@ -419,6 +423,98 @@ impl SsdpProbe {
         }
         Ok(parse_ssdp_responses(&gathered))
     }
+}
+
+/// Discover Chromecast receivers over native mDNS.
+///
+/// The Media picker opens a bounded `_googlecast._tcp.local.` browse and
+/// projects resolved service records into real [`CastTarget`]s. An unavailable
+/// multicast interface or mDNS daemon yields an empty list.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromecastProbe {
+    /// Maximum time to wait for resolved receiver records.
+    pub timeout: Duration,
+}
+
+impl Default for ChromecastProbe {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+impl RendererDiscovery for ChromecastProbe {
+    fn discover(&self) -> Vec<CastTarget> {
+        let Ok(daemon) = ServiceDaemon::new() else {
+            return Vec::new();
+        };
+        let Ok(events) = daemon.browse(GOOGLECAST_SERVICE_TYPE) else {
+            let _ = daemon.shutdown();
+            return Vec::new();
+        };
+        let deadline = std::time::Instant::now() + self.timeout;
+        let mut targets = Vec::new();
+        while targets.len() < MAX_CAST_TARGETS {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            match events.recv_timeout(remaining) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    if let Some(target) = chromecast_target(&info) {
+                        if !targets
+                            .iter()
+                            .any(|existing: &CastTarget| existing.id == target.id)
+                        {
+                            targets.push(target);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = daemon.stop_browse(GOOGLECAST_SERVICE_TYPE);
+        if let Ok(status) = daemon.shutdown() {
+            let _ = status.recv_timeout(Duration::from_millis(250));
+        }
+        targets.sort_by(|a, b| a.id.cmp(&b.id));
+        targets
+    }
+}
+
+/// Project one resolved native mDNS record into a Chromecast target.
+fn chromecast_target(info: &ServiceInfo) -> Option<CastTarget> {
+    let id = info.get_property_val_str("id")?.trim();
+    if !valid_discovery_field(id) || info.get_port() == 0 {
+        return None;
+    }
+    let mut addresses: Vec<String> = info
+        .get_addresses()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    addresses.sort();
+    let address = addresses.first()?;
+    let location = if address.contains(':') {
+        format!("[{address}]:{}", info.get_port())
+    } else {
+        format!("{address}:{}", info.get_port())
+    };
+    if parse_endpoint(&location).is_none() {
+        return None;
+    }
+    let name = info
+        .get_property_val_str("fn")
+        .map(str::trim)
+        .filter(|value| valid_discovery_field(value))
+        .unwrap_or(id);
+    Some(CastTarget {
+        kind: CastKind::Chromecast,
+        id: id.to_owned(),
+        name: name.to_owned(),
+        location,
+    })
 }
 
 /// Keep pure discovery folds bounded even when called directly with hostile input.
@@ -1117,6 +1213,43 @@ id=def456\nfn=Kitchen display\nhost=192.168.1.71\n";
         assert_eq!(targets[0].location, "192.168.1.70:8009");
         // The second omits an explicit port → the default control port.
         assert_eq!(targets[1].location, "192.168.1.71:8009");
+    }
+
+    #[test]
+    fn resolved_native_mdns_record_becomes_a_chromecast_target() {
+        let info = ServiceInfo::new(
+            GOOGLECAST_SERVICE_TYPE,
+            "Living Room TV",
+            "cast.local.",
+            "192.0.2.70",
+            8009,
+            &[("id", "abc123"), ("fn", "Living Room TV")][..],
+        )
+        .expect("valid Chromecast service fixture");
+        let target = chromecast_target(&info).expect("resolved target");
+        assert_eq!(target.kind, CastKind::Chromecast);
+        assert_eq!(target.id, "abc123");
+        assert_eq!(target.name, "Living Room TV");
+        assert_eq!(target.location, "192.0.2.70:8009");
+    }
+
+    #[test]
+    fn resolved_chromecast_requires_identity_address_and_port() {
+        for (port, txt) in [
+            (8009, Vec::<(&str, &str)>::new()),
+            (0, vec![("id", "cast-id")]),
+        ] {
+            let info = ServiceInfo::new(
+                GOOGLECAST_SERVICE_TYPE,
+                "Receiver",
+                "cast.local.",
+                "192.0.2.70",
+                port,
+                txt.as_slice(),
+            )
+            .expect("syntactically valid service fixture");
+            assert!(chromecast_target(&info).is_none());
+        }
     }
 
     #[test]

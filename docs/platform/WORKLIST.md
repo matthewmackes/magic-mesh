@@ -1127,8 +1127,8 @@ behavioral evidence is not completion.
 - **Typed target handoff checkpoint (2026-08-06):** bounded peer heartbeats project honestly; fresh idle mesh seats publish typed `transfer`, stale/owning peers remain browse-only.
   Music UI is 48/48 on `.50`, format is clean, and the hostile test covers `peer:seat-15`; live owner-yield/resume and DLNA/provider/package proof remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-target-handoff-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-peer-targets-r1.md`.
-- **Cast checkpoint (2026-08-06):** bounded discovery and real DLNA `SetAVTransportURI`/`Play`/`Seek` are fixture-verified; media-core is 240/240 on BigBoy and format-clean.
-  Loopback renderer acceptance is recorded in `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`; live renderer, Chromecast, mesh-owner, and seat proof remain open.
+- **Cast checkpoints (2026-08-06/09):** real DLNA control and off-render native Chromecast discovery are bounded; authenticated CastV2/live-seat proof remain open.
+  `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`.
 - **Live provider-loss checkpoint (2026-08-08):** release 11 on seat 15 passed a controlled healthy → provider loss → healthy transition with cached catalog/state available.
   The daemon stayed active with zero restarts and the seat-local firewall rule was removed; two-catalog outage and audible stream continuity remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.

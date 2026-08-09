@@ -30,8 +30,8 @@ use mde_jellyfin::{
 };
 use mde_media_core::{
     AbLoop, AudioConfig, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
-    CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget, Caster, EqBand, JoinOutcome,
-    Library, LibraryItem, LoginOutcome, LoudnessNorm, MediaEngine, MediaKind, MeshRoster,
+    CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget, Caster, ChromecastProbe, EqBand,
+    JoinOutcome, Library, LibraryItem, LoginOutcome, LoudnessNorm, MediaEngine, MediaKind, MeshRoster,
     MpvCapabilities, NetworkCaster, PartyPoll, PartySession, PlaybackControls, Player, PlayerEvent,
     PlayerState, Playlist, PlaylistItem, PollOutcome, RendererDiscovery, RepeatMode,
     ReplayGainMode, RoamingSession, ScreenshotMode, SortKey, SsdpProbe, SyncCommand, Track,
@@ -68,11 +68,13 @@ pub const EBU_R128_DEFAULT: LoudnessNorm = LoudnessNorm::Ebu {
 /// already open.  Poll at a human-paced cadence instead of every frame.
 const JELLYFIN_STORE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Keep repeated live cast-picker actions from launching another synchronous SSDP
-/// probe while the previous result is still fresh.  This matches the default SSDP
-/// receive window, so a repeated menu click cannot stack another potentially
-/// two-second network wait on top of the same discovery request.
+/// Keep repeated live cast-picker actions from launching duplicate workers while
+/// the previous result is still fresh.
 const CAST_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Drop an unresponsive discovery worker's result channel after every concrete
+/// probe budget has elapsed. The detached worker's network operations are bounded;
+/// a late result cannot overwrite a newer request after this receiver is dropped.
+const CAST_DISCOVERY_DEADLINE: Duration = Duration::from_secs(6);
 
 /// The four top-level views of the media app (design Q31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -173,6 +175,20 @@ impl CastUiState {
     #[must_use]
     pub const fn probed(&self) -> bool {
         self.probed
+    }
+}
+
+struct CastDiscoveryWorker {
+    results: std::sync::mpsc::Receiver<Vec<CastTarget>>,
+    started_at: Instant,
+}
+
+impl std::fmt::Debug for CastDiscoveryWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CastDiscoveryWorker")
+            .field("started_at", &self.started_at)
+            .finish_non_exhaustive()
     }
 }
 
@@ -606,10 +622,11 @@ pub struct MediaController<E: MediaEngine> {
     /// again.  This lets a root-owned shell converge on a user's store without
     /// doing filesystem work on every frame.
     next_jellyfin_store_refresh: Instant,
-    /// The start time of the last live cast discovery.  The live path combines a
-    /// mesh-roster read with a synchronous SSDP probe, so repeated actions are
+    /// The start time of the last live cast discovery. Repeated actions are
     /// coalesced while the prior target snapshot remains usable.
     last_cast_discovery: Option<Instant>,
+    /// Off-render discovery worker. The render loop only polls this channel.
+    cast_discovery_worker: Option<CastDiscoveryWorker>,
 }
 
 impl<E: MediaEngine> MediaController<E> {
@@ -628,6 +645,7 @@ impl<E: MediaEngine> MediaController<E> {
             ui: UiState::default(),
             next_jellyfin_store_refresh: Instant::now(),
             last_cast_discovery: None,
+            cast_discovery_worker: None,
         }
     }
 
@@ -910,6 +928,7 @@ impl<E: MediaEngine> MediaController<E> {
     /// file open — cheap + I/O-free, so it is safe to run every frame.
     pub fn pump(&mut self) {
         self.player.pump();
+        self.poll_cast_discovery_at(Instant::now());
         if let Some(roaming) = self.roaming.as_mut() {
             roaming.apply_pending(&mut self.player);
         }
@@ -1094,7 +1113,11 @@ impl<E: MediaEngine> MediaController<E> {
     /// [`discover_cast_targets`](Self::discover_cast_targets). Honest — an empty result
     /// reads as "no renderer found", never a fabricated device.
     pub fn refresh_cast_targets<D: RendererDiscovery>(&mut self, discovery: &D) {
-        self.cast.targets = discovery.discover();
+        self.apply_cast_targets(discovery.discover());
+    }
+
+    fn apply_cast_targets(&mut self, targets: Vec<CastTarget>) {
+        self.cast.targets = targets;
         self.cast.probed = true;
         self.ui.status = Some(if self.cast.targets.is_empty() {
             "No cast renderer found on this network.".to_owned()
@@ -1103,31 +1126,91 @@ impl<E: MediaEngine> MediaController<E> {
         });
     }
 
-    /// Discover cast renderers over the live sources (the replicated mesh roster +
-    /// an SSDP probe) — the app's "find renderers" affordance. Real `std::net`
-    /// discovery, honest-gated to a network with responders.
+    /// Start renderer discovery off the render thread. The worker combines the
+    /// replicated mesh roster, SSDP, and native Chromecast mDNS; [`pump`](Self::pump)
+    /// polls its result channel without blocking egui.
     pub fn discover_cast_targets(&mut self) {
-        let sources: [&dyn RendererDiscovery; 2] = [&MeshRoster, &SsdpProbe::default()];
-        self.discover_cast_targets_with(&SliceDiscovery(&sources), Instant::now());
+        self.start_cast_discovery_with(Instant::now(), || {
+            let sources: [&dyn RendererDiscovery; 3] = [
+                &MeshRoster,
+                &SsdpProbe::default(),
+                &ChromecastProbe::default(),
+            ];
+            discover_all(&sources)
+        });
     }
 
-    /// Run one live-style discovery at a supplied clock instant.  Keeping the
-    /// clock and discovery seam injectable makes the refresh coalescing policy
-    /// testable without opening a UDP socket.
-    fn discover_cast_targets_with<D: RendererDiscovery>(
+    fn start_cast_discovery_with<F>(
         &mut self,
-        discovery: &D,
         now: Instant,
-    ) -> bool {
+        discover: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Vec<CastTarget> + Send + 'static,
+    {
+        if self.cast_discovery_worker.is_some() {
+            self.ui.status = Some(
+                "Cast discovery is already running; showing the last results.".to_owned(),
+            );
+            return false;
+        }
         if !cast_discovery_is_due(self.last_cast_discovery, now) {
             self.ui.status = Some(
                 "Cast discovery is cooling down; showing the last results.".to_owned(),
             );
             return false;
         }
+        let (sender, results) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("mde-media-cast-discovery".to_owned())
+            .spawn(move || {
+                let _ = sender.send(discover());
+            });
+        if spawned.is_err() {
+            self.ui.status = Some("Cast discovery worker could not start.".to_owned());
+            return false;
+        }
         self.last_cast_discovery = Some(now);
-        self.refresh_cast_targets(discovery);
+        self.cast_discovery_worker = Some(CastDiscoveryWorker {
+            results,
+            started_at: now,
+        });
+        self.ui.status = Some("Looking for cast renderers…".to_owned());
         true
+    }
+
+    fn poll_cast_discovery_at(&mut self, now: Instant) {
+        let Some(worker) = self.cast_discovery_worker.as_ref() else {
+            return;
+        };
+        match worker.results.try_recv() {
+            Ok(targets) => {
+                self.cast_discovery_worker = None;
+                self.apply_cast_targets(targets);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.cast_discovery_worker = None;
+                self.cast.probed = true;
+                self.ui.status = Some("Cast discovery ended without a result.".to_owned());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if now.saturating_duration_since(worker.started_at)
+                    >= CAST_DISCOVERY_DEADLINE =>
+            {
+                self.cast_discovery_worker = None;
+                self.cast.probed = true;
+                self.ui.status = Some(
+                    "Cast discovery timed out; showing the last results.".to_owned(),
+                );
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Whether egui should keep scheduling bounded polls for an active discovery.
+    #[must_use]
+    pub const fn cast_discovery_pending(&self) -> bool {
+        self.cast_discovery_worker.is_some()
     }
 
     /// Cast the current playback to the discovered target `id` over an injected
@@ -2148,17 +2231,6 @@ fn cast_discovery_is_due(last: Option<Instant>, now: Instant) -> bool {
     })
 }
 
-/// Fold a slice of discovery sources into one [`RendererDiscovery`] (MEDIA-17), so the
-/// live mesh-roster + SSDP probe present as a single de-duplicated source to
-/// [`MediaController::refresh_cast_targets`].
-struct SliceDiscovery<'a>(&'a [&'a dyn RendererDiscovery]);
-
-impl RendererDiscovery for SliceDiscovery<'_> {
-    fn discover(&self) -> Vec<CastTarget> {
-        discover_all(self.0)
-    }
-}
-
 /// The display title of a Jellyfin item — its name, else its id (never empty).
 #[must_use]
 pub fn jellyfin_item_title(item: &BaseItemDto) -> String {
@@ -2909,37 +2981,66 @@ mod tests {
     }
 
     #[test]
-    fn live_cast_discovery_coalesces_duplicate_refreshes_and_expires() {
+    fn live_cast_discovery_runs_off_render_and_coalesces_duplicate_starts() {
         let mut c = loaded();
         let first = Instant::now();
-        assert!(c.discover_cast_targets_with(
-            &FakeDiscovery(vec![dlna_target()]),
-            first,
-        ));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(c.start_cast_discovery_with(first, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            vec![dlna_target()]
+        }));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker started without blocking the render caller");
+        assert!(c.cast_discovery_pending());
 
-        let mut replacement = dlna_target();
-        replacement.id = "tv-2".to_owned();
-        replacement.name = "Bedroom TV".to_owned();
+        // A second action cannot launch another worker while the first is live.
+        assert!(!c.start_cast_discovery_with(first, Vec::new));
+        assert_eq!(
+            c.ui().status.as_deref(),
+            Some("Cast discovery is already running; showing the last results.")
+        );
 
-        // A repeated live action inside the SSDP receive window does no second
-        // discovery and keeps the last known snapshot available to the picker.
-        assert!(!c.discover_cast_targets_with(
-            &FakeDiscovery(vec![replacement.clone()]),
-            first + CAST_DISCOVERY_REFRESH_INTERVAL - Duration::from_millis(1),
-        ));
+        release_tx.send(()).expect("release fixture worker");
+        for _ in 0..100 {
+            c.poll_cast_discovery_at(Instant::now());
+            if !c.cast_discovery_pending() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!c.cast_discovery_pending());
+        assert_eq!(c.cast().targets(), &[dlna_target()]);
+    }
+
+    #[test]
+    fn live_cast_discovery_expires_without_accepting_a_late_result() {
+        let mut c = loaded();
+        c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
+        let first = Instant::now();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(c.start_cast_discovery_with(first, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            let mut late = dlna_target();
+            late.id = "late".to_owned();
+            vec![late]
+        }));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker started");
+
+        c.poll_cast_discovery_at(first + CAST_DISCOVERY_DEADLINE);
+        assert!(!c.cast_discovery_pending());
         assert_eq!(c.cast().targets(), &[dlna_target()]);
         assert_eq!(
             c.ui().status.as_deref(),
-            Some("Cast discovery is cooling down; showing the last results.")
+            Some("Cast discovery timed out; showing the last results.")
         );
-
-        // Once the bounded interval expires, a deliberate refresh is allowed and
-        // the target snapshot can converge to the newly discovered renderer.
-        assert!(c.discover_cast_targets_with(
-            &FakeDiscovery(vec![replacement.clone()]),
-            first + CAST_DISCOVERY_REFRESH_INTERVAL,
-        ));
-        assert_eq!(c.cast().targets(), &[replacement]);
+        release_tx.send(()).expect("release expired fixture worker");
     }
 
     #[test]
