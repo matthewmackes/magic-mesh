@@ -430,7 +430,11 @@ payload_compress = "xz"
 # -21 (2026-08-08): prove the configured coordination plane by strict etcd
 # majority so corrected-forward recovery survives one lighthouse loss while
 # still failing closed when the cluster cannot commit proposals.
-release = "21"
+# -23 (2026-08-08): prevent one grouped daemon crash from deactivating the
+# aggregate target and cascading through every otherwise-healthy process, and
+# restart an already-active grouped target after an RPM upgrade so every group
+# maps the replacement binary and unit relationships.
+release = "23"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
@@ -800,7 +804,9 @@ if [ -f /etc/systemd/system/qnm-shared.service ] || [ -f /usr/lib/systemd/system
   rmdir /etc/systemd/system/qnm-shared.service.d 2>/dev/null || :
 fi
 mackesd_was_active=0
+mackesd_target_was_active=0
 systemctl is-active --quiet mackesd.service && mackesd_was_active=1
+systemctl is-active --quiet mackesd.target && mackesd_target_was_active=1
 systemctl disable --now mackesd.service >/dev/null 2>&1 || :
 rm -f /etc/systemd/system/mackesd.service \
       /etc/systemd/system/mackesd.service.d/20-qnm.conf \
@@ -959,6 +965,9 @@ timeout 60 update-desktop-database -q >/dev/null 2>&1 || :
 # upgrades cannot leave the old shell or daemon mapped through a deleted inode;
 # fresh installs remain governed by the normal role/start gates.
 systemctl try-restart mde-shell-egui.service >/dev/null 2>&1 || :
+if [ "$mackesd_target_was_active" -eq 1 ]; then
+  systemctl try-restart mackesd.target >/dev/null 2>&1 || :
+fi
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
@@ -1249,7 +1258,9 @@ summary = "MCNF thin DigitalOcean lighthouse — Nebula relay, etcd quorum, and 
 payload_compress = "xz"
 # Keep the role variants monotonic with the base package for corrected-forward
 # fleet deployment.
-release = "7"
+# -9 carries the same crash-isolating grouped-unit relationship and active-
+# target upgrade restart as base -23.
+release = "9"
 license = "GPL-3.0-or-later AND MPL-2.0"
 # The thin variant must replace (not co-install with) any role package that
 # owns the same daemon/unit paths.  An operator can use `dnf swap` for an
@@ -1311,7 +1322,9 @@ assets = [
 ]
 post_install_script = """
 mackesd_was_active=0
+mackesd_target_was_active=0
 systemctl is-active --quiet mackesd.service && mackesd_was_active=1
+systemctl is-active --quiet mackesd.target && mackesd_target_was_active=1
 systemctl disable --now mackesd.service >/dev/null 2>&1 || :
 rm -f /etc/systemd/system/mackesd.service \
       /etc/systemd/system/mackesd.service.d/20-qnm.conf \
@@ -1326,6 +1339,9 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
+fi
+if [ "$mackesd_target_was_active" -eq 1 ]; then
+  systemctl try-restart mackesd.target >/dev/null 2>&1 || :
 fi
 systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
 timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :

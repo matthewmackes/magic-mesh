@@ -367,6 +367,15 @@ behavioral evidence is not completion.
   gates passed 4/4. Live daemon round-trip and responsive captures remain.
   Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`.
 - Remaining work:
+- **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
+  `Requires=` edges cascaded one integrations crash through all six groups.
+  Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects
+  regressions in the process-boundary validator, and restarts an already-active
+  target during RPM upgrade. Seat 15 proved isolated integrations and control
+  crashes while every unaffected PID and restart counter remained unchanged;
+  target, mesh-health, and RPM verification stayed healthy. Dell was offline
+  for corrected-package deployment. Evidence:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a

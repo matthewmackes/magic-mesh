@@ -110,8 +110,13 @@ def validate_group(unit: UnitFile, group: str) -> list[str]:
         errors.append(f"{unit.path.name}: [Unit] PartOf must include {TARGET}")
     if group != "control":
         owner = "mackesd-control.service"
-        if owner not in words(unit, "Unit", "Requires"):
-            errors.append(f"{unit.path.name}: [Unit] Requires must include {owner}")
+        if owner not in words(unit, "Unit", "Wants"):
+            errors.append(f"{unit.path.name}: [Unit] Wants must include {owner}")
+        if owner in words(unit, "Unit", "Requires"):
+            errors.append(
+                f"{unit.path.name}: [Unit] Requires must not include {owner}; "
+                "a control crash must not stop healthy groups"
+            )
         if owner not in words(unit, "Unit", "After"):
             errors.append(f"{unit.path.name}: [Unit] After must include {owner}")
     required_service_directives = (
@@ -145,16 +150,26 @@ def validate_source(repo_root: Path) -> list[str]:
         try:
             target = read_unit(target_path)
             required = {f"mackesd-{group}.service" for group in GROUPS}
-            declared = words(target, "Unit", "Requires")
+            declared = words(target, "Unit", "Wants")
             declared_groups = {
                 unit for unit in declared if unit.startswith("mackesd-") and unit.endswith(".service")
             }
             missing = required - declared_groups
             if missing:
-                errors.append(f"{TARGET}: [Unit] Requires is missing {', '.join(sorted(missing))}")
+                errors.append(f"{TARGET}: [Unit] Wants is missing {', '.join(sorted(missing))}")
             extra = declared_groups - required
             if extra:
-                errors.append(f"{TARGET}: [Unit] Requires has unknown groups {', '.join(sorted(extra))}")
+                errors.append(f"{TARGET}: [Unit] Wants has unknown groups {', '.join(sorted(extra))}")
+            required_groups = {
+                unit
+                for unit in words(target, "Unit", "Requires")
+                if unit.startswith("mackesd-") and unit.endswith(".service")
+            }
+            if required_groups:
+                errors.append(
+                    f"{TARGET}: [Unit] Requires creates crash cascades for "
+                    f"{', '.join(sorted(required_groups))}; use Wants with After ordering"
+                )
             if values(target, "Service", "ExecStart"):
                 errors.append(f"{TARGET}: targets must aggregate units, not run an ExecStart")
             if "multi-user.target" not in words(target, "Install", "WantedBy"):
@@ -224,14 +239,14 @@ def write_fixture(root: Path, *, valid: bool = True) -> None:
     unit_dir.mkdir(parents=True)
     requirements = " ".join(f"mackesd-{group}.service" for group in GROUPS)
     (unit_dir / TARGET).write_text(
-        f"[Unit]\nRequires={requirements}\n\n[Install]\nWantedBy=multi-user.target\n",
+        f"[Unit]\nWants={requirements}\n\n[Install]\nWantedBy=multi-user.target\n",
         encoding="utf-8",
     )
     for group in GROUPS:
         owner_order = ""
         if group != "control":
             owner_order = (
-                "Requires=mackesd-control.service\n"
+                "Wants=mackesd-control.service\n"
                 "After=mackesd-control.service\n"
             )
         (unit_dir / f"mackesd-{group}.service").write_text(
@@ -263,6 +278,24 @@ def self_test() -> None:
         write_fixture(writer_errors_root, valid=False)
         writer_errors = validate_source(writer_errors_root)
         assert any("must be exactly" in error for error in writer_errors), writer_errors
+
+        cascade_root = root / "cascade"
+        write_fixture(cascade_root)
+        cascade_target = cascade_root / "packaging" / "systemd" / TARGET
+        cascade_target.write_text(
+            cascade_target.read_text(encoding="utf-8").replace("Wants=", "Requires=", 1),
+            encoding="utf-8",
+        )
+        cascade_group = cascade_root / "packaging" / "systemd" / "mackesd-actions.service"
+        cascade_group.write_text(
+            cascade_group.read_text(encoding="utf-8").replace(
+                "Wants=mackesd-control.service", "Requires=mackesd-control.service"
+            ),
+            encoding="utf-8",
+        )
+        cascade_errors = validate_source(cascade_root)
+        assert any("Requires creates crash cascades" in error for error in cascade_errors), cascade_errors
+        assert any("control crash must not stop healthy groups" in error for error in cascade_errors), cascade_errors
 
         source_like_root = root / "source-like"
         source_units = source_like_root / "packaging" / "systemd"

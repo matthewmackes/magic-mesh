@@ -2,7 +2,7 @@
 Description=MCNF control-plane daemon (actions group)
 Documentation=https://github.com/matthewmackes/magic-mesh
 PartOf=mackesd.target
-Requires=mackesd-control.service
+Wants=mackesd-control.service
 After=network-online.target nebula.service mackesd-control.service
 OnFailure=mesh-alert@%n.service
 StartLimitIntervalSec=300

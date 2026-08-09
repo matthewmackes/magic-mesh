@@ -1,7 +1,7 @@
 [Unit]
 Description=MCNF grouped control-plane daemon
 Documentation=https://github.com/matthewmackes/magic-mesh
-Requires=mackesd-control.service mackesd-observation.service mackesd-actions.service mackesd-data.service mackesd-compute.service mackesd-integrations.service
+Wants=mackesd-control.service mackesd-observation.service mackesd-actions.service mackesd-data.service mackesd-compute.service mackesd-integrations.service
 Requires=nebula.service
 Wants=network-online.target etcd.service syncthing.service mcnf-cloud-arm-credential.service mcnf-mesh-secret-recipient.service
 After=network-online.target nebula.service etcd.service mackesd-control.service mackesd-observation.service mackesd-actions.service mackesd-data.service mackesd-compute.service mackesd-integrations.service
