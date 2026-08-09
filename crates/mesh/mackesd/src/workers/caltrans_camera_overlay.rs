@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +21,9 @@ use mackes_mesh_types::caltrans_camera::{
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::Deserialize;
+
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
 
@@ -657,12 +660,53 @@ enum PreparedResponse {
     Modified(CaltransCameraSnapshot),
 }
 
+trait CameraBus {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>>;
+    fn publish_snapshot(
+        &mut self,
+        topic: &str,
+        snapshot: &CaltransCameraSnapshot,
+    ) -> io::Result<()>;
+}
+
+impl CameraBus for Persist {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+        self.reopen_if_index_changed();
+        self.read_latest(topic)
+            .map_err(io_other)?
+            .map(|message| {
+                message
+                    .body
+                    .ok_or_else(|| io::Error::other("vehicle Bus row has no body"))
+            })
+            .transpose()
+    }
+
+    fn publish_snapshot(
+        &mut self,
+        topic: &str,
+        snapshot: &CaltransCameraSnapshot,
+    ) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(|error| {
+            crate::metrics::record_bus_publish_error();
+            io_other(error)
+        })?;
+        self.reopen_if_index_changed();
+        self.write(topic, Priority::Default, None, Some(&body))
+            .map(|_| ())
+            .map_err(|error| {
+                crate::metrics::record_bus_publish_error();
+                io_other(error)
+            })
+    }
+}
+
 /// Workstation-side Caltrans traffic-camera adapter.
 pub struct CaltransCameraOverlayWorker {
     host: String,
     district: Option<u8>,
     probe: Option<Arc<dyn CaltransCameraProbe>>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -696,7 +740,7 @@ impl CaltransCameraOverlayWorker {
             host,
             district,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -709,10 +753,11 @@ impl CaltransCameraOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override the Bus root. Production resolves the current user/system root
+    /// for every transaction when no override is configured.
     #[must_use]
-    pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+    pub fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
         self
     }
 
@@ -723,23 +768,32 @@ impl CaltransCameraOverlayWorker {
         self
     }
 
-    fn current_context(&self) -> Option<CameraContext> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
+    fn open_bus(&self) -> io::Result<Persist> {
+        let root = caltrans_bus_root(
+            self.bus_root_override.as_deref(),
+            crate::bus_publish::default_bus_root(),
+        );
+        let mut persist = Persist::open(root).map_err(io_other)?;
+        persist.reopen_if_index_changed();
+        Ok(persist)
+    }
+
+    fn current_context(&self, bus: &mut impl CameraBus) -> io::Result<Option<CameraContext>> {
         let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
+        let Some(body) = bus.read_latest_body(&topic)? else {
+            return Ok(None);
+        };
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
         validated_vehicle_context(&vehicle, &self.host, now_ms())
     }
 
-    fn publish(&self, snapshot: &CaltransCameraSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &caltrans_camera_state_topic(&self.host),
-                snapshot,
-            );
-        }
+    fn publish(
+        &self,
+        bus: &mut impl CameraBus,
+        snapshot: &CaltransCameraSnapshot,
+    ) -> io::Result<()> {
+        bus.publish_snapshot(&caltrans_camera_state_topic(&self.host), snapshot)
     }
 
     fn no_context_snapshot(&self, district: u8, reason: &str) -> CaltransCameraSnapshot {
@@ -753,41 +807,64 @@ impl CaltransCameraOverlayWorker {
 
     fn publish_no_context_degraded(
         &self,
+        bus: &mut impl CameraBus,
         district: u8,
         reason: &str,
         last_good: &mut Option<CaltransCameraSnapshot>,
-    ) {
+    ) -> io::Result<()> {
         let snapshot = self.no_context_snapshot(district, reason);
-        self.publish(&snapshot);
+        self.publish(bus, &snapshot)?;
         // A missing same-host fix invalidates the previous camera relevance
         // origin. Keep the Bus mirror present and licensed, but do not let
         // later failures replay camera rows fetched for an old point.
         *last_good = None;
+        Ok(())
+    }
+
+    fn current_context_or_clear(
+        &self,
+        bus: &mut impl CameraBus,
+        district: u8,
+        last_good: &mut Option<CaltransCameraSnapshot>,
+    ) -> io::Result<Option<CameraContext>> {
+        let context = self.current_context(bus)?;
+        if context.is_none() {
+            self.publish_no_context_degraded(
+                bus,
+                district,
+                "fresh same-host California vehicle fix unavailable",
+                last_good,
+            )?;
+        }
+        Ok(context)
     }
 
     fn apply_result(
         &self,
+        bus: &mut impl CameraBus,
         result: io::Result<PreparedResponse>,
         last_good: &mut Option<CaltransCameraSnapshot>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         match result {
             Ok(PreparedResponse::Modified(snapshot)) => {
-                self.publish(&snapshot);
+                self.publish(bus, &snapshot)?;
                 *last_good = Some(snapshot);
-                true
+                Ok(true)
             }
             Err(error) => {
                 if let Some(snapshot) = last_good {
-                    snapshot
+                    let mut paused = snapshot.clone();
+                    paused
                         .gaps
                         .retain(|gap| !gap.starts_with("Caltrans cameras paused:"));
                     push_gap(
-                        &mut snapshot.gaps,
+                        &mut paused.gaps,
                         format!("Caltrans cameras paused: {error}"),
                     );
-                    self.publish(snapshot);
+                    self.publish(bus, &paused)?;
+                    *snapshot = paused;
                 }
-                false
+                Ok(false)
             }
         }
     }
@@ -855,25 +932,42 @@ impl CaltransCameraOverlayWorker {
     }
 }
 
+fn caltrans_bus_root(explicit: Option<&Path>, current: Option<PathBuf>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or(current)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 fn validated_vehicle_context(
     vehicle: &mackes_mesh_types::vehicle::VehicleState,
     expected_host: &str,
     now: i64,
-) -> Option<CameraContext> {
+) -> io::Result<Option<CameraContext>> {
     let mirror_age = now.saturating_sub(vehicle.published_at_ms).max(0);
     let future_skew = vehicle.published_at_ms.saturating_sub(now).max(0);
     let gps = &vehicle.gps;
-    if vehicle.host != expected_host
-        || !vehicle.online
-        || !gps.has_fix()
-        || !gps.latitude.is_finite()
+    if vehicle.host != expected_host {
+        return Err(io::Error::other(
+            "vehicle Bus row host does not match topic",
+        ));
+    }
+    if !vehicle.online || !gps.has_fix() {
+        return Ok(None);
+    }
+    if !gps.latitude.is_finite()
         || !gps.longitude.is_finite()
         || !gps.age_s.is_finite()
         || gps.age_s < 0.0
-        || future_skew > VEHICLE_MAX_FUTURE_SKEW_MS
+        || !(-90.0..=90.0).contains(&gps.latitude)
+        || !(-180.0..=180.0).contains(&gps.longitude)
+    {
+        return Err(io::Error::other("vehicle Bus row contains an invalid fix"));
+    }
+    if future_skew > VEHICLE_MAX_FUTURE_SKEW_MS
         || mirror_age as f64 + f64::from(gps.age_s) * 1_000.0 > VEHICLE_FIX_MAX_AGE_MS as f64
     {
-        return None;
+        return Ok(None);
     }
     let heading_deg = (gps.speed_mph.is_finite()
         && gps.speed_mph >= 5.0
@@ -885,7 +979,12 @@ fn validated_vehicle_context(
         longitude: gps.longitude,
         heading_deg,
     };
-    validate_context(context).ok().map(|()| context)
+    if !(32.0..=42.2).contains(&context.latitude) || !(-124.6..=-114.0).contains(&context.longitude)
+    {
+        return Ok(None);
+    }
+    validate_context(context)?;
+    Ok(Some(context))
 }
 
 #[async_trait::async_trait]
@@ -901,24 +1000,34 @@ impl Worker for CaltransCameraOverlayWorker {
         };
         let mut last_good = None;
         let mut retry = self.poll;
-        let mut no_fix_published = false;
         loop {
-            let Some(context) = self.current_context() else {
-                if !no_fix_published {
-                    self.publish_no_context_degraded(
-                        district,
-                        "fresh same-host California vehicle fix unavailable",
-                        &mut last_good,
+            let context = match self.open_bus().and_then(|mut bus| {
+                self.current_context_or_clear(&mut bus, district, &mut last_good)
+            }) {
+                Ok(Some(context)) => context,
+                Ok(None) => {
+                    retry = self.poll;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(self.poll) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::caltrans_camera_overlay",
+                        %error,
+                        "Caltrans vehicle context transaction deferred"
                     );
-                    no_fix_published = true;
+                    let delay = retry;
+                    retry = retry.saturating_mul(2).min(RETRY_MAX);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(self.poll) => {}
-                }
-                continue;
             };
-            no_fix_published = false;
             let Some(result) = self
                 .fetch_async(
                     probe.clone(),
@@ -931,7 +1040,26 @@ impl Worker for CaltransCameraOverlayWorker {
             else {
                 break;
             };
-            let success = self.apply_result(result, &mut last_good);
+            // Provider I/O runs without holding a Bus handle. Re-open and
+            // re-read the vehicle authority before publishing so a concurrent
+            // fix loss/change or index replacement cannot admit stale cameras.
+            let success = match self.open_bus().and_then(|mut bus| {
+                let latest = self.current_context_or_clear(&mut bus, district, &mut last_good)?;
+                if latest != Some(context) {
+                    return Ok(false);
+                }
+                self.apply_result(&mut bus, result, &mut last_good)
+            }) {
+                Ok(success) => success,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::caltrans_camera_overlay",
+                        %error,
+                        "Caltrans refresh transaction deferred"
+                    );
+                    false
+                }
+            };
             let delay = if success { self.poll } else { retry };
             retry = if success {
                 self.poll
@@ -1008,6 +1136,63 @@ mod tests {
 
     fn catalog(entries: Vec<serde_json::Value>) -> String {
         json!({"data":entries}).to_string()
+    }
+
+    fn vehicle(latitude: f64, longitude: f64) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude,
+            longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn write_vehicle(persist: &Persist, vehicle: &VehicleState) {
+        persist
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(vehicle).unwrap()),
+            )
+            .expect("vehicle publication");
+    }
+
+    #[derive(Default)]
+    struct FixtureBus {
+        body: Option<String>,
+        read_fails: bool,
+        failed_writes_remaining: usize,
+        published: Vec<CaltransCameraSnapshot>,
+    }
+
+    impl CameraBus for FixtureBus {
+        fn read_latest_body(&mut self, _topic: &str) -> io::Result<Option<String>> {
+            if self.read_fails {
+                Err(io::Error::other("injected vehicle read failure"))
+            } else {
+                Ok(self.body.clone())
+            }
+        }
+
+        fn publish_snapshot(
+            &mut self,
+            _topic: &str,
+            snapshot: &CaltransCameraSnapshot,
+        ) -> io::Result<()> {
+            if self.failed_writes_remaining > 0 {
+                self.failed_writes_remaining -= 1;
+                return Err(io::Error::other("injected camera write failure"));
+            }
+            self.published.push(snapshot.clone());
+            Ok(())
+        }
     }
 
     struct FakeProbe;
@@ -1125,13 +1310,17 @@ mod tests {
             age_s: 1.0,
             ..GpsFix::default()
         };
-        assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000).is_some());
-        assert!(validated_vehicle_context(&vehicle, "other", 110_000).is_none());
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000)
+            .unwrap()
+            .is_some());
+        assert!(validated_vehicle_context(&vehicle, "other", 110_000).is_err());
         vehicle.gps.latitude = f64::NAN;
-        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_none());
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_err());
         vehicle.gps.latitude = 42.3601;
         vehicle.gps.longitude = -71.0589;
-        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_none());
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1189,7 +1378,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let worker =
-            CaltransCameraOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+            CaltransCameraOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original = build_snapshot(
             &FakeProbe,
             "rig-1",
@@ -1203,11 +1392,15 @@ mod tests {
         assert!(!original.cameras.is_empty());
         let mut last_good = Some(original);
 
-        worker.publish_no_context_degraded(
-            3,
-            "fresh same-host California vehicle fix unavailable",
-            &mut last_good,
-        );
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        worker
+            .publish_no_context_degraded(
+                &mut bus,
+                3,
+                "fresh same-host California vehicle fix unavailable",
+                &mut last_good,
+            )
+            .expect("durable empty publication");
 
         assert!(
             last_good.is_none(),
@@ -1241,7 +1434,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let worker =
-            CaltransCameraOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+            CaltransCameraOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original = build_snapshot(
             &FakeProbe,
             "rig-1",
@@ -1253,8 +1446,21 @@ mod tests {
         )
         .expect("snapshot");
         let mut last_good = None;
-        assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), &mut last_good,));
-        assert!(!worker.apply_result(Err(io::Error::other("catalog timeout")), &mut last_good,));
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                &mut last_good,
+            )
+            .expect("publish fresh"));
+        assert!(!worker
+            .apply_result(
+                &mut bus,
+                Err(io::Error::other("catalog timeout")),
+                &mut last_good,
+            )
+            .expect("publish paused"));
         let retained = last_good.as_ref().expect("retained");
         assert_eq!(retained.fetched_at_ms, NOW_MS);
         assert!(retained
@@ -1266,6 +1472,167 @@ mod tests {
             .list_since(&caltrans_camera_state_topic("rig-1"), None)
             .expect("rows");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn vehicle_read_or_decode_failure_is_effect_free() {
+        let worker = CaltransCameraOverlayWorker::new("rig-1".to_string());
+        let original = build_snapshot(
+            &FakeProbe,
+            "rig-1",
+            3,
+            context(),
+            &catalog(vec![camera(1, "38.481128", "-121.510528")]),
+            None,
+            NOW_MS,
+        )
+        .expect("last-good snapshot");
+
+        for mut bus in [
+            FixtureBus {
+                read_fails: true,
+                ..FixtureBus::default()
+            },
+            FixtureBus {
+                body: Some("{not vehicle json".to_string()),
+                ..FixtureBus::default()
+            },
+        ] {
+            let mut last_good = Some(original.clone());
+            assert!(worker
+                .current_context_or_clear(&mut bus, 3, &mut last_good)
+                .is_err());
+            assert_eq!(last_good.as_ref(), Some(&original));
+            assert!(bus.published.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_publication_retains_state_and_corrects_forward() {
+        let worker = CaltransCameraOverlayWorker::new("rig-1".to_string());
+        let previous = CaltransCameraSnapshot::empty("rig-1", 3, NOW_MS - 1, 38.48, -121.51);
+        let replacement = build_snapshot(
+            &FakeProbe,
+            "rig-1",
+            3,
+            context(),
+            &catalog(vec![camera(1, "38.481128", "-121.510528")]),
+            None,
+            NOW_MS,
+        )
+        .expect("replacement snapshot");
+        let mut last_good = Some(previous.clone());
+        let mut bus = FixtureBus {
+            failed_writes_remaining: 1,
+            ..FixtureBus::default()
+        };
+
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(replacement.clone())),
+                &mut last_good,
+            )
+            .is_err());
+        assert_eq!(last_good.as_ref(), Some(&previous));
+        assert!(bus.published.is_empty());
+
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(replacement.clone())),
+                &mut last_good,
+            )
+            .expect("corrected-forward publication"));
+        assert_eq!(last_good.as_ref(), Some(&replacement));
+        assert_eq!(bus.published, vec![replacement.clone()]);
+
+        bus.body = None;
+        bus.failed_writes_remaining = 1;
+        assert!(worker
+            .current_context_or_clear(&mut bus, 3, &mut last_good)
+            .is_err());
+        assert_eq!(last_good.as_ref(), Some(&replacement));
+        assert_eq!(bus.published.len(), 1);
+        assert!(worker
+            .current_context_or_clear(&mut bus, 3, &mut last_good)
+            .expect("corrected-forward empty publication")
+            .is_none());
+        assert!(last_good.is_none());
+        assert_eq!(bus.published.len(), 2);
+        assert!(bus.published[1].cameras.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_and_replaced_bus_recovers_in_the_same_worker() {
+        assert_eq!(
+            caltrans_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let root = tempfile::tempdir().expect("root");
+        let bus_root = root.path().join("bus");
+        std::fs::write(&bus_root, b"blocks Persist::open").expect("late Bus blocker");
+        let mut worker = CaltransCameraOverlayWorker::new("rig-1".to_string())
+            .with_probe(3, Arc::new(FakeProbe))
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(!task.is_finished(), "late Bus terminated the worker");
+        std::fs::remove_file(&bus_root).expect("unblock Bus root");
+        let first_bus = Persist::open(bus_root.clone()).expect("activate Bus");
+        write_vehicle(&first_bus, &vehicle(38.481, -121.511));
+        let topic = caltrans_camera_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = first_bus.read_latest(&topic) {
+                    let snapshot: CaltransCameraSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == 38.481 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("late Bus publication");
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{suffix}",
+                bus_root.join("index.sqlite").display()
+            ));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(bus_root.clone()).expect("replacement Bus");
+        write_vehicle(&replacement_bus, &vehicle(38.482, -121.512));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = replacement_bus.read_latest(&topic) {
+                    let snapshot: CaltransCameraSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == 38.482 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus publication");
+
+        tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("worker join")
+            .expect("worker result");
     }
 
     struct SlowProbe;
@@ -1287,7 +1654,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_wins_while_catalog_is_in_flight() {
-        let worker = CaltransCameraOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
+        let worker = CaltransCameraOverlayWorker::new("rig-1".to_string());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut shutdown = ShutdownToken::from_receiver(rx);
         let sender = tokio::spawn(async move {
@@ -1310,7 +1677,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         let mut worker = CaltransCameraOverlayWorker::new("rig-1".to_string())
             .with_probe(3, Arc::new(FakeProbe))
-            .with_bus_root(Some(root.clone()))
+            .with_bus_root(root.clone())
             .with_poll(Duration::from_millis(50));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
