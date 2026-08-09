@@ -2897,6 +2897,87 @@ impl WorkloadComputeWorker {
         }
     }
 
+    /// Expiration after the defining boundary is a cleanup operation, not a
+    /// terminal status shortcut.  The adapter may already own a VM, overlay,
+    /// unit, or Display1 runtime, so keep the durable operation in flight and
+    /// therefore exclusive until idempotent cancellation proves everything is
+    /// stopped.  This also covers daemon restart: the journaled phase is the
+    /// authority for deciding whether side effects may exist.
+    fn cleanup_expired_operation(
+        &self,
+        ledger: &mut WorkloadOperationLedger,
+        request: &WorkloadOperationRequest,
+        mut status: WorkloadOperationStatus,
+        now_ms: u64,
+    ) {
+        if matches!(
+            status.phase,
+            WorkloadOperationPhase::Queued
+                | WorkloadOperationPhase::Validating
+                | WorkloadOperationPhase::Admitting
+        ) {
+            self.fail(
+                ledger,
+                request,
+                status,
+                "workload operation deadline expired before adapter side effects",
+                "issue a new operation from the current Workload projection",
+                false,
+                now_ms,
+            );
+            return;
+        }
+        if now_ms < status.next_retry_at_ms {
+            return;
+        }
+
+        // The visible lease must not outlive the deadline even if stopping the
+        // backend needs another poll.  Revocation is exact and idempotent.
+        self.actuator.revoke_attachment(&status);
+        status.attachment = None;
+
+        match self.actuator.cancel(request, &status) {
+            Ok(mut outcome)
+                if outcome.phase == WorkloadOperationPhase::Cancelled
+                    && outcome.power == WorkloadPowerState::Stopped
+                    && outcome.readiness == WorkloadReadiness::Unavailable
+                    && outcome.attachment.is_none() =>
+            {
+                outcome.reason = Some(
+                    "expired workload operation was cancelled and all adapter resources were cleaned up"
+                        .into(),
+                );
+                outcome.remediation =
+                    Some("issue a new operation from the current Workload projection".into());
+                self.apply_outcome(ledger, request, status, outcome, now_ms);
+            }
+            Ok(_) | Err(_) => {
+                // Never publish terminal failure while cleanup is unproven.
+                // Keeping this generation nonterminal also prevents a second
+                // open from creating a duplicate App VM session.
+                let attempt = status.attempt.saturating_add(1);
+                let exponent = u32::from(attempt.saturating_sub(1).min(5));
+                let delay = (1_000_u64.saturating_mul(1_u64 << exponent)).min(MAX_RETRY_BACKOFF_MS);
+                status.attempt = attempt;
+                status.phase = WorkloadOperationPhase::Stopping;
+                status.power = WorkloadPowerState::Stopping;
+                status.readiness = WorkloadReadiness::Unavailable;
+                status.retryable = true;
+                status.next_retry_at_ms = now_ms.saturating_add(delay);
+                status.reason =
+                    Some("workload deadline expired; adapter cleanup is still in progress".into());
+                status.remediation = Some(
+                    "wait for the authoritative Workload cleanup to finish before retrying".into(),
+                );
+                status.signals =
+                    WorkloadRuntimeSignals::from_readiness(status.phase, status.readiness);
+                if let Err(error) = ledger.advance(&request.request_id, status, now_ms) {
+                    tracing::error!(%error, "expired workload cleanup state could not be journaled");
+                }
+            }
+        }
+    }
+
     fn reconcile_inflight(&mut self, ledger: &mut WorkloadOperationLedger, now_ms: u64) {
         let pending: Vec<_> = ledger
             .statuses()
@@ -2922,15 +3003,7 @@ impl WorkloadComputeWorker {
                 continue;
             };
             if request.deadline_at_ms <= now_ms {
-                self.fail(
-                    ledger,
-                    &request,
-                    status,
-                    "workload operation deadline expired while waiting for readiness",
-                    "issue a new operation from the current Workload projection",
-                    false,
-                    now_ms,
-                );
+                self.cleanup_expired_operation(ledger, &request, status, now_ms);
                 continue;
             }
             // Backoff is durable state, not merely an admission-time hint.
@@ -3629,6 +3702,77 @@ mod tests {
             _: &WorkloadOperationStatus,
         ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
             Ok(None)
+        }
+    }
+
+    struct TimeoutCleanupActuator {
+        apply_calls: Arc<Mutex<u32>>,
+        cleanup_calls: Arc<Mutex<u32>>,
+        revoked: Arc<Mutex<Vec<(String, u64)>>>,
+        lease: WorkloadAttachmentLease,
+    }
+
+    impl WorkloadActuator for TimeoutCleanupActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            *self.apply_calls.lock().expect("apply calls") += 1;
+            Ok(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::WaitingForGuest,
+                power: WorkloadPowerState::Starting,
+                readiness: WorkloadReadiness::WaitingForGuest,
+                retryable: true,
+                reason: None,
+                remediation: None,
+                attachment: Some(self.lease.clone()),
+            })
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            let mut calls = self.cleanup_calls.lock().expect("cleanup calls");
+            *calls += 1;
+            if *calls == 1 {
+                return Ok(WorkloadActuatorOutcome {
+                    phase: WorkloadOperationPhase::Stopping,
+                    power: WorkloadPowerState::Stopping,
+                    readiness: WorkloadReadiness::Unavailable,
+                    retryable: true,
+                    reason: Some("hostile backend is still stopping".into()),
+                    remediation: None,
+                    attachment: None,
+                });
+            }
+            Ok(WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::Cancelled,
+                power: WorkloadPowerState::Stopped,
+                readiness: WorkloadReadiness::Unavailable,
+                retryable: false,
+                reason: None,
+                remediation: None,
+                attachment: None,
+            })
+        }
+
+        fn observe(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            panic!("an expired operation must clean up instead of being observed")
+        }
+
+        fn revoke_attachment(&self, status: &WorkloadOperationStatus) {
+            if let Some(lease) = status.attachment.as_ref() {
+                self.revoked
+                    .lock()
+                    .expect("revocations")
+                    .push((lease.lease_id.clone(), lease.generation));
+            }
         }
     }
 
@@ -4989,6 +5133,95 @@ mod tests {
 
         worker.reconcile_inflight(&mut ledger, retry_at);
         assert_eq!(*observe_calls.lock().expect("observe calls"), 2);
+    }
+
+    #[test]
+    fn expired_app_vm_open_revokes_lease_and_blocks_duplicates_until_cleanup() {
+        let temp = tempfile::tempdir().expect("temp");
+        let started_at = now_ms();
+        let mut request = request();
+        request.workload_id =
+            WorkloadId::new("app-vm:seat15:org.example.Editor").expect("App VM workload id");
+        request.deadline_at_ms = started_at + 1_000;
+        let lease = SystemWorkloadActuator::attachment_lease(&request, 1, started_at);
+        let apply_calls = Arc::new(Mutex::new(0));
+        let cleanup_calls = Arc::new(Mutex::new(0));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let mut worker = WorkloadComputeWorker::new("seat15".into(), 1)
+            .with_state_root(temp.path().to_path_buf())
+            .with_authorizer(Box::new(AllowAuthorizer))
+            .with_capacity(test_capacity())
+            .with_actuator(Box::new(TimeoutCleanupActuator {
+                apply_calls: Arc::clone(&apply_calls),
+                cleanup_calls: Arc::clone(&cleanup_calls),
+                revoked: Arc::clone(&revoked),
+                lease: lease.clone(),
+            }));
+        let mut ledger = WorkloadOperationLedger::open(temp.path()).expect("ledger");
+        let raw = serde_json::to_string(&request).expect("wire");
+
+        worker.handle_request(&mut ledger, &raw, request.clone(), started_at);
+        assert_eq!(*apply_calls.lock().expect("apply calls"), 1);
+        assert_eq!(
+            ledger
+                .status(&request.request_id)
+                .and_then(|status| status.attachment.as_ref()),
+            Some(&lease)
+        );
+
+        // The first cleanup attempt reports that the backend is still
+        // stopping.  The lease is already gone, but the operation remains
+        // nonterminal so another request cannot open a duplicate session.
+        worker.reconcile_inflight(&mut ledger, request.deadline_at_ms);
+        let pending = ledger.status(&request.request_id).expect("pending cleanup");
+        assert!(!pending.phase.is_terminal());
+        assert_eq!(pending.phase, WorkloadOperationPhase::Stopping);
+        assert_eq!(pending.power, WorkloadPowerState::Stopping);
+        assert!(pending.attachment.is_none());
+        assert_eq!(pending.generation, 1);
+        assert_eq!(
+            revoked.lock().expect("revocations").as_slice(),
+            &[(lease.lease_id.clone(), lease.generation)]
+        );
+        let retry_at = pending.next_retry_at_ms;
+
+        let mut duplicate = request.clone();
+        duplicate.request_id = "op-duplicate".into();
+        duplicate.deadline_at_ms = request.deadline_at_ms + 20_000;
+        let duplicate_raw = serde_json::to_string(&duplicate).expect("duplicate wire");
+        assert!(matches!(
+            worker.handle_request(
+                &mut ledger,
+                &duplicate_raw,
+                duplicate.clone(),
+                request.deadline_at_ms
+            ),
+            HandleResult::Rejected(WorkloadOperationErrorCode::StaleGeneration)
+        ));
+        assert!(ledger.request(&duplicate.request_id).is_none());
+        assert_eq!(*apply_calls.lock().expect("apply calls"), 1);
+
+        worker.reconcile_inflight(&mut ledger, retry_at);
+        let cleaned = ledger.status(&request.request_id).expect("cleaned status");
+        assert_eq!(cleaned.phase, WorkloadOperationPhase::Cancelled);
+        assert_eq!(cleaned.power, WorkloadPowerState::Stopped);
+        assert_eq!(cleaned.readiness, WorkloadReadiness::Unavailable);
+        assert!(cleaned.attachment.is_none());
+        assert_eq!(cleaned.generation, 1);
+        assert_eq!(*cleanup_calls.lock().expect("cleanup calls"), 2);
+
+        // A same-id Bus replay is read-only after cleanup: no second apply,
+        // cancellation, lease, or desired generation is produced.
+        worker.handle_request(&mut ledger, &raw, request.clone(), retry_at);
+        assert_eq!(*apply_calls.lock().expect("apply calls"), 1);
+        assert_eq!(*cleanup_calls.lock().expect("cleanup calls"), 2);
+        assert_eq!(
+            ledger
+                .status(&request.request_id)
+                .expect("replayed status")
+                .generation,
+            1
+        );
     }
 
     #[test]

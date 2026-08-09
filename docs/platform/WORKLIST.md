@@ -844,16 +844,15 @@ behavioral evidence is not completion.
   predictably.
 - Current state: bounded signed catalog admission, deterministic search, and a production-registered fail-closed importer now exist alongside typed App VM/OpenApp/session
   contracts; trust provisioning, image supply, launch readiness, UX, security, and live proof remain.
-- **Signed catalog checkpoint (2026-08-08):** exact-signer bounded admission and deterministic ranking passed 12 focused and 480 complete tests on `.196`:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-08-signed-app-catalog-s1-r1.md`.
-- **Catalog importer checkpoint (2026-08-08):** root-owned trust/state, restart-safe rollback protection, exact replay, last-good retention, and installed-only projection
-  passed 6/6 on `.196`; `.170` compiled the production binary:
-  `docs/platform/evidence/WL-FUNC-018-2026-08-08-catalog-importer-s1-r1.md`.
+- **Catalog checkpoints (2026-08-08):** exact-signer admission/ranking and root-owned rollback-safe import passed `.196`; `.170` compiled production:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-08-signed-app-catalog-s1-r1.md`, `docs/platform/evidence/WL-FUNC-018-2026-08-08-catalog-importer-s1-r1.md`.
 - **App VM profile checkpoint (2026-08-08):** the immutable Wayland/Flatpak contract, supervisor, readiness/provenance, and hostile fixtures passed on `.170`;
   a current built image/hash and live boot remain:
   `docs/platform/evidence/WL-FUNC-018-2026-08-08-app-vm-profile-s2-r1.md`.
 - **Runtime admission checkpoints (2026-08-09):** unavailable or cross-VM guest evidence cannot authorize resume or mutate desired state; `.90` passed 25/25 and BigBoy passed
   26/26: `docs/platform/evidence/WL-FUNC-018-2026-08-09-unavailable-runtime-admission-r2.md`, `docs/platform/evidence/WL-FUNC-018-2026-08-09-runtime-vm-identity-r3.md`.
+- **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
+  machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.

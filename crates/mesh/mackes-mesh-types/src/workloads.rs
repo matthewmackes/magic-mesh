@@ -1095,6 +1095,24 @@ pub fn valid_phase_transition(from: WorkloadOperationPhase, to: WorkloadOperatio
                 WorkloadOperationPhase::Queued,
                 WorkloadOperationPhase::Stopping
             ) | (
+                WorkloadOperationPhase::Defining,
+                WorkloadOperationPhase::Stopping
+            ) | (
+                WorkloadOperationPhase::Starting,
+                WorkloadOperationPhase::Stopping
+            ) | (
+                WorkloadOperationPhase::WaitingForGuest,
+                WorkloadOperationPhase::Stopping
+            ) | (
+                WorkloadOperationPhase::WaitingForService,
+                WorkloadOperationPhase::Stopping
+            ) | (
+                WorkloadOperationPhase::PreparingDisplay,
+                WorkloadOperationPhase::Stopping
+            ) | (
+                WorkloadOperationPhase::WaitingForFirstFrame,
+                WorkloadOperationPhase::Stopping
+            ) | (
                 WorkloadOperationPhase::Ready,
                 WorkloadOperationPhase::Stopping
             ) | (
