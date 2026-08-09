@@ -439,6 +439,10 @@ behavioral evidence is not completion.
   honest merged roster without daemon restart. Machine 193 passed two exact
   recovery/fallback tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`.
+- **Media-server Bus recovery checkpoint (2026-08-09):** share manifests,
+  serving, aggregation, and publication remain behind recoverable Bus startup;
+  machine 193 passed two exact activation/fallback tests:
+  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-recovery-r28.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a

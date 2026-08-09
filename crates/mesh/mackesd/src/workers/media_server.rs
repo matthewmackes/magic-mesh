@@ -78,6 +78,10 @@ pub const SHARE_DIRS_ENV: &str = "MDE_MEDIA_SHARE_DIRS";
 /// keeps the library fresh without hammering the filesystem.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Bounds for service-context Bus startup recovery.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Unconditional-republish heartbeat: between heartbeats the library publishes
 /// only on change; once elapsed it republishes so a late subscriber / pruned
 /// topic still finds a recent record (mirrors `media_sources`).
@@ -1050,19 +1054,22 @@ impl Worker for MediaServerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::media_server", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::media_server", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let bus_root = media_server_bus_root(self.bus_root_override.clone());
+        let retry_interval = self
+            .tick
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let persist = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::debug!(
+                    target: "mackesd::media_server",
+                    %error,
+                    "Bus open failed; media-server startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
 
@@ -1099,6 +1106,14 @@ impl Worker for MediaServerWorker {
         }
         Ok(())
     }
+}
+
+fn media_server_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    media_server_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn media_server_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 /// Wall-clock epoch millis for a published record.
@@ -1509,6 +1524,81 @@ mod tests {
     }
 
     // ── worker orchestration (no live server; real plane + bus) ──
+
+    #[test]
+    fn media_server_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/media-server-bus");
+        assert_eq!(media_server_bus_root(Some(explicit.clone())), explicit);
+        assert_eq!(
+            media_server_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_and_publishes_library_without_worker_restart() {
+        let holder = tempfile::tempdir().expect("media-server recovery root");
+        let bus = holder.path().join("bus");
+        std::fs::write(&bus, b"block Persist::open").expect("install Bus blocker");
+        let mount = tempfile::tempdir().expect("media-server mount");
+        let mut worker = MediaServerWorker::new(
+            "peer:recovery".to_string(),
+            "recovery".to_string(),
+            mount.path().to_path_buf(),
+        )
+        .with_share_dirs(Vec::new())
+        .with_bus_root(bus.clone())
+        .with_tick(Duration::from_millis(10))
+        .without_live_server();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            !task.is_finished(),
+            "an unopenable Bus must not permanently end the media server"
+        );
+        assert!(
+            !mount
+                .path()
+                .join("recovery")
+                .join(MESH_LIBRARY_MANIFEST_FILE)
+                .exists(),
+            "server state must not be materialized before Bus activation"
+        );
+
+        std::fs::remove_file(&bus).expect("remove Bus blocker");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let published = Persist::open(bus.clone())
+                    .and_then(|persist| persist.read_latest(MESH_LIBRARY_TOPIC))
+                    .map(|message| message.is_some())
+                    .unwrap_or(false);
+                if published {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the same worker must publish after Bus recovery");
+        assert!(mount
+            .path()
+            .join("recovery")
+            .join(MESH_LIBRARY_MANIFEST_FILE)
+            .exists());
+        assert!(!task.is_finished(), "recovered worker must remain active");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt media-server polling")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
 
     fn latest_state(persist: &Persist) -> MeshLibraryState {
         let msgs = persist.list_since(MESH_LIBRARY_TOPIC, None).unwrap();
