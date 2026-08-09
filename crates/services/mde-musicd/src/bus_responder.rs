@@ -4296,6 +4296,37 @@ fn admitted_handoff_queue(
         .then(|| completion.queue.clone())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetHandoffAction {
+    /// The shared completion belongs to another requesting peer. Every daemon
+    /// sees the replicated directory, so a bystander must leave it untouched.
+    IgnoreForeign,
+    /// This peer is named as the target, but its current intent no longer
+    /// authorizes the completion. Retire the unusable local-target record.
+    DropInvalid,
+    /// This peer owns the fresh one-use request and may attempt the exact queue.
+    Resume(Queue),
+}
+
+/// Route a shared completion before any peer is allowed to delete or consume
+/// it. Checking `from_peer` first is essential: otherwise the yielding owner
+/// sees its own completion, fails target admission under the owner's hostname,
+/// and erases the transfer before the requested seat can resume it.
+fn target_handoff_action(
+    completion: &state::HandoffCompletion,
+    intents: &[state::HandoffIntent],
+    target_peer: &str,
+    now_ms: u64,
+) -> TargetHandoffAction {
+    if completion.from_peer != target_peer {
+        return TargetHandoffAction::IgnoreForeign;
+    }
+    admitted_handoff_queue(completion, intents, target_peer, now_ms).map_or(
+        TargetHandoffAction::DropInvalid,
+        TargetHandoffAction::Resume,
+    )
+}
+
 /// Yield the local engine to the newest admitted takeover intent. The intent
 /// remains beside the durable completion until the requester consumes both;
 /// that binding prevents a stale or spoofed completion from authorizing a
@@ -4416,21 +4447,21 @@ fn apply_handoff_completions(engine: Option<&Engine>, queue_path: &Path, clients
     let intents = state::read_intents(&dir);
     let now_ms = state::now_ms();
     for completion in state::read_completions(&dir) {
-        if !state::completion_matches_intent(&completion, &intents, &my_host, now_ms) {
-            tracing::warn!(
-                intent_id = %completion.intent_id,
-                from_peer = %completion.from_peer,
-                owner_peer = %completion.owner_peer,
-                "music handoff completion has no matching pending intent; dropping it"
-            );
-            state::clear_completion(&dir, &completion.intent_id);
-            continue;
-        }
-        let previous_queue = queue::read_from(queue_path);
-        let Some(queue) = admitted_handoff_queue(&completion, &intents, &my_host, now_ms) else {
-            state::clear_completion(&dir, &completion.intent_id);
-            continue;
+        let queue = match target_handoff_action(&completion, &intents, &my_host, now_ms) {
+            TargetHandoffAction::IgnoreForeign => continue,
+            TargetHandoffAction::DropInvalid => {
+                tracing::warn!(
+                    intent_id = %completion.intent_id,
+                    from_peer = %completion.from_peer,
+                    owner_peer = %completion.owner_peer,
+                    "local music handoff completion has no matching pending intent; dropping it"
+                );
+                state::clear_completion(&dir, &completion.intent_id);
+                continue;
+            }
+            TargetHandoffAction::Resume(queue) => queue,
         };
+        let previous_queue = queue::read_from(queue_path);
         if queue::write_to(queue_path, &queue).is_err() {
             tracing::warn!(intent_id = %completion.intent_id, "music handoff queue could not be persisted; retaining completion");
             continue;
@@ -6825,6 +6856,71 @@ mod tests {
         ));
         source_playing = true;
         assert_ne!(source_playing, target_playing, "failure leaves one owner");
+    }
+
+    #[test]
+    fn shared_handoff_completion_survives_owner_and_bystander_pumps_for_target_resume() {
+        let transferred_queue = Queue {
+            songs: vec!["before".into(), "playing-now".into(), "after".into()],
+            current: 1,
+            preferred_source: None,
+        };
+        let intent = state::HandoffIntent {
+            intent_id: "owner-yield-target-resume".into(),
+            from_peer: "target-seat".into(),
+            to_peer: Some("source-seat".into()),
+            issued_ms: 20_000,
+        };
+        let completion = state::HandoffCompletion {
+            intent_id: intent.intent_id.clone(),
+            from_peer: intent.from_peer.clone(),
+            owner_peer: "source-seat".into(),
+            song_id: "playing-now".into(),
+            queue: transferred_queue.clone(),
+            position_ms: 73_250,
+            completed_ms: 20_001,
+            expires_ms: 20_001 + state::HANDOFF_ACK_TIMEOUT_MS,
+        };
+
+        for polling_peer in ["source-seat", "unrelated-seat"] {
+            assert_eq!(
+                target_handoff_action(
+                    &completion,
+                    std::slice::from_ref(&intent),
+                    polling_peer,
+                    20_002,
+                ),
+                TargetHandoffAction::IgnoreForeign,
+                "{polling_peer} must not erase a completion replicated for target-seat"
+            );
+        }
+        assert_eq!(
+            target_handoff_action(
+                &completion,
+                std::slice::from_ref(&intent),
+                "target-seat",
+                20_002,
+            ),
+            TargetHandoffAction::Resume(transferred_queue),
+            "the named target must retain the exact owner queue and resume position"
+        );
+
+        let superseding_intent = state::HandoffIntent {
+            intent_id: "newer-target-request".into(),
+            issued_ms: 20_003,
+            ..intent
+        };
+        assert_eq!(
+            target_handoff_action(
+                &completion,
+                std::slice::from_ref(&superseding_intent),
+                "target-seat",
+                20_004,
+            ),
+            TargetHandoffAction::DropInvalid,
+            "only the named target may retire its stale superseded completion"
+        );
+        assert_eq!(completion.position_ms, 73_250);
     }
 
     #[test]

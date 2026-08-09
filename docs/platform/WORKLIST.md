@@ -128,6 +128,9 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`.
 - **Cloud runtime-roster authority checkpoint (2026-08-09):** generic Cloud list/status/resource mirrors consume typed Workloads only; `.196` passed 208/208.
   Drift/Cuttlefish remain: `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-workload-roster-authority-r94.md`.
+- **Runtime-authority checkpoints (2026-08-09):** Cloud drift consumes typed Workloads and reports missing authority as unknown (machine 9: 19/19); new direct inventory outside
+  `workload_compute` is rejected (`.90`: hostile/repository lint). Cuttlefish and pinned reads remain.
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-drift-workload-authority-r96.md`; `docs/platform/evidence/WL-ARCH-010-2026-08-09-runtime-inventory-authority-scanner-r97.md`.
 - **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
   repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
@@ -146,9 +149,6 @@ behavioral evidence is not completion.
 - **Durable journal checkpoint (2026-08-06):** persisted Workload journals reject
   recursive duplicate JSON keys before replay; BigBoy passed 8/8 reconciler tests.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-ledger-duplicate-keys-r1.md`.
-- **Shell projection checkpoint (2026-08-06):** duplicate-key node projections
-  fail closed; `.50` was ENOSPC during compile, so no pass is claimed. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-shell-projection-duplicate-keys-r1.md`.
 - **VDI reconnect checkpoint (2026-08-06):** generation-zero reconnect evidence
   is refused; BigBoy passed 1/1. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-vdi-reconnect-generation-r1.md`.
@@ -395,8 +395,7 @@ behavioral evidence is not completion.
   target during RPM upgrade. Seat 15 proved isolated integrations and control
   crashes while every unaffected PID and restart counter remained unchanged;
   target, mesh-health, and RPM verification stayed healthy. Dell was offline
-  for corrected-package deployment. Evidence:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`.
+  for corrected-package deployment. Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-group-crash-isolation-r2.md`.
 - **Live cgroup-enforcement checkpoint (2026-08-08):** Release 23 on seat 15
   placed all six active groups in distinct cgroup-v2 paths whose effective
   memory, CPU, task, and I/O values matched the package. A bounded transient
@@ -418,6 +417,8 @@ behavioral evidence is not completion.
   the canonical registry. Exact/hostile argv and bidirectional registry guards
   passed 4/4 focused farm tests. Live package/cgroup census remains. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-responder-group-isolation-r5.md`.
+- **Nebula dispatcher ownership checkpoint (2026-08-09):** Control and Observation own distinct registered adapters; the other groups fail closed. Machine 196 passed 4/4
+  admission guards; complete worker-role rerun remains: `docs/platform/evidence/WL-ARCH-009-2026-08-09-nebula-dispatcher-ownership-r95.md`.
 - **Metrics collector recovery checkpoint (2026-08-09):** a missing
   node-exporter textfile directory is recreated, while symlink substitution
   fails closed and atomic temporary files are cleaned on failure. Machine 194
@@ -1379,14 +1380,13 @@ behavioral evidence is not completion.
 - **Typed target handoff checkpoint (2026-08-06):** bounded peer heartbeats project honestly; fresh idle mesh seats publish typed `transfer`, stale/owning peers remain browse-only.
   Music UI is 48/48 on `.50`, format is clean, and the hostile test covers `peer:seat-15`; live owner-yield/resume and DLNA/provider/package proof remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-target-handoff-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-06-peer-targets-r1.md`.
+- **Handoff target-routing checkpoint (2026-08-09):** owner and bystander pumps no longer erase another seat's completion; BigBoy passed 12/12.
+  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-09-handoff-target-routing-r95.md`.
 - **Cast checkpoints (2026-08-06/09):** real DLNA control and off-render native Chromecast discovery are bounded; authenticated CastV2/live-seat proof remain open.
   `evidence/WL-FUNC-021-2026-08-06-cast-bounds-r1.md`, `evidence/WL-FUNC-021-2026-08-09-chromecast-async-discovery-r12.md`.
 - **Live provider-loss checkpoint (2026-08-08):** release 11 on seat 15 passed a controlled healthy → provider loss → healthy transition with cached catalog/state available.
   The daemon stayed active with zero restarts and the seat-local firewall rule was removed; two-catalog outage and audible stream continuity remain open.
   `docs/platform/evidence/WL-FUNC-021-2026-08-08-live-provider-loss-release11-r1.md`.
-- **Provider-loss loopback checkpoint (2026-08-06):** bounded FIN/reset and zero fallback requests are transport/policy proof only, not live provider/daemon/
-  decoder/hardware proof. `install-helpers/verify-music-network-loss.sh`;
-  `docs/platform/evidence/WL-FUNC-021-2026-08-06-network-loss-loopback-r1.md`.
 - **Provider-loss reconnect checkpoint (2026-08-06):** the native engine now
   retries a failed Subsonic stream from the audible playhead using bounded
   `timeOffset` resumes, clears buffered-ahead samples before retry, preserves

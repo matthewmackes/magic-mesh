@@ -439,7 +439,10 @@ payload_compress = "xz"
 # host-Browser SELinux boot units during corrected-forward upgrades.
 # -26 (2026-08-09): hard-require Fedora's split QEMU D-Bus UI backend so the
 # Display1-first Browser/Workload domain can boot instead of failing autostart.
-release = "26"
+# -27 (2026-08-09): retain slow probed-RDP resources for the full scan window,
+# route Cloud drift through typed Workloads, isolate Nebula signal dispatchers
+# by process group, and preserve target-addressed Music handoff completions.
+release = "27"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.

@@ -1522,6 +1522,14 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         WorkerGroup::Integrations,
     ),
     WorkerSpec::responder("nebula_bus_responder", WorkerGroup::Control),
+    WorkerSpec::responder(
+        "nebula_control_signal_dispatcher",
+        WorkerGroup::Control,
+    ),
+    WorkerSpec::responder(
+        "nebula_observation_signal_dispatcher",
+        WorkerGroup::Observation,
+    ),
     WorkerSpec::direct(
         "nebula_ca_backup",
         RestartPolicy::OnFailure,
@@ -2868,7 +2876,7 @@ mod tests {
     fn canonical_registry_inventory_hash_covers_every_runtime_field() {
         let hash = registry_inventory_sha256(WORKER_REGISTRY);
         assert_eq!(
-            hash, "983c9334b4531f55afb42ea732438ed4cfdc12f0526affbf9b0b3971317ea616",
+            hash, "2a444300c05136dbdbe08420d7fce51efc7e9cc418b7adf1031ceed41e6588c4",
             "WL-ARCH-009: canonical registration inventory drifted"
         );
 
@@ -3038,7 +3046,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 143);
+        assert_eq!(WORKER_REGISTRY.len(), 145);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -3356,10 +3364,10 @@ mod tests {
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88. The two media
         // gateway proxies brought the real pre-cutover count to 90. The current
-        // canonical roster contains 82 tiered/dynamic registrations plus 61
+        // canonical roster contains 82 tiered/dynamic registrations plus 63
         // direct supervisors/responders; all retired VM authorities are absent.
-        assert_eq!(lh.len(), 105);
-        assert_eq!(ws.len(), 143);
+        assert_eq!(lh.len(), 107);
+        assert_eq!(ws.len(), 145);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

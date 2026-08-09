@@ -76,6 +76,143 @@ scan_shell_runtime_commands() {
   fi
 }
 
+# Scan the production surfaces most likely to grow a second runtime inventory.
+# `workload_compute.rs` is deliberately outside this set: it is the sole
+# libvirt/Quadlet adapter and must retain its bounded lifecycle/readiness calls.
+# Test modules are excluded because their fake command strings are negative
+# fixtures, not reachable production inventory.
+scan_runtime_inventory_candidates() {
+  local source_root="$1" file relative
+  local -a sources=(
+    "crates/mesh/mackesd/src"
+    "crates/desktop/mde-shell-egui/src"
+  )
+  local -a candidate_files=()
+
+  for relative in "${sources[@]}"; do
+    [ -e "$source_root/$relative" ] || continue
+    if [ -d "$source_root/$relative" ]; then
+      if command -v rg >/dev/null 2>&1; then
+        mapfile -t candidate_files < <(rg --files "$source_root/$relative" | rg '\.(rs|sh|py)$')
+      else
+        mapfile -t candidate_files < <(find "$source_root/$relative" -type f \
+          \( -name '*.rs' -o -name '*.sh' -o -name '*.py' \) -print)
+      fi
+    else
+      candidate_files=("$source_root/$relative")
+    fi
+
+    for file in "${candidate_files[@]}"; do
+      relative=${file#"$source_root"/}
+      [ "$relative" = 'crates/mesh/mackesd/src/workers/workload_compute.rs' ] && continue
+      # Skip only the item carrying cfg(test), not the rest of its file: inline
+      # test helpers must not hide production declarations that follow them.
+      awk -v relative="$relative" '
+        function brace_delta(line, copy, opens, closes) {
+          copy=line; opens=gsub(/\{/, "", copy)
+          copy=line; closes=gsub(/\}/, "", copy)
+          return opens-closes
+        }
+        skip_test {
+          test_depth += brace_delta($0)
+          if (test_depth <= 0) { skip_test=0; test_depth=0 }
+          next
+        }
+        pending_test {
+          delta=brace_delta($0)
+          if (delta > 0) { pending_test=0; skip_test=1; test_depth=delta }
+          if ($0 ~ /;/) { pending_test=0 }
+          next
+        }
+        /^#\[cfg\(test\)\]/{pending_test=1; next}
+        /"(\/usr\/bin\/)?(virsh|podman)"|\.list_instances[[:space:]]*\(|(virsh_output|podman_output)[[:space:]]*\(/ {print relative ":" FNR ":" $0}
+      ' "$file"
+    done
+  done
+}
+
+# S1 still records bounded read-only inventory debt in Cloud/Cuttlefish and
+# storage. Keep that debt count-limited and line-exact: removal is accepted,
+# while a duplicate or differently-shaped command is a new authority bypass.
+# The libvirt `version` health probe and the Podman volume runner are not
+# inventory, but are pinned here because the deliberately broad candidate scan
+# makes future argument expansion reviewable.
+is_reviewed_runtime_inventory_candidate() {
+  local relative="$1" code="$2" ordinal="$3"
+  case "$relative|$code" in
+    'crates/mesh/mackesd/src/probe_nmap.rs|"podman",')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/kvm.rs|"podman",')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/image_build.rs|run("podman", &["build", "-t", &tag, "-f", &cf, &ctx])?;')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/image_build.rs|run("podman", &["save", "-o", &art.to_string_lossy(), &tag])?;')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/cloud/verbs/cuttlefish.rs|.list_instances()')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/cloud/runner.rs|TOOL_LIBVIRT => ("virsh", vec!["-c", uri.as_str(), "version"], uri.as_str()),')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/cloud/runner.rs|"virsh",')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/cloud/runner.rs|let status = match Self::run("virsh", &["-c", &self.libvirt_uri, "domstate", name]) {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(uuids) = virsh_output(&["list", "--state-running", "--uuid"]) {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(blk) = virsh_output(&["domblklist", "--details", &uuid]) {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|let name = virsh_output(&["domname", &uuid])')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(json) = podman_output(&["ps", "--format", "json", "--filter", "status=running"])')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|if let Some(mounts) = podman_output(&[')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|bounded_stdout("virsh", args)')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|bounded_stdout("podman", args)')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|fn virsh_output(args: &[&str]) -> Option<String> {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/storage.rs|fn podman_output(args: &[&str]) -> Option<String> {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/virtual_storage.rs|if let Some(uuids) = bounded_stdout("virsh", &["list", "--state-running", "--uuid"]) {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/virtual_storage.rs|if let Some(blk) = bounded_stdout("virsh", &["domblklist", "--details", &uuid]) {')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/virtual_storage.rs|let name = bounded_stdout("virsh", &["domname", &uuid])')
+      [ "$ordinal" -le 1 ] ;;
+    'crates/mesh/mackesd/src/workers/virtual_storage.rs|"podman",')
+      [ "$ordinal" -le 2 ] ;;
+    'crates/mesh/mackesd/src/workers/virtual_storage.rs|let mut cmd = Command::new("podman");')
+      [ "$ordinal" -le 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+audit_runtime_inventory_authority() {
+  local source_root="$1" permit_reviewed="${2:-1}" finding relative numbered code key
+  local -A seen=()
+  local failed=0
+
+  while IFS= read -r finding; do
+    [ -n "$finding" ] || continue
+    relative=${finding%%:*}
+    numbered=${finding#*:}
+    code=${numbered#*:}
+    code=${code#"${code%%[![:space:]]*}"}
+    code=${code%"${code##*[![:space:]]}"}
+    key="$relative|$code"
+    seen["$key"]=$(( ${seen["$key"]:-0} + 1 ))
+    if [ "$permit_reviewed" -eq 1 ] \
+      && is_reviewed_runtime_inventory_candidate "$relative" "$code" "${seen["$key"]}"; then
+      continue
+    fi
+    printf '%s\n' "$finding"
+    failed=1
+  done < <(scan_runtime_inventory_candidates "$source_root")
+
+  return "$failed"
+}
+
 contains_literal() {
   local needle="$1" file="$2"
   if command -v rg >/dev/null 2>&1; then
@@ -152,6 +289,38 @@ run_self_test() {
   printf '%s\n' 'EntryKind::Link(Surface::InfraCode)' >"$fixture/src/raw-runtime.rs"
   if scan_shell_runtime_commands "$fixture/src" >/dev/null 2>&1; then
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — typed Workloads link was rejected' >&2
+    return 1
+  fi
+  local regression label fixture_path fixture_body
+  for regression in \
+    'Cloud|crates/mesh/mackesd/src/workers/cloud/runner.rs|let mut command = Command::new("virsh"); command.arg("list");' \
+    'Cuttlefish|crates/mesh/mackesd/src/workers/cloud/verbs/cuttlefish.rs|runner.list_instances();' \
+    'storage|crates/mesh/mackesd/src/workers/storage.rs|let mut command = Command::new("virsh"); command.arg("dominfo");' \
+    'shell|crates/desktop/mde-shell-egui/src/runtime.rs|let mut command = Command::new("podman"); command.arg("ps");'; do
+    IFS='|' read -r label fixture_path fixture_body <<<"$regression"
+    mkdir -p "$(dirname "$fixture/$fixture_path")"
+    printf '%s\n' "$fixture_body" >"$fixture/$fixture_path"
+    if audit_runtime_inventory_authority "$fixture" 0 >/dev/null; then
+      printf 'lint-workload-authority.sh: self-test failed — %s runtime inventory fixture was accepted\n' "$label" >&2
+      return 1
+    fi
+    rm -f "$fixture/$fixture_path"
+  done
+  printf '%s\n' 'let mut command = Command::new("virsh"); command.arg("domstate");' \
+    >"$fixture/crates/mesh/mackesd/src/workers/workload_compute.rs"
+  if ! audit_runtime_inventory_authority "$fixture" 0 >/dev/null; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — sole workload_compute adapter was rejected' >&2
+    return 1
+  fi
+  cat >"$fixture/crates/desktop/mde-shell-egui/src/runtime.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    const HOSTILE_FIXTURE: &str = "virsh";
+}
+fn typed_projection_only() {}
+EOF
+  if ! audit_runtime_inventory_authority "$fixture" 0 >/dev/null; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — cfg(test) command fixture leaked into production findings' >&2
     return 1
   fi
   for retired in 'action/container/lifecycle' 'action/cloud/provision' 'action/cloud/container-deploy' 'action/cloud/instance-start' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest' 'ArmAction::Provision' 'ArmAction::Lifecycle' 'ProvisionApply' 'arm_provision' 'arm_lifecycle' 'lifecycle_request_body' 'issue("provision"' 'issue("container-deploy"' 'is_nova_managed' 'CLOUD_MANAGED_TOOLTIP' 'Nova-managed'; do
@@ -259,6 +428,12 @@ fi
 
 if scan_shell_runtime_commands "$shell_root"; then
   printf '%s\n' 'lint-workload-authority.sh: shell bypasses the typed Workload projection with a raw runtime command' >&2
+  exit 1
+fi
+
+if ! runtime_inventory_findings=$(audit_runtime_inventory_authority "$repo_root" 1); then
+  printf '%s\n' "$runtime_inventory_findings" >&2
+  printf '%s\n' 'lint-workload-authority.sh: direct runtime inventory exists outside the sole Workload adapter' >&2
   exit 1
 fi
 

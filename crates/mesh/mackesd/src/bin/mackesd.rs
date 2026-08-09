@@ -3175,7 +3175,7 @@ fn run_serve(
         start_egress_bus_responders(&worker_names, &shutdown, &node_id, &workgroup_root);
         start_directory_jobs_bus_responders(&worker_names, &shutdown, &workgroup_root, &db_path);
         start_platform_bus_responders(&worker_names, &shutdown, &workgroup_root, &db_path);
-        start_nebula_signal_dispatcher(&nebula_signal_slot);
+        start_nebula_signal_dispatcher(&worker_names, &nebula_signal_slot);
         start_files_bus_responder(&worker_names, &shutdown, &host, &db_path);
 
         spawn_messaging_sync_workers(

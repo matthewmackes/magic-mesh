@@ -1191,9 +1191,12 @@ pub(crate) fn start_platform_bus_responders(
     }
 }
 
-// run_serve round-2 extract: the Nebula signal dispatcher (event/nebula/signals).
-// Fills the shared sender slot; registers no worker_names row (verbatim).
+// The Nebula signal dispatcher is process-local: Control owns enrollment
+// signals and Observation owns peer-health signals.  Give each adapter a
+// distinct canonical identity so those two producer groups get a sender while
+// the other four grouped services do not open duplicate Bus writers.
 pub(crate) fn start_nebula_signal_dispatcher(
+    worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     nebula_signal_slot: &mackesd_core::ipc::nebula::SignalSenderSlot,
 ) {
     // E0.3.1.b — the Nebula signal dispatcher drains worker
@@ -1202,8 +1205,27 @@ pub(crate) fn start_nebula_signal_dispatcher(
     // health_reconciler + nebula_csr_watcher workers pick up the
     // sender on their next tick. Relocated out of the retired
     // Fleet.Files D-Bus arm — it never depended on that connection.
-    let _nebula_sender = mackesd_core::ipc::nebula::spawn_signal_dispatcher(&nebula_signal_slot);
+    let worker_name = if responders_admitted(&["nebula_control_signal_dispatcher"]) {
+        let _nebula_sender =
+            mackesd_core::ipc::nebula::spawn_signal_dispatcher(nebula_signal_slot);
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("nebula_control_signal_dispatcher".into());
+        "nebula_control_signal_dispatcher"
+    } else if responders_admitted(&["nebula_observation_signal_dispatcher"]) {
+        let _nebula_sender =
+            mackesd_core::ipc::nebula::spawn_signal_dispatcher(nebula_signal_slot);
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("nebula_observation_signal_dispatcher".into());
+        "nebula_observation_signal_dispatcher"
+    } else {
+        return;
+    };
     tracing::info!(
+        worker = worker_name,
         "Nebula signal dispatcher spawned (Bus event topic {}); \
              health_reconciler + nebula_csr_watcher will emit on next \
              state transition",
@@ -3585,5 +3607,25 @@ mod process_group_thread_admission_tests {
             guarded, registered,
             "WL-ARCH-009 raw responder start sites must stay group-guarded"
         );
+    }
+
+    #[test]
+    fn nebula_signal_dispatchers_are_admitted_only_in_their_producer_groups() {
+        use mackesd_core::worker_role::WorkerGroup;
+
+        let control = "nebula_control_signal_dispatcher";
+        let observation = "nebula_observation_signal_dispatcher";
+        for group in WorkerGroup::ALL {
+            assert_eq!(
+                mackesd_core::worker_role::belongs_to_group(control, group),
+                group == WorkerGroup::Control,
+                "control dispatcher escaped into {group}"
+            );
+            assert_eq!(
+                mackesd_core::worker_role::belongs_to_group(observation, group),
+                group == WorkerGroup::Observation,
+                "observation dispatcher escaped into {group}"
+            );
+        }
     }
 }

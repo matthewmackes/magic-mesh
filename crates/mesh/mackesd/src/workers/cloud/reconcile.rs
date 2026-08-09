@@ -569,29 +569,39 @@ pub(crate) const fn drift_flag_from_plan(counts: PlanCounts) -> DriftFlag {
     }
 }
 
-/// Fold a node's desired `specs` + its live `roster` (from `virsh list`) into the
-/// per-workload [`WorkloadRow`]s the `state/cloud/<node>` mirror carries, stamping
-/// each with the node-level `drift` verdict.
+/// Fold a node's desired `specs` + its authoritative typed Workload `roster`
+/// into the per-workload [`WorkloadRow`]s the `state/cloud/<node>` mirror
+/// carries, stamping each with the node-level `drift` verdict.
 ///
-/// A desired workload with a matching live domain reads that domain's status +
-/// reachable; a desired workload with no live domain reads `absent` + unreachable
-/// (honest — it is declared but not running), which is itself a drift signal.
+/// A desired workload with a matching typed status reads that status +
+/// reachability; a desired workload missing from an available roster reads
+/// `absent`, which is itself a drift signal. An unavailable roster reads
+/// `unknown` and never fabricates absence.
 #[must_use]
 pub(crate) fn fold_workload_rows(
     specs: &[WorkloadSpec],
-    roster: &[CloudInstance],
+    roster: Option<&[CloudInstance]>,
     drift: DriftFlag,
 ) -> Vec<WorkloadRow> {
     specs
         .iter()
         .map(|spec| {
-            let live = roster
-                .iter()
-                .find(|i| i.name == spec.name || i.id == spec.name);
-            let status = live.map_or_else(|| "absent".to_string(), |i| i.status.to_lowercase());
+            let live = roster.and_then(|instances| {
+                instances
+                    .iter()
+                    .find(|i| i.name == spec.name || i.id == spec.name)
+            });
+            let status = if roster.is_none() {
+                "unknown".to_string()
+            } else {
+                live.map_or_else(|| "absent".to_string(), |i| i.status.to_lowercase())
+            };
             let reachable = live.is_some_and(|i| i.status.eq_ignore_ascii_case("ACTIVE"));
-            // A declared-but-absent domain is drift regardless of the plan verdict.
-            let row_drift = if live.is_none() && drift == DriftFlag::InSync {
+            // Missing runtime authority is indeterminate, not proof of absence.
+            // A declared-but-absent Workload is drift regardless of the plan verdict.
+            let row_drift = if roster.is_none() {
+                DriftFlag::Unknown
+            } else if live.is_none() && drift == DriftFlag::InSync {
                 DriftFlag::Drift
             } else {
                 drift
@@ -613,7 +623,7 @@ pub(crate) fn fold_workload_rows(
 }
 
 /// Run one drift tick for node `node`: read its desired slice, plan it, fold the
-/// live roster into per-workload rows + the node [`DriftSummary`].
+/// typed Workload roster into per-workload rows + the node [`DriftSummary`].
 ///
 /// Honest by construction (§7):
 /// - an empty desired slice is an honest "nothing declared" — zero rows, `drift_count
@@ -623,6 +633,7 @@ pub(crate) fn fold_workload_rows(
 #[must_use]
 pub(crate) fn drift_snapshot(
     runner: &dyn CloudRunner,
+    roster: Option<&[CloudInstance]>,
     state_root: &Path,
     node: &str,
     libvirt_uri: &str,
@@ -639,7 +650,6 @@ pub(crate) fn drift_snapshot(
             },
         );
     }
-    let roster = runner.list_instances().unwrap_or_default();
     let drift = match plan_counts_for_node(
         runner,
         state_root,
@@ -651,7 +661,7 @@ pub(crate) fn drift_snapshot(
         // A plan we couldn't run leaves drift indeterminate — never a faked in-sync.
         Err(_) => DriftFlag::Unknown,
     };
-    let rows = fold_workload_rows(&specs, &roster, drift);
+    let rows = fold_workload_rows(&specs, roster, drift);
     let drift_count =
         u32::try_from(rows.iter().filter(|r| r.drift == DriftFlag::Drift).count()).unwrap_or(0);
     (
@@ -982,7 +992,7 @@ mod tests {
     fn fold_marks_a_running_domain_in_sync_and_an_absent_one_drifted() {
         let specs = vec![spec("web", "eagle"), spec("db", "eagle")];
         let roster = vec![instance("web", "ACTIVE")];
-        let rows = fold_workload_rows(&specs, &roster, DriftFlag::InSync);
+        let rows = fold_workload_rows(&specs, Some(&roster), DriftFlag::InSync);
         assert_eq!(rows.len(), 2);
         let web = rows.iter().find(|r| r.name == "web").unwrap();
         assert_eq!(web.status, "active");
@@ -1001,6 +1011,7 @@ mod tests {
         let runner = FakeRunner::default();
         let (rows, summary) = drift_snapshot(
             &runner,
+            None,
             tmp.path(),
             "eagle",
             "qemu:///system",
@@ -1026,6 +1037,7 @@ mod tests {
         };
         let (rows, summary) = drift_snapshot(
             &runner,
+            Some(&runner.roster),
             tmp.path(),
             "eagle",
             "qemu:///system",
@@ -1052,6 +1064,7 @@ mod tests {
         };
         let (rows, summary) = drift_snapshot(
             &runner,
+            Some(&runner.roster),
             tmp.path(),
             "eagle",
             "qemu:///system",
@@ -1059,6 +1072,38 @@ mod tests {
             300,
         );
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].drift, DriftFlag::Unknown);
+        assert_eq!(summary.drift_count, 0, "indeterminate is not zero-drift");
+    }
+
+    #[test]
+    fn drift_snapshot_never_fabricates_absence_without_workload_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_desired_doc(tmp.path(), &spec("web", "eagle")).unwrap();
+        let runner = FakeRunner {
+            // A direct backend row must not leak through when the typed roster
+            // is unavailable.
+            roster: vec![instance("web", "ACTIVE")],
+            plan_ndjson: Some(
+                r#"{"type":"change_summary","changes":{"add":0,"change":0,"remove":0}}"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+
+        let (rows, summary) = drift_snapshot(
+            &runner,
+            None,
+            tmp.path(),
+            "eagle",
+            "qemu:///system",
+            DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            400,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "unknown");
+        assert!(!rows[0].reachable);
         assert_eq!(rows[0].drift, DriftFlag::Unknown);
         assert_eq!(summary.drift_count, 0, "indeterminate is not zero-drift");
     }

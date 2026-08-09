@@ -1067,8 +1067,20 @@ impl CloudWorker {
     /// plan the backend can't run leaves each row's drift `Unknown`, never a
     /// fabricated in-sync. A no-op when the node has nothing declared (empty slice).
     fn refresh_drift(&self) {
+        let roster = match self.workload_instances() {
+            Ok(instances) => Some(instances),
+            Err(error) => {
+                tracing::warn!(
+                    target: "mackesd::cloud",
+                    %error,
+                    "drift tick has no authoritative Workload roster"
+                );
+                None
+            }
+        };
         let snapshot = reconcile::drift_snapshot(
             self.runner.as_ref(),
+            roster.as_deref(),
             &self.state_root,
             &self.host,
             &default_libvirt_uri(),
