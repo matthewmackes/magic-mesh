@@ -1708,6 +1708,11 @@ behavioral evidence is not completion.
   convergence whenever the action log is unreadable. BigBoy passed three exact
   recovery tests:
   `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-roaming-bus-recovery-r21.md`.
+- **Compute-migration Bus checkpoint (2026-08-09):** late startup now folds
+  outage-queued migration state from durable cursors, and all four Bus lanes
+  must read before any migrate/apply/relinquish/rollback effect. BigBoy passed
+  four exact recovery/durability tests:
+  `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-compute-migrate-bus-recovery-r25.md`.
 - **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:

@@ -155,6 +155,10 @@ const MAX_MIGRATION_ID_BYTES: usize = 256;
 const MAX_MIGRATION_PATH_BYTES: usize = 4 * 1024;
 const MAX_MIGRATION_ERROR_BYTES: usize = 4 * 1024;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Bounds for startup Bus recovery. A late-mounted shared spool must recover
+/// without a daemon restart, while a bad test/configuration cannot hot-loop.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Migration-request payload per design doc §3.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1295,6 +1299,9 @@ fn drain_failed_events(
 }
 
 /// Worker handle.
+#[cfg(test)]
+type BusOpenFn = dyn Fn() -> Result<Persist, String> + Send + Sync;
+
 pub struct ComputeMigrateWorker {
     nebula_interface: String,
     nebula_addr_hint: String,
@@ -1303,7 +1310,10 @@ pub struct ComputeMigrateWorker {
     bus_root_override: Option<PathBuf>,
     state_root: PathBuf,
     authorizer: Arc<ActionAuthorizer>,
-    migration_client: WorkloadMigrationClient,
+    migration_client: Arc<dyn MigrationAuthority>,
+    /// Dynamic Bus open seam for startup-race tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
 }
 
 impl Default for ComputeMigrateWorker {
@@ -1324,7 +1334,9 @@ impl ComputeMigrateWorker {
             bus_root_override: None,
             state_root: PathBuf::from(DEFAULT_MIGRATION_STATE_ROOT),
             authorizer: Arc::new(ActionAuthorizer::production()),
-            migration_client: WorkloadMigrationClient,
+            migration_client: Arc::new(WorkloadMigrationClient),
+            #[cfg(test)]
+            bus_open_override: None,
         }
     }
 
@@ -1374,6 +1386,30 @@ impl ComputeMigrateWorker {
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
         self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_migration_authority(mut self, authority: Arc<dyn MigrationAuthority>) -> Self {
+        self.migration_client = authority;
+        self
+    }
+
+    fn open_bus(&self) -> Result<Persist, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open();
+        }
+
+        Persist::open(compute_migrate_bus_root(self.bus_root_override.clone()))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1887,8 +1923,31 @@ fn apply_ack_jobs(ledger: &mut MigrationLedger, now_ms: i64) -> Result<(), Strin
     ledger.store()
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+/// Resolve the shared Bus spool. System workers do not necessarily have HOME
+/// or XDG state during early boot, so the canonical `/run/mde-bus` root is the
+/// final authority when the environment resolver is unavailable.
+fn compute_migrate_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    compute_migrate_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn compute_migrate_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+/// Admit one coherent Bus sweep before any migration effect is allowed. Each
+/// admission checkpoints its cursor and prepared record atomically in the
+/// migration ledger. If any lane is unreadable, the caller performs no source
+/// migration, target apply, commit relinquish, timeout rollback, or retry.
+/// Partial admissions are safe: their durable cursors prevent duplication on
+/// the next successful sweep.
+fn admit_bus_jobs(
+    persist: &Persist,
+    worker: &ComputeMigrateWorker,
+    ledger: &mut MigrationLedger,
+) -> Result<(), String> {
+    admit_source_jobs(persist, worker, ledger)?;
+    admit_target_jobs(persist, worker, ledger)?;
+    admit_ack_jobs(persist, worker, ledger)
 }
 
 #[async_trait::async_trait]
@@ -1898,18 +1957,21 @@ impl Worker for ComputeMigrateWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = match self.bus_root_override.clone().or_else(default_bus_root) {
-            Some(r) => r,
-            None => {
-                tracing::debug!("compute_migrate: no bus root; worker idle");
-                return Ok(());
+        let retry_interval = self
+            .poll_interval
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let mut persist = loop {
+            match self.open_bus() {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    %error,
+                    "compute_migrate: Bus open failed; startup will retry"
+                ),
             }
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "compute_migrate: persist open failed; worker idle");
-                return Ok(());
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         let mut ledger = MigrationLedger::open(&self.state_root)
@@ -1921,8 +1983,20 @@ impl Worker for ComputeMigrateWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    admit_source_jobs(&persist, self, &mut ledger)
-                        .map_err(|error| anyhow::anyhow!("admit source migration: {error}"))?;
+                    // Follow a boot-recovery index replacement instead of
+                    // remaining attached to the deleted SQLite inode.
+                    let _ = persist.reopen_if_index_changed();
+                    // Migration requests are durable commands, so startup folds
+                    // from the ledger's cursors instead of tail-skipping actions
+                    // queued while the Bus was unavailable. No effect may run
+                    // until every required Bus lane completed this read sweep.
+                    if let Err(error) = admit_bus_jobs(&persist, self, &mut ledger) {
+                        tracing::warn!(
+                            %error,
+                            "compute_migrate: Bus read failed; deferring all migration effects"
+                        );
+                        continue;
+                    }
                     let source_jobs = ledger
                         .state
                         .source_jobs
@@ -1932,8 +2006,8 @@ impl Worker for ComputeMigrateWorker {
                         .collect::<Vec<_>>();
                     for job in source_jobs {
                         let req_run = job.request.clone();
-                        let client = self.migration_client;
-                        match tokio::task::spawn_blocking(move || run_migration(&req_run, &client)).await {
+                        let client = Arc::clone(&self.migration_client);
+                        match tokio::task::spawn_blocking(move || run_migration(&req_run, client.as_ref())).await {
                             Ok(MigrationOutcome::Ok { domain_xml }) => {
                                 let event = build_migrate_ready_event(
                                     &job.request,
@@ -1987,8 +2061,6 @@ impl Worker for ComputeMigrateWorker {
                         ledger.store().map_err(|error| anyhow::anyhow!("checkpoint migrate-ready publish: {error}"))?;
                     }
 
-                    admit_target_jobs(&persist, self, &mut ledger)
-                        .map_err(|error| anyhow::anyhow!("admit target migration: {error}"))?;
                     let target_ids = ledger.state.target_jobs.iter().map(|job| job.message_ulid.clone()).collect::<Vec<_>>();
                     for id in target_ids {
                         let Some(index) = ledger.state.target_jobs.iter().position(|job| job.message_ulid == id) else { continue; };
@@ -1997,8 +2069,8 @@ impl Worker for ComputeMigrateWorker {
                             TargetJobPhase::Apply => {
                                 let event = ledger.state.target_jobs[index].event.clone();
                                 let event_run = event.clone();
-                                let client = self.migration_client;
-                                match tokio::task::spawn_blocking(move || run_migrate_target(&event_run, &client)).await {
+                                let client = Arc::clone(&self.migration_client);
+                                match tokio::task::spawn_blocking(move || run_migrate_target(&event_run, client.as_ref())).await {
                                     Ok(Ok(())) => ledger.state.target_jobs[index].phase = TargetJobPhase::PublishCommitted,
                                     Ok(Err(error)) => ledger.state.target_jobs[index].phase = TargetJobPhase::PublishFailed { error },
                                     Err(error) => {
@@ -2023,8 +2095,6 @@ impl Worker for ComputeMigrateWorker {
                         }
                     }
 
-                    admit_ack_jobs(&persist, self, &mut ledger)
-                        .map_err(|error| anyhow::anyhow!("admit migration acknowledgement: {error}"))?;
                     apply_ack_jobs(&mut ledger, now_ms)
                         .map_err(|error| anyhow::anyhow!("checkpoint migration acknowledgement: {error}"))?;
                     for pending in &mut ledger.state.pending_commits {
@@ -2041,16 +2111,16 @@ impl Worker for ComputeMigrateWorker {
                     for id in retry_ids {
                         let Some(index) = ledger.state.pending_commits.iter().position(|pending| pending.request_ulid == id) else { continue; };
                         let pending = ledger.state.pending_commits[index].clone();
-                        let client = self.migration_client;
+                        let client = Arc::clone(&self.migration_client);
                         let result = match &pending.phase {
                             PendingPhase::Relinquish => {
                                 let vm = pending.vm_id.clone();
-                                tokio::task::spawn_blocking(move || run_source_undefine(&vm, &client)).await
+                                tokio::task::spawn_blocking(move || run_source_undefine(&vm, client.as_ref())).await
                             }
                             PendingPhase::Rollback { .. } => {
                                 let vm = pending.vm_id.clone();
                                 let xml = pending.domain_xml.clone();
-                                tokio::task::spawn_blocking(move || run_source_rollback(&vm, &xml, &client)).await
+                                tokio::task::spawn_blocking(move || run_source_rollback(&vm, &xml, client.as_ref())).await
                             }
                             _ => continue,
                         };
@@ -3344,6 +3414,189 @@ mod tests {
             recovered.state.pending_commits[0].next_attempt_ms,
             AUTH_NOW_MS
         );
+    }
+
+    #[test]
+    fn compute_migrate_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/compute-migrate-bus-test");
+        assert_eq!(compute_migrate_bus_root(Some(explicit.clone())), explicit);
+        assert_eq!(
+            compute_migrate_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_bus_retries_until_shutdown_without_touching_migration_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_root = tmp.path().join("state");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_open = Arc::clone(&attempts);
+        let authority = Arc::new(FakeMigrationActuator::default());
+        let authority_for_worker: Arc<dyn MigrationAuthority> = authority.clone();
+        let mut worker = test_worker(&tmp.path().join("auth"))
+            .with_state_root(state_root.clone())
+            .with_poll_interval(Duration::from_secs(30))
+            .with_migration_authority(authority_for_worker)
+            .with_bus_opener(Arc::new(move || {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                Err("injected unavailable Bus".into())
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        for _ in 0..40 {
+            if attempts.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!task.is_finished(), "Bus absence must not end the worker");
+        assert!(authority.calls().is_empty(), "no migration effect is safe");
+        assert!(
+            !state_root.exists(),
+            "Bus activation must precede migration-ledger recovery"
+        );
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must interrupt the bounded retry wait")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[test]
+    fn bus_read_error_is_failure_and_cannot_trigger_pending_rollback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bus_root = tmp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("persist");
+        let mut ledger = MigrationLedger::open(&tmp.path().join("state")).expect("ledger");
+        let mut pending = durable_pending(PendingPhase::Waiting);
+        pending.deadline_ms = 0;
+        ledger.state.pending_commits.push(pending);
+        ledger.store().expect("store expired pending migration");
+
+        let db = rusqlite::Connection::open(bus_root.join("index.sqlite")).expect("open index");
+        db.execute_batch("DROP TABLE messages;")
+            .expect("inject unreadable Bus index");
+        let worker = test_worker(&tmp.path().join("auth"));
+
+        let error = admit_bus_jobs(&persist, &worker, &mut ledger)
+            .expect_err("a Bus read fault must not look like an empty sweep");
+        assert!(error.contains("list source migration actions"));
+        assert!(ledger.state.source_cursor.is_none());
+        assert!(ledger.state.source_jobs.is_empty());
+        assert_eq!(ledger.state.pending_commits.len(), 1);
+        assert!(matches!(
+            ledger.state.pending_commits[0].phase,
+            PendingPhase::Waiting
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_bus_folds_queued_migration_once_and_preserves_pending_commit() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bus_root = tmp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("persist");
+        let request = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-queued-during-outage".into(),
+            disk_path: "/var/lib/mde-vms/vm-queued-during-outage.qcow2".into(),
+        };
+        let body = authorized_request_body(&request, "queued-during-bus-outage");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
+            .expect("queue migration while worker Bus is unavailable");
+        drop(persist);
+
+        let state_root = tmp.path().join("state");
+        let mut ledger = MigrationLedger::open(&state_root).expect("ledger");
+        let mut pending = durable_pending(PendingPhase::Waiting);
+        pending.deadline_ms = i64::MAX;
+        ledger.state.pending_commits.push(pending);
+        ledger.store().expect("store pre-existing pending commit");
+        drop(ledger);
+
+        let available = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let available_for_open = Arc::clone(&available);
+        let attempts_for_open = Arc::clone(&attempts);
+        let bus_for_open = bus_root.clone();
+        let authority = Arc::new(FakeMigrationActuator {
+            calls: Mutex::new(Vec::new()),
+            stop_error: true,
+        });
+        let authority_for_worker: Arc<dyn MigrationAuthority> = authority.clone();
+        let mut worker = test_worker(&tmp.path().join("auth"))
+            .with_state_root(state_root.clone())
+            .with_poll_interval(Duration::from_millis(10))
+            .with_migration_authority(authority_for_worker)
+            .with_bus_opener(Arc::new(move || {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                if !available_for_open.load(Ordering::SeqCst) {
+                    return Err("injected late Bus".into());
+                }
+                Persist::open(bus_for_open.clone()).map_err(|error| error.to_string())
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        for _ in 0..40 {
+            if attempts.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            authority.calls().is_empty(),
+            "outage must have zero effects"
+        );
+        available.store(true, Ordering::SeqCst);
+
+        for _ in 0..200 {
+            if authority.calls().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker shutdown")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            authority.calls(),
+            vec![
+                "capture:vm-queued-during-outage",
+                "stop:vm-queued-during-outage",
+                "define-start:vm-queued-during-outage",
+            ],
+            "the queued action must fold exactly once and restore on failed stop"
+        );
+        let recovered = MigrationLedger::open(&state_root).expect("recover ledger");
+        assert!(recovered.state.source_cursor.is_some());
+        assert!(recovered.state.source_jobs.is_empty());
+        assert_eq!(recovered.state.pending_commits.len(), 1);
+        assert!(matches!(
+            recovered.state.pending_commits[0].phase,
+            PendingPhase::Waiting
+        ));
     }
 
     #[test]
