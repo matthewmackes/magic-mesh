@@ -1046,12 +1046,10 @@ fn authorize_action(
     if !matches!(&request.target, HealthScope::Node { node } if node == host) {
         return ActionDecision::Refuse("target is not this node");
     }
-    let Some(condition) = snapshot
-        .active_conditions
-        .iter()
-        .find(|condition| condition.id == request.condition_id)
-    else {
-        return ActionDecision::Refuse("condition is not active");
+    let Some(condition) = snapshot.active_conditions.iter().find(|condition| {
+        condition.id == request.condition_id && condition.scope == request.target
+    }) else {
+        return ActionDecision::Refuse("condition is not active for target");
     };
     let offered = matches!(
         request.action,
@@ -1853,7 +1851,7 @@ mod tests {
         let snapshot = snapshot();
         assert!(matches!(
             authorize_action(&request(HealthAction::RestartMackesd), "node", &snapshot),
-            ActionDecision::Refuse("condition is not active")
+            ActionDecision::Refuse("condition is not active for target")
         ));
         let mut malformed = request(HealthAction::RestartMackesd);
         malformed.schema_version = 99;
@@ -1917,6 +1915,35 @@ mod tests {
                 &actionable
             ),
             ActionDecision::Apply
+        );
+    }
+
+    #[test]
+    fn remediation_cannot_borrow_an_offer_from_another_node() {
+        let mut snapshot = snapshot();
+        snapshot.active_conditions.push(condition(
+            "remote-node",
+            "root-space",
+            HealthComponent::Resources,
+            "root-filesystem",
+            HealthSeverity::Warning,
+            "remote root threshold breached",
+            100,
+            vec![remediation(
+                "remote-node",
+                HealthAction::ExpandSeat15Root,
+                7,
+                "bounded expansion on the remote node",
+                true,
+            )],
+        ));
+        let mut cross_node = request(HealthAction::ExpandSeat15Root);
+        cross_node.condition_id = "remote-node:root-space".into();
+
+        assert_eq!(
+            authorize_action(&cross_node, "node", &snapshot),
+            ActionDecision::Refuse("condition is not active for target"),
+            "a remote condition must not authorize mutation of the local target"
         );
     }
 

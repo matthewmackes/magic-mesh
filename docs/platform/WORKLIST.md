@@ -1094,11 +1094,8 @@ behavioral evidence is not completion.
 - **Media hardening (2026-08-06):** media-core 250/250 on BigBoy; four bounded Music proof-helper self-tests pass; live renderer and second-seat proof remain open. Evidence:
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-media-hardening-r2.md`; boundary: `evidence/WL-FUNC-021-2026-08-06-media-source-projection-r1.md`.
 - Remaining work:
-- **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** detail
-  loading is identity-bound; one current daemon and shell run per seat. Named
-  Dell records and synchronized five-seat CPU/NWS startup recovery pass. Evidence:
-  `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
+- **Named-detail/activation/NWS release-11 checkpoint (2026-08-08):** identity-bound details, one daemon/shell per seat, Dell records, and five-seat recovery pass:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-08-seat-activation-release10-r1.md`; `docs/platform/evidence/WL-FUNC-021-2026-08-08-nws-recovery-release11-r1.md`.
 - **Signed live-radio checkpoint (2026-08-08):** native F44 release 8 is live
   on all five seats with host-encrypted Music credentials. Dell and seat 15
   pass exact retained C-SPAN signed Play/Stop; Dell sink capture is non-silent
@@ -1236,6 +1233,8 @@ behavioral evidence is not completion.
   against live song `23427`, bounded at 15 seconds with no client process left
   behind; this does not claim audible or rendered acceptance. The helper uses
   no secret output and caps SSH/command/probe timeouts.
+- **Queue durability checkpoint (2026-08-09):** synced atomic replacement preserves the last-good queue and cleans failed temporary writes; `.50` passed 14/14:
+  `docs/platform/evidence/WL-FUNC-021-2026-08-09-queue-atomic-persistence-r1.md`.
   1. S1 Freeze catalog/provider authority.
      - Objective: make mde-musicd the only catalog/source/queue authority for Subsonic, local, Jellyfin, and approved providers.
      - Inputs: music types/domain, resource catalog, Jellyfin store.
@@ -1814,6 +1813,8 @@ behavioral evidence is not completion.
   outlive its earliest admitted source or the ten-minute contract maximum;
   `.90` passed 14/14 health tests including hostile `u64::MAX` validity:
   `docs/platform/evidence/WL-UX-013-2026-08-09-projection-freshness-r2.md`.
+- **Recovery target checkpoint (2026-08-09):** a condition cannot authorize remediation on another node; machine 194 passed 13/13:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-recovery-target-binding-r3.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.

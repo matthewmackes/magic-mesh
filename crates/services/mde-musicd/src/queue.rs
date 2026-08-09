@@ -10,6 +10,7 @@
 //! is the reachable entry point, and the playback daemon (AIR-2.b) reads
 //! the same file.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -238,7 +239,49 @@ pub fn write_to(path: &Path, queue: &Queue) -> std::io::Result<()> {
         queue: queue.clone(),
     })
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    write_atomically_with(path, json.as_bytes(), |temporary, target| {
+        std::fs::rename(temporary, target)
+    })
+}
+
+/// Replace one durable queue file without exposing a truncated intermediate.
+///
+/// The queue is authoritative rather than a rebuildable cache. Write and sync a
+/// uniquely named sibling first, then atomically rename it over the old file.
+/// The injected replace operation keeps the failure boundary directly testable.
+fn write_atomically_with<F>(path: &Path, bytes: &[u8], replace: F) -> std::io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queue path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let target_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("music-queue.json");
+    let temporary = parent.join(format!(".{target_name}.{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Return the deterministic compare-and-swap revision for a queue.
@@ -415,6 +458,39 @@ mod tests {
         q.next();
         write_to(&p, &q).unwrap();
         assert_eq!(read_from(&p), q);
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_last_good_queue() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("music-queue.json");
+        let old = q(&["provider-a/old"], 0);
+        write_to(&path, &old).unwrap();
+
+        let replacement = serde_json::to_vec(&QueueFileV1 {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            queue: q(&["provider-b/new"], 0),
+        })
+        .unwrap();
+        let error = write_atomically_with(&path, &replacement, |_temporary, _target| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected replacement failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            read_from(&path),
+            old,
+            "last-good queue remains authoritative"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "failed replacement temp is cleaned up"
+        );
     }
 
     #[test]
