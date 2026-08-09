@@ -1,0 +1,287 @@
+{
+  "schema_version": 1,
+  "kind": "mcnf-release-gate-matrix",
+  "source_revision": "46ea21b6f6c759fa6dcf09a28d62ba12040dc655",
+  "required_gate_ids": [
+    "farm-package-farm-ci",
+    "farm-package-lighthouse-rpm",
+    "farm-package-workstation-rpm",
+    "github-github-required",
+    "lighthouse-lh-104-236-118-177",
+    "lighthouse-lh-46-101-219-245",
+    "lighthouse-lh-64-23-131-57",
+    "scenario-network-loss",
+    "scenario-node-reboot",
+    "scenario-package-failure",
+    "scenario-peer-loss-corrected-forward",
+    "scenario-process-failure",
+    "scenario-provider-loss",
+    "scenario-sleep-resume",
+    "seat-dell",
+    "seat-eagle",
+    "seat-seat15",
+    "seat-surface",
+    "seat-t480"
+  ],
+  "rosters": {
+    "github_checks": [
+      "github-required"
+    ],
+    "farm_packages": [
+      "farm-ci",
+      "workstation-rpm",
+      "lighthouse-rpm"
+    ],
+    "seats": [
+      "t480",
+      "eagle",
+      "seat15",
+      "dell",
+      "surface"
+    ],
+    "lighthouses": [
+      "lh-104-236-118-177",
+      "lh-46-101-219-245",
+      "lh-64-23-131-57"
+    ],
+    "scenarios": [
+      "process-failure",
+      "network-loss",
+      "sleep-resume",
+      "node-reboot",
+      "provider-loss",
+      "package-failure",
+      "peer-loss-corrected-forward"
+    ]
+  },
+  "gates": [
+    {
+      "gate_id": "farm-package-farm-ci",
+      "scope_kind": "farm_package",
+      "scope_id": "farm-ci",
+      "categories": ["farm"],
+      "owner": "release-engineering",
+      "command": "install-helpers/ci-gate.sh verify docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/ci-gate-status.json --expected-revision 46ea21b6f6c759fa6dcf09a28d62ba12040dc655",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/ci-gate-status.json",
+      "pass_condition": "authenticated farm status is green and binds the exact job, host, slot, log, artifacts, and source revision",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "farm-package-lighthouse-rpm",
+      "scope_kind": "farm_package",
+      "scope_id": "lighthouse-rpm",
+      "categories": ["package"],
+      "owner": "release-engineering",
+      "command": "install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-lighthouse-*.rpm",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/lighthouse-rpm.json",
+      "pass_condition": "the thin lighthouse RPM digest, payload allowlist, Fedora target, transaction result, and source revision all pass",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "farm-package-workstation-rpm",
+      "scope_kind": "farm_package",
+      "scope_id": "workstation-rpm",
+      "categories": ["package"],
+      "owner": "release-engineering",
+      "command": "install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/workstation-rpm.json",
+      "pass_condition": "the Fedora 44 workstation RPM digest, payload allowlist, transaction result, and source revision all pass",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "github-github-required",
+      "scope_kind": "github_check",
+      "scope_id": "github-required",
+      "categories": ["ci"],
+      "owner": "github-release-authority",
+      "command": "install-helpers/verify-github-release-binding.sh check-workflow .github/workflows/ci.yml",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/github-required.json",
+      "pass_condition": "the authoritative github-required check succeeds without continue-on-error and verifies the exact farm artifact binding",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "lighthouse-lh-104-236-118-177",
+      "scope_kind": "lighthouse",
+      "scope_id": "lh-104-236-118-177",
+      "categories": ["network", "package", "runtime"],
+      "owner": "lighthouse-operations",
+      "command": "install-helpers/collect-six-node-topology.py --revision 46ea21b6f6c759fa6dcf09a28d62ba12040dc655 --candidate-manifest ${MCNF_CANDIDATE_MANIFEST} ${MCNF_RELEASE_TARGET_ARGS} --output docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/six-node-topology.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/six-node-topology.json",
+      "pass_condition": "104.236.118.177 directly proves the candidate package, runtime services, authenticated overlay, etcd convergence, and bounded recovery ledger",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "lighthouse-lh-46-101-219-245",
+      "scope_kind": "lighthouse",
+      "scope_id": "lh-46-101-219-245",
+      "categories": ["network", "package", "runtime"],
+      "owner": "lighthouse-operations",
+      "command": "install-helpers/collect-six-node-topology.py --revision 46ea21b6f6c759fa6dcf09a28d62ba12040dc655 --candidate-manifest ${MCNF_CANDIDATE_MANIFEST} ${MCNF_RELEASE_TARGET_ARGS} --output docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/six-node-topology.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/six-node-topology.json",
+      "pass_condition": "46.101.219.245 directly proves the candidate package, runtime services, authenticated overlay, etcd convergence, and bounded recovery ledger",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "lighthouse-lh-64-23-131-57",
+      "scope_kind": "lighthouse",
+      "scope_id": "lh-64-23-131-57",
+      "categories": ["network", "package", "runtime"],
+      "owner": "lighthouse-operations",
+      "command": "install-helpers/collect-six-node-topology.py --revision 46ea21b6f6c759fa6dcf09a28d62ba12040dc655 --candidate-manifest ${MCNF_CANDIDATE_MANIFEST} ${MCNF_RELEASE_TARGET_ARGS} --output docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/six-node-topology.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/six-node-topology.json",
+      "pass_condition": "64.23.131.57 directly proves the candidate package, runtime services, authenticated overlay, etcd convergence, and bounded recovery ledger",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-network-loss",
+      "scope_kind": "scenario",
+      "scope_id": "network-loss",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "network isolation produces truthful degraded state, bounded failover, authenticated rejoin, and no stale healthy claim",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-node-reboot",
+      "scope_kind": "scenario",
+      "scope_id": "node-reboot",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "reboot returns one authenticated identity and one healthy daemon session without restart storm or stale payload",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-package-failure",
+      "scope_kind": "scenario",
+      "scope_id": "package-failure",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "failed package transaction cannot promote and recovery installs a newer corrected-forward candidate without rollback",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-peer-loss-corrected-forward",
+      "scope_kind": "scenario",
+      "scope_id": "peer-loss-corrected-forward",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "peer loss converges to degraded state and rejoins through re-enrollment or a newer corrected-forward deployment without data loss",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-process-failure",
+      "scope_kind": "scenario",
+      "scope_id": "process-failure",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "daemon termination is observed, restarted within policy, and does not create duplicate authority or a restart storm",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-provider-loss",
+      "scope_kind": "scenario",
+      "scope_id": "provider-loss",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "provider withdrawal is explicit, fallback is bounded, and stale provider state cannot be reported as healthy",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "scenario-sleep-resume",
+      "scope_kind": "scenario",
+      "scope_id": "sleep-resume",
+      "categories": ["recovery"],
+      "owner": "fleet-recovery",
+      "command": "install-helpers/release-evidence.sh validate docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/release-evidence.json",
+      "pass_condition": "resume restores the authenticated overlay, services, GUI state, and audio path without duplicate sessions",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "seat-dell",
+      "scope_kind": "seat",
+      "scope_id": "dell",
+      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
+      "owner": "fleet-acceptance",
+      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "pass_condition": "Dell at 172.20.146.225 directly proves the exact package plus runtime, GUI, network, physical audio, and VDI acceptance",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "seat-eagle",
+      "scope_kind": "seat",
+      "scope_id": "eagle",
+      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
+      "owner": "fleet-acceptance",
+      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "pass_condition": "Eagle at 172.20.146.88 directly proves the exact package plus runtime, GUI, network, physical audio, and VDI acceptance",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "seat-seat15",
+      "scope_kind": "seat",
+      "scope_id": "seat15",
+      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
+      "owner": "fleet-acceptance",
+      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "pass_condition": "basement seat 15 at 172.20.0.15 directly proves the exact package plus runtime, direct-DRM GUI, network, physical audio, and VDI acceptance",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "seat-surface",
+      "scope_kind": "seat",
+      "scope_id": "surface",
+      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
+      "owner": "fleet-acceptance",
+      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "pass_condition": "Surface at 172.20.146.79 directly proves the exact package plus runtime, GUI, network, physical audio, and VDI acceptance",
+      "revision_ref": "source_revision",
+      "required": true
+    },
+    {
+      "gate_id": "seat-t480",
+      "scope_kind": "seat",
+      "scope_id": "t480",
+      "categories": ["audio", "gui", "network", "package", "runtime", "vdi"],
+      "owner": "fleet-acceptance",
+      "command": "install-helpers/test-five-seat-core.py --password-file ${MCNF_SEAT_PASSWORD_FILE} --key ${MCNF_SEAT_SSH_KEY} --evidence docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "evidence_filename": "docs/platform/release-evidence/46ea21b6f6c759fa6dcf09a28d62ba12040dc655/five-seat-core.json",
+      "pass_condition": "T480 at 172.20.146.68 directly proves the exact package plus runtime, direct-DRM GUI, network, physical audio, and VDI acceptance",
+      "revision_ref": "source_revision",
+      "required": true
+    }
+  ]
+}

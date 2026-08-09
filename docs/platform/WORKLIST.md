@@ -1477,6 +1477,12 @@ behavioral evidence is not completion.
 - **Governed candidate checkpoints (2026-08-09):** final-RPM digests and role compatibility are enforced; BigBoy built both RPMs and collector accepted `832726b0`.
   Bytes remain unsigned/undeployed: `evidence/WL-CRIT-006-2026-08-09-governed-candidate-path-r5.md`, `evidence/WL-CRIT-006-2026-08-09-current-candidate-r8.md`.
 - Remaining work:
+- **Explicit release-gate matrix checkpoint (2026-08-09):** one pinned revision
+  now names all 19 required GitHub, farm/package, five-seat, three-lighthouse,
+  and seven failure/recovery gates; the verifier rejects incomplete, duplicate,
+  reordered, optional, or revision-mismatched plans. Machine 196 passed one
+  positive and 12 hostile fixtures:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-09-release-gate-matrix-r9.md`.
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
      - Inputs: governance, current CI, all active P0/P1 epics.
