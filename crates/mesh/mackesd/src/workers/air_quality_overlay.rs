@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -525,6 +525,14 @@ struct ApplyOutcome {
     reload_key: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
 /// Workstation-side credential-gated AirNow adapter.
 pub struct AirQualityOverlayWorker {
     host: String,
@@ -587,9 +595,21 @@ impl AirQualityOverlayWorker {
         Ok(validated_vehicle_context(&vehicle, &self.host, now_ms()))
     }
 
-    fn publish(&self, snapshot: &AirQualitySnapshot) -> io::Result<()> {
+    fn publish(&self, snapshot: &AirQualitySnapshot) -> io::Result<BusIdentity> {
         let body = serde_json::to_string(snapshot).map_err(io_other)?;
-        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        let root = self.bus_root();
+        let before_open = match bus_identity(&root) {
+            Ok(identity) => Some(identity),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let persist = mde_bus::persist::Persist::open(root.clone()).map_err(io_other)?;
+        let opened = bus_identity(&root)?;
+        if before_open.is_some_and(|before| before != opened) {
+            return Err(io::Error::other(
+                "Air Quality Bus index changed while opening publication transaction",
+            ));
+        }
         persist
             .write(
                 &air_quality_state_topic(&self.host),
@@ -598,7 +618,32 @@ impl AirQualityOverlayWorker {
                 Some(&body),
             )
             .map_err(io_other)?;
-        Ok(())
+        let after = bus_identity(&root)?;
+        if opened != after {
+            return Err(io::Error::other(
+                "Air Quality Bus index changed during publication",
+            ));
+        }
+        Ok(after)
+    }
+
+    fn published_on_current_index(&self, published_on: Option<BusIdentity>) -> bool {
+        published_on.is_some_and(|published| {
+            bus_identity(&self.bus_root()).is_ok_and(|current| current == published)
+        })
+    }
+
+    fn publish_once_per_index(
+        &self,
+        snapshot: &AirQualitySnapshot,
+        published_on: &mut Option<BusIdentity>,
+    ) -> io::Result<bool> {
+        if self.published_on_current_index(*published_on) {
+            return Ok(false);
+        }
+        let identity = self.publish(snapshot)?;
+        *published_on = Some(identity);
+        Ok(true)
     }
 
     fn status_snapshot(
@@ -632,7 +677,7 @@ impl AirQualityOverlayWorker {
     ) -> ApplyOutcome {
         match result {
             Ok(snapshot) => match self.publish(&snapshot) {
-                Ok(()) => {
+                Ok(_) => {
                     *last_good = Some(snapshot);
                     ApplyOutcome {
                         success: true,
@@ -675,7 +720,7 @@ impl AirQualityOverlayWorker {
                     Some(context),
                     reason,
                 )) {
-                    Ok(()) => ApplyOutcome {
+                    Ok(_) => ApplyOutcome {
                         success: false,
                         publication_committed: true,
                         retry_after: error.retry_after,
@@ -770,6 +815,28 @@ fn air_quality_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
+fn bus_identity(root: &Path) -> io::Result<BusIdentity> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "Air Quality Bus index is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(BusIdentity {})
+    }
+}
+
 #[async_trait::async_trait]
 impl Worker for AirQualityOverlayWorker {
     fn name(&self) -> &'static str {
@@ -784,8 +851,8 @@ impl Worker for AirQualityOverlayWorker {
         let mut probe = self.probe.clone();
         let mut last_good: Option<AirQualitySnapshot> = None;
         let mut retry = POLL;
-        let mut no_fix_published = false;
-        let mut unconfigured_published = false;
+        let mut no_fix_published_on = None;
+        let mut unconfigured_published_on = None;
         loop {
             if probe.is_none() {
                 let Some(result) = self.load_probe(&mut shutdown).await else {
@@ -794,15 +861,15 @@ impl Worker for AirQualityOverlayWorker {
                 match result {
                     Ok(Some(loaded)) => {
                         probe = Some(loaded);
-                        unconfigured_published = false;
+                        unconfigured_published_on = None;
                     }
                     Ok(None) => {
-                        if !unconfigured_published {
-                            match self
-                                .publish(&AirQualitySnapshot::unconfigured(&self.host, now_ms()))
-                            {
-                                Ok(()) => {
-                                    unconfigured_published = true;
+                        if !self.published_on_current_index(unconfigured_published_on) {
+                            match self.publish_once_per_index(
+                                &AirQualitySnapshot::unconfigured(&self.host, now_ms()),
+                                &mut unconfigured_published_on,
+                            ) {
+                                Ok(_) => {
                                     retry = POLL;
                                 }
                                 Err(error) => {
@@ -810,7 +877,11 @@ impl Worker for AirQualityOverlayWorker {
                                 }
                             }
                         }
-                        let delay = if unconfigured_published { POLL } else { retry };
+                        let delay = if self.published_on_current_index(unconfigured_published_on) {
+                            POLL
+                        } else {
+                            retry
+                        };
                         tokio::select! {
                             () = shutdown.wait() => break,
                             () = tokio::time::sleep(delay) => {}
@@ -840,19 +911,21 @@ impl Worker for AirQualityOverlayWorker {
             let context = match self.current_context() {
                 Ok(Some(context)) => context,
                 Ok(None) => {
-                    if !no_fix_published {
+                    if !self.published_on_current_index(no_fix_published_on) {
                         let unavailable =
                             ProbeFailure::other("fresh same-host US vehicle fix unavailable");
                         // A successfully read missing/stale fix is a hard
                         // context boundary. Commit an empty public status
                         // before advancing the suppression flag or cache.
-                        match self.publish(&self.status_snapshot(
-                            AirNowAvailability::Ready,
-                            None,
-                            unavailable.to_string(),
-                        )) {
-                            Ok(()) => {
-                                no_fix_published = true;
+                        match self.publish_once_per_index(
+                            &self.status_snapshot(
+                                AirNowAvailability::Ready,
+                                None,
+                                unavailable.to_string(),
+                            ),
+                            &mut no_fix_published_on,
+                        ) {
+                            Ok(_) => {
                                 last_good = None;
                                 retry = POLL;
                             }
@@ -861,7 +934,11 @@ impl Worker for AirQualityOverlayWorker {
                             }
                         }
                     }
-                    let delay = if no_fix_published { POLL } else { retry };
+                    let delay = if self.published_on_current_index(no_fix_published_on) {
+                        POLL
+                    } else {
+                        retry
+                    };
                     tokio::select! {
                         () = shutdown.wait() => break,
                         () = tokio::time::sleep(delay) => {}
@@ -877,7 +954,7 @@ impl Worker for AirQualityOverlayWorker {
                     continue;
                 }
             };
-            no_fix_published = false;
+            no_fix_published_on = None;
             let Some(result) = self
                 .fetch_async(
                     probe.as_ref().expect("probe loaded").clone(),
@@ -905,13 +982,15 @@ impl Worker for AirQualityOverlayWorker {
                 Ok(None) => {
                     let unavailable =
                         ProbeFailure::other("fresh same-host US vehicle fix unavailable");
-                    match self.publish(&self.status_snapshot(
-                        AirNowAvailability::Ready,
-                        None,
-                        unavailable.to_string(),
-                    )) {
-                        Ok(()) => {
-                            no_fix_published = true;
+                    match self.publish_once_per_index(
+                        &self.status_snapshot(
+                            AirNowAvailability::Ready,
+                            None,
+                            unavailable.to_string(),
+                        ),
+                        &mut no_fix_published_on,
+                    ) {
+                        Ok(_) => {
                             last_good = None;
                             ApplyOutcome {
                                 success: false,
@@ -942,7 +1021,7 @@ impl Worker for AirQualityOverlayWorker {
                 }
             };
             if outcome.publication_committed {
-                unconfigured_published = false;
+                unconfigured_published_on = None;
             }
             if outcome.reload_key && self.probe.is_none() {
                 probe = None;
@@ -1215,6 +1294,108 @@ mod tests {
         assert_eq!(
             worker.current_context().expect("replacement bus"),
             Some(moved)
+        );
+    }
+
+    #[test]
+    fn repeated_no_fix_publishes_once_per_replacement_index() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        drop(Persist::open(root.clone()).expect("initial bus"));
+        let worker =
+            AirQualityOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let snapshot = worker.status_snapshot(
+            AirNowAvailability::Ready,
+            None,
+            "fresh same-host US vehicle fix unavailable".to_string(),
+        );
+        let mut published_on = None;
+
+        assert!(worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("first no-fix publication"));
+        assert!(!worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("repeated no-fix poll"));
+        assert_eq!(
+            Persist::open(root.clone())
+                .expect("initial reader")
+                .list_since(&air_quality_state_topic("rig-1"), None)
+                .expect("initial rows")
+                .len(),
+            1,
+            "identical no-fix polls must not churn the current index"
+        );
+
+        let replacement = temp.path().join("replacement");
+        drop(Persist::open(replacement.clone()).expect("replacement bus"));
+        std::fs::rename(replacement.join("index.sqlite"), root.join("index.sqlite"))
+            .expect("replace index at the same path");
+
+        assert!(worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("corrected-forward replacement publication"));
+        assert!(!worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("repeated replacement poll"));
+        assert_eq!(
+            Persist::open(root)
+                .expect("replacement reader")
+                .list_since(&air_quality_state_topic("rig-1"), None)
+                .expect("replacement rows")
+                .len(),
+            1,
+            "replacement index must receive exactly one no-fix row"
+        );
+    }
+
+    #[test]
+    fn failed_unconfigured_replacement_write_does_not_suppress_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        drop(Persist::open(root.clone()).expect("initial bus"));
+        let worker =
+            AirQualityOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let snapshot = AirQualitySnapshot::unconfigured("rig-1", NOW_MS);
+        let mut published_on = None;
+
+        assert!(worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("first unconfigured publication"));
+        assert!(!worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("repeated unconfigured poll"));
+        let initial_identity = published_on;
+
+        let replacement = temp.path().join("replacement");
+        drop(Persist::open(replacement.clone()).expect("replacement bus"));
+        std::fs::remove_file(root.join("index.sqlite")).expect("remove initial index");
+        std::fs::create_dir(root.join("index.sqlite")).expect("block replacement publication");
+        assert!(worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .is_err());
+        assert_eq!(
+            published_on, initial_identity,
+            "failed publication must not set replacement suppression"
+        );
+
+        std::fs::remove_dir(root.join("index.sqlite")).expect("unblock replacement index");
+        std::fs::rename(replacement.join("index.sqlite"), root.join("index.sqlite"))
+            .expect("install replacement index");
+        assert!(worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("retry replacement publication"));
+        assert!(!worker
+            .publish_once_per_index(&snapshot, &mut published_on)
+            .expect("repeated replacement poll"));
+        assert_eq!(
+            Persist::open(root)
+                .expect("replacement reader")
+                .list_since(&air_quality_state_topic("rig-1"), None)
+                .expect("replacement rows")
+                .len(),
+            1,
+            "successful retry must suppress later identical replacement polls"
         );
     }
 

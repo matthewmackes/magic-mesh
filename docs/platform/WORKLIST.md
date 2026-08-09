@@ -460,9 +460,7 @@ behavioral evidence is not completion.
   passed five exact tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-bookmarks-bus-recovery-r30.md`,
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-021-2026-08-09-adfilter-bus-recovery-r31.md`.
-- **Datacenter job-ledger recovery checkpoint (2026-08-09):** late Bus startup
-  now folds durable request/reply history, and unreadable replies cannot regress
-  terminal jobs to false pending state. Machine 196 passed three exact tests:
+- **Datacenter job recovery (2026-08-09):** late startup folds history; unreadable replies cannot regress terminal jobs. Machine 196 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-jobs-bus-recovery-r37.md`.
 - **Datacenter audit recovery checkpoint (2026-08-09):** request/output snapshots recover late storage and prevent duplicate projections; machine 9 passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-auditor-bus-recovery-r39.md`.
@@ -499,6 +497,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`,
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-replacement-suppression-r65.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`,
@@ -865,6 +864,7 @@ behavioral evidence is not completion.
 - **Environmental-overlay transaction checkpoints (2026-08-09):** exact post-I/O context, late/replaced storage, failed writes, validators, and transition suppression
   now gate Air Quality, IEM radar, NWS alerts, Earthquake, and Transit; machines 193/194/9 and BigBoy passed focused hostile recovery tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`.
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-replacement-suppression-r65.md`.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-nws-alert-bus-recovery-r60.md`.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`.
