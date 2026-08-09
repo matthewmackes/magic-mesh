@@ -1267,7 +1267,11 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         RestartPolicy::OnFailure,
         WorkerGroup::Actions,
     )
-    .with_config(ConfigPredicate::RuntimeAvailable("mesh-ansible-inventory")),
+    .with_config(ConfigPredicate::EnvironmentPresent("MDE_ANSIBLE_PULL_URL"))
+    .with_cadence(CadencePolicy::Periodic {
+        min_interval_secs: 900,
+        max_interval_secs: 900,
+    }),
     WorkerSpec::tier("app-sync", 1, RestartPolicy::OnFailure, WorkerGroup::Data),
     WorkerSpec::tier(
         "job_exec",
@@ -1668,6 +1672,38 @@ pub fn specs_for_group(group: WorkerGroup) -> impl Iterator<Item = &'static Work
 #[must_use]
 pub fn belongs_to_group(worker: &str, group: WorkerGroup) -> bool {
     spec(worker).is_some_and(|worker| worker.group == group)
+}
+
+/// Apply the canonical registry's startup-time configuration predicate.
+///
+/// Runtime/provider predicates stay admitted because their workers must run to
+/// observe records that can appear after daemon startup. Environment predicates
+/// are fixed for the process lifetime and are therefore enforced before a
+/// constructor can open a queue, socket, subprocess, or task.
+#[must_use]
+pub fn startup_configuration_allows(worker: &str) -> bool {
+    startup_configuration_allows_with(worker, |key| std::env::var_os(key))
+}
+
+fn startup_configuration_allows_with<F>(worker: &str, lookup: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let Some(worker) = spec(worker) else {
+        return false;
+    };
+    match worker.activation.config {
+        ConfigPredicate::Always | ConfigPredicate::RuntimeAvailable(_) => true,
+        ConfigPredicate::EnvironmentPresent(key) => {
+            lookup(key).is_some_and(|value| !value.is_empty())
+        }
+        ConfigPredicate::EnvironmentUnlessFalse(key) => lookup(key).is_none_or(|value| {
+            !matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        }),
+    }
 }
 
 /// Project one daemon registry row into the neutral worker-runtime contract.
@@ -2104,6 +2140,16 @@ pub fn workers_for_class(class: DeployClass) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registry_inventory_sha256(registry: &[WorkerSpec]) -> String {
+        use sha2::{Digest as _, Sha256};
+
+        let mut digest = Sha256::new();
+        for worker in registry {
+            digest.update(format!("{worker:?}\n"));
+        }
+        format!("{:x}", digest.finalize())
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // WL-ARCH-004 — the (now structural) drift guard.
@@ -2688,6 +2734,10 @@ mod tests {
         // Both scanned across run_serve (`bin/mackesd.rs`) and its spawn helpers
         // (`bin/mackesd/spawn.rs`).
         let bin = read_source("bin/mackesd.rs") + &read_source("bin/mackesd/spawn.rs");
+        assert!(
+            !bin.contains("std::env::var(\"MDE_ANSIBLE_PULL_URL\")"),
+            "WL-ARCH-009: ansible-pull startup configuration escaped the canonical registry"
+        );
         let tiered: BTreeSet<String> = scan_call_names(&bin, "spawn_tiered(").into_iter().collect();
         let pushed: BTreeSet<String> = scan_names(&bin, ".push(\"").into_iter().collect();
         let literal_policies = scan_literal_spawn_policies(&bin);
@@ -2811,6 +2861,55 @@ mod tests {
             "WL-ARCH-004 DRIFT: these workers are gated on `worker_role::runs(…)` but are MISSING \
              from WORKER_REGISTRY/WORKER_CAPABILITIES, so they silently default to rank 0 (the \
              BUG-STORAGE-1 bug). Add each to the census with a deliberate tier: {gated_uncensused:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_registry_inventory_hash_covers_every_runtime_field() {
+        let hash = registry_inventory_sha256(WORKER_REGISTRY);
+        assert_eq!(
+            hash, "983c9334b4531f55afb42ea732438ed4cfdc12f0526affbf9b0b3971317ea616",
+            "WL-ARCH-009: canonical registration inventory drifted"
+        );
+
+        let mut hostile = WORKER_REGISTRY.to_vec();
+        hostile[0].ownership.cleanup.grace_secs += 1;
+        assert_ne!(registry_inventory_sha256(&hostile), hash);
+        hostile[0] = WORKER_REGISTRY[0];
+        hostile[0].cadence = CadencePolicy::OnDemand;
+        assert_ne!(registry_inventory_sha256(&hostile), hash);
+    }
+
+    #[test]
+    fn startup_configuration_is_registry_owned_and_fails_closed() {
+        let lookup = |key: &str| match key {
+            "MDE_ANSIBLE_PULL_URL" => Some(std::ffi::OsString::from("https://fleet.invalid/repo")),
+            "MDE_OVERLAY_USGS_EARTHQUAKES" => Some(std::ffi::OsString::from("OFF")),
+            _ => None,
+        };
+
+        assert!(startup_configuration_allows_with("ansible-pull", lookup));
+        assert!(!startup_configuration_allows_with("vehicle", lookup));
+        assert!(!startup_configuration_allows_with(
+            "earthquake_overlay",
+            lookup
+        ));
+        assert!(!startup_configuration_allows_with("uncensused", lookup));
+        assert!(!startup_configuration_allows_with("ansible-pull", |_| {
+            Some(std::ffi::OsString::new())
+        }));
+
+        let ansible = spec("ansible-pull").expect("ansible-pull registry row");
+        assert_eq!(
+            ansible.activation.config,
+            ConfigPredicate::EnvironmentPresent("MDE_ANSIBLE_PULL_URL")
+        );
+        assert_eq!(
+            ansible.cadence,
+            CadencePolicy::Periodic {
+                min_interval_secs: 900,
+                max_interval_secs: 900,
+            }
         );
     }
 

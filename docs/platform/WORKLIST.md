@@ -378,15 +378,12 @@ behavioral evidence is not completion.
 - Current state: all 145 production starts have bounded runtime contracts; six grouped services ship, but complete ownership, providers, UI cutover, and fleet proof remain.
 - **SQLite authority complete (2026-08-08):** migrations reduced 61 direct writes to zero; final host/job and process-owner proof passed 24/24, and the empty baseline is enforced:
   `docs/platform/evidence/WL-ARCH-009-2026-08-08-sqlite-authority-zero-r11.md`.
-- **Workers Action Console checkpoint (2026-08-08):** the canonical Workers
-  surface now stages authenticated, generation-bound Preview/Commit/Cancel
-  requests and renders typed audit and partial-failure results; focused `.50`
-  gates passed 4/4. Live daemon round-trip and responsive captures remain.
-  Evidence: `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`.
-- **Action digest checkpoint (2026-08-09):** staged intent is canonically recomputed and tampering fails before routing; `.90` passed 9 contract and 15 daemon tests:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
+- **Action Console checkpoints (2026-08-08/09):** authenticated generation-bound Preview/Commit/Cancel and canonical digest recomputation fail closed; `.50`/`.90` passed:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-08-workers-action-console-s5-r1.md`, `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-console-digest-binding-r8.md`.
 - **Runtime census checkpoint (2026-08-09):** any uncensused supervisor worker now refuses the unified projection without advancing generation; BigBoy passed 15/15:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-unregistered-runtime-refusal-r4.md`.
+- **Canonical registry census (2026-08-09):** all reachable starts have one registry row and stable complete-field hash; ansible-pull configuration/cadence moved from
+  parallel spawn logic into that authority. BigBoy passed focused census/hostile tests: `docs/platform/evidence/WL-ARCH-009-2026-08-09-registry-census-r9.md`.
 - Remaining work:
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.

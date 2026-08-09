@@ -109,6 +109,13 @@ pub(crate) fn spawn_tiered<W, F>(
     if !mackesd_core::worker_role::runs(name, role_rank) {
         return;
     }
+    if !mackesd_core::worker_role::startup_configuration_allows(name) {
+        tracing::info!(
+            worker = name,
+            "worker disabled by canonical startup configuration"
+        );
+        return;
+    }
     sup.spawn(mackesd_core::workers::Spawn::new(build(), policy));
     worker_names
         .lock()
@@ -3479,20 +3486,9 @@ pub(crate) fn spawn_messaging_sync_workers(
     // Bug 6 (2026-06-06) — without MDE_ANSIBLE_PULL_URL the worker only spawns
     // `ansible-pull` to fail; a box with no fleet config-pull URL has nothing
     // to do, so skip rather than respawn-on-failure into a periodic WARN.
-    let ansible_configured = std::env::var("MDE_ANSIBLE_PULL_URL")
-        .map(|u| !u.is_empty())
-        .unwrap_or(false);
-    if mackesd_core::worker_role::runs("ansible-pull", role_rank) {
-        if ansible_configured {
-            spawn_tiered(sup, worker_names, role_rank, "ansible-pull", || {
-                mackesd_core::workers::ansible_pull::build()
-            });
-        } else {
-            tracing::info!(
-                "ansible-pull: MDE_ANSIBLE_PULL_URL unset; fleet config-pull worker skipped"
-            );
-        }
-    }
+    spawn_tiered(sup, worker_names, role_rank, "ansible-pull", || {
+        mackesd_core::workers::ansible_pull::build()
+    });
 
     // EPIC-SYNC-APP-CONFIG (Q26, 2026-05-28) — app-config sync is
     // now a native-Rust worker (`workers::app_sync`); it discovers
