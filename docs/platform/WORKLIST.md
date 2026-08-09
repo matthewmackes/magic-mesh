@@ -190,28 +190,17 @@ behavioral evidence is not completion.
   Workload caller and activation/package contracts passed their typed-action
   checks. BigBoy passed the focused reconciler admission test 1/1 and `.90`
   passed the hostile storage-link test 1/1; the focused backend contract gate
-  passed 12/12 on `.50`. This checkpoint does not
-  claim live Dell/seat-15, native KMS/EGL, packaging-install, or restart proof.
-  Evidence:
+  passed 12/12 on `.50`; live Dell/seat-15, native KMS/EGL, packaging-install,
+  and restart proof remain. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-wiring-r1.md`.
-- **Dell typed capacity-refusal checkpoint (2026-08-08):** Release 21 on Dell
-  published one capability-bound Browser Standard `StartAndAttach` through the
-  sole Workload operation lane. Live four-thread admission refused before any
-  actuator attempt or Display1 lease, retained the Browser VM shut off, and
-  published the expected typed failed state. OpenTofu, Ansible, libvirt, KVM,
-  Podman, storage, shell, and all six workers passed the focused live verifier.
-  The refusal's inaccurate same-profile remediation was corrected to recommend
-  the Small profile and is covered by one focused farm test. A larger-seat
-  successful first frame and the remaining lifecycle matrix remain. Evidence:
+- **Dell typed capacity-refusal checkpoint (2026-08-08):** Release 21 published one capability-bound Browser Standard `StartAndAttach`; live four-thread admission
+  refused before effects, retained the VM shut off, and produced typed failure. OpenTofu, Ansible, libvirt, KVM, Podman, storage, shell, and all six workers passed.
+  Remediation now recommends Small; larger-seat first-frame and lifecycle proof remain:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-dell-capacity-refusal-r1.md`.
 - **Startup readiness checkpoint (2026-08-09):** a not-running VM awaiting guest readiness retries instead of falsely completing stopped; BigBoy passed 37/37:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-startup-readiness-fail-closed-r13.md`.
-- **Compute firewall outcome checkpoint (2026-08-09):** authorized expose and
-  unexpose actions now journal their exact bounded result in root-owned local
-  state, recover publication after restart without replaying mutation, and
-  report failed/partial effects without fabricating active rules. Mesh removal
-  now uses the original destination-bound rule identity. Machine 194 passed the
-  exact failure/restart fixture:
+- **Compute firewall outcome checkpoint (2026-08-09):** root-owned result journaling, restart-safe reply recovery, honest partial/failed projections, and exact Mesh
+  removal identity passed machine 194:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-firewall-outcome-r18.md`.
   1. S1 Inventory authorities and remove reachability.
      - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
