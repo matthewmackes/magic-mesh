@@ -963,8 +963,8 @@ behavioral evidence is not completion.
   preserving boot and read-only catalog access; `.90` gates passed: `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-readiness-r4.md`.
 - **Catalog rollback checkpoint (2026-08-09):** same-publisher rollback/equivocation preserves last-good cards and revokes stale actions; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-remote-sessions-catalog-rollback-r5.md`.
-- **Live Windows authority checkpoint (2026-08-09):** seat 15 still reaches `172.20.146.54:3389`, but the authoritative store has no `resource/publisher-hmac` and no
-  Windows login was supplied; connection correctly remains closed: `docs/platform/evidence/WL-FUNC-019-2026-08-09-live-windows-rdp-s5-r6.md`.
+- **Live Windows authority checkpoint (2026-08-09):** seat 15 detects `172.20.146.54:3389`; publisher HMAC, accepted-receipt VDI handoff, and Windows login remain absent:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-rdp-authority-path-r7.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
