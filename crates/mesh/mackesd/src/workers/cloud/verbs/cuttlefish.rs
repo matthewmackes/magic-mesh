@@ -243,6 +243,15 @@ impl CuttlefishProviderClient for LibvirtCuttlefishProviderClient {
         &self,
         target: &CuttlefishVmTarget,
     ) -> Result<CuttlefishVmObservation, CuttlefishProviderError> {
+        // A retained display source is a lease on the last guest-ready
+        // observation, not durable VM identity. Revoke it before every refresh
+        // and restore it only when the current outer VM and guest relay both
+        // prove readiness. Provider loss, a stopped/replaced VM, or a failed
+        // guest observation must never leave an old session attachable.
+        *self
+            .guest_snapshot
+            .lock()
+            .map_err(|_| CuttlefishProviderError::StatePoisoned)? = None;
         let instances = self
             .runner
             .list_instances()
@@ -777,8 +786,9 @@ mod tests {
         AndroidImagePackage, AndroidPackageVersion, AospStarterApp,
     };
     use mackes_mesh_types::android_provider::{
-        CuttlefishGuestBootState, CuttlefishGuestReadiness, CuttlefishGuestReadinessEvidence,
-        CuttlefishImageProvenanceRef, CuttlefishVmId,
+        AndroidVdiProtocol, CuttlefishGuestBootState, CuttlefishGuestReadiness,
+        CuttlefishGuestReadinessEvidence, CuttlefishImageProvenanceRef, CuttlefishVmId,
+        ANDROID_VDI_SOURCE_SCHEMA_VERSION,
     };
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1073,5 +1083,49 @@ mod tests {
         );
         assert_eq!(observed.guest.readiness, CuttlefishGuestReadiness::NotReady);
         assert!(!observed.is_guest_ready());
+    }
+
+    #[test]
+    fn outer_vm_readiness_loss_revokes_retained_vdi_source() {
+        let runner = crate::workers::cloud::runner::fake::FakeRunner {
+            roster: vec![CloudInstance {
+                id: "android-t480".to_owned(),
+                name: "android-t480".to_owned(),
+                status: "STOPPED".to_owned(),
+                flavor: None,
+                image: None,
+                networks: None,
+            }],
+            ..Default::default()
+        };
+        let client = LibvirtCuttlefishProviderClient::new(Arc::new(runner));
+        let now = now_unix_ms();
+        *client.guest_snapshot.lock().expect("guest snapshot") = Some((
+            1,
+            GuestSnapshot {
+                inventory: AndroidAppInventory::pending("android-t480"),
+                vdi_source: AndroidVdiSource {
+                    schema_version: ANDROID_VDI_SOURCE_SCHEMA_VERSION,
+                    workload_id: "android-t480".to_owned(),
+                    image_provenance: target().image_provenance,
+                    catalog_digest: DIGEST.to_owned(),
+                    generation: 1,
+                    protocol: AndroidVdiProtocol::WebRtc,
+                    mesh_host: "android-t480.mesh".to_owned(),
+                    port: 8_443,
+                    session_id: "session-before-stop".to_owned(),
+                    observed_at_unix_ms: now,
+                    expires_at_unix_ms: now.saturating_add(60_000),
+                },
+            },
+        ));
+        assert!(client.vdi_source(1).is_some());
+
+        let observed = client.observe(&target()).expect("stopped observation");
+        assert_eq!(
+            observed.lifecycle_state,
+            CuttlefishVmLifecycleState::Stopped
+        );
+        assert!(client.vdi_source(1).is_none());
     }
 }

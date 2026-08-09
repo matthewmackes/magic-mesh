@@ -1031,8 +1031,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-signed-catalog-s1-r1.md`.
 - **Provider preflight (2026-08-08):** image hash/identity, KVM nesting, capacity, disk, and libvirt gate registration; 4/4 passed on BigBoy:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-provider-preflight-s2-r1.md`.
-- **S3 lifecycle (2026-08-08):** exact-generation lifecycle, recovery, bounded guest relay, and fail-closed typed VDI readiness passed focused BigBoy gates:
-  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-lifecycle-s3-r1.md`.
+- **S3 lifecycle/readiness (2026-08-09):** exact-generation recovery and bounded guest relay passed BigBoy; outer-VM loss now revokes retained VDI sources, with `.90` at 6/6:
+  `docs/platform/evidence/WL-FUNC-020-2026-08-08-android-lifecycle-s3-r1.md`, `docs/platform/evidence/WL-FUNC-020-2026-08-09-vdi-readiness-revocation-r4.md`.
 - **S4 governed Workloads UX (2026-08-08):** daemon-cache-bound signed cards, typed lifecycle, responsive rendering, and WebRTC handoff passed 6/6 on `.170`;
   authorized Remote Sessions consumption and fail-closed no-dial refusal passed 2/2; live decoder/captures remain. Evidence:
   `docs/platform/evidence/WL-FUNC-020-2026-08-08-governed-android-ux-s4-r1.md`.
