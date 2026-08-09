@@ -1295,6 +1295,12 @@ assets = [
     { source = "packaging/systemd/mcnf-mesh-secret-recipient.timer", dest = "/usr/lib/systemd/system/mcnf-mesh-secret-recipient.timer", mode = "644" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
+    # WL-CRIT-006 — a lighthouse candidate participates in authenticated
+    # resource publication, so its governed payload must carry the same
+    # host-bound publisher credential materializer as a workstation candidate.
+    { source = "install-helpers/provision-resource-publisher-credential.sh", dest = "/usr/libexec/mackesd/provision-resource-publisher-credential", mode = "755" },
+    { source = "packaging/systemd/resource-publisher-hmac.conf", dest = "/usr/libexec/mackesd/resource-publisher-hmac.conf", mode = "644" },
+    { source = "packaging/systemd/mcnf-resource-publisher-credential.service", dest = "/usr/lib/systemd/system/mcnf-resource-publisher-credential.service", mode = "644" },
     { source = "packaging/systemd/mesh-health.service", dest = "/usr/lib/systemd/system/mesh-health.service", mode = "644" },
     { source = "packaging/systemd/mesh-health.timer", dest = "/usr/lib/systemd/system/mesh-health.timer", mode = "644" },
     { source = "packaging/systemd/mesh-alert@.service", dest = "/usr/lib/systemd/system/mesh-alert@.service", mode = "644" },

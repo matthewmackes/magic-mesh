@@ -382,6 +382,37 @@ jobs:
             cp -- "$artifact" "$upload_dir/"
           done
 
+      # Derive the six-node collector's exact role manifest from immutable RPM
+      # snapshots. This emits candidate evidence only; release signing remains
+      # a separate manual operator gate.
+      - name: Emit governed candidate manifest
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          release_root="/tmp/mcnf-github-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          candidate_dir=automation/.state/candidate-evidence
+          mapfile -d '' workstation_rpms < <(
+            find "$release_root/artifacts" -maxdepth 1 -type f -name 'magic-mesh-[0-9]*.rpm' -print0
+          )
+          mapfile -d '' lighthouse_rpms < <(
+            find "$release_root/artifacts" -maxdepth 1 -type f -name 'magic-mesh-lighthouse-*.rpm' -print0
+          )
+          test "${#workstation_rpms[@]}" -eq 1
+          test "${#lighthouse_rpms[@]}" -eq 1
+          rm -rf -- "$candidate_dir"
+          mkdir -m 0700 -p -- "$candidate_dir"
+          ./install-helpers/write-candidate-manifest.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --revision "$EXPECTED_REVISION" \
+            --workstation-rpm "${workstation_rpms[0]}" \
+            --lighthouse-rpm "${lighthouse_rpms[0]}" \
+            --out-dir "$candidate_dir"
+          python3 install-helpers/collect-six-node-topology.py \
+            --validate-candidate-manifest \
+            --revision "$EXPECTED_REVISION" \
+            --candidate-manifest "$candidate_dir/candidate-manifest.json"
+
       # Generate descriptors from the final bytes, bind them into this exact
       # green farm log/status, regenerate descriptors to catch byte changes,
       # then verify the same copies that will cross the artifact boundary.
@@ -467,6 +498,7 @@ jobs:
             automation/.state/ci-gate.log
             automation/.state/ci-gate-manifest.txt
             automation/.state/release-binding.json
+            automation/.state/candidate-evidence
             automation/.state/release-artifacts
           if-no-files-found: error
 
@@ -496,6 +528,11 @@ jobs:
         with:
           name: ci-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: farm-evidence
+
+      - name: Install candidate artifact readers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm rpm2cpio cpio
 
       - name: Verify authoritative results
         env:
@@ -557,4 +594,30 @@ jobs:
             "$artifact_root" \
             "$EXPECTED_REVISION" "$EXPECTED_JOB_ID" \
             "$EXPECTED_FARM_HOST" "$EXPECTED_FARM_SLOT"
+          evidence_copy="${artifact_root%/artifacts}/farm-evidence"
+          mv -- farm-evidence "$evidence_copy"
+          mapfile -d '' workstation_rpms < <(
+            find "$artifact_root" -maxdepth 1 -type f -name 'magic-mesh-[0-9]*.rpm' -print0
+          )
+          mapfile -d '' lighthouse_rpms < <(
+            find "$artifact_root" -maxdepth 1 -type f -name 'magic-mesh-lighthouse-*.rpm' -print0
+          )
+          test "${#workstation_rpms[@]}" -eq 1
+          test "${#lighthouse_rpms[@]}" -eq 1
+          regenerated="${artifact_root%/artifacts}/candidate-regenerated"
+          mkdir -m 0700 -- "$regenerated"
+          ./install-helpers/write-candidate-manifest.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --revision "$EXPECTED_REVISION" \
+            --workstation-rpm "${workstation_rpms[0]}" \
+            --lighthouse-rpm "${lighthouse_rpms[0]}" \
+            --out-dir "$regenerated"
+          cmp -s -- "$regenerated/candidate-manifest.json" \
+            "$evidence_copy/candidate-evidence/candidate-manifest.json"
+          cmp -s -- "$regenerated/candidate-source-receipt.json" \
+            "$evidence_copy/candidate-evidence/candidate-source-receipt.json"
+          python3 install-helpers/collect-six-node-topology.py \
+            --validate-candidate-manifest \
+            --revision "$EXPECTED_REVISION" \
+            --candidate-manifest "$evidence_copy/candidate-evidence/candidate-manifest.json"
           rm -rf -- "${artifact_root%/artifacts}"

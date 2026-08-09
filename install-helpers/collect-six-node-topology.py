@@ -2817,6 +2817,11 @@ def self_test() -> None:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--validate-candidate-manifest",
+        action="store_true",
+        help="validate only the exact role candidate schema; do not connect or write",
+    )
     parser.add_argument("--revision", help="candidate 40-character source revision")
     parser.add_argument(
         "--candidate-manifest",
@@ -2889,6 +2894,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.self_test:
             self_test()
+            return 0
+        if args.validate_candidate_manifest:
+            if args.revision is None or args.candidate_manifest is None:
+                fail("candidate-manifest validation requires --revision and --candidate-manifest")
+            if args.target or args.output is not None or args.dry_run:
+                fail("candidate-manifest validation does not accept collection arguments")
+            revision = require_revision(args.revision)
+            manifest = read_candidate_manifest(args.candidate_manifest, revision)
+            print(
+                "collect-six-node-topology.py: PASS — exact candidate manifest "
+                f"covers {', '.join(sorted(manifest.roles))} at {revision}"
+            )
             return 0
         revision, targets, output, observation_root, candidate_manifest = validate_cli(args)
         if args.dry_run:
