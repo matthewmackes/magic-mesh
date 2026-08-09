@@ -1,5 +1,6 @@
 //! Centered System and Mesh Health modal.
 
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::health::{
@@ -24,6 +25,15 @@ const MESH_SELECTION: &str = "__mesh_wide__";
 const HISTORY_PAGE_SIZE: usize = 8;
 const HISTORY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const ACTION_ERROR_STATE_ID: &str = "health-action-publication-error";
+const SUPPORT_EXPORT_STATE_ID: &str = "health-support-export-outcome";
+const SUPPORT_BUNDLE_SCHEMA: &str = "mde.health.support-bundle.v1";
+const SUPPORT_BUNDLE_MAX_BYTES: usize = 64 * 1_024;
+const SUPPORT_BUNDLE_MAX_NODES: usize = 32;
+const SUPPORT_BUNDLE_MAX_ACTIVE: usize = 32;
+const SUPPORT_BUNDLE_MAX_RESOLVED: usize = 32;
+const SUPPORT_BUNDLE_MAX_FACTS: usize = 8;
+const SUPPORT_BUNDLE_MAX_TEXT_BYTES: usize = 192;
+const SUPPORT_BUNDLE_MAX_FILENAME_BYTES: usize = 128;
 
 pub(crate) fn mount(
     ctx: &egui::Context,
@@ -33,12 +43,14 @@ pub(crate) fn mount(
     if !chrome.health_modal_open {
         chrome.health_pending_action = None;
         clear_action_error(ctx);
+        clear_support_export_outcome(ctx);
         return;
     }
     if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
         chrome.health_modal_open = false;
         chrome.health_pending_action = None;
         clear_action_error(ctx);
+        clear_support_export_outcome(ctx);
         return;
     }
 
@@ -57,6 +69,7 @@ pub(crate) fn mount(
         chrome.health_modal_open = false;
         chrome.health_pending_action = None;
         clear_action_error(ctx);
+        clear_support_export_outcome(ctx);
     }
 }
 
@@ -98,7 +111,31 @@ fn show(
                 ui.label(format!("Overall {}", snapshot.mesh_summary.grade.as_str()));
             }
         }
+        let export = ui.add_enabled(
+            snapshot.is_some(),
+            egui::Button::new("Export redacted support bundle"),
+        );
+        if export.clicked() {
+            let snapshot = snapshot.expect("enabled export requires a current snapshot");
+            apply_support_export_result(ui.ctx(), export_support_bundle(snapshot));
+        }
     });
+    if let Some(outcome) = support_export_outcome(ui.ctx()) {
+        match outcome {
+            SupportExportOutcome::Exported(path) => {
+                ui.colored_label(
+                    Style::SUPPORT_SUCCESS,
+                    format!("Support bundle exported to {}", path.display()),
+                );
+            }
+            SupportExportOutcome::Failed(error) => {
+                ui.colored_label(
+                    Style::SUPPORT_ERROR,
+                    format!("Support bundle export failed: {error}"),
+                );
+            }
+        }
+    }
     ui.separator();
     if let Some(error) = action_error(ui.ctx()) {
         ui.colored_label(Style::SUPPORT_ERROR, error.presentable());
@@ -562,6 +599,535 @@ fn device_route_key(route: &str) -> Option<&str> {
     route
         .strip_prefix("device-manager?device=")
         .filter(|key| !key.is_empty())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SupportExportOutcome {
+    Exported(PathBuf),
+    Failed(String),
+}
+
+fn support_export_state_id() -> egui::Id {
+    egui::Id::new(SUPPORT_EXPORT_STATE_ID)
+}
+
+fn support_export_outcome(ctx: &egui::Context) -> Option<SupportExportOutcome> {
+    ctx.data(|data| {
+        data.get_temp::<Option<SupportExportOutcome>>(support_export_state_id())
+            .flatten()
+    })
+}
+
+fn set_support_export_outcome(ctx: &egui::Context, outcome: SupportExportOutcome) {
+    ctx.data_mut(|data| data.insert_temp(support_export_state_id(), Some(outcome)));
+}
+
+fn apply_support_export_result(ctx: &egui::Context, result: std::io::Result<PathBuf>) {
+    let outcome = result
+        .map(SupportExportOutcome::Exported)
+        .unwrap_or_else(|error| SupportExportOutcome::Failed(bounded_error(&error)));
+    set_support_export_outcome(ctx, outcome);
+}
+
+fn clear_support_export_outcome(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.remove_temp::<Option<SupportExportOutcome>>(support_export_state_id());
+    });
+}
+
+fn bounded_error(error: &std::io::Error) -> String {
+    bound_support_text(&error.to_string())
+}
+
+/// Resolve the one support-export location from the current UID's operating
+/// system account record. Environment-controlled XDG/HOME roots and temporary
+/// fallbacks are intentionally excluded from this security boundary.
+fn support_export_dir() -> std::io::Result<PathBuf> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).custom_flags(0o400000); // Linux O_NOFOLLOW.
+    let passwd = options.open("/etc/passwd")?;
+    if !passwd.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "account database is not a regular file",
+        ));
+    }
+    let mut contents = String::new();
+    passwd
+        .take(MAX_PASSWD_BYTES.saturating_add(1))
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_PASSWD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "account database exceeds its read bound",
+        ));
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let home = contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let _name = fields.next()?;
+        let _password = fields.next()?;
+        let account_uid = fields.next()?.parse::<u32>().ok()?;
+        let _gid = fields.next()?;
+        let _gecos = fields.next()?;
+        let home = fields.next()?;
+        (account_uid == uid).then(|| PathBuf::from(home))
+    });
+    let home = home.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "current UID has no account home",
+        )
+    })?;
+    if !home.is_absolute()
+        || home == Path::new("/")
+        || home.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "account home is not a safe absolute path",
+        ));
+    }
+    Ok(home
+        .join(".local")
+        .join("share")
+        .join("mde")
+        .join("health-support"))
+}
+
+fn support_bundle_filename(snapshot: &SystemMeshHealthSnapshot) -> String {
+    sanitize_support_filename(&format!(
+        "health-support-{}-{}.json",
+        snapshot.generated_at_ms, snapshot.generation
+    ))
+}
+
+fn sanitize_support_filename(name: &str) -> String {
+    let mut safe = String::with_capacity(name.len().min(SUPPORT_BUNDLE_MAX_FILENAME_BYTES));
+    for character in name.chars() {
+        let mapped = if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            character
+        } else {
+            '_'
+        };
+        if safe.len().saturating_add(mapped.len_utf8()) > SUPPORT_BUNDLE_MAX_FILENAME_BYTES {
+            break;
+        }
+        safe.push(mapped);
+    }
+    if safe.is_empty() || safe == "." || safe == ".." {
+        "health-support.json".into()
+    } else {
+        safe
+    }
+}
+
+fn export_support_bundle(snapshot: &SystemMeshHealthSnapshot) -> std::io::Result<PathBuf> {
+    export_support_bundle_to(&support_export_dir()?, snapshot)
+}
+
+fn export_support_bundle_to(
+    directory: &Path,
+    snapshot: &SystemMeshHealthSnapshot,
+) -> std::io::Result<PathBuf> {
+    let encoded = support_bundle_json(snapshot)?;
+    write_support_bundle(directory, &support_bundle_filename(snapshot), &encoded)
+}
+
+/// Write a complete sibling and rename it into place. The filename seam is
+/// deliberately defensive for tests and future callers: exactly one sanitized
+/// normal component is accepted, so traversal cannot escape `directory`.
+fn write_support_bundle(
+    directory: &Path,
+    filename: &str,
+    encoded: &[u8],
+) -> std::io::Result<PathBuf> {
+    use rand::RngCore as _;
+
+    let mut nonce = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    write_support_bundle_with_nonce(directory, filename, encoded, nonce)
+}
+
+fn write_support_bundle_with_nonce(
+    directory: &Path,
+    filename: &str,
+    encoded: &[u8],
+    nonce: [u8; 16],
+) -> std::io::Result<PathBuf> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use std::io::Write as _;
+    let mut components = Path::new(filename).components();
+    let one_safe_component = matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && filename == sanitize_support_filename(filename)
+        && filename.len() <= SUPPORT_BUNDLE_MAX_FILENAME_BYTES;
+    if !one_safe_component {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "support bundle filename is not contained",
+        ));
+    }
+    if encoded.len() > SUPPORT_BUNDLE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "support bundle exceeds the byte limit",
+        ));
+    }
+    if !directory.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "support export directory must be absolute",
+        ));
+    }
+    let path_components = directory
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            Component::RootDir => None,
+            _ => Some(std::ffi::OsString::new()),
+        })
+        .collect::<Vec<_>>();
+    if path_components.iter().any(|component| component.is_empty()) || path_components.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "support export directory contains an unsafe component",
+        ));
+    }
+
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory_fd =
+        rustix::fs::open("/", directory_flags, Mode::empty()).map_err(rustix_io_error)?;
+    for component in path_components {
+        directory_fd =
+            match rustix::fs::openat(&directory_fd, &component, directory_flags, Mode::empty()) {
+                Ok(opened) => opened,
+                Err(rustix::io::Errno::NOENT) => {
+                    match rustix::fs::mkdirat(
+                        &directory_fd,
+                        &component,
+                        Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                    ) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(rustix_io_error(error)),
+                    }
+                    let parent: std::fs::File = directory_fd.try_clone()?.into();
+                    parent.sync_all()?;
+                    rustix::fs::openat(&directory_fd, &component, directory_flags, Mode::empty())
+                        .map_err(rustix_io_error)?
+                }
+                Err(error) => return Err(rustix_io_error(error)),
+            };
+    }
+    let directory_metadata = rustix::fs::fstat(&directory_fd).map_err(rustix_io_error)?;
+    if directory_metadata.st_uid != rustix::process::getuid().as_raw()
+        || directory_metadata.st_mode & 0o077 != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "support export directory is not private to the current user",
+        ));
+    }
+
+    match rustix::fs::statat(&directory_fd, filename, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "support bundle destination is a symlink",
+            ));
+        }
+        Ok(metadata) if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "support bundle destination is not a regular file",
+            ));
+        }
+        Ok(_) | Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(rustix_io_error(error)),
+    }
+
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = format!(".health-support-{nonce}.tmp");
+    let temporary_flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let temporary_fd = rustix::fs::openat(
+        &directory_fd,
+        temporary.as_str(),
+        temporary_flags,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(rustix_io_error)?;
+    let mut temporary_file: std::fs::File = temporary_fd.into();
+    if let Err(error) = temporary_file
+        .write_all(encoded)
+        .and_then(|()| temporary_file.sync_all())
+    {
+        drop(temporary_file);
+        let _ = rustix::fs::unlinkat(&directory_fd, temporary.as_str(), AtFlags::empty());
+        let directory_file: std::fs::File = directory_fd.into();
+        let _ = directory_file.sync_all();
+        return Err(error);
+    }
+    drop(temporary_file);
+    if let Err(error) =
+        rustix::fs::renameat(&directory_fd, temporary.as_str(), &directory_fd, filename)
+    {
+        let _ = rustix::fs::unlinkat(&directory_fd, temporary.as_str(), AtFlags::empty());
+        let directory_file: std::fs::File = directory_fd.into();
+        let _ = directory_file.sync_all();
+        return Err(rustix_io_error(error));
+    }
+    let directory_file: std::fs::File = directory_fd.into();
+    directory_file.sync_all()?;
+    Ok(directory.join(filename))
+}
+
+fn rustix_io_error(error: rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+fn bounded_sorted_clones<'a, T: Clone + 'a>(
+    candidates: impl Iterator<Item = &'a T>,
+    maximum: usize,
+    compare: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> Vec<T> {
+    let mut selected = Vec::with_capacity(maximum);
+    for candidate in candidates {
+        let position = selected
+            .binary_search_by(|existing| compare(existing, candidate))
+            .unwrap_or_else(|position| position);
+        if position < maximum {
+            selected.insert(position, candidate.clone());
+            if selected.len() > maximum {
+                selected.pop();
+            }
+        }
+    }
+    selected
+}
+
+fn support_bundle_json(snapshot: &SystemMeshHealthSnapshot) -> std::io::Result<Vec<u8>> {
+    let mut nodes = bounded_sorted_clones(
+        snapshot.current_node_grades.iter(),
+        SUPPORT_BUNDLE_MAX_NODES,
+        |left, right| {
+            left.node
+                .cmp(&right.node)
+                .then_with(|| left.evaluated_at_ms.cmp(&right.evaluated_at_ms))
+        },
+    );
+
+    let mut active = bounded_sorted_clones(
+        snapshot
+            .active_conditions
+            .iter()
+            .filter(|condition| condition.is_active()),
+        SUPPORT_BUNDLE_MAX_ACTIVE,
+        support_condition_order,
+    );
+
+    let window_start = snapshot.generated_at_ms.saturating_sub(HISTORY_WINDOW_MS);
+    let mut resolved = bounded_sorted_clones(
+        snapshot.resolved_conditions.iter().filter(|condition| {
+            condition.resolved_at_ms.is_some_and(|resolved_at| {
+                (window_start..=snapshot.generated_at_ms).contains(&resolved_at)
+            })
+        }),
+        SUPPORT_BUNDLE_MAX_RESOLVED,
+        support_condition_order,
+    );
+
+    loop {
+        let value = support_bundle_value(snapshot, &nodes, &active, &resolved);
+        let encoded = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+        if encoded.len() <= SUPPORT_BUNDLE_MAX_BYTES {
+            return Ok(encoded);
+        }
+        if resolved.pop().is_some() || active.pop().is_some() || nodes.pop().is_some() {
+            continue;
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "support bundle metadata exceeds the byte limit",
+        ));
+    }
+}
+
+fn support_condition_order(left: &HealthCondition, right: &HealthCondition) -> std::cmp::Ordering {
+    right
+        .severity
+        .cmp(&left.severity)
+        .then_with(|| right.resolved_at_ms.cmp(&left.resolved_at_ms))
+        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.source.cmp(&right.source))
+}
+
+fn support_bundle_value(
+    snapshot: &SystemMeshHealthSnapshot,
+    nodes: &[NodeGrade],
+    active: &[HealthCondition],
+    resolved: &[HealthCondition],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": SUPPORT_BUNDLE_SCHEMA,
+        "generated_at_ms": snapshot.generated_at_ms,
+        "snapshot": {
+            "schema_version": snapshot.schema_version,
+            "generation": snapshot.generation,
+            "fresh_until_ms": snapshot.fresh_until_ms,
+            "observer": redact_support_text(&snapshot.observer),
+            "roster_revision": redact_support_text(&snapshot.roster_revision),
+        },
+        "mesh_summary": {
+            "grade": snapshot.mesh_summary.grade.as_str(),
+            "canonical_nodes": snapshot.mesh_summary.canonical_nodes,
+            "fresh_nodes": snapshot.mesh_summary.fresh_nodes,
+            "reachable_lighthouses": snapshot.mesh_summary.reachable_lighthouses,
+            "active_warnings": snapshot.mesh_summary.active_warnings,
+            "active_critical": snapshot.mesh_summary.active_critical,
+            "unacknowledged_actionable": snapshot.mesh_summary.unacknowledged_actionable,
+        },
+        "limits": {
+            "maximum_bytes": SUPPORT_BUNDLE_MAX_BYTES,
+            "maximum_text_bytes": SUPPORT_BUNDLE_MAX_TEXT_BYTES,
+            "history_window_ms": HISTORY_WINDOW_MS,
+            "nodes_in_snapshot": snapshot.current_node_grades.len(),
+            "nodes_exported": nodes.len(),
+            "active_in_snapshot": snapshot.active_conditions.len(),
+            "active_exported": active.len(),
+            "resolved_in_snapshot": snapshot.resolved_conditions.len(),
+            "resolved_exported": resolved.len(),
+        },
+        "nodes": nodes.iter().map(support_node_value).collect::<Vec<_>>(),
+        "active_conditions": active.iter().map(support_condition_value).collect::<Vec<_>>(),
+        "resolved_history": resolved.iter().map(support_condition_value).collect::<Vec<_>>(),
+        "redaction": "credential-shaped values, authorization material, and paths are omitted or replaced",
+    })
+}
+
+fn support_node_value(node: &NodeGrade) -> serde_json::Value {
+    serde_json::json!({
+        "node": redact_support_text(&node.node),
+        "grade": node.grade.as_str(),
+        "capability_score": node.capability_score,
+        "evaluated_at_ms": node.evaluated_at_ms,
+        "factors": {
+            "cpu": node.factors.cpu,
+            "memory": node.factors.memory,
+            "disk": node.factors.disk,
+            "system": node.factors.system,
+            "mesh": node.factors.mesh,
+            "devices": node.factors.devices,
+        },
+    })
+}
+
+fn support_condition_value(condition: &HealthCondition) -> serde_json::Value {
+    let scope = match &condition.scope {
+        HealthScope::Node { node } => serde_json::json!({
+            "scope": "node",
+            "node": redact_support_text(node),
+        }),
+        HealthScope::Mesh => serde_json::json!({ "scope": "mesh" }),
+    };
+    let facts = condition
+        .evidence
+        .facts
+        .iter()
+        .filter(|(key, _)| !credential_shaped(key))
+        .take(SUPPORT_BUNDLE_MAX_FACTS)
+        .map(|(key, value)| (redact_support_text(key), redact_support_text(value)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    serde_json::json!({
+        "id": redact_support_text(&condition.id),
+        "scope": scope,
+        "component": format!("{:?}", condition.component).to_ascii_lowercase(),
+        "source": redact_support_text(&condition.source),
+        "severity": format!("{:?}", condition.severity).to_ascii_lowercase(),
+        "requirement": format!("{:?}", condition.requirement).to_ascii_lowercase(),
+        "evidence": {
+            "provider": redact_support_text(&condition.evidence.provider),
+            "summary": redact_support_text(&condition.evidence.summary),
+            "facts": facts,
+            "observed_at_ms": condition.evidence.observed_at_ms,
+        },
+        "active_since_ms": condition.active_since_ms,
+        "last_observed_ms": condition.last_observed_ms,
+        "resolved_at_ms": condition.resolved_at_ms,
+        "acknowledged_at_ms": condition.acknowledged_at_ms,
+        "snoozed_until_ms": condition.snoozed_until_ms,
+    })
+}
+
+fn redact_support_text(value: &str) -> String {
+    if credential_shaped(value) || unsafe_path_shaped(value) {
+        "[redacted]".into()
+    } else {
+        bound_support_text(value)
+    }
+}
+
+fn credential_shaped(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let normalized: String = lower
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    [
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "password",
+        "privatekey",
+        "secret",
+        "token",
+        "-----begin",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn unsafe_path_shaped(value: &str) -> bool {
+    value.contains("../")
+        || value.contains("..\\")
+        || value.contains("file://")
+        || value.split_ascii_whitespace().any(|part| {
+            part.starts_with('/')
+                || part.starts_with('\\')
+                || part.as_bytes().get(1) == Some(&b':')
+                    && part
+                        .as_bytes()
+                        .get(2)
+                        .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+        })
+}
+
+fn bound_support_text(value: &str) -> String {
+    if value.len() <= SUPPORT_BUNDLE_MAX_TEXT_BYTES {
+        return value.to_string();
+    }
+    let mut bounded = String::with_capacity(SUPPORT_BUNDLE_MAX_TEXT_BYTES);
+    for character in value.chars() {
+        if bounded.len().saturating_add(character.len_utf8()) > SUPPORT_BUNDLE_MAX_TEXT_BYTES - 3 {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded.push_str("...");
+    bounded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1132,6 +1698,10 @@ mod tests {
         let text = painted_text(&output.shapes).join(" | ");
         assert!(text.contains("System and Mesh Health"), "{text}");
         assert!(text.contains("0 active issues"), "{text}");
+        assert!(
+            text.contains("Export redacted support bundle"),
+            "the current snapshot exposes its support action: {text}"
+        );
 
         let _ = render_frame(
             &ctx,
@@ -1587,6 +2157,240 @@ mod tests {
         apply_action_outcome(&ctx, &mut chrome, true, published);
         assert_eq!(chrome.health_pending_action, None);
         assert_eq!(action_error(&ctx), None);
+    }
+
+    #[test]
+    fn support_bundle_is_deterministic_byte_bounded_and_redacts_hostile_material() {
+        let mut snapshot = fixture_snapshot(true, true);
+        snapshot.observer = "Authorization: Bearer observer-secret".into();
+        snapshot.roster_revision = "/etc/shadow".into();
+        snapshot.current_node_grades.clear();
+        snapshot.active_conditions.clear();
+        snapshot.resolved_conditions.clear();
+        for index in 0..256 {
+            let node = format!("../../unsafe-node-{index}-{}", "n".repeat(512));
+            snapshot.current_node_grades.push(NodeGrade::evaluate(
+                node.clone(),
+                90,
+                GradeFactors::default(),
+                &[],
+                snapshot.generated_at_ms,
+            ));
+            let mut active = condition(
+                &format!("condition-{index}-{}", "i".repeat(512)),
+                &node,
+                HealthSeverity::Warning,
+                HealthComponent::System,
+            );
+            active.source = r"C:\Users\operator\private.txt".into();
+            active.evidence.provider = "password=hunter2".into();
+            active.evidence.summary = format!("token=top-secret-{index}-{}", "s".repeat(512));
+            active.evidence.facts = BTreeMap::from([
+                ("api_token".into(), "fact-secret".into()),
+                ("safe".into(), "private_key=key-secret".into()),
+                ("location".into(), "../../escape".into()),
+                ("bounded".into(), "v".repeat(1_024)),
+            ]);
+            snapshot.active_conditions.push(active.clone());
+            active.resolved_at_ms = Some(snapshot.generated_at_ms.saturating_sub(index as u64));
+            snapshot.resolved_conditions.push(active);
+        }
+
+        let encoded = support_bundle_json(&snapshot).expect("hostile snapshot remains exportable");
+        assert_eq!(
+            encoded,
+            support_bundle_json(&snapshot).expect("same snapshot encodes identically"),
+            "the bundle is deterministic"
+        );
+        assert!(encoded.len() <= SUPPORT_BUNDLE_MAX_BYTES);
+        let text = String::from_utf8(encoded.clone()).expect("JSON is UTF-8");
+        for forbidden in [
+            "observer-secret",
+            "hunter2",
+            "top-secret",
+            "fact-secret",
+            "key-secret",
+            "/etc/shadow",
+            "C:\\Users",
+            "../../",
+        ] {
+            assert!(!text.contains(forbidden), "leaked {forbidden:?}: {text}");
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&encoded).expect("valid JSON");
+        assert_eq!(parsed["schema"], SUPPORT_BUNDLE_SCHEMA);
+        assert_eq!(parsed["generated_at_ms"], snapshot.generated_at_ms);
+        assert!(parsed["nodes"].as_array().expect("nodes array").len() <= SUPPORT_BUNDLE_MAX_NODES);
+        assert!(
+            parsed["active_conditions"]
+                .as_array()
+                .expect("active array")
+                .len()
+                <= SUPPORT_BUNDLE_MAX_ACTIVE
+        );
+        assert!(
+            parsed["resolved_history"]
+                .as_array()
+                .expect("resolved array")
+                .len()
+                <= SUPPORT_BUNDLE_MAX_RESOLVED
+        );
+        assert_eq!(parsed["snapshot"]["observer"], "[redacted]");
+        assert_eq!(parsed["snapshot"]["roster_revision"], "[redacted]");
+    }
+
+    #[test]
+    fn support_bundle_writer_rejects_escape_and_filename_is_sanitized() {
+        let root = tempfile::tempdir().expect("support export fixture");
+        let directory = root.path().join("exports");
+        let outside = root.path().join("escaped.json");
+        let error = write_support_bundle(&directory, "../../escaped.json", b"{}")
+            .expect_err("traversal is rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!outside.exists());
+
+        let safe = sanitize_support_filename("../../host/health?.json");
+        assert!(!safe.contains('/') && !safe.contains('\\'));
+        let written = write_support_bundle(&directory, &safe, b"{}")
+            .expect("sanitized filename remains writable");
+        assert_eq!(written.parent(), Some(directory.as_path()));
+        assert!(written.starts_with(&directory));
+    }
+
+    #[test]
+    fn support_bundle_rejects_symlinked_directory_and_destination() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("support export fixture");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside fixture directory");
+        let linked_directory = root.path().join("linked-export");
+        symlink(&outside, &linked_directory).expect("preplant export-directory symlink");
+        let error = write_support_bundle(&linked_directory, "bundle.json", b"{}")
+            .expect_err("symlinked export directory is rejected");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(code) if code == rustix::io::Errno::LOOP.raw_os_error()
+                    || code == rustix::io::Errno::NOTDIR.raw_os_error()
+            ),
+            "unexpected symlink rejection: {error}"
+        );
+        assert!(!outside.join("bundle.json").exists());
+
+        let directory = root.path().join("real-export");
+        std::fs::create_dir(&directory).expect("real export directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("make export directory private");
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"untouched").expect("victim fixture");
+        symlink(&victim, directory.join("bundle.json")).expect("preplant destination symlink");
+        let error = write_support_bundle(&directory, "bundle.json", b"replacement")
+            .expect_err("symlinked destination is rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"untouched");
+    }
+
+    #[test]
+    fn support_bundle_exclusive_temp_collision_is_not_followed_or_removed() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("support export fixture");
+        let directory = root.path().join("exports");
+        std::fs::create_dir(&directory).expect("export fixture directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("make export directory private");
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"untouched").expect("victim fixture");
+        let nonce = [0xabu8; 16];
+        let temporary = directory.join(format!(
+            ".health-support-{}.tmp",
+            nonce
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+        symlink(&victim, &temporary).expect("preplant temporary symlink");
+
+        let error =
+            write_support_bundle_with_nonce(&directory, "bundle.json", b"replacement", nonce)
+                .expect_err("exclusive temporary collision is rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"untouched");
+        assert!(
+            std::fs::symlink_metadata(&temporary)
+                .expect("hostile temporary remains owned by its creator")
+                .file_type()
+                .is_symlink(),
+            "a failed create must not unlink an entry it did not create"
+        );
+        assert!(!directory.join("bundle.json").exists());
+    }
+
+    #[test]
+    fn support_bundle_export_writes_atomic_round_trip_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("support export fixture");
+        let directory = root.path().join("exports");
+        let snapshot = fixture_snapshot(true, true);
+        let path = export_support_bundle_to(&directory, &snapshot).expect("real export succeeds");
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(support_bundle_filename(&snapshot).as_str())
+        );
+        let encoded = std::fs::read(&path).expect("read completed export");
+        let parsed: serde_json::Value = serde_json::from_slice(&encoded).expect("round-trip JSON");
+        assert_eq!(parsed["schema"], SUPPORT_BUNDLE_SCHEMA);
+        assert_eq!(parsed["snapshot"]["generation"], snapshot.generation);
+        assert_eq!(parsed["mesh_summary"]["canonical_nodes"], 5);
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("read export directory")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".health-support-")),
+            "successful persistence leaves no temporary sibling"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("export metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "durable bundle remains private to its user"
+        );
+        std::fs::File::open(&path)
+            .expect("reopen durable bundle")
+            .sync_all()
+            .expect("completed bundle supports a persistence barrier");
+        std::fs::File::open(&directory)
+            .expect("reopen durable parent")
+            .sync_all()
+            .expect("parent directory supports a persistence barrier");
+    }
+
+    #[test]
+    fn support_bundle_write_failure_is_preserved_in_modal_state() {
+        let root = tempfile::tempdir().expect("support export fixture");
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block directory creation").expect("write blocker");
+        let snapshot = fixture_snapshot(false, true);
+        let failed = export_support_bundle_to(&blocker.join("exports"), &snapshot);
+        assert!(failed.is_err(), "the hostile write must fail");
+
+        let ctx = egui::Context::default();
+        apply_support_export_result(&ctx, failed);
+        let Some(SupportExportOutcome::Failed(message)) = support_export_outcome(&ctx) else {
+            panic!("the modal must preserve an honest export failure")
+        };
+        assert!(!message.is_empty());
+        assert!(message.len() <= SUPPORT_BUNDLE_MAX_TEXT_BYTES);
     }
 
     #[test]

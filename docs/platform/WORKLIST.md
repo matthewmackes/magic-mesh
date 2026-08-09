@@ -1988,6 +1988,11 @@ behavioral evidence is not completion.
   replies across store, Bus, or restart faults. Machine 193 passed five focused
   durability/security fixtures:
   `docs/platform/evidence/WL-UX-013-2026-08-09-health-result-durability-r10.md`.
+- **Support-export checkpoint (2026-08-09):** the modal now writes one explicit,
+  bounded/redacted support bundle through a private no-follow path and a synced
+  atomic transaction, with honest failures and bounded top-N materialization.
+  Machine 196 and BigBoy passed eight exact security/UI checks:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-health-support-export-r11.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.
