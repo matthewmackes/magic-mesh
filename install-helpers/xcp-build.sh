@@ -69,11 +69,36 @@ TOFU_DIR="${MCNF_TOFU_DIR:-$REPO/infra/tofu}"
 REMOTE_DIR="${MCNF_BUILD_DIR:-magic-mesh-farm}${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"
 ARTIFACTS="${MCNF_BUILD_ARTIFACTS:-$HOME/mcnf-release-artifacts}"
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
+MIN_SYNC_FREE_KIB="${MCNF_BUILD_MIN_SYNC_FREE_KIB:-8388608}"
 
 log()  { echo "==> xcp-build: $*"; }
 warn() { echo "==> xcp-build: $*" >&2; }
 
+assert_sync_space() {
+  local free_kib
+  case "$MIN_SYNC_FREE_KIB" in
+    ''|*[!0-9]*)
+      warn "MCNF_BUILD_MIN_SYNC_FREE_KIB must be a non-negative integer (got '$MIN_SYNC_FREE_KIB')"
+      return 2
+      ;;
+  esac
+  free_kib="$("${SSH[@]}" "$DEST" 'df -Pk "$HOME" | awk "NR == 2 { print \$4 }"')"
+  case "$free_kib" in
+    ''|*[!0-9]*)
+      warn "refusing sync: $BUILD_HOST did not report bounded free-space data"
+      return 2
+      ;;
+  esac
+  if [ "$free_kib" -lt "$MIN_SYNC_FREE_KIB" ]; then
+    warn "refusing sync to $BUILD_HOST: /home has ${free_kib} KiB free; ${MIN_SYNC_FREE_KIB} KiB required"
+    warn "remove only abandoned magic-mesh-farm slots or select another farm host"
+    return 1
+  fi
+  log "remote sync capacity: ${free_kib} KiB free (minimum ${MIN_SYNC_FREE_KIB})"
+}
+
 do_sync() {
+  assert_sync_space
   log "rsync working tree → $DEST:$REMOTE_DIR (excluding target*/)"
   # Exclude /.git entirely: farm builds need source files, not git history, and
   # syncing a worktree's .git-file (a broken gitdir pointer) or colliding with a

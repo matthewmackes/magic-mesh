@@ -1455,6 +1455,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-CRIT-006-2026-08-08-farm-xen196-r1.md`.
 - **Artifact claim checkpoint (2026-08-09):** one capture cannot satisfy independent node/scenario claims; `.90` passed 2 positive and 18 negative fixtures:
   `docs/platform/evidence/WL-CRIT-006-2026-08-09-six-node-artifact-claim-r2.md`.
+- **Farm capacity checkpoint (2026-08-09):** sync refuses below the bounded remote `/home` reserve before creating a partial slot; machine 196 passed refusal/success:
+  `docs/platform/evidence/WL-CRIT-006-2026-08-09-farm-sync-capacity-r3.md`.
 - Remaining work:
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.

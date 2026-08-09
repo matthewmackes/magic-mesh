@@ -176,6 +176,10 @@ created, then rerun the heavy job on BigBoy. Do not keep duplicate cold
 small-node filters running after an equivalent warmed BigBoy slot has already
 covered the assertion; cancel or clean the duplicate slot so the farm stays
 usable for the next gate.
+`xcp-build.sh` now refuses before rsync when remote `/home` has less than
+8 GiB free. `MCNF_BUILD_MIN_SYNC_FREE_KIB` may raise that bound for a known
+large job; lowering it makes the caller explicitly own the resulting capacity
+risk. The refusal never deletes a slot automatically.
 As of the 2026-07-15 Browser tab-polish pass, `.90` and `.170` both reported
 `/home` at 100% before compilation during fresh-slot rsync, largely due to the
 shared `~/magic-mesh-farm` plus stale heavy slots. Check `df -h /home` before
