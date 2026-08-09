@@ -390,12 +390,12 @@ impl NavigationWorker {
             return;
         }
         let authority = self.authority.as_mut().expect("authority loaded");
-        if let NavigationPhase::Active { progress, .. } = &mut authority.snapshot.phase {
-            *progress = request.progress;
-        }
         let Some(generation) = authority.snapshot.generation.checked_add(1) else {
             return;
         };
+        if let NavigationPhase::Active { progress, .. } = &mut authority.snapshot.phase {
+            *progress = request.progress;
+        }
         authority.snapshot.generation = generation;
         authority.snapshot.produced_at_ms = now_ms;
         authority.remember(request.request_id);
@@ -742,6 +742,53 @@ mod tests {
             fixture.worker.authority.as_ref().unwrap().snapshot.phase,
             NavigationPhase::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn exhausted_generation_preserves_last_good_progress_atomically() {
+        let mut fixture = Fixture::new(Arc::new(FixtureProvider));
+        fixture.publish(
+            &navigation_route_action_topic("seat-1"),
+            &request(0, "req-1"),
+        );
+        fixture.worker.tick_once().unwrap();
+        let active = fixture.worker.authority.as_ref().unwrap().snapshot.clone();
+        let (route, mut progress) = match &active.phase {
+            NavigationPhase::Active { route, progress } => (route.clone(), progress.clone()),
+            phase => panic!("unexpected {phase:?}"),
+        };
+        fixture
+            .worker
+            .authority
+            .as_mut()
+            .unwrap()
+            .snapshot
+            .generation = u64::MAX;
+        let exhausted = fixture.worker.authority.as_ref().unwrap().snapshot.clone();
+        progress.position = GeoPoint {
+            latitude: 40.05,
+            longitude: -75.05,
+        };
+        progress.distance_remaining_metres = 500;
+        progress.duration_remaining_seconds = 60;
+        fixture.publish(
+            &navigation_progress_action_topic("seat-1"),
+            &NavigationProgressRequest {
+                schema_version: 1,
+                request_id: "progress-generation-exhausted".into(),
+                host: "seat-1".into(),
+                expected_generation: u64::MAX,
+                issued_at_ms: NOW,
+                route_id: route.route_id.clone(),
+                progress,
+            },
+        );
+        fixture.worker.tick_once().unwrap();
+        assert_eq!(
+            fixture.worker.authority.as_ref().unwrap().snapshot,
+            exhausted,
+            "generation exhaustion partially mutated progress"
+        );
     }
 
     #[test]

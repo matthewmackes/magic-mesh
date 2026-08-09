@@ -378,6 +378,59 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_guest_cannot_refresh_existing_app_vm_desired_state() {
+        let tmp = tempdir().unwrap();
+        let bus = tempdir().unwrap();
+        admit_app_image(tmp.path());
+        let mut initial = body("eagle", "writer");
+        initial.resume = false;
+        let first =
+            build_reply_with_runtime_bus(tmp.path(), Some(bus.path()), "app-provision", &initial);
+        assert!(first.ok, "initial declaration failed: {:?}", first.error);
+        let desired_path = reconcile::desired_doc_path(tmp.path(), "eagle", "writer").unwrap();
+        let before = std::fs::read(&desired_path).unwrap();
+
+        let evidence = mackes_mesh_types::vdi_session::AppVmRuntimeEvidence {
+            session_id: "app-session-7".to_owned(),
+            vm_id: "writer".to_owned(),
+            app_id: "org.example.Writer".to_owned(),
+            generation: 7,
+            state: mackes_mesh_types::vdi_session::AppVmRuntimeState::Unavailable,
+            reason: Some("guest transport unavailable".to_owned()),
+        };
+        mde_bus::persist::Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .write(
+                mackes_mesh_types::vdi_session::APP_VM_RUNTIME_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&evidence).unwrap()),
+            )
+            .unwrap();
+
+        let mut hostile_resume = initial;
+        hostile_resume.resume = true;
+        hostile_resume.catalog_revision = Some("catalog-8".to_owned());
+        let replay = build_reply_with_runtime_bus(
+            tmp.path(),
+            Some(bus.path()),
+            "app-provision",
+            &hostile_resume,
+        );
+
+        assert!(!replay.ok, "unavailable guest was admitted for resume");
+        assert!(replay
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Unavailable")));
+        assert_eq!(
+            std::fs::read(desired_path).unwrap(),
+            before,
+            "rejected unavailable evidence mutated Workloads desired state"
+        );
+    }
+
+    #[test]
     fn stale_session_replay_is_rejected_without_overwriting_the_admitted_session() {
         let tmp = tempdir().unwrap();
         admit_app_image(tmp.path());

@@ -109,7 +109,17 @@ impl AppVmRuntimeAdmission {
     }
 
     pub(super) fn is_usable(&self) -> bool {
-        matches!(self, Self::Observed { .. })
+        matches!(
+            self,
+            Self::Observed {
+                state: AppVmRuntimeState::Installing
+                    | AppVmRuntimeState::StartingApp
+                    | AppVmRuntimeState::Connected
+                    | AppVmRuntimeState::Paused
+                    | AppVmRuntimeState::Reconnecting,
+                ..
+            }
+        )
     }
 }
 
@@ -704,5 +714,35 @@ mod tests {
             ),
             AppVmRuntimeAdmission::Terminal(_)
         ));
+    }
+
+    #[test]
+    fn unavailable_runtime_evidence_cannot_admit_resume() {
+        let root = tempdir().unwrap();
+        let message = publish_runtime(
+            root.path(),
+            "session-1",
+            "org.example.Writer",
+            4,
+            AppVmRuntimeState::Unavailable,
+            Some("guest transport unavailable"),
+        );
+        let admission = check_runtime_evidence(
+            Some(root.path()),
+            &runtime_request("session-1", "org.example.Writer"),
+            message.ts_unix_ms,
+        );
+
+        assert_eq!(
+            admission,
+            AppVmRuntimeAdmission::Observed {
+                state: AppVmRuntimeState::Unavailable,
+                generation: 4,
+            }
+        );
+        assert!(
+            !admission.is_usable(),
+            "an explicit guest-unavailable observation must not become launch readiness"
+        );
     }
 }

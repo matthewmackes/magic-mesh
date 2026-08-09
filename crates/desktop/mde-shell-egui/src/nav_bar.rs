@@ -1874,10 +1874,13 @@ fn nav_bar_tooltip(ui: &mut egui::Ui, text: &str) {
 
 fn control_id(mode: DockMode, control: Control) -> egui::Id {
     match (control.source_index, control.surface) {
+        // Session and pinned-desktop indices come from independent projections.
+        // Include the control kind so index zero in each projection cannot
+        // alias egui's interaction, focus, or accessibility state.
         (Some(index), _) => egui::Id::new((
             "construct-navigation-bar",
             mode.id_suffix(),
-            "pinned",
+            control.kind.id_suffix(),
             index,
         )),
         (None, Some(surface)) => egui::Id::new((
@@ -2861,6 +2864,51 @@ mod tests {
             control_action(control, &[], &sessions),
             Action::RemoteSession("s2".to_owned())
         );
+    }
+
+    #[test]
+    fn session_and_pinned_desktop_controls_have_disjoint_identity_and_hit_regions() {
+        let sessions = [SessionRailEntry::with_session_id(
+            "session-0",
+            "Oak desktop",
+            "LIVE",
+        )];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+
+        for (mode, geometry) in [
+            (
+                DockMode::Floating,
+                floating_geometry_for_catalog_with_sessions(screen, 1, &[], &sessions),
+            ),
+            (
+                DockMode::Docked,
+                docked_geometry_for_catalog_with_sessions(screen, 1, &[], &sessions),
+            ),
+        ] {
+            let session = geometry
+                .controls
+                .iter()
+                .find(|control| control.kind == ControlKind::RemoteSession)
+                .copied()
+                .expect("connected session target");
+            let pinned = geometry
+                .controls
+                .iter()
+                .find(|control| control.kind == ControlKind::PinnedDesktop)
+                .copied()
+                .expect("pinned desktop target");
+
+            assert_eq!(session.source_index, pinned.source_index);
+            assert_ne!(
+                control_id(mode, session),
+                control_id(mode, pinned),
+                "independent projections must not alias egui state in {mode:?} placement"
+            );
+            assert!(
+                !session.rect.intersects(pinned.rect),
+                "session and pinned desktop hit regions must be disjoint in {mode:?} placement"
+            );
+        }
     }
 
     #[test]

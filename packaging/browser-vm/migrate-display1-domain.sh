@@ -16,8 +16,8 @@ readonly SHUTDOWN_TIMEOUT_SECONDS=120
 usage() {
   cat >&2 <<'EOF'
 usage:
-  migrate-display1-domain.sh inspect --target HOST [--user USER] [--identity PATH] [--domain browser-vm]
-  migrate-display1-domain.sh apply --target HOST [--user USER] [--identity PATH] [--domain browser-vm]
+  migrate-display1-domain.sh inspect --target HOST [--user USER] [--identity PATH]
+  migrate-display1-domain.sh apply --target HOST [--user USER] [--identity PATH]
   migrate-display1-domain.sh --self-test
 
 `apply` preserves every disk and only changes the inactive libvirt XML: it
@@ -32,7 +32,6 @@ EOF
 fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$1" >&2; exit 1; }
 valid_host() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$ ]]; }
 valid_user() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; }
-valid_domain() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; }
 
 ssh_args() {
   SSH_ARGS=(ssh -T -o BatchMode=yes -o PasswordAuthentication=no
@@ -191,12 +190,24 @@ try:
     command("/usr/bin/virsh", "--connect", "qemu:///system", "define", str(candidate))
 finally:
     candidate.unlink(missing_ok=True)
-_raw, verified = xml_root()
-if source_fingerprints(verified) != before_disks:
-    raise RuntimeError("post-define disk source check failed; original XML is retained in backup")
-dbus_ok, video_ok, dbus_count = display_state(verified)
-if not dbus_ok or not video_ok or dbus_count != 1:
-    raise RuntimeError("post-define Display1 verification failed; original XML is retained in backup")
+try:
+    _raw, verified = xml_root()
+    if source_fingerprints(verified) != before_disks:
+        raise RuntimeError("post-define disk source check failed")
+    dbus_ok, video_ok, dbus_count = display_state(verified)
+    if not dbus_ok or not video_ok or dbus_count != 1:
+        raise RuntimeError("post-define Display1 verification failed")
+except Exception as verification_error:
+    try:
+        command("/usr/bin/virsh", "--connect", "qemu:///system", "define", str(backup))
+    except Exception as rollback_error:
+        raise RuntimeError(
+            f"{verification_error}; restoring the original definition also failed: {rollback_error}; "
+            f"manual recovery XML is {backup}"
+        ) from rollback_error
+    raise RuntimeError(
+        f"{verification_error}; original definition restored from {backup}"
+    ) from verification_error
 print(json.dumps({"schema_version": 1, "domain": domain, "state": "shut off",
                   "disk_count": len(before_disks), "display1": True, "virtio_video": True,
                   "backup": str(backup), "next": "request-browser-vm-workload StartAndAttach"},
@@ -207,10 +218,8 @@ PY
 self_test() {
   valid_host 172.20.146.225
   valid_user mm
-  valid_domain browser-vm
   ! valid_host 'host;rm -rf /'
   ! valid_user 'bad user'
-  ! valid_domain 'browser vm'
   python3 - <<'PY'
 import xml.etree.ElementTree as ET
 xml = "<domain><devices><disk type='file' device='disk'><source file='/var/lib/mde-vms/browser.qcow2'/></disk><graphics type='spice'/><video><model type='qxl'/></video></devices></domain>"
@@ -243,7 +252,6 @@ while (($#)); do
     --target) (($# >= 2)) || { usage; exit 2; }; TARGET=$2; shift 2 ;;
     --user) (($# >= 2)) || { usage; exit 2; }; USER_NAME=$2; shift 2 ;;
     --identity) (($# >= 2)) || { usage; exit 2; }; IDENTITY=$2; shift 2 ;;
-    --domain) (($# >= 2)) || { usage; exit 2; }; DOMAIN_NAME=$2; shift 2 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
@@ -251,7 +259,6 @@ done
 [[ -n "$TARGET" ]] || fail target-required
 valid_host "$TARGET" || fail unsafe-target
 valid_user "$USER_NAME" || fail unsafe-user
-valid_domain "$DOMAIN_NAME" || fail unsafe-domain
 [[ -z "$IDENTITY" || ( -f "$IDENTITY" && ! -L "$IDENTITY" ) ]] || fail unsafe-identity
 ssh_args
 remote_run "$MODE"

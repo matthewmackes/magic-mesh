@@ -300,10 +300,11 @@ behavioral evidence is not completion.
   BigBoy probe passed. Evidence: `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`. Live legacy-profile import remains open.
 - **Portable-boundary checkpoint (2026-08-06):** allowlist/idempotency/symlink/secret validator passed local and `.50` probes:
   `docs/platform/evidence/WL-ARCH-008-2026-08-09-portable-manifest-identity-r2.md`.
+- **Display1 migration rollback checkpoint (2026-08-09):** fixed-target cutover restores exact original XML after failed validation; `.90` gates passed:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
 - **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
-- **Standalone publication checkpoint (2026-08-08):** GitHub `main` is `2b36cedb`; `.170` passed 123/123 worker tests, `.50` warning-denied clippy,
-  `.196` passed clean-clone boundary/package contracts, and Actions run `31277690513` passed admitted/sandbox/CEF/Servo jobs:
+- **Standalone publication checkpoint (2026-08-08):** GitHub `main` is `2b36cedb`; farm and Actions `31277690513` passed worker/clippy/boundary/package jobs:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
@@ -673,8 +674,7 @@ behavioral evidence is not completion.
 - Required outcome: Maps provides production offline maps, turn-by-turn navigation, and a map-first current/1-day/3-day/5-day weather experience. A live weather icon
   and temperature beside the clock deep-link into Maps. Car exposes typed route/vehicle/radio health; MG90 is bounded, reconnectable, multi-manager, and never presents
   fabricated position, weather, forecast, or link state.
-- Current state: typed weather/location, providers, offline cache, map-first UI, launcher, and daemon navigation authority exist.
-  Offline download/package, route provider/data, Maps route wiring, radio recovery, and complete live proof remain.
+- Current state: Typed weather/location providers, cache, UI, launcher, and navigation authority exist; offline data/routes, radio recovery, and live proof remain.
 - **Current/forecast provider (2026-08-08):** generation-bound 5/10-minute NWS refresh, provider freshness, bounded cache/retry, and off-runtime I/O passed 8/8 twice;
   live NWS/Maps proof remains: `docs/platform/evidence/WL-FUNC-017-2026-08-08-weather-provider-s3-r1.md`.
 - **Atmospheric provider (2026-08-08):** exact nowCOAST WMS identity, bounded PNG/cache, and latest-wins dual-generation viewport admission passed ten focused tests;
@@ -683,8 +683,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-2026-08-08-maps-weather-interface-s8-r1.md`.
 - **Clock weather launcher (2026-08-08):** typed icon/temperature deep-link and weather→battery→time geometry passed 5/5; installed live captures remain:
   `docs/platform/evidence/WL-FUNC-017-2026-08-08-clock-weather-launcher-s9-r1.md`.
-- **S6 navigation authority (2026-08-08):** typed route/progress/cancel, replay, restart, provider refusal, reachable spawn, and Maps consumer passed 9/9 across `.90`/BigBoy:
-  `docs/platform/evidence/WL-FUNC-017-2026-08-08-navigation-authority-s6-r1.md`.
+- **Navigation authority (2026-08-09):** route/progress/replay/restart passed 9/9; generation-exhaustion atomicity passed 4/4:
+  `docs/platform/evidence/WL-FUNC-017-2026-08-08-navigation-authority-s6-r1.md`; `docs/platform/evidence/WL-FUNC-017-2026-08-09-navigation-generation-atomicity-r2.md`.
 - Remaining work:
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
@@ -845,6 +845,8 @@ behavioral evidence is not completion.
 - **App VM profile checkpoint (2026-08-08):** the immutable Wayland/Flatpak contract, supervisor, readiness/provenance, and hostile fixtures passed on `.170`;
   a current built image/hash and live boot remain:
   `docs/platform/evidence/WL-FUNC-018-2026-08-08-app-vm-profile-s2-r1.md`.
+- **Runtime admission checkpoint (2026-08-09):** unavailable guest evidence cannot authorize resume or mutate desired state; `.90` passed 25/25:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-09-unavailable-runtime-admission-r2.md`.
 - Remaining work:
   1. S1 Freeze catalog and identity.
      - Objective: verify signed app metadata, origin, permissions, version, icon, and search ranking.
@@ -1735,6 +1737,8 @@ behavioral evidence is not completion.
 - Current state: placement and full-width geometry scaffolding exist; exact icon/action semantics, persistence, responsive behavior, and five-seat proof remain.
 - **Live battery (2026-08-08):** the primary UPower percentage/icon is immediately left of the clock in both placements; `.90` passed 24/24 focused status tests:
   `docs/platform/evidence/WL-UX-012-2026-08-08-live-battery-left-clock-r1.md`.
+- **Taskbar identity checkpoint (2026-08-09):** connected sessions and pinned desktops now have disjoint typed egui identities and hit regions; BigBoy passed 49/49:
+  `docs/platform/evidence/WL-UX-012-2026-08-09-taskbar-control-identity-r2.md`.
 - Remaining work:
   1. S1 Freeze geometry and placement.
      - Objective: implement 48px Bottom/Left geometry, safe areas, display ownership, and persisted placement defaults.
