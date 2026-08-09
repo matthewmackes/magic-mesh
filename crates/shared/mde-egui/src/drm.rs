@@ -836,6 +836,64 @@ fn refresh_drm_clipboard_offer(
     let _ = authority.apply_client_poll(client.poll_offer());
 }
 
+const DRM_CLIPBOARD_PASTE_TIMEOUT: Duration = Duration::from_secs(1);
+const DRM_CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn drm_clipboard_poll_delay(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    deadline.map(|deadline| {
+        deadline
+            .saturating_duration_since(now)
+            .min(DRM_CLIPBOARD_POLL_INTERVAL)
+    })
+}
+
+fn apply_drm_clipboard_owner(
+    authority: &mut crate::LocalClipboardAuthority,
+    client: &mut dyn crate::RichClipboardClient,
+    owner: Option<&str>,
+    paste_deadline: &mut Option<Instant>,
+) {
+    match owner {
+        Some(owner) => match authority.focus(owner) {
+            Ok(true) => {
+                // A paste request belongs to the surface that received Ctrl+V.
+                // Never deliver its later provider result into a newly focused app.
+                *paste_deadline = None;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                authority.lose_focus();
+                client.clear_offer();
+                *paste_deadline = None;
+            }
+        },
+        None => {
+            authority.lose_focus();
+            client.clear_offer();
+            *paste_deadline = None;
+        }
+    }
+}
+
+fn poll_pending_drm_clipboard_paste(
+    authority: &mut crate::LocalClipboardAuthority,
+    client: &mut dyn crate::RichClipboardClient,
+    paste_deadline: &mut Option<Instant>,
+    now: Instant,
+    events: &mut Vec<egui::Event>,
+) {
+    let Some(deadline) = *paste_deadline else {
+        return;
+    };
+    refresh_drm_clipboard_offer(authority, client);
+    if let Ok(text) = authority.select_text() {
+        events.push(egui::Event::Paste(text.to_owned()));
+        *paste_deadline = None;
+    } else if now >= deadline {
+        *paste_deadline = None;
+    }
+}
+
 fn push_drm_clipboard_shortcut(
     events: &mut Vec<egui::Event>,
     modifiers: egui::Modifiers,
@@ -1738,7 +1796,7 @@ pub fn run_drm_with_clipboard_and_display1(
     let mut alt = false;
     let mut clipboard_authority = crate::LocalClipboardAuthority::new();
     let _ = clipboard_authority.focus(app_id);
-    let mut clipboard_paste_pending = false;
+    let mut clipboard_paste_deadline = None;
 
     // SURFACE-8 (lock 13): the touchscreen shares this one input pipeline. The
     // translator maps libinput's normalized multitouch contacts through the active
@@ -1827,7 +1885,7 @@ pub fn run_drm_with_clipboard_and_display1(
         let until_touch = (touch_active > 0).then_some(GESTURE_TICK_INTERVAL);
         // A paste whose provider update is still on the shell worker gets a
         // short poll wake without forcing a rendered frame or spinning.
-        let until_clipboard = clipboard_paste_pending.then_some(Duration::from_millis(10));
+        let until_clipboard = drm_clipboard_poll_delay(clipboard_paste_deadline, now);
         // Display1 has no mde-bus wakeup and its local socket is deliberately
         // hidden behind the source trait. A bounded 60 Hz poll keeps native
         // frames flowing without allowing an attachment to spin the shell.
@@ -2037,7 +2095,11 @@ pub fn run_drm_with_clipboard_and_display1(
                     let modifiers = drm_modifiers(alt, ctrl, shift);
                     if let Some(key) = drm_key(code) {
                         if pressed && modifiers.command && key == egui::Key::V {
-                            clipboard_paste_pending = true;
+                            clipboard_paste_deadline = Some(
+                                Instant::now()
+                                    .checked_add(DRM_CLIPBOARD_PASTE_TIMEOUT)
+                                    .unwrap_or_else(Instant::now),
+                            );
                             refresh_drm_clipboard_offer(&mut clipboard_authority, clipboard);
                         }
                         if pressed
@@ -2049,7 +2111,7 @@ pub fn run_drm_with_clipboard_and_display1(
                             )
                         {
                             if key == egui::Key::V && clipboard_authority.select_text().is_ok() {
-                                clipboard_paste_pending = false;
+                                clipboard_paste_deadline = None;
                             }
                             continue;
                         }
@@ -2166,13 +2228,13 @@ pub fn run_drm_with_clipboard_and_display1(
 
         // Complete the original Ctrl+V asynchronously once the transport
         // worker has an admitted offer. No second key press is required.
-        if clipboard_paste_pending {
-            refresh_drm_clipboard_offer(&mut clipboard_authority, clipboard);
-            if let Ok(text) = clipboard_authority.select_text() {
-                events.push(egui::Event::Paste(text.to_owned()));
-                clipboard_paste_pending = false;
-            }
-        }
+        poll_pending_drm_clipboard_paste(
+            &mut clipboard_authority,
+            clipboard,
+            &mut clipboard_paste_deadline,
+            Instant::now(),
+            &mut events,
+        );
 
         // SURFACE-9 (lock 15): drain the shell's rotation commands (Config tab /
         // hotkey) — a lock freezes auto-rotate, a manual override forces + holds an
@@ -2261,15 +2323,12 @@ pub fn run_drm_with_clipboard_and_display1(
             paint_software_cursor(&layer, cur, ctx.output(|output| output.cursor_icon));
         });
         if let Some(owner) = crate::clipboard::take_drm_clipboard_owner(&egui_ctx) {
-            match owner {
-                Some(owner) => {
-                    let _ = clipboard_authority.focus(&owner);
-                }
-                None => {
-                    clipboard_authority.lose_focus();
-                    clipboard.clear_offer();
-                }
-            }
+            apply_drm_clipboard_owner(
+                &mut clipboard_authority,
+                clipboard,
+                owner.as_deref(),
+                &mut clipboard_paste_deadline,
+            );
         }
         // a11y-01: hand this frame's AccessKit tree to the consumer seam (a no-op unless
         // AccessKit is enabled). Done before `shapes` / `textures_delta` are consumed
@@ -3033,14 +3092,16 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_rgba, drm_clipboard_output_text, drm_modifiers, drm_screen_for_scale,
-        explicit_modifier, open_primary_node, poll_display1_or_cleanup,
-        probe_prime_import_liveness, push_drm_clipboard_shortcut, refresh_drm_clipboard_offer,
-        store_drm_clipboard_output, Display1FramePoll, Display1FrameSource, DrmError,
-        ExternalDmaBufFrame, ReimportedGemBuffer,
+        apply_drm_clipboard_owner, clear_rgba, drm_clipboard_output_text, drm_clipboard_poll_delay,
+        drm_modifiers, drm_screen_for_scale, explicit_modifier, open_primary_node,
+        poll_display1_or_cleanup, poll_pending_drm_clipboard_paste, probe_prime_import_liveness,
+        push_drm_clipboard_shortcut, refresh_drm_clipboard_offer, store_drm_clipboard_output,
+        Display1FramePoll, Display1FrameSource, DrmError, ExternalDmaBufFrame, ReimportedGemBuffer,
+        DRM_CLIPBOARD_PASTE_TIMEOUT, DRM_CLIPBOARD_POLL_INTERVAL,
     };
-    use crate::{LocalClipboardAuthority, MemoryRichClipboardClient};
+    use crate::{LocalClipboardAuthority, MemoryRichClipboardClient, RichClipboardClient};
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
+    use mde_collab_types::{ClipboardDenialReasonV2, ClipboardMimeKind, ClipboardMimeOfferV2};
     use std::cell::Cell;
     use std::time::Instant;
 
@@ -3220,6 +3281,75 @@ mod tests {
         assert_eq!(authority.select_text(), Ok("remote text"));
         refresh_drm_clipboard_offer(&mut authority, &mut client);
         assert_eq!(authority.select_text(), Ok("remote text"));
+    }
+
+    #[test]
+    fn drm_clipboard_app_switch_cancels_inflight_paste_and_revokes_local_generation() {
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        authority
+            .replace(vec![
+                ClipboardMimeOfferV2::inline_text(ClipboardMimeKind::TextHtml, "<b>draft</b>")
+                    .expect("html offer"),
+                crate::clipboard::text_offer("draft").expect("plain offer"),
+            ])
+            .expect("rich offer");
+        let stale = authority
+            .selection(ClipboardMimeKind::TextHtml)
+            .expect("selection");
+        client.publish_offer(authority.current().expect("current offer"));
+        let mut paste_deadline = Some(Instant::now() + DRM_CLIPBOARD_PASTE_TIMEOUT);
+
+        apply_drm_clipboard_owner(
+            &mut authority,
+            &mut client,
+            Some("files"),
+            &mut paste_deadline,
+        );
+
+        assert!(paste_deadline.is_none());
+        assert!(authority.current().is_none());
+        assert_eq!(
+            authority.select(&stale),
+            Err(ClipboardDenialReasonV2::Stale)
+        );
+        assert_eq!(
+            client
+                .published()
+                .expect("global provider retains the explicit-copy offer")
+                .offers()
+                .iter()
+                .map(|offer| offer.mime)
+                .collect::<Vec<_>>(),
+            vec![ClipboardMimeKind::TextHtml, ClipboardMimeKind::TextPlain]
+        );
+    }
+
+    #[test]
+    fn drm_clipboard_unavailable_paste_expires_without_an_event_or_poll_spin() {
+        let mut client = MemoryRichClipboardClient::default();
+        let mut authority = LocalClipboardAuthority::new();
+        authority.focus("editor").expect("focus editor");
+        let now = Instant::now();
+        let mut paste_deadline = Some(now);
+        let mut events = Vec::new();
+
+        poll_pending_drm_clipboard_paste(
+            &mut authority,
+            &mut client,
+            &mut paste_deadline,
+            now,
+            &mut events,
+        );
+
+        assert!(paste_deadline.is_none());
+        assert!(events.is_empty());
+        assert_eq!(drm_clipboard_poll_delay(None, now), None);
+        assert_eq!(
+            drm_clipboard_poll_delay(Some(now + DRM_CLIPBOARD_PASTE_TIMEOUT), now),
+            Some(DRM_CLIPBOARD_POLL_INTERVAL)
+        );
     }
 
     #[test]
