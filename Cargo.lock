@@ -4240,13 +4240,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mackes-xcp"
-version = "12.1.6"
-dependencies = [
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "mackesd"
 version = "12.1.6"
 dependencies = [
@@ -4266,7 +4259,6 @@ dependencies = [
  "mackes-mesh-types",
  "mackes-nebula-https-tunnel",
  "mackes-transport",
- "mackes-xcp",
  "magic-fleet",
  "md5",
  "mde-bookmarks",

@@ -1,3 +1,12 @@
+# HISTORICAL / SUPERSEDED — XCP-ng VM provisioning
+
+The production VM lifecycle described below was retired by the Construct Cloud
+Workloads cutover. External XCP-ng hosts remain farm infrastructure or optional
+day-2 adopted inventory; they are not a platform VM lifecycle, capacity, or
+identity authority. Typed Workload operations through libvirt/virtqemud are the
+current production contract. This document is retained only as historical
+context for the still-used farm/onboarding helpers.
+
 # XCP-ng Integration — provision MDE-VMs + XCP hosts join the mesh
 
 Status: **locked** (operator survey 2026-06-16). Owner epic prefix: `XCP`.

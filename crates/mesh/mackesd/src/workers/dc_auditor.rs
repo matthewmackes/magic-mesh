@@ -2,8 +2,8 @@
 //!
 //! The companion to [`super::datacenter_orchestrator`]: where the orchestrator
 //! *publishes* datacenter state, this worker is a **read-only audit subscriber**.
-//! It watches the Bus action lanes (`action/dc/*` — VM power, droplet lifecycle,
-//! gateway changes, …) and emits one append-only audit record per request to
+//! It watches the registered Bus action lanes (`action/dc/*` — host power,
+//! storage, gateway changes, …) and emits one append-only audit record per request to
 //! `event/dc/audit/<ulid>`, WITHOUT touching the action handlers themselves. The
 //! audit trail is therefore a pure side-observer: nothing the handlers do depends
 //! on it, and it can never wedge an action.
@@ -29,8 +29,21 @@ use super::{ShutdownToken, Worker};
 /// hammering the Bus index).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The Bus prefix the auditor watches — every datacenter action lane.
+/// The Bus prefix containing registered datacenter action lanes.
 pub const ACTION_DC_PREFIX: &str = "action/dc/";
+
+/// Admit only topics that still have a production responder. Retained rows for
+/// retired VM verbs must not become fresh audit projections after an upgrade.
+#[must_use]
+fn is_registered_action_topic(topic: &str) -> bool {
+    let Some(verb) = topic.strip_prefix(ACTION_DC_PREFIX) else {
+        return false;
+    };
+    crate::ipc::datacenter::ACTION_VERBS.contains(&verb)
+        || crate::ipc::dc_power::ACTION_VERBS.contains(&verb)
+        || crate::ipc::host_ops::ACTION_VERBS.contains(&verb)
+        || crate::ipc::tofu::ACTION_VERBS.contains(&verb)
+}
 
 /// Max characters of the request body carried into the audit record's
 /// `body_summary`. Keeps the audit lane compact; the full body stays on the
@@ -44,7 +57,7 @@ pub fn audit_topic(ulid: &str) -> String {
 }
 
 /// The audited action name for a Bus topic: strips the leading `action/` so
-/// `action/dc/vm-power` → `dc/vm-power`. Topics without the prefix pass through
+/// `action/dc/host-power` → `dc/host-power`. Topics without the prefix pass through
 /// unchanged.
 #[must_use]
 pub fn audit_action_name(topic: &str) -> String {
@@ -121,7 +134,7 @@ fn target_of(body: &str) -> String {
 /// action observed for the first time).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AuditRecord {
-    /// The audited action name (`dc/vm-power`, …) — the source topic minus
+    /// The audited action name (`dc/host-power`, …) — the source topic minus
     /// the `action/` prefix.
     pub action: String,
     /// The request message's ULID (also the audit topic's leaf).
@@ -267,7 +280,7 @@ fn publish_to(bus_root: Option<&std::path::Path>, rec: &AuditRecord) {
     }
 }
 
-/// One poll pass: enumerate every `action/dc/*` topic and feed each message
+/// One poll pass: enumerate registered `action/dc/*` topics and feed each message
 /// through the dedup core, publishing the records that survive (first-sight
 /// ulids). Best-effort: a failed `list_topics`/`list_since` is logged + skipped.
 fn poll_and_audit(persist: &Persist, core: &mut DcAuditor) {
@@ -278,7 +291,7 @@ fn poll_and_audit(persist: &Persist, core: &mut DcAuditor) {
             return;
         }
     };
-    for topic in topics.iter().filter(|t| t.starts_with(ACTION_DC_PREFIX)) {
+    for topic in topics.iter().filter(|t| is_registered_action_topic(t)) {
         let msgs = match persist.list_since(topic, None) {
             Ok(m) => m,
             Err(e) => {
@@ -384,6 +397,13 @@ mod tests {
     #[test]
     fn audit_topic_formats_under_event_dc_audit() {
         assert_eq!(audit_topic("01HZX5"), "event/dc/audit/01HZX5");
+    }
+
+    #[test]
+    fn retained_vm_topics_are_not_projected_as_audit_events() {
+        assert!(is_registered_action_topic("action/dc/host-power"));
+        assert!(!is_registered_action_topic("action/dc/vm-power"));
+        assert!(!is_registered_action_topic("action/dc/vm-delete"));
     }
 
     /// perf-10 / arch-6 — `publish_to` writes the audit record in-process (no

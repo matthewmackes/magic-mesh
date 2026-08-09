@@ -1,6 +1,6 @@
 //! PLANES-3 (W82–W85) — capability tags.
 //!
-//! Orthogonal to the §5 role (Lighthouse ⊂ Server ⊂ Workstation):
+//! Orthogonal to the §5 role (Lighthouse or Workstation):
 //! a node carries zero or more **gating** capability tags that any
 //! enrolled operator surface may set (W83) and that decide what duty
 //! the node accepts (W84 — tags GATE, they don't merely prefer):
@@ -11,11 +11,6 @@
 //!   self-targeted ones (the Controller plane).
 //! - `headless`   — GUI app-surface units are disabled here; the
 //!   agent runs fully.
-//! - `hypervisor` — an XCP-ng dom0 joined as a static-Nebula member
-//!   that advertises compute capacity (DATACENTER-17). Orthogonal to
-//!   the §5 role: a `hypervisor` pins the Server tier (`PeerRole` flattens
-//!   to Host/Peer, so it is surfaced as a capability tag, not a 4th cert
-//!   role) and the `xcp_host` worker self-gates on the dom0 marker.
 //!
 //! Stored per-target on the replicated volume at
 //! `<root>/node-tags/<hostname>.json` (any node writes any target's
@@ -38,9 +33,8 @@ pub enum CapabilityTag {
     Execution,
     /// GUI app-surface units are disabled; agent runs fully headless.
     Headless,
-    /// XCP-ng dom0 joined as a static-Nebula member advertising compute
-    /// capacity (DATACENTER-17). Pins the Server tier; the `xcp_host`
-    /// worker self-gates on the dom0 marker.
+    /// Retired XCP capacity marker retained solely for decoding historical tag
+    /// files; it is not offered or parsed by current surfaces.
     Hypervisor,
     /// Retired media marker retained solely for decoding historical tag files;
     /// it is not part of [`CapabilityTag::ALL`] and cannot be parsed by current
@@ -52,8 +46,8 @@ impl CapabilityTag {
     /// Every v1 capability tag, in wire order — the single source of truth
     /// any surface should iterate (the fleet `tags --json` census, profile
     /// validation, the Node-roles editor) instead of hand-maintaining a
-    /// parallel list that silently drops a tag (DATACENTER-17 added a 4th).
-    pub const ALL: [Self; 4] = [Self::Hop, Self::Execution, Self::Headless, Self::Hypervisor];
+    /// parallel list that silently drops a tag.
+    pub const ALL: [Self; 3] = [Self::Hop, Self::Execution, Self::Headless];
 
     /// Stable wire token.
     #[must_use]
@@ -75,7 +69,6 @@ impl CapabilityTag {
             "hop" => Some(Self::Hop),
             "execution" => Some(Self::Execution),
             "headless" => Some(Self::Headless),
-            "hypervisor" => Some(Self::Hypervisor),
             _ => None,
         }
     }
@@ -142,19 +135,10 @@ mod tests {
 
     #[test]
     fn vocabulary_round_trips_and_refuses_unknowns() {
-        for t in [
-            CapabilityTag::Hop,
-            CapabilityTag::Execution,
-            CapabilityTag::Headless,
-            CapabilityTag::Hypervisor,
-        ] {
+        for t in CapabilityTag::ALL {
             assert_eq!(CapabilityTag::parse(t.as_str()), Some(t));
         }
-        assert_eq!(
-            CapabilityTag::parse("hypervisor"),
-            Some(CapabilityTag::Hypervisor),
-            "DATACENTER-17 — XCP-ng dom0 is a first-class v1 tag"
-        );
+        assert_eq!(CapabilityTag::parse("hypervisor"), None);
         assert_eq!(CapabilityTag::parse("builder"), None, "deferred — not v1");
         assert_eq!(CapabilityTag::parse(""), None);
     }
@@ -167,7 +151,7 @@ mod tests {
         for t in CapabilityTag::ALL {
             assert_eq!(CapabilityTag::parse(t.as_str()), Some(t));
         }
-        assert!(CapabilityTag::ALL.contains(&CapabilityTag::Hypervisor));
+        assert!(!CapabilityTag::ALL.contains(&CapabilityTag::Hypervisor));
     }
 
     #[test]

@@ -121,6 +121,9 @@ behavioral evidence is not completion.
   discovery scope. ADR-0007 and a fail-closed authority guard bind runtime
   identity to typed Workloads; focused resolver and lint gates pass. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-compute-inventory-hard-cut-r6.md`.
+- **Datacenter/XCP hard cut (2026-08-09):** VM actions/roster, both XCP workers/
+  crate/topics, and Server/Hypervisor profiles were deleted; retained rows fail closed. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-datacenter-xcp-authority-hard-cut-r7.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and

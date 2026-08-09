@@ -1187,14 +1187,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
         RestartPolicy::OnFailure,
         WorkerGroup::Observation,
     ),
-    // XCP-6 — hypervisor-capacity advertiser, self-gates on the dom0 marker.
-    WorkerSpec::tier(
-        "xcp_host",
-        0,
-        RestartPolicy::OnFailure,
-        WorkerGroup::Observation,
-    )
-    .with_config(ConfigPredicate::RuntimeAvailable("xcp-dom0-marker")),
     // MV-2 — per-node KVM service health, universal virt stack.
     WorkerSpec::tier(
         "kvm_health",
@@ -1615,7 +1607,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     WorkerSpec::responder("voip_bus_responder", WorkerGroup::Actions),
     WorkerSpec::direct("voip_rtt", RestartPolicy::Always, WorkerGroup::Observation),
     WorkerSpec::responder("vpn_bus_responder", WorkerGroup::Actions),
-    WorkerSpec::direct("xcp_provision", RestartPolicy::Always, WorkerGroup::Compute),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -2940,7 +2931,7 @@ mod tests {
         // ARCH-5 (drift guard) +14 universal rank-0 workers that were riding the
         // silent "unknown worker ⇒ rank 0" default (spawned + `runs(...)`-gated but
         // uncensused → hidden from `mackesd role-workers`, the BUG-STORAGE-1 class):
-        // boot_readiness, xcp_host, kvm_health, scheduler, session_broker,
+        // boot_readiness, kvm_health, scheduler, session_broker,
         // session_roaming, clipboard_bridge,
         // service_onboard, spawn_lighthouse_onboard, onboard_apply, lighthouse_probe.
         // All rank 0 (behavior-preserving), so the split shifts 30/27 → 44/27,
@@ -2975,7 +2966,7 @@ mod tests {
         // and retiring the duplicate VM/container tiers plus the raw console
         // relay leaves 76 role-tiered
         // workers in the current registry.
-        assert_eq!(WORKER_REGISTRY.len(), 140);
+        assert_eq!(WORKER_REGISTRY.len(), 145);
         assert_eq!(
             WORKER_REGISTRY
                 .iter()
@@ -2984,7 +2975,7 @@ mod tests {
                     SpawnBinding::Tiered | SpawnBinding::DynamicSupervisor
                 ))
                 .count(),
-            76
+            82
         );
     }
 
@@ -3018,12 +3009,12 @@ mod tests {
         };
         assert_eq!(
             count(0),
-            45,
+            44,
             "Lighthouse control plane plus universal storage/service/notification/control workers, with retired VM/container lifecycle and raw console relay absent"
         );
         assert_eq!(
             count(1),
-            31,
+            38,
             "Workstation = fleet/actions + desktop data + seat input + media gateways + the WL-FUNC-012 provider adapters; all retired host Browser workers are absent after the Chromium VM cutover"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
@@ -3294,10 +3285,10 @@ mod tests {
         // gateway proxies brought the real pre-cutover count to 90; removing all
         // 11 host Browser workers for the Chromium VM cutover leaves 79
         // role-gated registrations. WL-ARCH-009 adds the 66 directly bound
-        // supervisor/responders to the same canonical diagnostic roster:
-        // Lighthouse 49 + 66 = 115; Workstation 79 + 66 = 145.
-        assert_eq!(lh.len(), 109);
-        assert_eq!(ws.len(), 140);
+        // supervisor/responders to the same canonical diagnostic roster. The
+        // retired XCP capacity and provisioning authorities are absent.
+        assert_eq!(lh.len(), 107);
+        assert_eq!(ws.len(), 145);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

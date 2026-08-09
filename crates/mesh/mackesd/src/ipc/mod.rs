@@ -32,7 +32,7 @@ pub mod apps;
 pub mod clipboard;
 // CONNECT-1 — action/connect/* exposure-policy responder.
 pub mod connect;
-// DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.
+// DATACENTER (action layer) — non-VM planning and storage responder.
 pub mod datacenter;
 // DATACENTER-12 (storage action layer) — action/dc/{sr,vdi}-* Xen storage control.
 // Pure command-builder + reply layer dispatched into by `datacenter::build_reply`

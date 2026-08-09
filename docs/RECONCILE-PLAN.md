@@ -1,3 +1,9 @@
+# HISTORICAL / SUPERSEDED — 11.2 branch reconciliation
+
+This document records a completed pre-Construct branch reconciliation. It is
+not an active worklist or architecture source; XCP lifecycle, LizardFS, and the
+three-role model referenced below are retired.
+
 # Reconciliation working spec (master → farm-autoscale-plan, → 11.2.0)
 
 > Auto-generated 2026-06-29 by the divergence-mapping workflow (8 subsystem agents + synthesis).

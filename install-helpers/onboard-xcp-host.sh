@@ -13,9 +13,9 @@
 #   3. install + start `nebula.service` on dom0,
 #   4. verify overlay reachability (dom0 ↔ a lighthouse over 10.42.x).
 #
-# This gets the XCP host onto the mesh as a reachable member (Server-tier intent).
-# Advertising its VMs as mesh compute (XAPI → the directory) is the follow-on
-# (XCP-6, the `mackes-xcp` agent) — out of scope here; this is the JOIN method.
+# This gets the XCP host onto the mesh as a reachable infrastructure endpoint.
+# It does not advertise a second VM roster or lifecycle authority; production
+# VM operations remain exclusively on the typed Workloads/libvirt path.
 #
 # Run from a box with SSH to BOTH the CA lighthouse and the target XCP host.
 #

@@ -62,9 +62,6 @@ mackes-nebula-https-tunnel = { path = "../mackes-nebula-https-tunnel" }
 # worker (KDC2-3). Implementations live elsewhere (mde-kdc,
 # mackes-https-tunnel, mackesd::transport::direct_udp).
 mackes-transport = { path = "../mackes-transport" }
-# XCP-6 — the xcp_host worker drives the dom0's local `xe` via this layer to
-# advertise hypervisor capacity into the compute plane.
-mackes-xcp = { path = "../mackes-xcp" }
 # arch-7 — the passphrase-sealed byte envelope (Argon2id + XChaCha20-Poly1305).
 # Extracted out of `ca::backup` so browser_passkeys / the VPN secret store / CA
 # disaster-recovery share ONE audited primitive; `ca::backup` + `ipc::secret_store`

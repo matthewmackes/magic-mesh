@@ -12,6 +12,8 @@ set -euo pipefail
 # The spawned production actuator is workload_compute, and its typed projection
 # is state/workloads/<node>. Raw console endpoint publication is retired.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+workspace_manifest="$repo_root/Cargo.toml"
+mackesd_manifest="$repo_root/crates/mesh/mackesd/Cargo.toml"
 shell_root="$repo_root/crates/desktop/mde-shell-egui/src"
 spawn_file="$repo_root/crates/mesh/mackesd/src/bin/mackesd/spawn.rs"
 workers_mod="$repo_root/crates/mesh/mackesd/src/workers/mod.rs"
@@ -22,12 +24,17 @@ service_descriptors="$repo_root/crates/mesh/mackesd/src/descriptors.rs"
 peer_contracts="$repo_root/crates/mesh/mackes-mesh-types/src/peers.rs"
 desktop_sources="$repo_root/crates/mesh/mackesd/src/workers/desktop_sources.rs"
 probe_nmap="$repo_root/crates/mesh/mackesd/src/probe_nmap.rs"
+datacenter="$repo_root/crates/mesh/mackesd/src/ipc/datacenter.rs"
+datacenter_orchestrator="$repo_root/crates/mesh/mackesd/src/workers/datacenter_orchestrator.rs"
 inventory="$repo_root/docs/platform/workload-authority-inventory.md"
 retired_console_worker="$repo_root/crates/mesh/mackesd/src/workers/console_broker.rs"
 retired_cloud_console="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs/console.rs"
 retired_attach_schema="$repo_root/packaging/browser-vm/browser-vm-transport-attach.schema.json"
 retired_attach_example="$repo_root/packaging/browser-vm/browser-vm-transport-attach.example.json"
 retired_attach_verifier="$repo_root/packaging/browser-vm/verify-transport-attach.sh"
+retired_xcp_provision="$repo_root/crates/mesh/mackesd/src/workers/xcp_provision.rs"
+retired_xcp_host="$repo_root/crates/mesh/mackesd/src/workers/xcp_host.rs"
+retired_xcp_crate="$repo_root/crates/mesh/mackes-xcp/Cargo.toml"
 live_mirror_verifier="$repo_root/install-helpers/verify-live-mirrors.py"
 
 scan_shell() {
@@ -192,6 +199,16 @@ EOF
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — retired compute inventory reader was not detected' >&2
     return 1
   fi
+  printf '%s\n' 'const RETIRED: &str = "action/dc/vm-power";' >"$fixture/datacenter.rs"
+  if ! production_contains_literal 'action/dc/vm-' "$fixture/datacenter.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — Datacenter VM action fixture was not detected' >&2
+    return 1
+  fi
+  printf '%s\n' 'let _ = Command::new("xe").args(["vm-list"]);' >"$fixture/orchestrator.rs"
+  if ! production_contains_literal '"vm-list"' "$fixture/orchestrator.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — Datacenter VM roster fixture was not detected' >&2
+    return 1
+  fi
   printf '%s\n' 'lint-workload-authority.sh: self-test passed — lifecycle and presentation guards are fail-closed'
 }
 
@@ -211,7 +228,8 @@ fi
 [ -f "$workers_mod" ] && [ -f "$cloud_verbs" ] && [ -f "$compute_migrate" ] \
   && [ -f "$workload_compute" ] && [ -f "$service_descriptors" ] \
   && [ -f "$peer_contracts" ] && [ -f "$desktop_sources" ] \
-  && [ -f "$probe_nmap" ] && [ -f "$inventory" ] || {
+  && [ -f "$probe_nmap" ] && [ -f "$datacenter" ] \
+  && [ -f "$datacenter_orchestrator" ] && [ -f "$inventory" ] || {
   printf '%s\n' 'lint-workload-authority.sh: authority inventory or daemon registration surfaces are missing' >&2
   exit 1
 }
@@ -249,12 +267,34 @@ for retired_file in \
   "$retired_cloud_console" \
   "$retired_attach_schema" \
   "$retired_attach_example" \
-  "$retired_attach_verifier"; do
+  "$retired_attach_verifier" \
+  "$retired_xcp_provision" \
+  "$retired_xcp_host" \
+  "$retired_xcp_crate"; do
   if [ -e "$retired_file" ]; then
     printf 'lint-workload-authority.sh: retired authority artifact is reachable: %s\n' "$retired_file" >&2
     exit 1
   fi
 done
+
+if contains_literal 'xcp_provision' "$spawn_file" \
+  || contains_literal 'xcp_host' "$spawn_file" \
+  || contains_literal 'action/provision/' "$spawn_file" \
+  || contains_literal 'pub mod xcp_provision' "$workers_mod" \
+  || contains_literal 'pub mod xcp_host' "$workers_mod" \
+  || contains_literal 'crates/mesh/mackes-xcp' "$workspace_manifest" \
+  || contains_literal 'mackes-xcp' "$mackesd_manifest" \
+  || production_contains_literal 'action/dc/vm-' "$datacenter" \
+  || production_contains_literal '"vm-list"' "$datacenter_orchestrator" \
+  || production_contains_literal 'DcResource::new("vm"' "$datacenter_orchestrator"; then
+  printf '%s\n' 'lint-workload-authority.sh: retired Datacenter/XCP VM authority is registered or sampled' >&2
+  exit 1
+fi
+
+if ! production_contains_literal 'if topic.starts_with("event/dc/vm/")' "$datacenter_orchestrator"; then
+  printf '%s\n' 'lint-workload-authority.sh: Datacenter projection no longer refuses retained VM topics' >&2
+  exit 1
+fi
 
 if has_retired_spawn "$spawn_file"; then
   printf '%s\n' 'lint-workload-authority.sh: retired VM/container actuator is still spawned' >&2

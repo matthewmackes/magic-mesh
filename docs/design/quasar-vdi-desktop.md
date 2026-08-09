@@ -144,7 +144,7 @@ adopted capacity, never an install-time role.
 | `mde-kvm` | Superseded local cloud-hypervisor broker; retained only until CONSTRUCT-CLOUD cutover deletes the replaced stack. |
 | `mde-panel-*` | The mesh-native panels (Workbench/Files/Music/Voice) as in-shell modules reusing today's non-GUI logic. |
 | `mackesd` *(extend)* | `session_broker` + `vm_lifecycle` workers; the `desktop-host` capability. |
-| Reuse | `mde-bus`, `mackes-xcp` + the DATACENTER VM verbs (remote lifecycle/console), `mackes-mesh-types`, Nebula/etcd/Syncthing substrate. |
+| Reuse | `mde-bus`, typed Workload operations and projections, `mackes-mesh-types`, Nebula/etcd/Syncthing substrate. |
 | Retire | the iced/libcosmic GUI crates and retired token-gate code; retain `mde-theme` only for licensed brand assets if needed. |
 
 ## Acceptance criteria (epic-level, runtime-observable per §7)

@@ -630,14 +630,6 @@ pub mod wol;
 // inside the binary in BUS-1.2/1.3/1.4.
 pub mod boot_readiness;
 pub mod bus_supervisor;
-// XCP-6 — on an XCP-ng dom0, advertise hypervisor capacity into the compute
-// plane (`compute/xcp-host/<node>`) so the mesh can place VMs on it.
-pub mod xcp_host;
-// XCP-3 — the A-plane provision flow: drains `action/provision/spawn`, then
-// clones MDE-VM-golden → attaches the fresh identity seed → starts → resolves
-// the IP over the mackes-xcp Hypervisor layer (the runtime caller of
-// set_identity_seed, so a provisioned VM actually gets its identity seed).
-pub mod xcp_provision;
 // KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes the
 // per-node KVM virtualization service catalog (`crate::kvm::KVM_SERVICES`,
 // `systemctl is-active` each) every 30 s and publishes a whole-host health

@@ -44,6 +44,8 @@ worklist. Repository paths are the durable owner identifiers.
 | Nova domain-name heuristic and Cloud-managed badge | typed backend and power dimensions in `WorkloadOperationStatus` | provider-specific detector, badge, and warning path were deleted from Datacenter |
 | Heartbeat `podman ps` / `virsh list` probes and `ServiceDescriptors::{containers,vms}` | local and replicated `state/workloads/<node>` projections | probe functions and peer fields were deleted; authority lint rejects their commands, fields, and desktop-source readers |
 | Replicated `compute-inventory.json` VM roster used as probe targets | enrolled peer identity bundles plus bounded LAN/operator targets | production resolver and legacy reader were deleted; authority lint rejects the retired file/symbol |
+| Datacenter `action/dc/vm-*` responders and `event/dc/vm/*` roster | typed Workload operations and `state/workloads/<node>` | VM verbs and XAPI VM sampling were deleted; retained VM topics are ignored and cannot be republished |
+| XCP `action/provision/*`, `compute/xcp-host/*`, `xcp_provision`, and `xcp_host` | typed Workload operations and backend-specific HostCapacity admission | both workers and the runtime `mackes-xcp` crate were deleted; authority lint rejects their files, modules, registrations, and topics |
 
 ## Known non-lifecycle runtime tools
 
@@ -58,7 +60,6 @@ not automatically lifecycle authorities. Each is classified by effect:
 - network discovery accepts overlay targets only from enrolled peer identity;
   stale retired compute inventories cannot inject VM addresses into scans;
 - storage/runtime-probe calls are read-only;
-- compute-provision creates host storage pools, not domains;
 - service supervisors operate their named host services, not Workload units;
 - `compute_migrate` retains the distributed cold-migration protocol and bounded
   `rsync` disk transfer, but has no libvirt adapter. Capture, shutdown,

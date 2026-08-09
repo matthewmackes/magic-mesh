@@ -27,7 +27,6 @@ members = [
     "crates/mesh/mackes-mesh-types",
     "crates/mesh/mackes-nebula-https-tunnel",
     "crates/mesh/mackes-transport",
-    "crates/mesh/mackes-xcp",
     "crates/mesh/mackesd",
     "crates/mesh/mde-seal",
     "crates/mesh/mde-worker-core",

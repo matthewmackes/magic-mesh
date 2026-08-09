@@ -30,8 +30,21 @@ use super::{ShutdownToken, Worker};
 /// Sweep cadence — 3 s (job status should trail the request/reply closely).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(3);
 
-/// The Bus prefix the tracker watches — every datacenter action lane.
+/// The Bus prefix containing registered datacenter action lanes.
 pub const ACTION_DC_PREFIX: &str = "action/dc/";
+
+/// Admit only topics that still have a production responder. Retained rows for
+/// retired VM verbs must not become fresh job projections after an upgrade.
+#[must_use]
+fn is_registered_action_topic(topic: &str) -> bool {
+    let Some(verb) = topic.strip_prefix(ACTION_DC_PREFIX) else {
+        return false;
+    };
+    crate::ipc::datacenter::ACTION_VERBS.contains(&verb)
+        || crate::ipc::dc_power::ACTION_VERBS.contains(&verb)
+        || crate::ipc::host_ops::ACTION_VERBS.contains(&verb)
+        || crate::ipc::tofu::ACTION_VERBS.contains(&verb)
+}
 
 /// Bus topic a job-status event for `ulid` is published to: `event/dc/job/<ulid>`.
 #[must_use]
@@ -60,7 +73,7 @@ pub fn classify_reply(reply_body: Option<&str>) -> &'static str {
 }
 
 /// The audited action name for a Bus topic: strips the leading `action/` so
-/// `action/dc/vm-power` → `dc/vm-power`. Topics without the prefix pass through
+/// `action/dc/host-power` → `dc/host-power`. Topics without the prefix pass through
 /// unchanged.
 #[must_use]
 fn job_action_name(topic: &str) -> String {
@@ -71,7 +84,7 @@ fn job_action_name(topic: &str) -> String {
 /// first sight, or a pending→ok/error transition).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JobRecord {
-    /// The action name (`dc/vm-power`, …) — the source topic minus `action/`.
+    /// The action name (`dc/host-power`, …) — the source topic minus `action/`.
     pub action: String,
     /// The request message's ULID (also the job topic's leaf).
     pub ulid: String,
@@ -171,7 +184,7 @@ fn reply_body(persist: &Persist, ulid: &str) -> Option<String> {
     msgs.into_iter().last().and_then(|m| m.body)
 }
 
-/// One poll pass: enumerate every `action/dc/*` topic, and for each request
+/// One poll pass: enumerate registered `action/dc/*` topics, and for each request
 /// message look up its `reply/<ulid>` and feed the pair through the dedup core,
 /// publishing the records that survive (status transitions). Best-effort: a
 /// failed `list_topics`/`list_since` is logged + skipped.
@@ -183,7 +196,7 @@ fn poll_and_track(persist: &Persist, core: &mut DcJobs) {
             return;
         }
     };
-    for topic in topics.iter().filter(|t| t.starts_with(ACTION_DC_PREFIX)) {
+    for topic in topics.iter().filter(|t| is_registered_action_topic(t)) {
         let msgs = match persist.list_since(topic, None) {
             Ok(m) => m,
             Err(e) => {
@@ -315,6 +328,13 @@ mod tests {
     #[test]
     fn job_topic_formats_under_event_dc_job() {
         assert_eq!(job_topic("01HZX5"), "event/dc/job/01HZX5");
+    }
+
+    #[test]
+    fn retained_vm_topics_are_not_projected_as_jobs() {
+        assert!(is_registered_action_topic("action/dc/host-power"));
+        assert!(!is_registered_action_topic("action/dc/vm-power"));
+        assert!(!is_registered_action_topic("action/dc/vm-create"));
     }
 
     #[test]

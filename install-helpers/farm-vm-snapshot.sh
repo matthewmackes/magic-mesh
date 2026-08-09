@@ -86,7 +86,7 @@ clean_snapshots() {
   # alphabetically, so `snapshot-time` lands BEFORE `uuid`). Parse per-record —
   # collect uuid + snapshot-time wherever they appear, emit `time<TAB>uuid` only
   # at the record boundary — so the pairing is order-independent (mirrors the Rust
-  # parse_param_records in crates/mesh/mackes-xcp). snapshot-time is fixed-width
+  # the retired Rust XCP adapter used the same record parser). snapshot-time is fixed-width
   # ISO (YYYYMMDDThh:mm:ssZ), so `sort -r` on it is newest-first.
   xe snapshot-list snapshot-of="$1" name-label="$SNAP_NAME" \
     params=uuid,snapshot-time 2>/dev/null \

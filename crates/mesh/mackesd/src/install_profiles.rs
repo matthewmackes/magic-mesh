@@ -8,7 +8,7 @@
 //! This is the pure core: profiles are TOML on the Syncthing-replicated share
 //! (`<workgroup_root>/profiles/*.toml`, W88 — fleet state is TOML dirs +
 //! typed Bus verbs), junk-tolerant on read, plus a built-in **core pack**
-//! mapping the deployment roles (Lighthouse ⊂ Server ⊂ Workstation, §5) to
+//! mapping the two deployment roles (Lighthouse or Workstation, §5) to
 //! their stock profiles so the surface
 //! is never empty. The
 //! `mackesd profiles` CLI verb + the Provisioning ▸ Install Profiles
@@ -27,8 +27,8 @@ pub struct InstallProfile {
     /// Human description shown on the boot menu / panel.
     #[serde(default)]
     pub description: String,
-    /// Deployment role this profile pins (`lighthouse`|`server`|`workstation`,
-    /// §5). The retired `lighthouse_media` role is rejected.
+    /// Deployment role this profile pins (`lighthouse` or `workstation`, §5).
+    /// Retired Server and lighthouse subclasses are rejected.
     pub role: String,
     /// Capability tags applied at firstboot (hop|execution|headless, W82).
     #[serde(default)]
@@ -100,7 +100,7 @@ fn read_bounded_profile(path: &Path) -> Option<String> {
 }
 
 /// Read every profile TOML (junk-tolerant) plus the built-in core pack
-/// (the three role profiles). On-disk profiles with the same `name` as a
+/// (the two role profiles). On-disk profiles with the same `name` as a
 /// core profile override it.
 #[must_use]
 pub fn load_profiles(workgroup_root: &Path) -> Vec<InstallProfile> {
@@ -127,18 +127,10 @@ pub fn load_profiles(workgroup_root: &Path) -> Vec<InstallProfile> {
     by_name.into_values().collect()
 }
 
-/// The shipped profiles — the deployment roles (§5) plus the
-/// XCP-ng `hypervisor` profile (DATACENTER-17).
-///
-/// Server and Workstation are execution-capable; the headless Server omits the desktop; the
-/// Workstation is the Cosmic desktop. The
-/// `hypervisor` profile pins the Server tier (PeerRole flattens to
-/// Host/Peer, so the dom0 is surfaced via the `hypervisor` capability
-/// tag, not a 4th cert role) and joins as a static-Nebula member. The
-/// role profiles auto-join so a USB/ISO install enrols hands-free (W60);
-/// the hypervisor is provisioned by `onboard-xcp-host.sh` (static
-/// `nebula` on a locked-down dom0), so it does not bake the firstboot
-/// auto-join slot.
+/// The two shipped deployment profiles (§5). A headless machine is a
+/// Workstation carrying the `headless` tag, not a third role. Workstations
+/// auto-join so a USB/ISO install enrols hands-free; the founding Lighthouse
+/// establishes the mesh and therefore cannot auto-join it.
 #[must_use]
 pub fn core_pack() -> Vec<InstallProfile> {
     vec![
@@ -153,36 +145,14 @@ pub fn core_pack() -> Vec<InstallProfile> {
             auto_join: false,
         },
         InstallProfile {
-            name: "server".into(),
-            description:
-                "Everything a lighthouse runs, plus fleet automation + a Syncthing storage replica. Headless."
-                    .into(),
-            role: "server".into(),
-            tags: BTreeSet::from(["execution".to_string(), "headless".to_string()]),
-            ks_fragments: vec!["role-server".into()],
-            auto_join: true,
-        },
-        InstallProfile {
             name: "workstation".into(),
             description:
-                "Everything a server runs, plus the Cosmic desktop, voice, media, and KDC.".into(),
+                "The Construct Workstation stack; add headless when no local display is present."
+                    .into(),
             role: "workstation".into(),
             tags: BTreeSet::from(["execution".to_string()]),
-            ks_fragments: vec!["role-workstation".into(), "cosmic-desktop".into()],
+            ks_fragments: vec!["role-workstation".into(), "construct-desktop".into()],
             auto_join: true,
-        },
-        InstallProfile {
-            name: "hypervisor".into(),
-            description: "XCP-ng dom0 joined as a static-Nebula mesh member".into(),
-            // PeerRole flattens to Host/Peer (open-mesh), so a dom0 maps to
-            // the Server/Host tier; `hypervisor` is the capability tag that
-            // makes it first-class in the roster (DATACENTER-17).
-            role: "server".into(),
-            tags: BTreeSet::from(["hypervisor".to_string()]),
-            ks_fragments: vec!["role-hypervisor".into(), "nebula-static".into()],
-            // Joined via onboard-xcp-host.sh on a locked-down dom0 (static
-            // `nebula`, not the Fedora firstboot auto-join flow).
-            auto_join: false,
         },
     ]
 }
@@ -195,15 +165,13 @@ pub fn core_pack() -> Vec<InstallProfile> {
 // Validated up front so a typo'd role/tag never reaches an installer.
 // ─────────────────────────────────────────────────────────────────
 
-/// The deployment roles a profile may pin (§5, Lighthouse ⊂ Server ⊂
-/// Workstation). The former media-lighthouse subclass is retired.
-pub const VALID_ROLES: [&str; 3] = ["lighthouse", "server", "workstation"];
+/// The two deployment roles a profile may pin (§5).
+pub const VALID_ROLES: [&str; 2] = ["lighthouse", "workstation"];
 
-/// The capability tags a profile may carry (W82; `hypervisor` added by
-/// DATACENTER-17 for the XCP-ng dom0 profile). Kept in lock-step with
+/// The capability tags a profile may carry. Kept in lock-step with
 /// [`mackes_mesh_types::cap_tags::CapabilityTag`] — a profile tag that the
 /// typed vocabulary can't parse would never gate.
-pub const VALID_TAGS: [&str; 4] = ["hop", "execution", "headless", "hypervisor"];
+pub const VALID_TAGS: [&str; 3] = ["hop", "execution", "headless"];
 
 /// Why a profile write was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,12 +368,7 @@ mod tests {
     fn core_pack_covers_every_deployment_role() {
         let pack = core_pack();
         let roles: BTreeSet<&str> = pack.iter().map(|p| p.role.as_str()).collect();
-        // hypervisor pins the server tier; retired media lighthouse profiles
-        // are intentionally absent.
-        assert_eq!(
-            roles,
-            BTreeSet::from(["lighthouse", "server", "workstation"])
-        );
+        assert_eq!(roles, BTreeSet::from(["lighthouse", "workstation"]));
         // Every core profile validates (role + tags + name).
         for p in &pack {
             validate_profile(p).unwrap_or_else(|e| panic!("core profile {} invalid: {e}", p.name));
@@ -413,22 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn hypervisor_profile_is_a_server_tier_static_nebula_member() {
+    fn retired_server_and_hypervisor_profiles_are_absent() {
         let pack = core_pack();
-        let hv = pack
-            .iter()
-            .find(|p| p.name == "hypervisor")
-            .expect("DATACENTER-17 — hypervisor profile present");
-        // Server tier + the hypervisor capability tag (not a 4th cert role).
-        assert_eq!(hv.role, "server");
-        assert!(hv.tags.contains("hypervisor"));
-        // Static-Nebula join on a locked-down dom0: no firstboot auto-join.
-        assert!(!hv.auto_join);
-        assert_eq!(hv.ks_fragments, vec!["role-hypervisor", "nebula-static"]);
-        // The tag round-trips through the typed vocabulary the writer gates on.
+        assert!(pack.iter().all(|profile| profile.name != "server"));
+        assert!(pack.iter().all(|profile| profile.name != "hypervisor"));
         assert_eq!(
             mackes_mesh_types::cap_tags::CapabilityTag::parse("hypervisor"),
-            Some(mackes_mesh_types::cap_tags::CapabilityTag::Hypervisor),
+            None
         );
     }
 
@@ -445,11 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn server_is_headless_execution_workstation_is_not() {
+    fn workstation_is_execution_capable_and_displayed_by_default() {
         let pack = core_pack();
-        let server = pack.iter().find(|p| p.name == "server").unwrap();
-        assert!(server.tags.contains("headless") && server.tags.contains("execution"));
         let ws = pack.iter().find(|p| p.name == "workstation").unwrap();
+        assert!(ws.tags.contains("execution"));
         assert!(!ws.tags.contains("headless"));
     }
 
@@ -476,14 +429,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(profiles_dir(tmp.path())).unwrap();
         std::fs::write(
-            profiles_dir(tmp.path()).join("server.toml"),
-            "name = \"server\"\nrole = \"server\"\ndescription = \"custom\"\nauto_join = false\n",
+            profiles_dir(tmp.path()).join("workstation.toml"),
+            "name = \"workstation\"\nrole = \"workstation\"\ndescription = \"custom\"\nauto_join = false\n",
         )
         .unwrap();
         let profiles = load_profiles(tmp.path());
-        let server = profiles.iter().find(|p| p.name == "server").unwrap();
-        assert_eq!(server.description, "custom");
-        assert!(!server.auto_join);
+        let workstation = profiles.iter().find(|p| p.name == "workstation").unwrap();
+        assert_eq!(workstation.description, "custom");
+        assert!(!workstation.auto_join);
         // Still exactly the core count (override, not duplicate).
         assert_eq!(profiles.len(), core_pack().len());
     }
@@ -505,13 +458,13 @@ mod tests {
 
         // A final symlink must not turn a replicated override into an escape
         // or replace the built-in profile with data from outside the share.
-        let escaped = tmp.path().join("escaped-server.toml");
+        let escaped = tmp.path().join("escaped-workstation.toml");
         std::fs::write(
             &escaped,
-            "name = \"server\"\nrole = \"server\"\ndescription = \"escaped\"\n",
+            "name = \"workstation\"\nrole = \"workstation\"\ndescription = \"escaped\"\n",
         )
         .unwrap();
-        symlink(&escaped, dir.join("server.toml")).unwrap();
+        symlink(&escaped, dir.join("workstation.toml")).unwrap();
 
         // A directory is a non-regular leaf even though its name looks like
         // a profile. O_NONBLOCK also keeps special-file opens from blocking.
@@ -532,10 +485,14 @@ mod tests {
 
         let profiles = load_profiles(tmp.path());
         assert_eq!(profiles.len(), core_pack().len());
-        let server = profiles.iter().find(|profile| profile.name == "server");
+        let workstation = profiles
+            .iter()
+            .find(|profile| profile.name == "workstation");
         assert_eq!(
-            server,
-            core_pack().iter().find(|profile| profile.name == "server")
+            workstation,
+            core_pack()
+                .iter()
+                .find(|profile| profile.name == "workstation")
         );
         assert!(!profiles.iter().any(|profile| {
             matches!(
@@ -560,7 +517,7 @@ mod tests {
         };
         let path = write_profile(&p, tmp.path()).expect("write");
         assert_eq!(path, profiles_dir(tmp.path()).join("edge-relay.toml"));
-        // It comes back out of load_profiles alongside the 3 core ones.
+        // It comes back out of load_profiles alongside the two core ones.
         let loaded = load_profiles(tmp.path());
         let got = loaded
             .iter()
@@ -575,7 +532,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut p = core_pack()
             .into_iter()
-            .find(|p| p.name == "server")
+            .find(|p| p.name == "workstation")
             .unwrap();
         p.description = "house style".into();
         write_profile(&p, tmp.path()).expect("write");
@@ -584,7 +541,7 @@ mod tests {
         assert_eq!(
             loaded
                 .iter()
-                .find(|x| x.name == "server")
+                .find(|x| x.name == "workstation")
                 .unwrap()
                 .description,
             "house style"
@@ -597,7 +554,7 @@ mod tests {
         let base = || InstallProfile {
             name: "ok".into(),
             description: String::new(),
-            role: "server".into(),
+            role: "workstation".into(),
             tags: BTreeSet::new(),
             ks_fragments: vec![],
             auto_join: false,
@@ -630,7 +587,7 @@ mod tests {
         let p = InstallProfile {
             name: "scratch".into(),
             description: String::new(),
-            role: "server".into(),
+            role: "workstation".into(),
             tags: BTreeSet::new(),
             ks_fragments: vec![],
             auto_join: false,
@@ -655,7 +612,7 @@ mod tests {
         let profile = InstallProfile {
             name: "edge-relay".into(),
             description: "safe replacement".into(),
-            role: "server".into(),
+            role: "workstation".into(),
             tags: BTreeSet::from(["execution".to_string()]),
             ks_fragments: vec![],
             auto_join: false,
@@ -697,7 +654,7 @@ mod tests {
         let profile = InstallProfile {
             name: "edge-relay".into(),
             description: String::new(),
-            role: "server".into(),
+            role: "workstation".into(),
             tags: BTreeSet::new(),
             ks_fragments: vec![],
             auto_join: false,

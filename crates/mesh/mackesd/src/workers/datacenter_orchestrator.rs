@@ -3,7 +3,7 @@
 //! The no-fixed-center engine behind the Workbench **Datacenter** plane
 //! (`docs/design/datacenter-control.md`). It samples the datacenter substrate and
 //! publishes per-resource state to the Bus as `event/dc/<kind>/<id>` so hosts,
-//! VMs, droplets, storage, network, and the gateway are first-class mesh state —
+//! droplets, storage, network, and the gateway are first-class mesh state —
 //! readable by the panel (and the Notification Hub) with no AI in the loop, the
 //! same way [`super::farm_orchestrator`] surfaces farm jobs.
 //!
@@ -52,7 +52,7 @@ pub const SR_WARN_PCT: u64 = 85;
 /// `SR_CRITICAL_PCT`. Overridable via `MCNF_SR_CRIT_PCT`.
 pub const SR_CRIT_PCT: u64 = 95;
 
-/// One datacenter resource as last sampled: a `kind` (droplet/host/vm/…), a stable
+/// One datacenter resource as last sampled: a `kind` (droplet/host/sr/…), a stable
 /// `id`, and a `signature` JSON body. The signature is what the brain diffs on.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DcResource {
@@ -126,11 +126,14 @@ impl DatacenterOrchestrator {
 
     /// Reconcile against the full current resource set. Emits an event for each
     /// resource whose signature is new or changed, plus a `gone` event for each
-    /// previously-seen resource no longer present. Advances internal state.
+    /// previously-seen resource no longer present. Retired VM resources are
+    /// discarded so this generic differ cannot restore a second VM roster.
+    /// Advances internal state.
     pub fn reconcile(&mut self, current: &[DcResource]) -> Vec<DcEvent> {
+        self.published.retain(|_, (kind, _, _)| kind != "vm");
         let mut events = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for r in current {
+        for r in current.iter().filter(|resource| resource.kind != "vm") {
             let k = r.key();
             seen.insert(k.clone());
             let changed = self
@@ -407,25 +410,6 @@ fn publish_route(dom0: &str, route: &SshRoute, note: &str) {
         &topic,
         &body,
     );
-}
-
-/// Parse the remote `xe` helper's pipe-delimited `uuid|name|power-state` lines
-/// into `(uuid, name, power)` triples. Pure — fed the raw stdout.
-#[must_use]
-pub fn parse_xe_vms(output: &str) -> Vec<(String, String, String)> {
-    output
-        .lines()
-        .filter_map(|l| {
-            let mut p = l.splitn(3, '|');
-            let u = p.next()?.trim();
-            if u.is_empty() {
-                return None;
-            }
-            let n = p.next().unwrap_or("").trim();
-            let s = p.next().unwrap_or("").trim();
-            Some((u.to_string(), n.to_string(), s.to_string()))
-        })
-        .collect()
 }
 
 /// Parse `uuid|name|physical-size|physical-utilisation` lines into SR tuples. Pure.
@@ -768,11 +752,11 @@ impl XenRoute {
     }
 }
 
-/// Sample the Xen (dev) zone: each configured dom0 becomes a `host` resource and
-/// each of its non-control VMs a `vm` resource. Reads XAPI via `xe` over the
-/// mesh-key SSH (the no-XO read path proven by DATACENTER-1) — best-effort. The SSH
-/// is routed per DATACENTER-4 ([`XenRoute`]): Direct on-LAN, ProxyJump through a
-/// relay peer off-LAN — without changing the brain or the Bus contract.
+/// Sample the Xen (dev) zone's infrastructure resources. Reads XAPI via `xe` over
+/// the mesh-key SSH (the no-XO read path proven by DATACENTER-1) — best-effort.
+/// VM inventory is deliberately excluded: typed Workloads is the sole VM roster.
+/// The SSH is routed per DATACENTER-4 ([`XenRoute`]): Direct on-LAN, ProxyJump
+/// through a relay peer off-LAN — without changing the brain or the Bus contract.
 fn gather_xen() -> Vec<DcResource> {
     let key = xen_ssh_key();
     // DATACENTER-4: resolve the XAPI route once per pass — on-LAN nodes go Direct,
@@ -787,14 +771,9 @@ fn gather_xen() -> Vec<DcResource> {
     let mut out = Vec::new();
     for dom0 in xen_dom0s() {
         let mut route = XenRoute::open(&dom0, on_lan, relay.as_deref());
-        // Track this dom0's host name (for the power signal) and its running-VM
-        // count so we can emit the DATACENTER-16 idle signal after the gather.
-        let mut host_name: Option<String> = None;
-        let mut running_vms: usize = 0;
         if let Some(hn) = route.run(&key, "xe host-list params=name-label --minimal") {
             let hn = hn.trim();
             if !hn.is_empty() {
-                host_name = Some(hn.to_string());
                 // Best-effort host metrics from the Xen toolstack: `xl info` gives
                 // the host's REAL physical cpu count + total/free memory (MB), not
                 // dom0's capped view; load from /proc/loadavg. One ssh round-trip.
@@ -813,20 +792,6 @@ fn gather_xen() -> Vec<DcResource> {
                 })
                 .to_string();
                 out.push(DcResource::new("host", dom0.clone(), sig));
-            }
-        }
-        let script = "for u in $(xe vm-list is-control-domain=false params=uuid --minimal | tr , ' '); \
-             do echo \"$u|$(xe vm-param-get uuid=$u param-name=name-label)|$(xe vm-param-get uuid=$u param-name=power-state)\"; done";
-        if let Some(vmout) = route.run(&key, script) {
-            for (u, n, s) in parse_xe_vms(&vmout) {
-                if s == "running" {
-                    running_vms += 1;
-                }
-                let sig = serde_json::json!({
-                    "kind": "vm", "id": u, "name": n, "status": s, "host": dom0, "zone": "dev"
-                })
-                .to_string();
-                out.push(DcResource::new("vm", u, sig));
             }
         }
         // SRs with real capacity (skip the empty/virtual ones) → storage visibility (DC-12).
@@ -917,36 +882,8 @@ fn gather_xen() -> Vec<DcResource> {
                 out.push(DcResource::new("net", u, sig));
             }
         }
-        // DATACENTER-16: idle-host (energy) signal — one `power` resource per dom0
-        // carrying its running-VM count + an idle hint. READ-ONLY (the panel/operator
-        // decides; no auto-shutdown). Emitted only for dom0s whose host was readable,
-        // so the name is real. Best-effort, same as the rest of the gather.
-        if let Some(hn) = host_name {
-            let sig = idle_power_signal(&dom0, &hn, running_vms);
-            out.push(DcResource::new("power", dom0.clone(), sig));
-        }
     }
     out
-}
-
-/// DATACENTER-16 — the idle-host (energy) signal. Build the `power` resource
-/// signature for one dom0 from its running-VM count: a READ-ONLY hint the panel
-/// (or the operator) can act on. A host with zero running VMs is a
-/// `candidate-for-shutdown`; anything running keeps it `in-use`. No auto-shutdown
-/// is implied — this only surfaces the signal. Pure.
-#[must_use]
-pub fn idle_power_signal(dom0: &str, host_name: &str, running_vms: usize) -> String {
-    let idle = running_vms == 0;
-    serde_json::json!({
-        "kind": "power",
-        "id": dom0,
-        "name": host_name,
-        "zone": "dev",
-        "running_vms": running_vms,
-        "idle": idle,
-        "hint": if idle { "candidate-for-shutdown" } else { "in-use" }
-    })
-    .to_string()
 }
 
 /// Host of the on-prem UniFi gateway (the router) to sample over SSH —
@@ -1085,7 +1022,7 @@ impl ZoneRollup {
 /// PURE — fed the same `DcResource`s the per-resource events came from, filtered to
 /// `zone`, so the rollup is always consistent with the cards. Unknown/garbage
 /// numeric fields contribute 0 (best-effort, never an error), and only `sr`/`net`/
-/// `gateway` kinds participate (hosts/vms/droplets/power are summarised elsewhere).
+/// `gateway` kinds participate (hosts and droplets are summarised elsewhere).
 #[must_use]
 pub fn rollup_zone(zone: &str, resources: &[DcResource]) -> ZoneRollup {
     let mut roll = ZoneRollup::default();
@@ -1228,6 +1165,9 @@ fn publish(ev: &DcEvent) {
 /// honouring `MDE_BUS_ROOT`) and writes `body` verbatim to `topic`.
 /// Best-effort; tests pass a temp root.
 fn publish_topic_body(bus_root: Option<&std::path::Path>, topic: &str, body: &str) {
+    if topic.starts_with("event/dc/vm/") {
+        return;
+    }
     if let Some(mut persist) =
         crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
     {
@@ -1244,7 +1184,7 @@ enum Zone {
     /// The on-prem Xen (dev) zone **plus the UniFi gateway**: its dom0s + router sit
     /// on the `172.20.0.0/16` lab LAN, so only an **on-LAN** node is leader-eligible
     /// (an off-LAN node can read XAPI over a relay but can't be the always-on Xen
-    /// control point). Carries hosts/vms/srs/nets/gateway/power.
+    /// control point). Carries hosts, storage, networks, and gateway observations.
     Xen,
     /// The DigitalOcean (prod) zone: the DO API is internet-reachable, so **any**
     /// eligible node can be its leader. Carries droplets.
@@ -1405,6 +1345,65 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_refuses_retired_vm_resources_and_topics() {
+        let mut o = DatacenterOrchestrator::new();
+        o.published.insert(
+            "vm/stale-vm".into(),
+            (
+                "vm".into(),
+                "stale-vm".into(),
+                r#"{"kind":"vm","id":"stale-vm"}"#.into(),
+            ),
+        );
+        let resources = [
+            DcResource::new(
+                "vm",
+                "retired-vm",
+                r#"{"kind":"vm","id":"retired-vm","status":"running"}"#,
+            ),
+            DcResource::new("host", "xcp-a", r#"{"kind":"host","id":"xcp-a"}"#),
+        ];
+
+        let events = o.reconcile(&resources);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].topic(), "event/dc/host/xcp-a");
+        assert!(events.iter().all(|event| event.kind != "vm"));
+
+        let gone = o.reconcile(&[]);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].topic(), "event/dc/host/xcp-a");
+        assert!(gone.iter().all(|event| event.kind != "vm"));
+    }
+
+    #[test]
+    fn publish_boundary_refuses_retired_vm_topic() {
+        let tmp = tempfile::tempdir().unwrap();
+        publish_topic_body(
+            Some(tmp.path()),
+            "event/dc/vm/retired-vm",
+            r#"{"kind":"vm","id":"retired-vm"}"#,
+        );
+        publish_topic_body(
+            Some(tmp.path()),
+            "event/dc/host/xcp-a",
+            r#"{"kind":"host","id":"xcp-a"}"#,
+        );
+
+        let reader = mde_bus::persist::Persist::open(tmp.path().to_path_buf()).unwrap();
+        assert!(reader
+            .list_since("event/dc/vm/retired-vm", None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reader
+                .list_since("event/dc/host/xcp-a", None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn parse_droplets_reads_id_status_region_ip() {
         let json = r#"[
           {"id":579112110,"name":"lighthouse-01","status":"active",
@@ -1427,19 +1426,6 @@ mod tests {
         assert!(parse_droplets("not json").is_empty());
         assert!(parse_droplets("{}").is_empty());
         assert!(parse_droplets("[]").is_empty());
-    }
-
-    #[test]
-    fn parse_xe_vms_reads_pipe_lines() {
-        let out = "abc-1|mcnf-build-51|running\ndef-2|mcnf-golden|halted\n|skip-empty-uuid|x\n";
-        let vms = parse_xe_vms(out);
-        assert_eq!(vms.len(), 2); // the empty-uuid line is skipped
-        assert_eq!(
-            vms[0],
-            ("abc-1".into(), "mcnf-build-51".into(), "running".into())
-        );
-        assert_eq!(vms[1].1, "mcnf-golden");
-        assert_eq!(vms[1].2, "halted");
     }
 
     #[test]
@@ -1496,28 +1482,6 @@ mod tests {
             parse_unifi_cred("  ubnt:pw  \n"),
             ("ubnt".to_string(), "pw".to_string())
         );
-    }
-
-    #[test]
-    fn idle_power_signal_marks_idle_when_no_running_vms() {
-        let sig = idle_power_signal("172.20.0.9", "xcp-host-a", 0);
-        let v: serde_json::Value = serde_json::from_str(&sig).unwrap();
-        assert_eq!(v["kind"], "power");
-        assert_eq!(v["id"], "172.20.0.9");
-        assert_eq!(v["name"], "xcp-host-a");
-        assert_eq!(v["zone"], "dev");
-        assert_eq!(v["running_vms"], 0);
-        assert_eq!(v["idle"], true);
-        assert_eq!(v["hint"], "candidate-for-shutdown");
-    }
-
-    #[test]
-    fn idle_power_signal_marks_in_use_when_vms_running() {
-        let sig = idle_power_signal("172.20.145.193", "xcp-host-b", 3);
-        let v: serde_json::Value = serde_json::from_str(&sig).unwrap();
-        assert_eq!(v["running_vms"], 3);
-        assert_eq!(v["idle"], false);
-        assert_eq!(v["hint"], "in-use");
     }
 
     #[test]

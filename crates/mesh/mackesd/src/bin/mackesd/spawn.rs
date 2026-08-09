@@ -654,7 +654,7 @@ pub(crate) fn start_connectivity_bus_responders(
 }
 
 // run_serve round-2 extract: the datacenter Bus responders on action/dc/* —
-// Datacenter vm-power, Host-ops host-power, DC-power WoL, Tofu plan.
+// Datacenter planning/storage, Host-ops host-power, DC-power WoL, Tofu plan.
 pub(crate) fn start_datacenter_bus_responders(
     worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -670,9 +670,7 @@ pub(crate) fn start_datacenter_bus_responders(
     ]) {
         return;
     }
-    // DATACENTER (action layer) — the VM power-control responder:
-    // action/dc/vm-power runs `xe vm-{start,shutdown,reboot}` over the
-    // mesh-key SSH against an allowed dom0. Same dedicated-OS-thread shape.
+    // DATACENTER (action layer) — non-VM planning and storage responder.
     match mde_bus::default_data_dir()
         .ok_or_else(|| "no XDG data dir for bus".to_string())
         .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
@@ -689,9 +687,7 @@ pub(crate) fn start_datacenter_bus_responders(
                     });
                 })
                 .map(|_handle| {
-                    tracing::info!(
-                        "Datacenter Bus responder spawned; serving action/dc/vm-power (DATACENTER)"
-                    );
+                    tracing::info!("Datacenter Bus responder spawned");
                 })
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Datacenter Bus responder thread spawn failed");
@@ -1390,14 +1386,6 @@ pub(crate) fn spawn_compute_lifecycle_workers(
             node_id.clone(),
             db_path.clone(),
         )
-    });
-    // XCP-6 (B2) — on an XCP-ng dom0, advertise hypervisor capacity
-    // (CPU/RAM/SR-free/running-VMs) to `compute/xcp-host/<node>` so any node
-    // can target it for a VM spawn. Self-gates on the dom0 marker, so it's a
-    // harmless no-op on every non-hypervisor node; spawned on all roles (a
-    // joined XCP host pins Server).
-    spawn_tiered(sup, worker_names, role_rank, "xcp_host", || {
-        mackesd_core::workers::xcp_host::XcpHostWorker::new(node_id.clone())
     });
     // KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes
     // the per-node KVM virtualization service catalog
@@ -2842,26 +2830,6 @@ pub(crate) fn spawn_fleet_compute_workers(
         .lock()
         .expect("worker_names mutex")
         .push("compute_provision".into());
-
-    // XCP-3 — the A-plane provision flow. Drains
-    // `action/provision/spawn` and, for each request, drives the
-    // mackes-xcp Hypervisor layer over xe-over-SSH:
-    // `clone MDE-VM-golden → set_identity_seed (the fresh cloud-init
-    // seed: MDE-VM-<name> hostname, op key, regen host keys +
-    // machine-id) → start → resolve IP`, acking on
-    // `action/provision/spawn-ack/<ulid>`. This is the runtime caller
-    // that makes set_identity_seed reachable — a provisioned VM
-    // actually gets its identity seed. Idles cleanly on a node with no
-    // dom0 configured (MCNF_XEN_DOM0S empty → a clean error-ack); the
-    // dom0 allow-list is single-sourced from the datacenter env config.
-    sup.spawn(Spawn::new(
-        mackesd_core::workers::xcp_provision::XcpProvisionWorker::new(),
-        RestartPolicy::Always,
-    ));
-    worker_names
-        .lock()
-        .expect("worker_names mutex")
-        .push("xcp_provision".into());
 
     // MESH-A-1 (v5.0.0) — per-peer network assessment. Collects
     // the 9 items (docs/design/v6.0-mde-portal.md §7.1) hourly +

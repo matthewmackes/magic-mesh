@@ -1912,7 +1912,7 @@ mod tests {
         for sec in [
             "action/enroll/accept",
             "action/ca/revoke",
-            "action/provision/spawn",
+            "action/workload/operation",
             "action/music/play",
             "action/role/pin",
             "event/security/alert",
