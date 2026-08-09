@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::{ShutdownToken, Worker};
 
 const POLL: Duration = Duration::from_secs(1);
+const SYSTEM_BUS_ROOT: &str = mde_bus::SYSTEM_BUS_ROOT;
 const MAX_IMPORT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TRUST_BYTES: u64 = 256;
 const MAX_ROWS_PER_POLL: usize = 32;
@@ -46,8 +47,27 @@ struct PersistedCatalog {
 /// Workstation runtime authority for one node's signed Android catalog.
 pub struct AndroidCatalogWorker {
     host: String,
+    /// Explicit override for tests/deployments. `None` resolves the user Bus
+    /// root afresh on every pass and then falls back to the system spool.
     bus_root: Option<PathBuf>,
     config: Option<CatalogConfig>,
+    poll: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ImportState {
+    published_replay: bool,
+    cursor: Option<String>,
+    current: Option<AndroidSignedCatalog>,
+    bus_identity: Option<BusIdentity>,
 }
 
 impl AndroidCatalogWorker {
@@ -63,9 +83,20 @@ impl AndroidCatalogWorker {
             .ok();
         Self {
             host,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root: None,
             config,
+            poll: POLL,
         }
+    }
+
+    fn resolved_bus_root(&self) -> PathBuf {
+        resolve_bus_root(self.bus_root.clone(), mde_bus::default_data_dir())
+    }
+
+    #[cfg(test)]
+    const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
     }
 
     fn process_once(
@@ -127,6 +158,70 @@ impl AndroidCatalogWorker {
         }
         Ok(admitted)
     }
+
+    fn activate_bus(
+        &self,
+        persist: &mut Persist,
+        state: &mut ImportState,
+        identity: BusIdentity,
+    ) -> io::Result<()> {
+        if state.bus_identity == Some(identity) {
+            return Ok(());
+        }
+
+        // Imports are durable, signed commands. A replacement index is a new
+        // history, so replay it from the beginning under the same admission
+        // authority after restoring the durable last-good projection.
+        let mut staged = state.clone();
+        staged.cursor = None;
+        staged.published_replay = false;
+        if let Some(catalog) = staged.current.as_ref() {
+            publish_admitted(persist, &self.host, catalog)?;
+        }
+        staged.published_replay = true;
+        staged.bus_identity = Some(identity);
+        *state = staged;
+        Ok(())
+    }
+
+    fn process_bus_pass(
+        &self,
+        persist: &mut Persist,
+        bus_root: &Path,
+        state: &mut ImportState,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        let identity = bus_identity(bus_root)?;
+        self.activate_bus(persist, state, identity)?;
+        self.process_once(persist, &mut state.cursor, &mut state.current, now_ms)?;
+        Ok(())
+    }
+}
+
+fn resolve_bus_root(configured: Option<PathBuf>, user: Option<PathBuf>) -> PathBuf {
+    configured
+        .or(user)
+        .unwrap_or_else(|| PathBuf::from(SYSTEM_BUS_ROOT))
+}
+
+fn bus_identity(bus_root: &Path) -> io::Result<BusIdentity> {
+    let metadata = fs::metadata(bus_root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("Bus index is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(BusIdentity {})
+    }
 }
 
 #[async_trait::async_trait]
@@ -145,39 +240,30 @@ impl Worker for AndroidCatalogWorker {
             shutdown.wait().await;
             return Ok(());
         }
-        let mut cursor = None;
-        let mut current = self
-            .config
-            .as_ref()
-            .and_then(|config| load_last_good(config, now_unix_ms()).ok().flatten());
-        let mut published_replay = false;
+        let mut state = ImportState {
+            current: self
+                .config
+                .as_ref()
+                .and_then(|config| load_last_good(config, now_unix_ms()).ok().flatten()),
+            ..ImportState::default()
+        };
         loop {
-            if let (Some(root), Some(config)) = (self.bus_root.as_ref(), self.config.as_ref()) {
-                match Persist::open(root.clone()) {
-                    Ok(mut persist) => {
-                        if !published_replay {
-                            if let Some(catalog) = current.as_ref() {
-                                publish_admitted(&mut persist, &self.host, catalog)?;
-                            }
-                            published_replay = true;
-                        }
-                        if let Err(error) = self.process_once(
-                            &mut persist,
-                            &mut cursor,
-                            &mut current,
-                            now_unix_ms(),
-                        ) {
-                            tracing::warn!(target: "mackesd::android_catalog", %error, state = %config.state_file.display(), "Android catalog import pass failed");
-                        }
+            let root = self.resolved_bus_root();
+            match Persist::open(root.clone()) {
+                Ok(mut persist) => {
+                    if let Err(error) =
+                        self.process_bus_pass(&mut persist, &root, &mut state, now_unix_ms())
+                    {
+                        tracing::warn!(target: "mackesd::android_catalog", %error, "Android catalog Bus pass deferred");
                     }
-                    Err(error) => {
-                        tracing::warn!(target: "mackesd::android_catalog", %error, "Android catalog Bus unavailable")
-                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::android_catalog", %error, "Android catalog Bus unavailable; worker will retry")
                 }
             }
             tokio::select! {
                 () = shutdown.wait() => break,
-                () = tokio::time::sleep(POLL) => {}
+                () = tokio::time::sleep(self.poll) => {}
             }
         }
         Ok(())
@@ -248,10 +334,21 @@ fn publish_admitted(
 ) -> io::Result<()> {
     let topic = android_catalog_state_topic(host).map_err(io_other)?;
     let body = serde_json::to_string(catalog).map_err(io_other)?;
+    #[cfg(test)]
+    if FAIL_NEXT_PUBLICATION.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other(
+            "injected Android catalog publication failure",
+        ));
+    }
     persist
         .write(&topic, Priority::Default, None, Some(&body))
         .map_err(io_other)?;
     Ok(())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn store_last_good(path: &Path, catalog: &AndroidSignedCatalog) -> io::Result<()> {
@@ -361,13 +458,17 @@ mod tests {
     const NOW: u64 = 1_786_000_000_300;
 
     fn signed_catalog(key: &SigningKey, revision: u64) -> AndroidSignedCatalog {
+        signed_catalog_at(key, revision, NOW)
+    }
+
+    fn signed_catalog_at(key: &SigningKey, revision: u64, now_ms: u64) -> AndroidSignedCatalog {
         let image = AndroidImageManifest::new(
             "aosp-cuttlefish-2026-08",
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "aosp-source-2026-08",
             "starter-catalog-v1",
-            NOW - 300,
-            NOW - 200,
+            now_ms - 300,
+            now_ms - 200,
             AospStarterCatalog::v1(),
         )
         .unwrap();
@@ -406,8 +507,8 @@ mod tests {
                 schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
                 catalog_id: "aosp-starter-production".into(),
                 revision,
-                issued_at_unix_ms: NOW - 100,
-                expires_at_unix_ms: NOW + 60_000,
+                issued_at_unix_ms: now_ms - 100,
+                expires_at_unix_ms: now_ms + 60_000,
                 image_manifest: image,
                 package_manifest,
                 app_policies,
@@ -426,6 +527,7 @@ mod tests {
                 verifying_key: key.verifying_key(),
                 state_file: temp.path().join("state/catalog.json"),
             }),
+            poll: POLL,
         }
     }
 
@@ -555,6 +657,147 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replay_and_import_publication_failures_preserve_state_for_retry() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let bus_root = temp.path().join("bus");
+        let mut persist = Persist::open(bus_root.clone()).unwrap();
+        let catalog_7 = signed_catalog(&key, 7);
+        store_last_good(&worker.config.as_ref().unwrap().state_file, &catalog_7).unwrap();
+        let mut state = ImportState {
+            current: Some(catalog_7),
+            ..ImportState::default()
+        };
+
+        FAIL_NEXT_PUBLICATION.with(|fail| fail.set(true));
+        assert!(worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
+            .is_err());
+        assert!(!state.published_replay);
+        assert!(state.cursor.is_none());
+        assert_eq!(state.current.as_ref().unwrap().payload.revision, 7);
+        assert!(state.bus_identity.is_none());
+
+        worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
+            .unwrap();
+        assert!(state.published_replay);
+        assert!(state.bus_identity.is_some());
+
+        import(&persist, &signed_catalog(&key, 8));
+        FAIL_NEXT_PUBLICATION.with(|fail| fail.set(true));
+        assert!(worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
+            .is_err());
+        assert!(
+            state.cursor.is_none(),
+            "failed import remains unacknowledged"
+        );
+        assert_eq!(state.current.as_ref().unwrap().payload.revision, 7);
+        assert_eq!(
+            load_last_good(worker.config.as_ref().unwrap(), NOW)
+                .unwrap()
+                .unwrap()
+                .payload
+                .revision,
+            8,
+            "cache-first ordering preserves crash recovery authority"
+        );
+
+        worker
+            .process_bus_pass(&mut persist, &bus_root, &mut state, NOW)
+            .unwrap();
+        assert!(state.cursor.is_some());
+        assert_eq!(state.current.as_ref().unwrap().payload.revision, 8);
+        assert_eq!(
+            persist
+                .list_since(&android_catalog_state_topic("node-01").unwrap(), None)
+                .unwrap()
+                .len(),
+            2,
+            "one replay and one corrected-forward import publication"
+        );
+    }
+
+    async fn wait_for_revision(bus_root: &Path, revision: u64) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(persist) = Persist::open(bus_root.to_path_buf()) {
+                    if let Ok(Some(row)) =
+                        persist.read_latest(&android_catalog_state_topic("node-01").unwrap())
+                    {
+                        if row.body.as_deref().is_some_and(|body| {
+                            serde_json::from_str::<AndroidSignedCatalog>(body)
+                                .is_ok_and(|catalog| catalog.payload.revision == revision)
+                        }) {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Android catalog revision");
+    }
+
+    #[tokio::test]
+    async fn same_worker_recovers_late_and_replaced_bus_with_governed_replay() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let bus_root = temp.path().join("late-bus");
+        fs::write(&bus_root, b"temporarily unavailable").unwrap();
+
+        let wall_now = now_unix_ms();
+        let seeded_root = temp.path().join("seeded-bus");
+        let seeded = Persist::open(seeded_root.clone()).unwrap();
+        import(&seeded, &signed_catalog_at(&key, 7, wall_now));
+        drop(seeded);
+
+        let mut worker = worker(&temp, &key).with_poll(Duration::from_millis(10));
+        worker.bus_root = Some(bus_root.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task.is_finished(),
+            "unopenable Bus must not terminate worker"
+        );
+
+        fs::remove_file(&bus_root).unwrap();
+        fs::rename(&seeded_root, &bus_root).unwrap();
+        wait_for_revision(&bus_root, 7).await;
+
+        let replacement_root = temp.path().join("replacement-bus");
+        drop(Persist::open(replacement_root.clone()).unwrap());
+        fs::rename(
+            replacement_root.join("index.sqlite"),
+            bus_root.join("index.sqlite"),
+        )
+        .unwrap();
+        wait_for_revision(&bus_root, 7).await;
+
+        let live = Persist::open(bus_root.clone()).unwrap();
+        import(&live, &signed_catalog_at(&key, 8, wall_now));
+        wait_for_revision(&bus_root, 8).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("worker shutdown timeout")
+            .expect("worker task joins")
+            .expect("worker shutdown succeeds");
+        assert_eq!(
+            resolve_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
     #[tokio::test]
     async fn unconfigured_worker_quiesces_without_creating_bus_state() {
         let temp = TempDir::new().unwrap();
@@ -563,6 +806,7 @@ mod tests {
             host: "node-01".into(),
             bus_root: Some(bus_root.clone()),
             config: None,
+            poll: POLL,
         };
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle =
