@@ -139,10 +139,10 @@ behavioral evidence is not completion.
 - **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness,
   relay state, and stale sockets; BigBoy passed 7/7. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-display1-expiry-r1.md`.
-- **Storage path-boundary checkpoint (2026-08-06):** apply-time virtual-storage
-  validation rejects symlinks and outside-root image paths before executor use;
-  `.90` passed 1/1. Evidence:
+- **Storage path-boundary checkpoint (2026-08-06):** virtual-storage validation rejects symlinks/outside-root images; `.90` passed:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
+- **Storage Bus transaction checkpoint (2026-08-09):** stable reads precede effects; late/replaced storage and failed publication correct forward without repeated operations.
+  BigBoy passed six exact gates: `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`.
 - **Durable journal checkpoint (2026-08-06):** persisted Workload journals reject
   recursive duplicate JSON keys before replay; BigBoy passed 8/8 reconciler tests.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-ledger-duplicate-keys-r1.md`.
@@ -423,12 +423,12 @@ behavioral evidence is not completion.
   fails closed and atomic temporary files are cleaned on failure. Machine 194
   passed 3/3 focused tests; Dell deployment proof remains:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
-- **Compute/Cloud Bus recovery checkpoints (2026-08-09):** firewall exposure and Cloud transactions survive late/replaced storage; Cloud stages reads and durably
-  recovers mutation replies without repeating effects. Machines 194/193 passed focused gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`.
+- **Compute/Cloud/Storage Bus recovery checkpoints (2026-08-09):** late/replaced storage now preserves firewall, Cloud, and physical-storage transaction truth;
+  complete reads precede effects; authorization/pending output prevents repeats. Gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
+  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`.
 - **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open and tail priming as one fail-closed activation, skips retained actions, and executes one
-  forward signed action exactly once.
-  BigBoy passed three exact recovery tests:
+  forward signed action exactly once; BigBoy passed three exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
 - **Copilot Bus recovery checkpoint (2026-08-09):** late activation skips retained asks and answers one forward signed ask exactly once; machine 196 passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.

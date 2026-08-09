@@ -57,10 +57,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mde_bus::persist::Persist;
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::{Persist, StoredMessage};
 use thiserror::Error;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
@@ -3021,70 +3023,78 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Publish a JSON body to `topic` via the `mde-bus` CLI — the same fire-and-reap
-/// path `container`/`vm_lifecycle` use. Best-effort: a missing `mde-bus` binary
-/// (pre-RPM dev box) is swallowed.
-fn publish_json<T: serde::Serialize>(bus_root: Option<&Path>, topic: &str, body: &T) {
-    if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
-        crate::bus_publish::publish_json(&mut persist, topic, body);
-    }
-}
-
-/// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring `container`.
-fn read_new_requests(
-    bus_root: &Path,
+fn publish_json<T: serde::Serialize>(
+    persist: &Persist,
     topic: &str,
-    cursor: &mut Option<String>,
-    authorizer: &ActionAuthorizer,
-    node: &str,
-) -> Vec<StorageRequest> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(topic, cursor.as_deref()) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for msg in msgs {
-        *cursor = Some(msg.ulid.clone());
-        let body = msg.body.as_deref().unwrap_or("");
-        match parse_request(body) {
-            Ok(request) => {
-                let authorized = match &request {
-                    StorageRequest::Refresh => Ok(()),
-                    StorageRequest::Apply { armed_device, .. } => authorizer.authorize(
-                        body,
-                        MutationContext {
-                            verb: "storage-apply",
-                            node,
-                            target: armed_device,
-                        },
-                    ),
-                };
-                match authorized {
-                    Ok(()) => out.push(request),
-                    Err(error) => tracing::warn!(
-                        target: "mackesd::storage",
-                        ulid = %msg.ulid,
-                        node,
-                        error = %error,
-                        "refused unauthorized privileged request"
-                    ),
-                }
-            }
-            Err(e) => tracing::warn!(ulid = %msg.ulid, error = %e, "storage: bad storage request"),
-        }
-    }
-    out
+    body: &T,
+) -> Result<(), String> {
+    let body = serde_json::to_string(body).map_err(|error| error.to_string())?;
+    persist
+        .write(topic, Priority::Default, None, Some(&body))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-/// Seed the cursor to the newest existing message so a (re)start doesn't re-run the
-/// backlog of Apply verbs. `None` when the topic is empty.
-fn prime_cursor(bus_root: &Path, topic: &str) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(topic, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
+/// Strictly stage a complete action-lane read. Bus unavailability is an error,
+/// never an empty queue, and this function has no cursor or authorization effects.
+fn read_new_messages(
+    persist: &Persist,
+    topic: &str,
+    cursor: Option<&str>,
+) -> Result<Vec<StoredMessage>, String> {
+    persist
+        .list_since(topic, cursor)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageBusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn storage_bus_identity(root: &Path) -> Result<StorageBusIdentity, String> {
+    let metadata = fs::metadata(root.join("index.sqlite")).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("storage Bus index is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(StorageBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(StorageBusIdentity {})
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingStorageCommit {
+    source_index: StorageBusIdentity,
+    cursor: Option<String>,
+    progress: Vec<StorageProgress>,
+    progress_index: usize,
+    progress_destination: Option<StorageBusIdentity>,
+    publish_snapshot: bool,
+}
+
+#[derive(Debug, Default)]
+struct StorageBusState {
+    active_index: Option<StorageBusIdentity>,
+    cursor: Option<String>,
+    virtual_cursor: Option<String>,
+    pending: Option<PendingStorageCommit>,
+}
+
+struct StorageApplyOutcome {
+    changed: bool,
+    progress: Vec<StorageProgress>,
 }
 
 /// The E12-20 storage worker: the privileged owner of the per-node Storage plane.
@@ -3108,10 +3118,14 @@ pub struct StorageWorker {
     heartbeat: Duration,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
+    /// Focused hostile-test Bus fault budgets; production leaves both at zero.
+    bus_read_failures: AtomicU64,
+    bus_write_failures: AtomicU64,
     /// The E12-22 virtual-disks sub-worker (KVM images + Podman storage), drained +
     /// published in the same loop (no separate mackesd spawn line). See
     /// [`super::virtual_storage`].
     virtual_storage: super::virtual_storage::VirtualStorage,
+    virtual_enabled: bool,
 }
 
 impl StorageWorker {
@@ -3122,6 +3136,7 @@ impl StorageWorker {
     pub fn new(node_id: String) -> Self {
         Self {
             virtual_storage: super::virtual_storage::VirtualStorage::production(node_id.clone()),
+            virtual_enabled: true,
             node_id,
             udisks: Arc::new(ZbusUDisks2Client::new()),
             executor: Arc::new(UDisks2Executor::new()),
@@ -3130,6 +3145,8 @@ impl StorageWorker {
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
             bus_root_override: None,
+            bus_read_failures: AtomicU64::new(0),
+            bus_write_failures: AtomicU64::new(0),
         }
     }
 
@@ -3183,8 +3200,78 @@ impl StorageWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    fn bus_roots(&self) -> Vec<PathBuf> {
+        if let Some(root) = &self.bus_root_override {
+            return vec![root.clone()];
+        }
+        let mut roots = Vec::with_capacity(2);
+        if let Some(root) = default_bus_root() {
+            roots.push(root);
+        }
+        let system = PathBuf::from(mde_bus::SYSTEM_BUS_ROOT);
+        if !roots.contains(&system) {
+            roots.push(system);
+        }
+        roots
+    }
+
+    fn open_bus_transaction(&self) -> Result<(PathBuf, StorageBusIdentity, Persist), String> {
+        let mut last_error = None;
+        for root in self.bus_roots() {
+            let before = match storage_bus_identity(&root) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let persist = match Persist::open(root.clone()) {
+                Ok(persist) => persist,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            if storage_bus_identity(&root).is_ok_and(|after| after == before) {
+                return Ok((root, before, persist));
+            }
+            last_error = Some("storage Bus index changed while opening transaction".to_string());
+        }
+        Err(last_error.unwrap_or_else(|| "storage Bus root unresolved".to_string()))
+    }
+
+    fn verify_bus_identity(&self, root: &Path, expected: StorageBusIdentity) -> Result<(), String> {
+        if storage_bus_identity(root).is_ok_and(|identity| identity == expected) {
+            Ok(())
+        } else {
+            Err("storage Bus index changed during transaction".to_string())
+        }
+    }
+
+    fn consume_fault(counter: &AtomicU64) -> bool {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok_and(|remaining| remaining == 1)
+    }
+
+    fn write_json<T: serde::Serialize>(
+        &self,
+        persist: &Persist,
+        topic: &str,
+        body: &T,
+    ) -> Result<(), String> {
+        if Self::consume_fault(&self.bus_write_failures) {
+            return Err("injected storage Bus write failure".to_string());
+        }
+        publish_json(persist, topic, body)
+    }
+
+    #[cfg(test)]
+    fn without_virtual_tick(mut self) -> Self {
+        self.virtual_enabled = false;
+        self
     }
 
     /// Enumerate the live topology, or the typed unavailable reason.
@@ -3194,18 +3281,17 @@ impl StorageWorker {
 
     /// Publish the topology mirror to `state/storage/<node>` (honest backend
     /// state).
-    async fn publish_state(&self, bus_root: Option<&Path>) {
+    async fn storage_state(&self) -> StorageState {
         let (backend, topology) = match self.enumerate().await {
             Ok(topo) => (BackendStatus::Available, topo),
             Err(reason) => (BackendStatus::Unavailable { reason }, Topology::default()),
         };
-        let state = StorageState {
+        StorageState {
             host: self.node_id.clone(),
             backend,
             topology,
             published_at_ms: now_ms(),
-        };
-        publish_json(bus_root, &state_topic(&self.node_id), &state);
+        }
     }
 
     /// Handle one Apply verb: re-enumerate live, check arming, run the queue, and
@@ -3216,8 +3302,7 @@ impl StorageWorker {
         armed_device: &str,
         staged: &Topology,
         queue: &StorageQueue,
-        bus_root: Option<&Path>,
-    ) -> bool {
+    ) -> StorageApplyOutcome {
         let live = match self.enumerate().await {
             Ok(t) => t,
             Err(reason) => {
@@ -3225,7 +3310,10 @@ impl StorageWorker {
                     target: "mackesd::alert",
                     "ALERT (warn): storage apply refused — backend unavailable: {reason}"
                 );
-                return false;
+                return StorageApplyOutcome {
+                    changed: false,
+                    progress: Vec::new(),
+                };
             }
         };
         // Lock 8 — typed arming. A mismatch refuses the whole queue, nothing runs.
@@ -3236,23 +3324,25 @@ impl StorageWorker {
                     target: "mackesd::alert",
                     "ALERT (warn): storage apply refused — {e}"
                 );
-                return false;
+                return StorageApplyOutcome {
+                    changed: false,
+                    progress: Vec::new(),
+                };
             }
         };
         let total = queue.ops.len();
         let host = self.node_id.clone();
         let dev = device.clone();
-        let topic = progress_topic(&self.node_id);
-        // Run the (sync, pure-over-seams) queue on a blocking thread; stream
-        // per-op progress to the Bus as each op resolves.
+        // Run the (sync, pure-over-seams) queue on a blocking thread. Progress is
+        // staged in memory and published only after the complete queue resolves.
         let interlocks = Arc::clone(&self.interlocks);
         let executor = Arc::clone(&self.executor);
-        let progress_bus_root = bus_root.map(Path::to_path_buf);
         let staged_for_apply = staged.clone();
         let queue_for_apply = queue.clone();
         let live_for_apply = live;
         let outcome = tokio::task::spawn_blocking(move || {
-            apply_queue(
+            let mut progress = Vec::new();
+            let outcome = apply_queue(
                 &queue_for_apply,
                 &staged_for_apply,
                 &live_for_apply,
@@ -3260,7 +3350,7 @@ impl StorageWorker {
                 &*executor,
                 |idx, status| {
                     if let Some(state) = ProgressState::from_status(status) {
-                        let progress = StorageProgress {
+                        let event = StorageProgress {
                             host: host.clone(),
                             device: dev.clone(),
                             op_index: idx,
@@ -3269,14 +3359,15 @@ impl StorageWorker {
                             state,
                             published_at_ms: now_ms(),
                         };
-                        publish_json(progress_bus_root.as_deref(), &topic, &progress);
+                        progress.push(event);
                     }
                 },
-            )
+            );
+            (outcome, progress)
         })
         .await;
         match outcome {
-            Ok(o) => {
+            Ok((o, progress)) => {
                 if !o.is_success() {
                     tracing::warn!(
                         target: "mackesd::alert",
@@ -3295,64 +3386,245 @@ impl StorageWorker {
                         );
                     }
                 }
-                o.applied > 0
+                StorageApplyOutcome {
+                    changed: o.applied > 0,
+                    progress,
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "storage: apply task join failed");
-                false
+                StorageApplyOutcome {
+                    changed: false,
+                    progress: Vec::new(),
+                }
             }
         }
     }
 
-    /// Drain + handle new requests addressed to this node's topic. Returns `true`
-    /// when the topology likely changed (so the caller republishes the mirror).
-    async fn drain_and_apply(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
-        let topic = action_topic(&self.node_id);
-        let requests = read_new_requests(
-            bus_root,
-            &topic,
-            cursor,
-            self.authorizer.as_ref(),
-            &self.node_id,
-        );
+    /// Atomically tail-prime physical and virtual transient action lanes for a
+    /// newly observed Bus index. Neither cursor changes unless both tails and
+    /// the final identity check succeed.
+    fn activate_bus(
+        &self,
+        root: &Path,
+        index: StorageBusIdentity,
+        persist: &Persist,
+        state: &mut StorageBusState,
+    ) -> Result<(), String> {
+        if state.active_index == Some(index) {
+            return Ok(());
+        }
+        let cursor = persist
+            .latest_ulid(&action_topic(&self.node_id))
+            .map_err(|error| error.to_string())?;
+        let virtual_cursor = persist
+            .latest_ulid(&super::virtual_storage::action_topic(&self.node_id))
+            .map_err(|error| error.to_string())?;
+        self.verify_bus_identity(root, index)?;
+        state.active_index = Some(index);
+        state.cursor = cursor;
+        state.virtual_cursor = virtual_cursor;
+        Ok(())
+    }
+
+    async fn flush_pending(
+        &self,
+        state: &mut StorageBusState,
+        last_at: &mut Option<Instant>,
+    ) -> Result<(), String> {
+        let Some(mut pending) = state.pending.take() else {
+            return Ok(());
+        };
+        let result = async {
+            let (root, index, persist) = self.open_bus_transaction()?;
+            if pending.progress_destination != Some(index) {
+                pending.progress_index = 0;
+                pending.progress_destination = Some(index);
+            }
+            while let Some(progress) = pending.progress.get(pending.progress_index) {
+                self.write_json(&persist, &progress_topic(&self.node_id), progress)?;
+                self.verify_bus_identity(&root, index)?;
+                pending.progress_index += 1;
+            }
+            drop(persist);
+            if pending.publish_snapshot {
+                let snapshot = self.storage_state().await;
+                let (snapshot_root, snapshot_index, snapshot_persist) =
+                    self.open_bus_transaction()?;
+                if snapshot_index != index {
+                    pending.progress_index = 0;
+                    pending.progress_destination = Some(snapshot_index);
+                    return Err("storage Bus changed before snapshot publication".to_string());
+                }
+                self.write_json(&snapshot_persist, &state_topic(&self.node_id), &snapshot)?;
+                self.verify_bus_identity(&snapshot_root, snapshot_index)?;
+                *last_at = Some(Instant::now());
+                pending.publish_snapshot = false;
+            }
+            if pending.source_index == index {
+                state.cursor = pending.cursor.clone();
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            state.pending = Some(pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Strictly stage one complete physical action-lane read, execute its
+    /// authorized requests, and install the required progress/state publications
+    /// as one corrected-forward commit before acknowledging the cursor.
+    async fn drain_and_apply(
+        &self,
+        index: StorageBusIdentity,
+        messages: Vec<StoredMessage>,
+        state: &mut StorageBusState,
+        last_at: &mut Option<Instant>,
+    ) -> Result<bool, String> {
+        let mut cursor = state.cursor.clone();
         let mut changed = false;
-        for req in requests {
-            match req {
+        let mut publish_snapshot = false;
+        let mut progress = Vec::new();
+        for message in messages {
+            cursor = Some(message.ulid.clone());
+            let body = message.body.as_deref().unwrap_or("");
+            let request = match parse_request(body) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(ulid = %message.ulid, %error, "storage: bad storage request");
+                    continue;
+                }
+            };
+            match request {
                 StorageRequest::Apply {
                     armed_device,
                     staged,
                     queue,
                 } => {
-                    if self
-                        .handle_apply(&armed_device, &staged, &queue, Some(bus_root))
-                        .await
-                    {
-                        changed = true;
+                    if let Err(error) = self.authorizer.authorize(
+                        body,
+                        MutationContext {
+                            verb: "storage-apply",
+                            node: &self.node_id,
+                            target: &armed_device,
+                        },
+                    ) {
+                        tracing::warn!(
+                            target: "mackesd::storage",
+                            ulid = %message.ulid,
+                            node = %self.node_id,
+                            %error,
+                            "refused unauthorized privileged request"
+                        );
+                        continue;
                     }
+                    let outcome = self.handle_apply(&armed_device, &staged, &queue).await;
+                    changed |= outcome.changed;
+                    publish_snapshot |= outcome.changed;
+                    progress.extend(outcome.progress);
                 }
-                StorageRequest::Refresh => changed = true,
+                StorageRequest::Refresh => publish_snapshot = true,
             }
         }
-        changed
+        if cursor == state.cursor {
+            return Ok(false);
+        }
+        state.pending = Some(PendingStorageCommit {
+            source_index: index,
+            cursor,
+            progress,
+            progress_index: 0,
+            progress_destination: None,
+            publish_snapshot,
+        });
+        self.flush_pending(state, last_at).await?;
+        Ok(changed)
     }
 
     /// Republish the mirror when forced (an op applied) or the heartbeat elapsed.
     async fn publish_snapshot(
         &self,
-        bus_root: Option<&Path>,
+        expected_index: StorageBusIdentity,
         last_at: &mut Option<Instant>,
         force: bool,
-    ) {
+    ) -> Result<(), String> {
         let now = Instant::now();
         let due = force
             || last_at
                 .as_ref()
                 .is_none_or(|at| now.duration_since(*at) >= self.heartbeat);
         if !due {
-            return;
+            return Ok(());
         }
-        self.publish_state(bus_root).await;
+        let snapshot = self.storage_state().await;
+        let (root, index, persist) = self.open_bus_transaction()?;
+        if index != expected_index {
+            return Err("storage Bus changed before heartbeat publication".to_string());
+        }
+        self.write_json(&persist, &state_topic(&self.node_id), &snapshot)?;
+        self.verify_bus_identity(&root, index)?;
         *last_at = Some(now);
+        Ok(())
+    }
+
+    async fn cycle(
+        &self,
+        state: &mut StorageBusState,
+        last_at: &mut Option<Instant>,
+    ) -> Result<(), String> {
+        let (root, index, persist) = self.open_bus_transaction()?;
+        let new_index = state.active_index != Some(index);
+        self.activate_bus(&root, index, &persist, state)?;
+        drop(persist);
+        self.flush_pending(state, last_at).await?;
+
+        let (root, index, persist) = self.open_bus_transaction()?;
+        if state.active_index != Some(index) {
+            return Err("storage Bus changed after pending commit".to_string());
+        }
+        if Self::consume_fault(&self.bus_read_failures) {
+            return Err("injected storage virtual-lane read failure".to_string());
+        }
+        // Preflight the complete sibling mutation lane before any physical
+        // effect. `VirtualStorage::tick` performs its own decode/authorization,
+        // but an unavailable sibling lane must not masquerade as empty while a
+        // physical batch proceeds.
+        read_new_messages(
+            &persist,
+            &super::virtual_storage::action_topic(&self.node_id),
+            state.virtual_cursor.as_deref(),
+        )?;
+        if Self::consume_fault(&self.bus_read_failures) {
+            return Err("injected storage physical-lane read failure".to_string());
+        }
+        let messages = read_new_messages(
+            &persist,
+            &action_topic(&self.node_id),
+            state.cursor.as_deref(),
+        )?;
+        self.verify_bus_identity(&root, index)?;
+        drop(persist);
+        self.drain_and_apply(index, messages, state, last_at)
+            .await?;
+        self.publish_snapshot(index, last_at, new_index).await?;
+
+        if self.virtual_enabled {
+            let virtual_storage = self.virtual_storage.clone();
+            let authorizer = Arc::clone(&self.authorizer);
+            let virtual_root = root.clone();
+            let virtual_cursor = state.virtual_cursor.clone();
+            let advanced = tokio::task::spawn_blocking(move || {
+                virtual_storage.tick(&virtual_root, virtual_cursor, authorizer.as_ref())
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            self.verify_bus_identity(&root, index)?;
+            state.virtual_cursor = advanced;
+        }
+        Ok(())
     }
 }
 
@@ -3372,42 +3644,20 @@ impl Worker for StorageWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = self.bus_root();
-        // Publish an immediate mirror so a panel doesn't wait a heartbeat.
+        let mut bus_state = StorageBusState::default();
         let mut last_pub: Option<Instant> = None;
-        self.publish_snapshot(bus_root.as_deref(), &mut last_pub, true)
-            .await;
-        // Skip any Apply backlog so a restart doesn't re-run stale destructive ops.
-        let mut cursor = bus_root
-            .as_deref()
-            .and_then(|r| prime_cursor(r, &action_topic(&self.node_id)));
-        // The E12-22 virtual queue drains its own sibling topic; prime its cursor too.
-        let mut virtual_cursor = bus_root
-            .as_deref()
-            .and_then(|r| self.virtual_storage.prime_cursor(r));
+        // Immediate attempt; a late/unopenable Bus is retried by this same worker
+        // on the bounded poll cadence without claiming an empty/successful cycle.
+        if let Err(error) = self.cycle(&mut bus_state, &mut last_pub).await {
+            tracing::warn!(target: "mackesd::storage", %error, "storage Bus cycle deferred");
+        }
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let changed = if let Some(root) = &bus_root {
-                        self.drain_and_apply(root, &mut cursor).await
-                    } else {
-                        false
-                    };
-                    self.publish_snapshot(bus_root.as_deref(), &mut last_pub, changed).await;
-                    // The virtual sub-worker shells qemu-img/podman (blocking, bounded
-                    // by EFF-20), so run its tick off the runtime thread.
-                    if let Some(root) = &bus_root {
-                        let vs = self.virtual_storage.clone();
-                        let authorizer = Arc::clone(&self.authorizer);
-                        let root = root.clone();
-                        let cur = virtual_cursor.clone();
-                        virtual_cursor = tokio::task::spawn_blocking(move || {
-                            vs.tick(&root, cur, authorizer.as_ref())
-                        })
-                            .await
-                            .unwrap_or(virtual_cursor);
+                    if let Err(error) = self.cycle(&mut bus_state, &mut last_pub).await {
+                        tracing::warn!(target: "mackesd::storage", %error, "storage Bus cycle deferred");
                     }
                 }
                 () = shutdown.wait() => break,
@@ -4646,7 +4896,9 @@ mod tests {
             .with_udisks(Arc::new(FakeUDisks(Ok(sample_topo()))))
             .with_executor(executor.clone())
             .with_interlocks(Arc::new(free_interlocks()))
-            .with_authorizer(authorizer);
+            .with_authorizer(authorizer)
+            .with_bus_root(dir.path().to_path_buf())
+            .without_virtual_tick();
 
         let unsigned = serde_json::to_string(&storage_apply_request("unsigned")).unwrap();
         let future = signed_storage_body("future", "future", AUTH_NOW + 30_000)
@@ -4664,8 +4916,17 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut cursor = None;
-        worker.drain_and_apply(dir.path(), &mut cursor).await;
+        let index = storage_bus_identity(dir.path()).unwrap();
+        let mut state = StorageBusState {
+            active_index: Some(index),
+            ..Default::default()
+        };
+        let mut last_pub = None;
+        let messages = read_new_messages(&persist, &action_topic("node"), None).unwrap();
+        worker
+            .drain_and_apply(index, messages, &mut state, &mut last_pub)
+            .await
+            .unwrap();
         assert_eq!(*executor.seen.lock().unwrap(), 0);
 
         let replay = signed_storage_body("once", "replay", AUTH_NOW + 30_000);
@@ -4679,7 +4940,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        worker.drain_and_apply(dir.path(), &mut cursor).await;
+        let messages =
+            read_new_messages(&persist, &action_topic("node"), state.cursor.as_deref()).unwrap();
+        worker
+            .drain_and_apply(index, messages, &mut state, &mut last_pub)
+            .await
+            .unwrap();
         assert_eq!(*executor.seen.lock().unwrap(), 1);
     }
 
@@ -4763,6 +5029,210 @@ mod tests {
         assert_eq!(w.name(), "storage");
     }
 
+    #[tokio::test]
+    async fn storage_recovers_late_and_replaced_bus_without_replaying_retained_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::write(&bus, b"temporarily unavailable").unwrap();
+        let executor = Arc::new(FakeExecutor::ok());
+        let worker = StorageWorker::new("node".into())
+            .with_udisks(Arc::new(FakeUDisks(Ok(sample_topo()))))
+            .with_executor(executor.clone())
+            .with_interlocks(Arc::new(free_interlocks()))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                auth_tmp.path().join("auth"),
+                AUTH_NOW,
+            )))
+            .with_bus_root(bus.clone())
+            .without_virtual_tick();
+        let mut state = StorageBusState::default();
+        let mut last_pub = None;
+
+        assert!(worker.cycle(&mut state, &mut last_pub).await.is_err());
+        assert!(state.active_index.is_none());
+        assert!(last_pub.is_none());
+
+        fs::remove_file(&bus).unwrap();
+        let first = Persist::open(bus.clone()).unwrap();
+        first
+            .write(
+                &action_topic("node"),
+                Priority::Default,
+                None,
+                Some(&signed_storage_body(
+                    "retained",
+                    "storage-retained",
+                    AUTH_NOW + 30_000,
+                )),
+            )
+            .unwrap();
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        assert_eq!(*executor.seen.lock().unwrap(), 0, "retained apply skipped");
+
+        first
+            .write(
+                &action_topic("node"),
+                Priority::Default,
+                None,
+                Some(&signed_storage_body(
+                    "forward",
+                    "storage-forward",
+                    AUTH_NOW + 30_000,
+                )),
+            )
+            .unwrap();
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        assert_eq!(*executor.seen.lock().unwrap(), 1);
+        drop(first);
+
+        let replacement = tmp.path().join("replacement");
+        let replacement_bus = Persist::open(replacement.clone()).unwrap();
+        replacement_bus
+            .write(
+                &action_topic("node"),
+                Priority::Default,
+                None,
+                Some(&signed_storage_body(
+                    "replacement-retained",
+                    "storage-replacement-retained",
+                    AUTH_NOW + 30_000,
+                )),
+            )
+            .unwrap();
+        drop(replacement_bus);
+        fs::rename(replacement.join("index.sqlite"), bus.join("index.sqlite")).unwrap();
+
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        assert_eq!(
+            *executor.seen.lock().unwrap(),
+            1,
+            "replacement retained apply skipped"
+        );
+        let replacement_bus = Persist::open(bus.clone()).unwrap();
+        replacement_bus
+            .write(
+                &action_topic("node"),
+                Priority::Default,
+                None,
+                Some(&signed_storage_body(
+                    "replacement-forward",
+                    "storage-replacement-forward",
+                    AUTH_NOW + 30_000,
+                )),
+            )
+            .unwrap();
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        assert_eq!(*executor.seen.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn action_read_failure_is_effect_free_and_preserves_cursor_for_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let executor = Arc::new(FakeExecutor::ok());
+        let worker = StorageWorker::new("node".into())
+            .with_udisks(Arc::new(FakeUDisks(Ok(sample_topo()))))
+            .with_executor(executor.clone())
+            .with_interlocks(Arc::new(free_interlocks()))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                auth_tmp.path().join("auth"),
+                AUTH_NOW,
+            )))
+            .with_bus_root(bus.clone())
+            .without_virtual_tick();
+        let mut state = StorageBusState::default();
+        let mut last_pub = None;
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        let initial_cursor = state.cursor.clone();
+        persist
+            .write(
+                &action_topic("node"),
+                Priority::Default,
+                None,
+                Some(&signed_storage_body(
+                    "read-retry",
+                    "storage-read-retry",
+                    AUTH_NOW + 30_000,
+                )),
+            )
+            .unwrap();
+        // Let the virtual-lane preflight succeed, then fail the final physical
+        // action-lane read. The complete sweep must remain effect-free.
+        worker.bus_read_failures.store(2, Ordering::Relaxed);
+
+        assert!(worker.cycle(&mut state, &mut last_pub).await.is_err());
+        assert_eq!(state.cursor, initial_cursor);
+        assert!(state.pending.is_none());
+        assert_eq!(*executor.seen.lock().unwrap(), 0);
+
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        assert_eq!(*executor.seen.lock().unwrap(), 1);
+        assert_ne!(state.cursor, initial_cursor);
+    }
+
+    #[tokio::test]
+    async fn publication_failure_keeps_pending_cursor_and_retries_without_repeating_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let executor = Arc::new(FakeExecutor::ok());
+        let worker = StorageWorker::new("node".into())
+            .with_udisks(Arc::new(FakeUDisks(Ok(sample_topo()))))
+            .with_executor(executor.clone())
+            .with_interlocks(Arc::new(free_interlocks()))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                auth_tmp.path().join("auth"),
+                AUTH_NOW,
+            )))
+            .with_bus_root(bus.clone())
+            .without_virtual_tick();
+        let mut state = StorageBusState::default();
+        let mut last_pub = None;
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        let initial_cursor = state.cursor.clone();
+        persist
+            .write(
+                &action_topic("node"),
+                Priority::Default,
+                None,
+                Some(&signed_storage_body(
+                    "publish-retry",
+                    "storage-publish-retry",
+                    AUTH_NOW + 30_000,
+                )),
+            )
+            .unwrap();
+        worker.bus_write_failures.store(1, Ordering::Relaxed);
+
+        assert!(worker.cycle(&mut state, &mut last_pub).await.is_err());
+        assert_eq!(*executor.seen.lock().unwrap(), 1);
+        assert_eq!(state.cursor, initial_cursor);
+        assert!(state.pending.is_some());
+
+        worker.cycle(&mut state, &mut last_pub).await.unwrap();
+        assert_eq!(
+            *executor.seen.lock().unwrap(),
+            1,
+            "corrected-forward publication must not repeat destructive apply"
+        );
+        assert!(state.pending.is_none());
+        assert_ne!(state.cursor, initial_cursor);
+        assert_eq!(
+            persist
+                .list_since(&progress_topic("node"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     // multi_thread runtime so the spawned worker task runs on its OWN thread rather
     // than being serialized behind the test body on a single current-thread executor.
     // On a heavily-loaded farm node (e.g. a concurrent native helper compile pushing load >12)
@@ -4802,8 +5272,10 @@ mod tests {
         let w = StorageWorker::new("node".into())
             .with_udisks(Arc::new(FakeUDisks(Err("no udisks2".into()))))
             .with_bus_root(dir.path().to_path_buf());
-        w.publish_state(Some(dir.path())).await;
         let persist = Persist::open(dir.path().to_path_buf()).expect("open test bus");
+        let state = w.storage_state().await;
+        w.write_json(&persist, &state_topic("node"), &state)
+            .unwrap();
         let msg = persist
             .list_since(&state_topic("node"), None)
             .expect("read storage mirror")
