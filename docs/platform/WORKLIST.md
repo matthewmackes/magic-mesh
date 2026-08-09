@@ -466,8 +466,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-auditor-bus-recovery-r39.md`.
 - **Scheduled-snapshot recovery (2026-08-09):** schedule/history reads precede effects; failed result publication cannot repeat effects. Machine 193 passed four exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-snap-scheduler-bus-recovery-r42.md`.
-- **Navigation transaction recovery checkpoint (2026-08-09):** complete
-  three-lane reads and durable final-state publication precede cursor commit; failed publication retries without another provider call. Machine 9 passed six exact tests:
+- **Navigation recovery (2026-08-09):** reads/publication precede cursor commit; failed writes retry without another provider call. Machine 9 passed six exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-navigation-bus-transaction-recovery-r44.md`.
 - **Clock transaction recovery checkpoint (2026-08-09):** durable command and
   audio acknowledgement cursors survive late storage, commit failure, and publication failure in the same worker. Machine 194 passed four exact tests:
@@ -502,6 +501,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-firms-overlay-bus-recovery-r62.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-transit-overlay-bus-recovery-r63.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-wildfire-overlay-bus-recovery-r64.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
@@ -870,6 +870,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-earthquake-overlay-bus-recovery-r61.md`.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-firms-overlay-bus-recovery-r62.md`.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-transit-overlay-bus-recovery-r63.md`.
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-wildfire-overlay-bus-recovery-r64.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

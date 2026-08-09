@@ -13,7 +13,7 @@
 #![cfg(feature = "async-services")]
 
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +26,9 @@ use reqwest::header::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
 
@@ -709,8 +712,42 @@ fn io_other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+#[derive(Clone)]
 enum PreparedResponse {
     Modified(WildfireSnapshot),
+}
+
+enum RefreshCommit {
+    Applied(ApplyOutcome),
+    ContextChanged,
+    NoContext,
+}
+
+trait WildfireBus {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>>;
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &WildfireSnapshot) -> io::Result<()>;
+}
+
+impl WildfireBus for Persist {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+        self.reopen_if_index_changed();
+        self.read_latest(topic)
+            .map_err(io_other)?
+            .map(|message| {
+                message
+                    .body
+                    .ok_or_else(|| io::Error::other("wildfire Bus row has no body"))
+            })
+            .transpose()
+    }
+
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &WildfireSnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        self.reopen_if_index_changed();
+        self.write(topic, Priority::Default, None, Some(&body))
+            .map(|_| ())
+            .map_err(io_other)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,7 +760,7 @@ struct ApplyOutcome {
 pub struct WildfireOverlayWorker {
     host: String,
     probe: Option<Arc<dyn WildfireProbe>>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -752,7 +789,7 @@ impl WildfireOverlayWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -764,10 +801,11 @@ impl WildfireOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override Bus access. Production resolves the current user/system root
+    /// for every transaction when no override is configured.
     #[must_use]
-    pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+    pub fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
         self
     }
 
@@ -778,23 +816,28 @@ impl WildfireOverlayWorker {
         self
     }
 
-    fn current_context(&self) -> Option<WildfireContext> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
-        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
-        validated_vehicle_context(&vehicle, &self.host, now_ms())
+    fn open_bus(&self) -> io::Result<Persist> {
+        let root = wildfire_bus_root(
+            self.bus_root_override.as_deref(),
+            crate::bus_publish::default_bus_root(),
+        );
+        let mut persist = Persist::open(root).map_err(io_other)?;
+        persist.reopen_if_index_changed();
+        Ok(persist)
     }
 
-    fn publish(&self, snapshot: &WildfireSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &wildfire_state_topic(&self.host),
-                snapshot,
-            );
-        }
+    fn current_context(&self, bus: &mut impl WildfireBus) -> io::Result<Option<WildfireContext>> {
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
+        let Some(body) = bus.read_latest_body(&topic)? else {
+            return Ok(None);
+        };
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
+        Ok(validated_vehicle_context(&vehicle, &self.host, now_ms()))
+    }
+
+    fn publish(&self, bus: &mut impl WildfireBus, snapshot: &WildfireSnapshot) -> io::Result<()> {
+        bus.publish_snapshot(&wildfire_state_topic(&self.host), snapshot)
     }
 
     fn degraded_snapshot(
@@ -816,46 +859,95 @@ impl WildfireOverlayWorker {
 
     fn publish_unavailable(
         &self,
+        bus: &mut impl WildfireBus,
+        last_good: &mut Option<WildfireSnapshot>,
         context: Option<WildfireContext>,
         reason: impl std::fmt::Display,
-    ) {
+    ) -> io::Result<()> {
         let reason = reason.to_string();
         tracing::warn!(target: "mackesd::wildfire_overlay", host = %self.host, error = %reason, "WFIGS refresh unavailable; publishing empty degraded snapshot");
         let degraded = self.degraded_snapshot(context, reason);
-        self.publish(&degraded);
+        self.publish(bus, &degraded)?;
+        if context.is_none()
+            || last_good.as_ref().is_some_and(|snapshot| {
+                context
+                    != Some(WildfireContext {
+                        latitude: snapshot.query_latitude,
+                        longitude: snapshot.query_longitude,
+                    })
+            })
+        {
+            *last_good = None;
+        }
+        Ok(())
     }
 
-    fn publish_no_context_degraded(&self, reason: &str, last_good: &mut Option<WildfireSnapshot>) {
-        tracing::warn!(target: "mackesd::wildfire_overlay", host = %self.host, error = reason, "WFIGS refresh has no fresh same-host vehicle context; publishing empty degraded snapshot");
-        let degraded = self.degraded_snapshot(None, reason);
-        self.publish(&degraded);
-        // WFIGS perimeters are vehicle-scoped. Once the same-host fix
-        // disappears, retain the Bus topic but do not allow a later failure or
-        // 304 to replay perimeters from a stale prior point.
-        *last_good = None;
+    fn ensure_no_context_published(
+        &self,
+        bus: &mut impl WildfireBus,
+        last_good: &mut Option<WildfireSnapshot>,
+        no_context_published: &mut bool,
+    ) -> io::Result<()> {
+        if *no_context_published {
+            let current = bus
+                .read_latest_body(&wildfire_state_topic(&self.host))?
+                .map(|body| serde_json::from_str::<WildfireSnapshot>(&body).map_err(io_other))
+                .transpose()?;
+            if current.is_some_and(|snapshot| {
+                snapshot.host == self.host
+                    && snapshot.perimeters.is_empty()
+                    && snapshot.query_radius_km == 0
+            }) {
+                return Ok(());
+            }
+        }
+        self.publish_unavailable(
+            bus,
+            last_good,
+            None,
+            "fresh same-host US vehicle fix unavailable",
+        )?;
+        *no_context_published = true;
+        Ok(())
+    }
+
+    fn current_context_or_clear(
+        &self,
+        bus: &mut impl WildfireBus,
+        last_good: &mut Option<WildfireSnapshot>,
+        no_context_published: &mut bool,
+    ) -> io::Result<Option<WildfireContext>> {
+        let context = self.current_context(bus)?;
+        if context.is_some() {
+            *no_context_published = false;
+        } else {
+            self.ensure_no_context_published(bus, last_good, no_context_published)?;
+        }
+        Ok(context)
     }
 
     fn apply_result(
         &self,
+        bus: &mut impl WildfireBus,
         result: Result<PreparedResponse, ProbeFailure>,
         context: WildfireContext,
         last_good: &mut Option<WildfireSnapshot>,
-    ) -> ApplyOutcome {
+    ) -> io::Result<ApplyOutcome> {
         match result {
             Ok(PreparedResponse::Modified(snapshot)) => {
-                self.publish(&snapshot);
+                self.publish(bus, &snapshot)?;
                 *last_good = Some(snapshot);
-                ApplyOutcome {
+                Ok(ApplyOutcome {
                     success: true,
                     retry_after: None,
-                }
+                })
             }
             Err(error) => {
-                self.publish_unavailable(Some(context), &error);
-                ApplyOutcome {
+                self.publish_unavailable(bus, last_good, Some(context), &error)?;
+                Ok(ApplyOutcome {
                     success: false,
                     retry_after: error.retry_after(),
-                }
+                })
             }
         }
     }
@@ -910,6 +1002,28 @@ impl WildfireOverlayWorker {
     }
 }
 
+fn wildfire_bus_root(explicit: Option<&Path>, current: Option<PathBuf>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or(current)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn storage_retry_delay(current: Duration, poll: Duration) -> Duration {
+    current
+        .max(Duration::from_millis(1))
+        .min(poll)
+        .min(RETRY_MAX)
+}
+
+fn storage_backoff(current: Duration, poll: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .max(Duration::from_millis(1))
+        .min(poll)
+        .min(RETRY_MAX)
+}
+
 fn validated_vehicle_context(
     vehicle: &mackes_mesh_types::vehicle::VehicleState,
     expected_host: &str,
@@ -962,30 +1076,113 @@ impl Worker for WildfireOverlayWorker {
         };
         let mut last_good = None;
         let mut retry = RETRY_MIN;
-        let mut no_fix_published = false;
+        let mut storage_retry = self.poll.min(RETRY_MIN);
+        let mut no_context_published = false;
+        let mut pending: Option<(WildfireContext, Result<PreparedResponse, ProbeFailure>)> = None;
         loop {
-            let Some(context) = self.current_context() else {
-                if !no_fix_published {
-                    self.publish_no_context_degraded(
-                        "fresh same-host US vehicle fix unavailable",
+            let context = match self.open_bus().and_then(|mut bus| {
+                self.current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published)
+            }) {
+                Ok(Some(context)) => context,
+                Ok(None) => {
+                    pending = None;
+                    retry = RETRY_MIN;
+                    storage_retry = self.poll.min(RETRY_MIN);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(self.poll) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::wildfire_overlay", host = %self.host, %error, "wildfire vehicle context transaction deferred");
+                    let delay = storage_retry_delay(storage_retry, self.poll);
+                    storage_retry = storage_backoff(storage_retry, self.poll);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            };
+            storage_retry = self.poll.min(RETRY_MIN);
+            if pending
+                .as_ref()
+                .is_some_and(|(pending_context, _)| *pending_context != context)
+            {
+                pending = None;
+            }
+            if pending.is_none() {
+                let Some(result) = self
+                    .fetch_async(probe.clone(), context, last_good.clone(), &mut shutdown)
+                    .await
+                else {
+                    break;
+                };
+                pending = Some((context, result));
+            }
+
+            // WFIGS I/O runs without a Bus handle. Re-open and re-read the
+            // exact vehicle authority before any projection or private-state
+            // commit. Keep a prepared response across storage failure so a
+            // successful conditional fetch can correct forward without
+            // repeating the provider request or admitting an old perimeter.
+            let commit = self.open_bus().and_then(|mut bus| {
+                let latest = self.current_context(&mut bus)?;
+                let Some(latest) = latest else {
+                    self.ensure_no_context_published(
+                        &mut bus,
                         &mut last_good,
-                    );
-                    no_fix_published = true;
+                        &mut no_context_published,
+                    )?;
+                    return Ok(RefreshCommit::NoContext);
+                };
+                if latest != context {
+                    self.publish_unavailable(
+                        &mut bus,
+                        &mut last_good,
+                        Some(latest),
+                        "vehicle point changed during WFIGS refresh",
+                    )?;
+                    return Ok(RefreshCommit::ContextChanged);
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(self.poll) => {}
+                let result = pending.as_ref().expect("prepared WFIGS result").1.clone();
+                self.apply_result(&mut bus, result, context, &mut last_good)
+                    .map(RefreshCommit::Applied)
+            });
+            let outcome = match commit {
+                Ok(RefreshCommit::Applied(outcome)) => {
+                    pending = None;
+                    outcome
                 }
-                continue;
+                Ok(RefreshCommit::ContextChanged) => {
+                    pending = None;
+                    ApplyOutcome {
+                        success: false,
+                        retry_after: None,
+                    }
+                }
+                Ok(RefreshCommit::NoContext) => {
+                    pending = None;
+                    no_context_published = true;
+                    retry = RETRY_MIN;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(self.poll) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::wildfire_overlay", host = %self.host, %error, "wildfire refresh transaction deferred");
+                    let delay = storage_retry_delay(storage_retry, self.poll);
+                    storage_retry = storage_backoff(storage_retry, self.poll);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
             };
-            no_fix_published = false;
-            let Some(result) = self
-                .fetch_async(probe.clone(), context, last_good.clone(), &mut shutdown)
-                .await
-            else {
-                break;
-            };
-            let outcome = self.apply_result(result, context, &mut last_good);
             let delay = effective_retry(outcome, retry, self.poll);
             retry = if outcome.success {
                 RETRY_MIN
@@ -1023,7 +1220,7 @@ fn now_ms() -> i64 {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use mackes_mesh_types::vehicle::{GpsFix, VehicleState};
     use mde_bus::persist::Persist;
@@ -1037,6 +1234,109 @@ mod tests {
         WildfireContext {
             latitude: 44.0,
             longitude: -120.0,
+        }
+    }
+
+    fn vehicle(context: WildfireContext) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude: context.latitude,
+            longitude: context.longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn write_vehicle(root: &Path, context: WildfireContext) {
+        let body = serde_json::to_string(&vehicle(context)).expect("vehicle body");
+        Persist::open(root.to_path_buf())
+            .expect("vehicle Bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("vehicle write");
+    }
+
+    #[derive(Default)]
+    struct FixtureBus {
+        body: Option<String>,
+        output_body: Option<String>,
+        read_fails: bool,
+        failed_writes_remaining: usize,
+        published: Vec<WildfireSnapshot>,
+    }
+
+    impl WildfireBus for FixtureBus {
+        fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+            if self.read_fails {
+                return Err(io::Error::other("injected wildfire Bus read failure"));
+            }
+            if topic == wildfire_state_topic("rig-1") {
+                Ok(self.output_body.clone())
+            } else {
+                Ok(self.body.clone())
+            }
+        }
+
+        fn publish_snapshot(
+            &mut self,
+            _topic: &str,
+            snapshot: &WildfireSnapshot,
+        ) -> io::Result<()> {
+            if self.failed_writes_remaining > 0 {
+                self.failed_writes_remaining -= 1;
+                return Err(io::Error::other("injected wildfire Bus write failure"));
+            }
+            self.output_body = Some(serde_json::to_string(snapshot).expect("snapshot body"));
+            self.published.push(snapshot.clone());
+            Ok(())
+        }
+    }
+
+    struct LiveProbe;
+
+    impl WildfireProbe for LiveProbe {
+        fn fetch(&self, _context: WildfireContext) -> Result<ProbeResponse, ProbeFailure> {
+            Ok(ProbeResponse::Modified(captured_geojson()))
+        }
+    }
+
+    struct CountingProbe(Arc<AtomicUsize>);
+
+    impl WildfireProbe for CountingProbe {
+        fn fetch(&self, _context: WildfireContext) -> Result<ProbeResponse, ProbeFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ProbeResponse::Modified(captured_geojson()))
+        }
+    }
+
+    struct NotModifiedProbe;
+
+    impl WildfireProbe for NotModifiedProbe {
+        fn fetch(&self, _context: WildfireContext) -> Result<ProbeResponse, ProbeFailure> {
+            Ok(ProbeResponse::NotModified)
+        }
+    }
+
+    struct MovingProbe {
+        root: PathBuf,
+        moved: WildfireContext,
+        calls: AtomicUsize,
+    }
+
+    impl WildfireProbe for MovingProbe {
+        fn fetch(&self, _context: WildfireContext) -> Result<ProbeResponse, ProbeFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            write_vehicle(&self.root, self.moved);
+            Ok(ProbeResponse::Modified(captured_geojson()))
         }
     }
 
@@ -1168,25 +1468,31 @@ mod tests {
     fn failed_refresh_publishes_empty_degraded_projection_and_retains_private_cache() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original =
             parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
         let mut last_good = None;
-        let success = worker.apply_result(
-            Ok(PreparedResponse::Modified(original)),
-            context(),
-            &mut last_good,
-        );
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        let success = worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                context(),
+                &mut last_good,
+            )
+            .expect("successful publication");
         assert!(success.success);
-        let paused = worker.apply_result(
-            Err(ProbeFailure::rate_limited(
-                Duration::from_secs(60),
-                "ArcGIS HTTP 429",
-            )),
-            context(),
-            &mut last_good,
-        );
+        let paused = worker
+            .apply_result(
+                &mut bus,
+                Err(ProbeFailure::rate_limited(
+                    Duration::from_secs(60),
+                    "ArcGIS HTTP 429",
+                )),
+                context(),
+                &mut last_good,
+            )
+            .expect("degraded publication");
         assert!(!paused.success);
         assert_eq!(paused.retry_after, Some(Duration::from_secs(60)));
         let retained = last_good.as_ref().expect("private conditional cache");
@@ -1221,14 +1527,18 @@ mod tests {
     fn no_fresh_vehicle_fix_publishes_empty_state_before_first_fetch() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let mut private_cache = None;
 
-        worker.publish_no_context_degraded(
-            "fresh same-host US vehicle fix unavailable",
-            &mut private_cache,
-        );
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        worker
+            .publish_unavailable(
+                &mut bus,
+                &mut private_cache,
+                None,
+                "fresh same-host US vehicle fix unavailable",
+            )
+            .expect("empty publication");
 
         assert!(private_cache.is_none());
         let body = Persist::open(root)
@@ -1258,17 +1568,21 @@ mod tests {
     fn no_vehicle_fix_degraded_snapshot_retracts_prior_perimeters_and_query_origin() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original =
             parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
         assert!(!original.perimeters.is_empty());
         let mut last_good = Some(original);
 
-        worker.publish_no_context_degraded(
-            "fresh same-host US vehicle fix unavailable",
-            &mut last_good,
-        );
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        worker
+            .publish_unavailable(
+                &mut bus,
+                &mut last_good,
+                None,
+                "fresh same-host US vehicle fix unavailable",
+            )
+            .expect("empty publication");
 
         assert!(
             last_good.is_none(),
@@ -1297,27 +1611,32 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let seed_worker =
-            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let original =
             parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
         let mut seed_cache = None;
         assert!(
             seed_worker
                 .apply_result(
+                    &mut Persist::open(root.clone()).expect("bus"),
                     Ok(PreparedResponse::Modified(original)),
                     context(),
                     &mut seed_cache,
                 )
+                .expect("seed publication")
                 .success
         );
 
-        let restarted =
-            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let restarted = WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let mut private_cache = None;
-        restarted.publish_no_context_degraded(
-            "fresh same-host US vehicle fix unavailable after restart",
-            &mut private_cache,
-        );
+        restarted
+            .publish_unavailable(
+                &mut Persist::open(root.clone()).expect("bus"),
+                &mut private_cache,
+                None,
+                "fresh same-host US vehicle fix unavailable after restart",
+            )
+            .expect("restart empty publication");
 
         assert!(private_cache.is_none());
         let body = Persist::open(root)
@@ -1385,6 +1704,344 @@ mod tests {
         assert!(!contacted.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn failed_context_and_publication_are_effect_free_and_no_context_is_transition_bounded() {
+        let worker = WildfireOverlayWorker::new("rig-1".to_string());
+        let original =
+            parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
+
+        for mut bus in [
+            FixtureBus {
+                read_fails: true,
+                ..FixtureBus::default()
+            },
+            FixtureBus {
+                body: Some("{not vehicle json".to_string()),
+                ..FixtureBus::default()
+            },
+        ] {
+            let mut last_good = Some(original.clone());
+            let mut no_context_published = false;
+            assert!(worker
+                .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+                .is_err());
+            assert_eq!(last_good.as_ref(), Some(&original));
+            assert!(!no_context_published);
+            assert!(bus.published.is_empty());
+        }
+
+        let mut bus = FixtureBus {
+            failed_writes_remaining: 1,
+            ..FixtureBus::default()
+        };
+        let mut last_good = Some(original.clone());
+        let mut no_context_published = false;
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published)
+            .is_err());
+        assert_eq!(last_good.as_ref(), Some(&original));
+        assert!(!no_context_published);
+        assert!(bus.published.is_empty());
+
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published)
+            .expect("corrected-forward no-context publication")
+            .is_none());
+        assert!(last_good.is_none());
+        assert!(no_context_published);
+        assert_eq!(bus.published.len(), 1);
+
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published)
+            .expect("suppressed repeated no-context poll")
+            .is_none());
+        assert_eq!(bus.published.len(), 1);
+
+        bus.output_body = None;
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published)
+            .expect("replacement index no-context publication")
+            .is_none());
+        assert_eq!(bus.published.len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_and_replaced_bus_recovers_external_context_and_shutdown() {
+        assert_eq!(
+            wildfire_bus_root(Some(Path::new("/explicit")), Some("/current".into())),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            wildfire_bus_root(None, Some("/current".into())),
+            PathBuf::from("/current")
+        );
+        assert_eq!(
+            wildfire_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("late-bus");
+        std::fs::write(&root, b"temporarily unopenable Bus root").expect("block Bus root");
+        let mut worker = WildfireOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(LiveProbe))
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "late Bus must not terminate worker");
+        std::fs::remove_file(&root).expect("unblock Bus root");
+
+        let topic = wildfire_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = Persist::open(root.clone())
+                    .expect("recovered Bus")
+                    .list_since(&topic, None)
+                    .expect("recovered rows");
+                if rows.len() == 1 {
+                    break;
+                }
+                assert!(rows.len() <= 1, "no-context transition appended repeatedly");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first no-context transition");
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(
+            Persist::open(root.clone())
+                .expect("Bus")
+                .list_since(&topic, None)
+                .expect("rows")
+                .len(),
+            1
+        );
+
+        let index = root.join("index.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = Persist::open(root.clone())
+                    .expect("replacement Bus")
+                    .list_since(&topic, None)
+                    .expect("replacement rows");
+                if rows.len() == 1 {
+                    break;
+                }
+                assert!(
+                    rows.len() <= 1,
+                    "replacement transition appended repeatedly"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement no-context transition");
+
+        let external_context = WildfireContext {
+            latitude: 43.5,
+            longitude: -121.0,
+        };
+        write_vehicle(&root, external_context);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = Persist::open(root.clone())
+                    .expect("replacement Bus")
+                    .read_latest(&topic)
+                    .expect("read projection")
+                    .and_then(|row| row.body)
+                    .and_then(|body| serde_json::from_str::<WildfireSnapshot>(&body).ok());
+                if snapshot.is_some_and(|snapshot| {
+                    snapshot.query_latitude == external_context.latitude
+                        && !snapshot.perimeters.is_empty()
+                }) {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before external context");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("external context projection");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_fetch_movement_withholds_stale_perimeters() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        write_vehicle(&root, context());
+        let moved = WildfireContext {
+            latitude: 43.0,
+            longitude: -121.0,
+        };
+        let mut worker = WildfireOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(MovingProbe {
+                root: root.clone(),
+                moved,
+                calls: AtomicUsize::new(0),
+            }))
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        let topic = wildfire_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = Persist::open(root.clone())
+                    .expect("Bus")
+                    .list_since(&topic, None)
+                    .expect("rows");
+                let snapshots: Vec<WildfireSnapshot> = rows
+                    .iter()
+                    .filter_map(|row| row.body.as_deref())
+                    .filter_map(|body| serde_json::from_str(body).ok())
+                    .collect();
+                if snapshots.iter().any(|snapshot| {
+                    snapshot.query_latitude == moved.latitude && snapshot.perimeters.is_empty()
+                }) {
+                    assert!(snapshots.iter().all(|snapshot| {
+                        snapshot.query_latitude != context().latitude
+                            || snapshot.perimeters.is_empty()
+                    }));
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before movement recheck");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("movement retraction");
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_write_corrects_forward_without_refetch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        write_vehicle(&root, context());
+        let state_path = root.join(wildfire_state_topic("rig-1"));
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create state parent");
+        std::fs::write(&state_path, b"block wildfire topic directory")
+            .expect("block wildfire publication");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = WildfireOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(CountingProbe(Arc::clone(&calls))))
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                assert!(!task.is_finished(), "worker exited before WFIGS result");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("provider call");
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_file(&state_path).expect("unblock wildfire publication");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = Persist::open(root.clone())
+                    .expect("Bus")
+                    .read_latest(&wildfire_state_topic("rig-1"))
+                    .expect("read wildfire")
+                    .and_then(|row| row.body)
+                    .and_then(|body| serde_json::from_str::<WildfireSnapshot>(&body).ok());
+                if snapshot.is_some_and(|snapshot| !snapshot.perimeters.is_empty()) {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before corrected-forward write"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("corrected-forward wildfire publication");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown timeout")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn not_modified_remains_bound_to_matching_context() {
+        let worker = WildfireOverlayWorker::new("rig-1".to_string());
+        let previous =
+            parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = ShutdownToken::from_receiver(shutdown_rx);
+        let moved = WildfireContext {
+            latitude: 42.0,
+            longitude: -122.0,
+        };
+
+        let mismatched = worker
+            .fetch_async(
+                Arc::new(NotModifiedProbe),
+                moved,
+                Some(previous.clone()),
+                &mut shutdown,
+            )
+            .await
+            .expect("fetch completed");
+        assert!(mismatched.is_err());
+
+        let matching = worker
+            .fetch_async(
+                Arc::new(NotModifiedProbe),
+                context(),
+                Some(previous),
+                &mut shutdown,
+            )
+            .await
+            .expect("fetch completed")
+            .expect("matching 304 accepted");
+        let PreparedResponse::Modified(snapshot) = matching;
+        assert_eq!(snapshot.query_latitude, context().latitude);
+        assert_eq!(snapshot.query_longitude, context().longitude);
+        assert!(!snapshot.perimeters.is_empty());
+    }
+
     struct SlowProbe;
 
     impl WildfireProbe for SlowProbe {
@@ -1396,7 +2053,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_wins_while_wfigs_query_is_in_flight() {
-        let worker = WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
+        let worker = WildfireOverlayWorker::new("rig-1".to_string());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut shutdown = ShutdownToken::from_receiver(rx);
         let sender = tokio::spawn(async move {
@@ -1419,7 +2076,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         let mut worker = WildfireOverlayWorker::new("rig-1".to_string())
             .with_probe(Arc::new(SlowProbe))
-            .with_bus_root(Some(root.clone()))
+            .with_bus_root(root.clone())
             .with_poll(Duration::from_millis(50));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
