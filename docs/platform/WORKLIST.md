@@ -177,6 +177,16 @@ behavioral evidence is not completion.
   claim live Dell/seat-15, native KMS/EGL, packaging-install, or restart proof.
   Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-wiring-r1.md`.
+- **Dell typed capacity-refusal checkpoint (2026-08-08):** Release 21 on Dell
+  published one capability-bound Browser Standard `StartAndAttach` through the
+  sole Workload operation lane. Live four-thread admission refused before any
+  actuator attempt or Display1 lease, retained the Browser VM shut off, and
+  published the expected typed failed state. OpenTofu, Ansible, libvirt, KVM,
+  Podman, storage, shell, and all six workers passed the focused live verifier.
+  The refusal's inaccurate same-profile remediation was corrected to recommend
+  the Small profile and is covered by one focused farm test. A larger-seat
+  successful first frame and the remaining lifecycle matrix remain. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-dell-capacity-refusal-r1.md`.
   1. S1 Inventory authorities and remove reachability.
      - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
      - Inputs: repository search, CI authority scan, current evidence.

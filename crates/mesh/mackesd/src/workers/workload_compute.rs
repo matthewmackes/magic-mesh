@@ -3410,11 +3410,11 @@ fn admission_message(admission: WorkloadAdmission) -> (&'static str, &'static st
         ),
         Some(mackes_mesh_types::workloads::AdmissionDenial::CpuReserve) => (
             "workload would consume the reserved host CPU",
-            "stop another workload or choose the Standard profile",
+            "stop another workload or choose the Small profile",
         ),
         Some(mackes_mesh_types::workloads::AdmissionDenial::MemoryReserve) => (
             "workload would consume the reserved host memory",
-            "stop another workload or choose the Standard profile",
+            "stop another workload or choose the Small profile",
         ),
         Some(mackes_mesh_types::workloads::AdmissionDenial::StorageReserve) => (
             "the managed storage pool for this Workload backend has insufficient free space",
@@ -3520,6 +3520,26 @@ mod tests {
     use super::*;
     use mackes_mesh_types::workloads::{WorkloadId, WorkloadProfile};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn capacity_refusal_recommends_the_smaller_profile() {
+        for denial in [
+            mackes_mesh_types::workloads::AdmissionDenial::CpuReserve,
+            mackes_mesh_types::workloads::AdmissionDenial::MemoryReserve,
+        ] {
+            let (_, remediation) = admission_message(WorkloadAdmission {
+                admitted: false,
+                denial: Some(denial),
+                available_vcpu: 0,
+                available_memory_mb: 0,
+                available_storage_gb: 0,
+            });
+            assert_eq!(
+                remediation,
+                "stop another workload or choose the Small profile"
+            );
+        }
+    }
 
     struct AllowAuthorizer;
     impl WorkloadAuthorizer for AllowAuthorizer {
