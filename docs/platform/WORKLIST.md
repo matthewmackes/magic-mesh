@@ -127,12 +127,10 @@ behavioral evidence is not completion.
 - **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
   repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
-- **Distributed migration recovery checkpoint (2026-08-08):** one bounded
-  atomic authority now persists all migration cursors, admitted source/target
-  and acknowledgement jobs, publish state, wall-clock deadlines, and retained
-  relinquish/rollback retries before external effects. BigBoy passed 53/53.
-  Live libvirt crash injection and seat lifecycle proof remain. Evidence:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-08-distributed-migration-ledger-r3.md`.
+- **Distributed migration recovery checkpoint (2026-08-08/09):** one bounded authority persists all cursors, jobs, outboxes, deadlines, and pre-effect claims.
+  BigBoy hostile gates cover same-path replacement; returned/join failures after terminal claims become durable Indeterminate state without repeats. Live proof remains:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-distributed-migration-ledger-r3.md`,
+  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
 - **Contract duplicate-key checkpoint (2026-08-06):** recursive Workload JSON rejects duplicate keys; `.50` passed 9/9. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-06-contract-duplicate-keys-r1.md`.
 - **Display1 expiry checkpoint (2026-08-06):** lease expiry revokes readiness,
@@ -426,7 +424,8 @@ behavioral evidence is not completion.
   complete reads precede effects; authorization/pending output prevents repeats. Gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`,
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`.
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
+  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
 - **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open/tail priming as one fail-closed activation, skips retained actions, and executes one
   forward signed action exactly once; BigBoy passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
@@ -441,9 +440,7 @@ behavioral evidence is not completion.
 - **Media-source Bus recovery checkpoint (2026-08-09):** discovery survives late and same-path-replaced storage and republishes the complete roster without restart.
   Exact machine-193/196 gates passed: `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`,
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-replacement-r81.md`.
-- **Media-server Bus recovery checkpoint (2026-08-09):** share manifests,
-  serving, aggregation, and publication remain behind recoverable Bus startup;
-  machine 193 passed two exact activation/fallback tests:
+- **Media-server Bus recovery checkpoint (2026-08-09):** shares, serving, aggregation, and publication recover late Bus startup; machine 193 passed two tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-recovery-r28.md`.
 - **Notification/transfer Bus recovery checkpoint (2026-08-09):** monitoring and transfer effects survive late/replaced storage; complete registry reads and durable
   identity-bound result receipts prevent lost acknowledgements or repeated transfer effects. Focused farm gates:
