@@ -101,6 +101,11 @@ const NOTIFY_HISTORY_CAP: usize = 200;
 /// (dropped) rather than re-emitted — 5 minutes.
 const COALESCE_WINDOW: Duration = Duration::from_secs(300);
 
+/// Bounds for retrying a Bus that is not present or openable yet. The worker is
+/// long-lived, so a startup ordering race must not require a service restart.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 // ── the event sources ───────────────────────────────────────────────────────
 
 /// The event source a notification came from — the lane suffix + the `source`
@@ -575,9 +580,18 @@ impl NotifyWorker {
     ) {
         let topic = source.topic();
         let cursor = state.external_cursors.get(&topic).cloned().flatten();
-        let msgs = persist
-            .list_since(&topic, cursor.as_deref())
-            .unwrap_or_default();
+        let msgs = match persist.list_since(&topic, cursor.as_deref()) {
+            Ok(msgs) => msgs,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mackesd::notify",
+                    %topic,
+                    %error,
+                    "external notification lane unreadable; retaining cursor and rollup"
+                );
+                return;
+            }
+        };
         if let Some(last) = msgs.last() {
             state
                 .external_cursors
@@ -695,6 +709,20 @@ fn default_bus_root() -> Option<PathBuf> {
     resolve_default_bus_root(std::env::var_os("MDE_BUS_ROOT"), dirs::data_dir())
 }
 
+fn notify_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    notify_bus_root_or_system(override_root.or_else(default_bus_root))
+}
+
+fn notify_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -709,16 +737,22 @@ impl Worker for NotifyWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::debug!(target: "mackesd::notify", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::notify", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let bus_root = notify_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::notify",
+                    %error,
+                    "Persist open failed; notify startup will retry"
+                ),
             }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
         let mut state = SourceState::default();
         self.prime_lanes(&persist, now_unix_ms());
@@ -802,6 +836,72 @@ mod tests {
             resolve_default_bus_root(None, Some(PathBuf::from("/root/.local/share"))),
             Some(PathBuf::from("/root/.local/share/mde/bus")),
         );
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            notify_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            notify_bus_root_or_system(Some(PathBuf::from("/tmp/notify-explicit-bus"))),
+            PathBuf::from("/tmp/notify-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_in_the_same_worker_and_primes_forward_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let bus_root = root.join("late-bus");
+        std::fs::write(&bus_root, b"not a directory").unwrap();
+
+        let mut worker = NotifyWorker::new(root, "eagle".into())
+            .with_bus_root(bus_root.clone())
+            .with_poll_interval(Duration::from_millis(5))
+            .with_probe(Box::new(MapProbe::default().absent("dnf")));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task.is_finished(),
+            "an unopenable startup Bus is retryable"
+        );
+        std::fs::remove_file(&bus_root).unwrap();
+
+        let persist = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(persist) = Persist::open(bus_root.clone()) {
+                    let peer_ready = persist
+                        .list_since(&NotifySource::Peer.topic(), None)
+                        .is_ok_and(|messages| !messages.is_empty());
+                    let updates_ready = persist
+                        .list_since(&NotifySource::Updates.topic(), None)
+                        .is_ok_and(|messages| !messages.is_empty());
+                    if peer_ready && updates_ready {
+                        break persist;
+                    }
+                }
+                assert!(!task.is_finished(), "worker exited before Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must open the late Bus and prime its forward lanes");
+        assert_eq!(count_notify_msgs(&persist, NotifySource::Peer), 1);
+        assert_eq!(count_notify_msgs(&persist, NotifySource::Updates), 1);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown completes")
+            .expect("worker joins")
+            .expect("worker exits cleanly");
     }
 
     fn write_peer(root: &Path, host: &str) {

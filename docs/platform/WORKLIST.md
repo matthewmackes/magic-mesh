@@ -447,6 +447,10 @@ behavioral evidence is not completion.
   serving, aggregation, and publication remain behind recoverable Bus startup;
   machine 193 passed two exact activation/fallback tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-server-bus-recovery-r28.md`.
+- **Notification Bus recovery checkpoint (2026-08-09):** lifecycle notification
+  monitoring now survives late Bus storage, while failed durable Cloud-lane
+  reads retain their cursor and rollup. Machine 193 passed two exact tests:
+  `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
