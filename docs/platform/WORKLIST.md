@@ -197,9 +197,9 @@ behavioral evidence is not completion.
   refused before effects, retained the VM shut off, and produced typed failure. OpenTofu, Ansible, libvirt, KVM, Podman, storage, shell, and all six workers passed.
   Remediation now recommends Small; larger-seat first-frame and lifecycle proof remain:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-dell-capacity-refusal-r1.md`.
-- **Startup/readiness recovery checkpoint (2026-08-09):** stopped guests fail closed; KVM health publication recovers late/replaced Bus storage. Focused gates passed:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-startup-readiness-fail-closed-r13.md`.
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-kvm-health-bus-recovery-r73.md`.
+- **Startup/readiness recovery checkpoint (2026-08-09):** stopped guests fail closed; KVM publication recovers replacement. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-startup-readiness-fail-closed-r13.md`, `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-kvm-health-bus-recovery-r73.md`.
+  Browser catalog/boot boundary: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-catalog-boot-r80.md`.
 - **Compute firewall outcome checkpoint (2026-08-09):** root-owned result journaling, restart-safe reply recovery, honest partial/failed projections, and exact Mesh
   removal identity passed machine 194:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-firewall-outcome-r18.md`.
@@ -299,8 +299,7 @@ behavioral evidence is not completion.
 - Current state: Standalone CI and the typed Browser path pass; portable import, guest image/audio quality, and five-seat performance proof remain.
 - **Portable migration checkpoints (2026-08-06):** deterministic allowlist, idempotency, symlink, and secret boundaries passed BigBoy and `.50`:
   `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`, `docs/platform/evidence/WL-ARCH-008-2026-08-09-portable-manifest-identity-r2.md`.
-- **Display1 migration rollback checkpoint (2026-08-09):** fixed-target cutover restores exact original XML after failed validation; `.90` gates passed:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
+- **Display1 rollback checkpoint (2026-08-09):** exact XML restoration passed `.90`: `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
 - **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
 - **Standalone publication checkpoint (2026-08-08):** GitHub, farm, and Actions passed: `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
@@ -308,6 +307,7 @@ behavioral evidence is not completion.
 - **Browser VM artifact-identity checkpoint (2026-08-09):** exact 4/8192/64 profile and bounded qcow2/raw manifests reject stale, hostile, or unsupported artifacts;
   machine 194 passed the focused contract gates: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-image-contract-r72.md`.
   A real admitted 64-GiB qcow2 then passed `qemu-img` integrity: `docs/platform/evidence/WL-ARCH-008-2026-08-09-browser-vm-real-image-r77.md`.
+  Catalog/boot boundary: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-catalog-boot-r80.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.

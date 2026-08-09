@@ -33,6 +33,16 @@ digests, image-byte mismatch, and qcow2/raw virtual sizes other than exactly 64
 GiB. An OCI container built without `--disk` is an intermediate build input,
 not an admissible Browser VM artifact.
 
+`promote-catalog-image.py` is the bounded offline import path for an already
+admitted Browser VM pair when the live armed-token image promotion service is
+unavailable. It accepts only an absolute, previously nonexistent catalog root,
+re-runs the complete artifact/profile verifier and `qemu-img check`, preserves
+the original artifact and identity-manifest names, and atomically publishes the
+canonical `manifest.toml`, `image.sha256`, `<name>.img`, and `PROMOTED` layout.
+The Workload artifact name is a hard link to the admitted qcow2 bytes, not a
+conversion. This helper is therefore suitable for an isolated/offline catalog;
+it deliberately refuses to update or replace an existing production catalog.
+
 The checked-in `deploy-image.sh` is the bounded operator path for a direct KVM
 host. `preflight` verifies the local qcow2 and remote KVM/qemu-img/passwordless
 sudo prerequisites, including a resolvable remote `qemu` group, without
