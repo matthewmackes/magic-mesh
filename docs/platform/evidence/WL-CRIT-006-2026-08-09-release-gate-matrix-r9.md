@@ -15,6 +15,9 @@ The verifier rejects unknown fields and gates, duplicate gate IDs, duplicate
 node/scenario claims, missing owner/command/evidence values, malformed or mismatched
 revisions, incomplete/reordered rosters, unknown or incomplete categories, optional
 required gates, and any gate not bound to the sole `source_revision` field.
+The maintained `ci-gate.sh` policy stage runs both the hostile self-test and the
+current-tree matrix verification, so a later matrix edit cannot silently bypass
+the canonical farm/GitHub policy gate.
 
 ## Files and digests
 
@@ -44,9 +47,8 @@ verify-release-gate-matrix: self-test PASS (1 valid, 12 hostile fixtures rejecte
 verify-release-gate-matrix: PASS install-helpers/release-gate-matrix.json (19 explicit required gates)
 ```
 
-Local `git diff --check` passed for the two implementation files and this evidence
-file. No broad test, package build, live-seat action, commit, push, or worklist edit
-was performed.
+Local `git diff --check` and `bash -n install-helpers/ci-gate.sh` passed. No broad
+test, package build, or live-seat action was performed.
 
 ## Remaining blockers
 

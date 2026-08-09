@@ -97,6 +97,7 @@ POLICY_LINTS=(
   lint-brand-identity.sh
   lint-shared-substrate.sh
   lint-doc-supersession.sh
+  verify-release-gate-matrix.py
   lint-workload-authority.sh
   lint-worklist.sh
 )
@@ -107,6 +108,7 @@ POLICY_SELF_TESTS=(
   lint-layered-tiers.sh
   lint-brand-identity.sh
   lint-doc-supersession.sh
+  verify-release-gate-matrix.py
   lint-workload-authority.sh
   lint-worklist.sh
 )
