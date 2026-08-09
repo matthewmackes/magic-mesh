@@ -1150,10 +1150,10 @@ behavioral evidence is not completion.
   `install-helpers/verify-music-cast-loopback.sh`;
   `docs/platform/evidence/WL-FUNC-021-2026-08-06-cast-loopback-r1.md`.
 - **Roaming admission (2026-08-06):** 11/11; live two-seat proof open. Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-06-roaming-admission-r1.md`.
-- **Two-seat handoff checkpoints (2026-08-08/09):** fixtures prove exact-once queue/playhead transfer; physical preflight refused Eagle's release mismatch and stale peer
-  without mutation (`.50`/`.90` passed): `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`,
+- **Two-seat handoff checkpoints (2026-08-08/09):** fixtures prove exact-once transfer; physical preflight refused mismatch/stale peers, and records are atomic/authority-first.
+  `.50`/`.90` passed; `.170` passed 19/19: `evidence/WL-FUNC-021-2026-08-08-two-seat-owner-handoff-r1.md`,
   `docs/platform/evidence/WL-FUNC-021-2026-08-09-physical-two-seat-handoff-preflight-r5.md`,
-  `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`.
+  `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-09-handoff-atomic-r9.md`.
 - **Cast runtime audit checkpoint (2026-08-06):** read-only seat inspection
   found no physical UPnP renderer, usable Chromecast discovery path, target
   cast-receiver unit, or second admitted peer. Typed mesh transfer and the

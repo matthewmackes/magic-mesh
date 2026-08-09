@@ -376,6 +376,49 @@ pub fn read_state(dir: &Path) -> Option<MusicState> {
         .or_else(|| decode_bounded::<MusicState>(&bytes).filter(valid_state_record))
 }
 
+/// Replace one coordination record without exposing a partially written JSON
+/// document to the local daemon or Syncthing. The sibling temporary file is not
+/// a `.json` record, so bounded directory readers ignore it until the synced
+/// rename commits the complete record.
+fn write_record_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_record_atomically_with(path, bytes, |temporary, target| {
+        std::fs::rename(temporary, target)
+    })
+}
+
+fn write_record_atomically_with<F>(path: &Path, bytes: &[u8], replace: F) -> std::io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "music coordination record has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let target_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("music-state.json");
+    let temporary = parent.join(format!(".{target_name}.{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Write `music-state.json` (+ this peer's by-peer snapshot).
 ///
 /// # Errors
@@ -393,12 +436,13 @@ pub fn write_state(dir: &Path, state: &MusicState) -> std::io::Result<()> {
         state: state.clone(),
     })
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(state_path(dir), &json)?;
     let bp = by_peer_path(dir, &state.peer);
-    if let Some(parent) = bp.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(bp, json)
+    // These two records are independently atomic, not a filesystem transaction.
+    // Commit authority first: if the derived snapshot then fails, remote roster
+    // readers remain safely stale instead of observing state this owner never
+    // committed.
+    write_record_atomically(&state_path(dir), json.as_bytes())?;
+    write_record_atomically(&bp, json.as_bytes())
 }
 
 /// Read the newest bounded handoff-intent projection from the intents dir.
@@ -536,7 +580,7 @@ pub fn post_takeover(
     std::fs::create_dir_all(&d)?;
     let json = serde_json::to_string_pretty(&intent)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(d.join(format!("{id}.json")), json)?;
+    write_record_atomically(&d.join(format!("{id}.json")), json.as_bytes())?;
     Ok(intent)
 }
 
@@ -559,9 +603,9 @@ pub fn write_completion(dir: &Path, completion: &HandoffCompletion) -> std::io::
             "handoff completion exceeds its bounded record contract",
         ));
     }
-    std::fs::write(
-        directory.join(format!("{}.json", completion.intent_id)),
-        body,
+    write_record_atomically(
+        &directory.join(format!("{}.json", completion.intent_id)),
+        &body,
     )
 }
 
@@ -854,6 +898,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_handoff_record_replace_preserves_last_good_and_cleans_temporary() {
+        let dir = tempdir().unwrap();
+        let path = completions_dir(dir.path()).join("intent-1.json");
+        let last_good = completion("intent-1", "forge", "anvil", "song-7", 42_500, 88);
+        write_completion(dir.path(), &last_good).unwrap();
+
+        let replacement = serde_json::to_vec_pretty(&completion(
+            "intent-1", "forge", "anvil", "song-8", 51_000, 99,
+        ))
+        .unwrap();
+        let error = write_record_atomically_with(&path, &replacement, |_temporary, _target| {
+            Err(std::io::Error::other("injected handoff replace failure"))
+        })
+        .expect_err("failed replacement must be reported");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(read_completions(dir.path()), vec![last_good]);
+        assert!(
+            std::fs::read_dir(completions_dir(dir.path()))
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "tmp"))
+        );
+    }
+
+    #[test]
     fn handoff_readers_reject_alias_files_that_can_replay_same_handoff() {
         let dir = tempdir().unwrap();
         let intent = intent("intent-1", "forge", Some("anvil"), 77);
@@ -947,9 +1016,11 @@ mod tests {
         assert_eq!(retained.len(), MAX_PEER_STATE_SNAPSHOTS);
         assert!(!retained.iter().any(|item| item.peer == "peer-000"));
         assert!(retained.iter().any(|item| item.peer == "peer-064"));
-        assert!(retained
-            .windows(2)
-            .all(|items| items[0].peer <= items[1].peer));
+        assert!(
+            retained
+                .windows(2)
+                .all(|items| items[0].peer <= items[1].peer)
+        );
     }
 
     #[test]
