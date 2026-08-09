@@ -316,23 +316,25 @@ impl DeviceControlExecWorker {
         self
     }
 
-    /// The L9 rail (as `lifecycle_exec::offered`): is this device actually one this
-    /// box **publishes**? A request naming a device absent from this node's own
-    /// `device-inventory/<self>.json` (a stale/misrouted/spoofed request) is refused
-    /// before any privileged write. A host that has published no inventory yet
-    /// refuses everything (conservative + self-healing once it publishes).
+    /// The L9 rail (as `lifecycle_exec::offered`): is this exact target actually
+    /// one this box **publishes**? Every control-relevant field must match one
+    /// provider-owned category/device record. A matching sysfs path alone is not
+    /// enough: otherwise a requester could borrow a real device's path while
+    /// substituting another category, display name, or kernel module. A host that
+    /// has published no inventory yet refuses everything (conservative +
+    /// self-healing once it publishes).
     fn offered(&self, target: &DeviceTarget) -> bool {
         let Some(inv) = device_inventory::read_inventory(&self.workgroup_root, &self.self_hostname)
         else {
             return false;
         };
-        inv.categories.iter().flat_map(|c| &c.devices).any(|d| {
-            match (target.sysfs_path.as_deref(), d.sysfs_path.as_deref()) {
-                // The sysfs path is the strong key when both carry one.
-                (Some(a), Some(b)) => a == b,
-                // Otherwise fall back to the device name.
-                _ => d.name == target.name,
-            }
+        inv.categories.iter().any(|category| {
+            category.key == target.category
+                && category.devices.iter().any(|device| {
+                    device.name == target.name
+                        && device.sysfs_path == target.sysfs_path
+                        && device.driver == target.driver
+                })
         })
     }
 
@@ -340,6 +342,15 @@ impl DeviceControlExecWorker {
     /// side-effecting the audit/notify (those wrap it in [`Self::process`]) so the
     /// gate + plan logic is unit-testable in isolation.
     async fn handle_request(&self, req: &DeviceControlRequest) -> DeviceControlResult {
+        if req.target_host != self.self_hostname {
+            return DeviceControlResult::failed(
+                &req.id,
+                format!(
+                    "request targets `{}` but this provider owns `{}` — refused",
+                    req.target_host, self.self_hostname
+                ),
+            );
+        }
         if !self.offered(&req.target) {
             return DeviceControlResult::failed(
                 &req.id,
@@ -757,7 +768,7 @@ mod tests {
                 name: "Logitech Webcam".into(),
                 category: category::NETWORK_ADAPTERS.into(),
                 sysfs_path: Some(sysfs_path),
-                driver: Some("uvcvideo".into()),
+                driver: None,
             },
             target_host: "edge-2".into(),
             from: "peer:laptop-mm".into(),
@@ -774,6 +785,96 @@ mod tests {
         assert!(
             persist.list_since(NOTIFY_TOPIC, None).unwrap().is_empty(),
             "a successful op raises no failure notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_properties_cannot_borrow_a_provider_owned_device_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+
+        write_inventory(
+            tmp.path(),
+            "edge-2",
+            vec![DeviceRecord {
+                sysfs_path: Some(sysfs_path.clone()),
+                driver: Some("uvcvideo".into()),
+                ..DeviceRecord::new("Logitech Webcam", DeviceStatus::Ok)
+            }],
+        );
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        );
+        let hostile = DeviceControlRequest {
+            id: "01FORGED".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget {
+                name: "Provider-owned camera renamed by requester".into(),
+                category: category::DISPLAY.into(),
+                sysfs_path: Some(sysfs_path),
+                driver: Some("arbitrary-module".into()),
+            },
+            target_host: "edge-2".into(),
+            from: "peer:hostile-seat".into(),
+        };
+
+        let result = worker.handle_request(&hostile).await;
+        assert!(!result.ok, "forged provider properties must fail closed");
+        assert!(result.error.contains("not in edge-2's published inventory"));
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "a borrowed sysfs identity must not reach the mutation seam"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_host_request_cannot_use_this_providers_entity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dev_dir = tmp.path().join("sys/bus/usb/devices/1-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join("authorized"), "1").unwrap();
+        let sysfs_path = dev_dir.to_string_lossy().into_owned();
+
+        write_inventory(
+            tmp.path(),
+            "edge-2",
+            vec![DeviceRecord {
+                sysfs_path: Some(sysfs_path.clone()),
+                driver: Some("uvcvideo".into()),
+                ..DeviceRecord::new("Logitech Webcam", DeviceStatus::Ok)
+            }],
+        );
+        let worker = DeviceControlExecWorker::new(
+            tmp.path().to_path_buf(),
+            "edge-2".into(),
+            "peer:edge-2".into(),
+        );
+        let hostile = DeviceControlRequest {
+            id: "01FOREIGN".into(),
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget {
+                name: "Logitech Webcam".into(),
+                category: category::NETWORK_ADAPTERS.into(),
+                sysfs_path: Some(sysfs_path),
+                driver: Some("uvcvideo".into()),
+            },
+            target_host: "edge-9".into(),
+            from: "peer:hostile-seat".into(),
+        };
+
+        let result = worker.handle_request(&hostile).await;
+        assert!(!result.ok, "foreign-host actions must fail closed");
+        assert!(result.error.contains("this provider owns `edge-2`"));
+        assert_eq!(
+            std::fs::read_to_string(dev_dir.join("authorized")).unwrap(),
+            "1",
+            "a foreign-host request must not reach the mutation seam"
         );
     }
 

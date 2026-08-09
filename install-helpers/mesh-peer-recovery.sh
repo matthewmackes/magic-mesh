@@ -31,6 +31,14 @@ publish() {
 valid_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) [ "$1" -gt 0 ];; esac; }
 bounded_systemctl() { /usr/bin/timeout "$COMMAND_TIMEOUT" "$SYSTEMCTL" "$@"; }
 
+supported_role() {
+    [ "$(/usr/bin/grep -Ec '^[[:space:]]*role[[:space:]]*=' "$ROLE_FILE")" -eq 1 ] \
+        || return 1
+    /usr/bin/grep -Eq \
+        '^[[:space:]]*role[[:space:]]*=[[:space:]]*("workstation"|"lighthouse"|workstation|lighthouse)[[:space:]]*$' \
+        "$ROLE_FILE"
+}
+
 physical_network_online() {
     if [ -x "$NM_ONLINE" ] \
         && bounded_systemctl is-active --quiet NetworkManager.service >/dev/null 2>&1; then
@@ -145,6 +153,8 @@ main() {
         return 0
     fi
     [ -f "$ROLE_FILE" ] || { publish "refused-no-role"; return 0; }
+    supported_role \
+        || { publish "refused-invalid-role"; return 2; }
     if ! physical_network_online; then
         publish "offline-no-mutation"
         return 0

@@ -415,8 +415,9 @@ fn run_once(paths: &Paths) -> usize {
 // ── Worker ───────────────────────────────────────────────────────────
 
 /// Supervisor-ready app-config sync worker. 60 s tick; each tick
-/// discovers + writes configs. Best-effort throughout (a missing
-/// `workgroup_root` or unreachable peer just yields fewer servers).
+/// discovers + writes configs. The shared probe-inventory root is the
+/// provider's enablement anchor: when it is absent the worker remains
+/// quiescent until shutdown instead of materializing empty client state.
 pub struct AppSyncWorker {
     paths: Paths,
     tick: Duration,
@@ -444,6 +445,10 @@ impl Worker for AppSyncWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        if !self.paths.workgroup_root.is_dir() {
+            shutdown.wait().await;
+            return Ok(());
+        }
         run_once(&self.paths);
         loop {
             tokio::select! {
@@ -475,6 +480,39 @@ mod tests {
     #[test]
     fn worker_name_is_app_sync() {
         assert_eq!(build().name(), "app-sync");
+    }
+
+    #[tokio::test]
+    async fn missing_inventory_anchor_quiesces_without_creating_client_state() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::under(home.path(), home.path().join("missing-qnm-shared"));
+        let outputs = [
+            paths.media_dir.clone(),
+            paths.sublime.clone(),
+            paths.delfin.clone(),
+            paths.bookmarks.clone(),
+        ];
+        let mut worker = AppSyncWorker::new(paths);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle =
+            tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            outputs.iter().all(|path| !path.exists()),
+            "an unconfigured provider must not create media-client state"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the quiescent worker waits for shutdown"
+        );
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("quiescent worker exits promptly")
+            .expect("worker task joins")
+            .expect("worker shutdown succeeds");
     }
 
     #[test]

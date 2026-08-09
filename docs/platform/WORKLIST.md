@@ -405,6 +405,10 @@ behavioral evidence is not completion.
   creation and prompt cancellation; the target-file format gate passed. Other
   optional providers still require audit. Evidence:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-registry-app-quiescence-r6.md`.
+- **App-sync quiescence checkpoint (2026-08-09):** an absent shared probe
+  inventory now leaves the optional media app-sync provider waiting solely for
+  shutdown, without client-state creation or a polling timer; `.50` passed 9/9:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-app-sync-quiescence-r7.md`.
 - **Responder group-isolation checkpoint (2026-08-09):** all 20 raw responder
   and maintenance threads now fail closed outside the process group assigned by
   the canonical registry. Exact/hostile argv and bidirectional registry guards
@@ -932,6 +936,11 @@ behavioral evidence is not completion.
   passed 3/3. Live Windows address
   discovery and installed connection proof remain. Evidence:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-probed-rdp-resource-card-s2-r3.md`.
+- **Live Windows discovery checkpoint (2026-08-09):** Basement seat 15 now
+  explicitly targets the quiet Windows endpoint at `172.20.146.54`; its fresh
+  shared probe inventory contains `ms-wbt-server` on TCP 3389. Authenticated
+  connection/render proof and publisher-key distribution remain. Evidence:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-live-windows-rdp-discovery-s5-r1.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
@@ -1517,6 +1526,10 @@ behavioral evidence is not completion.
   mutation. `.90` fault/systemd checks passed. Live laptop/fleet convergence
   remains. Evidence:
   `docs/platform/evidence/WL-CRIT-007-2026-08-09-substrate-order-r2.md`.
+- **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
+  unsupported, malformed, or duplicate role before network, lock, or service
+  mutation; BigBoy passed all 9 deterministic fixtures:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-role-admission-r3.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
@@ -1650,6 +1663,11 @@ behavioral evidence is not completion.
 - Required outcome: credential-free Workers providers publish bounded sourced hardware/OS entities and only allow capability-gated, generation-bound, audited safe
   controls for Wi-Fi, audio, display, input, storage, printers, services, power, and virtualization.
 - Current state: device catalog and typed provider scaffolding exist; provider coverage, conflict/history, safe actions, and fleet proof remain.
+- **Device-control ownership checkpoint (2026-08-09):** privileged controls now
+  require an exact match on provider host, category, name, sysfs path, and
+  driver; forged and foreign-host targets cannot reach mutation. `.90` passed
+  16/16 focused tests:
+  `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-ownership-r1.md`.
 - Remaining work:
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.

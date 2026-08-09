@@ -147,6 +147,20 @@ echo 'PASS offline fixture: no service mutation'
 
 : >"$STATE/online"
 : >"$STATE/notifies"
+: >"$STATE/mutations"
+for invalid_role in 'role = "server"' 'role = "workstation' $'role = "workstation"\nrole = "lighthouse"'; do
+    printf '%s\n' "$invalid_role" >"$ROOT/role.toml"
+    if run_helper; then
+        echo 'invalid recovery role unexpectedly reported success' >&2
+        exit 1
+    fi
+done
+[ ! -s "$STATE/mutations" ]
+[ "$(grep -Fc 'status=refused-invalid-role' "$STATE/notifies")" -eq 3 ]
+printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
+echo 'PASS role fixture: unsupported, malformed, and duplicate identity fail before service mutation'
+
+: >"$STATE/notifies"
 run_helper
 cat >"$STATE/expected-mutations" <<'EOF'
 nebula.service
