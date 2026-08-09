@@ -57,7 +57,8 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
@@ -426,7 +427,7 @@ pub fn parse_dnf_check_update(out: &ProbeOut) -> usize {
 /// seen within [`COALESCE_WINDOW`] — the rate-limit that keeps a flapping source
 /// from spamming the feed while still letting the same event through once the
 /// window elapses.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct NotifyLog {
     recent: VecDeque<(String, i64)>,
 }
@@ -455,7 +456,7 @@ impl NotifyLog {
 // ── the worker ──────────────────────────────────────────────────────────────
 
 /// Per-run source state, carried across ticks so each source edge-triggers.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SourceState {
     /// The peer set as of the last poll (`None` before the first — seeds silently).
     known_peers: Option<BTreeSet<String>>,
@@ -515,23 +516,42 @@ impl NotifyWorker {
 
     /// One poll pass — the headless-testable core. `tick` selects which slow
     /// sources are due; `now_ms` stamps + windows the emissions.
-    fn tick_once(&self, persist: &Persist, state: &mut SourceState, tick: u64, now_ms: i64) {
+    fn stage_tick(
+        &self,
+        persist: &Persist,
+        state: &SourceState,
+        tick: u64,
+        now_ms: i64,
+    ) -> io::Result<SourceState> {
+        let mut staged = state.clone();
         let mut pending: Vec<Notification> = Vec::new();
 
         // Platform health is exclusively emitted by the typed node-grade health
         // authority. This legacy worker retains only non-health lifecycle lanes.
-        pending.extend(self.check_peers(state));
+        pending.extend(self.check_peers(&mut staged));
         if tick % UPDATES_EVERY == 0 {
-            pending.extend(self.check_updates(state));
+            pending.extend(self.check_updates(&mut staged));
         }
 
         for n in pending {
-            if state.log.admit(&n, now_ms) {
-                self.emit(persist, &n, now_ms);
-                self.update_segment_rollup(persist, state, &n, now_ms);
+            if staged.log.admit(&n, now_ms) {
+                self.emit(persist, &n, now_ms)?;
+                self.update_segment_rollup(persist, &mut staged, &n, now_ms)?;
             }
         }
-        self.fold_external_notify_lane(persist, state, NotifySource::Cloud, now_ms);
+        self.fold_external_notify_lane(persist, &mut staged, NotifySource::Cloud, now_ms)?;
+        Ok(staged)
+    }
+
+    fn tick_once(&self, persist: &Persist, state: &mut SourceState, tick: u64, now_ms: i64) {
+        match self.stage_tick(persist, state, tick, now_ms) {
+            Ok(staged) => *state = staged,
+            Err(error) => tracing::warn!(
+                target: "mackesd::notify",
+                %error,
+                "notification transaction deferred"
+            ),
+        }
     }
 
     /// Diff the replicated peer directory (the same source the chat/mesh mirror
@@ -577,7 +597,7 @@ impl NotifyWorker {
         state: &mut SourceState,
         source: NotifySource,
         now_ms: i64,
-    ) {
+    ) -> io::Result<()> {
         let topic = source.topic();
         let cursor = state.external_cursors.get(&topic).cloned().flatten();
         let msgs = match persist.list_since(&topic, cursor.as_deref()) {
@@ -589,14 +609,10 @@ impl NotifyWorker {
                     %error,
                     "external notification lane unreadable; retaining cursor and rollup"
                 );
-                return;
+                return Err(io::Error::other(error.to_string()));
             }
         };
-        if let Some(last) = msgs.last() {
-            state
-                .external_cursors
-                .insert(topic.clone(), Some(last.ulid.clone()));
-        }
+        let last_ulid = msgs.last().map(|message| message.ulid.clone());
         for msg in msgs {
             let Some(body) = msg.body.as_deref() else {
                 continue;
@@ -608,13 +624,17 @@ impl NotifyWorker {
                 continue;
             };
             let n = Notification::for_host(severity, source, external.host, external.summary);
-            self.update_segment_rollup(persist, state, &n, now_ms);
+            self.update_segment_rollup(persist, state, &n, now_ms)?;
         }
+        if let Some(last_ulid) = last_ulid {
+            state.external_cursors.insert(topic, Some(last_ulid));
+        }
+        Ok(())
     }
 
     /// Serialize + publish one notification on its `event/notify/<source>` lane —
     /// the alert-shaped body the [`super::chat`] worker folds into `alert:<self>`.
-    fn emit(&self, persist: &Persist, n: &Notification, now_ms: i64) {
+    fn emit(&self, persist: &Persist, n: &Notification, now_ms: i64) -> io::Result<()> {
         let body = NotifyBody {
             severity: n.severity.tag(),
             source: n.source.key(),
@@ -623,12 +643,13 @@ impl NotifyWorker {
             ts_unix_ms: now_ms,
         };
         let Ok(json) = serde_json::to_string(&body) else {
-            return;
+            return Err(io::Error::other("serialize notification"));
         };
         let topic = n.source.topic();
-        if let Err(e) = persist.write(&topic, Priority::Default, None, Some(&json)) {
-            tracing::debug!(target: "mackesd::notify", %topic, error = %e, "notify publish failed");
-        }
+        persist
+            .write(&topic, Priority::Default, None, Some(&json))
+            .map(|_| ())
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     fn update_segment_rollup(
@@ -637,14 +658,14 @@ impl NotifyWorker {
         state: &mut SourceState,
         n: &Notification,
         now_ms: i64,
-    ) {
+    ) -> io::Result<()> {
         let segment = n.source.segment();
         let should_replace = state
             .rollups
             .get(&segment)
             .is_none_or(|current| severity_rank(n.severity) >= severity_rank(current.severity));
         if !should_replace {
-            return;
+            return Ok(());
         }
         state.rollups.insert(segment, n.clone());
         let affected_host = n.host(&self.self_host);
@@ -664,12 +685,13 @@ impl NotifyWorker {
             ts_unix_ms: now_ms,
         };
         let Ok(json) = serde_json::to_string(&body) else {
-            return;
+            return Err(io::Error::other("serialize notification rollup"));
         };
         let topic = segment.topic();
-        if let Err(e) = persist.write(&topic, Priority::Default, None, Some(&json)) {
-            tracing::debug!(target: "mackesd::notify", %topic, error = %e, "segment rollup publish failed");
-        }
+        persist
+            .write(&topic, Priority::Default, None, Some(&json))
+            .map(|_| ())
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     /// Prime each source lane once at startup with a benign, chat-skipped message.
@@ -679,8 +701,16 @@ impl NotifyWorker {
     /// contract). A lane that first appears when a *real* notification lands would
     /// therefore lose that first notification. Priming makes the prime absorb the
     /// first-sight skip, so every real notification thereafter is folded.
-    fn prime_lanes(&self, persist: &Persist, now_ms: i64) {
+    fn prime_lanes(&self, persist: &Persist, now_ms: i64) -> io::Result<()> {
         for source in [NotifySource::Peer, NotifySource::Updates] {
+            let topic = source.topic();
+            if persist
+                .latest_ulid(&topic)
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .is_some()
+            {
+                continue;
+            }
             let body = NotifyBody {
                 severity: Severity::Info.tag(),
                 source: source.key(),
@@ -689,9 +719,35 @@ impl NotifyWorker {
                 ts_unix_ms: now_ms,
             };
             if let Ok(json) = serde_json::to_string(&body) {
-                let _ = persist.write(&source.topic(), Priority::Default, None, Some(&json));
+                persist
+                    .write(&topic, Priority::Default, None, Some(&json))
+                    .map_err(|error| io::Error::other(error.to_string()))?;
             }
         }
+        Ok(())
+    }
+
+    fn activate_bus(
+        &self,
+        root: &Path,
+        identity: NotifyBusIdentity,
+        persist: &Persist,
+        state: &mut SourceState,
+        now_ms: i64,
+    ) -> io::Result<()> {
+        let cloud_topic = NotifySource::Cloud.topic();
+        let cloud_tail = persist
+            .latest_ulid(&cloud_topic)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.prime_lanes(persist, now_ms)?;
+        let mut staged = state.clone();
+        for notification in state.rollups.values().cloned().collect::<Vec<_>>() {
+            self.update_segment_rollup(persist, &mut staged, &notification, now_ms)?;
+        }
+        verify_notify_bus_identity(root, identity)?;
+        staged.external_cursors.insert(cloud_topic, cloud_tail);
+        *state = staged;
+        Ok(())
     }
 }
 
@@ -717,6 +773,70 @@ fn notify_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotifyBusIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn notify_bus_identity(root: &Path) -> io::Result<NotifyBusIdentity> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("notify Bus index is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(NotifyBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(NotifyBusIdentity {
+            device: 0,
+            inode: 0,
+        })
+    }
+}
+
+fn open_current_notify_bus(root: &Path) -> io::Result<(Persist, NotifyBusIdentity)> {
+    let before = match notify_bus_identity(root) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            drop(
+                Persist::open(root.to_path_buf())
+                    .map_err(|error| io::Error::other(error.to_string()))?,
+            );
+            notify_bus_identity(root)?
+        }
+        Err(error) => return Err(error),
+    };
+    let persist =
+        Persist::open(root.to_path_buf()).map_err(|error| io::Error::other(error.to_string()))?;
+    let after = notify_bus_identity(root)?;
+    #[cfg(unix)]
+    let connection_matches_path = persist.index_inode() == Some(after.inode);
+    #[cfg(not(unix))]
+    let connection_matches_path = true;
+    if before != after || !connection_matches_path {
+        return Err(io::Error::other(
+            "notify Bus connection/path identity changed while opening",
+        ));
+    }
+    Ok((persist, after))
+}
+
+fn verify_notify_bus_identity(root: &Path, expected: NotifyBusIdentity) -> io::Result<()> {
+    if notify_bus_identity(root)? == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other("notify Bus changed during transaction"))
+    }
+}
+
 fn next_bus_retry_interval(current: Duration) -> Duration {
     current
         .saturating_mul(2)
@@ -739,9 +859,25 @@ impl Worker for NotifyWorker {
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let bus_root = notify_bus_root(self.bus_root_override.clone());
         let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
-        let persist = loop {
-            match Persist::open(bus_root.clone()) {
-                Ok(persist) => break persist,
+        let mut state = SourceState::default();
+        let mut active_identity = loop {
+            match open_current_notify_bus(&bus_root) {
+                Ok((persist, identity)) => {
+                    match self.activate_bus(
+                        &bus_root,
+                        identity,
+                        &persist,
+                        &mut state,
+                        now_unix_ms(),
+                    ) {
+                        Ok(()) => break identity,
+                        Err(error) => tracing::warn!(
+                            target: "mackesd::notify",
+                            %error,
+                            "notify Bus activation will retry"
+                        ),
+                    }
+                }
                 Err(error) => tracing::warn!(
                     target: "mackesd::notify",
                     %error,
@@ -754,15 +890,37 @@ impl Worker for NotifyWorker {
             }
             retry_interval = next_bus_retry_interval(retry_interval);
         };
-        let mut state = SourceState::default();
-        self.prime_lanes(&persist, now_unix_ms());
         let mut tick_no: u64 = 0;
         let mut tick = tokio::time::interval(self.poll_interval);
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.tick_once(&persist, &mut state, tick_no, now_unix_ms());
-                    tick_no = tick_no.wrapping_add(1);
+                    let result = (|| {
+                        let (persist, identity) = open_current_notify_bus(&bus_root)?;
+                        if identity != active_identity {
+                            self.activate_bus(
+                                &bus_root,
+                                identity,
+                                &persist,
+                                &mut state,
+                                now_unix_ms(),
+                            )?;
+                            active_identity = identity;
+                        }
+                        let staged = self.stage_tick(
+                            &persist,
+                            &state,
+                            tick_no,
+                            now_unix_ms(),
+                        )?;
+                        verify_notify_bus_identity(&bus_root, identity)?;
+                        state = staged;
+                        tick_no = tick_no.wrapping_add(1);
+                        Ok::<(), io::Error>(())
+                    })();
+                    if let Err(error) = result {
+                        tracing::warn!(target: "mackesd::notify", %error, "notify Bus transaction deferred");
+                    }
                 }
                 () = shutdown.wait() => break,
             }
@@ -902,6 +1060,120 @@ mod tests {
             .expect("shutdown completes")
             .expect("worker joins")
             .expect("worker exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn same_path_bus_replacement_skips_retained_cloud_and_folds_forward_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let bus_root = root.join("bus");
+        let retired_root = root.join("retired-bus");
+        let replacement_root = root.join("replacement-bus");
+        let initial = Persist::open(bus_root.clone()).unwrap();
+        let mut worker = NotifyWorker::new(root.clone(), "eagle".into())
+            .with_bus_root(bus_root.clone())
+            .with_poll_interval(Duration::from_millis(5))
+            .with_probe(Box::new(MapProbe::default().absent("dnf")));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if initial
+                    .list_since(&NotifySource::Peer.topic(), None)
+                    .is_ok_and(|messages| !messages.is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial Bus activation");
+        drop(initial);
+
+        let replacement = Persist::open(replacement_root.clone()).unwrap();
+        replacement
+            .write(
+                &NotifySource::Cloud.topic(),
+                Priority::Default,
+                None,
+                Some(r#"{"severity":"warning","summary":"retained","host":"oak"}"#),
+            )
+            .unwrap();
+        drop(replacement);
+        std::fs::rename(&bus_root, &retired_root).unwrap();
+        std::fs::rename(&replacement_root, &bus_root).unwrap();
+
+        let current = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let persist = Persist::open(bus_root.clone()).unwrap();
+                if persist
+                    .list_since(&NotifySource::Peer.topic(), None)
+                    .is_ok_and(|messages| !messages.is_empty())
+                {
+                    break persist;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus activation");
+        assert!(current
+            .list_since(&NotifySegment::Alerts.topic(), None)
+            .unwrap()
+            .is_empty());
+        current
+            .write(
+                &NotifySource::Cloud.topic(),
+                Priority::Default,
+                None,
+                Some(r#"{"severity":"warning","summary":"forward","host":"oak"}"#),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = current
+                    .list_since(&NotifySegment::Alerts.topic(), None)
+                    .unwrap();
+                if rows.iter().any(|message| {
+                    message
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| body.contains("forward"))
+                }) {
+                    assert_eq!(rows.len(), 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forward Cloud row folded on replacement");
+        assert!(!task.is_finished());
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown completes")
+            .expect("worker joins")
+            .expect("worker exits cleanly");
+    }
+
+    #[test]
+    fn repeated_bus_activation_does_not_duplicate_lane_primes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = persist_at(tmp.path());
+        let worker = worker_with(tmp.path(), MapProbe::default());
+
+        worker.prime_lanes(&persist, 10_000).unwrap();
+        worker.prime_lanes(&persist, 20_000).unwrap();
+
+        assert_eq!(count_notify_msgs(&persist, NotifySource::Peer), 1);
+        assert_eq!(count_notify_msgs(&persist, NotifySource::Updates), 1);
     }
 
     fn write_peer(root: &Path, host: &str) {
@@ -1073,7 +1345,7 @@ mod tests {
         let w = worker_with(root, probe);
         let mut st = SourceState::default();
         // Prime the lanes exactly as run() does (one skipped-by-chat msg per lane).
-        w.prime_lanes(&persist, 50_000);
+        w.prime_lanes(&persist, 50_000).unwrap();
         // Seed peers and run the lifecycle sources.
         w.tick_once(&persist, &mut st, 0, 100_000);
         w.tick_once(&persist, &mut st, UPDATES_EVERY, 200_000);
@@ -1096,7 +1368,8 @@ mod tests {
         let w = worker_with(root, MapProbe::default());
         let mut st = SourceState::default();
         let critical = Notification::new(Severity::Critical, NotifySource::Cloud, "cloud down");
-        w.update_segment_rollup(&persist, &mut st, &critical, 100_000);
+        w.update_segment_rollup(&persist, &mut st, &critical, 100_000)
+            .unwrap();
 
         let alerts = persist
             .list_since(&NotifySegment::Alerts.topic(), None)
@@ -1108,7 +1381,8 @@ mod tests {
         assert!(latest.contains(r#""critical_policy":"own-seat-light-show""#));
 
         let lower = Notification::new(Severity::Warning, NotifySource::Cloud, "later warning");
-        w.update_segment_rollup(&persist, &mut st, &lower, 200_000);
+        w.update_segment_rollup(&persist, &mut st, &lower, 200_000)
+            .unwrap();
         let alerts_after = persist
             .list_since(&NotifySegment::Alerts.topic(), None)
             .unwrap();

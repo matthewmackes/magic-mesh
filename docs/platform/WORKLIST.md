@@ -445,6 +445,7 @@ behavioral evidence is not completion.
 - **Notification/transfer Bus recovery checkpoint (2026-08-09):** monitoring and transfer effects survive late/replaced storage; complete registry reads and durable
   identity-bound result receipts prevent lost acknowledgements or repeated transfer effects. Focused farm gates:
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`,
+  `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-replacement-r85.md`,
   `docs/platform/evidence/WL-FUNC-016-WL-FUNC-019-WL-ARCH-009-2026-08-09-transfer-bus-transaction-recovery-r69.md`.
 - **Clipboard-sync recovery checkpoint (2026-08-09):** six lanes now activate
   and read atomically across late/replaced Bus storage without replaying retained mutations. BigBoy passed four exact tests:
@@ -626,6 +627,8 @@ behavioral evidence is not completion.
   duplicate toasts; one forward send executes once after late storage. Machine
   9 passed four exact activation/recovery tests:
   `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-chat-bus-recovery-r26.md`.
+- **Notification recovery checkpoint (2026-08-09):** replacement activation skips retained Cloud alerts, preserves failed folds, and primes lanes idempotently:
+  `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-replacement-r85.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
