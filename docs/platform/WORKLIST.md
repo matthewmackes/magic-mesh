@@ -490,8 +490,7 @@ behavioral evidence is not completion.
 - **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority
   recovers, and cache persistence precedes map publication. Machine 9 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
-- **Airspace publication recovery checkpoint (2026-08-09):** failed Bus writes
-  retain one MG90 survey for retry without reprobing. Machine 196 passed two exact tests:
+- **Airspace publication recovery checkpoint (2026-08-09):** failed Bus writes retain one MG90 survey for retry without reprobing; machine 196 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add, target apply, Voice, and lighthouse recover late storage and skip retained mutations;
   incomplete reads defer effects. Machines 9/194 and BigBoy passed eight exact tests:
@@ -503,6 +502,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`,
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`,
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-aircraft-overlay-bus-recovery-r53.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-caltrans-overlay-bus-recovery-r54.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-traffic-overlay-bus-recovery-r56.md`.
@@ -866,6 +866,10 @@ behavioral evidence is not completion.
   rechecked after provider I/O and failed reads/writes commit no state. Machine
   193 passed six exact recovery and withholding tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-air-quality-bus-recovery-r58.md`.
+- **IEM radar transaction checkpoint (2026-08-09):** late/replaced storage,
+  exact post-I/O context, failed writes, and no-fix transition suppression
+  passed eleven focused tests on machine 194:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-iem-radar-bus-recovery-r59.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.

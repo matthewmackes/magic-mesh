@@ -3,7 +3,7 @@
 #![cfg(feature = "async-services")]
 
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,9 @@ use mackes_mesh_types::iem_radar::{
 use reqwest::blocking::Client;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
+
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
 
@@ -408,11 +411,44 @@ enum PreparedResponse {
     Modified(IemRadarSnapshot),
 }
 
+trait RadarBus {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>>;
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &IemRadarSnapshot) -> io::Result<()>;
+}
+
+impl RadarBus for Persist {
+    fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+        self.reopen_if_index_changed();
+        self.read_latest(topic)
+            .map_err(io_other)?
+            .map(|message| {
+                message
+                    .body
+                    .ok_or_else(|| io::Error::other("vehicle Bus row has no body"))
+            })
+            .transpose()
+    }
+
+    fn publish_snapshot(&mut self, topic: &str, snapshot: &IemRadarSnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(|error| {
+            crate::metrics::record_bus_publish_error();
+            io_other(error)
+        })?;
+        self.reopen_if_index_changed();
+        self.write(topic, Priority::Default, None, Some(&body))
+            .map(|_| ())
+            .map_err(|error| {
+                crate::metrics::record_bus_publish_error();
+                io_other(error)
+            })
+    }
+}
+
 /// Workstation-side IEM radar adapter.
 pub struct IemRadarOverlayWorker {
     host: String,
     probe: Option<Arc<dyn IemRadarProbe>>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -431,7 +467,7 @@ impl IemRadarOverlayWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -443,30 +479,43 @@ impl IemRadarOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override the Bus root. Production resolves the current user/system root
+    /// for every transaction when no override is configured.
     #[must_use]
-    pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+    pub fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
         self
     }
 
-    fn current_context(&self) -> Option<RadarContext> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
+    /// Override cadence for focused recovery tests.
+    #[must_use]
+    pub const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    fn open_bus(&self) -> io::Result<Persist> {
+        let root = iem_radar_bus_root(
+            self.bus_root_override.as_deref(),
+            crate::bus_publish::default_bus_root(),
+        );
+        let mut persist = Persist::open(root).map_err(io_other)?;
+        persist.reopen_if_index_changed();
+        Ok(persist)
+    }
+
+    fn current_context(&self, bus: &mut impl RadarBus) -> io::Result<Option<RadarContext>> {
         let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
+        let Some(body) = bus.read_latest_body(&topic)? else {
+            return Ok(None);
+        };
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
         validated_vehicle_context(&vehicle, &self.host, now_ms())
     }
 
-    fn publish(&self, snapshot: &IemRadarSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &iem_radar_state_topic(&self.host),
-                snapshot,
-            );
-        }
+    fn publish(&self, bus: &mut impl RadarBus, snapshot: &IemRadarSnapshot) -> io::Result<()> {
+        bus.publish_snapshot(&iem_radar_state_topic(&self.host), snapshot)
     }
 
     fn no_context_snapshot(&self, reason: &str) -> IemRadarSnapshot {
@@ -475,36 +524,87 @@ impl IemRadarOverlayWorker {
         snapshot
     }
 
-    fn publish_no_context_degraded(&self, reason: &str, last_good: &mut Option<IemRadarSnapshot>) {
+    fn publish_no_context_degraded(
+        &self,
+        bus: &mut impl RadarBus,
+        reason: &str,
+        last_good: &mut Option<IemRadarSnapshot>,
+    ) -> io::Result<()> {
         let snapshot = self.no_context_snapshot(reason);
-        self.publish(&snapshot);
+        self.publish(bus, &snapshot)?;
         // A missing same-host fix invalidates the previous tile origin. Keep
         // the Bus mirror present and licensed, but do not let later failures
         // replay a tile fetched for an old point as if it still described the
         // vehicle's surroundings.
         *last_good = None;
+        Ok(())
+    }
+
+    fn ensure_no_context_published(
+        &self,
+        bus: &mut impl RadarBus,
+        last_good: &mut Option<IemRadarSnapshot>,
+        no_context_published: &mut bool,
+    ) -> io::Result<()> {
+        if *no_context_published {
+            let topic = iem_radar_state_topic(&self.host);
+            let current = bus
+                .read_latest_body(&topic)?
+                .map(|body| serde_json::from_str::<IemRadarSnapshot>(&body).map_err(io_other))
+                .transpose()?;
+            if current
+                .is_some_and(|snapshot| snapshot.host == self.host && snapshot.frames.is_empty())
+            {
+                return Ok(());
+            }
+        }
+        self.publish_no_context_degraded(
+            bus,
+            "fresh same-host US vehicle fix unavailable",
+            last_good,
+        )?;
+        *no_context_published = true;
+        Ok(())
+    }
+
+    fn current_context_or_clear(
+        &self,
+        bus: &mut impl RadarBus,
+        last_good: &mut Option<IemRadarSnapshot>,
+        no_context_published: &mut bool,
+    ) -> io::Result<Option<RadarContext>> {
+        let context = self.current_context(bus)?;
+        if context.is_some() {
+            *no_context_published = false;
+        } else {
+            self.ensure_no_context_published(bus, last_good, no_context_published)?;
+        }
+        Ok(context)
     }
 
     fn apply_result(
         &self,
+        bus: &mut impl RadarBus,
         result: io::Result<PreparedResponse>,
         last_good: &mut Option<IemRadarSnapshot>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         match result {
             Ok(PreparedResponse::Modified(snapshot)) => {
-                self.publish(&snapshot);
+                self.publish(bus, &snapshot)?;
                 *last_good = Some(snapshot);
-                true
+                Ok(true)
             }
             Err(error) => {
                 if let Some(snapshot) = last_good {
-                    snapshot
+                    let mut paused = snapshot.clone();
+                    paused
                         .gaps
                         .retain(|gap| !gap.starts_with("IEM radar paused:"));
-                    push_gap(&mut snapshot.gaps, format!("IEM radar paused: {error}"));
-                    self.publish(snapshot);
+                    push_gap(&mut paused.gaps, format!("IEM radar paused: {error}"));
+                    self.publish(bus, &paused)?;
+                    *snapshot = paused;
                 }
-                false
+                Ok(false)
             }
         }
     }
@@ -549,31 +649,53 @@ impl IemRadarOverlayWorker {
     }
 }
 
+fn iem_radar_bus_root(explicit: Option<&Path>, current: Option<PathBuf>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .or(current)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 fn validated_vehicle_context(
     vehicle: &mackes_mesh_types::vehicle::VehicleState,
     expected_host: &str,
     now: i64,
-) -> Option<RadarContext> {
+) -> io::Result<Option<RadarContext>> {
     let mirror_age = now.saturating_sub(vehicle.published_at_ms).max(0);
     let future_skew = vehicle.published_at_ms.saturating_sub(now).max(0);
     let gps = &vehicle.gps;
-    if vehicle.host != expected_host
-        || !vehicle.online
-        || !gps.has_fix()
-        || !gps.latitude.is_finite()
+    if vehicle.host != expected_host {
+        return Err(io::Error::other(
+            "vehicle Bus row host does not match topic",
+        ));
+    }
+    if !vehicle.online || !gps.has_fix() {
+        return Ok(None);
+    }
+    if !gps.latitude.is_finite()
         || !gps.longitude.is_finite()
         || !gps.age_s.is_finite()
         || gps.age_s < 0.0
-        || future_skew > VEHICLE_MAX_FUTURE_SKEW_MS
+        || !(-90.0..=90.0).contains(&gps.latitude)
+        || !(-180.0..=180.0).contains(&gps.longitude)
+    {
+        return Err(io::Error::other("vehicle Bus row contains an invalid fix"));
+    }
+    if future_skew > VEHICLE_MAX_FUTURE_SKEW_MS
         || mirror_age as f64 + f64::from(gps.age_s) * 1_000.0 > VEHICLE_FIX_MAX_AGE_MS as f64
     {
-        return None;
+        return Ok(None);
     }
     let context = RadarContext {
         latitude: gps.latitude,
         longitude: gps.longitude,
     };
-    validate_context(context).ok().map(|()| context)
+    if !(17.0..=72.0).contains(&context.latitude) || !(-180.0..=-64.0).contains(&context.longitude)
+    {
+        return Ok(None);
+    }
+    validate_context(context)?;
+    Ok(Some(context))
 }
 
 #[async_trait::async_trait]
@@ -588,31 +710,66 @@ impl Worker for IemRadarOverlayWorker {
             return Ok(());
         };
         let mut last_good = None;
+        let mut no_context_published = false;
         let mut retry = self.poll;
-        let mut no_fix_published = false;
         loop {
-            let Some(context) = self.current_context() else {
-                if !no_fix_published {
-                    self.publish_no_context_degraded(
-                        "fresh same-host US vehicle fix unavailable",
-                        &mut last_good,
+            let context = match self.open_bus().and_then(|mut bus| {
+                self.current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published)
+            }) {
+                Ok(Some(context)) => context,
+                Ok(None) => {
+                    retry = self.poll;
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(self.poll) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::iem_radar_overlay",
+                        %error,
+                        "IEM radar vehicle context transaction deferred"
                     );
-                    no_fix_published = true;
+                    let delay = retry;
+                    retry = retry.saturating_mul(2).min(RETRY_MAX);
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(self.poll) => {}
-                }
-                continue;
             };
-            no_fix_published = false;
             let Some(result) = self
                 .fetch_async(probe.clone(), context, last_good.clone(), &mut shutdown)
                 .await
             else {
                 break;
             };
-            let success = self.apply_result(result, &mut last_good);
+            // Metadata/tile I/O runs off-thread without holding the Bus. Re-open
+            // and re-read the exact vehicle authority before publication so
+            // movement, fix loss, or index replacement cannot admit old tiles.
+            let success = match self.open_bus().and_then(|mut bus| {
+                let latest = self.current_context_or_clear(
+                    &mut bus,
+                    &mut last_good,
+                    &mut no_context_published,
+                )?;
+                if latest != Some(context) {
+                    return Ok(false);
+                }
+                self.apply_result(&mut bus, result, &mut last_good)
+            }) {
+                Ok(success) => success,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::iem_radar_overlay",
+                        %error,
+                        "IEM radar refresh transaction deferred"
+                    );
+                    false
+                }
+            };
             let delay = if success { self.poll } else { retry };
             retry = if success {
                 self.poll
@@ -651,6 +808,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
 
     use mackes_mesh_types::vehicle::{GpsFix, VehicleState};
     use mde_bus::persist::Persist;
@@ -671,6 +829,17 @@ mod tests {
         let valid = chrono::DateTime::from_timestamp_millis(NOW_MS - i64::from(index) * 300_000)
             .expect("time")
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        format!(
+            r#"{{"meta":{{"product":"N0Q","site":"USCOMP","valid":"{valid}","radar_quorum":"143/147"}}}}"#
+        )
+    }
+
+    fn live_metadata(index: u8) -> String {
+        let valid = chrono::DateTime::from_timestamp_millis(
+            now_ms().saturating_sub(i64::from(index) * 300_000),
+        )
+        .expect("time")
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         format!(
             r#"{{"meta":{{"product":"N0Q","site":"USCOMP","valid":"{valid}","radar_quorum":"143/147"}}}}"#
         )
@@ -699,6 +868,108 @@ mod tests {
         fn fetch_tile(&self, _index: u8, _z: u8, _x: u32, _y: u32) -> io::Result<Vec<u8>> {
             self.tile_calls.fetch_add(1, Ordering::Relaxed);
             Ok(png())
+        }
+    }
+
+    struct LiveProbe;
+
+    impl IemRadarProbe for LiveProbe {
+        fn fetch_metadata(&self, index: u8) -> io::Result<String> {
+            Ok(live_metadata(index))
+        }
+
+        fn fetch_tile(&self, _index: u8, _z: u8, _x: u32, _y: u32) -> io::Result<Vec<u8>> {
+            Ok(png())
+        }
+    }
+
+    struct RaceProbe {
+        started: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl IemRadarProbe for RaceProbe {
+        fn fetch_metadata(&self, index: u8) -> io::Result<String> {
+            if index == 0 {
+                if let Some(started) = self.started.lock().unwrap().take() {
+                    started
+                        .send(())
+                        .map_err(|_| io::Error::other("race observer dropped"))?;
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| io::Error::other("race release missing"))?
+                        .recv()
+                        .map_err(|_| io::Error::other("race release dropped"))?;
+                }
+            }
+            Ok(live_metadata(index))
+        }
+
+        fn fetch_tile(&self, _index: u8, _z: u8, _x: u32, _y: u32) -> io::Result<Vec<u8>> {
+            Ok(png())
+        }
+    }
+
+    fn vehicle(latitude: f64, longitude: f64) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude,
+            longitude,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn write_vehicle(persist: &Persist, vehicle: &VehicleState) {
+        persist
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(vehicle).unwrap()),
+            )
+            .expect("vehicle publication");
+    }
+
+    #[derive(Default)]
+    struct FixtureBus {
+        body: Option<String>,
+        output_body: Option<String>,
+        read_fails: bool,
+        failed_writes_remaining: usize,
+        published: Vec<IemRadarSnapshot>,
+    }
+
+    impl RadarBus for FixtureBus {
+        fn read_latest_body(&mut self, topic: &str) -> io::Result<Option<String>> {
+            if self.read_fails {
+                Err(io::Error::other("injected vehicle read failure"))
+            } else if topic == iem_radar_state_topic("rig-1") {
+                Ok(self.output_body.clone())
+            } else {
+                Ok(self.body.clone())
+            }
+        }
+
+        fn publish_snapshot(
+            &mut self,
+            _topic: &str,
+            snapshot: &IemRadarSnapshot,
+        ) -> io::Result<()> {
+            if self.failed_writes_remaining > 0 {
+                self.failed_writes_remaining -= 1;
+                return Err(io::Error::other("injected radar write failure"));
+            }
+            self.output_body = Some(serde_json::to_string(snapshot).expect("fixture snapshot"));
+            self.published.push(snapshot.clone());
+            Ok(())
         }
     }
 
@@ -760,13 +1031,17 @@ mod tests {
             age_s: 1.0,
             ..GpsFix::default()
         };
-        assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000).is_some());
-        assert!(validated_vehicle_context(&vehicle, "other", 110_000).is_none());
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000)
+            .unwrap()
+            .is_some());
+        assert!(validated_vehicle_context(&vehicle, "other", 110_000).is_err());
         vehicle.gps.latitude = f64::NAN;
-        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_none());
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_err());
         vehicle.gps.latitude = 0.0;
         vehicle.gps.longitude = 0.0;
-        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_none());
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -802,16 +1077,24 @@ mod tests {
     fn failed_refresh_retains_producer_time_and_publishes_paused_state() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            IemRadarOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = IemRadarOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let probe = FakeProbe::default();
         let current = parse_metadata(&metadata(0), NOW_MS, true).expect("metadata");
         let original =
             build_snapshot(&probe, "rig-1", context(), current, NOW_MS).expect("snapshot");
         let valid = original.frames[0].valid_at_ms;
         let mut last_good = None;
-        assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), &mut last_good));
-        assert!(!worker.apply_result(Err(io::Error::other("timeout")), &mut last_good));
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(original)),
+                &mut last_good,
+            )
+            .expect("fresh publication"));
+        assert!(!worker
+            .apply_result(&mut bus, Err(io::Error::other("timeout")), &mut last_good,)
+            .expect("degraded publication"));
         let retained = last_good.as_ref().expect("retained");
         assert_eq!(retained.frames[0].valid_at_ms, valid);
         assert!(retained
@@ -832,8 +1115,7 @@ mod tests {
     fn no_vehicle_fix_degraded_snapshot_is_present_and_retracts_prior_frames() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker =
-            IemRadarOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let worker = IemRadarOverlayWorker::new("rig-1".to_string()).with_bus_root(root.clone());
         let probe = FakeProbe::default();
         let current = parse_metadata(&metadata(0), NOW_MS, true).expect("metadata");
         let original =
@@ -841,10 +1123,14 @@ mod tests {
         assert!(!original.frames.is_empty());
         let mut last_good = Some(original);
 
-        worker.publish_no_context_degraded(
-            "fresh same-host US vehicle fix unavailable",
-            &mut last_good,
-        );
+        let mut bus = Persist::open(root.clone()).expect("bus");
+        worker
+            .publish_no_context_degraded(
+                &mut bus,
+                "fresh same-host US vehicle fix unavailable",
+                &mut last_good,
+            )
+            .expect("durable empty publication");
 
         assert!(
             last_good.is_none(),
@@ -869,6 +1155,255 @@ mod tests {
             .any(|gap| gap.contains("vehicle fix unavailable")));
         assert_eq!(snapshot.license_tier, "public-domain-courtesy-attribution");
         assert_eq!(snapshot.attribution, "IEM / NOAA NWS NEXRAD");
+    }
+
+    #[test]
+    fn vehicle_read_or_decode_failure_is_effect_free() {
+        let worker = IemRadarOverlayWorker::new("rig-1".to_string());
+        let probe = FakeProbe::default();
+        let current = parse_metadata(&metadata(0), NOW_MS, true).expect("metadata");
+        let original = build_snapshot(&probe, "rig-1", context(), current, NOW_MS)
+            .expect("last-good snapshot");
+
+        for mut bus in [
+            FixtureBus {
+                read_fails: true,
+                ..FixtureBus::default()
+            },
+            FixtureBus {
+                body: Some("{not vehicle json".to_string()),
+                ..FixtureBus::default()
+            },
+        ] {
+            let mut last_good = Some(original.clone());
+            let mut no_context_published = false;
+            assert!(worker
+                .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+                .is_err());
+            assert_eq!(last_good.as_ref(), Some(&original));
+            assert!(!no_context_published);
+            assert!(bus.published.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_publication_retains_state_and_corrects_forward() {
+        let worker = IemRadarOverlayWorker::new("rig-1".to_string());
+        let previous = IemRadarSnapshot::empty("rig-1", NOW_MS - 1, 40.0, -72.0);
+        let probe = FakeProbe::default();
+        let current = parse_metadata(&metadata(0), NOW_MS, true).expect("metadata");
+        let replacement = build_snapshot(&probe, "rig-1", context(), current, NOW_MS)
+            .expect("replacement snapshot");
+        assert_eq!(replacement.frames.len(), usize::from(MAX_FRAMES));
+        let mut last_good = Some(previous.clone());
+        let mut bus = FixtureBus {
+            failed_writes_remaining: 1,
+            ..FixtureBus::default()
+        };
+
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(replacement.clone())),
+                &mut last_good,
+            )
+            .is_err());
+        assert_eq!(last_good.as_ref(), Some(&previous));
+        assert!(bus.published.is_empty());
+
+        assert!(worker
+            .apply_result(
+                &mut bus,
+                Ok(PreparedResponse::Modified(replacement.clone())),
+                &mut last_good,
+            )
+            .expect("corrected-forward publication"));
+        assert_eq!(last_good.as_ref(), Some(&replacement));
+        assert_eq!(bus.published, vec![replacement.clone()]);
+
+        bus.body = None;
+        bus.failed_writes_remaining = 1;
+        let mut no_context_published = false;
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .is_err());
+        assert_eq!(last_good.as_ref(), Some(&replacement));
+        assert!(!no_context_published);
+        assert_eq!(bus.published.len(), 1);
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .expect("corrected-forward empty publication")
+            .is_none());
+        assert!(last_good.is_none());
+        assert!(no_context_published);
+        assert!(bus.published.last().unwrap().frames.is_empty());
+
+        let rows_after_transition = bus.published.len();
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .expect("suppressed repeated no-context poll")
+            .is_none());
+        assert_eq!(bus.published.len(), rows_after_transition);
+
+        bus.output_body = None;
+        assert!(worker
+            .current_context_or_clear(&mut bus, &mut last_good, &mut no_context_published,)
+            .expect("replacement Bus empty publication")
+            .is_none());
+        assert_eq!(bus.published.len(), rows_after_transition + 1);
+    }
+
+    #[tokio::test]
+    async fn late_and_replaced_bus_recovers_in_the_same_worker() {
+        assert_eq!(
+            iem_radar_bus_root(None, None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        let root = tempfile::tempdir().expect("root");
+        let bus_root = root.path().join("bus");
+        std::fs::write(&bus_root, b"blocks Persist::open").expect("late Bus blocker");
+        let mut worker = IemRadarOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(LiveProbe))
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(10));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(!task.is_finished(), "late Bus terminated the worker");
+        std::fs::remove_file(&bus_root).expect("unblock Bus root");
+        let first_bus = Persist::open(bus_root.clone()).expect("activate Bus");
+        write_vehicle(&first_bus, &vehicle(42.3601, -71.0589));
+        let topic = iem_radar_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = first_bus.read_latest(&topic) {
+                    let snapshot: IemRadarSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == 42.3601 {
+                        assert!(snapshot.frames.len() <= usize::from(MAX_FRAMES));
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("late Bus publication");
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!(
+                "{}{suffix}",
+                bus_root.join("index.sqlite").display()
+            ));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(bus_root.clone()).expect("replacement Bus");
+        write_vehicle(&replacement_bus, &vehicle(41.0, -72.0));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = replacement_bus.read_latest(&topic) {
+                    let snapshot: IemRadarSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == 41.0 {
+                        assert!(snapshot.frames.len() <= usize::from(MAX_FRAMES));
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus publication");
+
+        tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("worker join")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn post_fetch_context_race_discards_old_tiles_and_retracts_on_loss() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let old_context = vehicle(42.3601, -71.0589);
+        write_vehicle(&persist, &old_context);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let probe = Arc::new(RaceProbe {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let mut worker = IemRadarOverlayWorker::new("rig-1".to_string())
+            .with_probe(probe)
+            .with_bus_root(bus.path().to_path_buf())
+            .with_poll(Duration::from_millis(5));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("race observer join")
+            .expect("provider did not start");
+        write_vehicle(&persist, &vehicle(41.0, -72.0));
+        release_tx.send(()).expect("release provider");
+
+        let topic = iem_radar_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = persist.read_latest(&topic) {
+                    let snapshot: IemRadarSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.query_latitude == 41.0 && !snapshot.frames.is_empty() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("moved-context publication");
+        let rows = persist.list_since(&topic, None).expect("radar rows");
+        assert!(!rows.is_empty());
+        for row in rows {
+            let snapshot: IemRadarSnapshot =
+                serde_json::from_str(row.body.as_deref().unwrap_or_default()).unwrap();
+            assert_ne!(snapshot.query_latitude, old_context.gps.latitude);
+            assert!(snapshot.frames.len() <= usize::from(MAX_FRAMES));
+        }
+
+        let mut lost = VehicleState::offline("rig-1");
+        lost.published_at_ms = now_ms();
+        write_vehicle(&persist, &lost);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(Some(message)) = persist.read_latest(&topic) {
+                    let snapshot: IemRadarSnapshot =
+                        serde_json::from_str(message.body.as_deref().unwrap_or_default()).unwrap();
+                    if snapshot.frames.is_empty() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("lost-context retraction");
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("prompt shutdown")
+            .expect("worker join")
+            .expect("worker result");
     }
 
     #[test]
@@ -934,7 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_wins_while_metadata_is_in_flight() {
-        let worker = IemRadarOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
+        let worker = IemRadarOverlayWorker::new("rig-1".to_string());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut shutdown = ShutdownToken::from_receiver(rx);
         let sender = tokio::spawn(async move {
@@ -952,24 +1487,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+    async fn repeated_no_fix_polls_publish_once_and_replacement_retries() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let mut worker = IemRadarOverlayWorker::new("rig-1".to_string())
             .with_probe(Arc::new(FakeProbe::default()))
-            .with_bus_root(Some(root.clone()));
+            .with_bus_root(root.clone())
+            .with_poll(Duration::from_millis(10));
         let (tx, rx) = tokio::sync::watch::channel(false);
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { worker.run(token).await });
 
         let topic = iem_radar_state_topic("rig-1");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let first_bus = Persist::open(root.clone()).expect("bus");
         let body = loop {
-            if let Some(row) = Persist::open(root.clone())
-                .expect("bus")
-                .read_latest(&topic)
-                .expect("read")
-            {
+            if let Some(row) = first_bus.read_latest(&topic).expect("read") {
                 break row.body.expect("body");
             }
             assert!(
@@ -978,6 +1511,48 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            first_bus
+                .list_since(&topic, None)
+                .expect("first Bus rows")
+                .len(),
+            1,
+            "repeated no-fix polls appended duplicate empty snapshots"
+        );
+
+        drop(first_bus);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", root.join("index.sqlite").display()));
+            if let Err(error) = std::fs::remove_file(path) {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            }
+        }
+        let replacement_bus = Persist::open(root.clone()).expect("replacement Bus");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if replacement_bus
+                    .read_latest(&topic)
+                    .expect("replacement read")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement Bus no-context publication");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            replacement_bus
+                .list_since(&topic, None)
+                .expect("replacement rows")
+                .len(),
+            1,
+            "replacement Bus received repeated empty snapshots"
+        );
 
         tx.send(true).expect("shutdown");
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
