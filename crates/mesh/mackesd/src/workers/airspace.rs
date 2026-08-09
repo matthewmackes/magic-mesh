@@ -18,6 +18,8 @@ use mackes_mesh_types::airspace::{
     airspace_state_topic, AirspaceAvailability, AirspaceContact, AirspaceContactKind,
     AirspaceSnapshot, AirspaceSurvey, MAX_GAPS, MAX_SNAPSHOT_BYTES,
 };
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 use super::{vehicle, ShutdownToken, Worker};
 
@@ -26,6 +28,8 @@ use vehicle::VehicleProbe;
 /// Mirror cadence and heartbeat interval.
 pub const POLL: Duration = Duration::from_secs(5);
 const FAILURE_RETRY_MAX: Duration = Duration::from_secs(60);
+const BUS_RETRY_MIN: Duration = Duration::from_millis(10);
+const BUS_RETRY_MAX: Duration = Duration::from_secs(2);
 const MAX_INITIAL_PHASE: Duration = Duration::from_millis(250);
 
 /// Spread the first expensive MG90 survey across a small deterministic window.
@@ -121,7 +125,7 @@ pub use Mg90SurveyProbe as AirspaceProbe;
 pub struct AirspaceWorker {
     host: String,
     probe: Option<Arc<dyn Mg90SurveyProbe>>,
-    bus_root: Option<PathBuf>,
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -143,7 +147,7 @@ impl AirspaceWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -155,10 +159,11 @@ impl AirspaceWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override the Bus root. Without an override, each publication resolves
+    /// the current user root and falls back to the canonical system spool.
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_root_override = root;
         self
     }
 
@@ -217,16 +222,44 @@ impl AirspaceWorker {
     }
 
     /// Publish one bounded latest-wins mirror record.
-    fn publish(&self, snapshot: &AirspaceSnapshot) {
+    fn publish(&self, snapshot: &AirspaceSnapshot) -> io::Result<()> {
         let Some(body) = self.body_for_publish(snapshot) else {
-            return;
+            return Err(io::Error::other("airspace snapshot could not be encoded"));
         };
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_body(
-                &mut persist,
+        let root = airspace_bus_root(self.bus_root_override.clone());
+        let persist = Persist::open(root).map_err(io_other)?;
+        persist
+            .write(
                 &airspace_state_topic(&self.host),
-                &body,
-            );
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
+    }
+
+    async fn publish_until_success(
+        &self,
+        snapshot: &AirspaceSnapshot,
+        shutdown: &mut ShutdownToken,
+    ) -> bool {
+        let mut retry = BUS_RETRY_MIN;
+        loop {
+            match self.publish(snapshot) {
+                Ok(()) => return true,
+                Err(error) => tracing::warn!(
+                    target: "mackesd::airspace",
+                    host = %self.host,
+                    %error,
+                    "airspace publication deferred until Bus recovery"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return false,
+                () = tokio::time::sleep(retry) => {}
+            }
+            retry = retry.saturating_mul(2).min(BUS_RETRY_MAX);
         }
     }
 
@@ -354,7 +387,7 @@ impl AirspaceWorker {
             let worker = AirspaceWorker {
                 host,
                 probe: None,
-                bus_root: None,
+                bus_root_override: None,
                 poll: POLL,
             };
             worker.build_snapshot(result, now_ms())
@@ -677,7 +710,10 @@ impl Worker for AirspaceWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let Some(probe) = self.probe.clone() else {
-            self.publish(&AirspaceSnapshot::no_source(&self.host, now_ms()));
+            let snapshot = AirspaceSnapshot::no_source(&self.host, now_ms());
+            if !self.publish_until_success(&snapshot, &mut shutdown).await {
+                return Ok(());
+            }
             shutdown.wait().await;
             return Ok(());
         };
@@ -692,7 +728,9 @@ impl Worker for AirspaceWorker {
             let Some(snapshot) = self.poll_once(probe.clone(), &mut shutdown).await else {
                 return Ok(());
             };
-            self.publish(&snapshot);
+            if !self.publish_until_success(&snapshot, &mut shutdown).await {
+                return Ok(());
+            }
             let delay = match snapshot.availability {
                 AirspaceAvailability::Ready => {
                     retry = self.poll;
@@ -713,6 +751,16 @@ impl Worker for AirspaceWorker {
     }
 }
 
+fn airspace_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    override_root
+        .or_else(crate::bus_publish::default_bus_root)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -723,6 +771,7 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use mackes_mesh_types::airspace::{
@@ -758,6 +807,21 @@ mod tests {
                 .as_ref()
                 .map(Clone::clone)
                 .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+        }
+    }
+
+    struct CountingProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Mg90SurveyProbe for CountingProbe {
+        fn survey(&self) -> io::Result<AirspaceSurvey> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AirspaceSurvey {
+                scanned_at_ms: Some(now_ms()),
+                contacts: vec![contact("aa:bb:cc")],
+                gaps: Vec::new(),
+            })
         }
     }
 
@@ -909,12 +973,23 @@ END_BT_INQUIRY RC=0
 
     #[tokio::test]
     async fn worker_publishes_explicit_no_source_without_contacts() {
+        assert_eq!(
+            airspace_bus_root(Some(PathBuf::from("/tmp/airspace-explicit-bus"))),
+            PathBuf::from("/tmp/airspace-explicit-bus")
+        );
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().to_path_buf();
+        let root = temp.path().join("late-bus");
+        std::fs::write(&root, b"temporarily block Bus directory").expect("block Bus root");
         let mut worker = AirspaceWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
         worker.probe = None;
         let (tx, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task.is_finished(),
+            "missing Bus must not terminate the no-source worker"
+        );
+        std::fs::remove_file(&root).expect("unblock Bus root");
         let topic = airspace_state_topic("rig-1");
         let mut decoded = None;
         for _ in 0..40 {
@@ -935,6 +1010,52 @@ END_BT_INQUIRY RC=0
         assert_eq!(snapshot.availability, AirspaceAvailability::NoSource);
         assert!(snapshot.contacts.is_empty());
         assert!(snapshot.gaps.iter().any(|gap| gap.contains("not proven")));
+    }
+
+    #[tokio::test]
+    async fn failed_publication_retries_snapshot_without_reprobing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("late-bus");
+        std::fs::write(&root, b"temporarily block Bus directory").expect("block Bus root");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = AirspaceWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(CountingProbe {
+                calls: Arc::clone(&calls),
+            }))
+            .with_bus_root(Some(root.clone()))
+            .with_poll(Duration::from_secs(60));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial survey");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(&root).expect("unblock Bus root");
+
+        let topic = airspace_state_topic("rig-1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if Persist::open(root.clone())
+                    .ok()
+                    .and_then(|persist| persist.read_latest(&topic).ok().flatten())
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovered publication");
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1047,7 +1168,7 @@ END_BT_INQUIRY RC=0
         );
         assert_eq!(snapshot.contacts.len(), MAX_RETAINED_CONTACTS);
 
-        worker.publish(&snapshot);
+        worker.publish(&snapshot).expect("publish bounded snapshot");
 
         let body = Persist::open(root)
             .expect("open bus")
@@ -1082,7 +1203,7 @@ END_BT_INQUIRY RC=0
             gaps: Vec::new(),
         };
 
-        worker.publish(&snapshot);
+        worker.publish(&snapshot).expect("publish offline fallback");
 
         let body = Persist::open(root)
             .expect("open bus")
@@ -1117,7 +1238,9 @@ END_BT_INQUIRY RC=0
         );
         snapshot.contacts[0].bearing_deg = f32::NAN;
 
-        worker.publish(&snapshot);
+        worker
+            .publish(&snapshot)
+            .expect("publish malformed-contact fallback");
 
         let body = Persist::open(root)
             .expect("open bus")

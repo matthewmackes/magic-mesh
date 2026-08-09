@@ -488,19 +488,19 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-location-bus-recovery-r47.md`.
 - **Health/Units/forecast recovery checkpoints (2026-08-09):** complete health
   and cloud-source reads now precede cursor/seen effects, request replies retry,
-  and weather pairs stage before publication. Machines 194/193 and BigBoy passed
-  the focused gates:
+  and weather pairs stage before publication; machines 194/193 and BigBoy passed the focused gates:
   `docs/platform/evidence/WL-UX-013-WL-ARCH-009-2026-08-09-health-reconciler-bus-recovery-r48.md`,
   `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-2026-08-09-unit-aggregator-bus-recovery-r49.md`,
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-forecast-bus-recovery-r50.md`.
-- **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus
-  authority recovers, and fresh identity-bound cache persistence precedes map
-  publication. Machine 9 passed two exact tests:
+- **Atmospheric-map recovery checkpoint (2026-08-09):** late/replaced Bus authority
+  recovers, and cache persistence precedes map publication. Machine 9 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
+- **Airspace publication recovery checkpoint (2026-08-09):** failed Bus writes
+  retain one MG90 survey for retry without reprobing. Machine 196 passed two exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
 - **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add,
   target apply, Voice, and lighthouse provisioning now recover late storage, skip retained
-  mutations, admit forward commands, and defer effects on incomplete reads.
-  Machines 9/194 and BigBoy passed eight exact tests:
+  mutations, admit forward commands, and defer effects on incomplete reads. Machines 9/194 and BigBoy passed eight exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-service-onboard-bus-recovery-r34.md`,
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-onboard-apply-bus-recovery-r35.md`,
   `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-voice-provision-bus-recovery-r36.md`,
@@ -852,6 +852,10 @@ behavioral evidence is not completion.
   location/viewport identity is rechecked after NOAA I/O, then a fresh cache
   commits before map publication. Machine 9 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
+- **Airspace publication checkpoint (2026-08-09):** late Bus startup recovers,
+  and a failed write retries the same bounded survey without another MG90
+  probe. Machine 196 passed two exact tests:
+  `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
   1. S1 Freeze provider, location, and weather contracts.
      - Objective: define vehicle, GNSS, radio, route, map tile, weather location, current conditions, forecast, map field, manager, capability, and health schemas with
        source, producer time, fetch time, attribution, freshness, and explicit gaps.
