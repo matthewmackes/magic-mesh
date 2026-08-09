@@ -1148,7 +1148,12 @@ impl ClipboardPermissionController {
         };
         if let Some(desired) = desired {
             let current = gate.state.load(Ordering::Acquire);
-            if current != CLIPBOARD_GATE_MATERIALIZING {
+            // Approval is one-use and must never rewind a transport that has
+            // already begun materialization. Revocation is different: cancel,
+            // expiry, focus loss, and session/lease replacement must remain
+            // observable by the transport even after materialization starts so
+            // multi-step protocol writes can stop before publishing more bytes.
+            if desired == CLIPBOARD_GATE_REFUSED || current != CLIPBOARD_GATE_MATERIALIZING {
                 gate.state.store(desired, Ordering::Release);
             }
         }
@@ -1510,6 +1515,48 @@ mod tests {
             ticket.try_begin_materialization(),
             ClipboardGateReadiness::Pending,
             "one-use ticket must not begin materialization twice"
+        );
+    }
+
+    #[test]
+    fn operator_cancel_after_materialization_revokes_transport_ticket() {
+        let mut controller = ClipboardPermissionController::default();
+        let ingress = controller.ingress();
+        let (lease, message) = vdi_message(24, "text/html", "text/plain;charset=utf-8");
+        let ticket = ingress
+            .submit_vdi(
+                &message,
+                &lease,
+                None,
+                target(ClipboardTargetKind::Guest),
+                NOW,
+            )
+            .expect("bounded host-to-guest ingress");
+
+        controller.poll_ingress(NOW);
+        let token = match controller.model.active_state() {
+            Some(ClipboardTransferState::AwaitingApproval { token }) => *token,
+            state => panic!("rich host-to-guest transfer was not gated: {state:?}"),
+        };
+        controller
+            .apply_operator_action(ClipboardOperatorAction::Approve(token), NOW + 1)
+            .expect("operator approval");
+        assert_eq!(
+            ticket.try_begin_materialization(),
+            ClipboardGateReadiness::Materialize
+        );
+
+        controller
+            .apply_operator_action(ClipboardOperatorAction::Cancel, NOW + 2)
+            .expect("operator cancellation");
+        assert_eq!(
+            ticket.readiness_before_materialization(),
+            ClipboardGateReadiness::Refused,
+            "transport must observe cancellation after materialization begins"
+        );
+        assert_eq!(
+            ticket.try_begin_materialization(),
+            ClipboardGateReadiness::Refused
         );
     }
 
