@@ -21,6 +21,7 @@ const SEATS: [(&str, &[&str]); 5] = [
     ("Surface", &["surface"]),
 ];
 const MESH_SELECTION: &str = "__mesh_wide__";
+const HISTORY_PAGE_SIZE: usize = 8;
 
 pub(crate) fn mount(
     ctx: &egui::Context,
@@ -59,6 +60,7 @@ fn show(
     chrome: &mut ConstructChrome,
     snapshot: Option<&SystemMeshHealthSnapshot>,
 ) {
+    stabilize_selection(chrome, snapshot);
     let active = active_condition_count(snapshot);
     let issue_text = format!(
         "{active} active {}",
@@ -134,6 +136,24 @@ fn show(
                         });
                 },
             );
+        });
+    }
+}
+
+/// Establish the default detail target once, then preserve it across live
+/// snapshot reorder/removal.  Selection belongs to the operator-facing modal
+/// model; deriving it from `current_node_grades.first()` on every paint lets an
+/// asynchronously refreshed roster silently move the evidence pane.
+fn stabilize_selection(
+    chrome: &mut ConstructChrome,
+    snapshot: Option<&SystemMeshHealthSnapshot>,
+) {
+    if chrome.health_selected_node.is_none() {
+        chrome.health_selected_node = snapshot.and_then(|snapshot| {
+            snapshot
+                .current_node_grades
+                .first()
+                .map(|grade| grade.node.clone())
         });
     }
 }
@@ -287,14 +307,7 @@ fn detail(
     chrome: &mut ConstructChrome,
     snapshot: Option<&SystemMeshHealthSnapshot>,
 ) {
-    let selected = chrome.health_selected_node.clone().or_else(|| {
-        snapshot.and_then(|snapshot| {
-            snapshot
-                .current_node_grades
-                .first()
-                .map(|grade| grade.node.clone())
-        })
-    });
+    let selected = chrome.health_selected_node.clone();
     let Some(node) = selected else {
         ui.heading("No current node evidence");
         ui.label("The health provider has not published a current seat row.");
@@ -579,21 +592,30 @@ fn sorted_history<'a>(
     conditions: &'a [HealthCondition],
     node: &str,
 ) -> Vec<&'a HealthCondition> {
-    let mut resolved: Vec<_> = conditions
-        .iter()
-        .filter(|condition| {
-            matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
-        })
-        .collect();
-    resolved.sort_by(|left, right| {
-        right
-            .severity
-            .cmp(&left.severity)
-            .then_with(|| resolution_duration_ms(right).cmp(&resolution_duration_ms(left)))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    resolved.truncate(8);
+    let mut resolved: Vec<&'a HealthCondition> = Vec::with_capacity(HISTORY_PAGE_SIZE);
+    for condition in conditions.iter().filter(|condition| {
+        matches!(&condition.scope, HealthScope::Node { node: target } if target.as_str() == node)
+    }) {
+        let insert_at = resolved.partition_point(|existing| {
+            history_order(existing, condition) != std::cmp::Ordering::Greater
+        });
+        if insert_at >= HISTORY_PAGE_SIZE {
+            continue;
+        }
+        resolved.insert(insert_at, condition);
+        if resolved.len() > HISTORY_PAGE_SIZE {
+            resolved.pop();
+        }
+    }
     resolved
+}
+
+fn history_order(left: &HealthCondition, right: &HealthCondition) -> std::cmp::Ordering {
+    right
+        .severity
+        .cmp(&left.severity)
+        .then_with(|| resolution_duration_ms(right).cmp(&resolution_duration_ms(left)))
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 #[cfg(test)]
@@ -1055,6 +1077,97 @@ mod tests {
             ordered.iter().map(|condition| condition.id.as_str()).collect::<Vec<_>>(),
             ["critical-long", "critical-short", "warning-long"]
         );
+    }
+
+    #[test]
+    fn live_snapshot_reorder_or_removal_never_moves_selection() {
+        let mut initial = fixture_snapshot(false, true);
+        let selected = initial.current_node_grades[0].node.clone();
+        let mut chrome = ConstructChrome::default();
+
+        stabilize_selection(&mut chrome, Some(&initial));
+        assert_eq!(chrome.health_selected_node.as_deref(), Some(selected.as_str()));
+
+        initial.current_node_grades.reverse();
+        assert_ne!(initial.current_node_grades[0].node, selected);
+        stabilize_selection(&mut chrome, Some(&initial));
+        assert_eq!(
+            chrome.health_selected_node.as_deref(),
+            Some(selected.as_str()),
+            "a live reorder must not silently switch the detail pane"
+        );
+
+        initial
+            .current_node_grades
+            .retain(|grade| grade.node != selected);
+        stabilize_selection(&mut chrome, Some(&initial));
+        assert_eq!(
+            chrome.health_selected_node.as_deref(),
+            Some(selected.as_str()),
+            "temporary node disappearance must retain the operator's selection"
+        );
+    }
+
+    #[test]
+    fn history_materialization_is_node_scoped_and_hard_bounded() {
+        let mut conditions = Vec::new();
+        for index in 0..64 {
+            let mut resolved = condition(
+                &format!("node:resolved-{index}"),
+                "node",
+                HealthSeverity::Warning,
+                HealthComponent::System,
+            );
+            resolved.resolved_at_ms = Some(2_000 + index);
+            conditions.push(resolved);
+        }
+        let mut short_critical = condition(
+            "node:critical-short",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        short_critical.resolved_at_ms = Some(2_000);
+        conditions.push(short_critical);
+        let mut long_critical = condition(
+            "node:critical-long",
+            "node",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        long_critical.active_since_ms = 0;
+        long_critical.resolved_at_ms = Some(10_000);
+        conditions.push(long_critical);
+        let mut other = condition(
+            "other:critical",
+            "other",
+            HealthSeverity::Critical,
+            HealthComponent::System,
+        );
+        other.resolved_at_ms = Some(9_999);
+        conditions.push(other);
+
+        let page = sorted_history(&conditions, "node");
+        assert_eq!(page.len(), 8, "one paint materializes at most eight rows");
+        assert_eq!(
+            page.iter()
+                .map(|condition| condition.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "node:critical-long",
+                "node:critical-short",
+                "node:resolved-63",
+                "node:resolved-62",
+                "node:resolved-61",
+                "node:resolved-60",
+                "node:resolved-59",
+                "node:resolved-58",
+            ],
+            "bounded insertion retains the same severity/duration/id ordering"
+        );
+        assert!(page.iter().all(|condition| {
+            matches!(&condition.scope, HealthScope::Node { node } if node == "node")
+        }));
     }
 
     #[test]
