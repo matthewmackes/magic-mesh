@@ -432,7 +432,9 @@ payload_compress = "xz"
 # aggregate target and cascading through every otherwise-healthy process, and
 # restart an already-active grouped target after an RPM upgrade so every group
 # maps the replacement binary and unit relationships.
-release = "23"
+# -24 (2026-08-09): carry the typed probed-RDP resource projection and stamp
+# slow probe snapshots at completion so live Remote Sessions do not disappear.
+release = "24"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
