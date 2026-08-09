@@ -28,6 +28,9 @@
 
 #![cfg(feature = "async-services")]
 
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +57,18 @@ const IDLE_SLEEP: Duration = Duration::from_millis(500);
 /// announce lane cannot grow mdns-sd registrations and their sockets without
 /// bound. Duplicates are still accepted as no-ops through the `registered` set.
 const MAX_REPUBLISHED_SERVICES: usize = 512;
+
+/// A relay pass is one complete, bounded Bus transaction. Refuse a larger
+/// transient batch instead of applying a partial prefix and advancing past work
+/// that was never inspected.
+const MAX_ANNOUNCES_PER_PASS: usize = 256;
+
+/// One untrusted announce cannot force an oversized JSON allocation downstream.
+const MAX_ANNOUNCE_BODY_BYTES: usize = 64 * 1024;
+
+/// Local discoveries survive a late/replaced Bus in a bounded corrected-forward
+/// queue. The payload itself is idempotent by service identity.
+const MAX_PENDING_OUTBOUND: usize = 512;
 
 /// Service types relayed by default (v1.x §9 lock — media + discovery).
 pub const RELAYED_TYPES: &[&str] = &[
@@ -170,12 +185,15 @@ pub fn announce_from_info(
     })
 }
 
-/// Publish an announce to the Bus (best-effort; absent Persist = no-op).
-fn publish_announce(persist: Option<&Persist>, ann: &MdnsAnnounce) {
-    let Some(p) = persist else { return };
-    if let Ok(body) = serde_json::to_string(ann) {
-        let _ = p.write(ANNOUNCE_TOPIC, Priority::Default, None, Some(&body));
-    }
+/// Publish an announce through the current identity-bound Bus transaction.
+fn publish_announce(transaction: &MdnsBusTransaction, ann: &MdnsAnnounce) -> io::Result<()> {
+    let body = serde_json::to_string(ann).map_err(io::Error::other)?;
+    transaction.verify_current()?;
+    transaction
+        .persist
+        .write(ANNOUNCE_TOPIC, Priority::Default, None, Some(&body))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    transaction.verify_current()
 }
 
 /// Peer-suffixed instance name for a republished service — avoids colliding
@@ -200,20 +218,209 @@ enum RepublishDecision {
     AtCap,
 }
 
-fn remember_republish_candidate(
-    registered: &mut std::collections::HashSet<String>,
+fn republish_decision(
+    registered: &HashMap<String, MdnsAnnounce>,
     ann: &MdnsAnnounce,
     max: usize,
 ) -> RepublishDecision {
     let key = service_key(ann);
-    if registered.contains(&key) {
+    if registered.get(&key) == Some(ann) {
         return RepublishDecision::Duplicate;
     }
-    if registered.len() >= max {
+    if !registered.contains_key(&key) && registered.len() >= max {
         return RepublishDecision::AtCap;
     }
-    registered.insert(key);
     RepublishDecision::Register
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MdnsBusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+struct MdnsBusTransaction {
+    root: PathBuf,
+    persist: Persist,
+    identity: MdnsBusIdentity,
+}
+
+impl MdnsBusTransaction {
+    fn open(root: PathBuf) -> io::Result<Self> {
+        let before = match mdns_bus_identity(&root) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                drop(
+                    Persist::open(root.clone())
+                        .map_err(|error| io::Error::other(error.to_string()))?,
+                );
+                mdns_bus_identity(&root)?
+            }
+            Err(error) => return Err(error),
+        };
+        let persist =
+            Persist::open(root.clone()).map_err(|error| io::Error::other(error.to_string()))?;
+        let after = mdns_bus_identity(&root)?;
+        #[cfg(unix)]
+        let handle_matches_path = persist.index_inode() == Some(after.inode);
+        #[cfg(not(unix))]
+        let handle_matches_path = true;
+        if before != after || !handle_matches_path {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "mDNS relay Bus changed while opening a transaction",
+            ));
+        }
+        Ok(Self {
+            root,
+            persist,
+            identity: after,
+        })
+    }
+
+    fn verify_current(&self) -> io::Result<()> {
+        if mdns_bus_identity(&self.root)? == self.identity {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "mDNS relay Bus changed during a transaction",
+            ))
+        }
+    }
+}
+
+#[derive(Default)]
+struct InboundBusState {
+    active_identity: Option<MdnsBusIdentity>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug)]
+struct StagedInbound {
+    announces: Vec<MdnsAnnounce>,
+    next_cursor: Option<String>,
+}
+
+impl InboundBusState {
+    /// Activate one generation atomically at its complete bounded tail. Bus
+    /// announcements are transient actions, so retained rows are never replayed
+    /// after startup or same-path replacement; the first later row remains live.
+    fn activate(&mut self, transaction: &MdnsBusTransaction) -> io::Result<()> {
+        let retained = bounded_announce_rows(&transaction.persist, None)?;
+        transaction.verify_current()?;
+        self.cursor = retained.last().map(|message| message.ulid.clone());
+        self.active_identity = Some(transaction.identity);
+        Ok(())
+    }
+
+    fn stage(
+        &mut self,
+        transaction: &MdnsBusTransaction,
+        own_ip: &str,
+    ) -> io::Result<StagedInbound> {
+        if self.active_identity != Some(transaction.identity) {
+            self.activate(transaction)?;
+        }
+        let rows = bounded_announce_rows(&transaction.persist, self.cursor.as_deref())?;
+        let next_cursor = rows
+            .last()
+            .map(|message| message.ulid.clone())
+            .or_else(|| self.cursor.clone());
+        let mut announces = Vec::with_capacity(rows.len());
+        for message in rows {
+            let Some(body) = message.body.as_deref() else {
+                continue;
+            };
+            let Some(announce) = parse_bounded_announce(body) else {
+                continue;
+            };
+            if announce.peer != own_ip {
+                announces.push(announce);
+            }
+        }
+        transaction.verify_current()?;
+        Ok(StagedInbound {
+            announces,
+            next_cursor,
+        })
+    }
+
+    fn commit(
+        &mut self,
+        transaction: &MdnsBusTransaction,
+        staged: StagedInbound,
+    ) -> io::Result<()> {
+        transaction.verify_current()?;
+        self.cursor = staged.next_cursor;
+        Ok(())
+    }
+}
+
+fn mdns_bus_identity(root: &Path) -> io::Result<MdnsBusIdentity> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mDNS relay Bus index is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(MdnsBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(MdnsBusIdentity {})
+    }
+}
+
+fn bounded_announce_rows(
+    persist: &Persist,
+    cursor: Option<&str>,
+) -> io::Result<Vec<mde_bus::persist::StoredMessage>> {
+    let rows = persist
+        .list_since_limit(ANNOUNCE_TOPIC, cursor, MAX_ANNOUNCES_PER_PASS + 1)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if rows.len() > MAX_ANNOUNCES_PER_PASS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mDNS relay announce batch exceeds the complete-read bound",
+        ));
+    }
+    Ok(rows)
+}
+
+fn parse_bounded_announce(body: &str) -> Option<MdnsAnnounce> {
+    if body.len() > MAX_ANNOUNCE_BODY_BYTES {
+        return None;
+    }
+    let announce: MdnsAnnounce = serde_json::from_str(body).ok()?;
+    let txt_bytes = announce
+        .txt
+        .iter()
+        .try_fold(0usize, |total, (key, value)| {
+            total.checked_add(key.len())?.checked_add(value.len())
+        })?;
+    if !is_relayed(&announce.service_type)
+        || announce.peer.len() > 64
+        || announce.peer.parse::<std::net::IpAddr>().is_err()
+        || announce.service.is_empty()
+        || announce.service.len() > 256
+        || announce.service_type.len() > 64
+        || announce.txt.len() > 64
+        || txt_bytes > MAX_ANNOUNCE_BODY_BYTES
+    {
+        return None;
+    }
+    Some(announce)
 }
 
 /// Build the `ServiceInfo` to register a peer's service on the LOCAL LAN:
@@ -262,7 +469,8 @@ fn run_relay_blocking(stop: &AtomicBool) {
             return;
         }
     };
-    let persist = mde_bus::default_data_dir().and_then(|d| Persist::open(d).ok());
+    let bus_root =
+        mde_bus::default_data_dir().unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT));
 
     let mut browsers = Vec::new();
     for bare in RELAYED_TYPES {
@@ -274,8 +482,9 @@ fn run_relay_blocking(stop: &AtomicBool) {
 
     // Inbound republish state: a cursor over the announce topic + the set of
     // already-registered service keys (a peer service is registered once).
-    let mut cursor: Option<String> = None;
-    let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut inbound = InboundBusState::default();
+    let mut registered: HashMap<String, MdnsAnnounce> = HashMap::new();
+    let mut pending_outbound = VecDeque::new();
 
     while !stop.load(Ordering::Relaxed) {
         let mut got_any = false;
@@ -286,50 +495,89 @@ fn run_relay_blocking(stop: &AtomicBool) {
                 got_any = true;
                 if let ServiceEvent::ServiceResolved(info) = event {
                     if let Some(ann) = announce_from_info(bare, &info, &own_ip) {
-                        publish_announce(persist.as_ref(), &ann);
+                        enqueue_outbound(&mut pending_outbound, ann);
                     }
                 }
             }
         }
 
-        // INBOUND — poll the Bus for peers' announces, republish locally.
-        if let Some(p) = persist.as_ref() {
-            if let Ok(msgs) = p.list_since(ANNOUNCE_TOPIC, cursor.as_deref()) {
-                for msg in msgs {
-                    got_any = true;
-                    cursor = Some(msg.ulid.clone());
-                    let Some(body) = msg.body.as_deref() else {
-                        continue;
-                    };
-                    let Ok(ann) = serde_json::from_str::<MdnsAnnounce>(body) else {
-                        continue;
-                    };
-                    if ann.peer == own_ip {
-                        continue; // anti-loop: our own announce
-                    }
-                    match remember_republish_candidate(
-                        &mut registered,
-                        &ann,
-                        MAX_REPUBLISHED_SERVICES,
-                    ) {
-                        RepublishDecision::Register => {
-                            if let Some(info) = build_republish_info(&ann) {
-                                if let Err(e) = daemon.register(info) {
-                                    tracing::warn!(error = %e, service = %ann.service, "mdns_relay: republish failed");
-                                }
-                            }
-                        }
-                        RepublishDecision::Duplicate => {}
-                        RepublishDecision::AtCap => {
-                            tracing::warn!(
-                                cap = MAX_REPUBLISHED_SERVICES,
-                                service = %ann.service,
-                                peer = %ann.peer,
-                                "mdns_relay: republish cap reached; skipping peer service"
-                            );
-                        }
-                    }
+        // Every pass fresh-opens and identity-binds the live index. Failed opens
+        // leave both outbound discoveries and inbound cursor state untouched.
+        let transaction = match MdnsBusTransaction::open(bus_root.clone()) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::debug!(%error, "mdns_relay: Bus unavailable; transaction deferred");
+                if !got_any {
+                    std::thread::sleep(IDLE_SLEEP);
                 }
+                continue;
+            }
+        };
+
+        // OUTBOUND publication is corrected forward after a late or replaced
+        // Bus. Keep an item queued unless the write and post-write identity
+        // check both succeed; duplicate corrected-forward rows are semantically
+        // idempotent because inbound registration keys the full service identity.
+        while let Some(announce) = pending_outbound.front() {
+            if let Err(error) = publish_announce(&transaction, announce) {
+                tracing::debug!(%error, "mdns_relay: outbound Bus publication deferred");
+                break;
+            }
+            pending_outbound.pop_front();
+            got_any = true;
+        }
+
+        // INBOUND — stage the complete bounded batch before any registration.
+        let staged = match inbound.stage(&transaction, &own_ip) {
+            Ok(staged) => staged,
+            Err(error) => {
+                tracing::debug!(%error, "mdns_relay: inbound Bus transaction deferred");
+                continue;
+            }
+        };
+        let mut effects_complete = true;
+        for announce in &staged.announces {
+            match republish_decision(&registered, announce, MAX_REPUBLISHED_SERVICES) {
+                RepublishDecision::Register => {
+                    let Some(info) = build_republish_info(announce) else {
+                        continue;
+                    };
+                    if let Err(error) = transaction.verify_current() {
+                        tracing::debug!(%error, "mdns_relay: registration deferred before effect");
+                        effects_complete = false;
+                        break;
+                    }
+                    // mdns-sd defines register of an existing fullname as an
+                    // idempotent update. We record success only after its
+                    // command is accepted; on a later batch failure, replayed
+                    // successful effects therefore collapse to Duplicate.
+                    if let Err(error) = daemon.register(info) {
+                        tracing::warn!(error = %error, service = %announce.service, "mdns_relay: republish failed; batch will retry");
+                        effects_complete = false;
+                        break;
+                    }
+                    if let Err(error) = transaction.verify_current() {
+                        tracing::debug!(%error, "mdns_relay: Bus changed after idempotent registration");
+                        effects_complete = false;
+                        break;
+                    }
+                    registered.insert(service_key(announce), announce.clone());
+                    got_any = true;
+                }
+                RepublishDecision::Duplicate => {}
+                RepublishDecision::AtCap => {
+                    tracing::warn!(
+                        cap = MAX_REPUBLISHED_SERVICES,
+                        service = %announce.service,
+                        peer = %announce.peer,
+                        "mdns_relay: republish cap reached; skipping peer service"
+                    );
+                }
+            }
+        }
+        if effects_complete {
+            if let Err(error) = inbound.commit(&transaction, staged) {
+                tracing::debug!(%error, "mdns_relay: inbound cursor commit deferred");
             }
         }
 
@@ -337,6 +585,22 @@ fn run_relay_blocking(stop: &AtomicBool) {
             std::thread::sleep(IDLE_SLEEP);
         }
     }
+}
+
+fn enqueue_outbound(queue: &mut VecDeque<MdnsAnnounce>, announce: MdnsAnnounce) {
+    let key = service_key(&announce);
+    if let Some(existing) = queue.iter_mut().find(|item| service_key(item) == key) {
+        *existing = announce;
+        return;
+    }
+    if queue.len() == MAX_PENDING_OUTBOUND {
+        queue.pop_front();
+        tracing::warn!(
+            cap = MAX_PENDING_OUTBOUND,
+            "mdns_relay: outbound discovery queue full; evicting oldest service"
+        );
+    }
+    queue.push_back(announce);
 }
 
 /// Park the thread until `stop` is set (the graceful-degrade idle path).
@@ -491,22 +755,23 @@ mod tests {
 
     #[test]
     fn republish_candidates_are_capped_but_duplicates_remain_noops() {
-        let mut registered = std::collections::HashSet::new();
+        let mut registered = HashMap::new();
         let a = ann("10.42.0.9", "Jellyfin", "_jellyfin._tcp", 8096);
         let b = ann("10.42.0.8", "Cast", "_googlecast._tcp", 8009);
 
         assert_eq!(
-            remember_republish_candidate(&mut registered, &a, 1),
+            republish_decision(&registered, &a, 1),
             RepublishDecision::Register
         );
+        registered.insert(service_key(&a), a.clone());
         assert_eq!(registered.len(), 1);
         assert_eq!(
-            remember_republish_candidate(&mut registered, &a, 1),
+            republish_decision(&registered, &a, 1),
             RepublishDecision::Duplicate
         );
         assert_eq!(registered.len(), 1);
         assert_eq!(
-            remember_republish_candidate(&mut registered, &b, 1),
+            republish_decision(&registered, &b, 1),
             RepublishDecision::AtCap
         );
         assert_eq!(registered.len(), 1);
@@ -534,5 +799,184 @@ mod tests {
     fn build_republish_info_rejects_a_non_ip_peer() {
         let a = ann("not-an-ip", "Jellyfin", "_jellyfin._tcp", 8096);
         assert!(build_republish_info(&a).is_none());
+    }
+
+    fn publish(persist: &Persist, announce: &MdnsAnnounce) {
+        let body = serde_json::to_string(announce).unwrap();
+        persist
+            .write(ANNOUNCE_TOPIC, Priority::Default, None, Some(&body))
+            .unwrap();
+    }
+
+    fn replace_bus_index(root: &Path, retained: &MdnsAnnounce) {
+        let replacement_root = root.parent().unwrap().join("replacement-bus");
+        let replacement = Persist::open(replacement_root.clone()).unwrap();
+        publish(&replacement, retained);
+        drop(replacement);
+        std::fs::rename(
+            replacement_root.join("index.sqlite"),
+            root.join("index.sqlite"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mdns_r91_same_path_replacement_skips_retained_and_consumes_first_forward_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bus");
+        let initial = Persist::open(root.clone()).unwrap();
+        publish(
+            &initial,
+            &ann("10.42.0.8", "initial-retained", "_jellyfin._tcp", 8096),
+        );
+        drop(initial);
+
+        let mut state = InboundBusState::default();
+        let initial_transaction = MdnsBusTransaction::open(root.clone()).unwrap();
+        let staged = state.stage(&initial_transaction, "10.42.0.3").unwrap();
+        assert!(staged.announces.is_empty());
+        state.commit(&initial_transaction, staged).unwrap();
+
+        let retained = ann("10.42.0.9", "replacement-retained", "_jellyfin._tcp", 8096);
+        replace_bus_index(&root, &retained);
+        let replacement_transaction = MdnsBusTransaction::open(root.clone()).unwrap();
+        let staged = state.stage(&replacement_transaction, "10.42.0.3").unwrap();
+        assert!(staged.announces.is_empty());
+        state.commit(&replacement_transaction, staged).unwrap();
+
+        let live = Persist::open(root.clone()).unwrap();
+        let forward = ann("10.42.0.9", "first-forward", "_jellyfin._tcp", 8096);
+        publish(&live, &forward);
+        drop(live);
+        let forward_transaction = MdnsBusTransaction::open(root.clone()).unwrap();
+        let staged = state.stage(&forward_transaction, "10.42.0.3").unwrap();
+        assert_eq!(staged.announces, vec![forward]);
+        state.commit(&forward_transaction, staged).unwrap();
+        let final_transaction = MdnsBusTransaction::open(root).unwrap();
+        assert!(state
+            .stage(&final_transaction, "10.42.0.3")
+            .unwrap()
+            .announces
+            .is_empty());
+    }
+
+    #[test]
+    fn mdns_r91_late_bus_recovers_without_replaying_retained_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bus");
+        std::fs::write(&root, b"blocks Persist::open").unwrap();
+        assert!(MdnsBusTransaction::open(root.clone()).is_err());
+
+        std::fs::remove_file(&root).unwrap();
+        let persist = Persist::open(root.clone()).unwrap();
+        publish(
+            &persist,
+            &ann("10.42.0.8", "late-retained", "_jellyfin._tcp", 8096),
+        );
+        drop(persist);
+        let mut state = InboundBusState::default();
+        let activation = MdnsBusTransaction::open(root.clone()).unwrap();
+        let staged = state.stage(&activation, "10.42.0.3").unwrap();
+        assert!(staged.announces.is_empty());
+        state.commit(&activation, staged).unwrap();
+
+        let persist = Persist::open(root.clone()).unwrap();
+        let forward = ann("10.42.0.8", "late-forward", "_jellyfin._tcp", 8096);
+        publish(&persist, &forward);
+        drop(persist);
+        let transaction = MdnsBusTransaction::open(root).unwrap();
+        assert_eq!(
+            state.stage(&transaction, "10.42.0.3").unwrap().announces,
+            vec![forward]
+        );
+    }
+
+    #[test]
+    fn mdns_r91_complete_bound_refuses_partial_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bus");
+        let persist = Persist::open(root.clone()).unwrap();
+        for index in 0..=MAX_ANNOUNCES_PER_PASS {
+            publish(
+                &persist,
+                &ann(
+                    "10.42.0.8",
+                    &format!("retained-{index}"),
+                    "_jellyfin._tcp",
+                    8096,
+                ),
+            );
+        }
+        drop(persist);
+        let transaction = MdnsBusTransaction::open(root).unwrap();
+        let mut state = InboundBusState::default();
+        let error = state.stage(&transaction, "10.42.0.3").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(state.active_identity, None);
+        assert_eq!(state.cursor, None);
+    }
+
+    #[test]
+    fn mdns_r91_hostile_rows_are_rejected_before_any_effect_batch() {
+        assert!(parse_bounded_announce(&"x".repeat(MAX_ANNOUNCE_BODY_BYTES + 1)).is_none());
+        assert!(parse_bounded_announce("{not-json").is_none());
+        assert!(parse_bounded_announce(
+            &serde_json::to_string(&ann("10.42.0.8", "ssh", "_ssh._tcp", 22)).unwrap()
+        )
+        .is_none());
+        assert!(parse_bounded_announce(
+            &serde_json::to_string(&ann("not-an-ip", "cast", "_googlecast._tcp", 8009)).unwrap()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn mdns_r91_registration_claim_is_success_bound_and_updates_are_idempotent() {
+        let original = ann("10.42.0.9", "Jellyfin", "_jellyfin._tcp", 8096);
+        let mut registered = HashMap::new();
+        assert_eq!(
+            republish_decision(&registered, &original, 1),
+            RepublishDecision::Register
+        );
+        // A failed external command stores no claim and is therefore retried.
+        assert_eq!(
+            republish_decision(&registered, &original, 1),
+            RepublishDecision::Register
+        );
+        registered.insert(service_key(&original), original.clone());
+        assert_eq!(
+            republish_decision(&registered, &original, 1),
+            RepublishDecision::Duplicate
+        );
+        let mut updated = original;
+        updated.port = 8097;
+        assert_eq!(
+            republish_decision(&registered, &updated, 1),
+            RepublishDecision::Register
+        );
+    }
+
+    #[test]
+    fn mdns_r91_outbound_queue_is_bounded_and_coalesces_service_identity() {
+        let mut queue = VecDeque::new();
+        let first = ann("10.42.0.3", "Jellyfin", "_jellyfin._tcp", 8096);
+        enqueue_outbound(&mut queue, first.clone());
+        let mut updated = first;
+        updated.port = 8097;
+        enqueue_outbound(&mut queue, updated.clone());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front(), Some(&updated));
+        for index in 0..=MAX_PENDING_OUTBOUND {
+            enqueue_outbound(
+                &mut queue,
+                ann(
+                    "10.42.0.3",
+                    &format!("service-{index}"),
+                    "_jellyfin._tcp",
+                    8096,
+                ),
+            );
+        }
+        assert_eq!(queue.len(), MAX_PENDING_OUTBOUND);
     }
 }

@@ -482,12 +482,12 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-weather-atmosphere-bus-recovery-r51.md`.
 - **Airspace publication recovery checkpoint (2026-08-09):** failed Bus writes retain one MG90 survey for retry without reprobing; machine 196 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-airspace-bus-recovery-r52.md`.
-- **Onboarding/Voice Bus recovery checkpoint (2026-08-09):** service-add, target apply, Voice, and lighthouse recover late storage and skip retained mutations;
+- **Onboarding/Voice/mDNS Bus recovery (2026-08-09):** service-add, target apply, Voice, and relay recover late storage and skip retained mutations;
   incomplete reads defer effects. Machines 9/194 and BigBoy passed eight exact tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-service-onboard-bus-recovery-r34.md`,
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-onboard-apply-bus-recovery-r35.md`,
   `docs/platform/evidence/WL-FUNC-011-WL-ARCH-009-2026-08-09-voice-provision-bus-recovery-r36.md`,
-  `docs/platform/evidence/WL-ARCH-009-2026-08-09-spawn-lighthouse-onboard-bus-recovery-r40.md`.
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-mdns-relay-bus-transaction-recovery-r91.md`.
 - **Catalog/overlay recovery checkpoints (2026-08-09):** staged state and exact context rechecks now gate publication; BigBoy and machines 193/194/9 passed focused tests:
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-app-catalog-bus-recovery-r55.md`,
   `docs/platform/evidence/WL-FUNC-018-WL-ARCH-009-2026-08-09-android-catalog-bus-recovery-r57.md`,
