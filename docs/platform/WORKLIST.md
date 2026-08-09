@@ -1683,6 +1683,11 @@ behavioral evidence is not completion.
   defers convergence instead of fabricating an empty roster and deleting live
   sessions; machine 193 passed two exact safety/fallback tests:
   `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-bus-loss-r19.md`.
+- **Session-roaming Bus checkpoint (2026-08-09):** roaming now retries late Bus
+  startup, folds queued policy after recovery, and defers destructive
+  convergence whenever the action log is unreadable. BigBoy passed three exact
+  recovery tests:
+  `docs/platform/evidence/WL-ARCH-010-WL-CRIT-007-2026-08-09-session-roaming-bus-recovery-r21.md`.
 - **Recovery role-admission checkpoint (2026-08-09):** recovery now refuses an
   unsupported, malformed, or duplicate role before network, lock, or service
   mutation; BigBoy passed all 9 deterministic fixtures:
