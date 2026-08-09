@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mackes_mesh_types::peers::{peers_dir, read_peers, PeerRecord};
+use mackes_mesh_types::peers::{peers_dir, PeerRecord};
 use mackes_mesh_types::resources::{
     ActionAvailability, ActionAvailabilityStatus, AuthMethod, AuthState, AuthStatus,
     ClientBoundary, ClientCapability, ClientCapabilityLimits, ClientFeature, DiscoverySource,
@@ -53,7 +53,7 @@ use mackes_mesh_types::resources::{
     MIN_RESOURCE_TTL_MS, RESOURCE_CONTRACT_VERSION,
 };
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use super::{ShutdownToken, Worker};
@@ -123,6 +123,12 @@ pub const MANUAL_STORE_FILE: &str = "manual-sources.json";
 /// bounded before JSON parsing while leaving ample room for a large operator
 /// roster.
 const MAX_MANUAL_STORE_BYTES: usize = 1024 * 1024;
+
+/// The replicated peer plane is operator-sized, not an unbounded filesystem
+/// ingestion surface. A larger directory is deferred as a whole rather than
+/// publishing a partial roster that looks authoritative.
+const MAX_PEER_RECORDS: usize = 4_096;
+const MAX_PEER_RECORD_BYTES: u64 = 1024 * 1024;
 
 // ───────────────────────────── data model ─────────────────────────────
 
@@ -1600,6 +1606,14 @@ pub trait VmEnumerator: Send + Sync {
     /// [`VmEnumerateError::Gated`] when the Workload Bus is unavailable;
     /// [`VmEnumerateError::Backend`] when its projection is malformed or unreadable.
     fn enumerate(&self) -> Result<Vec<Instance>, VmEnumerateError>;
+
+    /// Enumerate from the already-open Bus transaction. Test/platform seams
+    /// that do not consume Bus state retain the legacy [`Self::enumerate`]
+    /// behavior; the production Workload enumerator overrides this so local
+    /// and remote Workload rows come from the same index generation.
+    fn enumerate_from(&self, _persist: &Persist) -> Result<Vec<Instance>, VmEnumerateError> {
+        self.enumerate()
+    }
 }
 
 /// The production enumerator: reads the newest node-local
@@ -1621,8 +1635,8 @@ impl WorkloadEnumerator {
     #[must_use]
     pub fn new(node_id: String) -> Self {
         Self {
-            node_id: node_id.clone(),
-            bus_root: mde_bus::default_data_dir(),
+            node_id,
+            bus_root: None,
         }
     }
 
@@ -1636,13 +1650,13 @@ impl WorkloadEnumerator {
 
 impl VmEnumerator for WorkloadEnumerator {
     fn enumerate(&self) -> Result<Vec<Instance>, VmEnumerateError> {
-        let Some(root) = &self.bus_root else {
-            return Err(VmEnumerateError::Gated(
-                "Workload state Bus is unavailable on this node".to_string(),
-            ));
-        };
-        let persist = Persist::open(root.clone())
+        let root = desktop_bus_root(self.bus_root.clone());
+        let persist = Persist::open(root)
             .map_err(|error| VmEnumerateError::Backend(format!("open Workload state: {error}")))?;
+        self.enumerate_from(&persist)
+    }
+
+    fn enumerate_from(&self, persist: &Persist) -> Result<Vec<Instance>, VmEnumerateError> {
         let topic = workload_state_topic(&self.node_id);
         let messages = persist
             .list_since(&topic, None)
@@ -2654,12 +2668,130 @@ struct MdnsBrowse {
 #[cfg(test)]
 type BusOpenFn = dyn Fn() -> Result<Option<Persist>, String> + Send + Sync;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopBusIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+struct StagedDesktopActions {
+    add: Vec<StoredMessage>,
+    remove: Vec<StoredMessage>,
+    refresh: Vec<StoredMessage>,
+    cursors: HashMap<&'static str, String>,
+}
+
 fn desktop_bus_root(override_root: Option<PathBuf>) -> PathBuf {
     desktop_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
 }
 
 fn desktop_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
     resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn desktop_bus_identity(root: &Path) -> Result<DesktopBusIdentity, String> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))
+        .map_err(|error| format!("inspect desktop Bus index: {error}"))?;
+    if !metadata.is_file() {
+        return Err("desktop Bus index is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(DesktopBusIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(DesktopBusIdentity {})
+    }
+}
+
+#[cfg(unix)]
+const fn desktop_identity_inode(identity: DesktopBusIdentity) -> Option<u64> {
+    Some(identity.inode)
+}
+
+#[cfg(not(unix))]
+const fn desktop_identity_inode(_identity: DesktopBusIdentity) -> Option<u64> {
+    None
+}
+
+fn read_peer_records_bounded(dir: &Path) -> Result<Vec<PeerRecord>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read peer directory {}: {error}", dir.display())),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read peer directory entry: {error}"))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Err("peer record filename is not UTF-8".to_string());
+        };
+        if name.starts_with('.') || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        paths.push(path);
+        if paths.len() > MAX_PEER_RECORDS {
+            return Err(format!("peer directory exceeds {MAX_PEER_RECORDS} records"));
+        }
+    }
+    paths.sort();
+    let mut peers = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect peer record {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_PEER_RECORD_BYTES
+        {
+            return Err(format!(
+                "unsafe or oversized peer record {}",
+                path.display()
+            ));
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|error| format!("open peer record {}: {error}", path.display()))?;
+        let opened = file
+            .metadata()
+            .map_err(|error| format!("inspect open peer record {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                return Err(format!(
+                    "peer record changed while opening {}",
+                    path.display()
+                ));
+            }
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        file.take(MAX_PEER_RECORD_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read peer record {}: {error}", path.display()))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PEER_RECORD_BYTES {
+            return Err(format!("peer record grew oversized {}", path.display()));
+        }
+        let peer: PeerRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("decode peer record {}: {error}", path.display()))?;
+        let expected_name = format!("{}.json", peer.hostname);
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            return Err(format!(
+                "peer record filename/hostname mismatch {}",
+                path.display()
+            ));
+        }
+        peers.push(peer);
+    }
+    peers.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    Ok(peers)
 }
 
 /// CHOOSER-1 — the desktop-source discovery aggregator worker.
@@ -2762,16 +2894,64 @@ impl DesktopSourcesWorker {
         self
     }
 
-    fn open_bus(&self) -> Result<Option<Persist>, String> {
+    fn bus_roots(&self) -> Vec<PathBuf> {
+        if let Some(root) = self.bus_root_override.as_ref() {
+            return vec![root.clone()];
+        }
+        let mut roots = Vec::with_capacity(2);
+        if let Some(root) = mde_bus::default_data_dir() {
+            roots.push(root);
+        }
+        let system = PathBuf::from(mde_bus::SYSTEM_BUS_ROOT);
+        if !roots.contains(&system) {
+            roots.push(system);
+        }
+        roots
+    }
+
+    fn open_bus_transaction(
+        &self,
+    ) -> Result<Option<(PathBuf, Persist, DesktopBusIdentity)>, String> {
         #[cfg(test)]
         if let Some(open) = self.bus_open_override.as_ref() {
-            return open();
+            let Some(persist) = open()? else {
+                return Ok(None);
+            };
+            let root = desktop_bus_root(self.bus_root_override.clone());
+            let identity = desktop_bus_identity(&root)?;
+            if persist.index_inode() != desktop_identity_inode(identity) {
+                return Err("desktop Bus connection does not match its live path".to_string());
+            }
+            return Ok(Some((root, persist, identity)));
         }
 
-        let root = desktop_bus_root(self.bus_root_override.clone());
-        Persist::open(root)
-            .map(Some)
-            .map_err(|error| error.to_string())
+        let mut last_error = None;
+        for root in self.bus_roots() {
+            let before = desktop_bus_identity(&root).ok();
+            let persist = match Persist::open(root.clone()) {
+                Ok(persist) => persist,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            let identity = match desktop_bus_identity(&root) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            if before.is_some_and(|before| before != identity)
+                || persist.index_inode() != desktop_identity_inode(identity)
+            {
+                last_error =
+                    Some("desktop Bus connection/path identity changed while opening".to_string());
+                continue;
+            }
+            return Ok(Some((root, persist, identity)));
+        }
+        Err(last_error.unwrap_or_else(|| "desktop Bus root unresolved".to_string()))
     }
 
     /// Add a manual source (idempotent on the id). Returns whether the durable
@@ -2881,28 +3061,73 @@ impl DesktopSourcesWorker {
         )
     }
 
-    /// Drain one action topic since its cursor, returning the new bodies.
-    fn drain_topic(
-        persist: &Persist,
-        topic: &'static str,
-        cursors: &mut HashMap<&'static str, String>,
-    ) -> Vec<String> {
-        let cursor = cursors.get(topic).cloned();
-        let Ok(msgs) = persist.list_since(topic, cursor.as_deref()) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for msg in msgs {
-            cursors.insert(topic, msg.ulid.clone());
-            out.push(msg.body.unwrap_or_default());
+    fn verify_bus_identity(root: &Path, expected: DesktopBusIdentity) -> Result<(), String> {
+        if desktop_bus_identity(root).is_ok_and(|identity| identity == expected) {
+            Ok(())
+        } else {
+            Err("desktop Bus index changed during transaction".to_string())
         }
-        out
     }
 
-    /// Drain the three typed verbs. Returns `(manual_changed, refresh)`.
-    fn drain_actions(&mut self, persist: &Persist) -> (bool, bool) {
+    /// Tail-prime all transient lanes as one activation. The candidate map is
+    /// installed only after every read and the final path-identity check pass.
+    fn prime_action_cursors(
+        persist: &Persist,
+        root: &Path,
+        identity: DesktopBusIdentity,
+    ) -> Result<HashMap<&'static str, String>, String> {
+        let mut cursors = HashMap::new();
+        for topic in [ADD_SOURCE_TOPIC, REMOVE_SOURCE_TOPIC, REFRESH_TOPIC] {
+            if let Some(ulid) = persist
+                .latest_ulid(topic)
+                .map_err(|error| format!("prime {topic}: {error}"))?
+            {
+                cursors.insert(topic, ulid);
+            }
+        }
+        Self::verify_bus_identity(root, identity)?;
+        Ok(cursors)
+    }
+
+    /// Read every action lane before any authorization/store effect. A single
+    /// failed lane preserves the complete prior cursor map.
+    fn stage_actions(
+        persist: &Persist,
+        cursors: &HashMap<&'static str, String>,
+    ) -> Result<StagedDesktopActions, String> {
+        let read = |topic: &'static str| {
+            persist
+                .list_since(topic, cursors.get(topic).map(String::as_str))
+                .map_err(|error| format!("read {topic}: {error}"))
+        };
+        let add = read(ADD_SOURCE_TOPIC)?;
+        let remove = read(REMOVE_SOURCE_TOPIC)?;
+        let refresh = read(REFRESH_TOPIC)?;
+        let mut next = cursors.clone();
+        for (topic, messages) in [
+            (ADD_SOURCE_TOPIC, &add),
+            (REMOVE_SOURCE_TOPIC, &remove),
+            (REFRESH_TOPIC, &refresh),
+        ] {
+            if let Some(message) = messages.last() {
+                next.insert(topic, message.ulid.clone());
+            }
+        }
+        Ok(StagedDesktopActions {
+            add,
+            remove,
+            refresh,
+            cursors: next,
+        })
+    }
+
+    /// Apply an already-complete action batch. Returns
+    /// `(manual_changed, refresh)`; cursor installation remains the caller's
+    /// commit step.
+    fn apply_actions(&mut self, actions: &StagedDesktopActions) -> (bool, bool) {
         let mut changed = false;
-        for body in Self::drain_topic(persist, ADD_SOURCE_TOPIC, &mut self.cursors) {
+        for message in &actions.add {
+            let body = message.body.as_deref().unwrap_or_default();
             if let Err(error) = self.authorize_mutation(ADD_SOURCE_TOPIC, &body) {
                 tracing::warn!(
                     target: "mackesd::desktop_sources",
@@ -2918,7 +3143,8 @@ impl DesktopSourcesWorker {
                 }
             }
         }
-        for body in Self::drain_topic(persist, REMOVE_SOURCE_TOPIC, &mut self.cursors) {
+        for message in &actions.remove {
+            let body = message.body.as_deref().unwrap_or_default();
             if let Err(error) = self.authorize_mutation(REMOVE_SOURCE_TOPIC, &body) {
                 tracing::warn!(
                     target: "mackesd::desktop_sources",
@@ -2937,8 +3163,16 @@ impl DesktopSourcesWorker {
         // Refresh is an open, harmless read/nudge: it only re-enumerates
         // discovery and republishes the derived state; it never updates the
         // manual store or invokes a privileged mutator.
-        let refresh = !Self::drain_topic(persist, REFRESH_TOPIC, &mut self.cursors).is_empty();
+        let refresh = !actions.refresh.is_empty();
         (changed, refresh)
+    }
+
+    #[cfg(test)]
+    fn drain_actions(&mut self, persist: &Persist) -> (bool, bool) {
+        let actions = Self::stage_actions(persist, &self.cursors).expect("stage action lanes");
+        let result = self.apply_actions(&actions);
+        self.cursors = actions.cursors;
+        result
     }
 
     /// Drain pending mDNS browse events into the live endpoint cache.
@@ -2968,6 +3202,7 @@ impl DesktopSourcesWorker {
 
     /// Fold a VM enumeration outcome into the lane status + the instance
     /// list (an error contributes NO sources — never a fake, §7).
+    #[cfg(test)]
     fn fold_vm_result(&mut self, res: Result<Vec<Instance>, VmEnumerateError>) -> Vec<Instance> {
         match res {
             Ok(list) => {
@@ -2982,25 +3217,75 @@ impl DesktopSourcesWorker {
         }
     }
 
-    /// Enumerate local VMs on a blocking thread so synchronous SQLite reads do
-    /// not occupy the async worker executor.
-    async fn enumerate_vms(&mut self) -> Vec<Instance> {
-        let vms = Arc::clone(&self.vms);
-        let res = match tokio::task::spawn_blocking(move || vms.enumerate()).await {
-            Ok(r) => r,
-            Err(e) => Err(VmEnumerateError::Backend(format!("enumerate join: {e}"))),
-        };
-        self.fold_vm_result(res)
+    /// Stage the complete bounded registry + Workload source set from one Bus
+    /// connection. Missing state is a genuine empty lane; open/read/decode or
+    /// validation failure aborts the candidate instead of erasing sources.
+    fn stage_source_inputs(
+        &self,
+        persist: &Persist,
+    ) -> Result<(Vec<AdvertisedDesktop>, Vec<Instance>), String> {
+        let peers = read_peer_records_bounded(&peers_dir(&self.workgroup_root))?;
+        let mut advertised = Vec::new();
+        for rec in &peers {
+            advertised.extend(advertised_from_peer(rec, &self.node_id));
+            let topic = workload_state_topic(&rec.hostname);
+            let Some(message) = persist
+                .read_latest(&topic)
+                .map_err(|error| format!("read {topic}: {error}"))?
+            else {
+                continue;
+            };
+            let body = message
+                .body
+                .as_deref()
+                .ok_or_else(|| format!("decode {topic}: missing body"))?;
+            let snapshot: WorkloadStateSnapshot =
+                serde_json::from_str(body).map_err(|error| format!("decode {topic}: {error}"))?;
+            if !snapshot.node.eq_ignore_ascii_case(&rec.hostname) {
+                return Err(format!(
+                    "Workload state node {} does not match {}",
+                    snapshot.node, rec.hostname
+                ));
+            }
+            snapshot
+                .validate(now_ms())
+                .map_err(|error| format!("validate {topic}: {error}"))?;
+            advertised.extend(advertised_workloads_from_peer(
+                rec,
+                &snapshot,
+                &self.node_id,
+            ));
+        }
+        let vms = self
+            .vms
+            .enumerate_from(persist)
+            .map_err(|error| error.to_string())?;
+        Ok((advertised, vms))
+    }
+
+    fn fold_staged_sources(
+        &self,
+        advertised: &[AdvertisedDesktop],
+        vm_list: &[Instance],
+    ) -> Vec<DesktopSource> {
+        let mut mdns: Vec<MdnsEndpoint> = self.mdns_seen.values().cloned().collect();
+        mdns.sort_by(|a, b| a.fullname.cmp(&b.fullname));
+        let vms: Vec<DesktopSource> = vm_list
+            .iter()
+            .map(|instance| source_from_vm(&self.node_id, instance))
+            .collect();
+        merge_sources(advertised, &mdns, &vms, &self.manual)
     }
 
     /// Read the peers plane and authoritative remote Workload projections, then
     /// fold every lane into the merged roster.
+    #[cfg(test)]
     fn collect_sources(
         &self,
         persist: Option<&Persist>,
         vm_list: &[Instance],
     ) -> Vec<DesktopSource> {
-        let peers = read_peers(&peers_dir(&self.workgroup_root));
+        let peers = read_peer_records_bounded(&peers_dir(&self.workgroup_root)).unwrap_or_default();
         let mut advertised = Vec::new();
         for rec in &peers {
             advertised.extend(advertised_from_peer(rec, &self.node_id));
@@ -3079,6 +3364,80 @@ impl DesktopSourcesWorker {
         true
     }
 
+    fn publish_current(
+        &mut self,
+        persist: &Persist,
+        root: &Path,
+        identity: DesktopBusIdentity,
+        sources: Vec<DesktopSource>,
+        force: bool,
+    ) -> bool {
+        if Self::verify_bus_identity(root, identity).is_err() {
+            return false;
+        }
+        if !self.publish(persist, sources, force) {
+            return false;
+        }
+        if Self::verify_bus_identity(root, identity).is_err() {
+            self.last_fingerprint = None;
+            tracing::debug!(
+                target: "mackesd::desktop_sources",
+                "Bus changed during desktop-source publication; corrected-forward retry pending"
+            );
+            return false;
+        }
+        true
+    }
+
+    fn process_bus_cycle(
+        &mut self,
+        root: &Path,
+        persist: &Persist,
+        identity: DesktopBusIdentity,
+        active_identity: &mut Option<DesktopBusIdentity>,
+        browse: Option<&MdnsBrowse>,
+        due: bool,
+        publication_pending: &mut bool,
+    ) -> Result<bool, String> {
+        let bus_changed = *active_identity != Some(identity);
+        if bus_changed {
+            let primed = Self::prime_action_cursors(persist, root, identity)?;
+            self.cursors = primed;
+            *active_identity = Some(identity);
+            *publication_pending = true;
+            self.last_fingerprint = None;
+        }
+
+        let actions = Self::stage_actions(persist, &self.cursors)?;
+        let has_actions =
+            !actions.add.is_empty() || !actions.remove.is_empty() || !actions.refresh.is_empty();
+        let mdns_changed = self.drain_mdns(browse);
+        if !has_actions && !mdns_changed && !due && !*publication_pending {
+            return Ok(false);
+        }
+
+        // Stage every bounded source lane before mutation authorization/store
+        // effects or publication. The final identity check ties all reads to
+        // the connection/path generation opened for this cycle.
+        let (advertised, vms) = self.stage_source_inputs(persist)?;
+        Self::verify_bus_identity(root, identity)?;
+        let (manual_changed, refresh) = self.apply_actions(&actions);
+        self.cursors = actions.cursors;
+        self.vm_lane = format!("ok ({} vms)", vms.len());
+
+        if !manual_changed && !refresh && !mdns_changed && !due && !*publication_pending {
+            return Ok(false);
+        }
+        let sources = self.fold_staged_sources(&advertised, &vms);
+        let force = refresh || due || *publication_pending;
+        if self.publish_current(persist, root, identity, sources, force) {
+            *publication_pending = false;
+            return Ok(true);
+        }
+        *publication_pending = true;
+        Ok(false)
+    }
+
     /// Start the desktop-type mDNS browsers (graceful degrade: no daemon /
     /// no multicast interface → an honest `gated:` lane, worker keeps
     /// aggregating the other lanes).
@@ -3121,9 +3480,9 @@ impl Worker for DesktopSourcesWorker {
         let retry_interval = self
             .tick
             .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
-        let persist = loop {
-            match self.open_bus() {
-                Ok(Some(persist)) => break persist,
+        let first_bus = loop {
+            match self.open_bus_transaction() {
+                Ok(Some(opened)) => break opened,
                 Ok(None) => {
                     tracing::debug!(
                         target: "mackesd::desktop_sources",
@@ -3145,20 +3504,29 @@ impl Worker for DesktopSourcesWorker {
             }
         };
         self.manual = load_manual_sources(&self.store_root);
-        // Prime each verb cursor at its tail: manual sources are durable in
-        // the store, so replaying an old add would resurrect a removed one.
-        for topic in [ADD_SOURCE_TOPIC, REMOVE_SOURCE_TOPIC, REFRESH_TOPIC] {
-            if let Ok(Some(ulid)) = persist.latest_ulid(topic) {
-                self.cursors.insert(topic, ulid);
-            }
-        }
         let browse = self.start_mdns_browsers();
-
-        // Immediate first publish so the Chooser doesn't wait a heartbeat.
-        let vm_list = self.enumerate_vms().await;
-        let sources = self.collect_sources(Some(&persist), &vm_list);
-        self.publish(&persist, sources, true);
+        let mut active_identity = None;
+        let mut publication_pending = true;
         let mut last_pub = Instant::now();
+
+        let (root, persist, identity) = first_bus;
+        match self.process_bus_cycle(
+            &root,
+            &persist,
+            identity,
+            &mut active_identity,
+            browse.as_ref(),
+            false,
+            &mut publication_pending,
+        ) {
+            Ok(true) => last_pub = Instant::now(),
+            Ok(false) => {}
+            Err(error) => tracing::debug!(
+                target: "mackesd::desktop_sources",
+                %error,
+                "initial desktop-source transaction deferred"
+            ),
+        }
 
         // Keep the immediate first roster above, but spread the first
         // recurring Workload/peer fold. The subtraction means the first
@@ -3175,17 +3543,35 @@ impl Worker for DesktopSourcesWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let (changed, refresh) = self.drain_actions(&persist);
-                    let mdns_changed = self.drain_mdns(browse.as_ref());
                     let due = last_pub.elapsed() >= self.heartbeat;
-                    if changed || refresh || mdns_changed || due {
-                        let vm_list = self.enumerate_vms().await;
-                        let sources = self.collect_sources(Some(&persist), &vm_list);
-                        // A refresh/heartbeat republishes unconditionally
-                        // (late subscribers); otherwise only on change.
-                        if self.publish(&persist, sources, refresh || due) {
-                            last_pub = Instant::now();
+                    let (root, persist, identity) = match self.open_bus_transaction() {
+                        Ok(Some(opened)) => opened,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "mackesd::desktop_sources",
+                                %error,
+                                "desktop-source Bus transaction unavailable; cycle deferred"
+                            );
+                            continue;
                         }
+                    };
+                    match self.process_bus_cycle(
+                        &root,
+                        &persist,
+                        identity,
+                        &mut active_identity,
+                        browse.as_ref(),
+                        due,
+                        &mut publication_pending,
+                    ) {
+                        Ok(true) => last_pub = Instant::now(),
+                        Ok(false) => {}
+                        Err(error) => tracing::debug!(
+                            target: "mackesd::desktop_sources",
+                            %error,
+                            "desktop-source transaction deferred"
+                        ),
                     }
                 }
                 () = shutdown.wait() => break,
@@ -4570,7 +4956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bus_open_retry_recovers_forward_without_worker_restart() {
+    async fn late_and_same_path_replacement_skip_retained_and_run_forward_without_restart() {
         use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
         let temp = tempfile::tempdir().unwrap();
@@ -4584,6 +4970,7 @@ mod tests {
         let root_for_open = bus_root.clone();
         let mut worker = worker_at(workgroup.path(), store.path())
             .with_tick(Duration::from_millis(20))
+            .with_bus_root(bus_root.clone())
             .with_bus_opener(Arc::new(move || {
                 attempts_for_open.fetch_add(1, Ordering::SeqCst);
                 match mode_for_open.load(Ordering::SeqCst) {
@@ -4653,11 +5040,94 @@ mod tests {
         assert!(!store.path().join(MANUAL_STORE_FILE).exists());
         let attempts_after_open = attempts.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            attempts_after_open,
-            "Bus resolve/open and startup priming must stop after first success"
+        assert!(
+            attempts.load(Ordering::SeqCst) > attempts_after_open,
+            "fresh cycle opens are required to detect same-path replacement"
         );
+
+        let forward_unsigned =
+            r#"{"host":"10.0.0.31","port":3389,"protocol":"rdp","schema_version":1}"#;
+        Persist::open(bus_root.clone())
+            .unwrap()
+            .write(
+                ADD_SOURCE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&authorized_add_body(forward_unsigned, "late-forward")),
+            )
+            .unwrap();
+        for _ in 0..50 {
+            if load_manual_sources(store.path()).len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(load_manual_sources(store.path()).len(), 1);
+
+        let replacement_root = temp.path().join("replacement");
+        let replacement = Persist::open(replacement_root.clone()).unwrap();
+        let retained_unsigned =
+            r#"{"host":"10.0.0.32","port":3389,"protocol":"rdp","schema_version":1}"#;
+        replacement
+            .write(
+                ADD_SOURCE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&authorized_add_body(
+                    retained_unsigned,
+                    "replacement-retained",
+                )),
+            )
+            .unwrap();
+        drop(replacement);
+        let retired_root = temp.path().join("retired");
+        std::fs::rename(&bus_root, &retired_root).unwrap();
+        std::fs::rename(&replacement_root, &bus_root).unwrap();
+
+        for _ in 0..50 {
+            if Persist::open(bus_root.clone())
+                .unwrap()
+                .read_latest(SOURCES_TOPIC)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            load_manual_sources(store.path()).len(),
+            1,
+            "retained replacement action must be tail-skipped"
+        );
+
+        let replacement_forward =
+            r#"{"host":"10.0.0.33","port":5900,"protocol":"vnc","schema_version":1}"#;
+        Persist::open(bus_root.clone())
+            .unwrap()
+            .write(
+                ADD_SOURCE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&authorized_add_body(
+                    replacement_forward,
+                    "replacement-forward",
+                )),
+            )
+            .unwrap();
+        for _ in 0..50 {
+            if load_manual_sources(store.path()).len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let manual = load_manual_sources(store.path());
+        assert_eq!(
+            manual.len(),
+            2,
+            "first replacement-forward row executes once"
+        );
+        assert!(!manual.iter().any(|source| source.host == "10.0.0.32"));
         assert!(
             !task.is_finished(),
             "the same worker continues after recovery"
@@ -4669,6 +5139,140 @@ mod tests {
             .expect("shutdown")
             .expect("worker task")
             .expect("clean worker shutdown");
+    }
+
+    #[test]
+    fn connection_path_identity_race_is_rejected_before_activation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        drop(Persist::open(bus_root.clone()).unwrap());
+        let replacement_root = temp.path().join("replacement");
+        drop(Persist::open(replacement_root.clone()).unwrap());
+        let retired_root = temp.path().join("retired");
+        let swapped = Arc::new(AtomicBool::new(false));
+        let swapped_for_open = Arc::clone(&swapped);
+        let root_for_open = bus_root.clone();
+        let replacement_for_open = replacement_root.clone();
+        let retired_for_open = retired_root.clone();
+        let workgroup = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let worker = worker_at(workgroup.path(), store.path())
+            .with_bus_root(bus_root)
+            .with_bus_opener(Arc::new(move || {
+                let persist =
+                    Persist::open(root_for_open.clone()).map_err(|error| error.to_string())?;
+                if !swapped_for_open.swap(true, Ordering::SeqCst) {
+                    std::fs::rename(&root_for_open, &retired_for_open)
+                        .map_err(|error| error.to_string())?;
+                    std::fs::rename(&replacement_for_open, &root_for_open)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(Some(persist))
+            }));
+
+        let error = worker
+            .open_bus_transaction()
+            .expect_err("stale connection must not activate");
+        assert!(error.contains("does not match its live path"));
+        assert!(!store.path().join(MANUAL_STORE_FILE).exists());
+    }
+
+    #[test]
+    fn failed_complete_source_read_preserves_action_and_publication_until_retry() {
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let identity = desktop_bus_identity(bus.path()).unwrap();
+        let workgroup = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut worker =
+            worker_at(workgroup.path(), store.path()).with_bus_root(bus.path().to_path_buf());
+        let mut active = None;
+        let mut pending = true;
+        assert!(worker
+            .process_bus_cycle(
+                bus.path(),
+                &persist,
+                identity,
+                &mut active,
+                None,
+                false,
+                &mut pending,
+            )
+            .unwrap());
+        let initial_rows = persist.list_since(SOURCES_TOPIC, None).unwrap().len();
+        let initial_cursors = worker.cursors.clone();
+
+        let oak = peer("oak", "healthy", Some("10.42.0.7"), true, false);
+        mackes_mesh_types::peers::write_peer_record(&peers_dir(workgroup.path()), &oak).unwrap();
+        let topic = workload_state_topic("oak");
+        persist
+            .write(&topic, Priority::Default, None, Some("{malformed"))
+            .unwrap();
+        let unsigned = r#"{"host":"10.0.0.41","port":3389,"protocol":"rdp","schema_version":1}"#;
+        persist
+            .write(
+                ADD_SOURCE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&authorized_add_body(unsigned, "deferred-source-read")),
+            )
+            .unwrap();
+
+        let error = worker
+            .process_bus_cycle(
+                bus.path(),
+                &persist,
+                identity,
+                &mut active,
+                None,
+                false,
+                &mut pending,
+            )
+            .expect_err("malformed required Workload lane must defer the sweep");
+        assert!(error.contains("decode state/workloads/oak"));
+        assert_eq!(worker.cursors, initial_cursors);
+        assert!(worker.manual.is_empty());
+        assert_eq!(
+            persist.list_since(SOURCES_TOPIC, None).unwrap().len(),
+            initial_rows
+        );
+
+        let valid = workload_snapshot("oak", &[("win11", "running")]);
+        persist
+            .write(
+                &topic,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&valid).unwrap()),
+            )
+            .unwrap();
+        assert!(worker
+            .process_bus_cycle(
+                bus.path(),
+                &persist,
+                identity,
+                &mut active,
+                None,
+                false,
+                &mut pending,
+            )
+            .unwrap());
+        assert_eq!(
+            worker.manual.len(),
+            1,
+            "same-worker retry applies the action"
+        );
+        let state = latest_state(&persist);
+        assert!(state
+            .sources
+            .iter()
+            .any(|source| source.id == "peer-vm:oak:win11"));
+        assert!(state
+            .sources
+            .iter()
+            .any(|source| source.id == "manual:10.0.0.41:3389:rdp"));
     }
 
     #[test]

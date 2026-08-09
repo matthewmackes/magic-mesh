@@ -427,16 +427,16 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`.
-- **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open and tail priming as one fail-closed activation, skips retained actions, and executes one
-  forward signed action exactly once; BigBoy passed three exact tests:
+- **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open/tail priming as one fail-closed activation, skips retained actions, and executes one
+  forward signed action exactly once; BigBoy passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.
 - **Copilot Bus recovery checkpoint (2026-08-09):** late activation skips retained asks and answers one forward signed ask exactly once; machine 196 passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-copilot-bus-recovery-r16.md`.
-- **Session replacement recovery (2026-08-09):** broker dual-tail and Roaming fold preserve state while skipping retained replacement rows. Machine 196 gates:
+- **Session/desktop-source replacement recovery (2026-08-09):** broker, Roaming, and source roster folds preserve state while skipping retained replacement rows. Gates:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-bus-replacement-r71.md`,
-  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-roaming-bus-replacement-r78.md`.
-- **Vehicle transaction recovery (2026-08-09):** late/replaced Bus storage preserves staged state; a privileged-reboot journal prevents repeated effects.
-  BigBoy passed four exact gates:
+  `docs/platform/evidence/WL-FUNC-019-WL-ARCH-009-WL-CRIT-007-2026-08-09-session-roaming-bus-replacement-r78.md`,
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-desktop-sources-bus-recovery-r83.md`.
+- **Vehicle transaction recovery (2026-08-09):** replaced Bus storage preserves staged state; a reboot journal prevents repeats. BigBoy passed four exact gates:
   `docs/platform/evidence/WL-FUNC-017-WL-ARCH-009-2026-08-09-vehicle-bus-transaction-recovery-r67.md`.
 - **Media-source Bus recovery checkpoint (2026-08-09):** discovery survives late and same-path-replaced storage and republishes the complete roster without restart.
   Exact machine-193/196 gates passed: `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-media-sources-bus-recovery-r27.md`,
