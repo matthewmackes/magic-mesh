@@ -1451,7 +1451,24 @@ fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
 
 fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
     let (center_left, center_right) = floating_center_bounds(screen, gap);
-    (((center_right - center_left).max(0.0) + gap) / (CONTROL_EDGE + gap)).floor() as usize
+    let reserved_capacity =
+        (((center_right - center_left).max(0.0) + gap) / (CONTROL_EDGE + gap)).floor() as usize;
+    if reserved_capacity > 0 {
+        return reserved_capacity;
+    }
+
+    // On compact screens the responsive status tray can consume its entire
+    // preferred reservation even though one physical center target still fits
+    // between the fixed Home cluster and placement control. Admit that one
+    // slot only from exact hit geometry; at 320px it correctly remains zero
+    // because a centered 40px target would intersect Home.
+    let centered = egui::Rect::from_center_size(
+        egui::pos2(screen.center().x, screen.bottom() - TASKBAR_H / 2.0),
+        egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+    );
+    let fixed_left_edge = screen.left() + control_span(4, CONTROL_EDGE, gap) + gap;
+    let placement_left = screen.right() - Style::SP_S - CONTROL_EDGE - gap;
+    usize::from(centered.left() >= fixed_left_edge && centered.right() <= placement_left)
 }
 
 /// Select the catalog entries that remain in the fixed rail and preserve the
@@ -1501,7 +1518,7 @@ fn catalog_selection_with_sessions(
         visible_surface_count,
         visible_session_count,
         visible_pinned_count,
-        (!overflow_items.is_empty()).then_some(OverflowGeometry {
+        has_overflow.then_some(OverflowGeometry {
             items: overflow_items,
         }),
     )
@@ -1526,11 +1543,20 @@ fn floating_geometry_for_catalog_with_sessions(
     connected_sessions: &[SessionRailEntry],
 ) -> Geometry {
     let gap = FLOATING_GAP;
+    let center_capacity = floating_center_capacity(screen, gap);
+    let has_catalog_items = !surfaces.is_empty()
+        || !connected_sessions.is_empty()
+        || pinned_count.min(MAX_PINNED_SOURCES) > 0;
+    // Never emit the Editor when the fixed navigation and status reservations
+    // leave no physical center slot: doing so aliases Home's hit region. Under
+    // one-slot pressure, More takes priority so hidden sessions and apps remain
+    // reachable; Editor remains available through Communications/Documents.
+    let show_editor = center_capacity > usize::from(has_catalog_items);
     let (surface_count, session_count, pinned_count, overflow) = catalog_selection_with_sessions(
         surfaces,
         connected_sessions.len(),
         pinned_count,
-        floating_center_capacity(screen, gap).saturating_sub(1),
+        center_capacity.saturating_sub(usize::from(show_editor)),
     );
     let edge = CONTROL_EDGE;
     let outer = egui::Rect::from_min_size(
@@ -1564,19 +1590,24 @@ fn floating_geometry_for_catalog_with_sessions(
         });
         cursor_x += edge + gap;
     }
-    let center_count =
-        1 + surface_count + session_count + pinned_count + usize::from(overflow.is_some());
+    let center_count = usize::from(show_editor)
+        + surface_count
+        + session_count
+        + pinned_count
+        + usize::from(overflow.is_some());
     let center_span = control_span(center_count, edge, gap);
     let (center_left, center_right) = floating_center_bounds(screen, gap);
     let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
     cursor_x = center_start;
-    controls.push(Control {
-        kind: ControlKind::Editor,
-        rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
-        surface: None,
-        source_index: None,
-    });
-    cursor_x += edge + gap;
+    if show_editor {
+        controls.push(Control {
+            kind: ControlKind::Editor,
+            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
+            surface: None,
+            source_index: None,
+        });
+        cursor_x += edge + gap;
+    }
     for surface in surfaces.iter().copied().take(surface_count) {
         controls.push(Control {
             kind: ControlKind::SurfaceLauncher,
@@ -2678,6 +2709,53 @@ mod tests {
             .iter()
             .all(|control| { (control.rect.width() - CONTROL_EDGE).abs() <= 0.001 }));
         assert_hit_targets_inside_backing("floating sub-640 screen".to_string(), &geometry);
+    }
+
+    #[test]
+    fn bottom_taskbar_does_not_emit_center_controls_without_a_physical_slot() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
+        assert_eq!(floating_center_capacity(screen, FLOATING_GAP), 0);
+
+        let geometry = floating_geometry_for_catalog_with_sessions(
+            screen,
+            MAX_PINNED_SOURCES,
+            &default_taskbar_pins(),
+            &[SessionRailEntry::with_session_id(
+                "narrow-session",
+                "Narrow desktop",
+                "LIVE",
+            )],
+        );
+
+        assert!(geometry.controls.iter().all(|control| {
+            matches!(
+                control.kind,
+                ControlKind::Start
+                    | ControlKind::SurfaceLauncher
+                    | ControlKind::Back
+                    | ControlKind::Home
+                    | ControlKind::Pin
+            )
+        }));
+        assert_eq!(
+            geometry
+                .controls
+                .iter()
+                .filter(|control| control.kind == ControlKind::SurfaceLauncher)
+                .count(),
+            1,
+            "only the fixed Workloads launcher may remain outside the full center lane"
+        );
+        for (index, control) in geometry.controls.iter().enumerate() {
+            assert!(geometry.outer.contains(control.rect.min));
+            assert!(geometry.outer.contains(control.rect.max));
+            for other in geometry.controls.iter().skip(index + 1) {
+                assert!(
+                    !control.rect.intersects(other.rect),
+                    "narrow taskbar controls overlap: {control:?} and {other:?}"
+                );
+            }
+        }
     }
 
     #[test]
