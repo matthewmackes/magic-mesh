@@ -37,7 +37,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mde_bus::persist::Persist;
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::{Persist, StoredMessage};
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::onboard::spawn_lighthouse::{
@@ -45,7 +46,7 @@ use crate::onboard::spawn_lighthouse::{
     SpawnRequest, SpawnTarget,
 };
 
-use super::scheduler::{BusPublisher, Publisher};
+use super::scheduler::Publisher;
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains — the `action/<domain>/<verb>` convention
@@ -72,6 +73,9 @@ pub const ACTION_SCHEMA_VERSION: u64 = 1;
 /// operator-paced event, so the 2 s `service_onboard` cadence is responsive
 /// without spinning.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 // ───────────────────────────── wire contract ─────────────────────────────
 
@@ -291,43 +295,40 @@ pub fn resolve(
 
 // ─────────────────────────── bus + worker ───────────────────────────
 
-/// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring `service_onboard`. A
-/// malformed action is dropped honestly with a warn.
+/// Read one complete forward command batch without changing publication state.
 fn read_new_actions(
-    bus_root: &Path,
-    cursor: &mut Option<String>,
-) -> Vec<(String, SpawnLighthouseAction)> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for msg in msgs {
-        *cursor = Some(msg.ulid.clone());
-        let body = msg.body.as_deref().unwrap_or("");
-        match parse_action(body) {
-            Ok(a) => out.push((body.to_string(), a)),
-            Err(e) => {
-                tracing::warn!(ulid = %msg.ulid, error = %e, "spawn_lighthouse_onboard: bad spawn-lighthouse action");
-            }
-        }
-    }
-    out
+    persist: &mut Persist,
+    cursor: Option<&str>,
+) -> Result<Vec<StoredMessage>, String> {
+    // The retired path fresh-opened on every tick and therefore always followed
+    // an atomically replaced index.sqlite. Preserve that visibility while
+    // retaining one long-lived handle.
+    persist.reopen_if_index_changed();
+    persist
+        .list_since(ACTION_TOPIC, cursor)
+        .map_err(|error| format!("read {ACTION_TOPIC}: {error}"))
 }
 
 /// Seed the cursor to the newest existing message so a (re)start doesn't
 /// re-drive a historical spawn. `None` when the topic is empty.
-fn prime_cursor(bus_root: &Path) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(ACTION_TOPIC, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
+fn prime_cursor(persist: &Persist) -> Result<Option<String>, String> {
+    persist
+        .latest_ulid(ACTION_TOPIC)
+        .map_err(|error| format!("prime {ACTION_TOPIC}: {error}"))
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn spawn_lighthouse_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    spawn_lighthouse_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn spawn_lighthouse_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 /// Bind the capability to the requested lighthouse identity and HA shape. The
@@ -360,8 +361,16 @@ fn authorize_spawn_action(
     )
 }
 
-/// The Bus-reachable `onboard spawn-lighthouse` worker. Leader-gated +
-/// best-effort.
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+#[cfg(test)]
+type CursorPrimeFn = dyn Fn(&Persist) -> Result<Option<String>, String> + Send + Sync;
+#[cfg(test)]
+type ActionReadGateFn = dyn Fn() -> Result<(), String> + Send + Sync;
+#[cfg(test)]
+type EventPublishGateFn = dyn Fn() -> Result<(), String> + Send + Sync;
+
+/// The Bus-reachable `onboard spawn-lighthouse` worker. Leader-gated.
 pub struct SpawnLighthouseOnboardWorker {
     /// Shared-storage root — where [`gather`] reads the founding bundle
     /// (mesh-id + CA-holder overlay IP) and where the leader lock lives.
@@ -374,8 +383,8 @@ pub struct SpawnLighthouseOnboardWorker {
     leader_lock: PathBuf,
     /// The injectable provision seam (production: [`LiveProvisioner`]).
     prov: Box<dyn Provisioner + Send + Sync>,
-    /// The injectable publish seam (production: the shared [`BusPublisher`]).
-    publisher: Box<dyn Publisher + Send + Sync>,
+    /// Optional injected publisher. Production writes through the recovered Bus.
+    publisher: Option<Box<dyn Publisher + Send + Sync>>,
     /// Exact-body capability verifier for the privileged apply lane. Missing
     /// production credentials fail closed.
     authorizer: Arc<ActionAuthorizer>,
@@ -385,13 +394,24 @@ pub struct SpawnLighthouseOnboardWorker {
     facts_override: Option<crate::onboard::spawn_lighthouse::SpawnFacts>,
     /// Poll cadence.
     poll: Duration,
-    /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
+    /// Bus root override (tests). Otherwise user Bus then canonical system Bus.
     bus_root_override: Option<PathBuf>,
+    /// A resolved event whose mutation completed but durable publication did not.
+    /// It is retried before reading more commands, preventing effect replay.
+    pending_publication: Option<(String, String)>,
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
+    #[cfg(test)]
+    action_read_gate: Option<Arc<ActionReadGateFn>>,
+    #[cfg(test)]
+    event_publish_gate: Option<Arc<EventPublishGateFn>>,
 }
 
 impl SpawnLighthouseOnboardWorker {
     /// Construct with production defaults: the honestly integration-gated
-    /// [`LiveProvisioner`], the shared [`BusPublisher`], the shared leader lock
+    /// [`LiveProvisioner`], the recovered Bus, the shared leader lock
     /// under `workgroup_root`, and the default cadence.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
@@ -401,12 +421,21 @@ impl SpawnLighthouseOnboardWorker {
             node_id,
             leader_lock,
             prov: Box::new(crate::onboard::spawn_lighthouse::LiveProvisioner::default()),
-            publisher: Box::new(BusPublisher),
+            publisher: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
             #[cfg(test)]
             facts_override: None,
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            pending_publication: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
+            #[cfg(test)]
+            action_read_gate: None,
+            #[cfg(test)]
+            event_publish_gate: None,
         }
     }
 
@@ -417,10 +446,10 @@ impl SpawnLighthouseOnboardWorker {
         self
     }
 
-    /// Inject a publisher (tests). Production uses [`BusPublisher`].
+    /// Inject a publisher (tests). Production uses the recovered Bus handle.
     #[must_use]
     pub fn with_publisher(mut self, publisher: Box<dyn Publisher + Send + Sync>) -> Self {
-        self.publisher = publisher;
+        self.publisher = Some(publisher);
         self
     }
 
@@ -459,8 +488,76 @@ impl SpawnLighthouseOnboardWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_action_read_gate(mut self, gate: Arc<ActionReadGateFn>) -> Self {
+        self.action_read_gate = Some(gate);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_event_publish_gate(mut self, gate: Arc<EventPublishGateFn>) -> Self {
+        self.event_publish_gate = Some(gate);
+        self
+    }
+
+    fn bus_root(&self) -> PathBuf {
+        spawn_lighthouse_bus_root(self.bus_root_override.clone())
+    }
+
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_action_cursor(&self, persist: &Persist) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+        prime_cursor(persist)
+    }
+
+    fn publish_event(&self, persist: &Persist, body: &str) -> bool {
+        #[cfg(test)]
+        if let Some(gate) = self.event_publish_gate.as_ref() {
+            if let Err(error) = gate() {
+                tracing::debug!(target: "mackesd::spawn_lighthouse_onboard", %error, "injected event publication failure");
+                return false;
+            }
+        }
+        if let Some(publisher) = self.publisher.as_ref() {
+            publisher.publish(EVENT_TOPIC, body);
+            true
+        } else {
+            persist
+                .write(EVENT_TOPIC, Priority::Default, None, Some(body))
+                .map(|_| true)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(target: "mackesd::spawn_lighthouse_onboard", %error, "durable event publication failed");
+                    false
+                })
+        }
     }
 
     /// Only the elected node answers (no-fixed-center: any eligible node can be
@@ -474,57 +571,85 @@ impl SpawnLighthouseOnboardWorker {
         .is_leader()
     }
 
-    /// Drain new actions (advancing `cursor`) and — leader only — resolve each
-    /// through the reused onboard engine and publish its typed result event.
-    /// Non-leaders still advance their cursor (the `service_onboard`
-    /// convention), so a node that later wins the election answers new requests,
-    /// not backlog.
-    fn drain_and_publish(&self, bus_root: &Path, cursor: &mut Option<String>) {
-        let actions = read_new_actions(bus_root, cursor);
-        if actions.is_empty() || !self.is_leader() {
-            return;
+    fn live_facts(&self) -> crate::onboard::spawn_lighthouse::SpawnFacts {
+        #[cfg(test)]
+        if let Some(facts) = self.facts_override.clone() {
+            return facts;
         }
-        // Authenticate every apply before gathering the founding bundle. That
-        // gather reads the CA-holder bundle, and no untrusted apply may reach
-        // provider/backend/secret-adjacent work before its capability passes.
-        // Dry-run remains an intentionally unsigned, read-only preview.
-        let mut authorized_actions = Vec::with_capacity(actions.len());
-        for (body, action) in actions {
+        gather(&self.workgroup_root, &self.node_id)
+    }
+
+    /// Read one complete command batch, then mutate and durably publish in order.
+    /// A read failure changes neither cursor nor effects. A publication failure
+    /// retains the resolved event and retries it before any subsequent command.
+    fn drain_and_publish(&mut self, persist: &mut Persist, cursor: &mut Option<String>) -> bool {
+        if let Some((ulid, body)) = self.pending_publication.clone() {
+            if !self.publish_event(persist, &body) {
+                return false;
+            }
+            *cursor = Some(ulid);
+            self.pending_publication = None;
+        }
+
+        #[cfg(test)]
+        if let Some(gate) = self.action_read_gate.as_ref() {
+            if let Err(error) = gate() {
+                tracing::debug!(target: "mackesd::spawn_lighthouse_onboard", %error, "injected action read failure");
+                return false;
+            }
+        }
+        let messages = match read_new_actions(persist, cursor.as_deref()) {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::debug!(target: "mackesd::spawn_lighthouse_onboard", %error, "action read failed; mutation sweep deferred");
+                return false;
+            }
+        };
+        if messages.is_empty() {
+            return true;
+        }
+        if !self.is_leader() {
+            *cursor = messages.last().map(|message| message.ulid.clone());
+            return true;
+        }
+
+        let mut facts = None;
+        for message in messages {
+            let body = message.body.as_deref().unwrap_or_default();
+            let action = match parse_action(body) {
+                Ok(action) => action,
+                Err(error) => {
+                    tracing::warn!(ulid = %message.ulid, %error, "spawn_lighthouse_onboard: bad spawn-lighthouse action");
+                    *cursor = Some(message.ulid);
+                    continue;
+                }
+            };
+            // Authenticate every apply before gathering reaches any provider or
+            // secret-adjacent work. Dry-run is an unsigned read-only preview.
             if !action.dry_run {
-                if let Err(error) = authorize_spawn_action(self.authorizer.as_ref(), &body, &action)
+                if let Err(error) = authorize_spawn_action(self.authorizer.as_ref(), body, &action)
                 {
-                    tracing::warn!(
-                        id = %action.id,
-                        error = %error,
-                        "spawn_lighthouse_onboard: unauthorized apply refused"
-                    );
+                    tracing::warn!(id = %action.id, %error, "spawn_lighthouse_onboard: unauthorized apply refused");
+                    *cursor = Some(message.ulid);
                     continue;
                 }
             }
-            authorized_actions.push(action);
-        }
-        if authorized_actions.is_empty() {
-            return;
-        }
-
-        // Gather once per tick — the founding bundle is the same for every
-        // authorized action in this batch.
-        #[cfg(test)]
-        let facts = self
-            .facts_override
-            .clone()
-            .unwrap_or_else(|| gather(&self.workgroup_root, &self.node_id));
-        #[cfg(not(test))]
-        let facts = gather(&self.workgroup_root, &self.node_id);
-        for action in authorized_actions {
-            let event = resolve(&action, &facts, self.prov.as_ref());
-            match serde_json::to_string(&event) {
-                Ok(body) => self.publisher.publish(EVENT_TOPIC, &body),
-                Err(e) => {
-                    tracing::warn!(id = %event.id, error = %e, "spawn_lighthouse_onboard: event serialize failed");
+            let facts = facts.get_or_insert_with(|| self.live_facts());
+            let event = resolve(&action, facts, self.prov.as_ref());
+            let event_body = match serde_json::to_string(&event) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(id = %event.id, %error, "spawn_lighthouse_onboard: event serialize failed");
+                    return false;
                 }
+            };
+            if !self.publish_event(persist, &event_body) {
+                self.pending_publication = Some((message.ulid, event_body));
+                return false;
             }
+            *cursor = Some(message.ulid);
         }
+        true
     }
 }
 
@@ -535,18 +660,39 @@ impl Worker for SpawnLighthouseOnboardWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root() else {
-            tracing::debug!("spawn_lighthouse_onboard: no bus root; worker idle");
-            return Ok(());
+        let bus_root = self.bus_root();
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let (mut persist, mut cursor) = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_action_cursor(&persist) {
+                    Ok(cursor) => break (persist, cursor),
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::spawn_lighthouse_onboard",
+                        %error,
+                        "action-tail activation failed; startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::spawn_lighthouse_onboard",
+                    "Bus root unavailable; startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::spawn_lighthouse_onboard",
+                    %error,
+                    "Persist open failed; startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
         };
-        // Prime past the backlog: a spawn is a one-shot verb — a restart must
-        // not re-drive historical provisions (mirrors `service_onboard`).
-        let mut cursor = prime_cursor(&bus_root);
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
-                _ = tick.tick() => self.drain_and_publish(&bus_root, &mut cursor),
+                _ = tick.tick() => { self.drain_and_publish(&mut persist, &mut cursor); }
                 () = shutdown.wait() => break,
             }
         }
@@ -562,6 +708,7 @@ mod tests {
         CaMigrationStep, Endpoint, EnrollBootstrap, LiveProvisioner, ProvisionSpec,
     };
     use mde_bus::hooks::config::Priority;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn facts(cloud_token: bool, founded: bool) -> crate::onboard::spawn_lighthouse::SpawnFacts {
@@ -878,15 +1025,16 @@ mod tests {
         let calls = provisioner.calls.clone();
         let publisher = RecordingPublisher::default();
         let sent = publisher.sent.clone();
-        let worker = SpawnLighthouseOnboardWorker::new(wg.clone(), "peer:auth".to_string())
+        let mut worker = SpawnLighthouseOnboardWorker::new(wg.clone(), "peer:auth".to_string())
             .with_provisioner(Box::new(provisioner))
             .with_publisher(Box::new(publisher))
             .with_authorizer(authorizer)
             .with_facts(facts(true, true))
             .with_bus_root(bus.clone());
 
+        let mut persist = Persist::open(bus.clone()).expect("reopen bus");
         let mut cursor = None;
-        worker.drain_and_publish(&bus, &mut cursor);
+        assert!(worker.drain_and_publish(&mut persist, &mut cursor));
         let calls = calls.lock().unwrap().clone();
 
         assert_eq!(
@@ -915,12 +1063,13 @@ mod tests {
         std::fs::create_dir_all(&wg).expect("mk workgroup");
         let rec = RecordingPublisher::default();
         let log = rec.sent.clone();
-        let w = SpawnLighthouseOnboardWorker::new(wg.clone(), "peer:a".to_string())
+        let mut w = SpawnLighthouseOnboardWorker::new(wg.clone(), "peer:a".to_string())
             .with_publisher(Box::new(rec))
             .with_bus_root(bus.clone());
 
+        let mut persist = Persist::open(bus.clone()).expect("reopen bus");
         let mut cursor = None;
-        w.drain_and_publish(&bus, &mut cursor);
+        assert!(w.drain_and_publish(&mut persist, &mut cursor));
 
         let sent = log.lock().expect("recorder mutex");
         assert_eq!(sent.len(), 1, "one request ⇒ one event");
@@ -936,11 +1085,198 @@ mod tests {
         drop(sent);
 
         // The cursor advanced — a second drain re-answers nothing.
-        w.drain_and_publish(&bus, &mut cursor);
+        assert!(w.drain_and_publish(&mut persist, &mut cursor));
         assert_eq!(log.lock().expect("recorder mutex").len(), 1);
 
         let _ = std::fs::remove_dir_all(&bus);
         let _ = std::fs::remove_dir_all(&wg);
+    }
+
+    #[test]
+    fn service_bus_root_honors_override_and_falls_back_to_system_spool() {
+        assert_eq!(
+            spawn_lighthouse_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            spawn_lighthouse_bus_root_or_system(Some(PathBuf::from(
+                "/tmp/spawn-lighthouse-explicit-bus",
+            ))),
+            PathBuf::from("/tmp/spawn-lighthouse-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_without_replay_and_defers_reads_and_publication() {
+        const KEY: &[u8] = b"spawn-lighthouse-late-bus-key";
+        const AUTH_NOW: i64 = 1_700_000_000_000;
+
+        fn signed_apply_body(nonce: &str) -> String {
+            let unsigned = serde_json::to_string(&SpawnLighthouseAction {
+                id: "lh-late-bus".into(),
+                target: SpawnTargetKind::Cloud,
+                pair: false,
+                dry_run: false,
+                schema_version: ACTION_SCHEMA_VERSION,
+            })
+            .unwrap();
+            let action = parse_action(&unsigned).unwrap();
+            authorize_test_body(
+                KEY,
+                &unsigned,
+                MutationContext {
+                    verb: SPAWN_LIGHTHOUSE_AUTH_VERB,
+                    node: SPAWN_LIGHTHOUSE_NODE_SCOPE,
+                    target: &spawn_auth_target(&action),
+                },
+                nonce,
+                AUTH_NOW + 30_000,
+            )
+        }
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let bus_root = root.path().join("bus");
+        let workgroup = root.path().join("workgroup");
+        std::fs::create_dir_all(&workgroup).unwrap();
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_apply_body("spawn-startup-stale")),
+            )
+            .expect("write retained spawn command");
+
+        let provisioner = FakeProvisioner::default();
+        let calls = Arc::clone(&provisioner.calls);
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            KEY,
+            root.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let fail_reads_for_worker = Arc::clone(&fail_reads);
+        let fail_publication = Arc::new(AtomicBool::new(false));
+        let fail_publication_for_worker = Arc::clone(&fail_publication);
+        let mut worker = SpawnLighthouseOnboardWorker::new(workgroup, "peer:leader".into())
+            .with_provisioner(Box::new(provisioner))
+            .with_authorizer(authorizer)
+            .with_facts(facts(true, true))
+            .with_bus_root(bus_root.clone())
+            .with_poll(Duration::from_millis(5))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected action-tail failure".into());
+                }
+                prime_cursor(persist)
+            }))
+            .with_action_read_gate(Arc::new(move || {
+                if fail_reads_for_worker.load(Ordering::SeqCst) {
+                    Err("injected command read failure".into())
+                } else {
+                    Ok(())
+                }
+            }))
+            .with_event_publish_gate(Arc::new(move || {
+                if fail_publication_for_worker.load(Ordering::SeqCst) {
+                    Err("injected durable event failure".into())
+                } else {
+                    Ok(())
+                }
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover and activate");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(calls.lock().unwrap().is_empty(), "retained spawn replayed");
+        assert!(persist.list_since(EVENT_TOPIC, None).unwrap().is_empty());
+
+        fail_reads.store(true, Ordering::SeqCst);
+        fail_publication.store(true, Ordering::SeqCst);
+        // This handle is intentionally separate from the worker's long-held
+        // Persist. The forward write proves runtime refresh + list_since sees
+        // external publishers after activation.
+        persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_apply_body("spawn-forward")),
+            )
+            .expect("write forward spawn command");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "read failure allowed mutation"
+        );
+
+        fail_reads.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while calls.lock().unwrap().len() < 3 {
+                assert!(!task.is_finished(), "worker exited before forward mutation");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forward command must mutate after read recovery");
+        assert!(
+            persist.list_since(EVENT_TOPIC, None).unwrap().is_empty(),
+            "publication failure must not claim durable success"
+        );
+
+        fail_publication.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while persist.list_since(EVENT_TOPIC, None).unwrap().len() < 1 {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before durable publication"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pending event must publish after Bus recovery");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["provision", "push_enroll", "migrate_ca"],
+            "publication retry must not replay the completed mutation"
+        );
+        assert_eq!(persist.list_since(EVENT_TOPIC, None).unwrap().len(), 1);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown timed out")
+            .expect("worker task panicked")
+            .expect("worker returned an error");
     }
 
     #[tokio::test]
