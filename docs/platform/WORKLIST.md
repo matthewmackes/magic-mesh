@@ -296,18 +296,18 @@ behavioral evidence is not completion.
 - Problem: CEF/Servo host Browser code, frame copies, helpers, and package seams still compete with the DRM shell and violate the VM-only application boundary.
 - Required outcome: Preserve the old stack with history in matthewmackes/magic-mesh-browser-stack, remove it from magic-mesh, and make Surface::Browser start/resume a
   browser-vm that renders guest Chromium over VDI with focused input and guest-owned chrome.
-- Current state: The standalone repository and clean-checkout CI pass and the typed Browser workload path exists; portable live data import, guest image quality,
-  audio, and five-seat performance proof remain.
+- Current state: Standalone CI and the typed Browser path pass; portable import, guest image/audio quality, and five-seat performance proof remain.
 - **Portable migration checkpoints (2026-08-06):** deterministic allowlist, idempotency, symlink, and secret boundaries passed BigBoy and `.50`:
   `docs/platform/evidence/WL-ARCH-008-2026-08-06-portable-profile-r1.md`, `docs/platform/evidence/WL-ARCH-008-2026-08-09-portable-manifest-identity-r2.md`.
 - **Display1 migration rollback checkpoint (2026-08-09):** fixed-target cutover restores exact original XML after failed validation; `.90` gates passed:
   `docs/platform/evidence/WL-ARCH-008-2026-08-09-display1-migration-rollback-r3.md`.
 - **Host Browser negative-boundary checkpoint (2026-08-08):** host engine/package policy was removed; boundary lint, metadata, and 11/11 `.90` tests pass:
   `docs/platform/evidence/WL-ARCH-008-2026-08-08-host-browser-negative-boundary-r1.md`.
-- **Standalone publication checkpoint (2026-08-08):** GitHub `main` is `2b36cedb`; farm and Actions `31277690513` passed worker/clippy/boundary/package jobs:
-  `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
-- **Live-profile inventory checkpoint (2026-08-09):** accessible seats had no legacy profile; raced sources and failed entries now refuse partial publication while
-  credential stores remain untouched. BigBoy passed: `docs/platform/evidence/WL-ARCH-008-2026-08-09-live-profile-inventory-r4.md`.
+- **Standalone publication checkpoint (2026-08-08):** GitHub, farm, and Actions passed: `docs/platform/evidence/WL-ARCH-008-2026-08-08-standalone-publication-s1-r1.md`.
+- **Live-profile inventory checkpoint (2026-08-09):** raced/failed sources refuse partial publication; BigBoy passed:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-09-live-profile-inventory-r4.md`.
+- **Browser VM artifact-identity checkpoint (2026-08-09):** exact 4/8192/64 profile and bounded qcow2/raw manifests reject stale, hostile, or unsupported artifacts;
+  machine 194 passed the focused contract gates: `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-browser-vm-image-contract-r72.md`.
 - Remaining work:
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.

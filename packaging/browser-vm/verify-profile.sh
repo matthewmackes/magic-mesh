@@ -3,16 +3,43 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+MANIFEST_VERIFY="$ROOT/packaging/browser-vm/verify-image-manifest.py"
 SOURCE_MODE=0
-if [[ "${1:-}" == --source ]]; then
-    SOURCE_MODE=1
-    shift
-fi
-[ "$#" -le 1 ] || {
-    echo "usage: $0 [--source] [PROFILE]" >&2
+MANIFEST=
+IMAGE=
+SELF_TEST=0
+POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --source) SOURCE_MODE=1; shift ;;
+        --manifest) MANIFEST="${2:?--manifest needs a path}"; shift 2 ;;
+        --image) IMAGE="${2:?--image needs a path}"; shift 2 ;;
+        --self-test) SELF_TEST=1; shift ;;
+        --*) echo "usage: $0 [--source] [--manifest MANIFEST --image IMAGE] [PROFILE]" >&2; exit 2 ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+[ "${#POSITIONAL[@]}" -le 1 ] || {
+    echo "usage: $0 [--source] [--manifest MANIFEST --image IMAGE] [PROFILE]" >&2
     exit 2
 }
 PROFILE="${1:-$ROOT/packaging/browser-vm/profile.env}"
+if [ "${#POSITIONAL[@]}" -eq 1 ]; then
+    PROFILE="${POSITIONAL[0]}"
+fi
+if [ "$SELF_TEST" -eq 1 ]; then
+    [ -z "$MANIFEST" ] && [ -z "$IMAGE" ] && [ "${#POSITIONAL[@]}" -eq 0 ] || {
+        echo 'verify-browser-vm-profile: --self-test accepts no other input' >&2
+        exit 2
+    }
+    "$MANIFEST_VERIFY" self-test --repo-root "$ROOT" --profile "$PROFILE"
+    echo 'Browser VM profile/manifest self-tests passed'
+    exit 0
+fi
+if { [ -n "$MANIFEST" ] && [ -z "$IMAGE" ]; } || { [ -z "$MANIFEST" ] && [ -n "$IMAGE" ]; }; then
+    echo 'verify-browser-vm-profile: --manifest and --image are required together' >&2
+    exit 2
+fi
 
 die() {
     echo "verify-browser-vm-profile: $*" >&2
@@ -88,12 +115,11 @@ done
 [[ "${values[BROWSER_VM_GUEST_OS]}" == fedora-bootc ]] || die "unsupported guest OS"
 [[ "${values[BROWSER_VM_COMPOSITOR]}" == sway ]] || die "unsupported guest compositor"
 [[ "${values[BROWSER_VM_BROWSER]}" == chromium ]] || die "guest browser must be Chromium"
-[[ "${values[BROWSER_VM_VCPU]}" =~ ^[0-9]+$ && ${values[BROWSER_VM_VCPU]} -ge 4 ]] \
-    || die "Browser VM needs at least 4 vCPU"
-[[ "${values[BROWSER_VM_MEMORY_MB]}" =~ ^[0-9]+$ && ${values[BROWSER_VM_MEMORY_MB]} -ge 8192 ]] \
-    || die "Browser VM needs at least 8192 MiB"
-[[ "${values[BROWSER_VM_DISK_GB]}" =~ ^[0-9]+$ && ${values[BROWSER_VM_DISK_GB]} -ge 64 ]] \
-    || die "Browser VM needs at least 64 GiB"
+[[ "${values[BROWSER_VM_VCPU]}" == 4 ]] || die "Browser VM profile must be exactly 4 vCPU"
+[[ "${values[BROWSER_VM_MEMORY_MB]}" == 8192 ]] \
+    || die "Browser VM profile must be exactly 8192 MiB"
+[[ "${values[BROWSER_VM_DISK_GB]}" == 64 ]] \
+    || die "Browser VM profile must be exactly 64 GiB"
 [[ "${values[BROWSER_VM_TRANSPORTS]}" == rdp,spice ]] || die "transport set must be rdp,spice"
 [[ "${values[BROWSER_VM_DEFAULT_TRANSPORT]}" == rdp ]] || die "RDP must remain the implemented default transport"
 [[ "${values[BROWSER_VM_HOST_BROWSER]}" == false ]] || die "host Browser ownership is forbidden"
@@ -111,7 +137,15 @@ if grep -Eiq 'cef|servo|mde-web|native.?page' "$PROFILE"; then
 fi
 
 if [ "$SOURCE_MODE" -eq 1 ]; then
+    if [ -n "$MANIFEST" ]; then
+        "$MANIFEST_VERIFY" verify --repo-root "$ROOT" --profile "$PROFILE" \
+            --image "$IMAGE" --manifest "$MANIFEST" >/dev/null
+    fi
     echo "Browser VM source profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
 else
+    if [ -n "$MANIFEST" ]; then
+        "$MANIFEST_VERIFY" verify --repo-root "$ROOT" --profile "$PROFILE" \
+            --image "$IMAGE" --manifest "$MANIFEST" >/dev/null
+    fi
     echo "Browser VM profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
 fi

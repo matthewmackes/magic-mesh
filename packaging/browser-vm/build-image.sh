@@ -4,6 +4,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/packaging/browser-vm"
+MANIFEST_VERIFY="$DIR/verify-image-manifest.py"
 IMAGE="localhost/magic-mesh-browser-vm-chromium:latest"
 BASE=""
 LANE=repo
@@ -28,7 +29,7 @@ DISK_GB="$(sed -n 's/^BROWSER_VM_DISK_GB=//p' "$DIR/profile.env")"
     exit 2
 }
 
-usage() { echo "Usage: $0 [--rpm PATH]... [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]"; }
+usage() { echo "Usage: $0 [--rpm PATH]... [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw] [--out DIR]"; }
 
 resolve_image() {
     local ref=$1 label=$2 err rc=0
@@ -52,6 +53,11 @@ while [ "$#" -gt 0 ]; do
         *) echo "FATAL: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+case "$DISK" in
+    ""|qcow2|raw) ;;
+    *) echo "FATAL: unsupported disk output type: $DISK" >&2; exit 2 ;;
+esac
 
 command -v podman >/dev/null 2>&1 || { echo 'FATAL: podman is required' >&2; exit 2; }
 [ -f "$DIR/Containerfile" ] || { echo 'FATAL: Browser VM Containerfile is missing' >&2; exit 2; }
@@ -93,14 +99,19 @@ if [ -n "$DISK" ]; then
     case "$DISK" in
         qcow2) disk_path="$OUT/qcow2/disk.qcow2" ;;
         raw) disk_path="$OUT/raw/disk.raw" ;;
-        anaconda-iso) disk_path='' ;;
-        *) echo "FATAL: unsupported disk output type: $DISK" >&2; exit 2 ;;
     esac
-    if [ -n "$disk_path" ]; then
-        [ -f "$disk_path" ] || { echo "FATAL: expected disk output is missing: $disk_path" >&2; exit 2; }
+    [ -f "$disk_path" ] || { echo "FATAL: expected disk output is missing: $disk_path" >&2; exit 2; }
+    if [[ "$DISK" == qcow2 || "$DISK" == raw ]]; then
         command -v qemu-img >/dev/null 2>&1 || { echo 'FATAL: qemu-img is required to size the disk output' >&2; exit 2; }
         qemu-img resize -- "$disk_path" "${DISK_GB}G" >/dev/null
         qemu-img check -- "$disk_path" >/dev/null
         echo "Browser VM disk resized to ${DISK_GB} GiB: $disk_path"
     fi
+    manifest_path="${disk_path}.mcnf-manifest.json"
+    "$MANIFEST_VERIFY" create \
+        --repo-root "$REPO" --profile "$DIR/profile.env" \
+        --image "$disk_path" --format "$DISK" --manifest "$manifest_path"
+    "$DIR/verify-profile.sh" --source --manifest "$manifest_path" \
+        --image "$disk_path" "$DIR/profile.env"
+    "$DIR/verify-image.sh" --artifact "$disk_path" "$manifest_path"
 fi

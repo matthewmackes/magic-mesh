@@ -11,6 +11,7 @@ ACTIVATION_VERIFY="$BROWSER_VM/verify-activation-contract.sh"
 RUNTIME_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-runtime-evidence.py"
 IMAGE_BUILD="$BROWSER_VM/build-image.sh"
 IMAGE_VERIFY="$BROWSER_VM/verify-image.sh"
+MANIFEST_VERIFY="$BROWSER_VM/verify-image-manifest.py"
 PRODUCTION_CONTROL_VERIFY="$BROWSER_VM/verify-production-control-image.py"
 RUNTIME="$BROWSER_VM/mcnf-browser-vm-runtime.sh"
 RUNTIME_UNIT="$BROWSER_VM/mcnf-browser-vm-runtime.service"
@@ -40,6 +41,7 @@ fail() {
 [ -x "$RUNTIME_EVIDENCE_VERIFY" ] || fail "runtime evidence verifier is not executable"
 [ -x "$IMAGE_BUILD" ] || fail "image builder is not executable"
 [ -x "$IMAGE_VERIFY" ] || fail "image verifier is not executable"
+[ -x "$MANIFEST_VERIFY" ] || fail "image-manifest verifier is not executable"
 [ -x "$PRODUCTION_CONTROL_VERIFY" ] || fail "production-control image verifier is not executable"
 [ -x "$RUNTIME" ] || fail "guest runtime is not executable"
 [ -x "$XRDP_STARTWM" ] || fail "xrdp session entrypoint is not executable"
@@ -59,7 +61,7 @@ fail() {
 [ -f "$PRODUCTION_CONTROL_POLICY" ] || fail "production-control Chromium policy is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$SESSION_INPUT_VERIFY" "$EPHEMERAL_NOCLOUD" "$DEPLOY_IMAGE" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
-python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY" "$PRODUCTION_CONTROL_VERIFY"
+python3 -m py_compile "$MANIFEST_VERIFY" "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY" "$PERFORMANCE_EVIDENCE_VERIFY" "$LIVE_ACCEPTANCE_VERIFY" "$VDI_LIVE_PROOF_VERIFY" "$DEPLOYMENT_VERIFY" "$PRODUCTION_CONTROL_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
@@ -112,8 +114,19 @@ if grep -Eq '^[[:space:]]*(ADD|COPY)[[:space:]].*controller-secret' "$BROWSER_VM
 fi
 grep -Fq 'BROWSER_VM_DISK_GB' "$IMAGE_BUILD" || fail "image builder does not bind disk size to the profile"
 grep -Fq 'qemu-img resize' "$IMAGE_BUILD" || fail "image builder does not resize the disk output"
+grep -Fq 'verify-image-manifest.py' "$IMAGE_BUILD" || fail "image builder omits the cryptographic artifact manifest"
+grep -Fq 'mcnf-manifest.json' "$IMAGE_BUILD" || fail "image builder omits the stable artifact-manifest sidecar"
+set +e
+unsupported_disk_output="$($IMAGE_BUILD --disk anaconda-iso 2>&1)"
+unsupported_disk_rc=$?
+set -e
+[ "$unsupported_disk_rc" -eq 2 ] \
+    || fail "image builder did not reject its unsupported ISO lane with status 2"
+grep -Fq 'FATAL: unsupported disk output type: anaconda-iso' <<<"$unsupported_disk_output" \
+    || fail "image builder did not reject its unsupported ISO lane before build"
 grep -Fq '64 GiB' "$DEPLOY_IMAGE" || fail "deployment helper does not enforce the 64-GiB image floor"
 "$IMAGE_VERIFY" --self-test >/dev/null
+"$PROFILE_VERIFY" --self-test >/dev/null
 "$PRODUCTION_CONTROL_VERIFY" --self-test >/dev/null
 "$RUNTIME_EVIDENCE_VERIFY" --self-test >/dev/null
 "$MEDIA_EVIDENCE_VERIFY" --self-test >/dev/null

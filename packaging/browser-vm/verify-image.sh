@@ -5,13 +5,27 @@ TAG="${1:-localhost/magic-mesh-browser-vm-chromium:latest}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SESSION_INPUT_VERIFY="$ROOT/packaging/browser-vm/verify-session-input-contract.sh"
 PRODUCTION_CONTROL_VERIFY="$ROOT/packaging/browser-vm/verify-production-control-image.py"
+MANIFEST_VERIFY="$ROOT/packaging/browser-vm/verify-image-manifest.py"
 
 if [[ "${1:-}" == "--self-test" ]]; then
+    [ "$#" -eq 1 ] || { echo 'usage: verify-image.sh --self-test' >&2; exit 2; }
     # shellcheck disable=SC2050 # Deliberate fixed positive provenance fixture.
     [[ "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
+    "$MANIFEST_VERIFY" self-test --repo-root "$ROOT" \
+        --profile "$ROOT/packaging/browser-vm/profile.env" >/dev/null
     "$SESSION_INPUT_VERIFY" --self-test >/dev/null
     "$PRODUCTION_CONTROL_VERIFY" --self-test >/dev/null
-    echo 'Browser VM image provenance self-tests passed'
+    echo 'Browser VM image provenance/manifest self-tests passed'
+    exit 0
+fi
+if [[ "${1:-}" == "--artifact" ]]; then
+    [ "$#" -eq 3 ] || {
+        echo 'usage: verify-image.sh --artifact IMAGE MANIFEST' >&2
+        exit 2
+    }
+    "$ROOT/packaging/browser-vm/verify-profile.sh" --source \
+        --manifest "$3" --image "$2" \
+        "$ROOT/packaging/browser-vm/profile.env"
     exit 0
 fi
 command -v podman >/dev/null 2>&1 || { echo 'FATAL: podman is required' >&2; exit 2; }

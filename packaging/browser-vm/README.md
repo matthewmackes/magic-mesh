@@ -20,6 +20,19 @@ output virtual size to `BROWSER_VM_DISK_GB` from `profile.env` (currently 64
 GiB). Smaller bootc-image-builder defaults are enlarged before publication;
 `deploy-image.sh` and the seat preflight reject smaller artifacts.
 
+Every promotable qcow2/raw output now has one canonical sidecar named
+`<artifact>.mcnf-manifest.json`. The bounded schema binds the complete artifact
+bytes and format, the established `browser-vm-chromium-v1` image version, the
+exact profile bytes/resources/source revision, and the fixed runtime source
+assets copied or compiled into the guest. `verify-image.sh --artifact IMAGE
+MANIFEST` is the Workload-admission entrypoint; it also invokes the profile
+contract, so callers do not infer identity from a filename or maintain a second
+allowlist. The verifier rejects noncanonical sidecar names, symlinks, malformed
+or oversized JSON, duplicate/unknown fields, truncation, stale profile/runtime
+digests, image-byte mismatch, and qcow2/raw virtual sizes other than exactly 64
+GiB. An OCI container built without `--disk` is an intermediate build input,
+not an admissible Browser VM artifact.
+
 The checked-in `deploy-image.sh` is the bounded operator path for a direct KVM
 host. `preflight` verifies the local qcow2 and remote KVM/qemu-img/passwordless
 sudo prerequisites, including a resolvable remote `qemu` group, without
@@ -48,6 +61,12 @@ transport plus the retained SPICE compatibility path. The host is explicitly
 forbidden from owning a Browser
 engine; Chromium, browser chrome, page execution, media decode, and failures
 remain inside the guest.
+
+Sunshine/Moonlight is still unavailable: the image contains no Sunshine guest
+endpoint and Construct has no admitted decoder path. SPICE remains an explicit
+compatibility/recovery transport, not a claim that the requested Sunshine
+alternate has shipped. S4 live closure therefore still requires a promoted
+manifested image plus guest/host Sunshine implementation and live VDI evidence.
 
 The guest control plane is deliberately the thin `magic-mesh-lighthouse`
 package. It supplies `mackesd`, `meshctl`, Nebula join helpers, and guest
