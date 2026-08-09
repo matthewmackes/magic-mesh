@@ -1938,6 +1938,7 @@ mod tests {
     };
     use mackes_mesh_types::music_auth;
     use rusqlite::Connection;
+    use std::process::Command;
     use std::sync::atomic::{AtomicI64, Ordering};
     use tempfile::TempDir;
 
@@ -2268,6 +2269,90 @@ mod tests {
                 .find(|value| value.schedule_id == schedule_id)
                 .unwrap()
         }
+    }
+
+    const PROCESS_FIXTURE_ROOT_ENV: &str = "MDE_CLOCK_PROCESS_FIXTURE_ROOT";
+    const PROCESS_FIXTURE_NODE_ENV: &str = "MDE_CLOCK_PROCESS_FIXTURE_NODE";
+    const PROCESS_FIXTURE_NOW_ENV: &str = "MDE_CLOCK_PROCESS_FIXTURE_NOW";
+    const PROCESS_FIXTURE_DISABLED_ENV: &str = "MDE_CLOCK_PROCESS_FIXTURE_DISABLED";
+
+    fn process_fixture_worker(
+        root: &Path,
+        node_id: &str,
+        now_ms: i64,
+        disabled_schedule_ids: BTreeSet<String>,
+    ) -> ClockWorker {
+        let key = SigningKey::from_bytes(&[31; 32]);
+        ClockWorker {
+            node_id: node_id.to_owned(),
+            bus_root: Some(root.join("bus")),
+            poll: POLL,
+            clock: Arc::new(AdjustableClock(AtomicI64::new(now_ms))),
+            store: Arc::new(SqliteClockStore {
+                db_path: root.join(format!("{node_id}.db")),
+            }),
+            signer: Some(TrustedSigner {
+                signer_id: "clock-mesh-key".into(),
+                key: key.verifying_key(),
+            }),
+            command_signing_key: Some(key),
+            approved_peer_ids: ["node-a", "node-b", "node-c"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            blocked_origin_ids: BTreeSet::new(),
+            disabled_schedule_ids,
+            music_signing_seed: None,
+            snapshot: None,
+            action_cursor: None,
+            published_once: false,
+            audio_status_cursor: None,
+            audio_last_sent_ms: BTreeMap::new(),
+            peer_last_sent_ms: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn clock_process_fixture_child() {
+        let Ok(root) = std::env::var(PROCESS_FIXTURE_ROOT_ENV) else {
+            return;
+        };
+        let node_id = std::env::var(PROCESS_FIXTURE_NODE_ENV).unwrap();
+        let now_ms = std::env::var(PROCESS_FIXTURE_NOW_ENV)
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let disabled_schedule_ids = std::env::var(PROCESS_FIXTURE_DISABLED_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect();
+        process_fixture_worker(Path::new(&root), &node_id, now_ms, disabled_schedule_ids)
+            .tick_once()
+            .unwrap();
+    }
+
+    fn run_clock_process(root: &Path, node_id: &str, now_ms: i64, disabled: &[&str]) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("clock_process_fixture_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PROCESS_FIXTURE_ROOT_ENV, root)
+            .env(PROCESS_FIXTURE_NODE_ENV, node_id)
+            .env(PROCESS_FIXTURE_NOW_ENV, now_ms.to_string())
+            .env(PROCESS_FIXTURE_DISABLED_ENV, disabled.join(","))
+            .status()
+            .unwrap();
+        assert!(status.success(), "Clock child process for {node_id} failed");
+    }
+
+    fn process_fixture_snapshot(root: &Path, node_id: &str) -> ClockSnapshotV1 {
+        let store = SqliteClockStore {
+            db_path: root.join(format!("{node_id}.db")),
+        };
+        let record = store.load(node_id).unwrap().unwrap();
+        serde_json::from_str(&record.snapshot_json).unwrap()
     }
 
     fn signed_timer_for(
@@ -3495,5 +3580,148 @@ mod tests {
                 .disposition,
             ClockTargetDisposition::Ringing
         );
+    }
+
+    #[test]
+    fn persisted_bus_multi_process_peer_rejoin_opt_out_and_global_ack_converge() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let bus = root.join("bus");
+        let key = SigningKey::from_bytes(&[31; 32]);
+
+        // Each invocation is a separate OS process. It independently opens the
+        // retained Bus index and its node's SQLite Clock authority, then exits.
+        for node_id in ["node-a", "node-b", "node-c"] {
+            run_clock_process(root, node_id, NOW, &[]);
+        }
+
+        let schedule = signed_timer_for(
+            &key,
+            "node-a",
+            "process-schedule-1",
+            process_fixture_snapshot(root, "node-a").revision,
+            "process-timer-1",
+            NOW + 5_000,
+            &["node-a", "node-b", "node-c"],
+            NOW,
+        );
+        publish_to(&bus, "node-a", &schedule);
+        run_clock_process(root, "node-a", NOW, &[]);
+        run_clock_process(root, "node-b", NOW, &[]);
+        assert!(process_fixture_snapshot(root, "node-b")
+            .schedules
+            .iter()
+            .any(|value| value.schedule_id == "process-timer-1"));
+        assert!(process_fixture_snapshot(root, "node-c")
+            .schedules
+            .is_empty());
+
+        // C was absent for the initial delivery. A fresh process consumes the
+        // retained signed peer command when C rejoins, with no in-memory relay.
+        run_clock_process(root, "node-c", NOW, &[]);
+        assert!(process_fixture_snapshot(root, "node-c")
+            .schedules
+            .iter()
+            .any(|value| value.schedule_id == "process-timer-1"));
+
+        run_clock_process(root, "node-a", NOW + 10_000, &[]);
+        run_clock_process(root, "node-b", NOW + 10_000, &["process-timer-1"]);
+        run_clock_process(root, "node-c", NOW + 10_000, &[]);
+        let a_ringing = process_fixture_snapshot(root, "node-a");
+        let b_disabled = process_fixture_snapshot(root, "node-b");
+        let c_ringing = process_fixture_snapshot(root, "node-c");
+        assert_eq!(
+            b_disabled
+                .occurrences
+                .iter()
+                .find(|value| value.schedule_id == "process-timer-1")
+                .unwrap()
+                .targets
+                .iter()
+                .find(|target| target.target_node_id == "node-b")
+                .unwrap()
+                .disposition,
+            ClockTargetDisposition::DisabledLocally
+        );
+        for (snapshot, node_id) in [(&a_ringing, "node-a"), (&c_ringing, "node-c")] {
+            assert_eq!(
+                snapshot
+                    .occurrences
+                    .iter()
+                    .find(|value| value.schedule_id == "process-timer-1")
+                    .unwrap()
+                    .targets
+                    .iter()
+                    .find(|target| target.target_node_id == node_id)
+                    .unwrap()
+                    .disposition,
+                ClockTargetDisposition::Ringing
+            );
+        }
+
+        let b_occurrence = b_disabled
+            .occurrences
+            .iter()
+            .find(|value| value.schedule_id == "process-timer-1")
+            .unwrap();
+        let c_occurrence = c_ringing
+            .occurrences
+            .iter()
+            .find(|value| value.schedule_id == "process-timer-1")
+            .unwrap();
+        publish_to(
+            &bus,
+            "node-b",
+            &signed_ack_for(
+                &key,
+                "node-b",
+                "process-snooze-tie",
+                b_disabled.revision,
+                b_occurrence,
+                7,
+                false,
+                NOW + 10_000,
+            ),
+        );
+        publish_to(
+            &bus,
+            "node-c",
+            &signed_ack_for(
+                &key,
+                "node-c",
+                "process-stop-tie",
+                c_ringing.revision,
+                c_occurrence,
+                7,
+                true,
+                NOW + 10_000,
+            ),
+        );
+
+        // Independent actors commit concurrently chosen Snooze/Stop outcomes;
+        // subsequent fresh processes replay peer publications until Stop wins
+        // the exact actor-clock tie on every durable authority.
+        for node_id in ["node-b", "node-c", "node-a", "node-b", "node-c"] {
+            let disabled = (node_id == "node-b").then_some("process-timer-1");
+            run_clock_process(
+                root,
+                node_id,
+                NOW + 10_000,
+                &disabled.into_iter().collect::<Vec<_>>(),
+            );
+        }
+        for node_id in ["node-a", "node-b", "node-c"] {
+            let snapshot = process_fixture_snapshot(root, node_id);
+            let occurrence = snapshot
+                .occurrences
+                .iter()
+                .find(|value| value.schedule_id == "process-timer-1")
+                .unwrap();
+            assert_eq!(occurrence.phase, ClockOccurrencePhase::Stopped);
+            let acknowledgement = occurrence.acknowledgement.as_ref().unwrap();
+            assert!(acknowledgement.stop);
+            assert_eq!(acknowledgement.actor_clock, 7);
+            assert_eq!(acknowledgement.actor_node_id, "node-c");
+        }
     }
 }

@@ -1314,17 +1314,17 @@ behavioral evidence is not completion.
   visible clock opens Clock, a dedicated bell opens Notification Center, mackesd owns persisted scheduling and signed multi-peer execution, and mde-musicd remains the
   only Music/radio/NPR source and playback authority.
 - Current state: Signed contracts, durable scheduling/convergence, governed audio, and Clock/bell chrome exist; multi-process/UI/package/live proof remains.
-- **Clock contract checkpoint (2026-08-08):** 5/5 focused and 473/473 complete tests passed on `.196`:
-  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`.
+- **Contract/peer checkpoints (2026-08-08):** bounded Clock contracts and delivery/loss/rejoin/replay/global Stop passed `.196`:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-contracts-s1-r1.md`, `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
 - **Scheduler/restart checkpoint (2026-08-09):** weekday/DST execution and durable alarm auto-silence/audio stop passed the 7/7 Clock suite:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-scheduler-s2-r1.md`; `docs/platform/evidence/WL-FUNC-022-2026-08-09-weekday-alarm-dst-r2.md`;
   `docs/platform/evidence/WL-FUNC-022-2026-08-09-auto-silence-restart-r4.md`.
-- **Peer convergence checkpoint (2026-08-08):** delivery/loss/rejoin, replay/reordering, local removal, global Stop, and missed-late passed 3/3 on `.196`:
-  `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-peer-convergence-s2-r1.md`.
 - **Clock audio checkpoint (2026-08-08):** durable signed Start/Stop/Snooze replay and the 3,000 ms audibility fallback passed 7/7 on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-audio-s3-r1.md`.
 - **Clock UI checkpoint (2026-08-08):** projection, Jiff/IANA time, actions, and fail-closed behavior passed 5/5 on `.50`; evidence:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-ui-s4-r1.md`.
+- **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
+  convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
 - **Resolve/preview checkpoint:** typed isolated preview and governed local-file admission passed 13 focused tests on `.196`:
   `docs/platform/evidence/WL-FUNC-022-2026-08-08-clock-resolve-preview-s3-r1.md`.
