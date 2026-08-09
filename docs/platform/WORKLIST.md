@@ -1005,6 +1005,12 @@ behavioral evidence is not completion.
   Release 23 still lacks the typed Desktop/RDP projection and needs corrected
   deployment:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-rdp-scan-completion-freshness-r18.md`.
+- **Seat 15 Release 24 checkpoint (2026-08-09):** the clean Fedora 44 artifact
+  passed real-RPM gates and a dry-run, then installed after the visible warning.
+  All daemon groups and publisher credential activation passed; consecutive
+  scans retained `172.20.146.54:3389` as an available typed Desktop/RDP card
+  with an approval-gated connect action. Authenticated login/render remains:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-seat15-release24-r19.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
