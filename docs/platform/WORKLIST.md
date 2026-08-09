@@ -451,6 +451,12 @@ behavioral evidence is not completion.
   monitoring now survives late Bus storage, while failed durable Cloud-lane
   reads retain their cursor and rollup. Machine 193 passed two exact tests:
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-011-2026-08-09-notify-bus-recovery-r32.md`.
+- **Bookmarks/ad-filter Bus recovery checkpoint (2026-08-09):** both workers
+  recover after late storage, atomically skip retained mutations, admit first
+  post-activation commands, and preserve durable state. Machine 9 and BigBoy
+  passed five exact tests:
+  `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-bookmarks-bus-recovery-r30.md`,
+  `docs/platform/evidence/WL-ARCH-009-WL-FUNC-021-2026-08-09-adfilter-bus-recovery-r31.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
@@ -1088,6 +1094,11 @@ behavioral evidence is not completion.
   arm/input controls are skipped and one forward consented input runs exactly
   once. Machine 196 passed two exact tests:
   `docs/platform/evidence/WL-FUNC-019-WL-CRIT-007-2026-08-09-seat-remote-input-bus-recovery-r23.md`.
+- **Mesh-mount Bus recovery checkpoint (2026-08-09):** mount lifecycle polling
+  survives late storage, atomically skips retained host actions, executes first
+  requests on new host topics, and defers convergence on read failure. Machine
+  194 passed three exact tests:
+  `docs/platform/evidence/WL-ARCH-010-WL-FUNC-019-2026-08-09-mesh-mount-bus-recovery-r29.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.

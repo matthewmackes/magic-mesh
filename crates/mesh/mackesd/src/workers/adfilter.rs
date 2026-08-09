@@ -82,6 +82,11 @@ pub const MIRROR_SUBDIR: &str = "mirror";
 /// mirror drop); a 30 s tick keeps convergence prompt without polling storms.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(30);
 
+/// Bounds for recovering a Bus that is unresolved, unopenable, or not yet
+/// safe to activate. The same worker remains live while backing off.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Default freshness window: a sync older than this reads as [`Staleness::Stale`]
 /// (7 days — EasyList's own refresh cadence).
 pub const DEFAULT_FRESHNESS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -442,6 +447,16 @@ fn load_store(path: &Path) -> Option<FilterPolicyStore> {
 
 // ── the worker ───────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn =
+    dyn Fn(&Persist) -> Result<HashMap<String, Option<String>>, String> + Send + Sync;
+
+#[cfg(test)]
+type RequestReadGateFn = dyn Fn(&str, usize) -> Result<(), String> + Send + Sync;
+
 /// BOOKMARKS-7 — the mesh-wide ad-filter worker.
 pub struct AdfilterWorker {
     /// This node's id (the store owner + status key).
@@ -466,14 +481,23 @@ pub struct AdfilterWorker {
     last_flush_ms: u64,
     /// Poll/flush cadence.
     tick: Duration,
-    /// Per-topic action cursors (`action/adfilter/<verb>` → last ULID).
-    cursors: HashMap<String, String>,
+    /// Per-topic action cursors (`action/adfilter/<verb>` → last ULID). A
+    /// present `None` is an existing empty topic primed during activation; an
+    /// absent topic appeared afterward and drains its first forward message.
+    cursors: HashMap<String, Option<String>>,
     /// Injected wall clock.
     now_fn: NowFn,
     /// Test seam forcing the share up/down; `None` → the real writable guard.
     share_gate: Option<Arc<AtomicBool>>,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus seams for deterministic startup/read-failure tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
+    #[cfg(test)]
+    request_read_gate: Option<Arc<RequestReadGateFn>>,
     /// Exact-body capability verifier for cross-UID allowlist mutations.
     authorizer: Arc<ActionAuthorizer>,
 }
@@ -500,6 +524,12 @@ impl AdfilterWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
+            #[cfg(test)]
+            request_read_gate: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
@@ -532,6 +562,27 @@ impl AdfilterWorker {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_request_read_gate(mut self, gate: Arc<RequestReadGateFn>) -> Self {
+        self.request_read_gate = Some(gate);
+        self
+    }
+
     /// Inject an isolated verifier and replay ledger for hostile action tests.
     #[cfg(test)]
     #[must_use]
@@ -549,6 +600,29 @@ impl AdfilterWorker {
 
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
+    }
+
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_action_cursors(
+        &self,
+        persist: &Persist,
+    ) -> Result<HashMap<String, Option<String>>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_action_cursors(persist)
     }
 
     /// Whether the shared folder is present + writable this tick. The test gate
@@ -763,30 +837,49 @@ impl AdfilterWorker {
     /// Drain net-new `action/adfilter/{allow,block}` requests, applying each to the
     /// own store's allowlist. Publishes immediately when any landed so the surface
     /// reflects the edit without waiting for the flush.
-    fn drain_requests(&mut self, persist: &Persist) {
+    fn drain_requests(&mut self, persist: &Persist) -> bool {
         let topics = match persist.list_topics() {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!(target: "mackesd::adfilter", error = %e, "list_topics failed");
-                return;
+                return false;
             }
         };
-        let mut changed = false;
-        for topic in topics
+        let mut candidate_cursors = self.cursors.clone();
+        let mut requests = Vec::new();
+        for (index, topic) in topics
             .into_iter()
             .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
+            .enumerate()
         {
+            #[cfg(test)]
+            if let Some(gate) = self.request_read_gate.as_ref() {
+                if let Err(error) = gate(&topic, index) {
+                    tracing::debug!(target: "mackesd::adfilter", topic, %error, "injected list_since failure");
+                    return false;
+                }
+            }
             let verb = topic[ACTION_PREFIX.len()..].to_string();
-            let cursor = self.cursors.get(&topic).cloned();
-            let msgs = match persist.list_since(&topic, cursor.as_deref()) {
+            let cursor = self.cursors.get(&topic).and_then(Option::as_deref);
+            let messages = match persist.list_since(&topic, cursor) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::debug!(target: "mackesd::adfilter", topic, error = %e, "list_since failed");
-                    continue;
+                    return false;
                 }
             };
-            for msg in msgs {
-                self.cursors.insert(topic.clone(), msg.ulid.clone());
+            if let Some(tail) = messages.last().map(|message| message.ulid.clone()) {
+                candidate_cursors.insert(topic, Some(tail));
+            }
+            requests.push((verb, messages));
+        }
+
+        // A failed read means unavailable state, not an empty command set. Only
+        // install cursors and execute mutations after the whole sweep succeeds.
+        self.cursors = candidate_cursors;
+        let mut changed = false;
+        for (verb, messages) in requests {
+            for msg in messages {
                 let body = msg.body.as_deref().unwrap_or_default();
                 let action = match parse_action(&verb, body) {
                     Ok(action) => action,
@@ -828,22 +921,41 @@ impl AdfilterWorker {
             self.rebuild_converged();
             self.publish_state(persist);
         }
+        true
     }
+}
 
-    /// Seed each action topic's cursor at its tail so a restart doesn't replay +
-    /// re-apply already-processed requests (the edits are already in the store).
-    fn seed_cursors(&mut self, persist: &Persist) {
-        if let Ok(topics) = persist.list_topics() {
-            for topic in topics
-                .into_iter()
-                .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
-            {
-                if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
-                    self.cursors.insert(topic, ulid);
-                }
-            }
-        }
+/// Discover and tail-prime every existing mutation topic as one activation
+/// transaction. The caller installs this map only after every tail read succeeds.
+fn prime_action_cursors(persist: &Persist) -> Result<HashMap<String, Option<String>>, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover adfilter action topics: {error}"))?;
+    let mut cursors = HashMap::new();
+    for topic in topics
+        .into_iter()
+        .filter(|topic| topic.starts_with(ACTION_PREFIX) && topic.len() > ACTION_PREFIX.len())
+    {
+        let tail = persist
+            .latest_ulid(&topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?;
+        cursors.insert(topic, tail);
     }
+    Ok(cursors)
+}
+
+fn adfilter_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    adfilter_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn adfilter_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 #[async_trait::async_trait]
@@ -853,31 +965,49 @@ impl Worker for AdfilterWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::adfilter", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::adfilter", error = %e, "persist open failed; worker idle");
-                return Ok(());
-            }
-        };
+        // Durable policy is filesystem-backed and survives a Bus outage; restore
+        // it before waiting for the transient command transport to activate.
         self.load();
-        self.seed_cursors(&persist);
+        let bus_root = adfilter_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_action_cursors(&persist) {
+                    Ok(cursors) => {
+                        self.cursors = cursors;
+                        break persist;
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::adfilter",
+                        %error,
+                        "action-topic activation failed; adfilter startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::adfilter",
+                    "Bus root unavailable; adfilter startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::adfilter",
+                    %error,
+                    "Persist open failed; adfilter startup will retry"
+                ),
+            }
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
+        };
         self.flush(&persist); // publish the initial converged state
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await; // burn the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.drain_requests(&persist);
-                    self.flush(&persist);
+                    if self.drain_requests(&persist) {
+                        self.flush(&persist);
+                    }
                 }
                 () = shutdown.wait() => break,
             }
@@ -1164,6 +1294,10 @@ mod tests {
     const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn signed_allow_body(node: &str, domain: &str, nonce: &str) -> String {
+        signed_action_body("allow", node, domain, nonce)
+    }
+
+    fn signed_action_body(verb: &str, node: &str, domain: &str, nonce: &str) -> String {
         let unsigned = serde_json::json!({
             "domain": domain,
             "schema_version": 1,
@@ -1174,13 +1308,168 @@ mod tests {
             AUTH_KEY,
             &unsigned,
             MutationContext {
-                verb: "adfilter-allow",
+                verb: &format!("adfilter-{verb}"),
                 node,
                 target: &target,
             },
             nonce,
             AUTH_NOW + 30_000,
         )
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            adfilter_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            adfilter_bus_root_or_system(Some(PathBuf::from("/tmp/adfilter-explicit-bus"))),
+            PathBuf::from("/tmp/adfilter-explicit-bus")
+        );
+    }
+
+    #[tokio::test]
+    async fn late_bus_recovers_without_replay_and_defers_failed_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("local");
+        let share = root.path().join("share");
+        let bus_root = root.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+
+        // Durable policy is independent of the transient Bus and must be loaded
+        // while startup is waiting for that Bus to become usable.
+        let mut durable = FilterPolicyStore::default();
+        durable.allow_site("durable.example", "local-host", 500);
+        std::fs::create_dir_all(node_dir(&local, "local-host")).unwrap();
+        std::fs::write(store_path(&local, "local-host"), durable.to_json().unwrap()).unwrap();
+
+        // This retained destructive command predates activation and must never
+        // replay after the same worker eventually opens the Bus.
+        let stale = signed_action_body("block", "local-host", "stale.example", "startup-stale");
+        persist
+            .write(
+                &format!("{ACTION_PREFIX}block"),
+                Priority::Default,
+                None,
+                Some(&stale),
+            )
+            .unwrap();
+
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            root.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let open_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let fail_reads_for_worker = Arc::clone(&fail_reads);
+        let (_clock, now) = fake_clock(1_000);
+        let mut worker = worker("local-host", &local, &share, now)
+            .with_authorizer(authorizer)
+            .with_fetcher(Arc::new(DeadFetcher))
+            .with_bus_root(bus_root.clone())
+            .with_tick(Duration::from_millis(5))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected action-tail read failure".into());
+                }
+                prime_action_cursors(persist)
+            }))
+            .with_request_read_gate(Arc::new(move |_, _| {
+                if fail_reads_for_worker.load(Ordering::SeqCst) {
+                    Err("injected runtime Bus read failure".into())
+                } else {
+                    Ok(())
+                }
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover and activate");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let restored = load_store(&store_path(&local, "local-host")).unwrap();
+        assert!(restored.is_allowed("durable.example"));
+        assert!(
+            !restored.allowlist.contains_key("stale.example"),
+            "retained startup mutation must be tail-primed, not replayed"
+        );
+
+        // `allow` appears only after activation. Its first message is forward
+        // work, but a failed Bus read must defer both that effect and the tick's
+        // convergence/status publish until a complete sweep succeeds.
+        fail_reads.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let state_topic = format!("{STATE_PREFIX}local-host");
+        let states_before = persist.list_since(&state_topic, None).unwrap().len();
+        let forward = signed_allow_body("local-host", "forward.example", "forward-first");
+        persist
+            .write(
+                &format!("{ACTION_PREFIX}allow"),
+                Priority::Default,
+                None,
+                Some(&forward),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            persist.list_since(&state_topic, None).unwrap().len(),
+            states_before,
+            "failed reads must defer convergence and publishing"
+        );
+        assert!(
+            !load_store(&store_path(&local, "local-host"))
+                .unwrap()
+                .is_allowed("forward.example"),
+            "failed read must not masquerade as an empty successful sweep"
+        );
+
+        fail_reads.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if load_store(&store_path(&local, "local-host"))
+                    .is_some_and(|store| store.is_allowed("forward.example"))
+                {
+                    break;
+                }
+                assert!(!task.is_finished(), "worker exited before forward mutation");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("new post-activation topic's first message must execute");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("worker shutdown timed out")
+            .expect("worker task panicked")
+            .expect("worker returned an error");
     }
 
     #[test]

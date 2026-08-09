@@ -45,7 +45,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::cloud::CloudArmSigner;
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 
 use crate::ipc::action_auth::{production_action_signer, ActionAuthorizer, MutationContext};
 
@@ -82,6 +82,13 @@ pub const DEFAULT_MESH_USER: &str = crate::ipc::mesh_service_account::MESH_SERVI
 /// A mount request is rare + human-driven, so a 2 s tick keeps latency
 /// imperceptible while the same tick paces idle/stale/backoff bookkeeping.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Lower bound for retrying an unresolved, unopenable, or not-yet-safe Bus.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Upper bound for startup retry backoff. The same worker must recover when the
+/// system Bus appears instead of depending on supervisor restart churn.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default idle window before an untouched mount is auto-unmounted (lock 11).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -732,6 +739,13 @@ struct HostEntry {
     reason: Option<String>,
 }
 
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn =
+    dyn Fn(&Persist) -> Result<HashMap<String, Option<String>>, String> + Send + Sync;
+
 impl HostEntry {
     fn new(scope: MountScope, mountpoint: PathBuf) -> Self {
         let now = Instant::now();
@@ -772,10 +786,18 @@ pub struct MeshMountWorker {
     tick: Duration,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus open seam for deterministic startup-recovery tests.
+    #[cfg(test)]
+    bus_open_override: Option<std::sync::Arc<BusOpenFn>>,
+    /// Atomic request-topic activation seam for deterministic failure tests.
+    #[cfg(test)]
+    cursor_prime_override: Option<std::sync::Arc<CursorPrimeFn>>,
     /// Per-host live state.
     entries: HashMap<String, HostEntry>,
-    /// Per-topic request cursors (`action/mesh-mount/<host>` → last ULID).
-    cursors: HashMap<String, String>,
+    /// Per-topic request cursors (`action/mesh-mount/<host>` → last ULID). A
+    /// present `None` is an existing topic safely activated while empty; an
+    /// absent topic appeared later and its first forward request is drained.
+    cursors: HashMap<String, Option<String>>,
 }
 
 impl MeshMountWorker {
@@ -802,6 +824,10 @@ impl MeshMountWorker {
             stale_after: DEFAULT_STALE_AFTER,
             tick: DEFAULT_TICK_INTERVAL,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
             entries: HashMap::new(),
             cursors: HashMap::new(),
         }
@@ -836,6 +862,22 @@ impl MeshMountWorker {
         self
     }
 
+    /// Override Bus opening without changing production retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: std::sync::Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override atomic request-topic activation for deterministic failure tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: std::sync::Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
     /// Override the idle-unmount window (tests use a short value).
     #[must_use]
     pub const fn with_idle_timeout(mut self, d: Duration) -> Self {
@@ -855,6 +897,29 @@ impl MeshMountWorker {
     pub fn with_mesh_user(mut self, user: impl Into<String>) -> Self {
         self.mesh_user = user.into();
         self
+    }
+
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_request_cursors(
+        &self,
+        persist: &Persist,
+    ) -> Result<HashMap<String, Option<String>>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_request_cursors(persist)
     }
 
     /// Publish the current state record for `host`.
@@ -990,65 +1055,78 @@ impl MeshMountWorker {
     /// run the health/idle/reconnect tick. Fully synchronous so the `&Persist`
     /// borrow is held across the whole sweep without breaking `Send`.
     fn sweep(&mut self, persist: &Persist) {
-        self.drain_requests(persist);
-        self.health_tick(persist);
+        // A failed Bus read is unknown state, not an empty command set. Defer
+        // every mount/unmount/reconnect effect until one complete read succeeds.
+        if self.drain_requests(persist) {
+            self.health_tick(persist);
+        }
     }
 
     /// Poll each request topic since its cursor, mapping the typed verb onto a
     /// state event.
-    fn drain_requests(&mut self, persist: &Persist) {
+    fn drain_requests(&mut self, persist: &Persist) -> bool {
         let topics = match persist.list_topics() {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!(target: "mackesd::mesh_mount", error = %e, "list_topics failed");
-                return;
+                return false;
             }
         };
+        // Stage all reads and cursor advances before executing any destructive
+        // verb. One unreadable topic aborts the whole sweep with no partial
+        // cursor commit and no mount convergence side effect.
+        let mut candidate_cursors = self.cursors.clone();
+        let mut batch: Vec<(String, StoredMessage)> = Vec::new();
         for topic in topics
             .into_iter()
             .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
         {
-            let host = topic[ACTION_PREFIX.len()..].to_string();
-            let cursor = self.cursors.get(&topic).cloned();
-            let msgs = match persist.list_since(&topic, cursor.as_deref()) {
+            let cursor = candidate_cursors.get(&topic).and_then(Option::as_deref);
+            let msgs = match persist.list_since(&topic, cursor) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::debug!(target: "mackesd::mesh_mount", topic, error = %e, "list_since failed");
-                    continue;
+                    return false;
                 }
             };
             for msg in msgs {
-                self.cursors.insert(topic.clone(), msg.ulid.clone());
-                let body = msg.body.as_deref().unwrap_or_default();
-                let verb = match parse_verb(body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(target: "mackesd::mesh_mount", host = %host, error = %e, "bad request");
-                        continue;
-                    }
-                };
-                let context = MutationContext {
-                    verb: match verb {
-                        MeshMountVerb::Mount => "mesh-mount-mount",
-                        MeshMountVerb::Escalate => "mesh-mount-escalate",
-                        MeshMountVerb::Unmount => "mesh-mount-unmount",
-                    },
-                    node: &host,
-                    target: &host,
-                };
-                if let Err(error) = self.authorizer.authorize(body, context) {
-                    tracing::warn!(
-                        target: "mackesd::mesh_mount",
-                        host = %host,
-                        verb = verb.tag(),
-                        error = %error,
-                        "refused unauthorized privileged request"
-                    );
-                    continue;
-                }
-                self.handle_verb(persist, &host, verb);
+                candidate_cursors.insert(topic.clone(), Some(msg.ulid.clone()));
+                batch.push((topic.clone(), msg));
             }
         }
+        self.cursors = candidate_cursors;
+        for (topic, msg) in batch {
+            let host = topic[ACTION_PREFIX.len()..].to_string();
+            let body = msg.body.as_deref().unwrap_or_default();
+            let verb = match parse_verb(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(target: "mackesd::mesh_mount", host = %host, error = %e, "bad request");
+                    continue;
+                }
+            };
+            let context = MutationContext {
+                verb: match verb {
+                    MeshMountVerb::Mount => "mesh-mount-mount",
+                    MeshMountVerb::Escalate => "mesh-mount-escalate",
+                    MeshMountVerb::Unmount => "mesh-mount-unmount",
+                },
+                node: &host,
+                target: &host,
+            };
+            if let Err(error) = self.authorizer.authorize(body, context) {
+                tracing::warn!(
+                    target: "mackesd::mesh_mount",
+                    host = %host,
+                    verb = verb.tag(),
+                    error = %error,
+                    "refused unauthorized privileged request"
+                );
+                continue;
+            }
+            self.handle_verb(persist, &host, verb);
+        }
+        true
     }
 
     /// Apply one typed verb to a host, tracking the desired scope.
@@ -1151,6 +1229,43 @@ pub fn scope_auth_payload(host: &str, state: &str, scope: &str, since_ms: u64) -
     format!("v1|mesh-mount-state|{host}|{state}|{scope}|{since_ms}")
 }
 
+/// Resolve the production Bus location once per invocation. A caller override
+/// wins; otherwise the canonical system spool keeps this daemon worker viable
+/// when no user `HOME`/`XDG_RUNTIME_DIR` can be discovered.
+fn mesh_mount_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    mesh_mount_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn mesh_mount_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+/// Discover and tail-prime every existing transient action topic as one
+/// activation transaction. The map is installed only after every tail read
+/// succeeds, so retained mount/unmount effects can never partially activate.
+fn prime_request_cursors(persist: &Persist) -> Result<HashMap<String, Option<String>>, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover mesh-mount request topics: {error}"))?;
+    let mut cursors = HashMap::new();
+    for topic in topics
+        .into_iter()
+        .filter(|topic| topic.starts_with(ACTION_PREFIX) && topic.len() > ACTION_PREFIX.len())
+    {
+        let tail = persist
+            .latest_ulid(&topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?;
+        cursors.insert(topic, tail);
+    }
+    Ok(cursors)
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
+}
+
 #[async_trait::async_trait]
 impl Worker for MeshMountWorker {
     fn name(&self) -> &'static str {
@@ -1158,33 +1273,38 @@ impl Worker for MeshMountWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::mesh_mount", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::mesh_mount", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let bus_root = mesh_mount_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_request_cursors(&persist) {
+                    Ok(cursors) => {
+                        self.cursors = cursors;
+                        break persist;
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::mesh_mount",
+                        %error,
+                        "request-topic activation failed; mesh-mount startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::mesh_mount",
+                    "Bus root unavailable; mesh-mount startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::mesh_mount",
+                    %error,
+                    "Persist open failed; mesh-mount startup will retry"
+                ),
             }
-        };
-        // Seed each existing request topic's cursor at its tail so a restart
-        // doesn't replay + re-mount stale requests.
-        if let Ok(topics) = persist.list_topics() {
-            for topic in topics
-                .into_iter()
-                .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
-            {
-                if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
-                    self.cursors.insert(topic, ulid);
-                }
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
-        }
+            retry_interval = next_bus_retry_interval(retry_interval);
+        };
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await; // burn the immediate first tick
         loop {
@@ -1455,6 +1575,196 @@ mod tests {
         // that has them the missing key is still a Gated refusal. Either way it's
         // never Ok and never a different (unexpected) success.
         assert!(matches!(res, Err(MountError::Gated(_))));
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            mesh_mount_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            mesh_mount_bus_root_or_system(Some(PathBuf::from("/tmp/mesh-mount-explicit-bus"))),
+            PathBuf::from("/tmp/mesh-mount-explicit-bus")
+        );
+    }
+
+    #[test]
+    fn request_topic_activation_is_atomic_when_a_tail_read_fails() {
+        let (_dir, persist) = temp_persist();
+        for host in ["oak", "birch"] {
+            persist
+                .write(
+                    &format!("{ACTION_PREFIX}{host}"),
+                    Priority::Default,
+                    None,
+                    Some("retained"),
+                )
+                .unwrap();
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_for_prime = Arc::clone(&observed);
+        let worker =
+            worker_with(FakeBackend::new(vec![])).with_cursor_primer(Arc::new(move |persist| {
+                let mut topics = persist.list_topics().map_err(|error| error.to_string())?;
+                topics.sort();
+                let mut candidate = HashMap::new();
+                for (index, topic) in topics
+                    .into_iter()
+                    .filter(|topic| topic.starts_with(ACTION_PREFIX))
+                    .enumerate()
+                {
+                    observed_for_prime.lock().unwrap().push(topic.clone());
+                    if index == 1 {
+                        return Err("injected second-topic tail failure".into());
+                    }
+                    candidate.insert(
+                        topic.clone(),
+                        persist
+                            .latest_ulid(&topic)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok(candidate)
+            }));
+
+        assert!(worker.prime_request_cursors(&persist).is_err());
+        assert!(
+            worker.cursors.is_empty(),
+            "a failed activation must not install any candidate cursor"
+        );
+        assert_eq!(observed.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn late_bus_and_new_host_topics_recover_without_replay_or_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus_root = dir.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("prepare delayed Bus");
+        let backend = FakeBackend::new(vec![Ok(()), Ok(())]);
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            dir.path().join("auth"),
+            AUTH_NOW,
+        ));
+
+        let retained = signed_mount_body(
+            MeshMountVerb::Mount,
+            "oak",
+            "mesh-mount-retained",
+            AUTH_NOW + 30_000,
+        );
+        persist
+            .write(
+                "action/mesh-mount/oak",
+                Priority::Default,
+                None,
+                Some(&retained),
+            )
+            .expect("write retained startup action");
+
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let mut worker = worker_with(backend.clone())
+            .with_authorizer(authorizer)
+            .with_bus_root(bus_root.clone())
+            .with_tick(Duration::from_millis(5))
+            .with_idle_timeout(Duration::from_secs(3600))
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected action-topic tail failure".into());
+                }
+                prime_request_cursors(persist)
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must activate after Bus and tail recovery");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(backend.mounts.load(Ordering::SeqCst), 0);
+
+        let forward_oak = signed_mount_body(
+            MeshMountVerb::Mount,
+            "oak",
+            "mesh-mount-oak-forward",
+            AUTH_NOW + 30_000,
+        );
+        persist
+            .write(
+                "action/mesh-mount/oak",
+                Priority::Default,
+                None,
+                Some(&forward_oak),
+            )
+            .expect("write forward action on activated topic");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while backend.mounts.load(Ordering::SeqCst) < 1 {
+                assert!(!task.is_finished(), "worker exited before forward action");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("forward action must mount once");
+
+        let first_birch = signed_mount_body(
+            MeshMountVerb::Mount,
+            "birch",
+            "mesh-mount-birch-first",
+            AUTH_NOW + 30_000,
+        );
+        persist
+            .write(
+                "action/mesh-mount/birch",
+                Priority::Default,
+                None,
+                Some(&first_birch),
+            )
+            .expect("create new host topic with its first forward action");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while backend.mounts.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    !task.is_finished(),
+                    "worker exited before new host's first action"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("new host topic's first action must execute");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(backend.mounts.load(Ordering::SeqCst), 2);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must complete")
+            .expect("worker task must join")
+            .expect("worker must exit cleanly");
     }
 
     // ── orchestration over fake seams (no FUSE, no network) ──────────────

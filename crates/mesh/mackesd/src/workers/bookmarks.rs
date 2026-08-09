@@ -67,7 +67,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_bookmarks::{key_between, Author, Collection, Hlc, HlcClock, Item, Op, OpKind, Source};
 use mde_bus::hooks::config::Priority;
-use mde_bus::persist::Persist;
+use mde_bus::persist::{Persist, StoredMessage};
 use uuid::Uuid;
 
 use super::{ShutdownToken, Worker};
@@ -116,6 +116,14 @@ pub const CLOCK_FILE: &str = "clock.json";
 /// tick keeps convergence imperceptible without polling storms.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(3);
 
+/// Lower bound for retrying a Bus that is unresolved, unopenable, or not yet
+/// safe to activate. This keeps late-Bus recovery responsive without spinning.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Upper bound for startup retry backoff. The same supervised worker remains
+/// responsible for activating when the canonical Bus becomes available.
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Default number of flush ticks between a snapshot+prune pass (~1 min at the
 /// default cadence). Prune also fires early once the tail crosses
 /// [`DEFAULT_TAIL_THRESHOLD`].
@@ -162,6 +170,16 @@ type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// Injected URL probe. Production uses a bounded fixed-argv `curl`; tests use a
 /// deterministic pure map so the suite never depends on the public network.
 type LinkProbeFn = Arc<dyn Fn(&str) -> LinkProbeOutcome + Send + Sync>;
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn(&Path) -> Result<Option<Persist>, String> + Send + Sync;
+
+#[cfg(test)]
+type CursorPrimeFn = dyn Fn(&Persist) -> Result<HashMap<String, String>, String> + Send + Sync;
+
+#[cfg(test)]
+type RequestReadFn =
+    dyn Fn(&Persist, &str, Option<&str>) -> Result<Vec<StoredMessage>, String> + Send + Sync;
 
 // ── the typed Bus action ────────────────────────────────────────────────────
 
@@ -871,6 +889,15 @@ pub struct BookmarksWorker {
     share_gate: Option<Arc<AtomicBool>>,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus open seam for deterministic startup recovery tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
+    /// Atomic request-topic cursor-prime seam for deterministic failure tests.
+    #[cfg(test)]
+    cursor_prime_override: Option<Arc<CursorPrimeFn>>,
+    /// Per-topic Bus read seam for deterministic fail-closed sweep tests.
+    #[cfg(test)]
+    request_read_override: Option<Arc<RequestReadFn>>,
     /// Exact-body capability verifier for the root-owned replicated store.
     authorizer: Arc<ActionAuthorizer>,
 }
@@ -904,6 +931,12 @@ impl BookmarksWorker {
             link_probe: Arc::new(probe_link_with_curl),
             share_gate: None,
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
+            #[cfg(test)]
+            cursor_prime_override: None,
+            #[cfg(test)]
+            request_read_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
@@ -940,6 +973,30 @@ impl BookmarksWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Override Bus opening without changing production retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
+        self
+    }
+
+    /// Override request-topic tail priming for deterministic activation tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_cursor_primer(mut self, prime: Arc<CursorPrimeFn>) -> Self {
+        self.cursor_prime_override = Some(prime);
+        self
+    }
+
+    /// Override per-topic reads for deterministic fail-closed sweep tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_request_reader(mut self, read: Arc<RequestReadFn>) -> Self {
+        self.request_read_override = Some(read);
         self
     }
 
@@ -1362,29 +1419,28 @@ impl BookmarksWorker {
     /// Drain net-new requests across every `action/bookmarks/<verb>` topic,
     /// applying each typed action locally. Publishes immediately when any edit
     /// landed so the surface reflects a local edit without waiting for the flush.
-    fn drain_requests(&mut self, persist: &Persist) {
-        let topics = match persist.list_topics() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::bookmarks", error = %e, "list_topics failed");
-                return;
-            }
-        };
-        let mut changed = false;
+    fn drain_requests(&mut self, persist: &Persist) -> Result<(), String> {
+        let topics = persist
+            .list_topics()
+            .map_err(|error| format!("discover bookmark request topics: {error}"))?;
+        // Read every lane into a candidate batch before advancing any cursor or
+        // authorizing/applying any effect. A failed Bus read is unavailable
+        // command state, never an empty lane, and therefore aborts the complete
+        // sweep without partially converging command effects.
+        let mut batches = Vec::new();
         for topic in topics
             .into_iter()
             .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
         {
             let verb = topic[ACTION_PREFIX.len()..].to_string();
             let cursor = self.cursors.get(&topic).cloned();
-            let msgs = match persist.list_since(&topic, cursor.as_deref()) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::debug!(target: "mackesd::bookmarks", topic, error = %e, "list_since failed");
-                    continue;
-                }
-            };
-            for msg in msgs {
+            let messages = self.read_requests(persist, &topic, cursor.as_deref())?;
+            batches.push((topic, verb, messages));
+        }
+
+        let mut changed = false;
+        for (topic, verb, messages) in batches {
+            for msg in messages {
                 self.cursors.insert(topic.clone(), msg.ulid.clone());
                 let body = msg.body.as_deref().unwrap_or_default();
                 if !crate::ipc::body_within_cap(Some(body)) {
@@ -1441,22 +1497,84 @@ impl BookmarksWorker {
         if changed {
             self.publish_state(persist);
         }
+        Ok(())
     }
 
-    /// Seed each request topic's cursor at its tail so a restart doesn't replay +
-    /// re-apply already-processed requests (the ops are already in the store).
-    fn seed_cursors(&mut self, persist: &Persist) {
-        if let Ok(topics) = persist.list_topics() {
-            for topic in topics
-                .into_iter()
-                .filter(|t| t.starts_with(ACTION_PREFIX) && t.len() > ACTION_PREFIX.len())
-            {
-                if let Ok(Some(ulid)) = persist.latest_ulid(&topic) {
-                    self.cursors.insert(topic, ulid);
-                }
-            }
+    fn open_bus(&self, root: &Path) -> Result<Option<Persist>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open(root);
+        }
+
+        Persist::open(root.to_path_buf())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn prime_request_cursors(&self, persist: &Persist) -> Result<HashMap<String, String>, String> {
+        #[cfg(test)]
+        if let Some(prime) = self.cursor_prime_override.as_ref() {
+            return prime(persist);
+        }
+
+        prime_request_cursors(persist)
+    }
+
+    fn read_requests(
+        &self,
+        persist: &Persist,
+        topic: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<StoredMessage>, String> {
+        #[cfg(test)]
+        if let Some(read) = self.request_read_override.as_ref() {
+            return read(persist, topic, cursor);
+        }
+
+        persist
+            .list_since(topic, cursor)
+            .map_err(|error| format!("read {topic}: {error}"))
+    }
+}
+
+/// Resolve the production Bus location once per worker invocation. A seated
+/// user spool wins when present; the canonical system spool keeps the daemon
+/// operational when no user data directory can be resolved.
+fn bookmarks_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    bookmarks_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn bookmarks_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+/// Discover and tail-prime all transient bookmark command lanes as one
+/// activation transaction. The map is installed only after every tail read
+/// succeeds. Topics created after this snapshot remain absent from the map, so
+/// their first message is forward work and drains from `list_since(None)`.
+fn prime_request_cursors(persist: &Persist) -> Result<HashMap<String, String>, String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("discover bookmark request topics: {error}"))?;
+    let mut cursors = HashMap::new();
+    for topic in topics
+        .into_iter()
+        .filter(|topic| topic.starts_with(ACTION_PREFIX) && topic.len() > ACTION_PREFIX.len())
+    {
+        if let Some(tail) = persist
+            .latest_ulid(&topic)
+            .map_err(|error| format!("prime {topic}: {error}"))?
+        {
+            cursors.insert(topic, tail);
         }
     }
+    Ok(cursors)
+}
+
+fn next_bus_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL)
 }
 
 #[async_trait::async_trait]
@@ -1466,30 +1584,60 @@ impl Worker for BookmarksWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self
-            .bus_root_override
-            .clone()
-            .or_else(mde_bus::default_data_dir)
-        else {
-            tracing::debug!(target: "mackesd::bookmarks", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::bookmarks", error = %e, "persist open failed; worker idle");
-                return Ok(());
-            }
-        };
+        // Durable bookmark history is independent of Bus availability. Restore
+        // and fold node-local/Syncthing state before waiting for command-plane
+        // activation so queued file history survives a Bus outage unchanged.
         self.load();
-        self.seed_cursors(&persist);
+
+        let bus_root = bookmarks_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match self.open_bus(&bus_root) {
+                Ok(Some(persist)) => match self.prime_request_cursors(&persist) {
+                    Ok(cursors) => {
+                        self.cursors = cursors;
+                        break persist;
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::bookmarks",
+                        %error,
+                        "request-topic activation failed; bookmarks startup will retry"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    target: "mackesd::bookmarks",
+                    "Bus root unavailable; bookmarks startup will retry"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::bookmarks",
+                    %error,
+                    "Persist open failed; bookmarks startup will retry"
+                ),
+            }
+
+            tokio::select! {
+                () = shutdown.wait() => {
+                    self.persist_own_local();
+                    let _ = self.mirror_to_share();
+                    return Ok(());
+                }
+                () = tokio::time::sleep(retry_interval) => {}
+            }
+            retry_interval = next_bus_retry_interval(retry_interval);
+        };
         self.flush(&persist); // publish the initial converged state
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await; // burn the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.drain_requests(&persist);
+                    if let Err(error) = self.drain_requests(&persist) {
+                        tracing::warn!(
+                            target: "mackesd::bookmarks",
+                            %error,
+                            "Bus read failed; bookmark command sweep left untouched"
+                        );
+                    }
                     self.flush(&persist);
                     self.prune_counter = self.prune_counter.saturating_add(1);
                     if self.prune_counter >= self.prune_every
@@ -1629,6 +1777,252 @@ mod tests {
             mde_bookmarks::Item::Bookmark(b) if b.title == title => Some(b.id),
             _ => None,
         })
+    }
+
+    #[test]
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            bookmarks_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+        assert_eq!(
+            bookmarks_bus_root_or_system(Some(PathBuf::from("/tmp/bookmarks-explicit-bus"))),
+            PathBuf::from("/tmp/bookmarks-explicit-bus")
+        );
+    }
+
+    #[test]
+    fn bus_read_failure_leaves_the_complete_command_sweep_untouched() {
+        let (_clock, now) = fake_clock(1000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let auth_root = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let add_topic = format!("{ACTION_PREFIX}add");
+        let folder_topic = format!("{ACTION_PREFIX}add-folder");
+        let add_body = signed_body(
+            "n1",
+            "add",
+            r#"{"schema_version":1,"url":"https://atomic.test","title":"Atomic"}"#,
+            "bookmarks-atomic-add",
+        );
+        let folder_body = signed_body(
+            "n1",
+            "add-folder",
+            r#"{"schema_version":1,"name":"Atomic Folder"}"#,
+            "bookmarks-atomic-folder",
+        );
+        persist
+            .write(&add_topic, Priority::Default, None, Some(&add_body))
+            .unwrap();
+        persist
+            .write(&folder_topic, Priority::Default, None, Some(&folder_body))
+            .unwrap();
+
+        let fail_folder = Arc::new(AtomicBool::new(true));
+        let fail_folder_for_reader = Arc::clone(&fail_folder);
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        ));
+        let mut worker = worker("n1", "alice", local.path(), share.path(), now)
+            .with_authorizer(authorizer)
+            .with_request_reader(Arc::new(move |persist, topic, cursor| {
+                if topic.ends_with("/add-folder") && fail_folder_for_reader.load(Ordering::SeqCst) {
+                    return Err("injected bookmark lane read failure".into());
+                }
+                persist
+                    .list_since(topic, cursor)
+                    .map_err(|error| error.to_string())
+            }));
+
+        assert!(worker.drain_requests(&persist).is_err());
+        assert!(worker.collection().is_empty());
+        assert!(worker.cursors.is_empty());
+        assert!(worker.own_tail.is_empty());
+
+        fail_folder.store(false, Ordering::SeqCst);
+        worker.drain_requests(&persist).unwrap();
+        assert_eq!(worker.collection().len(), 2);
+        assert_eq!(worker.cursors.len(), 2);
+        assert_eq!(worker.own_tail.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn late_bus_folds_durable_history_and_processes_new_topic_from_first_message() {
+        use std::sync::atomic::AtomicUsize;
+
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("local");
+        let share = root.path().join("share");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        let bus_root = root.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        persist
+            .write(
+                &format!("{ACTION_PREFIX}{CHECK_LINKS_VERB}"),
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .unwrap();
+
+        let (_seed_clock, seed_now) = fake_clock(500);
+        let mut seed = worker("n1", "alice", &local, &share, seed_now);
+        seed.apply_action(add("https://durable.test", "Durable"));
+        seed.persist_own_local();
+
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_worker = Arc::clone(&open_attempts);
+        let bus_root_for_worker = bus_root.clone();
+        let prime_attempts = Arc::new(AtomicUsize::new(0));
+        let prime_attempts_for_worker = Arc::clone(&prime_attempts);
+        let auth_root = root.path().join("auth");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(AUTH_KEY, auth_root, AUTH_NOW));
+        let (_worker_clock, worker_now) = fake_clock(1000);
+        let mut worker = worker("n1", "alice", &local, &share, worker_now)
+            .with_authorizer(authorizer)
+            .with_bus_root(bus_root.clone())
+            .with_tick(Duration::from_millis(5))
+            .with_link_probe(test_link_probe())
+            .with_bus_opener(Arc::new(move |_| {
+                match open_attempts_for_worker.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected unopenable Bus".into()),
+                    _ => Persist::open(bus_root_for_worker.clone())
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                }
+            }))
+            .with_cursor_primer(Arc::new(move |persist| {
+                if prime_attempts_for_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("injected bookmark topic-tail read failure".into());
+                }
+                prime_request_cursors(persist)
+            }));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while prime_attempts.load(Ordering::SeqCst) < 2 {
+                assert!(!task.is_finished(), "worker exited during Bus recovery");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must recover and activate");
+        assert!(open_attempts.load(Ordering::SeqCst) >= 4);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let states = persist.list_since(STATE_COLLECTION, None).unwrap();
+                let folded = states.last().is_some_and(|message| {
+                    message
+                        .body
+                        .as_deref()
+                        .and_then(|body| serde_json::from_str::<Collection>(body).ok())
+                        .is_some_and(|collection| find_by_title(&collection, "Durable").is_some())
+                });
+                if folded {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("durable outage history must fold after Bus activation");
+        assert!(
+            persist
+                .list_since(STATE_LINK_CHECK, None)
+                .unwrap()
+                .is_empty(),
+            "retained startup command must be tail-primed, not replayed"
+        );
+
+        let first = signed_body(
+            "n1",
+            "add",
+            r#"{"schema_version":1,"url":"https://forward-one.test","title":"Forward One"}"#,
+            "bookmarks-forward-one",
+        );
+        persist
+            .write(
+                &format!("{ACTION_PREFIX}add"),
+                Priority::Default,
+                None,
+                Some(&first),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let states = persist.list_since(STATE_COLLECTION, None).unwrap();
+                let applied = states.last().is_some_and(|message| {
+                    message
+                        .body
+                        .as_deref()
+                        .and_then(|body| serde_json::from_str::<Collection>(body).ok())
+                        .is_some_and(|collection| {
+                            find_by_title(&collection, "Forward One").is_some()
+                        })
+                });
+                if applied {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a dynamically appearing topic's first message must execute");
+
+        let second = signed_body(
+            "n1",
+            "add",
+            r#"{"schema_version":1,"url":"https://forward-two.test","title":"Forward Two"}"#,
+            "bookmarks-forward-two",
+        );
+        persist
+            .write(
+                &format!("{ACTION_PREFIX}add"),
+                Priority::Default,
+                None,
+                Some(&second),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let states = persist.list_since(STATE_COLLECTION, None).unwrap();
+                let applied = states.last().is_some_and(|message| {
+                    message
+                        .body
+                        .as_deref()
+                        .and_then(|body| serde_json::from_str::<Collection>(body).ok())
+                        .is_some_and(|collection| {
+                            collection.len() == 3
+                                && find_by_title(&collection, "Forward Two").is_some()
+                        })
+                });
+                if applied {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the new topic must continue from its first-message cursor");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown must interrupt worker promptly")
+            .expect("worker task must join")
+            .expect("worker must exit cleanly");
     }
 
     // ── request parsing ─────────────────────────────────────────────────────
@@ -1823,7 +2217,7 @@ mod tests {
             .write(&topic, Priority::Default, None, Some(&oversized))
             .unwrap();
 
-        w.drain_requests(&persist);
+        w.drain_requests(&persist).unwrap();
         assert_eq!(w.collection().len(), 0);
         assert!(w.own_tail.is_empty());
         assert_eq!(w.pending, 0);
@@ -1853,7 +2247,7 @@ mod tests {
         persist
             .write(&topic, Priority::Default, None, Some(&signed))
             .unwrap();
-        w.drain_requests(&persist);
+        w.drain_requests(&persist).unwrap();
         assert_eq!(w.collection().len(), 1);
         assert_eq!(w.own_tail.len(), 1);
         assert_eq!(w.pending, 1);
@@ -1863,7 +2257,7 @@ mod tests {
         persist
             .write(&topic, Priority::Default, None, Some(&signed))
             .unwrap();
-        w.drain_requests(&persist);
+        w.drain_requests(&persist).unwrap();
         assert_eq!(w.collection().len(), 1);
         assert_eq!(w.own_tail.len(), 1);
         assert_eq!(w.pending, 1);
@@ -1993,7 +2387,7 @@ mod tests {
                 Some(&body),
             )
             .unwrap();
-        w.drain_requests(&persist);
+        w.drain_requests(&persist).unwrap();
 
         assert_eq!(
             w.own_tail.len(),
