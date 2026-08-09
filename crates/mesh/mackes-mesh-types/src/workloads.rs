@@ -1057,6 +1057,9 @@ pub fn valid_phase_transition(from: WorkloadOperationPhase, to: WorkloadOperatio
                 WorkloadOperationPhase::Completed
             ) | (
                 WorkloadOperationPhase::Stopping,
+                WorkloadOperationPhase::Starting
+            ) | (
+                WorkloadOperationPhase::Stopping,
                 WorkloadOperationPhase::Completed
             ) | (
                 WorkloadOperationPhase::Queued,

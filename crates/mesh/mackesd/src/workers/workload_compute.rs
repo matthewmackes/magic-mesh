@@ -22,11 +22,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mackes_mesh_types::workloads::{
-    admit_workload_for_backend, reject_duplicate_json_keys, workload_state_topic, HostCapacity,
-    WorkloadAdmission, WorkloadAttachmentLease, WorkloadAttachmentProtocol, WorkloadBackend,
-    WorkloadOperationAction, WorkloadOperationErrorCode, WorkloadOperationPhase,
-    WorkloadOperationReply, WorkloadOperationRequest, WorkloadOperationStatus, WorkloadPowerState,
-    WorkloadReadiness, WorkloadRuntimeSignals, WorkloadStateSnapshot, WorkloadStorageCapacity,
+    admit_workload_for_backend, reject_duplicate_json_keys, valid_phase_transition,
+    workload_state_topic, HostCapacity, WorkloadAdmission, WorkloadAttachmentLease,
+    WorkloadAttachmentProtocol, WorkloadBackend, WorkloadOperationAction,
+    WorkloadOperationErrorCode, WorkloadOperationPhase, WorkloadOperationReply,
+    WorkloadOperationRequest, WorkloadOperationStatus, WorkloadPowerState, WorkloadReadiness,
+    WorkloadRuntimeSignals, WorkloadStateSnapshot, WorkloadStorageCapacity,
     MAX_WORKLOAD_WIRE_BYTES, WORKLOAD_CONTRACT_SCHEMA_VERSION, WORKLOAD_OPERATION_TOPIC,
 };
 use mde_bus::hooks::config::Priority;
@@ -631,6 +632,86 @@ pub struct SystemWorkloadActuator {
     workgroup_root: PathBuf,
     display1_root: PathBuf,
     attachments: Arc<Mutex<BTreeMap<String, Arc<Display1AttachmentRuntime>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartRecoveryStep {
+    WaitForStop,
+    JournalStarting,
+    StartBackend,
+    ObserveGuest,
+}
+
+fn restart_recovery_step(
+    phase: WorkloadOperationPhase,
+    running: bool,
+) -> Option<RestartRecoveryStep> {
+    match (phase, running) {
+        (WorkloadOperationPhase::Stopping, true) => Some(RestartRecoveryStep::WaitForStop),
+        (WorkloadOperationPhase::Stopping, false) => Some(RestartRecoveryStep::JournalStarting),
+        (WorkloadOperationPhase::Starting, false) => Some(RestartRecoveryStep::StartBackend),
+        (WorkloadOperationPhase::Starting, true) => Some(RestartRecoveryStep::ObserveGuest),
+        _ => None,
+    }
+}
+
+fn restart_stop_verb(backend: WorkloadBackend, running: bool) -> Option<&'static str> {
+    running.then_some(if backend.is_vm() { "shutdown" } else { "stop" })
+}
+
+fn recover_restart<F>(
+    phase: WorkloadOperationPhase,
+    running: bool,
+    start_backend: F,
+) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError>
+where
+    F: FnOnce() -> Result<(), WorkloadActuatorError>,
+{
+    let Some(step) = restart_recovery_step(phase, running) else {
+        return Ok(None);
+    };
+    let outcome = match step {
+        RestartRecoveryStep::WaitForStop => WorkloadActuatorOutcome {
+            phase: WorkloadOperationPhase::Stopping,
+            power: WorkloadPowerState::Stopping,
+            readiness: WorkloadReadiness::Unavailable,
+            retryable: true,
+            reason: Some("restart is waiting for the backend to stop".into()),
+            remediation: None,
+            attachment: None,
+        },
+        RestartRecoveryStep::JournalStarting => WorkloadActuatorOutcome {
+            phase: WorkloadOperationPhase::Starting,
+            power: WorkloadPowerState::Stopped,
+            readiness: WorkloadReadiness::Unavailable,
+            retryable: true,
+            reason: Some("restart stop completed; the durable journal now authorizes start".into()),
+            remediation: None,
+            attachment: None,
+        },
+        RestartRecoveryStep::StartBackend => {
+            start_backend()?;
+            WorkloadActuatorOutcome {
+                phase: WorkloadOperationPhase::WaitingForGuest,
+                power: WorkloadPowerState::Starting,
+                readiness: WorkloadReadiness::WaitingForGuest,
+                retryable: true,
+                reason: Some("restart start was issued from its durable phase".into()),
+                remediation: None,
+                attachment: None,
+            }
+        }
+        RestartRecoveryStep::ObserveGuest => WorkloadActuatorOutcome {
+            phase: WorkloadOperationPhase::WaitingForGuest,
+            power: WorkloadPowerState::Starting,
+            readiness: WorkloadReadiness::WaitingForGuest,
+            retryable: true,
+            reason: Some("restart start survived recovery; observing guest readiness".into()),
+            remediation: None,
+            attachment: None,
+        },
+    };
+    Ok(Some(outcome))
 }
 
 /// Runtime ownership for one authenticated Display1 lease. The server is
@@ -1828,13 +1909,21 @@ impl WorkloadActuator for SystemWorkloadActuator {
                 }
             }
             WorkloadOperationAction::Restart => {
-                Self::run_power_command(request, "restart")?;
+                // Restart is deliberately split into journaled stop and start
+                // phases. Replaying Defining may repeat only the idempotent
+                // stop request; Starting is persisted before start, so a
+                // daemon crash can observe an already-running backend instead
+                // of issuing a second restart.
+                if let Some(verb) = restart_stop_verb(request.backend, Self::running(request)?) {
+                    Self::run_power_command(request, verb)?;
+                }
+                self.remove_attachment(request);
                 WorkloadActuatorOutcome {
-                    phase: WorkloadOperationPhase::WaitingForGuest,
-                    power: WorkloadPowerState::Starting,
-                    readiness: WorkloadReadiness::WaitingForGuest,
+                    phase: WorkloadOperationPhase::Stopping,
+                    power: WorkloadPowerState::Stopping,
+                    readiness: WorkloadReadiness::Unavailable,
                     retryable: true,
-                    reason: None,
+                    reason: Some("restart is waiting for the backend to stop".into()),
                     remediation: None,
                     attachment: None,
                 }
@@ -1984,6 +2073,13 @@ impl WorkloadActuator for SystemWorkloadActuator {
         status: &WorkloadOperationStatus,
     ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
         let running = Self::running(request)?;
+        if request.action == WorkloadOperationAction::Restart {
+            if let Some(outcome) = recover_restart(status.phase, running, || {
+                Self::run_power_command(request, "start").map_err(WorkloadActuatorError::Retryable)
+            })? {
+                return Ok(Some(outcome));
+            }
+        }
         let outcome = if running {
             match status.phase {
                 WorkloadOperationPhase::WaitingForGuest => WorkloadActuatorOutcome {
@@ -3548,6 +3644,9 @@ fn phase_steps(
     ) {
         return Some(vec![to]);
     }
+    if valid_phase_transition(from, to) {
+        return Some(vec![to]);
+    }
     let mut steps = Vec::new();
     let mut current = from;
     while current != to {
@@ -3630,6 +3729,65 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn restart_recovery_journals_start_before_the_only_start_effect() {
+        assert_eq!(
+            restart_stop_verb(WorkloadBackend::LibvirtVirtqemud, true),
+            Some("shutdown")
+        );
+        assert_eq!(
+            restart_stop_verb(WorkloadBackend::QuadletSystemd, true),
+            Some("stop")
+        );
+        assert_eq!(
+            restart_stop_verb(WorkloadBackend::LibvirtVirtqemud, false),
+            None
+        );
+
+        assert_eq!(
+            restart_recovery_step(WorkloadOperationPhase::Stopping, true),
+            Some(RestartRecoveryStep::WaitForStop)
+        );
+        assert_eq!(
+            restart_recovery_step(WorkloadOperationPhase::Stopping, false),
+            Some(RestartRecoveryStep::JournalStarting)
+        );
+        assert_eq!(
+            restart_recovery_step(WorkloadOperationPhase::Starting, false),
+            Some(RestartRecoveryStep::StartBackend)
+        );
+        assert_eq!(
+            restart_recovery_step(WorkloadOperationPhase::Starting, true),
+            Some(RestartRecoveryStep::ObserveGuest)
+        );
+        assert!(valid_phase_transition(
+            WorkloadOperationPhase::Defining,
+            WorkloadOperationPhase::Stopping
+        ));
+        assert!(valid_phase_transition(
+            WorkloadOperationPhase::Stopping,
+            WorkloadOperationPhase::Starting
+        ));
+        assert!(valid_phase_transition(
+            WorkloadOperationPhase::Starting,
+            WorkloadOperationPhase::WaitingForGuest
+        ));
+        assert_eq!(
+            phase_steps(
+                WorkloadOperationPhase::Defining,
+                WorkloadOperationPhase::Stopping
+            ),
+            Some(vec![WorkloadOperationPhase::Stopping])
+        );
+        assert_eq!(
+            phase_steps(
+                WorkloadOperationPhase::Stopping,
+                WorkloadOperationPhase::Starting
+            ),
+            Some(vec![WorkloadOperationPhase::Starting])
+        );
+    }
+
+    #[test]
     fn capacity_refusal_recommends_the_smaller_profile() {
         for denial in [
             mackes_mesh_types::workloads::AdmissionDenial::CpuReserve,
@@ -3702,6 +3860,116 @@ mod tests {
             _: &WorkloadOperationStatus,
         ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
             Ok(None)
+        }
+    }
+
+    struct RestartRecoveryActuator {
+        running: Arc<AtomicBool>,
+        start_calls: Arc<AtomicU64>,
+    }
+
+    impl WorkloadActuator for RestartRecoveryActuator {
+        fn apply(
+            &self,
+            _: &WorkloadOperationRequest,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("reopened Starting state must be observed, not applied")
+        }
+
+        fn cancel(
+            &self,
+            _: &WorkloadOperationRequest,
+            _: &WorkloadOperationStatus,
+        ) -> Result<WorkloadActuatorOutcome, WorkloadActuatorError> {
+            unreachable!("restart recovery test does not cancel")
+        }
+
+        fn observe(
+            &self,
+            request: &WorkloadOperationRequest,
+            status: &WorkloadOperationStatus,
+        ) -> Result<Option<WorkloadActuatorOutcome>, WorkloadActuatorError> {
+            assert_eq!(request.action, WorkloadOperationAction::Restart);
+            let running = self.running.load(Ordering::Acquire);
+            recover_restart(status.phase, running, || {
+                self.start_calls.fetch_add(1, Ordering::AcqRel);
+                self.running.store(true, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+
+    fn seed_restart_starting(root: &Path, now: u64) {
+        let mut request = request();
+        request.action = WorkloadOperationAction::Restart;
+        request.preferred_attachment = None;
+        let mut ledger = WorkloadOperationLedger::open(root).expect("restart ledger");
+        let mut status = ledger.accept(request, now).expect("accept restart");
+        for phase in [
+            WorkloadOperationPhase::Validating,
+            WorkloadOperationPhase::Admitting,
+            WorkloadOperationPhase::Defining,
+            WorkloadOperationPhase::Stopping,
+            WorkloadOperationPhase::Starting,
+        ] {
+            status.phase = phase;
+            if phase == WorkloadOperationPhase::Stopping {
+                status.power = WorkloadPowerState::Stopping;
+                status.readiness = WorkloadReadiness::Unavailable;
+            } else if phase == WorkloadOperationPhase::Starting {
+                status.power = WorkloadPowerState::Stopped;
+                status.readiness = WorkloadReadiness::Unavailable;
+            }
+            status.signals = WorkloadRuntimeSignals::from_readiness(phase, status.readiness);
+            status = ledger
+                .advance("op-1", status, now)
+                .expect("journal restart phase");
+        }
+    }
+
+    #[test]
+    fn reopened_starting_restart_counts_the_only_start_effect_and_advances_journal() {
+        for (already_running, expected_starts) in [(true, 0), (false, 1)] {
+            let state = tempfile::tempdir().expect("restart state");
+            let now = now_ms();
+            seed_restart_starting(state.path(), now);
+
+            // Reopen the real journal to model a daemon crash after Starting
+            // was durable but before its WaitingForGuest outcome was flushed.
+            let mut ledger = WorkloadOperationLedger::open(state.path()).expect("reopen ledger");
+            assert_eq!(
+                ledger.status("op-1").expect("starting status").phase,
+                WorkloadOperationPhase::Starting
+            );
+            let running = Arc::new(AtomicBool::new(already_running));
+            let start_calls = Arc::new(AtomicU64::new(0));
+            let mut worker = WorkloadComputeWorker::new("seat15".into(), 1).with_actuator(
+                Box::new(RestartRecoveryActuator {
+                    running: Arc::clone(&running),
+                    start_calls: Arc::clone(&start_calls),
+                }),
+            );
+
+            worker.reconcile_inflight(&mut ledger, now.saturating_add(1));
+            assert_eq!(start_calls.load(Ordering::Acquire), expected_starts);
+            assert_eq!(
+                ledger.status("op-1").expect("advanced status").phase,
+                WorkloadOperationPhase::WaitingForGuest
+            );
+            drop(ledger);
+
+            let mut reopened =
+                WorkloadOperationLedger::open(state.path()).expect("reopen advanced ledger");
+            assert_eq!(
+                reopened.status("op-1").expect("durable status").phase,
+                WorkloadOperationPhase::WaitingForGuest
+            );
+            worker.reconcile_inflight(&mut reopened, now.saturating_add(2));
+            assert_eq!(
+                start_calls.load(Ordering::Acquire),
+                expected_starts,
+                "replaying the advanced journal repeated the start effect"
+            );
         }
     }
 

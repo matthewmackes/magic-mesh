@@ -97,7 +97,8 @@ behavioral evidence is not completion.
   envelope, and matching live verifier were deleted. Typed Workload Open plus
   authenticated Display1 leases remain; fail-closed lint and focused BigBoy/
   `.90` gates pass. A follow-up bounded channel now lets only the Workload
-  reconciler execute cold-migration VM effects; restart journaling remains.
+  reconciler executes cold-migration VM effects; Restart persists Stop/Starting
+  before effects and replays active starts once. Restart evidence: docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md.
   Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
 - **Shell runtime-projection hard cut (2026-08-08):** Console's raw Podman and
