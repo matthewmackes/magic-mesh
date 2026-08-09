@@ -267,9 +267,9 @@ pub struct PeerRecord {
     /// — Netdata-alarm-derived since PD-2 (L15 3-tier mapping).
     #[serde(default = "default_health")]
     pub health: String,
-    /// PD-2 — what this peer offers the mesh (remote access, Podman
-    /// containers, libvirt guests, media services) + its Netdata alarm
-    /// summary. `None` from pre-PD-2 writers; readers tolerate.
+    /// PD-2 — what this peer offers outside Workload authority (remote access,
+    /// media services, mesh storage) plus its Netdata alarm summary. VM and
+    /// container state lives only in `state/workloads/<node>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptors: Option<ServiceDescriptors>,
     /// This peer's own Nebula overlay IP (`nebula1`), recorded by the
@@ -319,7 +319,7 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// PD-2 (L10–L15) — a peer's locally-probed service inventory,
+/// PD-2 — a peer's locally-probed non-Workload service inventory,
 /// published on the heartbeat (one cycle, one write — L13). Every
 /// probe is localhost-only; nothing leaves the publishing host (Q19).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -327,10 +327,6 @@ const fn is_false(b: &bool) -> bool {
 pub struct ServiceDescriptors {
     /// Remote-access listeners on this box.
     pub remote_access: RemoteAccess,
-    /// Podman containers (L10: name + image + state + published ports).
-    pub containers: Vec<ContainerInfo>,
-    /// libvirt guests (L11: name + state + specs + agent addresses).
-    pub vms: Vec<VmInfo>,
     /// Media services answering on the pinned localhost port list (L12).
     pub media: Vec<MediaService>,
     /// Netdata alarm summary (L15 3-tier).
@@ -367,36 +363,6 @@ pub struct RemoteAccess {
     pub rdp: bool,
     /// VNC server is listening on this host.
     pub vnc: bool,
-}
-
-/// One Podman container (L10).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ContainerInfo {
-    /// Container name (`podman ps --format {{.Names}}`).
-    pub name: String,
-    /// Image reference the container was created from.
-    pub image: String,
-    /// `running` | `exited` | …
-    pub state: String,
-    /// Published ports, `host->container/proto` strings.
-    pub ports: Vec<String>,
-}
-
-/// One libvirt guest (L11).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VmInfo {
-    /// libvirt domain name.
-    pub name: String,
-    /// `running` | `shut off` | `paused` | …
-    pub state: String,
-    /// Virtual CPU count (`None` when unavailable).
-    pub vcpus: Option<u32>,
-    /// Allocated memory in mebibytes (`None` when unavailable).
-    pub memory_mb: Option<u64>,
-    /// Guest IPs via the qemu agent (empty when no agent).
-    pub addresses: Vec<String>,
 }
 
 /// One media service answering on a pinned localhost port (L12).
@@ -694,6 +660,24 @@ mod tests {
         let peers = read_peers(dir.path());
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].hostname, "anvil");
+    }
+
+    #[test]
+    fn retired_runtime_descriptor_fields_are_ignored_and_not_republished() {
+        let mut value =
+            serde_json::to_value(PeerRecord::now("anvil", Some("12.1.6".into()), "healthy"))
+                .unwrap();
+        value["descriptors"] = serde_json::json!({
+            "containers": [{"name": "old", "state": "running"}],
+            "vms": [{"name": "old-vm", "state": "running"}],
+            "remote_access": {"ssh": true, "rdp": false, "vnc": false}
+        });
+        let record: PeerRecord = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(record).unwrap();
+        let descriptors = encoded["descriptors"].as_object().unwrap();
+        assert!(!descriptors.contains_key("containers"));
+        assert!(!descriptors.contains_key("vms"));
+        assert_eq!(descriptors["remote_access"]["ssh"], true);
     }
 
     #[test]

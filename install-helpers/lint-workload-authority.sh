@@ -18,6 +18,9 @@ workers_mod="$repo_root/crates/mesh/mackesd/src/workers/mod.rs"
 cloud_verbs="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs.rs"
 compute_migrate="$repo_root/crates/mesh/mackesd/src/workers/compute_migrate.rs"
 workload_compute="$repo_root/crates/mesh/mackesd/src/workers/workload_compute.rs"
+service_descriptors="$repo_root/crates/mesh/mackesd/src/descriptors.rs"
+peer_contracts="$repo_root/crates/mesh/mackes-mesh-types/src/peers.rs"
+desktop_sources="$repo_root/crates/mesh/mackesd/src/workers/desktop_sources.rs"
 inventory="$repo_root/docs/platform/workload-authority-inventory.md"
 retired_console_worker="$repo_root/crates/mesh/mackesd/src/workers/console_broker.rs"
 retired_cloud_console="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs/console.rs"
@@ -178,6 +181,11 @@ EOF
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — durable migration fixture was rejected' >&2
     return 1
   fi
+  printf '%s\n' 'let _ = Command::new("virsh");' >"$fixture/descriptors.rs"
+  if ! production_contains_literal 'Command::new("virsh")' "$fixture/descriptors.rs"; then
+    printf '%s\n' 'lint-workload-authority.sh: self-test failed — raw descriptor runtime probe was not detected' >&2
+    return 1
+  fi
   printf '%s\n' 'lint-workload-authority.sh: self-test passed — lifecycle and presentation guards are fail-closed'
 }
 
@@ -195,7 +203,8 @@ fi
   exit 1
 }
 [ -f "$workers_mod" ] && [ -f "$cloud_verbs" ] && [ -f "$compute_migrate" ] \
-  && [ -f "$workload_compute" ] && [ -f "$inventory" ] || {
+  && [ -f "$workload_compute" ] && [ -f "$service_descriptors" ] \
+  && [ -f "$peer_contracts" ] && [ -f "$desktop_sources" ] && [ -f "$inventory" ] || {
   printf '%s\n' 'lint-workload-authority.sh: authority inventory or daemon registration surfaces are missing' >&2
   exit 1
 }
@@ -254,6 +263,16 @@ if ! contains_literal 'WorkloadMigrationClient' "$compute_migrate" \
   || ! has_durable_migration_boundary "$workload_compute" \
   || ! has_durable_distributed_migration "$compute_migrate"; then
   printf '%s\n' 'lint-workload-authority.sh: migration commands are not durably reconciler-owned' >&2
+  exit 1
+fi
+
+if production_contains_literal 'Command::new("virsh")' "$service_descriptors" \
+  || production_contains_literal 'Command::new("podman")' "$service_descriptors" \
+  || contains_literal 'pub vms: Vec<VmInfo>' "$peer_contracts" \
+  || contains_literal 'pub containers: Vec<ContainerInfo>' "$peer_contracts" \
+  || contains_literal 'descriptors.vms' "$desktop_sources" \
+  || contains_literal 'desc.vms' "$desktop_sources"; then
+  printf '%s\n' 'lint-workload-authority.sh: heartbeat descriptors retain a competing VM/container runtime projection' >&2
   exit 1
 fi
 

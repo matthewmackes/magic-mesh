@@ -110,6 +110,12 @@ behavioral evidence is not completion.
   deleted. One typed Workloads link/projection remains; the strengthened
   authority guard and three focused BigBoy shell tests pass. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-shell-runtime-projection-hard-cut-r4.md`.
+- **Heartbeat runtime-projection hard cut (2026-08-08):** peer heartbeats no
+  longer probe or replicate raw Podman/libvirt inventories. Remote VM desktop
+  cards consume the serving node's validated typed Workload snapshot; rolling
+  readers discard retired fields, and focused farm/authority gates pass.
+  Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-08-heartbeat-runtime-projection-hard-cut-r5.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and

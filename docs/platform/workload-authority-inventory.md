@@ -12,7 +12,7 @@ worklist. Repository paths are the durable owner identifiers.
 | Operation consumer, journal, reconciliation | `mackesd::workers::workload_compute` | no second consumer | persisted request precedes every side effect |
 | VM lifecycle adapter | `workload_compute::SystemWorkloadActuator` | libvirt / `virtqemud` via bounded `virsh` commands | only the reconciler invokes workload or cold-migration lifecycle effects; `compute_migrate` can submit bounded commands but has no adapter |
 | Container lifecycle adapter | `workload_compute::SystemWorkloadActuator` | rootful Quadlet / systemd and approved Podman image materialization | only the reconciler installs or removes a Workload Quadlet unit |
-| Runtime/readiness projection | `workload_compute::publish_projection` | shell `workload_api`, datacenter, desktop sources, and daemon IPC are read-only consumers | one bounded `state/workloads/<node>` snapshot |
+| Runtime/readiness projection | `workload_compute::publish_projection` | shell `workload_api`, datacenter, desktop sources, and daemon IPC are read-only consumers | one bounded `state/workloads/<node>` snapshot; peer heartbeats carry no VM/container roster |
 | Native presentation lease | `workload_compute` Display1 attachment runtime | shell `display1_client` consumes one-use local leases | lease metadata may be projected; descriptors stay on the authenticated Unix socket and never enter the Bus |
 | Session semantics | `session_broker` | chooser/session rail publish session intent; roaming reads session state | owns user/session focus only; cannot actuate a VM/container or mint a console endpoint |
 | Placement proposals | `scheduler` | publishes placement events | cannot publish Workload operations or invoke a runtime adapter |
@@ -42,6 +42,7 @@ worklist. Repository paths are the durable owner identifiers.
 | Browser transport attach JSON schema/example/verifier | Workload attachment lease contract | obsolete package artifacts were deleted; package contract no longer invokes the retired verifier |
 | Console `podman ps` / `virsh list` inventory shortcuts | `Surface::InfraCode` backed by `state/workloads/<node>` | authority lint rejects raw Podman/libvirt command literals in production shell sources |
 | Nova domain-name heuristic and Cloud-managed badge | typed backend and power dimensions in `WorkloadOperationStatus` | provider-specific detector, badge, and warning path were deleted from Datacenter |
+| Heartbeat `podman ps` / `virsh list` probes and `ServiceDescriptors::{containers,vms}` | local and replicated `state/workloads/<node>` projections | probe functions and peer fields were deleted; authority lint rejects their commands, fields, and desktop-source readers |
 
 ## Known non-lifecycle runtime tools
 
@@ -51,6 +52,8 @@ not automatically lifecycle authorities. Each is classified by effect:
 
 - the desktop shell offers no curated raw `virsh` or Podman command; operators
   enter Workloads for authoritative VM/container inventory and lifecycle;
+- peer heartbeats probe only non-Workload services; remote desktop VM cards
+  fold the serving peer's validated typed Workload snapshot;
 - storage/runtime-probe calls are read-only;
 - compute-provision creates host storage pools, not domains;
 - service supervisors operate their named host services, not Workload units;

@@ -6,14 +6,11 @@
 //! that builds it. Four discovery lanes, folded into one deduped roster
 //! published to [`SOURCES_TOPIC`] (`state/desktops/sources`):
 //!
-//! 1. **Mesh registry (peer-advertised).** Every node ALREADY advertises what
-//!    desktops it serves through the replicated peers plane
-//!    (`mackes_mesh_types::peers::PeerRecord`, PD-2): its own seat's RDP/VNC
-//!    listeners (`descriptors.remote_access`) and the VM desktops it hosts
-//!    (`descriptors.vms`). The small advertised shape is
-//!    [`AdvertisedDesktop`]; the pure fold [`advertised_from_peer`] lifts it
-//!    from a peer's published record — no second advertisement channel is
-//!    minted (§6 glue over the existing plane).
+//! 1. **Mesh registry + Workloads.** Peer records advertise only each node's
+//!    seat listeners (`descriptors.remote_access`). VM desktops come from that
+//!    peer's replicated `state/workloads/<node>` projection. The small merged
+//!    shape is [`AdvertisedDesktop`]; no raw libvirt inventory or second VM
+//!    advertisement channel exists.
 //! 2. **mDNS (LAN).** RDP (`_rdp._tcp`), VNC (`_rfb._tcp`) and Spice
 //!    (`_spice._tcp`) endpoints browsed with the SAME `mdns-sd` machinery the
 //!    `mdns_relay` worker uses — including its anti-loop `mde-relay-origin`
@@ -31,10 +28,10 @@
 //! **Reachability is derived, never probed** (lock 14): peer sources fold
 //! roster presence + health, VM sources fold power state, mDNS entries are
 //! live-by-presence (the daemon's TTL expiry removes them), and manual
-//! entries are honestly `Unknown`. **Live KVM enumeration is honestly gated**
-//! (§7, mirroring `mesh_mount`): no `virsh` on the box → a typed
-//! [`VmEnumerateError::Gated`], surfaced in the published per-lane status —
-//! never a faked (or silently missing) source. The `thumbnail_ref` field
+//! entries are honestly `Unknown`. **Workload enumeration is honestly gated**
+//! (§7): an unavailable Bus → a typed [`VmEnumerateError::Gated`], surfaced in
+//! the published per-lane status — never a faked (or silently missing) source.
+//! The `thumbnail_ref` field
 //! ships now, honestly empty (`null`), for CHOOSER-3 to fill.
 
 #![cfg(feature = "async-services")]
@@ -86,7 +83,7 @@ const DESKTOP_ADD_SOURCE_AUTH_VERB: &str = "desktop-add-source";
 const DESKTOP_REMOVE_SOURCE_AUTH_VERB: &str = "desktop-remove-source";
 
 /// Action-drain cadence. Discovery is human-paced; a 2 s poll keeps verb
-/// latency imperceptible without spinning virsh or the peers plane.
+/// latency imperceptible without spinning the Workload or peers planes.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Republish heartbeat.
@@ -1257,9 +1254,8 @@ pub struct DesktopSource {
 /// The small peer-advertised desktop shape.
 ///
 /// What one node's published state says it serves — lifted from the peer's
-/// replicated [`PeerRecord`] by [`advertised_from_peer`]: the node's own
-/// seat (its RDP/VNC listeners, `vm == None`) and each VM desktop it hosts
-/// (`vm == Some(name)`).
+/// replicated peer and Workload state: the node's own seat has `vm == None`;
+/// each authoritative VM Workload has `vm == Some(name)`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdvertisedDesktop {
     /// The advertising node's hostname.
@@ -1306,9 +1302,9 @@ pub fn peer_reachability(health: &str, stale: bool) -> (Reachability, Option<Str
 
 /// Lift the advertised desktops out of one peer's published record.
 ///
-/// Yields the seat (when its RDP/VNC listeners are advertised) + each hosted
-/// VM. The local node's own record is skipped — its VMs come from the richer
-/// live KVM lane, and its own seat is not a remote desktop to itself.
+/// Yields the seat when its RDP/VNC listeners are advertised. VM desktops are
+/// folded separately from [`advertised_workloads_from_peer`]. The local node's
+/// own record is skipped because its seat is not remote to itself.
 #[must_use]
 pub fn advertised_from_peer(rec: &PeerRecord, self_node: &str) -> Vec<AdvertisedDesktop> {
     if rec.hostname.eq_ignore_ascii_case(self_node) {
@@ -1348,32 +1344,56 @@ pub fn advertised_from_peer(rec: &PeerRecord, self_node: &str) -> Vec<Advertised
             reason: reason.clone(),
         });
     }
-    for vm in &desc.vms {
-        let live = matches!(
-            vm_state_from_str(&vm.state),
-            VmState::Running | VmState::Paused
-        );
-        let (r, why) = if reachability == Reachability::Reachable && !live {
-            (
-                Reachability::Unreachable,
-                Some(format!("vm {}", vm.state.trim())),
-            )
-        } else {
-            (reachability, reason.clone())
-        };
-        out.push(AdvertisedDesktop {
-            node: rec.hostname.clone(),
-            host: host.clone(),
-            vm: Some(vm.name.clone()),
-            // MV-3 domains carry Spice graphics; the console is brokered by
-            // the serving peer (E12 VDI), so no port is claimed here.
-            protocols: vec![ProtocolOffer::new(DesktopProtocol::Spice, None)],
-            power_state: Some(vm.state.clone()),
-            reachability: r,
-            reason: why,
-        });
-    }
     out
+}
+
+/// Lift one remote peer's libvirt Workloads into advertised desktop rows.
+/// Peer health supplies transport reachability; the typed Workload projection
+/// supplies identity and power. A mismatched or local snapshot is refused.
+#[must_use]
+pub fn advertised_workloads_from_peer(
+    rec: &PeerRecord,
+    snapshot: &WorkloadStateSnapshot,
+    self_node: &str,
+) -> Vec<AdvertisedDesktop> {
+    if rec.hostname.eq_ignore_ascii_case(self_node)
+        || !snapshot.node.eq_ignore_ascii_case(&rec.hostname)
+    {
+        return Vec::new();
+    }
+    let host = rec
+        .overlay_ip
+        .clone()
+        .unwrap_or_else(|| format!("{}.{}", rec.hostname, super::mesh_dns::MESH_SUFFIX));
+    let (reachability, reason) = peer_reachability(&rec.health, rec.is_stale(PEER_STALE_MS));
+    instances_from_snapshot(snapshot)
+        .into_iter()
+        .map(|vm| {
+            let live = matches!(
+                vm_state_from_str(&vm.state),
+                VmState::Running | VmState::Paused
+            );
+            let (r, why) = if reachability == Reachability::Reachable && !live {
+                (
+                    Reachability::Unreachable,
+                    Some(format!("vm {}", vm.state.trim())),
+                )
+            } else {
+                (reachability, reason.clone())
+            };
+            AdvertisedDesktop {
+                node: rec.hostname.clone(),
+                host: host.clone(),
+                vm: Some(vm.name),
+                // Recovery transport is brokered by the serving peer; no raw
+                // libvirt graphics port is published.
+                protocols: vec![ProtocolOffer::new(DesktopProtocol::Spice, None)],
+                power_state: Some(vm.state),
+                reachability: r,
+                reason: why,
+            }
+        })
+        .collect()
 }
 
 /// Fold one advertised desktop into a roster row.
@@ -1483,6 +1503,42 @@ pub struct Instance {
     pub state: String,
 }
 
+fn instances_from_snapshot(snapshot: &WorkloadStateSnapshot) -> Vec<Instance> {
+    snapshot
+        .workloads
+        .iter()
+        .filter(|status| status.backend == WorkloadBackend::LibvirtVirtqemud)
+        .map(|status| {
+            let name = status
+                .workload_id
+                .as_str()
+                .rsplit(':')
+                .next()
+                .unwrap_or(status.workload_id.as_str())
+                .to_string();
+            let state = match status.power {
+                WorkloadPowerState::Running => "running",
+                WorkloadPowerState::Paused => "paused",
+                WorkloadPowerState::Starting
+                | WorkloadPowerState::Defined
+                | WorkloadPowerState::Stopping
+                | WorkloadPowerState::Stopped => "shut off",
+                WorkloadPowerState::Failed => "crashed",
+            };
+            let state = if status.phase == WorkloadOperationPhase::Cancelled {
+                "shut off"
+            } else {
+                state
+            };
+            Instance {
+                id: status.workload_id.as_str().to_string(),
+                name,
+                state: state.to_string(),
+            }
+        })
+        .collect()
+}
+
 /// Power states understood by the Chooser's reachability fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
@@ -1509,10 +1565,10 @@ pub fn vm_state_from_str(value: &str) -> VmState {
 /// toolchain refuses cleanly, never fakes a source list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmEnumerateError {
-    /// The prerequisites aren't on this box (no `virsh`). The honest
-    /// headless/CI gate — surfaced in the published lane status.
+    /// The typed Workload Bus is unavailable. The honest headless/CI gate is
+    /// surfaced in the published lane status.
     Gated(String),
-    /// libvirt answered with an error (surfaced verbatim, no sources).
+    /// The Workload projection could not be read or validated.
     Backend(String),
 }
 
@@ -1535,8 +1591,8 @@ pub trait VmEnumerator: Send + Sync {
     /// gate/error — NEVER a fabricated list.
     ///
     /// # Errors
-    /// [`VmEnumerateError::Gated`] on a box without the toolchain;
-    /// [`VmEnumerateError::Backend`] when libvirt errors.
+    /// [`VmEnumerateError::Gated`] when the Workload Bus is unavailable;
+    /// [`VmEnumerateError::Backend`] when its projection is malformed or unreadable.
     fn enumerate(&self) -> Result<Vec<Instance>, VmEnumerateError>;
 }
 
@@ -1594,39 +1650,16 @@ impl VmEnumerator for WorkloadEnumerator {
         let snapshot: WorkloadStateSnapshot = serde_json::from_str(body).map_err(|error| {
             VmEnumerateError::Backend(format!("decode Workload state: {error}"))
         })?;
-        Ok(snapshot
-            .workloads
-            .into_iter()
-            .filter(|status| status.backend == WorkloadBackend::LibvirtVirtqemud)
-            .map(|status| {
-                let name = status
-                    .workload_id
-                    .as_str()
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or(status.workload_id.as_str())
-                    .to_string();
-                let state = match status.power {
-                    WorkloadPowerState::Running => "running",
-                    WorkloadPowerState::Paused => "paused",
-                    WorkloadPowerState::Starting
-                    | WorkloadPowerState::Defined
-                    | WorkloadPowerState::Stopping => "shut off",
-                    WorkloadPowerState::Stopped => "shut off",
-                    WorkloadPowerState::Failed => "crashed",
-                };
-                let state = if status.phase == WorkloadOperationPhase::Cancelled {
-                    "shut off"
-                } else {
-                    state
-                };
-                Instance {
-                    id: status.workload_id.as_str().to_string(),
-                    name,
-                    state: state.to_string(),
-                }
-            })
-            .collect())
+        snapshot.validate(now_ms()).map_err(|error| {
+            VmEnumerateError::Backend(format!("validate Workload state: {error}"))
+        })?;
+        if !snapshot.node.eq_ignore_ascii_case(&self.node_id) {
+            return Err(VmEnumerateError::Backend(format!(
+                "Workload state node {} does not match {}",
+                snapshot.node, self.node_id
+            )));
+        }
+        Ok(instances_from_snapshot(&snapshot))
     }
 }
 
@@ -2833,7 +2866,8 @@ impl DesktopSourcesWorker {
         }
     }
 
-    /// Enumerate local VMs on a blocking thread (virsh shells out).
+    /// Enumerate local VMs on a blocking thread so synchronous SQLite reads do
+    /// not occupy the async worker executor.
     async fn enumerate_vms(&mut self) -> Vec<Instance> {
         let vms = Arc::clone(&self.vms);
         let res = match tokio::task::spawn_blocking(move || vms.enumerate()).await {
@@ -2843,12 +2877,36 @@ impl DesktopSourcesWorker {
         self.fold_vm_result(res)
     }
 
-    /// Read the peers plane + fold every lane into the merged roster.
-    fn collect_sources(&self, vm_list: &[Instance]) -> Vec<DesktopSource> {
+    /// Read the peers plane and authoritative remote Workload projections, then
+    /// fold every lane into the merged roster.
+    fn collect_sources(
+        &self,
+        persist: Option<&Persist>,
+        vm_list: &[Instance],
+    ) -> Vec<DesktopSource> {
         let peers = read_peers(&peers_dir(&self.workgroup_root));
         let mut advertised = Vec::new();
         for rec in &peers {
             advertised.extend(advertised_from_peer(rec, &self.node_id));
+            if let Some(snapshot) = persist.and_then(|store| {
+                let message = store
+                    .read_latest(&workload_state_topic(&rec.hostname))
+                    .ok()??;
+                let body = message.body.as_deref()?;
+                let snapshot: WorkloadStateSnapshot = serde_json::from_str(body).ok()?;
+                if !snapshot.node.eq_ignore_ascii_case(&rec.hostname)
+                    || snapshot.validate(now_ms()).is_err()
+                {
+                    return None;
+                }
+                Some(snapshot)
+            }) {
+                advertised.extend(advertised_workloads_from_peer(
+                    rec,
+                    &snapshot,
+                    &self.node_id,
+                ));
+            }
         }
         let mut mdns: Vec<MdnsEndpoint> = self.mdns_seen.values().cloned().collect();
         mdns.sort_by(|a, b| a.fullname.cmp(&b.fullname));
@@ -2971,7 +3029,7 @@ impl Worker for DesktopSourcesWorker {
 
         // Immediate first publish so the Chooser doesn't wait a heartbeat.
         let vm_list = self.enumerate_vms().await;
-        let sources = self.collect_sources(&vm_list);
+        let sources = self.collect_sources(Some(&persist), &vm_list);
         self.publish(&persist, sources, true);
         let mut last_pub = Instant::now();
 
@@ -2995,7 +3053,7 @@ impl Worker for DesktopSourcesWorker {
                     let due = last_pub.elapsed() >= self.heartbeat;
                     if changed || refresh || mdns_changed || due {
                         let vm_list = self.enumerate_vms().await;
-                        let sources = self.collect_sources(&vm_list);
+                        let sources = self.collect_sources(Some(&persist), &vm_list);
                         // A refresh/heartbeat republishes unconditionally
                         // (late subscribers); otherwise only on change.
                         if self.publish(&persist, sources, refresh || due) {
@@ -3039,7 +3097,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
-    use mackes_mesh_types::peers::{RemoteAccess, ServiceDescriptors, VmInfo};
+    use mackes_mesh_types::peers::{RemoteAccess, ServiceDescriptors};
 
     const AUTH_KEY: &[u8] = b"desktop-sources-action-auth-key";
     const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -3050,7 +3108,6 @@ mod tests {
         overlay_ip: Option<&str>,
         rdp: bool,
         vnc: bool,
-        vms: Vec<VmInfo>,
     ) -> PeerRecord {
         let mut rec = PeerRecord::now(hostname, Some("12.0.0".into()), health);
         rec.overlay_ip = overlay_ip.map(str::to_string);
@@ -3060,35 +3117,54 @@ mod tests {
                 rdp,
                 vnc,
             },
-            vms,
             ..ServiceDescriptors::default()
         });
         rec
     }
 
-    fn vm_info(name: &str, state: &str) -> VmInfo {
-        VmInfo {
-            name: name.into(),
-            state: state.into(),
-            vcpus: Some(2),
-            memory_mb: Some(2048),
-            addresses: vec![],
-        }
+    fn workload_snapshot(node: &str, rows: &[(&str, &str)]) -> WorkloadStateSnapshot {
+        let workloads: Vec<_> = rows
+            .iter()
+            .map(|(name, state)| {
+                let (power, phase, readiness) = match *state {
+                    "running" => ("running", "ready", "ready"),
+                    "paused" => ("paused", "ready", "ready"),
+                    _ => ("stopped", "completed", "unknown"),
+                };
+                serde_json::json!({
+                    "schema_version": 1,
+                    "request_id": format!("test-{name}"),
+                    "workload_id": format!("vm:{node}:{name}"),
+                    "backend": "libvirt_virtqemud",
+                    "resources": {"vcpu": 2, "memory_mb": 2048, "disk_gb": 32},
+                    "generation": 1,
+                    "phase": phase,
+                    "power": power,
+                    "readiness": readiness,
+                    "retryable": false,
+                    "reason": null,
+                    "remediation": null,
+                    "attachment": null
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "node": node,
+            "observed_at_ms": AUTH_NOW,
+            "workloads": workloads
+        }))
+        .expect("typed workload snapshot")
     }
 
     // ── lane 1: the advertised shape ──
 
     #[test]
-    fn advertised_from_peer_lifts_seat_and_vm_desktops() {
-        let rec = peer(
-            "oak",
-            "healthy",
-            Some("10.42.0.7"),
-            true,
-            true,
-            vec![vm_info("win11", "running"), vm_info("dev", "shut off")],
-        );
-        let ads = advertised_from_peer(&rec, "elm");
+    fn advertised_peer_seat_and_workload_vms_share_one_typed_roster() {
+        let rec = peer("oak", "healthy", Some("10.42.0.7"), true, true);
+        let snapshot = workload_snapshot("oak", &[("win11", "running"), ("dev", "shut off")]);
+        let mut ads = advertised_from_peer(&rec, "elm");
+        ads.extend(advertised_workloads_from_peer(&rec, &snapshot, "elm"));
         assert_eq!(ads.len(), 3, "seat + two VMs");
         // The seat: RDP + VNC at their well-known default ports, overlay host.
         let seat = &ads[0];
@@ -3123,21 +3199,20 @@ mod tests {
 
     #[test]
     fn advertised_from_peer_skips_self_and_empty_advertisers() {
-        let own = peer(
-            "elm",
-            "healthy",
-            None,
-            true,
-            true,
-            vec![vm_info("v", "running")],
-        );
+        let own = peer("elm", "healthy", None, true, true);
         assert!(
             advertised_from_peer(&own, "elm").is_empty(),
             "own record is skipped — local VMs ride the live KVM lane"
         );
+        assert!(advertised_workloads_from_peer(
+            &own,
+            &workload_snapshot("elm", &[("v", "running")]),
+            "elm"
+        )
+        .is_empty());
         // A peer with no desktop listeners and no VMs advertises nothing
         // (ssh alone is not a desktop).
-        let quiet = peer("ash", "healthy", None, false, false, vec![]);
+        let quiet = peer("ash", "healthy", None, false, false);
         assert!(advertised_from_peer(&quiet, "elm").is_empty());
         // A pre-PD-2 writer (no descriptors) advertises nothing.
         let bare = PeerRecord::now("older", None, "healthy");
@@ -3146,7 +3221,7 @@ mod tests {
 
     #[test]
     fn advertised_host_falls_back_to_mesh_fqdn() {
-        let rec = peer("oak", "healthy", None, true, false, vec![]);
+        let rec = peer("oak", "healthy", None, true, false);
         let ads = advertised_from_peer(&rec, "elm");
         assert_eq!(ads[0].host, "oak.mesh");
     }
@@ -3180,7 +3255,7 @@ mod tests {
 
     #[test]
     fn stale_peer_desktops_grey_with_the_stale_reason() {
-        let mut rec = peer("oak", "healthy", Some("10.42.0.7"), true, false, vec![]);
+        let mut rec = peer("oak", "healthy", Some("10.42.0.7"), true, false);
         rec.last_seen_ms = 1; // ancient
         let ads = advertised_from_peer(&rec, "elm");
         assert_eq!(ads[0].reachability, Reachability::Unreachable);
@@ -3807,9 +3882,11 @@ mod tests {
             tempfile::tempdir().unwrap().path(),
             tempfile::tempdir().unwrap().path(),
         );
-        let list = w.fold_vm_result(Err(VmEnumerateError::Gated("virsh not found".into())));
+        let list = w.fold_vm_result(Err(VmEnumerateError::Gated(
+            "Workload Bus unavailable".into(),
+        )));
         assert!(list.is_empty(), "a gate NEVER fabricates a source");
-        assert_eq!(w.vm_lane, "gated: virsh not found");
+        assert_eq!(w.vm_lane, "gated: Workload Bus unavailable");
         let lanes = w.lanes();
         let kvm = lanes.iter().find(|l| l.lane == "local-kvm").unwrap();
         assert!(kvm.status.starts_with("gated:"));
@@ -4262,7 +4339,7 @@ mod tests {
         assert_eq!(back, state);
     }
 
-    // ── worker orchestration over fake seams (no libvirt, no LAN) ──
+    // ── worker orchestration over fake seams (no runtime or LAN) ──
 
     struct FakeVms(Result<Vec<Instance>, VmEnumerateError>);
     impl VmEnumerator for FakeVms {
@@ -4315,6 +4392,28 @@ mod tests {
         (dir, persist)
     }
 
+    #[test]
+    fn local_workload_enumerator_refuses_a_foreign_node_projection() {
+        let (bus, persist) = temp_persist();
+        let foreign = workload_snapshot("oak", &[("win11", "running")]);
+        persist
+            .write(
+                &workload_state_topic("elm"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&foreign).unwrap()),
+            )
+            .unwrap();
+
+        let result = WorkloadEnumerator::new("elm".into())
+            .with_bus_root(bus.path().to_path_buf())
+            .enumerate();
+        assert!(matches!(
+            result,
+            Err(VmEnumerateError::Backend(reason)) if reason.contains("does not match")
+        ));
+    }
+
     fn latest_state(persist: &Persist) -> DesktopSourcesState {
         let msgs = persist.list_since(SOURCES_TOPIC, None).unwrap();
         let body = msgs.last().unwrap().body.clone().unwrap();
@@ -4345,7 +4444,7 @@ mod tests {
         // Durable: a fresh load sees it.
         assert_eq!(load_manual_sources(store.path()), w.manual);
         // The published roster carries it.
-        let sources = w.collect_sources(&[]);
+        let sources = w.collect_sources(None, &[]);
         assert!(w.publish(&persist, sources, false));
         let state = latest_state(&persist);
         assert_eq!(state.node, "elm");
@@ -4432,7 +4531,7 @@ mod tests {
         assert!(refresh);
         // publish-on-change: the first publish writes, an identical fold
         // doesn't, a forced (refresh/heartbeat) one does.
-        let sources = w.collect_sources(&[]);
+        let sources = w.collect_sources(None, &[]);
         assert!(w.publish(&persist, sources.clone(), false));
         assert!(!w.publish(&persist, sources.clone(), false));
         assert!(w.publish(&persist, sources, true));
@@ -4557,7 +4656,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_sources_folds_the_peers_plane_and_local_vms() {
+    fn collect_sources_folds_peer_seats_and_remote_and_local_workload_vms() {
         let (_bus, persist) = temp_persist();
         let wg = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
@@ -4565,12 +4664,21 @@ mod tests {
         let pdir = peers_dir(wg.path());
         mackes_mesh_types::peers::write_peer_record(
             &pdir,
-            &peer("oak", "healthy", Some("10.42.0.7"), true, false, vec![]),
+            &peer("oak", "healthy", Some("10.42.0.7"), true, false),
         )
         .unwrap();
+        let remote_snapshot = workload_snapshot("oak", &[("win11", "running")]);
+        persist
+            .write(
+                &workload_state_topic("oak"),
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&remote_snapshot).unwrap()),
+            )
+            .unwrap();
         mackes_mesh_types::peers::write_peer_record(
             &pdir,
-            &peer("elm", "healthy", Some("10.42.0.2"), true, true, vec![]),
+            &peer("elm", "healthy", Some("10.42.0.2"), true, true),
         )
         .unwrap();
         let mut w = worker_at(wg.path(), store.path());
@@ -4579,12 +4687,12 @@ mod tests {
             name: "dev".into(),
             state: "running".into(),
         }];
-        let sources = w.collect_sources(&vms);
+        let sources = w.collect_sources(Some(&persist), &vms);
         let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["vm:elm:dev", "peer:oak"]);
+        assert_eq!(ids, vec!["vm:elm:dev", "peer:oak", "peer-vm:oak:win11"]);
         assert!(w.publish(&persist, sources, false));
         let state = latest_state(&persist);
-        assert_eq!(state.sources.len(), 2);
+        assert_eq!(state.sources.len(), 3);
         assert_eq!(state.lanes.len(), 4);
     }
 }
