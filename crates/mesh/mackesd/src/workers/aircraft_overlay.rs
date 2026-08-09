@@ -549,7 +549,9 @@ enum PreparedResponse {
 pub struct AircraftOverlayWorker {
     host: String,
     probe: Option<Arc<dyn AircraftProbe>>,
-    bus_root: Option<PathBuf>,
+    /// Explicit override. Without one, every Bus transaction resolves the
+    /// current user root and falls back to the canonical system spool.
+    bus_root_override: Option<PathBuf>,
     poll: Duration,
 }
 
@@ -578,7 +580,7 @@ impl AircraftOverlayWorker {
         Self {
             host,
             probe,
-            bus_root: crate::bus_publish::default_bus_root(),
+            bus_root_override: None,
             poll: POLL,
         }
     }
@@ -590,10 +592,11 @@ impl AircraftOverlayWorker {
         self
     }
 
-    /// Override or disable Bus access.
+    /// Override Bus access. `None` restores per-transaction production
+    /// resolution; it no longer freezes this worker in a disabled state.
     #[must_use]
     pub fn with_bus_root(mut self, root: Option<PathBuf>) -> Self {
-        self.bus_root = root;
+        self.bus_root_override = root;
         self
     }
 
@@ -604,23 +607,41 @@ impl AircraftOverlayWorker {
         self
     }
 
-    fn current_vehicle_fix(&self) -> Option<VehicleFix> {
-        let root = self.bus_root.clone()?;
-        let persist = mde_bus::persist::Persist::open(root).ok()?;
-        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
-        let body = persist.read_latest(&topic).ok().flatten()?.body?;
-        let vehicle: mackes_mesh_types::vehicle::VehicleState = serde_json::from_str(&body).ok()?;
-        validated_vehicle_fix(&vehicle, &self.host, now_ms())
+    fn bus_root(&self) -> PathBuf {
+        aircraft_overlay_bus_root(self.bus_root_override.clone())
     }
 
-    fn publish(&self, snapshot: &AircraftSnapshot) {
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
+    /// `Ok(None)` is reserved for a successfully read, genuinely absent or stale
+    /// vehicle context. Bus/open/read/decode failures remain errors so the pass
+    /// defers without publishing a false empty overlay.
+    fn current_vehicle_fix(&self) -> io::Result<Option<VehicleFix>> {
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(&self.host);
+        let Some(message) = persist.read_latest(&topic).map_err(io_other)? else {
+            return Ok(None);
+        };
+        let body = message
+            .body
+            .ok_or_else(|| io::Error::other("vehicle context message has no body"))?;
+        let vehicle: mackes_mesh_types::vehicle::VehicleState =
+            serde_json::from_str(&body).map_err(io_other)?;
+        Ok(validated_vehicle_fix(&vehicle, &self.host, now_ms()))
+    }
+
+    /// Fresh-open and publish one complete projection. Success is explicit so
+    /// callers cannot commit private state or cadence after a swallowed failure.
+    fn publish(&self, snapshot: &AircraftSnapshot) -> io::Result<()> {
+        let body = serde_json::to_string(snapshot).map_err(io_other)?;
+        let persist = mde_bus::persist::Persist::open(self.bus_root()).map_err(io_other)?;
+        persist
+            .write(
                 &aircraft_state_topic(&self.host),
-                snapshot,
-            );
-        }
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(io_other)?;
+        Ok(())
     }
 
     fn degraded_snapshot(
@@ -631,15 +652,15 @@ impl AircraftOverlayWorker {
         // A worker restart has no private cache, but the Bus can still hold a
         // prior location's successful record. Read it only to derive an empty
         // degraded projection; never expose those aircraft as current data.
-        let persisted = self.bus_root.clone().and_then(|root| {
-            let persist = mde_bus::persist::Persist::open(root).ok()?;
+        let persisted = (|| {
+            let persist = mde_bus::persist::Persist::open(self.bus_root()).ok()?;
             let body = persist
                 .read_latest(&aircraft_state_topic(&self.host))
                 .ok()
                 .flatten()?
                 .body?;
             serde_json::from_str::<AircraftSnapshot>(&body).ok()
-        });
+        })();
         let mut degraded = last_good
             .cloned()
             .or(persisted)
@@ -670,11 +691,16 @@ impl AircraftOverlayWorker {
         last_good: &mut Option<AircraftSnapshot>,
     ) -> bool {
         match result {
-            Ok(PreparedResponse::Modified(snapshot)) => {
-                self.publish(&snapshot);
-                *last_good = Some(snapshot);
-                true
-            }
+            Ok(PreparedResponse::Modified(snapshot)) => match self.publish(&snapshot) {
+                Ok(()) => {
+                    *last_good = Some(snapshot);
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, %error, "aircraft publication failed; refresh remains uncommitted");
+                    false
+                }
+            },
             Ok(PreparedResponse::NotModified) => {
                 if last_good
                     .as_ref()
@@ -686,13 +712,22 @@ impl AircraftOverlayWorker {
                     );
                     return false;
                 }
-                if let Some(snapshot) = last_good {
-                    snapshot.fetched_at_ms = now_ms();
-                    snapshot
+                if let Some(snapshot) = last_good.as_ref() {
+                    let mut refreshed = snapshot.clone();
+                    refreshed.fetched_at_ms = now_ms();
+                    refreshed
                         .gaps
                         .retain(|gap| !gap.starts_with("adsb.lol refresh failed:"));
-                    self.publish(snapshot);
-                    true
+                    match self.publish(&refreshed) {
+                        Ok(()) => {
+                            *last_good = Some(refreshed);
+                            true
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, %error, "aircraft 304 publication failed; refresh remains uncommitted");
+                            false
+                        }
+                    }
                 } else {
                     false
                 }
@@ -707,17 +742,24 @@ impl AircraftOverlayWorker {
     fn publish_failure(&self, last_good: &mut Option<AircraftSnapshot>, gap: &str) {
         tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, error = gap, "aircraft refresh failed; publishing empty degraded snapshot");
         let degraded = self.degraded_snapshot(last_good.as_ref(), gap);
-        self.publish(&degraded);
+        if let Err(error) = self.publish(&degraded) {
+            tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, %error, "aircraft degraded publication failed");
+        }
     }
 
-    fn publish_no_context_degraded(&self, last_good: &mut Option<AircraftSnapshot>, reason: &str) {
+    fn publish_no_context_degraded(
+        &self,
+        last_good: &mut Option<AircraftSnapshot>,
+        reason: &str,
+    ) -> io::Result<()> {
         tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, error = reason, "aircraft refresh has no fresh same-host vehicle context; publishing empty degraded snapshot");
         let degraded = self.no_context_snapshot(reason);
-        self.publish(&degraded);
+        let published = self.publish(&degraded);
         // Vehicle-scoped aircraft are invalid once the same-host fix disappears.
-        // Keep the retained Bus topic present, but do not let a later error or
-        // 304 replay point metadata from the stale position.
+        // Clear private state even if the retraction cannot yet reach the Bus;
+        // a later error or 304 must never replay the stale point's aircraft.
         *last_good = None;
+        published
     }
 
     async fn fetch_async(
@@ -780,6 +822,14 @@ fn snapshot_matches_fix(snapshot: &AircraftSnapshot, fix: VehicleFix) -> bool {
         && (snapshot.query_altitude_msl_ft - fix.altitude_msl_ft).abs() <= 50.0
 }
 
+fn aircraft_overlay_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    aircraft_overlay_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn aircraft_overlay_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
 #[async_trait::async_trait]
 impl Worker for AircraftOverlayWorker {
     fn name(&self) -> &'static str {
@@ -796,19 +846,31 @@ impl Worker for AircraftOverlayWorker {
         let mut retry = self.poll;
         let mut no_fix_published = false;
         loop {
-            let Some(fix) = self.current_vehicle_fix() else {
-                if !no_fix_published {
-                    self.publish_no_context_degraded(
-                        &mut last_good,
-                        "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
-                    );
-                    no_fix_published = true;
+            let fix = match self.current_vehicle_fix() {
+                Ok(Some(fix)) => fix,
+                Ok(None) => {
+                    if !no_fix_published {
+                        no_fix_published = self
+                            .publish_no_context_degraded(
+                                &mut last_good,
+                                "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
+                            )
+                            .is_ok();
+                    }
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+                    }
+                    continue;
                 }
-                tokio::select! {
-                    () = shutdown.wait() => break,
-                    () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+                Err(error) => {
+                    tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, %error, "vehicle context read failed; aircraft pass deferred");
+                    tokio::select! {
+                        () = shutdown.wait() => break,
+                        () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
+                    }
+                    continue;
                 }
-                continue;
             };
             no_fix_published = false;
             let Some(result) = self.fetch_async(probe.clone(), fix, &mut shutdown).await else {
@@ -852,7 +914,7 @@ fn now_ms() -> i64 {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use mackes_mesh_types::vehicle::{GpsFix, VehicleState};
     use mde_bus::persist::Persist;
@@ -888,6 +950,35 @@ mod tests {
 
     fn worker() -> AircraftOverlayWorker {
         AircraftOverlayWorker::new("rig-1".to_string()).with_bus_root(None)
+    }
+
+    fn vehicle_state(latitude: f64) -> VehicleState {
+        let mut vehicle = VehicleState::offline("rig-1");
+        vehicle.online = true;
+        vehicle.published_at_ms = now_ms();
+        vehicle.gps = GpsFix {
+            fix_type: "gps".to_string(),
+            latitude,
+            longitude: -74.006,
+            altitude_m: 12.0,
+            satellites: 8,
+            age_s: 0.0,
+            ..GpsFix::default()
+        };
+        vehicle
+    }
+
+    fn publish_vehicle(root: PathBuf, vehicle: &VehicleState) {
+        let body = serde_json::to_string(vehicle).expect("vehicle json");
+        Persist::open(root)
+            .expect("bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("vehicle write");
     }
 
     #[test]
@@ -1131,10 +1222,12 @@ mod tests {
         assert!(!original.aircraft.is_empty());
         let mut last = Some(original);
 
-        worker.publish_no_context_degraded(
-            &mut last,
-            "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
-        );
+        worker
+            .publish_no_context_degraded(
+                &mut last,
+                "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
+            )
+            .expect("publish retraction");
 
         assert!(
             last.is_none(),
@@ -1178,10 +1271,12 @@ mod tests {
 
         let restarted = worker().with_bus_root(Some(root.clone()));
         let mut private_cache = None;
-        restarted.publish_no_context_degraded(
-            &mut private_cache,
-            "adsb.lol refresh failed: no fresh vehicle fix after restart",
-        );
+        restarted
+            .publish_no_context_degraded(
+                &mut private_cache,
+                "adsb.lol refresh failed: no fresh vehicle fix after restart",
+            )
+            .expect("publish retraction");
         assert!(private_cache.is_none());
         let latest: AircraftSnapshot = serde_json::from_str(
             Persist::open(root)
@@ -1206,13 +1301,15 @@ mod tests {
         let root = temp.path().to_path_buf();
         let worker = worker().with_bus_root(Some(root));
         let mut private_cache = None;
-        worker.publish_no_context_degraded(
-            &mut private_cache,
-            "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
-        );
+        worker
+            .publish_no_context_degraded(
+                &mut private_cache,
+                "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
+            )
+            .expect("publish no-context snapshot");
         assert!(private_cache.is_none());
         let snapshot: AircraftSnapshot = serde_json::from_str(
-            Persist::open(worker.bus_root.clone().expect("root"))
+            Persist::open(worker.bus_root())
                 .expect("bus")
                 .read_latest(&aircraft_state_topic("rig-1"))
                 .expect("read")
@@ -1229,6 +1326,120 @@ mod tests {
             .gaps
             .iter()
             .any(|gap| gap.contains("vehicle fix unavailable")));
+    }
+
+    #[test]
+    fn late_and_replaced_bus_are_reopened_per_transaction() {
+        assert_eq!(
+            aircraft_overlay_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker = worker().with_bus_root(Some(root.clone()));
+        assert!(worker.current_vehicle_fix().is_err());
+
+        std::fs::remove_file(&root).expect("remove blocking file");
+        publish_vehicle(root.clone(), &vehicle_state(40.7128));
+        assert_eq!(
+            worker
+                .current_vehicle_fix()
+                .expect("late bus readable")
+                .expect("fresh fix")
+                .latitude,
+            40.7128
+        );
+
+        let retired = temp.path().join("retired-bus");
+        std::fs::rename(&root, &retired).expect("replace old bus");
+        publish_vehicle(root, &vehicle_state(41.0));
+        assert_eq!(
+            worker
+                .current_vehicle_fix()
+                .expect("replacement bus readable")
+                .expect("replacement fix")
+                .latitude,
+            41.0
+        );
+    }
+
+    struct CountingProbe(Arc<AtomicUsize>);
+
+    impl AircraftProbe for CountingProbe {
+        fn fetch(&self, _fix: VehicleFix) -> io::Result<ProbeResponse> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(ProbeResponse::Modified(CAPTURED_ADSB.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_vehicle_context_read_is_effect_free() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        Persist::open(root.clone())
+            .expect("bus")
+            .write(
+                &mackes_mesh_types::vehicle::vehicle_state_topic("rig-1"),
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{malformed"),
+            )
+            .expect("malformed context write");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = worker()
+            .with_bus_root(Some(root.clone()))
+            .with_probe(Arc::new(CountingProbe(calls.clone())))
+            .with_poll(Duration::from_millis(5));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle =
+            tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(true).expect("shutdown");
+        handle.await.expect("join").expect("worker");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(Persist::open(root)
+            .expect("bus")
+            .read_latest(&aircraft_state_topic("rig-1"))
+            .expect("aircraft read")
+            .is_none());
+    }
+
+    #[test]
+    fn publish_failure_retries_without_committing_last_good_or_success() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("bus");
+        std::fs::write(&root, "not a bus directory").expect("blocking file");
+        let worker = worker().with_bus_root(Some(root.clone()));
+        let snapshot =
+            build_snapshot("rig-1", fix(), CAPTURED_ADSB, FETCHED_AT_MS).expect("snapshot");
+        let mut last_good = None;
+
+        assert!(!worker.apply_result(
+            Ok(PreparedResponse::Modified(snapshot.clone())),
+            fix(),
+            &mut last_good,
+        ));
+        assert!(last_good.is_none());
+
+        std::fs::remove_file(&root).expect("recover bus");
+        assert!(worker.apply_result(
+            Ok(PreparedResponse::Modified(snapshot)),
+            fix(),
+            &mut last_good,
+        ));
+        assert!(last_good.is_some());
+        assert_eq!(
+            Persist::open(root)
+                .expect("bus")
+                .list_since(&aircraft_state_topic("rig-1"), None)
+                .expect("published rows")
+                .len(),
+            1
+        );
     }
 
     struct SlowProbe;
