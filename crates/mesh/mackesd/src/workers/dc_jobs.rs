@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
@@ -29,6 +30,9 @@ use super::{ShutdownToken, Worker};
 
 /// Sweep cadence — 3 s (job status should trail the request/reply closely).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(3);
+
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The Bus prefix containing registered datacenter action lanes.
 pub const ACTION_DC_PREFIX: &str = "action/dc/";
@@ -153,69 +157,71 @@ impl DcJobs {
 
 // ---- thin I/O: watch the action lanes, emit job-status events via the Bus ----
 
-/// Publish one job-status record onto the Bus in-process (perf-10 / arch-6) — no
-/// fork+exec of the `mde-bus` CLI per record. Byte-identical stored row to the
-/// old `mde-bus publish <topic> --body-flag <body>`.
-///
-/// Targets [`crate::bus_publish::default_bus_root`] (which honours
-/// `MDE_BUS_ROOT`) — the same canonical root used by this worker's request
-/// reader and by the fork+exec'd CLI.
-fn publish(rec: &JobRecord) {
-    publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
-}
-
-/// Root-injectable body of [`publish`] — fresh-opens the Bus at `bus_root` and
-/// writes the record in-process (mirrors the CLI's per-call open). Best-effort;
-/// tests pass a temp root.
-fn publish_to(bus_root: Option<&std::path::Path>, rec: &JobRecord) {
-    if let Some(mut persist) =
-        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
-    {
-        crate::bus_publish::publish_body(&mut persist, &rec.topic(), &rec.body());
-    }
-}
-
 /// Read the current reply body for a request ulid, if any. The reply lane
 /// (`reply/<ulid>`) carries at most the single RPC reply; we take the last
 /// message's body. Best-effort: a failed read is treated as "no reply yet".
-fn reply_body(persist: &Persist, ulid: &str) -> Option<String> {
+fn reply_body(persist: &Persist, ulid: &str) -> Result<Option<String>, String> {
     let topic = reply_topic(ulid);
-    let msgs = persist.list_since(&topic, None).ok()?;
-    msgs.into_iter().last().and_then(|m| m.body)
+    let msgs = persist
+        .list_since(&topic, None)
+        .map_err(|error| format!("read {topic}: {error}"))?;
+    Ok(msgs.into_iter().last().and_then(|message| message.body))
 }
 
 /// One poll pass: enumerate registered `action/dc/*` topics, and for each request
 /// message look up its `reply/<ulid>` and feed the pair through the dedup core,
 /// publishing the records that survive (status transitions). Best-effort: a
 /// failed `list_topics`/`list_since` is logged + skipped.
-fn poll_and_track(persist: &Persist, core: &mut DcJobs) {
-    let topics = match persist.list_topics() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::debug!(error = %e, "dc_jobs: list_topics failed");
-            return;
-        }
-    };
+fn poll_and_track(persist: &Persist, core: &mut DcJobs) -> Result<(), String> {
+    let topics = persist
+        .list_topics()
+        .map_err(|error| format!("list datacenter action topics: {error}"))?;
+    let mut observations = Vec::new();
     for topic in topics.iter().filter(|t| is_registered_action_topic(t)) {
-        let msgs = match persist.list_since(topic, None) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(topic = %topic, error = %e, "dc_jobs: list_since failed");
-                continue;
-            }
-        };
+        let msgs = persist
+            .list_since(topic, None)
+            .map_err(|error| format!("read {topic}: {error}"))?;
         let action = job_action_name(topic);
         for msg in msgs {
-            let reply = reply_body(persist, &msg.ulid);
-            if let Some(rec) = core.observe(&msg.ulid, &action, reply.as_deref()) {
-                publish(&rec);
-            }
+            let reply = reply_body(persist, &msg.ulid)?;
+            observations.push((msg.ulid, action.clone(), reply));
         }
     }
+
+    // Every request and reply lane has been read successfully. Only now may a
+    // status transition be published or remembered; an unreadable reply can
+    // never masquerade as a fresh `pending` regression.
+    for (ulid, action, reply) in observations {
+        let status = classify_reply(reply.as_deref());
+        if core.last_status.get(&ulid) == Some(&status) {
+            continue;
+        }
+        let record = JobRecord {
+            action,
+            ulid: ulid.clone(),
+            status,
+        };
+        persist
+            .write(
+                &record.topic(),
+                Priority::Default,
+                None,
+                Some(&record.body()),
+            )
+            .map_err(|error| format!("publish {}: {error}", record.topic()))?;
+        core.last_status.insert(ulid, status);
+    }
+    Ok(())
 }
 
 fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
+}
+
+fn dc_jobs_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    override_root
+        .or_else(default_bus_root)
+        .unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 /// The supervised worker. Leader-gated (only the elected node writes the
@@ -267,23 +273,32 @@ impl Worker for DcJobsWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = match self.bus_root_override.clone().or_else(default_bus_root) {
-            Some(r) => r,
-            None => {
-                tracing::debug!("dc_jobs: no bus root; worker idle");
-                return Ok(());
+        let bus_root = dc_jobs_bus_root(self.bus_root_override.clone());
+        let mut retry_interval = MIN_BUS_RETRY_INTERVAL;
+        let persist = loop {
+            match Persist::open(bus_root.clone()) {
+                Ok(persist) => break persist,
+                Err(error) => tracing::warn!(
+                    %error,
+                    "dc_jobs: Persist open failed; startup will retry"
+                ),
             }
-        };
-        let persist = match Persist::open(bus_root) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "dc_jobs: persist open failed; worker idle");
-                return Ok(());
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
+            retry_interval = retry_interval
+                .saturating_mul(2)
+                .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
         };
         loop {
             if self.is_leader() {
-                poll_and_track(&persist, &mut self.core);
+                if let Err(error) = poll_and_track(&persist, &mut self.core) {
+                    tracing::warn!(
+                        %error,
+                        "dc_jobs: incomplete Bus sweep deferred all new status transitions"
+                    );
+                }
             }
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
@@ -297,32 +312,92 @@ impl Worker for DcJobsWorker {
 mod tests {
     use super::*;
 
-    /// perf-10 / arch-6 — `publish_to` writes the job-status record in-process
-    /// (no fork+exec of `mde-bus`) with EXACTLY the row a
-    /// `mde-bus publish event/dc/job/<ulid> --body-flag <body>` produced.
     #[test]
-    fn publish_to_writes_cli_equivalent_row_in_process() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rec = JobRecord {
-            action: "dc/vm-power".to_string(),
-            ulid: "ulid-9".to_string(),
-            status: "ok",
-        };
+    fn service_bus_root_falls_back_to_the_shared_system_spool() {
+        assert_eq!(
+            dc_jobs_bus_root(None),
+            default_bus_root().unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+        );
+        assert_eq!(
+            dc_jobs_bus_root(Some(PathBuf::from("/tmp/dc-jobs-explicit-bus"))),
+            PathBuf::from("/tmp/dc-jobs-explicit-bus")
+        );
+    }
 
-        publish_to(Some(tmp.path()), &rec);
+    #[tokio::test]
+    async fn late_bus_is_opened_by_the_same_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("late-bus");
+        std::fs::write(&bus_root, b"not a directory").unwrap();
+        let mut worker = DcJobsWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus_root.clone());
+        worker.tick_interval = Duration::from_millis(5);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
 
-        let reader = Persist::open(tmp.path().to_path_buf()).unwrap();
-        let topic = job_topic(&rec.ulid);
-        let rows = reader.list_since(&topic, None).unwrap();
-        assert_eq!(rows.len(), 1, "exactly one job-status record published");
-        let row = &rows[0];
-        assert_eq!(row.topic, topic);
-        assert_eq!(row.priority, "default");
-        assert!(row.title.is_none());
-        assert!(row.actions.is_empty());
-        assert!(row.reply_to.is_none());
-        // Byte-identical to the record's `body()` — what `--body-flag` carried.
-        assert_eq!(row.body.as_deref(), Some(rec.body().as_str()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "late Bus is retryable");
+        std::fs::remove_file(&bus_root).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !bus_root.is_dir() {
+                assert!(!task.is_finished(), "worker exited before opening late Bus");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same worker must open the recovered Bus path");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("shutdown completes")
+            .expect("worker joins")
+            .expect("worker exits cleanly");
+    }
+
+    #[test]
+    fn retained_job_history_folds_pending_then_terminal_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(temp.path().to_path_buf()).unwrap();
+        let request = persist
+            .write(
+                "action/dc/host-power",
+                Priority::Default,
+                None,
+                Some(r#"{"host":"nodeA","action":"reboot"}"#),
+            )
+            .unwrap();
+        let mut core = DcJobs::new();
+
+        poll_and_track(&persist, &mut core).unwrap();
+        let topic = job_topic(&request.ulid);
+        let pending = persist.list_since(&topic, None).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""status":"pending""#));
+
+        persist
+            .write(
+                &reply_topic(&request.ulid),
+                Priority::Default,
+                None,
+                Some(r#"{"ok":true}"#),
+            )
+            .unwrap();
+        poll_and_track(&persist, &mut core).unwrap();
+        let terminal = persist.list_since(&topic, None).unwrap();
+        assert_eq!(terminal.len(), 2);
+        assert!(terminal[1]
+            .body
+            .as_deref()
+            .unwrap()
+            .contains(r#""status":"ok""#));
     }
 
     #[test]

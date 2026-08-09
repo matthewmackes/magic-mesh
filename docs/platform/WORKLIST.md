@@ -457,6 +457,10 @@ behavioral evidence is not completion.
   passed five exact tests:
   `docs/platform/evidence/WL-FUNC-021-WL-ARCH-009-2026-08-09-bookmarks-bus-recovery-r30.md`,
   `docs/platform/evidence/WL-ARCH-009-WL-FUNC-021-2026-08-09-adfilter-bus-recovery-r31.md`.
+- **Datacenter job-ledger recovery checkpoint (2026-08-09):** late Bus startup
+  now folds durable request/reply history, and unreadable replies cannot regress
+  terminal jobs to false pending state. Machine 196 passed three exact tests:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-09-dc-jobs-bus-recovery-r37.md`.
 - **Workers navigation and clock checkpoint (2026-08-07):** `Surface::Workers`
   is now the canonical node-management route; Fleet & Mesh, This Node,
   System, Storage, About, and Phones deep links normalize into it. Phones is a
