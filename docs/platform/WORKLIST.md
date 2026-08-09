@@ -206,6 +206,13 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-dell-capacity-refusal-r1.md`.
 - **Startup readiness checkpoint (2026-08-09):** a not-running VM awaiting guest readiness retries instead of falsely completing stopped; BigBoy passed 37/37:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-startup-readiness-fail-closed-r13.md`.
+- **Compute firewall outcome checkpoint (2026-08-09):** authorized expose and
+  unexpose actions now journal their exact bounded result in root-owned local
+  state, recover publication after restart without replaying mutation, and
+  report failed/partial effects without fabricating active rules. Mesh removal
+  now uses the original destination-bound rule identity. Machine 194 passed the
+  exact failure/restart fixture:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-firewall-outcome-r18.md`.
   1. S1 Inventory authorities and remove reachability.
      - Objective: enumerate every lifecycle publisher, projection writer, adapter, console reader, and direct shell/backend call.
      - Inputs: repository search, CI authority scan, current evidence.

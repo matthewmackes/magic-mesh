@@ -45,8 +45,8 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -84,6 +84,12 @@ pub const LAN_ZONE: &str = "public";
 /// Fallback zone when WAN-zone detection fails (single-network
 /// hosts where LAN + WAN coincide).
 pub const DEFAULT_WAN_ZONE: &str = "public";
+
+/// Root-owned crash journal for consumed compute firewall actions.
+pub const DEFAULT_ACTION_JOURNAL_PATH: &str = "/var/lib/mackesd/compute-expose/action-journal.json";
+const ACTION_JOURNAL_SCHEMA_VERSION: u16 = 1;
+const ACTION_JOURNAL_MAX_ENTRIES: usize = 1024;
+const ACTION_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Which network the expose rule applies to.
 #[derive(
@@ -170,6 +176,69 @@ pub struct ExposedState {
     pub peer: String,
     /// Active forwarding rules in deterministic order.
     pub rules: Vec<ActiveRule>,
+}
+
+/// Terminal outcome for one authorized firewall action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FirewallActionOutcome {
+    /// Every requested change became active, or the desired state already held.
+    Applied,
+    /// Some, but not all, effects succeeded or permanent changes could not reload.
+    Partial,
+    /// No requested change became active.
+    Failed,
+}
+
+/// Bounded reply correlated to the exact Bus message that consumed the capability.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FirewallActionResult {
+    /// Exact result schema.
+    pub schema_version: u16,
+    /// ULID of the consumed `compute/expose` or `compute/unexpose` message.
+    pub request_ulid: String,
+    /// Closed action name (`expose` or `unexpose`), never a raw command.
+    pub action: String,
+    /// Honest terminal classification.
+    pub outcome: FirewallActionOutcome,
+    /// Number of firewall rule changes requested after idempotence filtering.
+    pub attempted: u16,
+    /// Number of changes reflected in the active-rule projection.
+    pub applied: u16,
+    /// Number of requested changes not reflected in that projection.
+    pub failed: u16,
+    /// Bounded operator-safe explanation with no command or stderr content.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PreparedFirewallAction {
+    action: String,
+    planned: Vec<ActiveRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal: Option<FirewallActionResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirewallActionJournal {
+    schema_version: u16,
+    entries: BTreeMap<String, PreparedFirewallAction>,
+}
+
+impl Default for FirewallActionJournal {
+    fn default() -> Self {
+        Self {
+            schema_version: ACTION_JOURNAL_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+/// Standard exact-request reply lane used by action workers.
+#[must_use]
+pub fn action_result_topic(request_ulid: &str) -> String {
+    format!("reply/{request_ulid}")
 }
 
 /// Resolve the firewalld zone for a `Network`. `wan_zone` is the
@@ -443,6 +512,30 @@ fn run_firewall_cmd(args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
+trait FirewallMutationRunner: Send + Sync {
+    fn run(&self, args: &[String]) -> bool;
+}
+
+trait ActionResultWriter: Send + Sync {
+    fn publish(&self, persist: &Persist, result: &FirewallActionResult) -> bool;
+}
+
+struct PersistActionResultWriter;
+
+impl ActionResultWriter for PersistActionResultWriter {
+    fn publish(&self, persist: &Persist, result: &FirewallActionResult) -> bool {
+        write_action_result(persist, result)
+    }
+}
+
+struct SystemFirewallMutationRunner;
+
+impl FirewallMutationRunner for SystemFirewallMutationRunner {
+    fn run(&self, args: &[String]) -> bool {
+        run_firewall_cmd(args)
+    }
+}
+
 /// Run `firewall-cmd <args>` and capture stdout (empty string on
 /// failure). Used for read-only queries like `--list-rich-rules`.
 fn firewall_cmd_stdout(args: &[String]) -> String {
@@ -526,6 +619,9 @@ pub struct ComputeExposeWorker {
     poll_interval: Duration,
     bus_root_override: Option<PathBuf>,
     authorizer: Arc<ActionAuthorizer>,
+    mutation_runner: Arc<dyn FirewallMutationRunner>,
+    result_writer: Arc<dyn ActionResultWriter>,
+    journal_path: PathBuf,
     active: Mutex<BTreeSet<ActiveRule>>,
 }
 
@@ -545,6 +641,9 @@ impl ComputeExposeWorker {
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
+            mutation_runner: Arc::new(SystemFirewallMutationRunner),
+            result_writer: Arc::new(PersistActionResultWriter),
+            journal_path: PathBuf::from(DEFAULT_ACTION_JOURNAL_PATH),
             active: Mutex::new(BTreeSet::new()),
         }
     }
@@ -574,6 +673,30 @@ impl ComputeExposeWorker {
         self
     }
 
+    /// Inject a deterministic mutation boundary for hostile failure tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_mutation_runner(mut self, runner: Arc<dyn FirewallMutationRunner>) -> Self {
+        self.mutation_runner = runner;
+        self
+    }
+
+    /// Inject a deterministic result-publication boundary for retry tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_result_writer(mut self, writer: Arc<dyn ActionResultWriter>) -> Self {
+        self.result_writer = writer;
+        self
+    }
+
+    /// Override the root-owned crash journal path for hostile restart tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_journal_path(mut self, path: PathBuf) -> Self {
+        self.journal_path = path;
+        self
+    }
+
     /// Override the poll cadence. Used in tests.
     #[must_use]
     pub fn with_poll_interval(mut self, d: Duration) -> Self {
@@ -600,21 +723,83 @@ fn resolve_nebula_addr(worker: &ComputeExposeWorker) -> String {
     local_nebula_addr(&worker.nebula_interface)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplySummary {
+    outcome: FirewallActionOutcome,
+    attempted: u16,
+    applied: u16,
+    detail: &'static str,
+}
+
+impl ApplySummary {
+    fn failed(self) -> u16 {
+        self.attempted.saturating_sub(self.applied)
+    }
+
+    fn changed(self) -> bool {
+        self.applied > 0
+    }
+}
+
+fn classify_apply(attempted: usize, succeeded: usize, reload_succeeded: bool) -> ApplySummary {
+    let attempted = u16::try_from(attempted).unwrap_or(u16::MAX);
+    let succeeded = u16::try_from(succeeded).unwrap_or(u16::MAX);
+    if attempted == 0 {
+        return ApplySummary {
+            outcome: FirewallActionOutcome::Applied,
+            attempted,
+            applied: 0,
+            detail: "requested firewall state was already satisfied",
+        };
+    }
+    if succeeded == 0 {
+        return ApplySummary {
+            outcome: FirewallActionOutcome::Failed,
+            attempted,
+            applied: 0,
+            detail: "every requested firewall change failed",
+        };
+    }
+    if !reload_succeeded {
+        return ApplySummary {
+            outcome: FirewallActionOutcome::Partial,
+            attempted,
+            applied: 0,
+            detail: "permanent firewall changes succeeded but activation reload failed",
+        };
+    }
+    if succeeded == attempted {
+        ApplySummary {
+            outcome: FirewallActionOutcome::Applied,
+            attempted,
+            applied: succeeded,
+            detail: "all requested firewall changes are active",
+        }
+    } else {
+        ApplySummary {
+            outcome: FirewallActionOutcome::Partial,
+            attempted,
+            applied: succeeded,
+            detail: "only part of the requested firewall changes became active",
+        }
+    }
+}
+
 fn apply_expose(
     worker: &ComputeExposeWorker,
     nebula_ip: &str,
     wan_zone: &str,
     req: &ExposeRequest,
-) {
+) -> ApplySummary {
     let mut active = worker
         .active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let new_rules = diff_expose(&active, req);
     if new_rules.is_empty() {
-        return;
+        return classify_apply(0, 0, true);
     }
-    let mut any_applied = false;
+    let mut succeeded = Vec::new();
     for rule in &new_rules {
         let zone = zone_for_network(rule.network, wan_zone);
         let body = build_rich_rule_body(
@@ -625,9 +810,8 @@ fn apply_expose(
             &rule.proto,
         );
         let args = add_rich_rule_args(&zone, &body);
-        if run_firewall_cmd(&args) {
-            active.insert(rule.clone());
-            any_applied = true;
+        if worker.mutation_runner.run(&args) {
+            succeeded.push(rule.clone());
         } else {
             tracing::warn!(
                 vm_ip = %rule.vm_nebula_ip,
@@ -637,49 +821,60 @@ fn apply_expose(
             );
         }
     }
-    if any_applied {
-        let _ = run_firewall_cmd(&["--reload".to_string()]);
+    let reload_succeeded =
+        succeeded.is_empty() || worker.mutation_runner.run(&["--reload".to_string()]);
+    let summary = classify_apply(new_rules.len(), succeeded.len(), reload_succeeded);
+    if reload_succeeded {
+        active.extend(succeeded);
     }
+    summary
 }
 
-fn apply_unexpose(worker: &ComputeExposeWorker, wan_zone: &str, req: &UnexposeRequest) {
+fn apply_unexpose(
+    worker: &ComputeExposeWorker,
+    nebula_ip: &str,
+    wan_zone: &str,
+    req: &UnexposeRequest,
+) -> ApplySummary {
     let mut active = worker
         .active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let removals = diff_unexpose(&active, req);
     if removals.is_empty() {
-        return;
+        return classify_apply(0, 0, true);
     }
-    let mut any_removed = false;
+    let mut succeeded = Vec::new();
     for rule in &removals {
         let zone = zone_for_network(rule.network, wan_zone);
         let body = build_rich_rule_body(
             rule.network,
-            "", // destination address unused for lan/wan; mesh used the original at insert time
+            nebula_ip,
             &rule.vm_nebula_ip,
             rule.host_port,
             &rule.proto,
         );
         let args = remove_rich_rule_args(&zone, &body);
-        if run_firewall_cmd(&args) {
-            active.remove(rule);
-            any_removed = true;
+        if worker.mutation_runner.run(&args) {
+            succeeded.push(rule.clone());
         } else {
-            // Even if firewalld rejects (rule already gone), drop
-            // from shadow set so the published topic catches up.
-            active.remove(rule);
-            tracing::debug!(
+            tracing::warn!(
                 vm_ip = %rule.vm_nebula_ip,
                 port = rule.host_port,
                 network = rule.network.wire_name(),
-                "compute_expose: firewall-cmd remove-rich-rule non-zero; dropped from shadow set anyway"
+                "compute_expose: firewall-cmd remove-rich-rule failed"
             );
         }
     }
-    if any_removed {
-        let _ = run_firewall_cmd(&["--reload".to_string()]);
+    let reload_succeeded =
+        succeeded.is_empty() || worker.mutation_runner.run(&["--reload".to_string()]);
+    let summary = classify_apply(removals.len(), succeeded.len(), reload_succeeded);
+    if reload_succeeded {
+        for rule in succeeded {
+            active.remove(&rule);
+        }
     }
+    summary
 }
 
 fn publish_exposed_state(persist: &Persist, peer: &str, worker: &ComputeExposeWorker) {
@@ -703,6 +898,225 @@ fn publish_exposed_state(persist: &Persist, peer: &str, worker: &ComputeExposeWo
     }
 }
 
+fn build_action_result(
+    request_ulid: &str,
+    action: &str,
+    summary: ApplySummary,
+) -> FirewallActionResult {
+    FirewallActionResult {
+        schema_version: 1,
+        request_ulid: request_ulid.to_string(),
+        action: action.to_string(),
+        outcome: summary.outcome,
+        attempted: summary.attempted,
+        applied: summary.applied,
+        failed: summary.failed(),
+        detail: summary.detail.to_string(),
+    }
+}
+
+fn write_action_result(persist: &Persist, result: &FirewallActionResult) -> bool {
+    let Ok(body) = serde_json::to_string(&result) else {
+        return false;
+    };
+    let topic = action_result_topic(&result.request_ulid);
+    if let Err(error) = persist.write(&topic, Priority::Default, None, Some(&body)) {
+        tracing::warn!(
+            ulid = %result.request_ulid,
+            error = %error,
+            "compute_expose: exact action result publish failed"
+        );
+        return false;
+    }
+    true
+}
+
+fn load_action_journal(path: &Path) -> Result<FirewallActionJournal, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FirewallActionJournal::default());
+        }
+        Err(error) => return Err(format!("action journal metadata unavailable: {error}")),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("action journal is not a regular file".to_string());
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("action journal ownership or mode is unsafe".to_string());
+    }
+    if metadata.len() > ACTION_JOURNAL_MAX_BYTES {
+        return Err("action journal exceeds its size bound".to_string());
+    }
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("action journal read failed: {error}"))?;
+    let journal: FirewallActionJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("action journal decode failed: {error}"))?;
+    if journal.schema_version != ACTION_JOURNAL_SCHEMA_VERSION
+        || journal.entries.len() > ACTION_JOURNAL_MAX_ENTRIES
+        || journal.entries.iter().any(|(ulid, entry)| {
+            !matches!(entry.action.as_str(), "expose" | "unexpose")
+                || entry.planned.len() > 3
+                || entry.terminal.as_ref().is_some_and(|result| {
+                    &result.request_ulid != ulid
+                        || result.action != entry.action
+                        || result.attempted > 3
+                        || result.applied > result.attempted
+                        || result.failed != result.attempted.saturating_sub(result.applied)
+                })
+        })
+    {
+        return Err("action journal invariants failed".to_string());
+    }
+    Ok(journal)
+}
+
+fn store_action_journal(path: &Path, mut journal: FirewallActionJournal) -> Result<(), String> {
+    while journal.entries.len() > ACTION_JOURNAL_MAX_ENTRIES {
+        let Some(oldest) = journal.entries.keys().next().cloned() else {
+            break;
+        };
+        journal.entries.remove(&oldest);
+    }
+    let body = serde_json::to_vec(&journal)
+        .map_err(|error| format!("action journal encode failed: {error}"))?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > ACTION_JOURNAL_MAX_BYTES {
+        return Err("action journal encoding exceeds its size bound".to_string());
+    }
+    crate::ca::seal::write_atomic_sealed(path, &body)
+        .map_err(|error| format!("action journal atomic write failed: {error}"))
+}
+
+fn prepare_action(
+    worker: &ComputeExposeWorker,
+    request_ulid: &str,
+    action: &str,
+    planned: Vec<ActiveRule>,
+) -> Result<(), String> {
+    let mut journal = load_action_journal(&worker.journal_path)?;
+    if journal.entries.contains_key(request_ulid) {
+        return Ok(());
+    }
+    journal.entries.insert(
+        request_ulid.to_string(),
+        PreparedFirewallAction {
+            action: action.to_string(),
+            planned,
+            terminal: None,
+        },
+    );
+    store_action_journal(&worker.journal_path, journal)
+}
+
+fn terminalize_action(
+    worker: &ComputeExposeWorker,
+    result: FirewallActionResult,
+) -> Result<(), String> {
+    let mut journal = load_action_journal(&worker.journal_path)?;
+    let entry = journal
+        .entries
+        .get_mut(&result.request_ulid)
+        .ok_or_else(|| "prepared action is missing from the journal".to_string())?;
+    if entry.action != result.action {
+        return Err("prepared action kind changed".to_string());
+    }
+    entry.terminal = Some(result);
+    store_action_journal(&worker.journal_path, journal)
+}
+
+fn recovered_summary(worker: &ComputeExposeWorker, entry: &PreparedFirewallAction) -> ApplySummary {
+    let active = worker
+        .active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let applied = entry
+        .planned
+        .iter()
+        .filter(|rule| {
+            if entry.action == "expose" {
+                active.contains(rule)
+            } else {
+                !active.contains(rule)
+            }
+        })
+        .count();
+    let attempted = entry.planned.len();
+    if attempted == 0 {
+        classify_apply(0, 0, true)
+    } else if applied == 0 {
+        ApplySummary {
+            outcome: FirewallActionOutcome::Failed,
+            attempted: u16::try_from(attempted).unwrap_or(u16::MAX),
+            applied: 0,
+            detail: "prepared firewall action had no active effect after restart",
+        }
+    } else if applied == attempted {
+        ApplySummary {
+            outcome: FirewallActionOutcome::Applied,
+            attempted: u16::try_from(attempted).unwrap_or(u16::MAX),
+            applied: u16::try_from(applied).unwrap_or(u16::MAX),
+            detail: "prepared firewall action was fully recovered from active state",
+        }
+    } else {
+        ApplySummary {
+            outcome: FirewallActionOutcome::Partial,
+            attempted: u16::try_from(attempted).unwrap_or(u16::MAX),
+            applied: u16::try_from(applied).unwrap_or(u16::MAX),
+            detail: "prepared firewall action was partially recovered from active state",
+        }
+    }
+}
+
+fn publish_journaled_result(
+    persist: &Persist,
+    worker: &ComputeExposeWorker,
+    request_ulid: &str,
+) -> Result<bool, String> {
+    let journal = load_action_journal(&worker.journal_path)?;
+    let Some(result) = journal
+        .entries
+        .get(request_ulid)
+        .and_then(|entry| entry.terminal.as_ref())
+    else {
+        return Ok(false);
+    };
+    if persist
+        .read_latest(&action_result_topic(request_ulid))
+        .ok()
+        .flatten()
+        .and_then(|message| message.body)
+        .and_then(|body| serde_json::from_str::<FirewallActionResult>(&body).ok())
+        .as_ref()
+        == Some(result)
+    {
+        return Ok(true);
+    }
+    Ok(worker.result_writer.publish(persist, result))
+}
+
+fn recover_or_publish_journaled(
+    persist: &Persist,
+    worker: &ComputeExposeWorker,
+    request_ulid: &str,
+) -> Result<Option<bool>, String> {
+    let journal = load_action_journal(&worker.journal_path)?;
+    let Some(entry) = journal.entries.get(request_ulid).cloned() else {
+        return Ok(None);
+    };
+    if entry.terminal.is_none() {
+        let summary = recovered_summary(worker, &entry);
+        terminalize_action(
+            worker,
+            build_action_result(request_ulid, &entry.action, summary),
+        )?;
+    }
+    publish_journaled_result(persist, worker, request_ulid).map(Some)
+}
+
 fn poll_once(
     persist: &Persist,
     worker: &ComputeExposeWorker,
@@ -719,23 +1133,87 @@ fn poll_once(
     match persist.list_since(&expose_topic, expose_cursor.as_deref()) {
         Ok(msgs) => {
             for msg in msgs {
-                *expose_cursor = Some(msg.ulid.clone());
+                match recover_or_publish_journaled(persist, worker, &msg.ulid) {
+                    Ok(Some(true)) => {
+                        *expose_cursor = Some(msg.ulid.clone());
+                        continue;
+                    }
+                    Ok(Some(false)) => break,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: action journal recovery failed");
+                        break;
+                    }
+                }
                 let body = msg.body.as_deref().unwrap_or("");
                 match parse_expose_request(body) {
                     Ok(req) => {
+                        let target = expose_auth_target(&req);
+                        if let Err(error) = authorizer.verify_exact_body(
+                            body,
+                            MutationContext {
+                                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                                target: &target,
+                            },
+                        ) {
+                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: refused unauthorized expose request");
+                            *expose_cursor = Some(msg.ulid.clone());
+                            continue;
+                        }
+                        let planned = {
+                            let active = worker
+                                .active
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            diff_expose(&active, &req)
+                        };
+                        if let Err(error) =
+                            prepare_action(worker, &msg.ulid, "expose", planned.clone())
+                        {
+                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably prepare expose request");
+                            break;
+                        }
                         if let Err(error) = authorize_expose_request(authorizer, body, &req) {
                             tracing::warn!(
                                 ulid = %msg.ulid,
                                 error = %error,
                                 "compute_expose: refused unauthorized expose request"
                             );
+                            let summary = ApplySummary {
+                                outcome: FirewallActionOutcome::Failed,
+                                attempted: u16::try_from(planned.len()).unwrap_or(u16::MAX),
+                                applied: 0,
+                                detail: "capability claim failed before firewall mutation",
+                            };
+                            if terminalize_action(
+                                worker,
+                                build_action_result(&msg.ulid, "expose", summary),
+                            )
+                            .is_err()
+                                || !publish_journaled_result(persist, worker, &msg.ulid)
+                                    .unwrap_or(false)
+                            {
+                                break;
+                            }
+                            *expose_cursor = Some(msg.ulid.clone());
                             continue;
                         }
-                        apply_expose(worker, nebula_ip, wan_zone, &req);
-                        changed = true;
+                        let summary = apply_expose(worker, nebula_ip, wan_zone, &req);
+                        changed |= summary.changed();
+                        let result = build_action_result(&msg.ulid, "expose", summary);
+                        if let Err(error) = terminalize_action(worker, result) {
+                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably terminalize expose request");
+                            break;
+                        }
+                        if !publish_journaled_result(persist, worker, &msg.ulid).unwrap_or(false) {
+                            break;
+                        }
+                        *expose_cursor = Some(msg.ulid.clone());
                     }
                     Err(e) => {
                         tracing::warn!(ulid = %msg.ulid, error = %e, "compute_expose: bad expose request");
+                        *expose_cursor = Some(msg.ulid.clone());
                     }
                 }
             }
@@ -748,23 +1226,87 @@ fn poll_once(
     match persist.list_since(&unexpose_topic, unexpose_cursor.as_deref()) {
         Ok(msgs) => {
             for msg in msgs {
-                *unexpose_cursor = Some(msg.ulid.clone());
+                match recover_or_publish_journaled(persist, worker, &msg.ulid) {
+                    Ok(Some(true)) => {
+                        *unexpose_cursor = Some(msg.ulid.clone());
+                        continue;
+                    }
+                    Ok(Some(false)) => break,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: action journal recovery failed");
+                        break;
+                    }
+                }
                 let body = msg.body.as_deref().unwrap_or("");
                 match parse_unexpose_request(body) {
                     Ok(req) => {
+                        let target = unexpose_auth_target(&req);
+                        if let Err(error) = authorizer.verify_exact_body(
+                            body,
+                            MutationContext {
+                                verb: COMPUTE_UNEXPOSE_AUTH_VERB,
+                                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                                target: &target,
+                            },
+                        ) {
+                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: refused unauthorized unexpose request");
+                            *unexpose_cursor = Some(msg.ulid.clone());
+                            continue;
+                        }
+                        let planned = {
+                            let active = worker
+                                .active
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            diff_unexpose(&active, &req)
+                        };
+                        if let Err(error) =
+                            prepare_action(worker, &msg.ulid, "unexpose", planned.clone())
+                        {
+                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably prepare unexpose request");
+                            break;
+                        }
                         if let Err(error) = authorize_unexpose_request(authorizer, body, &req) {
                             tracing::warn!(
                                 ulid = %msg.ulid,
                                 error = %error,
                                 "compute_expose: refused unauthorized unexpose request"
                             );
+                            let summary = ApplySummary {
+                                outcome: FirewallActionOutcome::Failed,
+                                attempted: u16::try_from(planned.len()).unwrap_or(u16::MAX),
+                                applied: 0,
+                                detail: "capability claim failed before firewall mutation",
+                            };
+                            if terminalize_action(
+                                worker,
+                                build_action_result(&msg.ulid, "unexpose", summary),
+                            )
+                            .is_err()
+                                || !publish_journaled_result(persist, worker, &msg.ulid)
+                                    .unwrap_or(false)
+                            {
+                                break;
+                            }
+                            *unexpose_cursor = Some(msg.ulid.clone());
                             continue;
                         }
-                        apply_unexpose(worker, wan_zone, &req);
-                        changed = true;
+                        let summary = apply_unexpose(worker, nebula_ip, wan_zone, &req);
+                        changed |= summary.changed();
+                        let result = build_action_result(&msg.ulid, "unexpose", summary);
+                        if let Err(error) = terminalize_action(worker, result) {
+                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably terminalize unexpose request");
+                            break;
+                        }
+                        if !publish_journaled_result(persist, worker, &msg.ulid).unwrap_or(false) {
+                            break;
+                        }
+                        *unexpose_cursor = Some(msg.ulid.clone());
                     }
                     Err(e) => {
                         tracing::warn!(ulid = %msg.ulid, error = %e, "compute_expose: bad unexpose request");
+                        *unexpose_cursor = Some(msg.ulid.clone());
                     }
                 }
             }
@@ -883,9 +1425,59 @@ impl Worker for ComputeExposeWorker {
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const AUTH_KEY: &[u8] = b"compute-expose-action-auth-key";
     const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    struct AlwaysFailFirewall;
+
+    impl FirewallMutationRunner for AlwaysFailFirewall {
+        fn run(&self, _args: &[String]) -> bool {
+            false
+        }
+    }
+
+    struct ReloadFailFirewall;
+
+    impl FirewallMutationRunner for ReloadFailFirewall {
+        fn run(&self, args: &[String]) -> bool {
+            args.len() != 1 || args[0] != "--reload"
+        }
+    }
+
+    struct PanicFirewall;
+
+    impl FirewallMutationRunner for PanicFirewall {
+        fn run(&self, _args: &[String]) -> bool {
+            panic!("recovered action must not rerun a consumed mutation")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingFirewall {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl FirewallMutationRunner for RecordingFirewall {
+        fn run(&self, args: &[String]) -> bool {
+            self.calls.lock().expect("calls").push(args.to_vec());
+            true
+        }
+    }
+
+    struct FailFirstResultWriter {
+        attempts: AtomicUsize,
+    }
+
+    impl ActionResultWriter for FailFirstResultWriter {
+        fn publish(&self, persist: &Persist, result: &FirewallActionResult) -> bool {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return false;
+            }
+            write_action_result(persist, result)
+        }
+    }
 
     #[test]
     fn default_bus_root_uses_the_shared_mde_bus_resolver() {
@@ -918,6 +1510,245 @@ mod tests {
         assert!(authorize_expose_request(&authorizer, &tampered, &tampered_request).is_err());
         assert!(authorize_expose_request(&authorizer, &armed, &request).is_ok());
         assert!(authorize_expose_request(&authorizer, &armed, &request).is_err());
+    }
+
+    #[test]
+    fn failed_expose_reply_retry_and_reload_counts_are_honest() {
+        let unsigned = r#"{"vm_nebula_ip":"10.42.128.1","guest_port":8080,"proto":"tcp","networks":["mesh","lan"],"schema_version":1}"#;
+        let request = parse_expose_request(unsigned).expect("valid expose request");
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &expose_auth_target(&request),
+            },
+            "compute-expose-failing-once",
+            AUTH_NOW + 30_000,
+        );
+        let bus_root = tempfile::tempdir().expect("bus root");
+        let persist = Persist::open(bus_root.path().to_path_buf()).expect("persist");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let journal_root = tempfile::tempdir().expect("journal root");
+        let journal_path = journal_root.path().join("action-journal.json");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        ));
+        let worker = ComputeExposeWorker::new()
+            .with_authorizer(Arc::clone(&authorizer))
+            .with_mutation_runner(Arc::new(AlwaysFailFirewall))
+            .with_journal_path(journal_path.clone())
+            .with_result_writer(Arc::new(FailFirstResultWriter {
+                attempts: AtomicUsize::new(0),
+            }));
+        let request_message = persist
+            .write(
+                "compute/expose/10.42.0.15",
+                Priority::Default,
+                None,
+                Some(&armed),
+            )
+            .expect("request write");
+        let mut expose_cursor = None;
+        let mut unexpose_cursor = None;
+
+        poll_once(
+            &persist,
+            &worker,
+            "10.42.0.15",
+            "public",
+            &mut expose_cursor,
+            &mut unexpose_cursor,
+            authorizer.as_ref(),
+        );
+
+        assert!(
+            expose_cursor.is_none(),
+            "failed reply must withhold acknowledgement"
+        );
+        assert!(worker.active_snapshot().is_empty());
+        assert!(persist
+            .list_since("compute/exposed/10.42.0.15", None)
+            .expect("state query")
+            .is_empty());
+        assert!(persist
+            .list_since(&action_result_topic(&request_message.ulid), None)
+            .expect("failed result query")
+            .is_empty());
+        let journal = load_action_journal(&journal_path).expect("durable journal");
+        assert!(journal.entries[&request_message.ulid].terminal.is_some());
+        assert!(authorize_expose_request(&authorizer, &armed, &request).is_err());
+
+        let restarted_worker = ComputeExposeWorker::new()
+            .with_authorizer(Arc::clone(&authorizer))
+            .with_mutation_runner(Arc::new(PanicFirewall))
+            .with_journal_path(journal_path.clone());
+
+        poll_once(
+            &persist,
+            &restarted_worker,
+            "10.42.0.15",
+            "public",
+            &mut expose_cursor,
+            &mut unexpose_cursor,
+            authorizer.as_ref(),
+        );
+
+        assert_eq!(
+            expose_cursor.as_deref(),
+            Some(request_message.ulid.as_str())
+        );
+        let replies = persist
+            .list_since(&action_result_topic(&request_message.ulid), None)
+            .expect("result query");
+        assert_eq!(replies.len(), 1);
+        let result: FirewallActionResult =
+            serde_json::from_str(replies[0].body.as_deref().expect("result body"))
+                .expect("typed result");
+        assert_eq!(result.request_ulid, request_message.ulid);
+        assert_eq!(result.action, "expose");
+        assert_eq!(result.outcome, FirewallActionOutcome::Failed);
+        assert_eq!((result.attempted, result.applied, result.failed), (2, 0, 2));
+        assert!(!result.detail.contains("firewall-cmd"));
+
+        poll_once(
+            &persist,
+            &restarted_worker,
+            "10.42.0.15",
+            "public",
+            &mut expose_cursor,
+            &mut unexpose_cursor,
+            authorizer.as_ref(),
+        );
+        assert_eq!(
+            persist
+                .list_since(&action_result_topic(&request_message.ulid), None)
+                .expect("terminal result query")
+                .len(),
+            1,
+            "consumed capability must remain terminally acknowledged"
+        );
+
+        let prepared_unsigned = r#"{"vm_nebula_ip":"10.42.128.9","guest_port":9443,"proto":"tcp","networks":["mesh"],"schema_version":1}"#;
+        let prepared_request = parse_expose_request(prepared_unsigned).expect("prepared request");
+        let prepared_armed = authorize_test_body(
+            AUTH_KEY,
+            prepared_unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &expose_auth_target(&prepared_request),
+            },
+            "compute-expose-prepared-crash",
+            AUTH_NOW + 30_000,
+        );
+        let prepared_message = persist
+            .write(
+                "compute/expose/10.42.0.15",
+                Priority::Default,
+                None,
+                Some(&prepared_armed),
+            )
+            .expect("prepared request write");
+        prepare_action(
+            &restarted_worker,
+            &prepared_message.ulid,
+            "expose",
+            diff_expose(&BTreeSet::new(), &prepared_request),
+        )
+        .expect("write-ahead prepare");
+        authorize_expose_request(&authorizer, &prepared_armed, &prepared_request)
+            .expect("consume before simulated crash");
+        let second_restart = ComputeExposeWorker::new()
+            .with_authorizer(Arc::clone(&authorizer))
+            .with_mutation_runner(Arc::new(PanicFirewall))
+            .with_journal_path(journal_path.clone());
+        poll_once(
+            &persist,
+            &second_restart,
+            "10.42.0.15",
+            "public",
+            &mut expose_cursor,
+            &mut unexpose_cursor,
+            authorizer.as_ref(),
+        );
+        assert_eq!(
+            expose_cursor.as_deref(),
+            Some(prepared_message.ulid.as_str())
+        );
+        let prepared_reply = persist
+            .read_latest(&action_result_topic(&prepared_message.ulid))
+            .expect("prepared result query")
+            .expect("prepared result");
+        let prepared_result: FirewallActionResult = serde_json::from_str(
+            prepared_reply
+                .body
+                .as_deref()
+                .expect("prepared result body"),
+        )
+        .expect("prepared typed result");
+        assert_eq!(prepared_result.outcome, FirewallActionOutcome::Failed);
+        assert_eq!(
+            (
+                prepared_result.attempted,
+                prepared_result.applied,
+                prepared_result.failed,
+            ),
+            (1, 0, 1)
+        );
+
+        let reload_worker =
+            ComputeExposeWorker::new().with_mutation_runner(Arc::new(ReloadFailFirewall));
+        let reload_summary = apply_expose(
+            &reload_worker,
+            "10.42.0.15",
+            "public",
+            &expose_req("10.42.128.2", 8443, &[Network::Mesh, Network::Lan]),
+        );
+        let reload_result = build_action_result("01RELOADFAIL", "expose", reload_summary);
+        assert_eq!(reload_result.outcome, FirewallActionOutcome::Partial);
+        assert_eq!(
+            (
+                reload_result.attempted,
+                reload_result.applied,
+                reload_result.failed,
+            ),
+            (2, 0, 2),
+            "reload failure leaves every requested change failed-to-activate"
+        );
+        assert!(reload_worker.active_snapshot().is_empty());
+
+        let recording = Arc::new(RecordingFirewall::default());
+        let mesh_worker = ComputeExposeWorker::new().with_mutation_runner(recording.clone());
+        let mesh_request = expose_req("10.42.128.10", 3389, &[Network::Mesh]);
+        assert_eq!(
+            apply_expose(&mesh_worker, "10.42.0.15", "public", &mesh_request,).outcome,
+            FirewallActionOutcome::Applied
+        );
+        assert_eq!(
+            apply_unexpose(
+                &mesh_worker,
+                "10.42.0.15",
+                "public",
+                &unexpose_req("10.42.128.10", 3389),
+            )
+            .outcome,
+            FirewallActionOutcome::Applied
+        );
+        let calls = recording.calls.lock().expect("calls");
+        let added_body = calls[0][2]
+            .strip_prefix("--add-rich-rule=")
+            .expect("add body");
+        let removed_body = calls[2][2]
+            .strip_prefix("--remove-rich-rule=")
+            .expect("remove body");
+        assert_eq!(
+            added_body, removed_body,
+            "Mesh removal must exactly match the local-destination add body"
+        );
     }
 
     #[test]
@@ -1219,7 +2050,7 @@ mod tests {
     //    worker; tests the shadow-set update directly) ──
 
     #[test]
-    fn apply_unexpose_drops_shadow_rules_even_when_firewall_cmd_unavailable() {
+    fn apply_unexpose_retains_shadow_rules_when_firewall_cmd_fails() {
         let worker = ComputeExposeWorker::new();
         {
             let mut active = worker
@@ -1239,19 +2070,18 @@ mod tests {
                 proto: "tcp".into(),
             });
         }
-        // apply_unexpose attempts firewall-cmd (absent in test env)
-        // but per the design always drops from the shadow set so the
-        // published `compute/exposed/<peer>` stays consistent with
-        // operator intent.
-        apply_unexpose(&worker, "public", &unexpose_req("10.42.128.1", 8080));
+        let summary = apply_unexpose(
+            &worker,
+            "10.42.0.15",
+            "public",
+            &unexpose_req("10.42.128.1", 8080),
+        );
         let active = worker
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            active.is_empty(),
-            "shadow set should be empty after unexpose"
-        );
+        assert_eq!(summary.outcome, FirewallActionOutcome::Failed);
+        assert_eq!(active.len(), 2, "failed removal cannot fabricate absence");
     }
 
     // ── ExposedState serializes with all required fields ──
