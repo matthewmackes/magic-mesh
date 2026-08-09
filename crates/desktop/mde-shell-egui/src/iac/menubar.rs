@@ -248,7 +248,9 @@ mod tests {
         assert_eq!(state.route(), WorkloadsRoute::Drift);
         // Help surfaces the honest posture note.
         apply(&mut state, MenuAction::HelpAbout);
-        assert!(state.note_text().is_some_and(|n| n.contains("apply")));
+        assert!(state
+            .note_text()
+            .is_some_and(|n| n.contains("capability-gated") && n.contains("typed row operations")));
     }
 
     #[test]

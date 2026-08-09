@@ -74,14 +74,13 @@ use android_provider::{
     ProductionAndroidHostProbe,
 };
 #[cfg(test)]
-pub(crate) use gate::nonce_digest;
 pub(crate) use gate::{
     claim_nonce, placement_match, verify_token, HmacTokenSigner, NullSigner, Placement,
     TokenSigner, TokenVerdict, DEFAULT_AUTH_ROOT,
 };
 use runner::{
     default_browser_vm_image_source, default_iac_root, default_libvirt_uri, instances_table,
-    CloudRunOutcome, CloudRunner, ShellCloudRunner, BACKEND_TOOLS,
+    CloudRunner, ShellCloudRunner, BACKEND_TOOLS,
 };
 #[cfg(test)]
 use verbs::AndroidInventoryLedgerError;
@@ -127,16 +126,13 @@ const PLACEMENT_STALE_AFTER_MS: i64 = 3 * 60 * 1000;
 /// placement-routed (not leader-gated); the `state/cloud/<node>` mirror is
 /// per-node universal.
 pub struct CloudWorker {
-    /// This node's id — the `state/cloud/<host>` namespace, the placement key, and
-    /// the audit actor's node.
+    /// This node's id — the `state/cloud/<host>` namespace and placement key.
     host: String,
     /// The pinned deployment role published in the cloud mirror.
     deployment_role: DeploymentRole,
     /// Whether this node may receive workload mutations. Lighthouses remain
     /// coordination-only even if a forged Bus request names them as placement.
     workloads_allowed: bool,
-    /// The mesh node id (`peer:<host>`) — the audit actor identity.
-    node_id: String,
     /// The injectable backend seam (production: [`ShellCloudRunner`]).
     runner: Arc<dyn CloudRunner>,
     /// The armed-token verification/signing seam (production: keyed
@@ -154,8 +150,6 @@ pub struct CloudWorker {
     /// (`<state_root>/mcnf/cloud/desired/<node>/…`) U4's `set-desired` writes and
     /// U5's reconcile/drift tick reads.
     state_root: PathBuf,
-    /// The hash-chain audit DB (destructive performed ops audit here).
-    db_path: PathBuf,
     /// Bounded, typed Android guest observations admitted by a future provider.
     /// The ledger is retained in a bounded host-scoped snapshot below the
     /// workgroup root, then folded into the Workloads mirror.
@@ -197,12 +191,13 @@ pub struct CloudWorker {
 impl CloudWorker {
     /// Construct with production defaults: the [`ShellCloudRunner`] over the
     /// deployed IaC tree + local libvirt, a placement-node-local arming authority,
-    /// honest reconcile skeleton, the canonical audit DB, and the persisted Bus
-    /// tree. `host` is this node's id; `node_id` is the audit actor;
+    /// honest reconcile skeleton and the persisted Bus tree. `host` is this
+    /// node's id; the retained `_node_id` parameter preserves the worker
+    /// constructor shape while cloud-local lifecycle audit authority is retired;
     /// `workgroup_root` is the desired-state / tfvars root (reserved for the
     /// reconcile seam).
     #[must_use]
-    pub fn new(host: String, node_id: String, workgroup_root: PathBuf) -> Self {
+    pub fn new(host: String, _node_id: String, workgroup_root: PathBuf) -> Self {
         let runner = Arc::new(ShellCloudRunner::new(
             &default_iac_root(),
             default_libvirt_uri(),
@@ -270,13 +265,11 @@ impl CloudWorker {
             host,
             deployment_role,
             workloads_allowed,
-            node_id,
             runner,
             signer,
             arm_capable,
             auth_root,
             state_root: workgroup_root,
-            db_path: crate::default_db_path(),
             android_inventory_ledger: std::sync::Mutex::new(android_inventory_ledger),
             android_guest_providers: AndroidGuestProviderRegistry::new(),
             android_provider_admissions: std::sync::Mutex::new(Vec::new()),
@@ -342,13 +335,6 @@ impl CloudWorker {
     #[must_use]
     pub const fn with_arm_capable(mut self, capable: bool) -> Self {
         self.arm_capable = capable;
-        self
-    }
-
-    /// Override the audit DB path (tests point it at a tempdir).
-    #[must_use]
-    pub fn with_db_path(mut self, p: PathBuf) -> Self {
-        self.db_path = p;
         self
     }
 
@@ -454,31 +440,12 @@ impl CloudWorker {
         verdict
     }
 
-    /// Write one hash-chain audit row for a performed destructive cloud op through
-    /// the EXISTING events plane (best-effort — a store fault is logged, never
-    /// fatal). Makes the reply's `audited: true` truthful.
-    pub(crate) fn audit(&self, verb: &str, instance: Option<&str>, outcome: &CloudRunOutcome) {
-        crate::events::append_and_alert(
-            &self.db_path,
-            &self.node_id,
-            crate::events::EventKind::AdminAction,
-            serde_json::json!({
-                "action": "cloud",
-                "verb": verb,
-                "instance": instance,
-                "ok": outcome.ok,
-                "applied": outcome.applied,
-                "summary": outcome.summary,
-            }),
-        );
-    }
-
     /// Handle one `action/cloud/<verb>` request end to end → a typed [`CloudReply`].
     ///
     /// The Bus drain routes placement-scoped requests before calling this method,
     /// but this is also a public crate seam used by adapters and tests. Re-checking
     /// placement here prevents a direct caller from presenting a valid capability
-    /// for another node and making this worker run that node's lifecycle action.
+    /// for another node and making this worker run that node's action.
     #[must_use]
     pub fn handle(&self, verb_name: &str, body: &str) -> CloudReply {
         if let Some(reply) = self.reject_lighthouse_workload(verb_name) {
@@ -1494,25 +1461,12 @@ mod tests {
         );
     }
 
-    // ── destructive lifecycle: target-scoped + typed confirmation ──
     #[test]
-    fn workspace_wide_destroy_is_retired_and_never_reaches_the_runner() {
-        let runner = Arc::new(FakeRunner::default());
-        let w = armed_worker(runner.clone());
-        let reply = w.handle("destroy", r#"{"schema_version":1,"node":"me"}"#);
-        assert!(!reply.ok);
-        assert!(reply
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("workspace-wide destroy is retired")));
-        assert!(runner.calls.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn retired_lifecycle_and_console_verbs_are_refused_before_auth_or_backend() {
+    fn retired_instance_lifecycle_verbs_fail_closed_before_parsing_auth_or_backend() {
         let runner = Arc::new(FakeRunner::default());
         let w = staged_worker(runner.clone());
         for verb in [
+            "destroy",
             "instance-start",
             "instance-stop",
             "instance-reboot",
@@ -1520,17 +1474,18 @@ mod tests {
             "instance-start-all",
             "instance-stop-all",
             "instance-reboot-all",
-            "container-restart",
-            "container-logs",
-            "container-destroy",
-            "console-attach",
         ] {
-            let reply = w.handle(verb, r#"{"schema_version":1,"node":"me","instance":"web"}"#);
-            assert!(!reply.ok);
-            assert!(reply
-                .error
-                .as_deref()
-                .is_some_and(|error| { error.contains("unknown cloud verb") }));
+            assert_eq!(CloudVerb::from_verb(verb), None);
+            let reply = w.handle(
+                verb,
+                r#"{"schema_version":99,"node":"elsewhere","instance":"web","armed_token":"executable-looking""#,
+            );
+            assert!(!reply.ok, "{verb} must fail closed");
+            let error = reply.error.as_deref().expect("explicit retirement refusal");
+            assert!(error.contains(verb), "{error}");
+            assert!(error.contains("action/workload/operation"), "{error}");
+            assert!(!error.contains("target-scoped"), "{error}");
+            assert!(reply.gated.is_none());
         }
         assert!(runner.calls.lock().unwrap().is_empty());
         assert!(runner.tool_calls.lock().unwrap().is_empty());

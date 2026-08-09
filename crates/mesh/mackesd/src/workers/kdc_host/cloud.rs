@@ -1,27 +1,23 @@
-//! KDC-MESH-8 — placement-local cloud lifecycle run-commands for the KDC host.
+//! KDC-MESH-8 — placement-local cloud inventory run-commands for the KDC host.
 //!
 //! Split out of the parent `kdc_host` god-file (behavior-preserving
-//! relocation): the phone-triggered [`CloudCommand`] set that drives the
-//! QC `action/cloud/*` typed Bus verbs by consuming the installed provider
-//! adapter's PUBLIC interface, never touching the adapter. Every action audits
-//! #16.
+//! relocation): the phone-triggered [`CloudCommand`] set that reads the
+//! placement-local cloud inventory over public `action/cloud/*` read verbs.
+//! Lifecycle is intentionally absent: stock KDE Connect commands carry no
+//! bounded Workload identity or generation and therefore cannot safely publish
+//! `action/workload/operation`.
 
 use super::*;
 use mackes_mesh_types::cloud::{
-    cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
-    CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL, CLOUD_ARM_NODE_SCOPE,
+    decode_cloud_arm_credential, CloudArmSigner, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
 };
-
-/// A phone capability remains useful long enough for one local Bus drain, but
-/// not as a reusable ambient credential.
-const CLOUD_ARM_TTL_MS: i64 = 30_000;
 
 /// How long a phone-triggered cloud Bus round-trip waits for the provider
 /// adapter's reply before honest-gating "cloud unavailable" (no fabricated
 /// result).
 const CLOUD_BUS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Audit action name for phone-triggered cloud lifecycle work.
+/// Audit action name for phone-triggered cloud inventory reads.
 const KDC_CLOUD_AUDIT_ACTION: &str = "kdc_cloud";
 
 /// The systemd cloud-arm credential is 64 hex characters plus optional
@@ -29,26 +25,17 @@ const KDC_CLOUD_AUDIT_ACTION: &str = "kdc_cloud";
 /// credential path is replaced with a hostile regular file.
 const CLOUD_ARM_CREDENTIAL_MAX_BYTES: usize = 4 * 1024;
 
-/// The placement-local cloud lifecycle commands the phone can trigger (design #12).
+/// The placement-local cloud inventory commands the phone can trigger.
 ///
-/// Bulk-scoped because stock KDE Connect's run-command sends only a curated
-/// `key` (no instance argument): `List`/`Status` read the roster; `StartAll`/
-/// `StopAll`/`RebootAll` act on every matching instance on this KDC node. **Delete
-/// is deliberately NOT phone-exposed** — a bulk delete with no typed target is past
-/// the safety line the audit log alone shouldn't backstop (a targeted delete
-/// needs an instance the stock run-command can't carry).
+/// Stock KDE Connect's run-command sends only a curated key, not the bounded
+/// target, generation, backend and action required by a Workload operation.
+/// Consequently this surface is read-only; lifecycle belongs to Workloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CloudCommand {
     /// List every cloud provider instance (name + status).
     List,
     /// Summarize the roster (counts by status).
     Status,
-    /// Start every `SHUTOFF` instance.
-    StartAll,
-    /// Stop every `ACTIVE` instance.
-    StopAll,
-    /// Reboot every `ACTIVE` instance.
-    RebootAll,
 }
 
 impl CloudCommand {
@@ -57,9 +44,6 @@ impl CloudCommand {
         match self {
             Self::List => "cloud-list",
             Self::Status => "cloud-status",
-            Self::StartAll => "cloud-start-all",
-            Self::StopAll => "cloud-stop-all",
-            Self::RebootAll => "cloud-reboot-all",
         }
     }
 
@@ -68,61 +52,28 @@ impl CloudCommand {
         match self {
             Self::List => "Cloud: list this node's instances",
             Self::Status => "Cloud: this node's status",
-            Self::StartAll => "Cloud: start stopped instances on this node",
-            Self::StopAll => "Cloud: stop active instances on this node",
-            Self::RebootAll => "Cloud: reboot active instances on this node",
         }
     }
 
     /// Map a run-command key to its command, or `None` for a non-cloud key.
     pub(super) fn from_key(key: &str) -> Option<Self> {
-        [
-            Self::List,
-            Self::Status,
-            Self::StartAll,
-            Self::StopAll,
-            Self::RebootAll,
-        ]
-        .into_iter()
-        .find(|c| c.key() == key)
-    }
-
-    /// The lifecycle action a bulk command drives (`None` for the reads).
-    const fn lifecycle(self) -> Option<LifecycleAction> {
-        match self {
-            Self::StartAll => Some(LifecycleAction::Start),
-            Self::StopAll => Some(LifecycleAction::Stop),
-            Self::RebootAll => Some(LifecycleAction::Reboot),
-            Self::List | Self::Status => None,
-        }
+        [Self::List, Self::Status]
+            .into_iter()
+            .find(|c| c.key() == key)
     }
 }
 
 /// Every cloud command as a [`RunCmd`] so it appears in the phone's run-command
-/// list. The `command` field is a static label (cloud keys never shell out — they
-/// route through the Bus in [`handle_cloud_command`]).
+/// list. The `command` field is a static label (cloud keys never shell out).
 pub(super) fn cloud_command_entries() -> Vec<RunCmd> {
-    [
-        CloudCommand::List,
-        CloudCommand::Status,
-        CloudCommand::StartAll,
-        CloudCommand::StopAll,
-        CloudCommand::RebootAll,
-    ]
-    .into_iter()
-    .map(|c| RunCmd {
-        key: c.key().to_string(),
-        name: c.name().to_string(),
-        command: "(Cloud provider lifecycle over the Bus)".to_string(),
-    })
-    .collect()
-}
-
-/// The placement-local bulk lifecycle Bus verb. Target selection happens in
-/// the privileged cloud worker from its live runner roster, never in this
-/// public-Bus client.
-pub(super) fn lifecycle_bulk_bus_verb(action: LifecycleAction) -> String {
-    format!("instance-{}-all", action.cli_verb())
+    [CloudCommand::List, CloudCommand::Status]
+        .into_iter()
+        .map(|c| RunCmd {
+            key: c.key().to_string(),
+            name: c.name().to_string(),
+            command: "(Cloud inventory over the Bus)".to_string(),
+        })
+        .collect()
 }
 
 /// A phone-friendly one-line roster listing (`cloud-list`). Pure + testable.
@@ -189,44 +140,6 @@ fn cloud_bus_call(persist: &Persist, verb: &str, body: &str) -> Option<CloudRepl
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-}
-
-/// Insert a short-lived, body-bound capability into one frozen placement-local
-/// bulk request. Pure apart from its supplied clock/nonce so hostile-body tests
-/// do not need a production credential.
-pub(super) fn authorize_bulk_body_with_signer(
-    signer: &CloudArmSigner,
-    node: &str,
-    verb: &str,
-    now_ms: i64,
-    nonce: &str,
-) -> Result<String, String> {
-    for (label, value) in [("node", node), ("verb", verb), ("nonce", nonce)] {
-        if value.is_empty() || value.len() > 255 || value.contains('|') {
-            return Err(format!(
-                "cloud authorization {label} is not capability-safe"
-            ));
-        }
-    }
-    let body = json!({
-        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
-        "node": node,
-    })
-    .to_string();
-    let token = CloudArmedToken::mint(
-        signer,
-        nonce,
-        now_ms.saturating_add(CLOUD_ARM_TTL_MS),
-        verb,
-        node,
-        CLOUD_ARM_NODE_SCOPE,
-        &cloud_request_digest(&body).map_err(str::to_string)?,
-    )
-    .encode();
-    let mut document: Value =
-        serde_json::from_str(&body).map_err(|error| format!("build cloud request: {error}"))?;
-    document["armed_token"] = Value::String(token);
-    Ok(document.to_string())
 }
 
 /// Load the mint authority only from mackesd's root-only systemd credential.
@@ -296,26 +209,9 @@ fn read_cloud_arm_credential(path: &std::path::Path) -> std::io::Result<Vec<u8>>
     Ok(raw)
 }
 
-fn authorize_bulk_body(node: &str, verb: &str) -> Result<String, String> {
-    use rand::RngCore as _;
-    let signer = production_cloud_arm_signer()?;
-    let mut nonce = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let nonce = nonce
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .map_err(|_| "system clock is before the Unix epoch".to_string())?;
-    authorize_bulk_body_with_signer(&signer, node, verb, now_ms, &nonce)
-}
-
-/// Run a cloud command against this placement node over the Bus (design #12) and return the
-/// phone-friendly result line. Sync (the `Persist` Bus round-trips can't cross an
-/// await); the async caller runs it via `spawn_blocking`. Every performed op
-/// audits (#16); an unavailable cloud / no-responder is an honest gate.
+/// Run a cloud inventory command against this placement node over the Bus and
+/// return the phone-friendly result line. Sync (the `Persist` Bus round-trips
+/// cannot cross an await); the async caller runs it via `spawn_blocking`.
 fn run_cloud_command_blocking(cmd: CloudCommand, node: &str) -> String {
     let Some(bus) = mde_bus::default_data_dir() else {
         return "Cloud unavailable (no Bus)".to_string();
@@ -323,33 +219,8 @@ fn run_cloud_command_blocking(cmd: CloudCommand, node: &str) -> String {
     let Ok(persist) = Persist::open(bus) else {
         return "Cloud unavailable (Bus not open)".to_string();
     };
-    if let Some(action) = cmd.lifecycle() {
-        let verb = lifecycle_bulk_bus_verb(action);
-        let body = match authorize_bulk_body(node, &verb) {
-            Ok(body) => body,
-            Err(error) => return format!("Cloud authorization unavailable: {error}"),
-        };
-        let result = match cloud_bus_call(&persist, &verb, &body) {
-            Some(reply) if reply.ok => reply
-                .raw_log
-                .unwrap_or_else(|| format!("{} completed", cmd.name())),
-            Some(reply) => format!(
-                "Cloud gated: {}",
-                reply.gated.or(reply.error).unwrap_or_default()
-            ),
-            None => "Cloud unavailable (no response from this node's cloud worker)".to_string(),
-        };
-        audit_kdc_action(json!({
-            "action": KDC_CLOUD_AUDIT_ACTION,
-            "verb": verb,
-            "node": node,
-            "result": &result,
-        }));
-        return result;
-    }
-
     // Read commands use a placement-scoped roster query. They never feed a
-    // later privileged target decision; mutations are worker-selected above.
+    // later privileged target decision.
     let roster_body = json!({
         "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
         "node": node,

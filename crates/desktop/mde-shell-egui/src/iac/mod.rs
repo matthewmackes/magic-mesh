@@ -29,9 +29,10 @@
 //! Every state is honest (§7): an off-mesh Bus is a silent degrade, an empty
 //! roster is a real "no workloads", and a panel with no landed backend render
 //! draws an honest **not yet built** stub rather than fake data. Every
-//! destructive intent passes a typed-confirm echo first (RUN-006), while
-//! prepared service/image changes use a simple Yes/No review. Every performed
-//! op lands in the session audit trail.
+//! destructive intent passes an explicit review first (RUN-006); live Ansible
+//! apply retains the typed-confirm echo while typed Workload and prepared
+//! service/image changes use a simple Yes/No review. Every performed op lands
+//! in the session audit trail.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -526,21 +527,6 @@ fn configure_request_body(node: &str, playbook: &str, group: &str) -> String {
     .to_string()
 }
 
-/// Serialize a workload lifecycle request for the node that reported its row.
-/// Destructive calls carry the operator's already-validated typed echo so the
-/// daemon independently enforces the same target confirmation.
-fn lifecycle_request_body(node: &str, instance: &str, typed_name: Option<&str>) -> String {
-    let mut body = serde_json::json!({
-        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
-        "node": node,
-        "instance": instance,
-    });
-    if let Some(typed_name) = typed_name {
-        body["typed_name"] = serde_json::Value::String(typed_name.to_string());
-    }
-    body.to_string()
-}
-
 /// Match the action worker's bounded Android identity vocabulary before the
 /// review sheet opens. Workload identities may include `:` because that is part
 /// of the shared Android guest contract; placement hosts are path-safe segments
@@ -970,18 +956,6 @@ pub(super) enum ProvisionProgress {
 pub(super) enum ArmAction {
     /// A live `configure` (Ansible apply) — echo [`APPLY_ECHO`].
     Configure,
-    /// A destructive per-workload lifecycle op (`instance-reboot` /
-    /// `instance-delete`) — echo the workload name.
-    Lifecycle {
-        /// The lifecycle verb.
-        verb: &'static str,
-        /// The placement node that reported the workload row.
-        node: String,
-        /// The target workload/instance id.
-        instance_id: String,
-        /// The workload's display name — the required echo.
-        name: String,
-    },
     /// A route-specific live mutation whose complete body is frozen before the
     /// simple Yes/No review opens (for example, image build or promote).
     Prepared {
@@ -1040,12 +1014,11 @@ pub(super) enum ArmAction {
 }
 
 impl ArmAction {
-    /// The `action/cloud/*` verb this action publishes (test seam — the perform
-    /// path matches the variant directly).
+    /// The authority verb this action publishes (test seam — the perform path
+    /// matches the variant directly).
     const fn verb(&self) -> &'static str {
         match self {
             Self::Configure => "configure",
-            Self::Lifecycle { verb, .. } => verb,
             Self::Prepared { verb, .. } => verb,
             Self::Workload { .. } => "workload-operation",
             Self::ExecPrepared { .. } => EXEC_AUTH_VERB,
@@ -1057,7 +1030,6 @@ impl ArmAction {
     fn echo(&self) -> String {
         match self {
             Self::Configure => APPLY_ECHO.to_string(),
-            Self::Lifecycle { name, .. } => name.clone(),
             Self::Prepared { echo, .. } => echo.clone(),
             Self::Workload { echo, .. } => echo.clone(),
             Self::ExecPrepared { echo, .. } => echo.clone(),
@@ -1069,7 +1041,6 @@ impl ArmAction {
     fn confirm_word(&self) -> &'static str {
         match self {
             Self::Configure => "Apply",
-            Self::Lifecycle { verb, .. } => verb_label(verb),
             Self::Prepared { word, .. } => word,
             Self::Workload { word, .. } => word,
             Self::ExecPrepared { word, .. } => word,
@@ -1081,7 +1052,6 @@ impl ArmAction {
     fn subject(&self) -> String {
         match self {
             Self::Configure => "the Ansible convergence (live apply)".to_string(),
-            Self::Lifecycle { name, .. } => format!("workload {name}"),
             Self::Prepared { subject, .. } => subject.clone(),
             Self::Workload { subject, .. } => subject.clone(),
             Self::ExecPrepared { subject, .. } => subject.clone(),
@@ -1089,9 +1059,9 @@ impl ArmAction {
         }
     }
 
-    /// Prepared service/image actions use the low-friction explicit-choice
-    /// review. Live infrastructure applies and lifecycle mutations retain the
-    /// stronger typed-echo interlock.
+    /// Prepared service/image and typed Workload actions use the low-friction
+    /// explicit-choice review. Live infrastructure apply retains the stronger
+    /// typed-echo interlock.
     const fn uses_yes_no_review(&self) -> bool {
         matches!(
             self,
@@ -1124,7 +1094,7 @@ fn armed(typed: &str, echo: &str) -> bool {
 
 /// The immutable facts the review sheet renders before the exact echo can
 /// release an action. This is deliberately derived from the pending
-/// [`ArmAction`], not live form controls, so prepared/lifecycle mutations show
+/// [`ArmAction`], not live form controls, so prepared mutations show
 /// the same command, target, placement, and request digest that will be bound to
 /// the capability token.
 #[derive(Debug, Clone)]
@@ -1167,26 +1137,6 @@ fn review_sheet_facts(action: &ArmAction, state: &WorkloadsState) -> ReviewSheet
                 format!(
                     "Live Ansible convergence can change workloads on placement node {node}; \
                      authorization is scoped to {CLOUD_ARM_NODE_SCOPE}."
-                ),
-            )
-        }
-        ArmAction::Lifecycle {
-            verb,
-            node,
-            instance_id,
-            name,
-        } => {
-            let body = lifecycle_request_body(node, instance_id, Some(name));
-            request_review_facts(
-                command,
-                subject,
-                instance_id.clone(),
-                node.clone(),
-                &body,
-                format!(
-                    "{} affects one workload: {name} ({instance_id}) on placement node {node}. \
-                     No other node or workload is authorized by this review.",
-                    verb_label(verb)
                 ),
             )
         }
@@ -1358,7 +1308,7 @@ impl AuditOutcome {
 /// hash-chained events log; this is the local "what did I do here" list.
 #[derive(Debug, Clone)]
 pub(super) struct AuditEntry {
-    /// The verb performed (`provision` / `instance-delete` / …).
+    /// The authority verb performed (`configure` / `workload-operation` / …).
     verb: String,
     /// The honest verdict.
     outcome: AuditOutcome,
@@ -1409,7 +1359,7 @@ pub struct WorkloadsState {
     loaded_at: Option<Instant>,
     /// A manual refresh is queued — re-reads the mirror on the next poll.
     forced: bool,
-    /// A pending review-sheet confirm for a destructive intent, if any.
+    /// A pending review-sheet action, if any.
     arming: Option<ReviewSheetState>,
     /// The one in-flight mutation — its reply resolves into the note + audit.
     mutation_pending: Option<Pending>,
@@ -2021,8 +1971,8 @@ impl WorkloadsState {
     }
 
     /// Perform a confirmed action — called only past the review-sheet gate
-    /// ([`armed`]). Android launcher requests use the audited execution lane;
-    /// the existing cloud lifecycle path remains unchanged for all other arms.
+    /// ([`armed`]). Typed Workload and Android requests use their dedicated
+    /// audited authority lanes.
     fn perform(&mut self, action: ArmAction, typed: &str) {
         match action {
             ArmAction::Workload {
@@ -2116,7 +2066,9 @@ impl WorkloadsState {
                     Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
                 }
             }
-            action => self.perform_cloud(action, typed),
+            action @ (ArmAction::Configure | ArmAction::Prepared { .. }) => {
+                self.perform_cloud(action, typed)
+            }
         }
     }
 
@@ -2144,12 +2096,6 @@ impl WorkloadsState {
                     body,
                     "live configuration (apply)".to_string(),
                 )
-            }
-            ArmAction::Lifecycle { verb, name, .. } => {
-                self.note = Some(format!(
-                    "Legacy lifecycle action {verb} for {name} is retired; use the typed Workload operation. Nothing was sent."
-                ));
-                return;
             }
             ArmAction::Prepared {
                 verb,
@@ -2222,9 +2168,10 @@ impl WorkloadsState {
     /// Open a short Yes/No review for the sole typed Workload operation lane.
     /// The legacy cloud/lifecycle verbs are deliberately not used for VM or
     /// Quadlet day-2 controls.
-    pub(super) fn issue_workload_direct(
+    pub(super) fn issue_workload_operation(
         &mut self,
-        verb: &'static str,
+        action: WorkloadOperationAction,
+        attachment: Option<WorkloadAttachmentProtocol>,
         node: &str,
         workload_id: &str,
         delivery: DeliveryType,
@@ -2233,9 +2180,9 @@ impl WorkloadsState {
         let node = node.trim();
         let workload_id = workload_id.trim();
         if node.is_empty() || workload_id.is_empty() {
+            let operation = workload_operation_label(action);
             self.note = Some(format!(
-                "Could not request {} on {name}: the workload placement or identity is missing.",
-                verb_label(verb)
+                "Could not request {operation} on {name}: the workload placement or identity is missing."
             ));
             return;
         }
@@ -2244,49 +2191,21 @@ impl WorkloadsState {
         } else {
             WorkloadBackend::LibvirtVirtqemud
         };
-        let (action, attachment, label, word) = match verb {
-            "instance-start" => (
-                WorkloadOperationAction::StartAndAttach,
-                Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
-                format!("start and attach {name}"),
-                "Start",
-            ),
-            "instance-stop" | "container-stop" => (
-                WorkloadOperationAction::Stop,
-                None,
-                format!("stop {name}"),
-                "Stop",
-            ),
-            "instance-reboot" | "container-restart" => (
-                WorkloadOperationAction::Restart,
-                Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
-                format!("restart {name}"),
-                "Restart",
-            ),
-            "instance-open" => (
-                WorkloadOperationAction::Open,
-                Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
-                format!("open {name}"),
-                "Open",
-            ),
-            "container-logs" => (
-                WorkloadOperationAction::Open,
-                Some(WorkloadAttachmentProtocol::Logs),
-                format!("open logs for {name}"),
-                "Open",
-            ),
-            "instance-delete" | "container-destroy" => (
-                WorkloadOperationAction::Destroy,
-                None,
-                format!("destroy {name}"),
-                "Destroy",
-            ),
-            _ => {
-                self.note = Some(format!(
-                    "Workload operation {verb} is not available on the typed API. Nothing was sent."
-                ));
-                return;
+        let (label, word) = match (action, attachment) {
+            (WorkloadOperationAction::StartAndAttach, _) => {
+                (format!("start and attach {name}"), "Start")
             }
+            (WorkloadOperationAction::Stop, _) => (format!("stop {name}"), "Stop"),
+            (WorkloadOperationAction::Restart, _) => (format!("restart {name}"), "Restart"),
+            (WorkloadOperationAction::Open, Some(WorkloadAttachmentProtocol::Logs)) => {
+                (format!("open logs for {name}"), "Open")
+            }
+            (WorkloadOperationAction::Open, _) => (format!("open {name}"), "Open"),
+            (WorkloadOperationAction::Destroy, _) => (format!("destroy {name}"), "Destroy"),
+            _ => (
+                format!("{} {name}", workload_operation_label(action)),
+                "Run",
+            ),
         };
         // Workload operations use a durable compare-and-swap generation. Read
         // the authoritative node projection before minting the capability so
@@ -2346,8 +2265,9 @@ impl WorkloadsState {
             );
             return;
         }
-        self.issue_workload_direct(
-            "instance-open",
+        self.issue_workload_operation(
+            WorkloadOperationAction::Open,
+            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
             node,
             instance_id,
             DeliveryType::DesktopVm,
@@ -2395,46 +2315,6 @@ impl WorkloadsState {
                 self.note = Some(format!("App launch was not sent: {error}"));
             }
         }
-    }
-
-    /// Open the review-sheet confirm for a destructive lifecycle op
-    /// (`instance-reboot` / `instance-delete`) — nothing publishes until the
-    /// workload name is typed (RUN-006). The resource rows drive this seam.
-    pub(super) fn arm_lifecycle(
-        &mut self,
-        verb: &'static str,
-        node: &str,
-        instance_id: &str,
-        name: &str,
-    ) {
-        let node = node.trim();
-        if node.is_empty() {
-            self.note = Some(format!(
-                "Could not arm {} on {name}: the workload has no placement node.",
-                verb_label(verb)
-            ));
-            return;
-        }
-        let instance_id = instance_id.trim();
-        let name = name.trim();
-        if instance_id.is_empty() || name.is_empty() {
-            self.note = Some(format!(
-                "Could not arm {}: the workload identity is incomplete (instance and name are \
-                 required). Nothing was sent.",
-                verb_label(verb)
-            ));
-            return;
-        }
-        self.note = None;
-        self.arming = Some(ReviewSheetState {
-            action: ArmAction::Lifecycle {
-                verb,
-                node: node.to_string(),
-                instance_id: instance_id.to_string(),
-                name: name.to_string(),
-            },
-            typed: String::new(),
-        });
     }
 
     /// Open a Yes/No review for a fully prepared route mutation. The body is
@@ -2743,16 +2623,18 @@ fn fold_mutation(reply: &CloudReply) -> (String, AuditEntry) {
     }
 }
 
-/// The button/label word for a lifecycle (or mutation) verb.
-fn verb_label(verb: &str) -> &'static str {
-    match verb {
-        "instance-start" => "Start",
-        "instance-stop" => "Stop",
-        "instance-reboot" => "Reboot",
-        "instance-delete" => "Delete",
-        "configure" => "Configure",
-        "destroy" => "Destroy",
-        _ => "Run",
+const fn workload_operation_label(action: WorkloadOperationAction) -> &'static str {
+    match action {
+        WorkloadOperationAction::StartAndAttach => "start and attach",
+        WorkloadOperationAction::Start => "start",
+        WorkloadOperationAction::Stop => "stop",
+        WorkloadOperationAction::Restart => "restart",
+        WorkloadOperationAction::Destroy => "destroy",
+        WorkloadOperationAction::Pause => "pause",
+        WorkloadOperationAction::Resume => "resume",
+        WorkloadOperationAction::Open => "open",
+        WorkloadOperationAction::Reconcile => "reconcile",
+        WorkloadOperationAction::Cancel => "cancel",
     }
 }
 
@@ -3267,8 +3149,9 @@ fn resource_row_actions(
     ui.horizontal(|ui| match row.delivery_type {
         DeliveryType::ServiceContainer => {
             if row_button(ui, "Restart", false).clicked() {
-                state.issue_workload_direct(
-                    "container-restart",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Restart,
+                    None,
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -3276,8 +3159,9 @@ fn resource_row_actions(
                 );
             }
             if row_button(ui, "Logs", false).clicked() {
-                state.issue_workload_direct(
-                    "container-logs",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Open,
+                    Some(WorkloadAttachmentProtocol::Logs),
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -3285,8 +3169,9 @@ fn resource_row_actions(
                 );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct(
-                    "container-destroy",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Destroy,
+                    None,
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -3347,8 +3232,9 @@ fn vm_lifecycle_actions(
         state.issue_console_attach(&row.node, &row.name, &row.name);
     }
     if row_button(ui, "Start", false).clicked() {
-        state.issue_workload_direct(
-            "instance-start",
+        state.issue_workload_operation(
+            WorkloadOperationAction::StartAndAttach,
+            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
             &row.node,
             &row.name,
             row.delivery_type,
@@ -3356,8 +3242,9 @@ fn vm_lifecycle_actions(
         );
     }
     if row_button(ui, "Stop", false).clicked() {
-        state.issue_workload_direct(
-            "instance-stop",
+        state.issue_workload_operation(
+            WorkloadOperationAction::Stop,
+            None,
             &row.node,
             &row.name,
             row.delivery_type,
@@ -3365,8 +3252,9 @@ fn vm_lifecycle_actions(
         );
     }
     if row_button(ui, "Reboot\u{2026}", true).clicked() {
-        state.issue_workload_direct(
-            "instance-reboot",
+        state.issue_workload_operation(
+            WorkloadOperationAction::Restart,
+            Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
             &row.node,
             &row.name,
             row.delivery_type,
@@ -3374,8 +3262,9 @@ fn vm_lifecycle_actions(
         );
     }
     if row_button(ui, "Destroy\u{2026}", true).clicked() {
-        state.issue_workload_direct(
-            "instance-delete",
+        state.issue_workload_operation(
+            WorkloadOperationAction::Destroy,
+            None,
             &row.node,
             &row.name,
             row.delivery_type,

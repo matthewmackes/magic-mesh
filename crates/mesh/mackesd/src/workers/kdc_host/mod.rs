@@ -93,14 +93,13 @@ use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
-// KDC-MESH-8 — drive placement-local instance lifecycle from the phone over the neutral
-// `action/cloud/*` Bus verb namespace (design #12). This is a read-only producer
-// of typed cloud requests + reader of the typed reply; the cloud backend that
-// answers them is provided by a later local-first worker. The neutral wire shapes
-// live in `mackes_mesh_types::cloud` (§6 — neither side depends on the other).
+// KDC-MESH-8 — read placement-local cloud inventory from the phone over the
+// neutral `action/cloud/*` Bus namespace. Phone run-command keys do not carry
+// the identity/generation required by the sole typed Workload lifecycle API, so
+// this surface intentionally exposes no lifecycle mutation.
 use mackes_mesh_types::cloud::{
     cloud_action_topic, cloud_request_digest, CloudArmSigner, CloudArmedToken, CloudInstance,
-    CloudReply, LifecycleAction,
+    CloudReply,
 };
 
 // ARCH: this worker was split out of a 5.3K-line god-file into a directory
@@ -1361,8 +1360,8 @@ fn local_announce() -> Announce {
         "kdeconnect.share.request",
         // Ring this host (ring_local_device).
         "kdeconnect.findmyphone.request",
-        // Curated command list + execution (handle_runcommand), incl. the
-        // KDC-MESH-8 cloud lifecycle commands.
+        // Curated command list + execution (handle_runcommand), including the
+        // KDC-MESH-8 read-only cloud inventory commands.
         "kdeconnect.runcommand.request",
         // KDC-MESH-7 — the phone's SFTP mount-info reply (browse the phone's FS
         // from this desktop; the request goes out below). Handled by mounting the
@@ -1622,9 +1621,9 @@ async fn run_host(
                     // KDC-PLUGINS / KDC-MESH-8 — Run Command: the phone asks for the
                     // command list (`requestCommandList`) or triggers a curated key.
                     // Results come back as a `kdeconnect.ping` notification. Cloud
-                    // (cloud lifecycle) keys drive the QC `action/cloud/*` verbs;
-                    // every executed command audits (#16). The cloud path is gated on
-                    // a paired device (the auth, #16).
+                    // keys read inventory through `action/cloud/*`; lifecycle has no
+                    // phone command. Every executed command audits (#16), and the
+                    // cloud path is paired-device gated.
                     if packet.kind == "kdeconnect.runcommand.request" {
                         let paired = pairing.is_paired(peer.as_str());
                         handle_runcommand(
@@ -2127,11 +2126,10 @@ fn execute_runcommand(cmds: &[RunCmd], key: &str) -> String {
 /// runs off the reactor thread (`spawn_blocking`) so a slow command can't stall
 /// the host event loop.
 ///
-/// KDC-MESH-8: the published list carries the shell commands PLUS the fleet
-/// cloud lifecycle commands ([`cloud_command_entries`]). A `cloud-*` key is
-/// routed through the QC `action/cloud/*` Bus verbs ([`handle_cloud_command`]) —
-/// gated on a `paired` device (the auth, #16) — instead of the shell. Every
-/// executed command audits (#16).
+/// KDC-MESH-8: the published list carries configured shell commands plus the
+/// read-only cloud inventory commands ([`cloud_command_entries`]). A `cloud-*`
+/// key is routed through read-only `action/cloud/*` Bus verbs
+/// ([`handle_cloud_command`]), gated on a paired device, and audited.
 async fn handle_runcommand(
     transport: &OverlayTransport,
     config_dir: &std::path::Path,
@@ -2142,7 +2140,7 @@ async fn handle_runcommand(
 ) {
     let shell_cmds = load_runcommands(config_dir);
     if body.get("requestCommandList").and_then(Value::as_bool) == Some(true) {
-        // The phone-visible list = the shell commands + the cloud lifecycle set.
+        // The phone-visible list = configured commands + cloud inventory reads.
         let mut all = shell_cmds.clone();
         all.extend(cloud_command_entries());
         let list = command_list_json(&all);
@@ -2153,8 +2151,8 @@ async fn handle_runcommand(
         return;
     }
     if let Some(key) = body.get("key").and_then(Value::as_str) {
-        // KDC-MESH-8 — a cloud lifecycle key drives the fleet cloud verbs over
-        // the Bus (paired-gated), not the shell.
+        // KDC-MESH-8 — a cloud inventory key uses the Bus (paired-gated), not a
+        // shell command.
         if let Some(cmd) = CloudCommand::from_key(key) {
             if !paired {
                 let pkt = build_packet(
@@ -2559,13 +2557,13 @@ fn serve_browse(config_dir: &std::path::Path, body: &Value) -> String {
     }
 }
 
-// ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ──
+// ── KDC-MESH-8: cloud inventory commands + telephony + connectivity ──
 //
-// The phone triggers placement-local cloud lifecycle commands (design #12) that drive
-// the QC `action/cloud/*` typed verbs over the Bus — the neutral cloud verb
-// namespace answered by the cloud backend, never a direct worker dependency. Battery + connectivity
-// report on desktops, telephony alerts surface, find-my-device works both ways;
-// pairing is the auth but EVERY action audits (#16, `audit_kdc_action`).
+// The phone reads placement-local cloud inventory through neutral
+// `action/cloud/*` read verbs. Workload lifecycle is deliberately absent because
+// run-command keys carry neither a target generation nor a bounded operation.
+// Battery/connectivity report on desktops, telephony alerts surface, and every
+// paired-device action audits (#16, `audit_kdc_action`).
 
 // ── KDC-MESH-8: telephony alerts + connectivity report ───────────────────────
 

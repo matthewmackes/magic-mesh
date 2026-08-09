@@ -2,8 +2,9 @@
 //!
 //! [`CloudVerb`] classifies a drained `action/cloud/<verb>` token; [`dispatch`] is
 //! the single match that routes a classified verb to its handler. The existing
-//! verbs (list/status/configure) keep their behavior; legacy live provision and
-//! workspace-wide destroy are explicitly refused;
+//! verbs (list/status/configure) keep their behavior; legacy live provision is
+//! explicitly refused, and retired instance lifecycle tokens are rejected before
+//! classification, request parsing, authorization, or backend contact;
 //! the U1a Workloads verbs (set-desired/plan/inventory/output/image-build/
 //! android-provision/browser-provision) land here as typed handlers or honest
 //! gates. Retired `container-deploy` remains classified only for an explicit
@@ -31,6 +32,33 @@ use mackes_mesh_types::cloud::{
 
 use super::runner::CloudRunOutcome;
 use super::CloudWorker;
+
+/// Cloud-owned instance lifecycle ended with the direct runner methods. Keep
+/// these exact old wire tokens recognizable only long enough to return an
+/// actionable no-effect compatibility refusal; they never become [`CloudVerb`]s.
+const RETIRED_INSTANCE_LIFECYCLE_VERBS: &[&str] = &[
+    "destroy",
+    "instance-start",
+    "instance-stop",
+    "instance-reboot",
+    "instance-delete",
+    "instance-start-all",
+    "instance-stop-all",
+    "instance-reboot-all",
+];
+
+fn retired_instance_lifecycle_refusal(verb_name: &str) -> Option<CloudReply> {
+    RETIRED_INSTANCE_LIFECYCLE_VERBS
+        .contains(&verb_name)
+        .then(|| CloudReply {
+            ok: false,
+            verb: verb_name.to_string(),
+            error: Some(format!(
+                "cloud instance lifecycle verb `{verb_name}` is retired; use `action/workload/operation`"
+            )),
+            ..Default::default()
+        })
+}
 
 /// The maximum action body accepted before JSON materialization. Direct callers
 /// and Bus callers share the same RPC-sized boundary.
@@ -106,9 +134,6 @@ pub(crate) enum CloudVerb {
     Provision,
     /// `configure` — `ansible-playbook` over the mesh inventory (MUTATION).
     Configure,
-    /// Retired workspace-wide `destroy` wire verb. Kept classified only so old
-    /// clients receive an explicit refusal instead of an unknown-verb ambiguity.
-    Destroy,
     /// `set-desired` — persist a node's desired-state doc (MUTATION; skeleton, U4).
     SetDesired,
     /// `image-build` — drive a bootc/osbuild image build (MUTATION; skeleton, U7).
@@ -135,7 +160,6 @@ impl CloudVerb {
             "status" => Self::Status,
             "provision" => Self::Provision,
             "configure" => Self::Configure,
-            "destroy" => Self::Destroy,
             v if v == VERB_INVENTORY => Self::Inventory,
             v if v == VERB_OUTPUT => Self::Output,
             v if v == VERB_PLAN => Self::Plan,
@@ -160,7 +184,6 @@ impl CloudVerb {
             self,
             Self::Provision
                 | Self::Configure
-                | Self::Destroy
                 | Self::SetDesired
                 | Self::ImageBuild
                 | Self::ContainerDeploy
@@ -182,16 +205,6 @@ impl CloudVerb {
                 Self::LocalList | Self::Inventory | Self::Output | Self::Plan
             )
     }
-
-    /// Whether performing this verb is destructive (`destroy` / a destructive
-    /// lifecycle op) — the ops audited on the events plane when performed (§7).
-    #[must_use]
-    pub const fn is_destructive(self) -> bool {
-        match self {
-            Self::Destroy => true,
-            _ => false,
-        }
-    }
 }
 
 /// The parsed `action/cloud/*` request body — the fields the worker reads off the
@@ -208,10 +221,7 @@ pub(crate) struct CloudActionBody {
     /// Mutations require a non-empty explicit value.
     #[serde(default)]
     pub node: String,
-    /// A lifecycle op's target instance/domain name.
-    #[serde(default)]
-    pub instance: Option<String>,
-    /// A verb-specific workload name (Android provision and console attach).
+    /// A verb-specific workload name (Android provision).
     #[serde(default)]
     pub name: Option<String>,
     /// Stable reverse-DNS Flatpak identity for `app-provision`.
@@ -238,9 +248,6 @@ pub(crate) struct CloudActionBody {
     /// The armed-token capability authorizing a live mutation (mesh-identity-signed).
     #[serde(default)]
     pub armed_token: Option<String>,
-    /// The typed-arming confirmation a destructive lifecycle request carries.
-    #[serde(default)]
-    pub typed_name: Option<String>,
     /// Set only when the wire body could not be parsed. This is deliberately
     /// outside the wire schema so a malformed body cannot be mistaken for the
     /// valid legacy `{}` read envelope.
@@ -298,6 +305,12 @@ impl CloudActionBody {
 /// implemented mutations run the armed-token gate; skeleton mutations return an
 /// honest `not-yet-wired`. Never panics.
 pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> CloudReply {
+    // This precedes classification and body parsing deliberately. The retired
+    // tokens must not regain placement, schema, authorization, replay, or backend
+    // semantics merely because an old publisher sends executable-looking JSON.
+    if let Some(reply) = retired_instance_lifecycle_refusal(verb_name) {
+        return reply;
+    }
     let Some(verb) = CloudVerb::from_verb(verb_name) else {
         return CloudReply {
             ok: false,
@@ -450,9 +463,8 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
                 return reply;
             }
             let outcome = w.runner.configure();
-            finish_authorized_mutation(w, verb, verb_name, &outcome, None)
+            finish_authorized_mutation(verb_name, &outcome)
         }
-        CloudVerb::Destroy => handle_destroy(w, verb_name, &body),
     }
 }
 
@@ -500,40 +512,14 @@ fn handle_read_roster(w: &CloudWorker, verb_name: &str) -> CloudReply {
     }
 }
 
-/// Workspace-wide destruction is not a valid Workloads operation. Old clients
-/// get an explicit fail-closed reply and must select a row, which routes through
-/// target-scoped `instance-delete`.
-fn handle_destroy(_w: &CloudWorker, verb_name: &str, _body: &CloudActionBody) -> CloudReply {
-    CloudReply {
-        ok: false,
-        verb: verb_name.to_string(),
-        error: Some(
-            "workspace-wide destroy is retired; use target-scoped `instance-delete`".to_string(),
-        ),
-        ..Default::default()
-    }
-}
-
 /// Turn an authorized backend mutation into its reply. Authorization has already
-/// consumed the request's nonce before this function is reached; destructive
-/// operations are audited so `audited: true` remains truthful.
-fn finish_authorized_mutation(
-    w: &CloudWorker,
-    verb: CloudVerb,
-    verb_name: &str,
-    outcome: &CloudRunOutcome,
-    instance: Option<&str>,
-) -> CloudReply {
+/// consumed the request's nonce before this function is reached.
+fn finish_authorized_mutation(verb_name: &str, outcome: &CloudRunOutcome) -> CloudReply {
     let outcome = outcome.clone().require_live_apply(verb_name);
-    let audited = verb.is_destructive();
-    if audited {
-        w.audit(verb_name, instance, &outcome);
-    }
     if outcome.ok {
         CloudReply {
             ok: true,
             verb: verb_name.to_string(),
-            audited,
             ..Default::default()
         }
     } else {
@@ -541,7 +527,6 @@ fn finish_authorized_mutation(
             ok: false,
             verb: verb_name.to_string(),
             error: Some(outcome.summary.clone()),
-            audited,
             ..Default::default()
         }
     }
@@ -552,7 +537,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_supported_verbs_and_retires_legacy_lifecycle_topics() {
+    fn classifies_only_supported_cloud_verbs() {
         assert_eq!(CloudVerb::from_verb("list"), Some(CloudVerb::List));
         assert_eq!(
             CloudVerb::from_verb("list-instances"),
@@ -567,22 +552,11 @@ mod tests {
             CloudVerb::from_verb("provision"),
             Some(CloudVerb::Provision)
         );
-        for verb in [
-            "instance-start",
-            "instance-stop",
-            "instance-reboot",
-            "instance-delete",
-            "instance-start-all",
-            "instance-stop-all",
-            "instance-reboot-all",
-            "container-restart",
-            "container-logs",
-            "container-destroy",
-        ] {
+        for verb in RETIRED_INSTANCE_LIFECYCLE_VERBS {
             assert_eq!(
                 CloudVerb::from_verb(verb),
                 None,
-                "legacy lifecycle topic `{verb}` must be unclassified"
+                "retired instance lifecycle token `{verb}` must have no executable classification"
             );
         }
         // U1a Workloads verbs classify (they were unknown before U2).
@@ -609,7 +583,7 @@ mod tests {
         );
         assert_eq!(CloudVerb::from_verb("frobnicate"), None);
 
-        // read/mutation/destructive classification.
+        // Read/mutation classification covers only executable operations.
         assert!(!CloudVerb::List.is_mutation());
         assert!(!CloudVerb::Inventory.is_mutation());
         assert!(!CloudVerb::Plan.is_mutation());
@@ -623,18 +597,16 @@ mod tests {
         assert!(CloudVerb::AndroidProvision.is_mutation());
         assert!(CloudVerb::BrowserProvision.is_mutation());
         assert!(CloudVerb::AppProvision.is_mutation());
-        assert!(CloudVerb::Destroy.is_destructive());
-        assert!(!CloudVerb::Provision.is_destructive());
     }
 
     #[test]
     fn a_request_body_parses_the_placement_and_arming_fields() {
         let b = CloudActionBody::parse(
-            r#"{"schema_version":1,"node":"eagle","instance":"web","armed_token":"tok","typed_name":"web"}"#,
+            r#"{"schema_version":1,"node":"eagle","name":"web","armed_token":"tok"}"#,
         );
         assert_eq!(b.schema_version, Some(CLOUD_ACTION_SCHEMA_VERSION));
         assert_eq!(b.node, "eagle");
-        assert_eq!(b.instance.as_deref(), Some("web"));
+        assert_eq!(b.name.as_deref(), Some("web"));
         assert_eq!(b.armed_token.as_deref(), Some("tok"));
         // A malformed body is retained as an explicit parse failure rather than
         // being treated as the valid legacy empty read envelope.
@@ -721,41 +693,5 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("valid JSON")));
         assert!(mutation_runner.calls.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn retired_lifecycle_topics_are_refused_before_auth_or_backend() {
-        use std::path::PathBuf;
-        use std::sync::Arc;
-
-        use super::super::runner::fake::FakeRunner;
-        use super::super::CloudWorker;
-
-        let runner = Arc::new(FakeRunner::default());
-        let worker = CloudWorker::new(
-            "me".into(),
-            "peer:me".into(),
-            PathBuf::from("/tmp/mackesd-cloud-verbs-lifecycle-test"),
-        )
-        .with_runner(runner.clone());
-
-        for verb in [
-            "instance-start",
-            "instance-stop",
-            "instance-reboot",
-            "instance-delete",
-            "container-restart",
-            "container-logs",
-            "container-destroy",
-        ] {
-            let body = r#"{"schema_version":1,"node":"me","instance":"web"}"#;
-            let reply = worker.handle(verb, &body);
-            assert!(!reply.ok, "{verb} must be rejected");
-            assert!(reply
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("unknown cloud verb")));
-        }
-        assert!(runner.calls.lock().unwrap().is_empty());
     }
 }

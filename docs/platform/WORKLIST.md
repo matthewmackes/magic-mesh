@@ -122,7 +122,8 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-compute-provision-hard-cut-r8.md`.
 - **Cloud/certificate authority hard cut (2026-08-09):** direct cloud VM apply/lifecycle, shell Provision Apply, and the producerless certificate responder were deleted. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-cert-authority-hard-cut-r9.md`,
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-cloud-contract-truth-r10.md`.
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-retired-cloud-contract-truth-r10.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-09-phone-cloud-lifecycle-hard-cut-r11.md`.
 - **Migration journal checkpoint (2026-08-08):** reconciler-owned cold-
   migration commands are atomically journaled before effects, replay pending
   records after restart, clean applied records without repeating effects, and

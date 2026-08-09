@@ -23,6 +23,10 @@ worklist. Repository paths are the durable owner identifiers.
 - Browser, Workloads/IaC, Datacenter, Explorer, Front Door, chooser, first
   desktop onboarding, and daemon action adapters publish the shared
   `WorkloadOperationRequest` contract.
+- KDE Connect phone cloud commands are inventory-only (`cloud-list` and
+  `cloud-status`). The retired bulk start/stop/reboot commands carried no
+  bounded Workload identity or generation and were deleted rather than
+  translated into an unsafe wildcard operation.
 - `Open` and `StartAndAttach` request a declared `WorkloadAttachmentProtocol`;
   the shell never requests or decodes a raw console `host:port` record.
 - Cloud VM/container day-two verbs and the former cloud console verb are
@@ -47,7 +51,7 @@ worklist. Repository paths are the durable owner identifiers.
 | Datacenter `action/dc/vm-*` responders and `event/dc/vm/*` roster | typed Workload operations and `state/workloads/<node>` | VM verbs and XAPI VM sampling were deleted; retained VM topics are ignored and cannot be republished |
 | XCP `action/provision/*`, `compute/xcp-host/*`, `xcp_provision`, and `xcp_host` | typed Workload operations and backend-specific HostCapacity admission | both workers and the runtime `mackes-xcp` crate were deleted; authority lint rejects their files, modules, registrations, and topics |
 | `compute/create/*`, `compute/create-ack/*`, `compute_provision`, and its producerless certificate responder | typed Workload create operations, canonical sealed-CA enrollment, and `state/workloads/<node>` status | the orphan worker directly ran `virt-install`; it and the obsolete responder had no production publishers, were deleted, and are rejected by authority lint |
-| cloud `provision`, direct instance lifecycle, and shell Provision Apply | typed Workload operations | OpenTofu apply and direct libvirt lifecycle methods were deleted; the retained provision wire verb refuses without consuming authorization or contacting a backend, and authority lint rejects restoration |
+| cloud `provision`, `action/cloud/instance-*`, phone bulk lifecycle, direct instance lifecycle, and shell Provision Apply/legacy lifecycle arm | typed Workload operations | OpenTofu apply and direct libvirt lifecycle methods were deleted; the phone remains read-only, dead shell request builders were removed, retained compatibility verbs refuse without backend contact, and authority lint rejects restoration |
 
 ## Known non-lifecycle runtime tools
 

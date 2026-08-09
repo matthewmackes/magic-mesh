@@ -355,8 +355,9 @@ fn app_card(
                 state.issue_console_attach(&row.node, &row.name, &row.name);
             }
             if row_button(ui, "Start", false).clicked() {
-                state.issue_workload_direct(
-                    "instance-start",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::StartAndAttach,
+                    Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -364,8 +365,9 @@ fn app_card(
                 );
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_workload_direct(
-                    "instance-stop",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Stop,
+                    None,
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -373,8 +375,9 @@ fn app_card(
                 );
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.issue_workload_direct(
-                    "instance-reboot",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Restart,
+                    Some(WorkloadAttachmentProtocol::QemuDisplay1Dmabuf),
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -382,8 +385,9 @@ fn app_card(
                 );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct(
-                    "instance-delete",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Destroy,
+                    None,
                     &row.node,
                     &row.name,
                     row.delivery_type,

@@ -20,10 +20,10 @@
 //!   absent one [`HealthState::Absent`], never a fabricated `up` (§7).
 //! - [`ResourceTable`] / [`HeatStackDetail`] / [`HeatPreview`] — the read-only
 //!   resource tables + the stack (IaC) detail/preview shapes.
-//! - [`CloudInstance`] / [`LifecycleAction`] / [`CloudReply`] +
-//!   [`cloud_action_topic`] — compatibility shapes for the `action/cloud/*`
-//!   command namespace. Direct cloud provision and instance lifecycle mutation
-//!   are retired; workload realization belongs to the typed Workload authority.
+//! - [`CloudInstance`] / [`CloudReply`] / [`cloud_action_topic`] — compatibility
+//!   shapes for the `action/cloud/*` command namespace. Direct cloud provision
+//!   and instance lifecycle mutation are retired; workload realization belongs
+//!   to the typed Workload authority.
 //!
 //! The I/O (minting the mirror, issuing probes, converging the backend) belongs to
 //! the mesh-side worker; only these pure types + parsers are shared, so the
@@ -1444,53 +1444,6 @@ fn hex_decode(text: &str) -> Result<Vec<u8>, &'static str> {
 #[must_use]
 pub fn cloud_action_topic(verb: &str) -> String {
     format!("{CLOUD_ACTION_PREFIX}{verb}")
-}
-
-/// A legacy cloud-instance lifecycle action retained for wire compatibility.
-/// Direct execution through the cloud backend is retired; typed Workload
-/// operations own instance lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LifecycleAction {
-    /// Start a stopped instance.
-    Start,
-    /// Stop a running instance.
-    Stop,
-    /// Reboot an instance (soft reboot) — destructive.
-    Reboot,
-    /// Delete an instance — destructive.
-    Delete,
-}
-
-impl LifecycleAction {
-    /// Map a lifecycle verb name to its action, or `None` for a non-lifecycle verb.
-    #[must_use]
-    pub fn from_verb(verb: &str) -> Option<Self> {
-        match verb {
-            "instance-start" => Some(Self::Start),
-            "instance-stop" => Some(Self::Stop),
-            "instance-reboot" => Some(Self::Reboot),
-            "instance-delete" => Some(Self::Delete),
-            _ => None,
-        }
-    }
-
-    /// The lifecycle sub-verb token (`start` / `stop` / `reboot` / `delete`).
-    #[must_use]
-    pub const fn cli_verb(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Reboot => "reboot",
-            Self::Delete => "delete",
-        }
-    }
-
-    /// Whether this legacy action is destructive (delete/reboot). Consumers may
-    /// use this classification when rejecting or translating old requests.
-    #[must_use]
-    pub const fn is_destructive(self) -> bool {
-        matches!(self, Self::Reboot | Self::Delete)
-    }
 }
 
 /// A cloud instance as the backend reports it — the typed row the `list-instances`

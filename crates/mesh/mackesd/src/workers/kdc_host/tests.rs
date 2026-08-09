@@ -1,8 +1,6 @@
 use super::*;
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
-use mackes_mesh_types::cloud::{
-    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ARM_NODE_SCOPE,
-};
+use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex as StdMutex;
@@ -1773,7 +1771,7 @@ fn connect_verb_sftp_requires_paired_and_enqueues_a_browse_request() {
     assert_eq!(queued[0].packet.kind, "kdeconnect.sftp.request");
 }
 
-// ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ─
+// ── KDC-MESH-8: cloud inventory commands + telephony + connectivity ─
 
 fn instance(name: &str, status: &str) -> CloudInstance {
     CloudInstance {
@@ -1792,24 +1790,31 @@ fn cloud_command_keys_map_and_the_list_includes_them() {
         CloudCommand::from_key("cloud-list"),
         Some(CloudCommand::List)
     );
-    assert_eq!(
-        CloudCommand::from_key("cloud-reboot-all"),
-        Some(CloudCommand::RebootAll)
-    );
+    for retired in ["cloud-start-all", "cloud-stop-all", "cloud-reboot-all"] {
+        assert_eq!(
+            CloudCommand::from_key(retired),
+            None,
+            "phone cloud lifecycle key {retired} must remain retired"
+        );
+    }
     // A shell key isn't a cloud command (so it takes the shell path).
     assert_eq!(CloudCommand::from_key("mesh-health"), None);
     // The phone-visible command list carries the cloud entries.
     let list = command_list_json(&cloud_command_entries());
-    for c in [
-        "cloud-list",
+    for c in ["cloud-list", "cloud-status"] {
+        assert!(list.contains(c), "command list missing {c}");
+    }
+    for retired in [
         "cloud-start-all",
         "cloud-stop-all",
         "cloud-reboot-all",
+        "cloud-delete",
     ] {
-        assert!(list.contains(c), "command list missing {c}");
+        assert!(
+            !list.contains(retired),
+            "phone list must not expose lifecycle key {retired}"
+        );
     }
-    // Delete is deliberately NOT phone-exposed (safety).
-    assert!(!list.contains("cloud-delete"));
     let lower = list.to_ascii_lowercase();
     for term in ["openstack", "nova", "keystone", "heat", "horizon"] {
         assert!(
@@ -1817,58 +1822,6 @@ fn cloud_command_keys_map_and_the_list_includes_them() {
             "phone-visible cloud command list must not expose {term}"
         );
     }
-}
-
-#[test]
-fn lifecycle_bulk_bus_verb_maps_to_the_worker_selected_action() {
-    assert_eq!(
-        lifecycle_bulk_bus_verb(LifecycleAction::Start),
-        "instance-start-all"
-    );
-    assert_eq!(
-        lifecycle_bulk_bus_verb(LifecycleAction::Reboot),
-        "instance-reboot-all"
-    );
-}
-
-#[test]
-fn phone_bulk_authorization_is_placement_body_and_request_bound() {
-    let signer = CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
-    let body = authorize_bulk_body_with_signer(
-        &signer,
-        "eagle",
-        "instance-stop-all",
-        1_000,
-        "0123456789abcdef",
-    )
-    .unwrap();
-    let value: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(value["node"], "eagle");
-    assert_eq!(
-        value["schema_version"],
-        mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
-    );
-    let token = CloudArmedToken::parse(value["armed_token"].as_str().unwrap()).unwrap();
-    assert_eq!(token.verb, "instance-stop-all");
-    assert_eq!(token.node, "eagle");
-    assert_eq!(token.target, CLOUD_ARM_NODE_SCOPE);
-    assert_eq!(token.expires_at_ms, 31_000);
-    assert_eq!(token.request_sha256, cloud_request_digest(&body).unwrap());
-    assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
-
-    let altered = body.replace("eagle", "badger");
-    assert_ne!(
-        token.request_sha256,
-        cloud_request_digest(&altered).unwrap()
-    );
-    assert!(authorize_bulk_body_with_signer(
-        &signer,
-        "bad|node",
-        "instance-stop-all",
-        1_000,
-        "0123456789abcdef",
-    )
-    .is_err());
 }
 
 #[test]
@@ -1928,9 +1881,7 @@ fn kdc_mesh8_a_phone_action_appends_a_hash_chained_audit_row() {
     let tmp = tempdir().unwrap();
     std::env::set_var("MDE_HOME", tmp.path());
     let before = audit_row_count(&crate::default_db_path());
-    audit_kdc_action(
-        json!({ "action": "kdc_cloud", "verb": "instance-reboot", "instance": "web" }),
-    );
+    audit_kdc_action(json!({ "action": "kdc_cloud", "verb": "list-instances-local", "count": 2 }));
     let after = audit_row_count(&crate::default_db_path());
     assert_eq!(
         after,

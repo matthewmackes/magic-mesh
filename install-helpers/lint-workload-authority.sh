@@ -8,6 +8,7 @@ set -euo pipefail
 # Migration map (kept here beside the executable guard):
 #   action/vm/lifecycle       -> action/workload/operation
 #   action/container/lifecycle -> action/workload/operation
+#   action/cloud/instance-*    -> action/workload/operation
 #   VmPowerRequest            -> WorkloadOperationRequest
 # The spawned production actuator is workload_compute, and its typed projection
 # is state/workloads/<node>. Raw console endpoint publication is retired.
@@ -15,6 +16,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 workspace_manifest="$repo_root/Cargo.toml"
 mackesd_manifest="$repo_root/crates/mesh/mackesd/Cargo.toml"
 shell_root="$repo_root/crates/desktop/mde-shell-egui/src"
+phones_hub="$shell_root/phones_hub.rs"
 spawn_file="$repo_root/crates/mesh/mackesd/src/bin/mackesd/spawn.rs"
 workers_mod="$repo_root/crates/mesh/mackesd/src/workers/mod.rs"
 worker_role="$repo_root/crates/mesh/mackesd/src/worker_role.rs"
@@ -22,6 +24,8 @@ cloud_verbs="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs.rs"
 cloud_runner="$repo_root/crates/mesh/mackesd/src/workers/cloud/runner.rs"
 cloud_android_lifecycle="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs/android_lifecycle.rs"
 cloud_cuttlefish="$repo_root/crates/mesh/mackesd/src/workers/cloud/verbs/cuttlefish.rs"
+kdc_cloud="$repo_root/crates/mesh/mackesd/src/workers/kdc_host/cloud.rs"
+shared_cloud="$repo_root/crates/mesh/mackes-mesh-types/src/cloud.rs"
 compute_migrate="$repo_root/crates/mesh/mackesd/src/workers/compute_migrate.rs"
 workload_compute="$repo_root/crates/mesh/mackesd/src/workers/workload_compute.rs"
 service_descriptors="$repo_root/crates/mesh/mackesd/src/descriptors.rs"
@@ -49,11 +53,11 @@ scan_shell() {
   local source_root="$1"
   if command -v rg >/dev/null 2>&1; then
     rg -n --glob '*.rs' --glob '!**/tests.rs' \
-      'action/(vm/lifecycle|container/lifecycle|cloud/(provision|container-deploy))|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::Provision|ProvisionApply|arm_provision|issue\("(provision|container-deploy)"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
+      'action/(vm/lifecycle|container/lifecycle|cloud/(provision|container-deploy|instance-))|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::(Provision|Lifecycle)|ProvisionApply|arm_(provision|lifecycle)|lifecycle_request_body|issue\("(provision|container-deploy)"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
       "$source_root"
   else
     grep -RInE --include='*.rs' --exclude='tests.rs' \
-      'action/(vm/lifecycle|container/lifecycle|cloud/(provision|container-deploy))|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::Provision|ProvisionApply|arm_provision|issue\("(provision|container-deploy)"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
+      'action/(vm/lifecycle|container/lifecycle|cloud/(provision|container-deploy|instance-))|state/vdi/console|console-attach|console_broker|LIFECYCLE_TOPIC|VmPowerRequest|ArmAction::(Provision|Lifecycle)|ProvisionApply|arm_(provision|lifecycle)|lifecycle_request_body|issue\("(provision|container-deploy)"|is_nova_managed|CLOUD_MANAGED_TOOLTIP|Nova-managed' \
       "$source_root"
   fi
 }
@@ -82,7 +86,11 @@ contains_literal() {
 
 production_contains_literal() {
   local needle="$1" file="$2"
-  awk '/#\[cfg\(test\)\]/{exit} {print}' "$file" | grep -Fq -- "$needle"
+  awk -v needle="$needle" '
+    /#\[cfg\(test\)\]/ { exit }
+    index($0, needle) { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$file"
 }
 
 has_durable_migration_boundary() {
@@ -145,7 +153,7 @@ run_self_test() {
     printf '%s\n' 'lint-workload-authority.sh: self-test failed — typed Workloads link was rejected' >&2
     return 1
   fi
-  for retired in 'action/container/lifecycle' 'action/cloud/provision' 'action/cloud/container-deploy' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest' 'ArmAction::Provision' 'ProvisionApply' 'arm_provision' 'issue("provision"' 'issue("container-deploy"' 'is_nova_managed' 'CLOUD_MANAGED_TOOLTIP' 'Nova-managed'; do
+  for retired in 'action/container/lifecycle' 'action/cloud/provision' 'action/cloud/container-deploy' 'action/cloud/instance-start' 'state/vdi/console' 'console-attach' 'console_broker' 'VmPowerRequest' 'ArmAction::Provision' 'ArmAction::Lifecycle' 'ProvisionApply' 'arm_provision' 'arm_lifecycle' 'lifecycle_request_body' 'issue("provision"' 'issue("container-deploy"' 'is_nova_managed' 'CLOUD_MANAGED_TOOLTIP' 'Nova-managed'; do
     printf 'const RETIRED: &str = "%s";\n' "$retired" >"$fixture/src/legacy.rs"
     if ! scan_shell "$fixture/src" >/dev/null 2>&1; then
       printf 'lint-workload-authority.sh: self-test failed — retired fixture was not detected: %s\n' "$retired" >&2
@@ -237,6 +245,7 @@ fi
   && [ -f "$workload_compute" ] && [ -f "$service_descriptors" ] \
   && [ -f "$peer_contracts" ] && [ -f "$desktop_sources" ] \
   && [ -f "$probe_nmap" ] && [ -f "$datacenter" ] \
+  && [ -f "$kdc_cloud" ] && [ -f "$shared_cloud" ] && [ -f "$phones_hub" ] \
   && [ -f "$datacenter_orchestrator" ] && [ -f "$inventory" ] || {
   printf '%s\n' 'lint-workload-authority.sh: authority inventory or daemon registration surfaces are missing' >&2
   exit 1
@@ -325,6 +334,20 @@ if production_contains_literal 'fn provision(&self' "$cloud_runner" \
   || production_contains_literal '.runner.lifecycle' "$cloud_android_lifecycle" \
   || production_contains_literal 'fn lifecycle(' "$cloud_cuttlefish"; then
   printf '%s\n' 'lint-workload-authority.sh: cloud retains a direct VM provision/lifecycle actuator' >&2
+  exit 1
+fi
+
+if production_contains_literal 'cloud-start-all' "$kdc_cloud" \
+  || production_contains_literal 'cloud-stop-all' "$kdc_cloud" \
+  || production_contains_literal 'cloud-reboot-all' "$kdc_cloud" \
+  || production_contains_literal 'instance-start-all' "$kdc_cloud" \
+  || production_contains_literal 'instance-stop-all' "$kdc_cloud" \
+  || production_contains_literal 'instance-reboot-all' "$kdc_cloud" \
+  || production_contains_literal 'cloud-start-all' "$phones_hub" \
+  || production_contains_literal 'cloud-stop-all' "$phones_hub" \
+  || production_contains_literal 'cloud-reboot-all' "$phones_hub" \
+  || production_contains_literal 'pub enum LifecycleAction' "$shared_cloud"; then
+  printf '%s\n' 'lint-workload-authority.sh: phone/shared contracts retain a retired cloud lifecycle publisher' >&2
   exit 1
 fi
 

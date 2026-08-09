@@ -520,10 +520,10 @@ mod tests {
             &s,
             "nonce-abcdef",
             10_000,
-            "destroy",
+            "configure",
             "db.mesh.internal",
-            "database",
-            r#"{"node":"db.mesh.internal","instance":"database"}"#,
+            CLOUD_ARM_NODE_SCOPE,
+            r#"{"node":"db.mesh.internal"}"#,
         );
         // A dotted FQDN node survives the pipe-delimited encoding.
         let back = ArmedToken::parse(&tok.encode()).expect("parse");
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(
             verify_token(
                 Some(&tok.encode()),
-                "destroy",
+                "image-build",
                 "eagle",
                 CLOUD_ARM_NODE_SCOPE,
                 body,

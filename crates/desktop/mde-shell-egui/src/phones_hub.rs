@@ -17,8 +17,8 @@
 //!   roots + a shallow snapshot off the service directory, plus a live deeper browse
 //!   of THIS node over `action/connect/browse`.
 //! * **Commands** — the run-command catalog the phone can trigger (the mesh-ops
-//!   bundle + the KDC-MESH-8 `OpenStack` lifecycle set, with the #16 blast-radius
-//!   flag) + a composer that emits a `runcommands.toml` stanza to drop on a node.
+//!   bundle plus read-only cloud inventory) + a composer that emits a
+//!   `runcommands.toml` stanza to drop on a node.
 //! * **Pair** — the pair-a-phone flow: the KDE Connect device name the phone sees
 //!   (the "Construct Mesh" endpoint name when this node is the mesh-fanout endpoint,
 //!   #8), the reachable overlay address, and the scannable KDC-MESH-4 QR payload.
@@ -270,8 +270,7 @@ struct CatalogCmd {
     name: &'static str,
     /// A short human description of what the phone triggers.
     what: &'static str,
-    /// Fleet-scope blast-radius flag (#16) — the bulk `OpenStack` ops + a service
-    /// restart carry it; the reads don't.
+    /// Fleet-scope blast-radius flag (#16); read-only inventory does not carry it.
     danger: bool,
 }
 
@@ -1069,9 +1068,9 @@ impl PhonesHubState {
             ui.colored_label(
                 Style::TEXT_DIM,
                 RichText::new(
-                    "The curated run-commands the KDE Connect host offers the phone (mesh-ops + \
-                     the fleet OpenStack lifecycle). The phone triggers these; there is no \
-                     arbitrary shell.",
+                    "The curated run-commands the KDE Connect host offers the phone: mesh \
+                     operations plus read-only cloud inventory. VM and container lifecycle stays \
+                     in Workloads.",
                 )
                 .size(Style::SMALL),
             );
@@ -1097,10 +1096,10 @@ impl PhonesHubState {
             }
             ui.add_space(Style::SP_XS);
             ui.colored_label(
-                Style::WARN,
+                Style::TEXT_DIM,
                 RichText::new(
-                    "Blast radius (#16): a paired phone can drive fleet-wide OpenStack lifecycle \
-                     with no per-command confirm — every action is in the audit log.",
+                    "Cloud commands are read-only. Configured mesh service commands remain \
+                     paired-device gated and audited.",
                 )
                 .size(Style::SMALL),
             );
@@ -1575,7 +1574,8 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// The phone-triggerable run-command catalog (mirrors `kdc_host::default_runcommands`
-/// + `cloud_command_entries`, KDC-MESH-8). Danger = fleet-wide blast radius (#16).
+/// + `cloud_command_entries`, KDC-MESH-8). Cloud commands are inventory-only;
+/// phone run-command keys cannot carry a bounded Workload operation identity.
 fn runcommand_catalog() -> Vec<CatalogCmd> {
     vec![
         CatalogCmd {
@@ -1605,7 +1605,7 @@ fn runcommand_catalog() -> Vec<CatalogCmd> {
         CatalogCmd {
             key: "cloud-list",
             name: "Cloud: list instances",
-            what: "every Nova instance + status",
+            what: "every declared instance and its status",
             danger: false,
         },
         CatalogCmd {
@@ -1613,24 +1613,6 @@ fn runcommand_catalog() -> Vec<CatalogCmd> {
             name: "Cloud: status",
             what: "instance counts by status",
             danger: false,
-        },
-        CatalogCmd {
-            key: "cloud-start-all",
-            name: "Cloud: start all instances",
-            what: "starts every SHUTOFF instance",
-            danger: true,
-        },
-        CatalogCmd {
-            key: "cloud-stop-all",
-            name: "Cloud: stop all instances",
-            what: "stops every ACTIVE instance",
-            danger: true,
-        },
-        CatalogCmd {
-            key: "cloud-reboot-all",
-            name: "Cloud: reboot all instances",
-            what: "reboots every ACTIVE instance",
-            danger: true,
         },
     ]
 }
@@ -2151,13 +2133,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_carries_the_openstack_lifecycle_set_with_danger_flags() {
+    fn catalog_keeps_cloud_commands_read_only() {
         let cat = runcommand_catalog();
-        assert!(cat.iter().any(|c| c.key == "cloud-reboot-all" && c.danger));
         assert!(cat.iter().any(|c| c.key == "cloud-list" && !c.danger));
+        assert!(cat.iter().any(|c| c.key == "cloud-status" && !c.danger));
         assert!(cat.iter().any(|c| c.key == "mesh-health"));
-        // Delete is deliberately NOT phone-exposed (safety, KDC-MESH-8).
-        assert!(!cat.iter().any(|c| c.key.contains("delete")));
+        for retired in ["cloud-start-all", "cloud-stop-all", "cloud-reboot-all"] {
+            assert!(
+                !cat.iter().any(|command| command.key == retired),
+                "phone catalog must not restore lifecycle command {retired}"
+            );
+        }
     }
 
     #[test]

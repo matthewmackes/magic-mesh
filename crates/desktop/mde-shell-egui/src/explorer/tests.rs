@@ -84,12 +84,7 @@ fn focused(s: &ExplorerState) -> Unit {
     s.units[idx].clone()
 }
 
-fn assert_armed_workload_call(
-    call: &(String, String),
-    node: &str,
-    instance: &str,
-    action: &str,
-) {
+fn assert_armed_workload_call(call: &(String, String), node: &str, instance: &str, action: &str) {
     assert_eq!(
         call.0,
         mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC
@@ -757,12 +752,9 @@ fn instance_unit(id: &str, name: &str) -> Unit {
 }
 
 #[test]
-fn topic_and_id_mirrors_match_the_worker_contract() {
-    // §6 — the shell's local mirrors must equal the openstack worker's wire.
-    assert_eq!(CLOUD_ACTION_PREFIX, "action/cloud/");
+fn unit_topic_and_id_mirrors_match_the_worker_contract() {
     assert_eq!(UNITS_REQUEST_TOPIC, "action/units/get-stream");
-    assert_eq!(cloud_topic("instance-stop"), "action/cloud/instance-stop");
-    // The Nova id is the aggregator's `cloud:<kind>:<object-id>` tail.
+    // The typed unit id is the aggregator's `cloud:<kind>:<object-id>` tail.
     assert_eq!(
         cloud_object_id(&unit("cloud:instance:uuid-1", UnitKind::Instance, "web", 1)),
         "uuid-1"
@@ -775,7 +767,7 @@ fn topic_and_id_mirrors_match_the_worker_contract() {
 }
 
 #[test]
-fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
+fn instance_lifecycle_verbs_dispatch_over_the_typed_workload_bus() {
     let mut s = ExplorerState::with_fake(
         vec![UnitsState {
             host: "me".into(),
@@ -789,12 +781,7 @@ fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
 
     // Start is non-destructive → fires immediately.
     s.fire(Verb::Start, &u);
-    assert_armed_workload_call(
-        &fake.calls.borrow()[0],
-        "node-a",
-        "i-9",
-        "start",
-    );
+    assert_armed_workload_call(&fake.calls.borrow()[0], "node-a", "i-9", "start");
 
     // The three destructive verbs each publish their own topic once armed.
     for (verb, action) in [
@@ -806,12 +793,7 @@ fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
         s.arm_verb(verb, &u.id);
         s.arm.as_mut().expect("armed").echo = "web".to_string();
         assert!(s.confirm_armed(&u), "the typed-name confirm fires the verb");
-        assert_armed_workload_call(
-            &fake.calls.borrow()[0],
-            "node-a",
-            "i-9",
-            action,
-        );
+        assert_armed_workload_call(&fake.calls.borrow()[0], "node-a", "i-9", action);
         assert!(s.arm.is_none(), "arming clears after the confirm");
     }
 }
@@ -937,7 +919,7 @@ fn verbs_without_a_seam_are_honestly_disabled() {
 }
 
 #[test]
-fn cloud_lifecycle_fails_closed_without_placement_or_authority() {
+fn workload_lifecycle_fails_closed_without_placement() {
     let mut missing_placement = instance_unit("cloud:instance:i", "web");
     missing_placement.reachability = Reachability::InMesh;
     assert!(verb_seam(Verb::Start, &missing_placement).is_err());
@@ -945,15 +927,6 @@ fn cloud_lifecycle_fails_closed_without_placement_or_authority() {
         node: "   ".to_string(),
     };
     assert!(verb_seam(Verb::Start, &missing_placement).is_err());
-
-    let error = authorized_instance_request_with(
-        "instance-start",
-        "i",
-        "bigboy",
-        |_body, _verb, _node, _target| Err("credential unavailable".to_string()),
-    )
-    .expect_err("a missing credential must suppress the request body");
-    assert!(error.contains("credential unavailable"));
 }
 
 #[test]
@@ -2543,18 +2516,8 @@ fn bulk_destructive_is_gated_on_the_typed_count_phrase() {
     assert!(s.confirm_bulk());
     let calls = fake.calls.borrow();
     assert_eq!(calls.len(), 2, "one QC-11 request per marked instance");
-    assert_armed_workload_call(
-        &calls[0],
-        "node-a",
-        "i2",
-        "destroy",
-    );
-    assert_armed_workload_call(
-        &calls[1],
-        "node-a",
-        "i1",
-        "destroy",
-    );
+    assert_armed_workload_call(&calls[0], "node-a", "i2", "destroy");
+    assert_armed_workload_call(&calls[1], "node-a", "i1", "destroy");
     drop(calls);
     assert!(s.bulk_arm.is_none(), "the arm clears after the run");
     let rollup = s.bulk_rollup.as_ref().expect("a rollup landed");

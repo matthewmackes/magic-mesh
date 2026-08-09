@@ -1037,7 +1037,7 @@ fn android_cuttlefish_reply_reads_as_desired_saved_not_live_applied() {
 }
 
 #[test]
-fn ui_mutation_requests_carry_their_explicit_placement_node() {
+fn cloud_configure_and_typed_workload_requests_carry_their_explicit_placement_node() {
     let (_tmp, mut state) = placed_bus_state();
 
     state.perform(ArmAction::Configure, "apply");
@@ -1049,22 +1049,8 @@ fn ui_mutation_requests_carry_their_explicit_placement_node() {
     assert!(CloudArmedToken::parse(configure["armed_token"].as_str().unwrap()).is_some());
 
     // The fixture has one pending-reply slot; clear the unrelated configure
-    // request before proving the retired lifecycle shape cannot publish.
+    // request before proving the typed Workload publication.
     state.mutation_pending = None;
-    state.perform(
-        ArmAction::Lifecycle {
-            verb: "instance-start",
-            node: "otter".to_string(),
-            instance_id: "seat-1".to_string(),
-            name: "seat-1".to_string(),
-        },
-        "seat-1",
-    );
-    assert!(state.mutation_pending.is_none());
-    assert!(state.note_text().is_some_and(
-        |note| note.contains("Legacy lifecycle action") && note.contains("Nothing was sent")
-    ));
-
     state.issue_console_attach("otter", "seat-1", "seat-1");
     assert!(state.mutation_pending.is_none());
     confirm_pending(&mut state);
@@ -1082,6 +1068,10 @@ fn ui_mutation_requests_carry_their_explicit_placement_node() {
     assert_eq!(
         operation.action,
         mackes_mesh_types::workloads::WorkloadOperationAction::Open
+    );
+    assert_eq!(
+        operation.backend,
+        mackes_mesh_types::workloads::WorkloadBackend::LibvirtVirtqemud
     );
     assert_eq!(
         operation.preferred_attachment,
@@ -1293,113 +1283,48 @@ fn prepared_review_sheet_renders_frozen_mutation_facts_before_confirm() {
 }
 
 #[test]
-fn lifecycle_review_sheet_renders_frozen_mutation_facts_before_confirm() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Run);
-    state.bus_root = Some(tmp.path().join("bus"));
-    let body = lifecycle_request_body("eagle", "seat-1", Some("seat-1"));
-    let digest = cloud_request_digest(&body).expect("fixture body has a stable digest");
-
-    state.arm_lifecycle("instance-delete", "eagle", "seat-1", "seat-1");
-
-    let text = rendered_text(|ui| render_review_sheet(ui, &mut state));
-
-    assert!(
-        text.contains("Command") && text.contains("action/cloud/instance-delete"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Subject") && text.contains("workload seat-1"),
-        "{text}"
-    );
-    assert!(text.contains("Target") && text.contains("seat-1"), "{text}");
-    assert!(
-        text.contains("Placement node") && text.contains("eagle"),
-        "{text}"
-    );
-    assert!(
-        text.contains("type \u{201C}seat-1\u{201D} exactly"),
-        "destructive lifecycle actions must retain typed confirmation: {text}"
-    );
-    assert!(
-        text.contains("Body digest") && text.contains(&format!("sha256:{digest}")),
-        "{text}"
-    );
-    assert!(
-        text.contains("Body summary")
-            && text.contains("instance")
-            && text.contains("typed_name")
-            && text.contains("schema_version"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Frozen body")
-            && text.contains("\"instance\":\"seat-1\"")
-            && text.contains("\"typed_name\":\"seat-1\""),
-        "{text}"
-    );
-    assert!(
-        text.contains("Blast radius")
-            && text.contains("one workload")
-            && text.contains("No other node or workload"),
-        "{text}"
-    );
-    assert!(state.mutation_pending.is_none());
-    assert_eq!(
-        emitted_request_count(&state, "instance-delete"),
-        0,
-        "review render must not publish before the exact echo confirms"
-    );
-}
-
-#[test]
-fn lifecycle_reboot_and_delete_are_typed_confirm_gated() {
+fn typed_workload_actions_reject_incomplete_workload_identity() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
     state.bus_root = Some(tmp.path().join("bus"));
-    // A destructive lifecycle op arms on the workload name (the roster row seam).
-    state.arm_lifecycle("instance-delete", "eagle", "seat-1", "seat-1");
-    let arming = state.arming.as_ref().expect("delete opens the confirm");
-    assert_eq!(arming.action.verb(), "instance-delete");
-    assert_eq!(arming.action.echo(), "seat-1");
-    assert!(state.mutation_pending.is_none() && state.note.is_none());
-    // The armed confirm panel still tessellates.
-    assert!(run_panel(&mut state), "the arming confirm drew nothing");
 
-    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
-    state.perform(
-        ArmAction::Lifecycle {
-            verb: "instance-delete",
-            node: "eagle".to_string(),
-            instance_id: "seat-1".to_string(),
-            name: "seat-1".to_string(),
-        },
+    state.issue_workload_operation(
+        WorkloadOperationAction::Destroy,
+        None,
+        "",
+        "seat-1",
+        DeliveryType::DesktopVm,
         "seat-1",
     );
-    assert!(state.mutation_pending.is_none());
-    assert!(state.note_text().is_some_and(
-        |note| note.contains("Legacy lifecycle action") && note.contains("Nothing was sent")
-    ));
-}
-
-#[test]
-fn lifecycle_and_console_actions_reject_incomplete_workload_identity() {
-    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
-
-    state.arm_lifecycle("instance-delete", "eagle", "seat-1", "");
     assert!(
         !state.has_arming(),
-        "blank names must not open delete confirmation"
+        "blank placement must not open typed Workload confirmation"
     );
     assert!(state
         .note_text()
-        .is_some_and(|note| note.contains("identity is incomplete")));
+        .is_some_and(|note| note.contains("placement or identity is missing")));
 
     state.note = None;
-    state.arm_lifecycle("instance-delete", "eagle", "", "seat-1");
+    state.issue_workload_operation(
+        WorkloadOperationAction::Destroy,
+        None,
+        "eagle",
+        "",
+        DeliveryType::DesktopVm,
+        "seat-1",
+    );
     assert!(
         !state.has_arming(),
-        "blank instance ids must not open delete confirmation"
+        "blank workload ids must not open typed Workload confirmation"
+    );
+    let persist =
+        Persist::open(state.bus_root.clone().expect("fixture bus root")).expect("open fixture bus");
+    assert!(
+        persist
+            .read_latest(mackes_mesh_types::workloads::WORKLOAD_OPERATION_TOPIC)
+            .expect("read typed Workload topic")
+            .is_none(),
+        "incomplete typed identities must never publish"
     );
 
     state.note = None;

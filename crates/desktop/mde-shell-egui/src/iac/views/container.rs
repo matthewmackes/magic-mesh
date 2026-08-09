@@ -58,8 +58,9 @@ fn container_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadR
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Restart", false).clicked() {
-                state.issue_workload_direct(
-                    "container-restart",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Restart,
+                    None,
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -67,8 +68,9 @@ fn container_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadR
                 );
             }
             if row_button(ui, "Logs", false).clicked() {
-                state.issue_workload_direct(
-                    "container-logs",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Open,
+                    Some(WorkloadAttachmentProtocol::Logs),
                     &row.node,
                     &row.name,
                     row.delivery_type,
@@ -76,8 +78,9 @@ fn container_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadR
                 );
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.issue_workload_direct(
-                    "container-destroy",
+                state.issue_workload_operation(
+                    WorkloadOperationAction::Destroy,
+                    None,
                     &row.node,
                     &row.name,
                     row.delivery_type,

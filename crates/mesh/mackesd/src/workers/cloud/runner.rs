@@ -159,7 +159,7 @@ pub(crate) const TOOL_LIBVIRT: &str = "libvirt";
 pub(crate) const BACKEND_TOOLS: [&str; 3] = [TOOL_TOFU, TOOL_ANSIBLE, TOOL_LIBVIRT];
 
 /// The honest outcome of one runner op — its success, a short human summary, and
-/// whether a live mutation was actually attempted (drives the reply's `audited`).
+/// whether a live mutation was actually attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudRunOutcome {
     /// Whether the op succeeded.

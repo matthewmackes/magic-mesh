@@ -616,37 +616,10 @@ impl UnitsClient for BusUnits {
 
 // ─────────────────────── the action-dispatch seam (EXPLORER-5) ───────────────────────
 
-/// Legacy cloud lifecycle mirrors retained only for the historical contract
-/// tests. Runtime Explorer dispatch uses [`WORKLOAD_OPERATION_TOPIC`]
-/// exclusively; no `action/cloud/instance-*` publisher remains reachable.
-#[cfg(test)]
-const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
-
 /// The aggregator's E9 pull verb — a mirror of
 /// `mackesd::workers::unit_aggregator::verb::UNITS_REQUEST_TOPIC`. Publishing an
 /// (empty) request forces a fresh live unit stream: the honest "health-check".
 const UNITS_REQUEST_TOPIC: &str = "action/units/get-stream";
-
-/// Historical topic formatting retained only by the legacy contract tests.
-#[cfg(test)]
-fn cloud_topic(verb: &str) -> String {
-    format!("{CLOUD_ACTION_PREFIX}{verb}")
-}
-
-/// Exact cloud lifecycle request before its short-lived capability is inserted.
-#[cfg(test)]
-#[derive(Debug, Serialize)]
-struct InstanceReq {
-    /// Current typed cloud-action wire schema.
-    schema_version: u16,
-    /// Placement node that reported the cloud object.
-    node: String,
-    /// Cloud server id (or name) to act on.
-    instance: String,
-    /// Destructive delete confirmation, bound to the exact target.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    typed_name: Option<String>,
-}
 
 /// The injectable publish seam over the Bus — production writes each request
 /// through [`Persist`] ([`BusActions`]); tests inject a recording fake so the
@@ -825,41 +798,17 @@ enum HeroAction {
     },
 }
 
-#[cfg(test)]
-fn authorized_instance_request_with(
-    verb: &str,
-    instance: &str,
-    node: &str,
-    authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
-) -> Result<String, String> {
-    let body = serde_json::to_string(&InstanceReq {
-        schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
-        node: node.to_string(),
-        instance: instance.to_string(),
-        typed_name: (verb == "instance-delete").then(|| instance.to_string()),
-    })
-    .map_err(|error| error.to_string())?;
-    authorize(&body, verb, node, instance)
-}
-
 /// Resolve a verb on `unit` to its real seam, or an honest reason it is disabled
 /// (§7 — a verb with no reachable seam is never a live no-op button).
 fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
-    let cloud = |stem: &'static str| {
+    let workload = |action: WorkloadOperationAction| {
         let Reachability::CloudObject { node } = &unit.reachability else {
-            return Err("Cloud lifecycle requires an explicit placement node.".to_string());
+            return Err("Workload operation requires an explicit placement node.".to_string());
         };
         let node = node.trim();
         if node.is_empty() {
-            return Err("Cloud lifecycle requires an explicit placement node.".to_string());
+            return Err("Workload operation requires an explicit placement node.".to_string());
         }
-        let action = match stem {
-            "instance-start" => WorkloadOperationAction::Start,
-            "instance-stop" => WorkloadOperationAction::Stop,
-            "instance-reboot" => WorkloadOperationAction::Restart,
-            "instance-delete" => WorkloadOperationAction::Destroy,
-            _ => return Err(format!("Unsupported instance lifecycle verb: {stem}")),
-        };
         Ok(HeroAction::Workload {
             action,
             workload_id: format!("vm:{node}:{}", cloud_object_id(unit)),
@@ -874,16 +823,16 @@ fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
             }),
             _ => Err("No console endpoint reported yet.".to_string()),
         },
-        Verb::Start => cloud("instance-start"),
-        Verb::Stop => cloud("instance-stop"),
-        Verb::Reboot => cloud("instance-reboot"),
-        Verb::Delete => cloud("instance-delete"),
+        Verb::Start => workload(WorkloadOperationAction::Start),
+        Verb::Stop => workload(WorkloadOperationAction::Stop),
+        Verb::Reboot => workload(WorkloadOperationAction::Restart),
+        Verb::Delete => workload(WorkloadOperationAction::Destroy),
         Verb::Inspect => Ok(HeroAction::Goto {
             verb: "shell/goto/instances".to_string(),
             headline: format!("Open the Cloud surface to inspect {}.", unit.name),
         }),
         Verb::ObjectDelete => Err(format!(
-            "{} deletion isn't on the cloud bus yet — instance lifecycle only.",
+            "{} deletion isn't on the Workloads bus yet — workload operations only.",
             unit.kind.label()
         )),
         Verb::OpenInFleet => Ok(HeroAction::Goto {
