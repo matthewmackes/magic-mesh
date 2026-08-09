@@ -121,9 +121,9 @@ behavioral evidence is not completion.
 - **Authority/contract hardening (2026-08-09):** lifecycle/provision bypasses were deleted; attachment identity, restart replay, and Display1 ownership fail closed. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-contract-restart-display1-hardening-r12.md`.
 - **Cloud/Workload recovery checkpoints (2026-08-09):** production authorization and late/replaced Bus activation preserve durable mutation/reply output:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-09-cloud-production-compile-r14.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`.
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-scheduler-bus-transaction-recovery-r75.md`.
 - **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
   repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
@@ -420,12 +420,12 @@ behavioral evidence is not completion.
   fails closed and atomic temporary files are cleaned on failure. Machine 194
   passed 3/3 focused tests; Dell deployment proof remains:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
-- **Compute/Cloud/Storage Bus recovery checkpoints (2026-08-09):** late/replaced storage now preserves firewall, Cloud, and physical-storage transaction truth;
-  complete reads precede effects; authorization/pending output prevents repeats. Gates: `docs/platform/evidence/WL-ARCH-009-2026-08-09-compute-bus-recovery-r12.md`,
+- **Compute Bus recovery (2026-08-09):** complete reads and durable pending output preserve Cloud/storage/workload/migration/scheduler truth across late/replaced Bus:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
-  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`.
+  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-scheduler-bus-transaction-recovery-r75.md`.
 - **Action Bus recovery checkpoint (2026-08-09):** startup retries Bus open/tail priming as one fail-closed activation, skips retained actions, and executes one
   forward signed action exactly once; BigBoy passed three tests:
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-action-bus-recovery-r14.md`.

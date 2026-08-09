@@ -20,12 +20,12 @@
 //!   [`plan_placement`] (what to publish) never touch the bus or a clock
 //!   (`now_ms` is passed in).
 //! - The sole outward seam is an injectable [`Publisher`] (production
-//!   [`BusPublisher`] writes only the non-privileged placement and desired-state
-//!   event topics; a `RecordingPublisher` drives the tests). The action-topic
-//!   drain + capacity read are the same short sync
-//!   `Persist` open-read-drop `vm_lifecycle` uses (never crosses an `.await`),
-//!   and the cursor is primed to the newest message on start so a restart
-//!   doesn't re-propose a queued placement.
+//!   [`BusPublisher`] writes only non-privileged placement, desired-state, and
+//!   correlated reply topics). Each pass resolves and generation-checks a fresh
+//!   Bus connection, stages complete bounded reads before publication, and uses
+//!   a durable host-local outbox to recover required outputs without repeating
+//!   already-visible proposal rows. Every newly observed Bus index atomically
+//!   tail-primes retained transient actions before admitting forward work.
 //! - Rank-0-default like `vm_lifecycle` / `container` (runs on every node). An
 //!   **interim** lowest-node-id single-actor election ([`is_leader`]) keeps N
 //!   nodes each running this worker from emitting N duplicate placements — it's
@@ -60,10 +60,18 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+use mde_bus::rpc::reply_topic;
+use sha2::{Digest, Sha256};
 
 use super::kvm_health::KvmHealth;
 use super::{ShutdownToken, Worker};
@@ -405,32 +413,262 @@ pub fn replace_decisions(
 
 // ─────────────────────────── bus + worker ───────────────────────────
 
-/// The outward publish seam. Production wires [`BusPublisher`]; tests wire a
-/// recorder so the request → publish wiring runs without an `mde-bus` binary.
-pub trait Publisher {
-    /// Publish `body` to `topic`. Best-effort (a failed publish is swallowed,
-    /// like every other tick-publisher).
-    fn publish(&self, topic: &str, body: &str);
+const MAX_ACTIONS_PER_SWEEP: usize = 64;
+const MAX_TOPIC_PAGE: usize = 64;
+const OUTBOX_DIR: &str = "scheduler-outbox";
+const MAX_OUTBOX_RECORDS: usize = 128;
+const MAX_OUTBOX_RECORD_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusIdentity {
+    device: u64,
+    inode: u64,
 }
 
-/// Production [`Publisher`]: an in-process [`crate::bus_publish`] write (perf-10
-/// / arch-6) — no fork+exec of the `mde-bus` CLI (a whole process + a fresh
-/// SQLite open + a [`crate::proc_reap`] reaper thread) per publish. Byte-identical
-/// stored row to the old `mde-bus publish <topic> --body-flag <body>`. Targets
-/// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT` — the SAME
-/// root the fork+exec'd CLI resolved via the inherited env). A `None` root /
-/// failed open / write is swallowed (pre-RPM dev-box parity).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SchedulerReply {
+    schema_version: u16,
+    accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<PlacementDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingOutput {
+    topic: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SchedulerOutboxRecord {
+    schema_version: u16,
+    record_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action_ulid: Option<String>,
+    outputs: Vec<PendingOutput>,
+}
+
+struct SchedulerOutbox {
+    root: PathBuf,
+}
+
+impl SchedulerOutbox {
+    fn open(state_root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(state_root)?;
+        let root = state_root.join(OUTBOX_DIR);
+        fs::create_dir_all(&root)?;
+        let metadata = fs::symlink_metadata(&root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "scheduler outbox is not a regular directory",
+            ));
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        Ok(Self { root })
+    }
+
+    fn path(&self, record_id: &str) -> PathBuf {
+        self.root.join(format!("{record_id}.json"))
+    }
+
+    fn validate(record: &SchedulerOutboxRecord) -> io::Result<()> {
+        if record.schema_version != 1
+            || record.record_id.is_empty()
+            || record.record_id.len() > 96
+            || !record
+                .record_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || record.outputs.is_empty()
+            || record.outputs.len() > 3
+            || record.outputs.iter().any(|output| {
+                output.topic.starts_with("action/")
+                    || !(output.topic == PLACEMENTS_TOPIC
+                        || output.topic == DESIRED_TOPIC
+                        || output.topic.starts_with("reply/"))
+            })
+        {
+            return Err(io::Error::other(
+                "scheduler outbox record failed validation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn store(&self, record: &SchedulerOutboxRecord) -> io::Result<()> {
+        Self::validate(record)?;
+        let destination = self.path(&record.record_id);
+        if !destination.exists() {
+            let retained = fs::read_dir(&self.root)?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|value| value == "json")
+                })
+                .count();
+            if retained >= MAX_OUTBOX_RECORDS {
+                return Err(io::Error::other("scheduler outbox is at capacity"));
+            }
+        }
+        let body = serde_json::to_vec(record).map_err(io_other)?;
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_OUTBOX_RECORD_BYTES {
+            return Err(io::Error::other("scheduler outbox record is oversized"));
+        }
+        let temporary = self.root.join(format!(
+            ".{}.{}.{}.tmp",
+            record.record_id,
+            std::process::id(),
+            now_ms()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        if let Err(error) = file.write_all(&body).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        fs::File::open(&self.root)?.sync_all()
+    }
+
+    fn decode(&self, path: &Path) -> io::Result<SchedulerOutboxRecord> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_OUTBOX_RECORD_BYTES
+        {
+            return Err(io::Error::other(
+                "scheduler outbox contains an unsafe record",
+            ));
+        }
+        let record: SchedulerOutboxRecord =
+            serde_json::from_slice(&fs::read(path)?).map_err(io_other)?;
+        Self::validate(&record)?;
+        if self.path(&record.record_id) != path {
+            return Err(io::Error::other(
+                "scheduler outbox filename does not match its record",
+            ));
+        }
+        Ok(record)
+    }
+
+    fn load(&self, record_id: &str) -> io::Result<Option<SchedulerOutboxRecord>> {
+        let path = self.path(record_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.decode(&path).map(Some)
+    }
+
+    fn pending(&self) -> io::Result<Vec<SchedulerOutboxRecord>> {
+        let mut paths = fs::read_dir(&self.root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|value| value == "json"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.len() > MAX_OUTBOX_RECORDS {
+            return Err(io::Error::other(
+                "scheduler outbox exceeds its bounded capacity",
+            ));
+        }
+        paths.iter().map(|path| self.decode(path)).collect()
+    }
+
+    fn remove(&self, record_id: &str) -> io::Result<()> {
+        match fs::remove_file(self.path(record_id)) {
+            Ok(()) => fs::File::open(&self.root)?.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The outward publication seam. Production writes through the already-open,
+/// generation-checked Bus transaction; tests may inject precise write faults.
+pub trait Publisher {
+    /// Compatibility publication seam used by sibling onboarding workers.
+    fn publish(&self, topic: &str, body: &str);
+
+    /// Scheduler transaction publication. Existing external implementors retain
+    /// their two-argument API; production overrides this method so failures and
+    /// the exact staged Bus connection remain visible.
+    fn publish_transaction(&self, _persist: &Persist, topic: &str, body: &str) -> io::Result<()> {
+        self.publish(topic, body);
+        Ok(())
+    }
+}
+
+/// Production publisher. Scheduler-owned transactions use
+/// [`Publisher::publish_transaction`] so write errors remain visible.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BusPublisher;
 
 impl Publisher for BusPublisher {
     fn publish(&self, topic: &str, body: &str) {
-        if let Some(mut persist) =
-            crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
+        if let Ok(persist) =
+            Persist::open(scheduler_bus_root_or_system(mde_bus::default_data_dir()))
         {
-            crate::bus_publish::publish_body(&mut persist, topic, body);
+            let _ = persist.write(topic, Priority::Default, None, Some(body));
         }
     }
+
+    fn publish_transaction(&self, persist: &Persist, topic: &str, body: &str) -> io::Result<()> {
+        persist
+            .write(topic, Priority::Default, None, Some(body))
+            .map(|_| ())
+            .map_err(io_other)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BusTransaction<'a> {
+    persist: &'a Persist,
+    root: &'a Path,
+    identity: BusIdentity,
+}
+
+impl BusTransaction<'_> {
+    fn verify_current(self) -> io::Result<()> {
+        if bus_identity(self.root)? != self.identity {
+            return Err(io::Error::other(
+                "scheduler Bus index changed during transaction",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct StagedRecord {
+    record: SchedulerOutboxRecord,
+    already_present: Vec<bool>,
+}
+
+struct StagedSweep {
+    pending: Vec<StagedRecord>,
+    actions: Vec<mde_bus::persist::StoredMessage>,
+    capacity: BTreeMap<NodeId, KvmHealth>,
+    desired: Vec<DesiredPlacement>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SchedulerBusFaults {
+    fail_action_reads: std::sync::atomic::AtomicU64,
+    fail_capacity_reads: std::sync::atomic::AtomicU64,
+    fail_desired_reads: std::sync::atomic::AtomicU64,
+    replace_index_after_open: std::sync::Mutex<Option<PathBuf>>,
 }
 
 /// MV-5b — the "who is alive right now" seam the failover tick reads. Production
@@ -462,80 +700,76 @@ impl LiveDirectory for PeerDirectory {
     }
 }
 
-/// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring `vm_lifecycle`.
-fn read_new_requests(bus_root: &Path, cursor: &mut Option<String>) -> Vec<PlaceRequest> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
-        return vec![];
-    };
-    let mut out = Vec::new();
-    for msg in msgs {
-        *cursor = Some(msg.ulid.clone());
-        let body = msg.body.as_deref().unwrap_or("");
-        match parse_request(body) {
-            Ok(r) => out.push(r),
-            Err(e) => tracing::warn!(ulid = %msg.ulid, error = %e, "scheduler: bad place request"),
+fn io_other(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+fn bus_identity(root: &Path) -> io::Result<BusIdentity> {
+    let metadata = fs::metadata(root.join("index.sqlite"))?;
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "scheduler Bus index is not a regular file",
+        ));
+    }
+    Ok(BusIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn scheduler_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
+}
+
+fn read_topic_complete(
+    persist: &Persist,
+    topic: &str,
+) -> io::Result<Vec<mde_bus::persist::StoredMessage>> {
+    let mut messages = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = persist
+            .list_since_limit(topic, cursor.as_deref(), MAX_TOPIC_PAGE)
+            .map_err(io_other)?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(|message| message.ulid.clone());
+        let complete = page.len() < MAX_TOPIC_PAGE;
+        messages.extend(page);
+        if complete {
+            break;
         }
     }
-    out
+    Ok(messages)
 }
 
-/// Fold the latest `event/kvm/services` per node into a capacity map. A short
-/// sync open-read-drop like [`read_new_requests`].
-fn read_capacity(bus_root: &Path) -> BTreeMap<NodeId, KvmHealth> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return BTreeMap::new();
-    };
-    let Ok(msgs) = persist.list_since(super::kvm_health::SERVICES_TOPIC, None) else {
-        return BTreeMap::new();
-    };
-    let bodies: Vec<String> = msgs
-        .into_iter()
-        .map(|m| m.body.unwrap_or_default())
-        .collect();
-    fold_capacity(bodies.iter().map(String::as_str))
+fn topic_contains(persist: &Persist, topic: &str, body: &str) -> io::Result<bool> {
+    Ok(read_topic_complete(persist, topic)?
+        .iter()
+        .any(|message| message.body.as_deref() == Some(body)))
 }
 
-/// MV-5b — read the persisted desired-state, folded latest-wins-by-key
-/// ([`fold_desired`]). A short sync open-read-drop like [`read_capacity`]; the
-/// `event/schedule/desired` log survives a restart / leader change, so the leader
-/// that takes over on failover sees the full intent even though it never handled
-/// the original request.
-fn read_desired(bus_root: &Path) -> Vec<DesiredPlacement> {
-    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
-        return vec![];
-    };
-    let Ok(msgs) = persist.list_since(DESIRED_TOPIC, None) else {
-        return vec![];
-    };
-    let bodies: Vec<String> = msgs
-        .into_iter()
-        .map(|m| m.body.unwrap_or_default())
-        .collect();
-    fold_desired(bodies.iter().map(String::as_str))
-        .into_values()
-        .collect()
+#[cfg(test)]
+fn take_fault(counter: &std::sync::atomic::AtomicU64) -> bool {
+    use std::sync::atomic::Ordering;
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
 }
 
-/// Seed the cursor to the newest existing message so a (re)start doesn't
-/// re-execute a queued placement. `None` when the topic is empty.
-fn prime_cursor(bus_root: &Path) -> Option<String> {
-    let persist = Persist::open(bus_root.to_path_buf()).ok()?;
-    let msgs = persist.list_since(ACTION_TOPIC, None).ok()?;
-    msgs.last().map(|m| m.ulid.clone())
-}
-
-fn default_bus_root() -> Option<PathBuf> {
-    // Keep the action reader on the same resolver as every other daemon-side
-    // worker.  In production this is the shared `/run/mde-bus` spool through
-    // `MDE_BUS_ROOT`; the per-home fallback remains available for standalone
-    // development runs.  The publisher already used this resolver, so using a
-    // hand-rolled `dirs::data_dir()` path here could silently split requests
-    // from their placement events.
-    mde_bus::default_data_dir()
+#[cfg(test)]
+fn install_replacement_index(root: &Path, replacement: &Path) -> io::Result<()> {
+    for sidecar in ["index.sqlite-wal", "index.sqlite-shm"] {
+        match fs::remove_file(root.join(sidecar)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::rename(replacement, root.join("index.sqlite"))
 }
 
 fn now_ms() -> u64 {
@@ -556,8 +790,13 @@ pub struct SchedulerWorker {
     live_dir: Box<dyn LiveDirectory + Send + Sync>,
     /// Action-drain cadence.
     poll: Duration,
-    /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
+    /// Bus root override (tests). `None` resolves current/system per pass.
     bus_root_override: Option<PathBuf>,
+    bus_identity: Option<BusIdentity>,
+    cursor: Option<String>,
+    state_root: PathBuf,
+    #[cfg(test)]
+    bus_faults: Arc<SchedulerBusFaults>,
 }
 
 impl SchedulerWorker {
@@ -574,6 +813,14 @@ impl SchedulerWorker {
             }),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            bus_identity: None,
+            cursor: None,
+            state_root: crate::default_db_path()
+                .parent()
+                .map(|parent| parent.join("scheduler"))
+                .unwrap_or_else(|| PathBuf::from("/var/lib/mde/scheduler")),
+            #[cfg(test)]
+            bus_faults: Arc::new(SchedulerBusFaults::default()),
         }
     }
 
@@ -606,95 +853,420 @@ impl SchedulerWorker {
         self
     }
 
-    fn bus_root(&self) -> Option<PathBuf> {
-        self.bus_root_override.clone().or_else(default_bus_root)
+    #[cfg(test)]
+    fn with_state_root(mut self, root: PathBuf) -> Self {
+        self.state_root = root;
+        self
     }
 
-    /// Drain new placement requests (advancing the cursor) and, when this node
-    /// is the elected scheduler, choose a node for each and publish only the
-    /// non-privileged decision + desired-state proposal.
-    async fn drain_and_place(&self, bus_root: &Path, cursor: &mut Option<String>) {
-        let requests = read_new_requests(bus_root, cursor);
-        if requests.is_empty() {
-            return;
+    #[cfg(test)]
+    fn with_bus_faults(mut self, faults: Arc<SchedulerBusFaults>) -> Self {
+        self.bus_faults = faults;
+        self
+    }
+
+    fn bus_root(&self) -> PathBuf {
+        scheduler_bus_root_or_system(
+            self.bus_root_override
+                .clone()
+                .or_else(mde_bus::default_data_dir),
+        )
+    }
+
+    fn open_bus(&self) -> io::Result<(PathBuf, Persist, BusIdentity)> {
+        let root = self.bus_root();
+        let identity_before = match bus_identity(&root) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                drop(Persist::open(root.clone()).map_err(io_other)?);
+                bus_identity(&root)?
+            }
+            Err(error) => return Err(error),
+        };
+        let persist = Persist::open(root.clone()).map_err(io_other)?;
+        #[cfg(test)]
+        if let Some(replacement) = self
+            .bus_faults
+            .replace_index_after_open
+            .lock()
+            .expect("scheduler open replacement mutex")
+            .take()
+        {
+            install_replacement_index(&root, &replacement)?;
         }
-        let capacity = read_capacity(bus_root);
-        // Only the elected node acts; non-leaders still advanced their cursor
-        // above, so the leader handles new requests from its own cursor (a
-        // deliberate no-catch-up-on-failover — that's MV-5b).
-        if !is_leader(&self.host, &capacity) {
-            return;
+        let identity_after = bus_identity(&root)?;
+        if identity_before != identity_after {
+            return Err(io::Error::other(
+                "scheduler Bus index changed while opening transaction",
+            ));
         }
-        for req in requests {
-            match plan_placement(&capacity, &req, now_ms()) {
-                Some(p) => {
-                    let Ok(decision_body) = serde_json::to_string(&p.decision) else {
-                        continue;
-                    };
-                    self.publisher.publish(PLACEMENTS_TOPIC, &decision_body);
-                    // MV-5b — persist the desired-state so the intent survives a
-                    // restart / leader change and the failover tick can re-place
-                    // this workload if its node is later lost. This is an event,
-                    // never input to a privileged actuator.
-                    if let Ok(desired_body) = serde_json::to_string(&p.desired) {
-                        self.publisher.publish(DESIRED_TOPIC, &desired_body);
-                    }
-                    tracing::info!(
-                        kind = ?req.kind, chosen = %p.chosen_host,
-                        "scheduler: placement proposed; privileged execution requires an operator-authorized typed request",
-                    );
+        Ok((root, persist, identity_after))
+    }
+
+    fn stage_pending(
+        &self,
+        persist: &Persist,
+        outbox: &SchedulerOutbox,
+    ) -> io::Result<Vec<StagedRecord>> {
+        outbox
+            .pending()?
+            .into_iter()
+            .map(|record| {
+                let already_present = record
+                    .outputs
+                    .iter()
+                    .map(|output| topic_contains(persist, &output.topic, &output.body))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Ok(StagedRecord {
+                    record,
+                    already_present,
+                })
+            })
+            .collect()
+    }
+
+    fn stage_sweep(
+        &self,
+        transaction: BusTransaction<'_>,
+        outbox: &SchedulerOutbox,
+    ) -> io::Result<StagedSweep> {
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_action_reads) {
+            return Err(io::Error::other("injected scheduler action read failure"));
+        }
+        let actions = transaction
+            .persist
+            .list_since_limit(ACTION_TOPIC, self.cursor.as_deref(), MAX_ACTIONS_PER_SWEEP)
+            .map_err(io_other)?;
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_capacity_reads) {
+            return Err(io::Error::other("injected scheduler capacity read failure"));
+        }
+        let capacity_messages =
+            read_topic_complete(transaction.persist, super::kvm_health::SERVICES_TOPIC)?;
+        #[cfg(test)]
+        if take_fault(&self.bus_faults.fail_desired_reads) {
+            return Err(io::Error::other("injected scheduler desired read failure"));
+        }
+        let desired_messages = read_topic_complete(transaction.persist, DESIRED_TOPIC)?;
+        let pending = self.stage_pending(transaction.persist, outbox)?;
+        transaction.verify_current()?;
+        let capacity_bodies = capacity_messages
+            .iter()
+            .map(|message| message.body.as_deref().unwrap_or(""));
+        let desired_bodies = desired_messages
+            .iter()
+            .map(|message| message.body.as_deref().unwrap_or(""));
+        Ok(StagedSweep {
+            pending,
+            actions,
+            capacity: fold_capacity(capacity_bodies),
+            desired: fold_desired(desired_bodies).into_values().collect(),
+        })
+    }
+
+    fn deliver_record(
+        &self,
+        transaction: BusTransaction<'_>,
+        outbox: &SchedulerOutbox,
+        staged: &StagedRecord,
+        cleanup: bool,
+    ) -> io::Result<()> {
+        for (output, present) in staged.record.outputs.iter().zip(&staged.already_present) {
+            if !present {
+                self.publisher.publish_transaction(
+                    transaction.persist,
+                    &output.topic,
+                    &output.body,
+                )?;
+                transaction.verify_current()?;
+            }
+        }
+        if cleanup {
+            transaction.verify_current()?;
+            outbox.remove(&staged.record.record_id)?;
+            if let Err(error) = transaction.verify_current() {
+                outbox.store(&staged.record)?;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        transaction: BusTransaction<'_>,
+        outbox: &SchedulerOutbox,
+    ) -> io::Result<()> {
+        let tail = transaction
+            .persist
+            .latest_ulid(ACTION_TOPIC)
+            .map_err(io_other)?;
+        let pending = self.stage_pending(transaction.persist, outbox)?;
+        transaction.verify_current()?;
+        for staged in &pending {
+            self.deliver_record(transaction, outbox, staged, false)?;
+        }
+        transaction.verify_current()?;
+        let mut removed = Vec::new();
+        for staged in &pending {
+            if let Err(error) = outbox.remove(&staged.record.record_id) {
+                for prior in &removed {
+                    let _ = outbox.store(prior);
                 }
-                None => tracing::warn!(
-                    target: "mackesd::alert",
-                    "ALERT (warn): scheduler found no healthy candidate for a place request — dropping",
+                return Err(error);
+            }
+            removed.push(staged.record.clone());
+        }
+        if let Err(error) = transaction.verify_current() {
+            for record in &removed {
+                let _ = outbox.store(record);
+            }
+            return Err(error);
+        }
+        self.cursor = tail;
+        self.bus_identity = Some(transaction.identity);
+        Ok(())
+    }
+
+    fn action_record(
+        &self,
+        message: &mde_bus::persist::StoredMessage,
+        capacity: &BTreeMap<NodeId, KvmHealth>,
+    ) -> io::Result<SchedulerOutboxRecord> {
+        let parsed = parse_request(message.body.as_deref().unwrap_or(""));
+        let (mut outputs, reply) = match parsed {
+            Err(error) => (
+                Vec::new(),
+                SchedulerReply {
+                    schema_version: 1,
+                    accepted: false,
+                    request_id: None,
+                    decision: None,
+                    error: Some(error),
+                },
+            ),
+            Ok(request) if !is_leader(&self.host, capacity) => (
+                Vec::new(),
+                SchedulerReply {
+                    schema_version: 1,
+                    accepted: false,
+                    request_id: request.request_id,
+                    decision: None,
+                    error: Some("this node is not the elected scheduler".into()),
+                },
+            ),
+            Ok(request) => match plan_placement(capacity, &request, now_ms()) {
+                Some(placement) => {
+                    let desired_body =
+                        serde_json::to_string(&placement.desired).map_err(io_other)?;
+                    let decision_body =
+                        serde_json::to_string(&placement.decision).map_err(io_other)?;
+                    let reply = SchedulerReply {
+                        schema_version: 1,
+                        accepted: true,
+                        request_id: request.request_id,
+                        decision: Some(placement.decision),
+                        error: None,
+                    };
+                    (
+                        vec![
+                            PendingOutput {
+                                topic: DESIRED_TOPIC.into(),
+                                body: desired_body,
+                            },
+                            PendingOutput {
+                                topic: PLACEMENTS_TOPIC.into(),
+                                body: decision_body,
+                            },
+                        ],
+                        reply,
+                    )
+                }
+                None => (
+                    Vec::new(),
+                    SchedulerReply {
+                        schema_version: 1,
+                        accepted: false,
+                        request_id: request.request_id,
+                        decision: None,
+                        error: Some("no healthy placement candidate".into()),
+                    },
                 ),
+            },
+        };
+        outputs.push(PendingOutput {
+            topic: reply_topic(&message.ulid),
+            body: serde_json::to_string(&reply).map_err(io_other)?,
+        });
+        Ok(SchedulerOutboxRecord {
+            schema_version: 1,
+            record_id: message.ulid.clone(),
+            action_ulid: Some(message.ulid.clone()),
+            outputs,
+        })
+    }
+
+    fn failover_record(placement: Placement) -> io::Result<SchedulerOutboxRecord> {
+        let desired_body = serde_json::to_string(&placement.desired).map_err(io_other)?;
+        let decision_body = serde_json::to_string(&placement.decision).map_err(io_other)?;
+        let mut digest = Sha256::new();
+        digest.update(desired_body.as_bytes());
+        digest.update(decision_body.as_bytes());
+        let record_id = format!("failover-{:x}", digest.finalize());
+        Ok(SchedulerOutboxRecord {
+            schema_version: 1,
+            record_id,
+            action_ulid: None,
+            outputs: vec![
+                PendingOutput {
+                    topic: DESIRED_TOPIC.into(),
+                    body: desired_body,
+                },
+                PendingOutput {
+                    topic: PLACEMENTS_TOPIC.into(),
+                    body: decision_body,
+                },
+            ],
+        })
+    }
+
+    fn tick_transaction(
+        &mut self,
+        transaction: BusTransaction<'_>,
+        outbox: &SchedulerOutbox,
+    ) -> io::Result<()> {
+        let staged = self.stage_sweep(transaction, outbox)?;
+        if !staged.pending.is_empty() {
+            for pending in &staged.pending {
+                self.deliver_record(transaction, outbox, pending, true)?;
+                if let Some(action_ulid) = &pending.record.action_ulid {
+                    self.cursor = Some(action_ulid.clone());
+                }
+            }
+            return Ok(());
+        }
+
+        if !staged.actions.is_empty() {
+            for message in staged.actions {
+                let record = self.action_record(&message, &staged.capacity)?;
+                outbox.store(&record)?;
+                let staged_record = StagedRecord {
+                    already_present: vec![false; record.outputs.len()],
+                    record,
+                };
+                self.deliver_record(transaction, outbox, &staged_record, true)?;
+                self.cursor = Some(message.ulid);
+            }
+            return Ok(());
+        }
+
+        if staged.desired.is_empty() {
+            return Ok(());
+        }
+        let live = live_node_ids(&self.live_dir.live_hostnames(), &staged.capacity);
+        if !is_failover_leader(&self.host, &live) {
+            return Ok(());
+        }
+        let persisted = staged
+            .desired
+            .iter()
+            .map(|desired| desired.to_placement(0, 0))
+            .collect::<Vec<_>>();
+        for mut placement in replace_decisions(&persisted, &live, &staged.capacity) {
+            placement.decision.published_at_ms = now_ms();
+            let record = Self::failover_record(placement)?;
+            if outbox.load(&record.record_id)?.is_none() {
+                outbox.store(&record)?;
+            }
+            let staged_record = StagedRecord {
+                already_present: vec![false; record.outputs.len()],
+                record,
+            };
+            self.deliver_record(transaction, outbox, &staged_record, true)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn drain_and_place(&self, bus_root: &Path, cursor: &mut Option<String>) {
+        let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
+            return;
+        };
+        let Ok(actions) = persist.list_since(ACTION_TOPIC, cursor.as_deref()) else {
+            return;
+        };
+        let Ok(capacity_messages) =
+            read_topic_complete(&persist, super::kvm_health::SERVICES_TOPIC)
+        else {
+            return;
+        };
+        let capacity = fold_capacity(
+            capacity_messages
+                .iter()
+                .map(|message| message.body.as_deref().unwrap_or("")),
+        );
+        for message in actions {
+            *cursor = Some(message.ulid.clone());
+            let Ok(request) = parse_request(message.body.as_deref().unwrap_or("")) else {
+                continue;
+            };
+            if !is_leader(&self.host, &capacity) {
+                continue;
+            }
+            let Some(placement) = plan_placement(&capacity, &request, now_ms()) else {
+                continue;
+            };
+            if let Ok(body) = serde_json::to_string(&placement.decision) {
+                self.publisher.publish(PLACEMENTS_TOPIC, &body);
+            }
+            if let Ok(body) = serde_json::to_string(&placement.desired) {
+                self.publisher.publish(DESIRED_TOPIC, &body);
             }
         }
     }
 
-    /// MV-5b failover tick: re-place workloads whose node has left the mesh. Only
-    /// the leader acts, and leadership here re-elects over the **live** set
-    /// ([`is_failover_leader`]) so a lost leader is taken over. Reads the persisted
-    /// desired-state + the live-node directory, computes [`replace_decisions`], and
-    /// for each re-placement publishes a new proposal and updates the persisted
-    /// desired-state. It never emits an unsigned privileged lifecycle command;
-    /// execution requires a separate operator-authorized typed request. Runs in
-    /// the existing loop; no new worker, no new consensus. Best-effort like every
-    /// tick-publisher.
+    #[cfg(test)]
     async fn failover_once(&self, bus_root: &Path) {
-        // Cheap local-bus read first: no persisted intent ⇒ nothing to fail over
-        // (and we skip the directory read entirely).
-        let desired = read_desired(bus_root);
-        if desired.is_empty() {
+        let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
             return;
-        }
-        let capacity = read_capacity(bus_root);
+        };
+        let Ok(desired_messages) = read_topic_complete(&persist, DESIRED_TOPIC) else {
+            return;
+        };
+        let desired = fold_desired(
+            desired_messages
+                .iter()
+                .map(|message| message.body.as_deref().unwrap_or("")),
+        )
+        .into_values()
+        .collect::<Vec<_>>();
+        let Ok(capacity_messages) =
+            read_topic_complete(&persist, super::kvm_health::SERVICES_TOPIC)
+        else {
+            return;
+        };
+        let capacity = fold_capacity(
+            capacity_messages
+                .iter()
+                .map(|message| message.body.as_deref().unwrap_or("")),
+        );
         let live = live_node_ids(&self.live_dir.live_hostnames(), &capacity);
-        // Single active actor: the lowest live node. A non-leader (or a node not
-        // yet in its own live set) does nothing.
         if !is_failover_leader(&self.host, &live) {
             return;
         }
-        let persisted: Vec<Placement> = desired.iter().map(|d| d.to_placement(0, 0)).collect();
-        for mut p in replace_decisions(&persisted, &live, &capacity) {
-            // Fresh audit time on the re-placement (replace_decisions is clock-free).
-            p.decision.published_at_ms = now_ms();
-            let Ok(decision_body) = serde_json::to_string(&p.decision) else {
-                continue;
-            };
-            // 1. Audit the proposed re-placement.
-            self.publisher.publish(PLACEMENTS_TOPIC, &decision_body);
-            // 2. Update the persisted desired-state to the new home (idempotent —
-            //    next fold sees the workload as live there, so it isn't re-placed
-            //    again).
-            if let Ok(body) = serde_json::to_string(&p.desired) {
+        let persisted = desired
+            .iter()
+            .map(|desired| desired.to_placement(0, 0))
+            .collect::<Vec<_>>();
+        for mut placement in replace_decisions(&persisted, &live, &capacity) {
+            placement.decision.published_at_ms = now_ms();
+            if let Ok(body) = serde_json::to_string(&placement.decision) {
+                self.publisher.publish(PLACEMENTS_TOPIC, &body);
+            }
+            if let Ok(body) = serde_json::to_string(&placement.desired) {
                 self.publisher.publish(DESIRED_TOPIC, &body);
             }
-            tracing::warn!(
-                target: "mackesd::alert",
-                chosen = %p.chosen_host,
-                "ALERT (warn): scheduler proposed re-placement after node loss; privileged execution still requires operator authorization",
-            );
         }
     }
 }
@@ -706,18 +1278,29 @@ impl Worker for SchedulerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let bus_root = self.bus_root();
-        // Skip any backlog so a restart doesn't re-fire a queued placement.
-        let mut cursor = bus_root.as_deref().and_then(prime_cursor);
+        let outbox = SchedulerOutbox::open(&self.state_root)?;
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Some(root) = &bus_root {
-                        self.drain_and_place(root, &mut cursor).await;
-                        // MV-5b — re-place workloads whose node has left (leader-only).
-                        self.failover_once(root).await;
+                    match self.open_bus() {
+                        Ok((root, persist, identity)) => {
+                            let transaction = BusTransaction {
+                                persist: &persist,
+                                root: &root,
+                                identity,
+                            };
+                            let result = if self.bus_identity != Some(identity) {
+                                self.activate(transaction, &outbox)
+                            } else {
+                                self.tick_transaction(transaction, &outbox)
+                            };
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "scheduler Bus transaction deferred");
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "scheduler Bus unavailable; retrying"),
                     }
                 }
                 () = shutdown.wait() => break,
@@ -1348,6 +1931,481 @@ mod tests {
                 .expect("recorder mutex")
                 .push((topic.to_string(), body.to_string()));
         }
+    }
+
+    #[derive(Default)]
+    struct FaultPublisherState {
+        attempts: usize,
+        fail_on: BTreeSet<usize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FaultPublisher {
+        state: Arc<Mutex<FaultPublisherState>>,
+    }
+
+    impl FaultPublisher {
+        fn fail_on(attempts: impl IntoIterator<Item = usize>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FaultPublisherState {
+                    attempts: 0,
+                    fail_on: attempts.into_iter().collect(),
+                })),
+            }
+        }
+
+        fn fail_next(&self) {
+            let mut state = self.state.lock().expect("fault publisher mutex");
+            let next = state.attempts + 1;
+            state.fail_on.insert(next);
+        }
+    }
+
+    impl Publisher for FaultPublisher {
+        fn publish(&self, _topic: &str, _body: &str) {}
+
+        fn publish_transaction(
+            &self,
+            persist: &Persist,
+            topic: &str,
+            body: &str,
+        ) -> io::Result<()> {
+            let mut state = self.state.lock().expect("fault publisher mutex");
+            state.attempts += 1;
+            let attempt = state.attempts;
+            if state.fail_on.remove(&attempt) {
+                return Err(io::Error::other("injected scheduler publication failure"));
+            }
+            drop(state);
+            persist
+                .write(topic, Priority::Default, None, Some(body))
+                .map(|_| ())
+                .map_err(io_other)
+        }
+    }
+
+    fn seed_capacity(persist: &Persist, host: &str) {
+        persist
+            .write(
+                super::super::kvm_health::SERVICES_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&health(host, 3, true)).expect("capacity wire")),
+            )
+            .expect("capacity row");
+    }
+
+    fn placement_request(request_id: &str, name: &str) -> PlaceRequest {
+        PlaceRequest {
+            kind: PlaceKind::Vm,
+            spec: serde_json::json!({"name": name}),
+            host: None,
+            request_id: Some(request_id.into()),
+        }
+    }
+
+    fn transaction<'a>(persist: &'a Persist, root: &'a Path) -> BusTransaction<'a> {
+        BusTransaction {
+            persist,
+            root,
+            identity: bus_identity(root).expect("Bus identity"),
+        }
+    }
+
+    async fn wait_for_row(root: &Path, topic: &str) -> mde_bus::persist::StoredMessage {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(persist) = Persist::open(root.to_path_buf()) {
+                    if let Ok(Some(message)) = persist.read_latest(topic) {
+                        return message;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for scheduler Bus row")
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_late_and_replaced_bus_and_skips_retained_actions() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        fs::write(&bus_root, b"unopenable").expect("block Bus root");
+        let staged_root = temp.path().join("staged");
+        let staged = Persist::open(staged_root.clone()).expect("staged Bus");
+        seed_capacity(&staged, "peer:a");
+        let retained = staged
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&placement_request("retained", "old"))
+                        .expect("retained wire"),
+                ),
+            )
+            .expect("retained action");
+        drop(staged);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker = SchedulerWorker::new("peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_state_root(temp.path().join("state"))
+            .with_poll(Duration::from_millis(10));
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "late Bus terminated scheduler");
+
+        fs::remove_file(&bus_root).expect("remove Bus blocker");
+        fs::rename(&staged_root, &bus_root).expect("install late Bus");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let bus = Persist::open(bus_root.clone()).expect("late Bus");
+        assert!(bus
+            .list_since(&reply_topic(&retained.ulid), None)
+            .expect("retained reply query")
+            .is_empty());
+        let forward = bus
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&placement_request("forward-1", "first"))
+                        .expect("forward wire"),
+                ),
+            )
+            .expect("forward action");
+        wait_for_row(&bus_root, &reply_topic(&forward.ulid)).await;
+        assert_eq!(
+            bus.list_since(PLACEMENTS_TOPIC, None)
+                .expect("placement rows")
+                .len(),
+            1
+        );
+        drop(bus);
+
+        let replacement_root = temp.path().join("replacement");
+        let replacement = Persist::open(replacement_root.clone()).expect("replacement Bus");
+        seed_capacity(&replacement, "peer:a");
+        let retained_replacement = replacement
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&placement_request("retained-2", "old-2"))
+                        .expect("replacement retained wire"),
+                ),
+            )
+            .expect("replacement retained action");
+        drop(replacement);
+        install_replacement_index(&bus_root, &replacement_root.join("index.sqlite"))
+            .expect("replace Bus index");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let current = Persist::open(bus_root.clone()).expect("current Bus");
+        assert!(current
+            .list_since(&reply_topic(&retained_replacement.ulid), None)
+            .expect("replacement retained reply query")
+            .is_empty());
+        let forward_replacement = current
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&placement_request("forward-2", "second"))
+                        .expect("replacement forward wire"),
+                ),
+            )
+            .expect("replacement forward action");
+        wait_for_row(&bus_root, &reply_topic(&forward_replacement.ulid)).await;
+        assert_eq!(
+            current
+                .list_since(PLACEMENTS_TOPIC, None)
+                .expect("replacement placement rows")
+                .len(),
+            1
+        );
+
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("scheduler shutdown timeout")
+            .expect("scheduler task joins")
+            .expect("scheduler shutdown succeeds");
+        assert_eq!(
+            scheduler_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[test]
+    fn complete_reads_and_durable_reply_recovery_do_not_repeat_outputs() {
+        use std::sync::atomic::Ordering;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("Bus");
+        seed_capacity(&persist, "peer:a");
+        let state_root = temp.path().join("state");
+        let faults = Arc::new(SchedulerBusFaults::default());
+        let publisher = FaultPublisher::fail_on([3]);
+        let mut worker = SchedulerWorker::new("peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_state_root(state_root.clone())
+            .with_publisher(Box::new(publisher.clone()))
+            .with_bus_faults(Arc::clone(&faults));
+        let outbox = SchedulerOutbox::open(&state_root).expect("outbox");
+        worker
+            .activate(transaction(&persist, &bus_root), &outbox)
+            .expect("activation");
+        let action = persist
+            .write(
+                ACTION_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&placement_request("r1", "workload"))
+                        .expect("action wire"),
+                ),
+            )
+            .expect("action");
+
+        faults.fail_desired_reads.store(1, Ordering::SeqCst);
+        assert!(worker
+            .tick_transaction(transaction(&persist, &bus_root), &outbox)
+            .is_err());
+        assert!(worker.cursor.is_none());
+        assert!(persist
+            .list_since(DESIRED_TOPIC, None)
+            .expect("desired after read failure")
+            .is_empty());
+
+        assert!(worker
+            .tick_transaction(transaction(&persist, &bus_root), &outbox)
+            .is_err());
+        assert!(worker.cursor.is_none());
+        assert_eq!(
+            persist
+                .list_since(DESIRED_TOPIC, None)
+                .expect("desired after reply failure")
+                .len(),
+            1
+        );
+        assert_eq!(
+            persist
+                .list_since(PLACEMENTS_TOPIC, None)
+                .expect("placement after reply failure")
+                .len(),
+            1
+        );
+        assert!(persist
+            .list_since(&reply_topic(&action.ulid), None)
+            .expect("failed reply")
+            .is_empty());
+
+        let mut restarted = SchedulerWorker::new("peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_state_root(state_root)
+            .with_publisher(Box::new(publisher));
+        restarted
+            .activate(transaction(&persist, &bus_root), &outbox)
+            .expect("durable corrected-forward activation");
+        assert_eq!(restarted.cursor.as_deref(), Some(action.ulid.as_str()));
+        assert_eq!(
+            persist
+                .list_since(DESIRED_TOPIC, None)
+                .expect("desired final")
+                .len(),
+            1
+        );
+        assert_eq!(
+            persist
+                .list_since(PLACEMENTS_TOPIC, None)
+                .expect("placement final")
+                .len(),
+            1
+        );
+        assert_eq!(
+            persist
+                .list_since(&reply_topic(&action.ulid), None)
+                .expect("recovered reply")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failover_publication_recovers_without_duplicate_proposals() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        let persist = Persist::open(bus_root.clone()).expect("Bus");
+        seed_capacity(&persist, "peer:a");
+        persist
+            .write(
+                DESIRED_TOPIC,
+                Priority::Default,
+                None,
+                Some(
+                    &serde_json::to_string(&dp(PlaceKind::Vm, "peer:dead", "move", Some("move-1")))
+                        .expect("desired wire"),
+                ),
+            )
+            .expect("lost desired row");
+        let state_root = temp.path().join("state");
+        let publisher = FaultPublisher::fail_on([2]);
+        let mut worker = SchedulerWorker::new("peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_state_root(state_root.clone())
+            .with_live_directory(Box::new(FakeDirectory(live_set(&["a"]))))
+            .with_publisher(Box::new(publisher.clone()));
+        let outbox = SchedulerOutbox::open(&state_root).expect("outbox");
+        worker
+            .activate(transaction(&persist, &bus_root), &outbox)
+            .expect("activation");
+        assert!(worker
+            .tick_transaction(transaction(&persist, &bus_root), &outbox)
+            .is_err());
+        assert_eq!(
+            persist
+                .list_since(DESIRED_TOPIC, None)
+                .expect("desired after partial publication")
+                .len(),
+            2
+        );
+        assert!(persist
+            .list_since(PLACEMENTS_TOPIC, None)
+            .expect("failed placement audit")
+            .is_empty());
+
+        let mut restarted = SchedulerWorker::new("peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_state_root(state_root)
+            .with_live_directory(Box::new(FakeDirectory(live_set(&["a"]))))
+            .with_publisher(Box::new(publisher));
+        restarted
+            .activate(transaction(&persist, &bus_root), &outbox)
+            .expect("recover pending failover publication");
+        restarted
+            .tick_transaction(transaction(&persist, &bus_root), &outbox)
+            .expect("settled failover sweep");
+        assert_eq!(
+            persist
+                .list_since(DESIRED_TOPIC, None)
+                .expect("desired final")
+                .len(),
+            2
+        );
+        assert_eq!(
+            persist
+                .list_since(PLACEMENTS_TOPIC, None)
+                .expect("placement final")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_and_gated_replies_retry_without_cursor_loss() {
+        let temp = tempfile::tempdir().expect("temp");
+        for (case, host, body) in [
+            ("malformed", "peer:a", "not-json".to_string()),
+            (
+                "gated",
+                "peer:z",
+                serde_json::to_string(&placement_request("gated-1", "blocked"))
+                    .expect("gated wire"),
+            ),
+        ] {
+            let bus_root = temp.path().join(format!("{case}-bus"));
+            let state_root = temp.path().join(format!("{case}-state"));
+            let persist = Persist::open(bus_root.clone()).expect("Bus");
+            seed_capacity(&persist, "peer:a");
+            let publisher = FaultPublisher::default();
+            let mut worker = SchedulerWorker::new(host.into())
+                .with_bus_root(bus_root.clone())
+                .with_state_root(state_root.clone())
+                .with_publisher(Box::new(publisher.clone()));
+            let outbox = SchedulerOutbox::open(&state_root).expect("outbox");
+            worker
+                .activate(transaction(&persist, &bus_root), &outbox)
+                .expect("activation");
+            let action = persist
+                .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
+                .expect("action");
+            publisher.fail_next();
+            assert!(worker
+                .tick_transaction(transaction(&persist, &bus_root), &outbox)
+                .is_err());
+            assert!(worker.cursor.is_none(), "{case} cursor advanced on failure");
+            worker
+                .tick_transaction(transaction(&persist, &bus_root), &outbox)
+                .expect("corrected-forward reply");
+            assert_eq!(worker.cursor.as_deref(), Some(action.ulid.as_str()));
+            assert_eq!(
+                persist
+                    .list_since(&reply_topic(&action.ulid), None)
+                    .expect("reply rows")
+                    .len(),
+                1
+            );
+            assert!(persist
+                .list_since(PLACEMENTS_TOPIC, None)
+                .expect("proposal rows")
+                .is_empty());
+            assert!(persist
+                .list_since(DESIRED_TOPIC, None)
+                .expect("desired rows")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn replacement_during_open_is_rejected_before_current_reopen() {
+        const MARKER: &str = "test/scheduler/open-generation";
+
+        let temp = tempfile::tempdir().expect("temp");
+        let bus_root = temp.path().join("bus");
+        let retired = Persist::open(bus_root.clone()).expect("retired Bus");
+        retired
+            .write(MARKER, Priority::Default, None, Some("retired"))
+            .expect("retired marker");
+        drop(retired);
+        let replacement_root = temp.path().join("replacement");
+        let replacement = Persist::open(replacement_root.clone()).expect("replacement Bus");
+        replacement
+            .write(MARKER, Priority::Default, None, Some("current"))
+            .expect("current marker");
+        drop(replacement);
+        let faults = Arc::new(SchedulerBusFaults::default());
+        *faults
+            .replace_index_after_open
+            .lock()
+            .expect("replacement mutex") = Some(replacement_root.join("index.sqlite"));
+        let worker = SchedulerWorker::new("peer:a".into())
+            .with_bus_root(bus_root.clone())
+            .with_bus_faults(faults);
+
+        let error = match worker.open_bus() {
+            Err(error) => error,
+            Ok(_) => panic!("mixed-generation open must be rejected"),
+        };
+        assert!(error.to_string().contains("changed while opening"));
+        let (root, current, identity) = worker.open_bus().expect("reopen current Bus");
+        assert_eq!(root, bus_root);
+        assert_eq!(identity, bus_identity(&root).expect("current identity"));
+        assert_eq!(
+            current
+                .read_latest(MARKER)
+                .expect("marker read")
+                .and_then(|message| message.body)
+                .as_deref(),
+            Some("current")
+        );
     }
 
     #[tokio::test]
