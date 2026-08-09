@@ -875,8 +875,13 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-FUNC-019-2026-08-08-resource-actions-s4-r1.md`.
 - **Wide-LAN Windows checkpoint (2026-08-08):** skipped broad CIDRs now admit
   at most 128 valid observed neighbors and issue a one-time explicit-target
-  diagnostic for quiet RDP hosts; `.50` passed 45/45:
-  `docs/platform/evidence/WL-FUNC-019-2026-08-08-wide-lan-rdp-discovery-s2-r1.md`.
+  diagnostic for quiet RDP hosts. The separate Nodes scanner now consumes that
+  same bounded fallback instead of discarding valid neighbors outside its local
+  `/24`; focused farm tests passed on `.50` and `.90`. A live Windows target was
+  not present among the currently observed neighbors, so deployed round-trip
+  proof remains:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-08-wide-lan-rdp-discovery-s2-r1.md`,
+  `docs/platform/evidence/WL-FUNC-019-2026-08-08-nodes-wide-lan-rdp-s2-r2.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.

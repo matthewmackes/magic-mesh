@@ -4,7 +4,8 @@
 //! An **active nmap-style** discovery over the local subnet, running ONLY while
 //! the surface-gated `scan_active` flag is set (EXPLORER-1 wires it; the shell
 //! flips it while Discovery is visible, lock #24). The pipeline unions three
-//! discovery signals over the local /24(s):
+//! discovery signals over the local /24(s), plus bounded validated neighbours
+//! observed on wider physical LANs:
 //!
 //! 1. **mDNS / DNS-SD listen** — advertised services + names (reusing the tested
 //!    [`crate::surrounding_hosts::collect_mdns`] avahi parse).
@@ -53,7 +54,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::probe_nmap::DEFAULT_EXCLUDE_IFACE_PREFIXES;
+use crate::probe_nmap::{detect_wide_lan_neighbors, DEFAULT_EXCLUDE_IFACE_PREFIXES};
 use crate::surrounding_hosts::{
     arp_neigh_map, classify, collect_mdns, reverse_dns, HostSignals, HostType, MdnsService,
 };
@@ -108,6 +109,10 @@ pub trait ScanEnv: Send + Sync {
     /// This node's own physical-LAN IPv4 address(es) — the /24(s) to sweep and
     /// the self-addresses to exclude (so we never list ourselves as a LAN host).
     fn local_ipv4s(&self) -> Vec<Ipv4Addr>;
+    /// Already-resolved neighbours on physical LANs wider than `/24`.
+    /// Production delegates to the probe target resolver's interface-, prefix-,
+    /// and size-bounded validation instead of trusting arbitrary ARP rows.
+    fn wide_lan_neighbors(&self) -> Vec<Ipv4Addr>;
     /// The ARP / neighbour table as an `ip → mac` map (silent-host discovery +
     /// the stable MAC key).
     fn arp_table(&self) -> HashMap<String, String>;
@@ -136,6 +141,13 @@ impl ScanEnv for LiveScanEnv {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn wide_lan_neighbors(&self) -> Vec<Ipv4Addr> {
+        detect_wide_lan_neighbors()
+            .into_iter()
+            .filter_map(|candidate| candidate.parse().ok())
+            .collect()
     }
 
     fn arp_table(&self) -> HashMap<String, String> {
@@ -324,7 +336,8 @@ fn probe_one(
 
 /// Run one full scan pass over the injected environment.
 ///
-/// Unions the ping-sweep + ARP + mDNS candidates on the local /24(s),
+/// Unions the ping-sweep + ARP + mDNS candidates on the local /24(s) with the
+/// bounded, validated neighbour fallback for wider physical LANs,
 /// fingerprints each, and returns the discovered [`LanHostRecord`]s
 /// (self-excluded, deterministically ordered). The pure heart of the scan — I/O
 /// only through `env`, so tests drive it directly.
@@ -354,6 +367,16 @@ pub fn build_records(env: &dyn ScanEnv) -> Vec<LanHostRecord> {
         .into_iter()
         .flatten()
         .collect();
+
+    // A machine can carry a wide prefix while the active sweep remains bounded
+    // to its local /24. Admit only neighbours that the shared probe resolver has
+    // already validated against the real interface and prefix; this reaches a
+    // Windows/RDP host in another /24 without expanding or sweeping the /16.
+    candidates.extend(
+        env.wide_lan_neighbors()
+            .into_iter()
+            .filter(|ip| !self_set.contains(ip)),
+    );
 
     // 2. Union the ARP/neighbour table + mDNS advertisers (in-subnet, non-self) —
     //    hosts we've talked to / that announce, even if they didn't answer ping.
@@ -500,6 +523,7 @@ mod tests {
     #[derive(Default)]
     struct FakeScanEnv {
         locals: Vec<Ipv4Addr>,
+        wide_neighbors: Vec<Ipv4Addr>,
         arp: HashMap<String, String>,
         mdns: Vec<MdnsService>,
         alive: HashSet<Ipv4Addr>,
@@ -512,6 +536,9 @@ mod tests {
     impl ScanEnv for FakeScanEnv {
         fn local_ipv4s(&self) -> Vec<Ipv4Addr> {
             self.locals.clone()
+        }
+        fn wide_lan_neighbors(&self) -> Vec<Ipv4Addr> {
+            self.wide_neighbors.clone()
         }
         fn arp_table(&self) -> HashMap<String, String> {
             self.arp.clone()
@@ -589,6 +616,26 @@ mod tests {
         let server = find(&recs, "192.168.1.41");
         assert_eq!(server.services, vec!["ssh".to_string()]);
         assert_eq!(server.type_guess.as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn observed_wide_lan_neighbor_reaches_rdp_fingerprint() {
+        let windows = ip("172.20.145.77");
+        let mut env = FakeScanEnv {
+            locals: vec![ip("172.20.146.225")],
+            wide_neighbors: vec![windows],
+            ..Default::default()
+        };
+        env.arp
+            .insert(windows.to_string(), "aa:bb:cc:dd:ee:77".into());
+        env.ports.insert(windows, vec![3389]);
+
+        let records = build_records(&env);
+        let desktop = find(&records, "172.20.145.77");
+        assert_eq!(desktop.services, vec!["rdp".to_string()]);
+        assert_eq!(desktop.open_ports, vec![3389]);
+        assert_eq!(desktop.type_guess.as_deref(), Some("computer"));
+        assert_eq!(desktop.key, "aa:bb:cc:dd:ee:77");
     }
 
     #[test]
