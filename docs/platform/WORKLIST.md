@@ -963,8 +963,9 @@ behavioral evidence is not completion.
   preserving boot and read-only catalog access; `.90` gates passed: `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-readiness-r4.md`.
 - **Catalog rollback checkpoint (2026-08-09):** same-publisher rollback/equivocation preserves last-good cards and revokes stale actions; `.50` passed:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-remote-sessions-catalog-rollback-r5.md`.
-- **Live Windows authority checkpoints (2026-08-09):** seat 15 detects RDP; exact signed Open receipt and receipt-bound revocation/cancellation passed 1/1 plus 1/1 on `.196`.
-  Publisher HMAC/live login remain: `evidence/WL-FUNC-019-2026-08-09-rdp-authority-path-r7.md`, `evidence/WL-FUNC-019-2026-08-09-rdp-authority-handoff-r8.md`.
+- **Live Windows authority checkpoints (2026-08-09):** seat 15 detects RDP; signed Open/revocation passed on `.196`, and the formerly absent shared publisher key is sealed.
+  Installed credential activation/live login remain: `evidence/WL-FUNC-019-2026-08-09-rdp-authority-handoff-r8.md`,
+  `evidence/WL-FUNC-019-2026-08-09-resource-publisher-key-r9.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
