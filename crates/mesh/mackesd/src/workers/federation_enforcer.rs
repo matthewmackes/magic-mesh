@@ -70,12 +70,21 @@ const FEDERATION_ACTION_NODE_SCOPE: &str = "federation";
 /// often. Cheap local reads, so a tight cadence keeps a foreign-mesh message from
 /// lingering unenforced.
 const DEFAULT_POLL: Duration = Duration::from_secs(2);
+/// Keep startup recovery responsive without spinning on a missing/unopenable Bus.
+const MIN_BUS_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_BUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+type BusOpenFn = dyn Fn() -> Result<Option<(PathBuf, Persist)>, String> + Send + Sync;
 
 /// The WL-SEC-002 federation runtime-enforcement worker.
 pub struct FederationEnforcerWorker {
     node_id: String,
     authorizer: Arc<ActionAuthorizer>,
     bus_root_override: Option<PathBuf>,
+    /// Dynamic Bus resolve/open seam for startup-race tests.
+    #[cfg(test)]
+    bus_open_override: Option<Arc<BusOpenFn>>,
     trust_dir_override: Option<PathBuf>,
     poll_interval: Duration,
     // ── runtime cursors + last-published status (mutated in `tick_once`) ──
@@ -93,6 +102,8 @@ impl FederationEnforcerWorker {
             node_id,
             authorizer: Arc::new(ActionAuthorizer::production()),
             bus_root_override: None,
+            #[cfg(test)]
+            bus_open_override: None,
             trust_dir_override: None,
             poll_interval: DEFAULT_POLL,
             accept_cursor: None,
@@ -106,6 +117,15 @@ impl FederationEnforcerWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Override dynamic Bus resolution/opening without changing production
+    /// retry behavior.
+    #[cfg(test)]
+    #[must_use]
+    fn with_bus_opener(mut self, open: Arc<BusOpenFn>) -> Self {
+        self.bus_open_override = Some(open);
         self
     }
 
@@ -134,6 +154,18 @@ impl FederationEnforcerWorker {
 
     fn resolved_trust_dir(&self) -> PathBuf {
         self.trust_dir_override.clone().unwrap_or_else(trust_dir)
+    }
+
+    fn open_bus(&self) -> Result<Option<(PathBuf, Persist)>, String> {
+        #[cfg(test)]
+        if let Some(open) = self.bus_open_override.as_ref() {
+            return open();
+        }
+
+        let root = federation_bus_root(self.bus_root_override.clone());
+        Persist::open(root.clone())
+            .map(|persist| Some((root, persist)))
+            .map_err(|error| error.to_string())
     }
 
     /// One enforcement pass. Ordered so a just-accepted pair enforces on the SAME
@@ -582,8 +614,12 @@ fn is_safe_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn default_bus_root() -> Option<PathBuf> {
-    mde_bus::default_data_dir()
+fn federation_bus_root(override_root: Option<PathBuf>) -> PathBuf {
+    federation_bus_root_or_system(override_root.or_else(mde_bus::default_data_dir))
+}
+
+fn federation_bus_root_or_system(resolved: Option<PathBuf>) -> PathBuf {
+    resolved.unwrap_or_else(|| PathBuf::from(mde_bus::SYSTEM_BUS_ROOT))
 }
 
 #[async_trait::async_trait]
@@ -593,15 +629,30 @@ impl Worker for FederationEnforcerWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
-            tracing::debug!(target: "mackesd::federation_enforcer", "no bus root; worker idle");
-            return Ok(());
-        };
-        let persist = match Persist::open(bus_root.clone()) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "mackesd::federation_enforcer", error = %e, "persist open failed; worker idle");
-                return Ok(());
+        let retry_interval = self
+            .poll_interval
+            .clamp(MIN_BUS_RETRY_INTERVAL, MAX_BUS_RETRY_INTERVAL);
+        let (bus_root, persist) = loop {
+            match self.open_bus() {
+                Ok(Some(opened)) => break opened,
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "mackesd::federation_enforcer",
+                        "Bus root unavailable; federation enforcement startup will retry"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::federation_enforcer",
+                        %error,
+                        "Persist open failed; federation enforcement startup will retry"
+                    );
+                }
+            }
+
+            tokio::select! {
+                () = shutdown.wait() => return Ok(()),
+                () = tokio::time::sleep(retry_interval) => {}
             }
         };
         let trust = self.resolved_trust_dir();
@@ -709,6 +760,184 @@ mod tests {
             &format!("federation-{}", uniq()),
             AUTH_NOW + 30_000,
         )
+    }
+
+    #[test]
+    fn federation_bus_root_preserves_override_and_has_system_fallback() {
+        let explicit = PathBuf::from("/tmp/federation-bus-test");
+        assert_eq!(
+            federation_bus_root_or_system(Some(explicit.clone())),
+            explicit
+        );
+        assert_eq!(
+            federation_bus_root_or_system(None),
+            PathBuf::from(mde_bus::SYSTEM_BUS_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_absence_wait_is_alive_and_shutdown_prompt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_open = Arc::clone(&attempts);
+        let mut w = worker(dir.path())
+            .with_poll_interval(Duration::from_secs(30))
+            .with_bus_opener(Arc::new(move || {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(async move { w.run(ShutdownToken::from_receiver(shutdown_rx)).await });
+
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !task.is_finished(),
+            "a missing Bus root must leave federation enforcement alive"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("shutdown must interrupt the Bus retry wait")
+            .expect("worker task")
+            .expect("clean worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn bus_open_retry_recovers_and_processes_queued_action_once() {
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let bus_root = temp.path().join("bus");
+        let mode = Arc::new(AtomicU8::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mode_for_open = Arc::clone(&mode);
+        let attempts_for_open = Arc::clone(&attempts);
+        let root_for_open = bus_root.clone();
+        let mut w = worker(&bus_root)
+            .with_poll_interval(Duration::from_millis(20))
+            .with_bus_opener(Arc::new(move || {
+                attempts_for_open.fetch_add(1, Ordering::SeqCst);
+                match mode_for_open.load(Ordering::SeqCst) {
+                    0 => Ok(None),
+                    1 => Err("injected Persist::open failure".to_string()),
+                    _ => Persist::open(root_for_open.clone())
+                        .map(|persist| Some((root_for_open.clone(), persist)))
+                        .map_err(|error| error.to_string()),
+                }
+            }));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(async move { w.run(ShutdownToken::from_receiver(shutdown_rx)).await });
+
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!task.is_finished(), "root absence must not end the worker");
+
+        mode.store(1, Ordering::SeqCst);
+        for _ in 0..20 {
+            if attempts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert!(
+            !task.is_finished(),
+            "Persist::open failure must not end the worker"
+        );
+
+        // This valid mutation arrives while the Bus is unavailable. Recovery
+        // must fold from None so the operator's queued trust decision is not
+        // silently dropped; the durable authorizer remains the replay guard.
+        let queued_mint_id = {
+            let env = MintEnvelope {
+                ulid: uniq(),
+                mnemonic: "queued federation mint must be removed".to_string(),
+                expires_at_unix_ms: mde_bus::federation::now_unix_ms() + 86_400_000,
+                used: false,
+            };
+            write_mint_envelope(&bus_root, &env).unwrap();
+            env.ulid
+        };
+        let preexisting = Persist::open(bus_root.clone()).unwrap();
+        let queued_body = signed_action(
+            "refuse-mint",
+            &serde_json::json!({
+                "schema_version": 1,
+                "ulid": queued_mint_id
+            })
+            .to_string(),
+        );
+        preexisting
+            .write(
+                REFUSE_MINT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&queued_body),
+            )
+            .unwrap();
+        drop(preexisting);
+        mode.store(2, Ordering::SeqCst);
+
+        let status_topic = format!("{STATUS_PREFIX}peer:test");
+        for _ in 0..50 {
+            if Persist::open(bus_root.clone())
+                .ok()
+                .and_then(|persist| persist.read_latest(&status_topic).ok().flatten())
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let persist = Persist::open(bus_root.clone()).unwrap();
+        for _ in 0..50 {
+            if !mint_path(&bus_root, &queued_mint_id).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !mint_path(&bus_root, &queued_mint_id).exists(),
+            "a federation action queued during startup was dropped"
+        );
+        let attempts_after_open = attempts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            persist
+                .list_since("federation/mint-revoked/local", None)
+                .unwrap()
+                .len(),
+            1,
+            "the recovered worker enforced the queued action more than once"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            attempts_after_open,
+            "Bus resolve/open must stop after first success"
+        );
+        assert!(!task.is_finished(), "the same worker must remain active");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("shutdown")
+            .expect("worker task")
+            .expect("clean worker shutdown");
     }
 
     // ── the DEFINING two-identity acceptance: unaccepted-deny / granted-allow /

@@ -539,6 +539,10 @@ behavioral evidence is not completion.
   failed delivery retries, and traversal/forged-symlink IDs fail safely.
   Machine 196 passed the exact hostile boundary:
   `docs/platform/evidence/WL-FUNC-011-2026-08-09-alert-delivery-restart-r18.md`.
+- **Federation Bus recovery checkpoint (2026-08-09):** enforcement now retries
+  late Bus availability without daemon restart and folds valid trust actions
+  queued during startup exactly once. Machine 194 passed three exact tests:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-federation-bus-recovery-r15.md`.
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
      - Inputs: current parity ledger, collab types/core, archived IDs.
