@@ -123,7 +123,7 @@ behavioral evidence is not completion.
 - **Cloud/Workload recovery checkpoints (2026-08-09):** production authorization and late/replaced Bus activation preserve durable mutation/reply output:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
-  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-scheduler-bus-transaction-recovery-r75.md`.
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`.
 - **Migration journal checkpoint (2026-08-08):** cold-migration commands are journaled before effects, replay pending records after restart, clean applied records without
   repeated effects, and pace retryable recovery. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-journal-r2.md`.
@@ -422,7 +422,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-metrics-collector-recovery-r10.md`.
 - **Compute Bus recovery (2026-08-09):** complete reads and durable pending output preserve Cloud/storage/workload/migration/scheduler truth across late/replaced Bus:
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-cloud-bus-transaction-recovery-r68.md`,
-  `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`,
+  `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-compute-expose-bus-transaction-recovery-r89.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-workload-compute-bus-recovery-r70.md`,
   `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-compute-migrate-bus-transaction-recovery-r84.md`,
   `docs/platform/evidence/WL-ARCH-010-WL-ARCH-009-2026-08-09-scheduler-bus-transaction-recovery-r75.md`.

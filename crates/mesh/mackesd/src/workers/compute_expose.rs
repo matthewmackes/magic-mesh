@@ -47,6 +47,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -91,6 +92,14 @@ pub const DEFAULT_ACTION_JOURNAL_PATH: &str = "/var/lib/mackesd/compute-expose/a
 const ACTION_JOURNAL_SCHEMA_VERSION: u16 = 1;
 const ACTION_JOURNAL_MAX_ENTRIES: usize = 1024;
 const ACTION_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
+const BUS_LANE_MAX_MESSAGES: usize = 4096;
+const BUS_LANE_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComputeExposeBusIdentity {
+    device: u64,
+    inode: u64,
+}
 
 /// Which network the expose rule applies to.
 #[derive(
@@ -1163,210 +1172,281 @@ fn recover_or_publish_journaled(
 
 fn poll_once(
     persist: &Persist,
+    bus_root: &Path,
+    bus_identity: ComputeExposeBusIdentity,
     worker: &ComputeExposeWorker,
     nebula_ip: &str,
     wan_zone: &str,
     expose_cursor: &mut Option<String>,
     unexpose_cursor: &mut Option<String>,
     authorizer: &ActionAuthorizer,
-) {
+) -> Result<(), String> {
     let expose_topic = format!("compute/expose/{nebula_ip}");
     let unexpose_topic = format!("compute/unexpose/{nebula_ip}");
 
+    // Acquire a complete, bounded snapshot of both command lanes before any
+    // authorization claim or firewall effect. This prevents a replacement
+    // between lane reads from creating a mixed-generation transaction.
+    let expose_messages = persist
+        .list_since(&expose_topic, expose_cursor.as_deref())
+        .map_err(|error| format!("expose lane read failed: {error}"))?;
+    let unexpose_messages = persist
+        .list_since(&unexpose_topic, unexpose_cursor.as_deref())
+        .map_err(|error| format!("unexpose lane read failed: {error}"))?;
+    for (lane, messages) in [
+        ("expose", expose_messages.as_slice()),
+        ("unexpose", unexpose_messages.as_slice()),
+    ] {
+        let body_bytes = messages.iter().try_fold(0_usize, |total, message| {
+            total.checked_add(message.body.as_deref().map_or(0, str::len))
+        });
+        if messages.len() > BUS_LANE_MAX_MESSAGES
+            || body_bytes.is_none_or(|bytes| bytes > BUS_LANE_MAX_BODY_BYTES)
+        {
+            return Err(format!("{lane} lane exceeds its complete-read bound"));
+        }
+    }
+    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+
     let mut changed = false;
-    match persist.list_since(&expose_topic, expose_cursor.as_deref()) {
-        Ok(msgs) => {
-            for msg in msgs {
-                match recover_or_publish_journaled(persist, worker, &msg.ulid) {
-                    Ok(Some(true)) => {
+    {
+        for msg in expose_messages {
+            verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+            match recover_or_publish_journaled(persist, worker, &msg.ulid) {
+                Ok(Some(true)) => {
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    *expose_cursor = Some(msg.ulid.clone());
+                    continue;
+                }
+                Ok(Some(false)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: action journal recovery failed");
+                    break;
+                }
+            }
+            let body = msg.body.as_deref().unwrap_or("");
+            match parse_expose_request(body) {
+                Ok(req) => {
+                    let target = expose_auth_target(&req);
+                    if let Err(error) = authorizer.verify_exact_body(
+                        body,
+                        MutationContext {
+                            verb: COMPUTE_EXPOSE_AUTH_VERB,
+                            node: COMPUTE_EXPOSE_NODE_SCOPE,
+                            target: &target,
+                        },
+                    ) {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: refused unauthorized expose request");
                         *expose_cursor = Some(msg.ulid.clone());
                         continue;
                     }
-                    Ok(Some(false)) => break,
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: action journal recovery failed");
+                    let planned = {
+                        let active = worker
+                            .active
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        diff_expose(&active, &req)
+                    };
+                    if let Err(error) = prepare_action(worker, &msg.ulid, "expose", planned.clone())
+                    {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably prepare expose request");
                         break;
                     }
-                }
-                let body = msg.body.as_deref().unwrap_or("");
-                match parse_expose_request(body) {
-                    Ok(req) => {
-                        let target = expose_auth_target(&req);
-                        if let Err(error) = authorizer.verify_exact_body(
-                            body,
-                            MutationContext {
-                                verb: COMPUTE_EXPOSE_AUTH_VERB,
-                                node: COMPUTE_EXPOSE_NODE_SCOPE,
-                                target: &target,
-                            },
-                        ) {
-                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: refused unauthorized expose request");
-                            *expose_cursor = Some(msg.ulid.clone());
-                            continue;
-                        }
-                        let planned = {
-                            let active = worker
-                                .active
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            diff_expose(&active, &req)
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    if let Err(error) = authorize_expose_request(authorizer, body, &req) {
+                        tracing::warn!(
+                            ulid = %msg.ulid,
+                            error = %error,
+                            "compute_expose: refused unauthorized expose request"
+                        );
+                        let summary = ApplySummary {
+                            outcome: FirewallActionOutcome::Failed,
+                            attempted: u16::try_from(planned.len()).unwrap_or(u16::MAX),
+                            applied: 0,
+                            detail: "capability claim failed before firewall mutation",
                         };
-                        if let Err(error) =
-                            prepare_action(worker, &msg.ulid, "expose", planned.clone())
+                        if terminalize_action(
+                            worker,
+                            build_action_result(&msg.ulid, "expose", summary),
+                        )
+                        .is_err()
+                            || !publish_journaled_result(persist, worker, &msg.ulid)
+                                .unwrap_or(false)
                         {
-                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably prepare expose request");
                             break;
                         }
-                        if let Err(error) = authorize_expose_request(authorizer, body, &req) {
-                            tracing::warn!(
-                                ulid = %msg.ulid,
-                                error = %error,
-                                "compute_expose: refused unauthorized expose request"
-                            );
-                            let summary = ApplySummary {
-                                outcome: FirewallActionOutcome::Failed,
-                                attempted: u16::try_from(planned.len()).unwrap_or(u16::MAX),
-                                applied: 0,
-                                detail: "capability claim failed before firewall mutation",
-                            };
-                            if terminalize_action(
-                                worker,
-                                build_action_result(&msg.ulid, "expose", summary),
-                            )
-                            .is_err()
-                                || !publish_journaled_result(persist, worker, &msg.ulid)
-                                    .unwrap_or(false)
-                            {
-                                break;
-                            }
-                            *expose_cursor = Some(msg.ulid.clone());
-                            continue;
-                        }
-                        let summary = apply_expose(worker, nebula_ip, wan_zone, &req);
-                        changed |= summary.changed();
-                        let result = build_action_result(&msg.ulid, "expose", summary);
-                        if let Err(error) = terminalize_action(worker, result) {
-                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably terminalize expose request");
-                            break;
-                        }
-                        if !publish_journaled_result(persist, worker, &msg.ulid).unwrap_or(false) {
-                            break;
-                        }
+                        verify_compute_expose_bus(persist, bus_root, bus_identity)?;
                         *expose_cursor = Some(msg.ulid.clone());
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::warn!(ulid = %msg.ulid, error = %e, "compute_expose: bad expose request");
-                        *expose_cursor = Some(msg.ulid.clone());
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    let summary = apply_expose(worker, nebula_ip, wan_zone, &req);
+                    changed |= summary.changed();
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    let result = build_action_result(&msg.ulid, "expose", summary);
+                    if let Err(error) = terminalize_action(worker, result) {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably terminalize expose request");
+                        break;
                     }
+                    if !publish_journaled_result(persist, worker, &msg.ulid).unwrap_or(false) {
+                        break;
+                    }
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    *expose_cursor = Some(msg.ulid.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(ulid = %msg.ulid, error = %e, "compute_expose: bad expose request");
+                    *expose_cursor = Some(msg.ulid.clone());
                 }
             }
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, topic = expose_topic, "compute_expose: list_since failed")
         }
     }
 
-    match persist.list_since(&unexpose_topic, unexpose_cursor.as_deref()) {
-        Ok(msgs) => {
-            for msg in msgs {
-                match recover_or_publish_journaled(persist, worker, &msg.ulid) {
-                    Ok(Some(true)) => {
+    {
+        for msg in unexpose_messages {
+            verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+            match recover_or_publish_journaled(persist, worker, &msg.ulid) {
+                Ok(Some(true)) => {
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    *unexpose_cursor = Some(msg.ulid.clone());
+                    continue;
+                }
+                Ok(Some(false)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: action journal recovery failed");
+                    break;
+                }
+            }
+            let body = msg.body.as_deref().unwrap_or("");
+            match parse_unexpose_request(body) {
+                Ok(req) => {
+                    let target = unexpose_auth_target(&req);
+                    if let Err(error) = authorizer.verify_exact_body(
+                        body,
+                        MutationContext {
+                            verb: COMPUTE_UNEXPOSE_AUTH_VERB,
+                            node: COMPUTE_EXPOSE_NODE_SCOPE,
+                            target: &target,
+                        },
+                    ) {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: refused unauthorized unexpose request");
                         *unexpose_cursor = Some(msg.ulid.clone());
                         continue;
                     }
-                    Ok(Some(false)) => break,
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: action journal recovery failed");
+                    let planned = {
+                        let active = worker
+                            .active
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        diff_unexpose(&active, &req)
+                    };
+                    if let Err(error) =
+                        prepare_action(worker, &msg.ulid, "unexpose", planned.clone())
+                    {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably prepare unexpose request");
                         break;
                     }
-                }
-                let body = msg.body.as_deref().unwrap_or("");
-                match parse_unexpose_request(body) {
-                    Ok(req) => {
-                        let target = unexpose_auth_target(&req);
-                        if let Err(error) = authorizer.verify_exact_body(
-                            body,
-                            MutationContext {
-                                verb: COMPUTE_UNEXPOSE_AUTH_VERB,
-                                node: COMPUTE_EXPOSE_NODE_SCOPE,
-                                target: &target,
-                            },
-                        ) {
-                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: refused unauthorized unexpose request");
-                            *unexpose_cursor = Some(msg.ulid.clone());
-                            continue;
-                        }
-                        let planned = {
-                            let active = worker
-                                .active
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            diff_unexpose(&active, &req)
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    if let Err(error) = authorize_unexpose_request(authorizer, body, &req) {
+                        tracing::warn!(
+                            ulid = %msg.ulid,
+                            error = %error,
+                            "compute_expose: refused unauthorized unexpose request"
+                        );
+                        let summary = ApplySummary {
+                            outcome: FirewallActionOutcome::Failed,
+                            attempted: u16::try_from(planned.len()).unwrap_or(u16::MAX),
+                            applied: 0,
+                            detail: "capability claim failed before firewall mutation",
                         };
-                        if let Err(error) =
-                            prepare_action(worker, &msg.ulid, "unexpose", planned.clone())
+                        if terminalize_action(
+                            worker,
+                            build_action_result(&msg.ulid, "unexpose", summary),
+                        )
+                        .is_err()
+                            || !publish_journaled_result(persist, worker, &msg.ulid)
+                                .unwrap_or(false)
                         {
-                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably prepare unexpose request");
                             break;
                         }
-                        if let Err(error) = authorize_unexpose_request(authorizer, body, &req) {
-                            tracing::warn!(
-                                ulid = %msg.ulid,
-                                error = %error,
-                                "compute_expose: refused unauthorized unexpose request"
-                            );
-                            let summary = ApplySummary {
-                                outcome: FirewallActionOutcome::Failed,
-                                attempted: u16::try_from(planned.len()).unwrap_or(u16::MAX),
-                                applied: 0,
-                                detail: "capability claim failed before firewall mutation",
-                            };
-                            if terminalize_action(
-                                worker,
-                                build_action_result(&msg.ulid, "unexpose", summary),
-                            )
-                            .is_err()
-                                || !publish_journaled_result(persist, worker, &msg.ulid)
-                                    .unwrap_or(false)
-                            {
-                                break;
-                            }
-                            *unexpose_cursor = Some(msg.ulid.clone());
-                            continue;
-                        }
-                        let summary = apply_unexpose(worker, nebula_ip, wan_zone, &req);
-                        changed |= summary.changed();
-                        let result = build_action_result(&msg.ulid, "unexpose", summary);
-                        if let Err(error) = terminalize_action(worker, result) {
-                            tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably terminalize unexpose request");
-                            break;
-                        }
-                        if !publish_journaled_result(persist, worker, &msg.ulid).unwrap_or(false) {
-                            break;
-                        }
+                        verify_compute_expose_bus(persist, bus_root, bus_identity)?;
                         *unexpose_cursor = Some(msg.ulid.clone());
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::warn!(ulid = %msg.ulid, error = %e, "compute_expose: bad unexpose request");
-                        *unexpose_cursor = Some(msg.ulid.clone());
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    let summary = apply_unexpose(worker, nebula_ip, wan_zone, &req);
+                    changed |= summary.changed();
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    let result = build_action_result(&msg.ulid, "unexpose", summary);
+                    if let Err(error) = terminalize_action(worker, result) {
+                        tracing::warn!(ulid = %msg.ulid, error = %error, "compute_expose: could not durably terminalize unexpose request");
+                        break;
                     }
+                    if !publish_journaled_result(persist, worker, &msg.ulid).unwrap_or(false) {
+                        break;
+                    }
+                    verify_compute_expose_bus(persist, bus_root, bus_identity)?;
+                    *unexpose_cursor = Some(msg.ulid.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(ulid = %msg.ulid, error = %e, "compute_expose: bad unexpose request");
+                    *unexpose_cursor = Some(msg.ulid.clone());
                 }
             }
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, topic = unexpose_topic, "compute_expose: list_since failed")
         }
     }
 
     if changed {
+        verify_compute_expose_bus(persist, bus_root, bus_identity)?;
         publish_exposed_state(persist, nebula_ip, worker);
+        verify_compute_expose_bus(persist, bus_root, bus_identity)?;
     }
+    Ok(())
 }
 
 fn default_bus_root() -> Option<PathBuf> {
     mde_bus::default_data_dir()
+}
+
+fn compute_expose_bus_identity(root: &Path) -> Result<ComputeExposeBusIdentity, String> {
+    let metadata = std::fs::metadata(root.join("index.sqlite"))
+        .map_err(|error| format!("Bus index identity unavailable: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Bus index is not a regular file".to_string());
+    }
+    Ok(ComputeExposeBusIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn open_current_compute_expose_bus(
+    runtime: &dyn ComputeExposeRuntime,
+    root: PathBuf,
+) -> Result<(Persist, ComputeExposeBusIdentity), String> {
+    let before = compute_expose_bus_identity(&root).ok();
+    let persist = runtime.open_bus(root.clone())?;
+    let after = compute_expose_bus_identity(&root)?;
+    if before.is_some_and(|identity| identity != after)
+        || persist.index_inode() != Some(after.inode)
+    {
+        return Err("Bus changed while opening an identity-bound connection".to_string());
+    }
+    Ok((persist, after))
+}
+
+fn verify_compute_expose_bus(
+    persist: &Persist,
+    root: &Path,
+    expected: ComputeExposeBusIdentity,
+) -> Result<(), String> {
+    let current = compute_expose_bus_identity(root)?;
+    if current != expected || persist.index_inode() != Some(expected.inode) {
+        return Err("Bus generation changed during compute exposure transaction".to_string());
+    }
+    Ok(())
 }
 
 /// Seed the active-rule shadow set from firewalld's persisted rich rules
@@ -1419,32 +1499,6 @@ impl Worker for ComputeExposeWorker {
             return Ok(());
         }
 
-        let retry_interval = self
-            .poll_interval
-            .clamp(Duration::from_millis(10), DEFAULT_POLL_INTERVAL);
-        let persist = loop {
-            if let Some(bus_root) = self
-                .runtime
-                .resolve_bus_root(self.bus_root_override.as_deref())
-            {
-                match self.runtime.open_bus(bus_root) {
-                    Ok(persist) => break persist,
-                    Err(error) => {
-                        tracing::debug!(
-                            error = %error,
-                            "compute_expose: persist open failed; retrying"
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!("compute_expose: no bus root; retrying");
-            }
-
-            tokio::select! {
-                () = shutdown.wait() => return Ok(()),
-                () = tokio::time::sleep(retry_interval) => {}
-            }
-        };
         let wan_zone = detect_wan_zone();
         // VIRT-7.followup: seed the shadow set from firewalld's persisted
         // (--permanent) rules so the first compute/exposed publish reflects
@@ -1452,6 +1506,7 @@ impl Worker for ComputeExposeWorker {
         seed_active_from_firewalld(self, &wan_zone);
         let mut expose_cursor: Option<String> = None;
         let mut unexpose_cursor: Option<String> = None;
+        let mut active_identity: Option<ComputeExposeBusIdentity> = None;
         let mut tick = tokio::time::interval(self.poll_interval);
         tick.tick().await;
         loop {
@@ -1462,15 +1517,55 @@ impl Worker for ComputeExposeWorker {
                         // Nebula not yet up — skip this tick.
                         continue;
                     }
-                    poll_once(
+                    let Some(bus_root) = self.runtime.resolve_bus_root(
+                        self.bus_root_override.as_deref(),
+                    ) else {
+                        tracing::debug!("compute_expose: no bus root; retrying");
+                        continue;
+                    };
+                    let (persist, identity) = match open_current_compute_expose_bus(
+                        self.runtime.as_ref(),
+                        bus_root.clone(),
+                    ) {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            tracing::debug!(error = %error, "compute_expose: identity-bound Bus open failed; retrying");
+                            continue;
+                        }
+                    };
+                    if active_identity.is_some_and(|active| active != identity) {
+                        // A replacement may retain old rows. Floor both lanes at
+                        // the replacement's current tail so only corrected-forward
+                        // requests can trigger a new external effect.
+                        expose_cursor = persist
+                            .read_latest(&format!("compute/expose/{nebula_ip}"))
+                            .ok()
+                            .flatten()
+                            .map(|message| message.ulid);
+                        unexpose_cursor = persist
+                            .read_latest(&format!("compute/unexpose/{nebula_ip}"))
+                            .ok()
+                            .flatten()
+                            .map(|message| message.ulid);
+                        if let Err(error) = verify_compute_expose_bus(&persist, &bus_root, identity) {
+                            tracing::debug!(error = %error, "compute_expose: replacement changed during activation");
+                            continue;
+                        }
+                    }
+                    active_identity = Some(identity);
+                    if let Err(error) = poll_once(
                         &persist,
+                        &bus_root,
+                        identity,
                         self,
                         &nebula_ip,
                         &wan_zone,
                         &mut expose_cursor,
                         &mut unexpose_cursor,
                         self.authorizer.as_ref(),
-                    );
+                    ) {
+                        tracing::debug!(error = %error, "compute_expose: transaction deferred for a fresh Bus sweep");
+                    }
                 }
                 _ = shutdown.wait() => break,
             }
@@ -1741,7 +1836,7 @@ mod tests {
         .expect("worker must activate after Bus recovery");
 
         assert!(runtime.resolve_calls.load(Ordering::SeqCst) >= 3);
-        assert_eq!(runtime.open_calls.load(Ordering::SeqCst), 2);
+        assert!(runtime.open_calls.load(Ordering::SeqCst) >= 2);
         let calls = firewall.calls.lock().expect("calls");
         assert_eq!(calls.len(), 2, "one add plus one reload expected");
         assert!(calls[0]
@@ -1754,6 +1849,166 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(250), task)
             .await
             .expect("active worker shutdown must be prompt")
+            .expect("worker task")
+            .expect("worker result");
+    }
+
+    #[tokio::test]
+    async fn same_path_bus_replacement_skips_retained_request_and_runs_forward_once() {
+        let parent = tempfile::tempdir().expect("parent");
+        let bus_path = parent.path().join("bus");
+        let retired_path = parent.path().join("retired-bus");
+        let initial = Persist::open(bus_path.clone()).expect("initial Bus");
+        let initial_unsigned = r#"{"vm_nebula_ip":"10.42.128.1","guest_port":8080,"proto":"tcp","networks":["mesh"],"schema_version":1}"#;
+        let initial_request = parse_expose_request(initial_unsigned).expect("initial request");
+        let initial_armed = authorize_test_body(
+            AUTH_KEY,
+            initial_unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &expose_auth_target(&initial_request),
+            },
+            "compute-expose-initial-generation",
+            AUTH_NOW + 30_000,
+        );
+        let initial_message = initial
+            .write(
+                "compute/expose/10.42.0.15",
+                Priority::Default,
+                None,
+                Some(&initial_armed),
+            )
+            .expect("initial write");
+
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let journal_root = tempfile::tempdir().expect("journal root");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        ));
+        let firewall = Arc::new(RecordingFirewall::default());
+        let runtime = Arc::new(ScriptedRuntime {
+            firewall_available: true,
+            resolved_root: Some(bus_path.clone()),
+            unresolved_attempts: AtomicUsize::new(0),
+            open_failures: AtomicUsize::new(0),
+            resolve_calls: AtomicUsize::new(0),
+            open_calls: AtomicUsize::new(0),
+        });
+        let mut worker = ComputeExposeWorker::new()
+            .with_runtime(runtime.clone())
+            .with_authorizer(authorizer)
+            .with_mutation_runner(firewall.clone())
+            .with_journal_path(journal_root.path().join("action-journal.json"))
+            .with_nebula_addr_hint("10.42.0.15".to_string())
+            .with_poll_interval(Duration::from_millis(10));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task =
+            tokio::spawn(
+                async move { worker.run(ShutdownToken::from_receiver(shutdown_rx)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if initial
+                    .read_latest(&action_result_topic(&initial_message.ulid))
+                    .expect("initial result query")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial generation must drain");
+        drop(initial);
+
+        std::fs::rename(&bus_path, &retired_path).expect("retire Bus at same path");
+        let replacement = Persist::open(bus_path.clone()).expect("replacement Bus");
+        let retained_unsigned = r#"{"vm_nebula_ip":"10.42.128.2","guest_port":8081,"proto":"tcp","networks":["mesh"],"schema_version":1}"#;
+        let retained_request = parse_expose_request(retained_unsigned).expect("retained request");
+        let retained_armed = authorize_test_body(
+            AUTH_KEY,
+            retained_unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &expose_auth_target(&retained_request),
+            },
+            "compute-expose-retained-replacement",
+            AUTH_NOW + 30_000,
+        );
+        let retained_message = replacement
+            .write(
+                "compute/expose/10.42.0.15",
+                Priority::Default,
+                None,
+                Some(&retained_armed),
+            )
+            .expect("retained replacement write");
+        let open_floor = runtime.open_calls.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.open_calls.load(Ordering::SeqCst) <= open_floor + 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement must activate");
+
+        let forward_unsigned = r#"{"vm_nebula_ip":"10.42.128.3","guest_port":8082,"proto":"tcp","networks":["mesh"],"schema_version":1}"#;
+        let forward_request = parse_expose_request(forward_unsigned).expect("forward request");
+        let forward_armed = authorize_test_body(
+            AUTH_KEY,
+            forward_unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &expose_auth_target(&forward_request),
+            },
+            "compute-expose-forward-replacement",
+            AUTH_NOW + 30_000,
+        );
+        let forward_message = replacement
+            .write(
+                "compute/expose/10.42.0.15",
+                Priority::Default,
+                None,
+                Some(&forward_armed),
+            )
+            .expect("forward write");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if replacement
+                    .read_latest(&action_result_topic(&forward_message.ulid))
+                    .expect("forward result query")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forward request must drain");
+
+        assert!(replacement
+            .read_latest(&action_result_topic(&retained_message.ulid))
+            .expect("retained result query")
+            .is_none());
+        let calls = firewall.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 4, "exactly two add/reload transactions");
+        assert!(calls.iter().all(|call| !call
+            .iter()
+            .any(|arg| { arg.starts_with("--add-rich-rule=") && arg.contains("10.42.128.2") })));
+        drop(calls);
+
+        shutdown_tx.send(true).expect("request shutdown");
+        tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("shutdown must be prompt")
             .expect("worker task")
             .expect("worker result");
     }
@@ -1831,13 +2086,16 @@ mod tests {
 
         poll_once(
             &persist,
+            bus_root.path(),
+            compute_expose_bus_identity(bus_root.path()).expect("Bus identity"),
             &worker,
             "10.42.0.15",
             "public",
             &mut expose_cursor,
             &mut unexpose_cursor,
             authorizer.as_ref(),
-        );
+        )
+        .expect("first poll");
 
         assert!(
             expose_cursor.is_none(),
@@ -1863,13 +2121,16 @@ mod tests {
 
         poll_once(
             &persist,
+            bus_root.path(),
+            compute_expose_bus_identity(bus_root.path()).expect("Bus identity"),
             &restarted_worker,
             "10.42.0.15",
             "public",
             &mut expose_cursor,
             &mut unexpose_cursor,
             authorizer.as_ref(),
-        );
+        )
+        .expect("restart poll");
 
         assert_eq!(
             expose_cursor.as_deref(),
@@ -1890,13 +2151,16 @@ mod tests {
 
         poll_once(
             &persist,
+            bus_root.path(),
+            compute_expose_bus_identity(bus_root.path()).expect("Bus identity"),
             &restarted_worker,
             "10.42.0.15",
             "public",
             &mut expose_cursor,
             &mut unexpose_cursor,
             authorizer.as_ref(),
-        );
+        )
+        .expect("idempotence poll");
         assert_eq!(
             persist
                 .list_since(&action_result_topic(&request_message.ulid), None)
@@ -1942,13 +2206,16 @@ mod tests {
             .with_journal_path(journal_path.clone());
         poll_once(
             &persist,
+            bus_root.path(),
+            compute_expose_bus_identity(bus_root.path()).expect("Bus identity"),
             &second_restart,
             "10.42.0.15",
             "public",
             &mut expose_cursor,
             &mut unexpose_cursor,
             authorizer.as_ref(),
-        );
+        )
+        .expect("prepared recovery poll");
         assert_eq!(
             expose_cursor.as_deref(),
             Some(prepared_message.ulid.as_str())
