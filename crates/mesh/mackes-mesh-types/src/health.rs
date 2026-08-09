@@ -1480,13 +1480,22 @@ pub fn fold_snapshot(
             .max()
             .unwrap_or(GradeLetter::C)
     };
+    // A roster fold is a projection of admitted publications, not a new
+    // observation that can extend their lifetime. Bound an empty/synthetic
+    // fold to the contract maximum, and never let a populated projection
+    // outlive its earliest-expiring source publication.
+    let mut fresh_until_ms =
+        now_ms.saturating_add(validity_ms.min(MAX_NODE_HEALTH_PUBLICATION_TTL_MS));
+    if let Some(source_expiry_ms) = accepted.iter().map(|state| state.valid_until_ms).min() {
+        fresh_until_ms = fresh_until_ms.min(source_expiry_ms);
+    }
     SystemMeshHealthSnapshot {
         schema_version: HEALTH_SCHEMA_VERSION,
         observer: observer.into(),
         roster_revision,
         generation,
         generated_at_ms: now_ms,
-        fresh_until_ms: now_ms.saturating_add(validity_ms),
+        fresh_until_ms,
         current_node_grades,
         active_conditions,
         resolved_conditions,
@@ -1939,6 +1948,40 @@ mod tests {
         );
         assert_eq!(snapshot.mesh_summary.reachable_lighthouses, 1);
         assert_eq!(snapshot.active_conditions[0].id, "mesh:publisher-freshness");
+    }
+
+    #[test]
+    fn fold_freshness_never_outlives_contract_or_admitted_source() {
+        let roster = BTreeSet::from(["node".to_string()]);
+        let snapshot = fold_snapshot(
+            "node",
+            "r1",
+            &roster,
+            vec![state("node", 1, 100)],
+            2,
+            100,
+            u64::MAX,
+            0,
+        );
+        assert_eq!(snapshot.fresh_until_ms, 200);
+        assert!(snapshot.is_fresh(200));
+        assert!(!snapshot.is_fresh(201));
+
+        let empty = fold_snapshot(
+            "node",
+            "r1",
+            &BTreeSet::new(),
+            Vec::new(),
+            3,
+            100,
+            u64::MAX,
+            0,
+        );
+        assert_eq!(
+            empty.fresh_until_ms,
+            100 + MAX_NODE_HEALTH_PUBLICATION_TTL_MS,
+            "a caller cannot fabricate an unbounded fresh projection"
+        );
     }
 
     #[test]

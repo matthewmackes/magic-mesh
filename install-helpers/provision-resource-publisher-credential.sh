@@ -15,6 +15,7 @@ readonly CREDENTIAL_PATH="/etc/credstore.encrypted/resource-publisher-hmac"
 readonly DROPIN_SOURCE="/usr/libexec/mackesd/resource-publisher-hmac.conf"
 readonly DROPIN_PATH="/etc/systemd/system/mde-shell-egui.service.d/60-resource-publisher-hmac.conf"
 readonly SECRET_BIN="/usr/bin/mackesd"
+readonly UNIT_SOURCE="/usr/lib/systemd/system/mcnf-resource-publisher-credential.service"
 
 validate_key() {
   local value bytes
@@ -27,7 +28,7 @@ validate_key() {
 }
 
 self_test() {
-  local test_dir good bad template
+  local test_dir good bad template unit
   test_dir="$(mktemp -d)"
   good="$test_dir/good"
   bad="$test_dir/bad"
@@ -42,6 +43,13 @@ self_test() {
   grep -Fxq \
     'LoadCredentialEncrypted=resource-publisher-hmac:/etc/credstore.encrypted/resource-publisher-hmac' \
     "$template"
+  unit="$UNIT_SOURCE"
+  if [ ! -r "$unit" ]; then
+    unit="$(cd "$(dirname "$0")/.." && pwd)/packaging/systemd/mcnf-resource-publisher-credential.service"
+  fi
+  grep -Fxq \
+    'ExecStart=-/usr/bin/timeout --signal=TERM --kill-after=5s 30s /usr/libexec/mackesd/provision-resource-publisher-credential' \
+    "$unit"
   rm -rf -- "$test_dir"
   echo "provision-resource-publisher-credential: self-test passed"
 }
@@ -63,7 +71,7 @@ fi
   echo "provision-resource-publisher-credential: must run as root" >&2
   exit 1
 }
-for command_name in systemd-creds install grep wc; do
+for command_name in systemd-creds install grep wc cmp chmod chown; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "provision-resource-publisher-credential: required command unavailable: $command_name" >&2
     exit 1
@@ -82,6 +90,7 @@ tmp_dir="$(mktemp -d /run/mcnf-resource-publisher.XXXXXX)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 plain="$tmp_dir/plain"
 encrypted="$tmp_dir/encrypted"
+decrypted="$tmp_dir/decrypted"
 
 if ! "$SECRET_BIN" secret get "$SECRET_NAME" >"$plain" 2>/dev/null; then
   echo "provision-resource-publisher-credential: approved secret '$SECRET_NAME' is unavailable" >&2
@@ -92,9 +101,40 @@ validate_key "$plain" || {
   exit 1
 }
 
-systemd-creds encrypt --name="$CREDENTIAL_NAME" "$plain" "$encrypted" >/dev/null
-install -D -m 0600 -o root -g root "$encrypted" "$CREDENTIAL_PATH"
-install -D -m 0644 -o root -g root "$DROPIN_SOURCE" "$DROPIN_PATH"
+for path in "$CREDENTIAL_PATH" "$DROPIN_PATH"; do
+  [ ! -L "$path" ] || {
+    echo "provision-resource-publisher-credential: refusing symlinked output: $path" >&2
+    exit 1
+  }
+  [ ! -e "$path" ] || [ -f "$path" ] || {
+    echo "provision-resource-publisher-credential: refusing non-regular output: $path" >&2
+    exit 1
+  }
+done
 
-systemctl daemon-reload
-echo "provision-resource-publisher-credential: host-bound publisher credential installed"
+changed=0
+if [ -f "$CREDENTIAL_PATH" ] \
+  && systemd-creds decrypt "$CREDENTIAL_PATH" "$decrypted" >/dev/null 2>&1 \
+  && cmp -s "$plain" "$decrypted"; then
+  chmod 0600 "$CREDENTIAL_PATH"
+  chown root:root "$CREDENTIAL_PATH"
+else
+  systemd-creds encrypt --name="$CREDENTIAL_NAME" "$plain" "$encrypted" >/dev/null
+  install -D -m 0600 -o root -g root "$encrypted" "$CREDENTIAL_PATH"
+  changed=1
+fi
+
+if [ -f "$DROPIN_PATH" ] && cmp -s "$DROPIN_SOURCE" "$DROPIN_PATH"; then
+  chmod 0644 "$DROPIN_PATH"
+  chown root:root "$DROPIN_PATH"
+else
+  install -D -m 0644 -o root -g root "$DROPIN_SOURCE" "$DROPIN_PATH"
+  changed=1
+fi
+
+if [ "$changed" -eq 1 ]; then
+  systemctl daemon-reload
+  echo "provision-resource-publisher-credential: host-bound publisher credential staged for the next controlled shell restart"
+else
+  echo "provision-resource-publisher-credential: host-bound publisher credential already current"
+fi

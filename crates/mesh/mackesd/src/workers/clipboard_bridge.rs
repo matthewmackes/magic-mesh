@@ -82,6 +82,20 @@ pub const ACTION_AUTH_NODE_SCOPE: &str = "vdi-clipboard";
 /// image/rich-text format may raise or per-format it.
 pub const MAX_CLIP_BYTES: usize = 1024 * 1024;
 
+/// Maximum bytes admitted for clipboard routing identities and attribution.
+///
+/// These values are capability inputs and retained metadata, not clipboard
+/// content. Keeping them independently small prevents a tiny clip from carrying
+/// attacker-sized session/source metadata through parse and authorization.
+pub const MAX_CLIP_METADATA_ID_BYTES: usize = 128;
+
+/// Maximum action body decoded by this worker.
+///
+/// [`ActionAuthorizer`] applies the same 64 KiB privileged-action ceiling, but
+/// parsing happens first because the signed target is derived from the event.
+/// Enforce that ceiling before serde allocates attacker-controlled strings.
+pub const MAX_CLIPBOARD_ACTION_BODY_BYTES: usize = 64 * 1024;
+
 /// Relay cadence.
 ///
 /// The bus read is a cheap local log scan and a copy/paste is a slow, human-paced
@@ -270,9 +284,18 @@ pub struct ClipboardEvent {
 /// A human-readable message on malformed JSON, an unknown enum tag, or an oversized
 /// payload ([`ClipboardError::PayloadTooLarge`]).
 pub fn parse_event(body: &str) -> Result<ClipboardEvent, String> {
+    if body.len() > MAX_CLIPBOARD_ACTION_BODY_BYTES {
+        return Err(format!(
+            "clipboard event body exceeds {MAX_CLIPBOARD_ACTION_BODY_BYTES} bytes"
+        ));
+    }
     let ev: ClipboardEvent =
         serde_json::from_str(body).map_err(|e| format!("malformed clipboard event: {e}"))?;
-    validate_target_seat(&ev.target_seat)?;
+    validate_metadata_id(&ev.session_id, "session_id")?;
+    validate_metadata_id(&ev.target_seat, "target_seat")?;
+    if let Some(source) = ev.source.as_deref() {
+        validate_metadata_id(source, "source")?;
+    }
     ev.payload
         .ensure_within_ceiling()
         .map_err(|e| format!("clipboard event rejected: {e}"))?;
@@ -280,16 +303,21 @@ pub fn parse_event(body: &str) -> Result<ClipboardEvent, String> {
 }
 
 pub(super) fn validate_target_seat(target_seat: &str) -> Result<(), String> {
-    let target_seat = target_seat.trim();
-    if target_seat.is_empty() {
-        return Err("clipboard event missing target_seat".to_owned());
+    validate_metadata_id(target_seat, "target_seat")
+}
+
+fn validate_metadata_id(value: &str, field: &'static str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value {
+        return Err(format!("clipboard event {field} is empty or padded"));
     }
-    if target_seat.len() > 128
-        || target_seat.bytes().any(|byte| {
+    if value.len() > MAX_CLIP_METADATA_ID_BYTES
+        || value.bytes().any(|byte| {
             !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
         })
     {
-        return Err("clipboard event target_seat is unsafe or too long".to_owned());
+        return Err(format!(
+            "clipboard event {field} is unsafe or exceeds {MAX_CLIP_METADATA_ID_BYTES} bytes"
+        ));
     }
     Ok(())
 }
@@ -1046,7 +1074,40 @@ mod tests {
         };
         let body = serde_json::to_string(&ev).unwrap();
         let err = parse_event(&body).unwrap_err();
-        assert!(err.contains("too large"), "names the size reject: {err}");
+        assert!(
+            err.contains("body exceeds") || err.contains("too large"),
+            "names the bounded-ingest rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_event_rejects_unbounded_or_unsafe_routing_metadata() {
+        for body in [
+            format!(
+                r#"{{"session_id":"{}","target_seat":"seat:dell","direction":"client_to_guest","payload":{{"format":"text","content":"x"}}}}"#,
+                "s".repeat(MAX_CLIP_METADATA_ID_BYTES + 1)
+            ),
+            format!(
+                r#"{{"session_id":"s1","target_seat":"seat:dell","direction":"client_to_guest","payload":{{"format":"text","content":"x"}},"source":"{}"}}"#,
+                "n".repeat(MAX_CLIP_METADATA_ID_BYTES + 1)
+            ),
+            r#"{"session_id":"s1","target_seat":"seat:dell","direction":"client_to_guest","payload":{"format":"text","content":"x"},"source":"../../credential"}"#.to_owned(),
+        ] {
+            assert!(
+                parse_event(&body).is_err(),
+                "hostile routing metadata must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_event_rejects_an_oversized_action_before_json_decode() {
+        let body = "{".repeat(MAX_CLIPBOARD_ACTION_BODY_BYTES + 1);
+        let error = parse_event(&body).expect_err("oversized action must fail closed");
+        assert!(
+            error.contains("body exceeds"),
+            "the pre-decode size boundary must produce the rejection: {error}"
+        );
     }
 
     // ── policy ──
@@ -1555,6 +1616,34 @@ mod tests {
             "unauthorized and tampered bodies must not reach write_local"
         );
         assert!(latest.is_empty(), "refused bodies must not enter the fold");
+        let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[tokio::test]
+    async fn authorized_action_with_hostile_metadata_has_no_write_effect() {
+        let mut hostile = event("s1", ClipDirection::ClientToGuest, "secret");
+        hostile.source = Some("n".repeat(MAX_CLIP_METADATA_ID_BYTES + 1));
+        let body = signed_body(&hostile, "clip-hostile-metadata");
+        let bus = seed_bodies(&[body]);
+        let access = FakeClipboard::default();
+        let writes = access.writes.clone();
+        let w = ClipboardBridgeWorker::new()
+            .with_access(Box::new(access))
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
+
+        let mut cursor = None;
+        let mut latest = BTreeMap::new();
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
+
+        assert!(
+            writes.lock().expect("writes mutex").is_empty(),
+            "even correctly signed attacker-sized metadata must not reach write_local"
+        );
+        assert!(
+            latest.is_empty(),
+            "refused metadata must not enter the fold"
+        );
         let _ = std::fs::remove_dir_all(&bus);
     }
 

@@ -543,13 +543,11 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         // proof/deep-link callers.
         "car" | "auto-home" | "autohome" => Some(Surface::AutoHome),
         "maps" | "location" | "maps-location" | "mapslocation" => Some(Surface::MapsLocation),
-        // WL-FUNC-011 Phase-2 — the retired Chat / Voice / Editor surfaces folded
-        // into the unified Communications hub, so their legacy `shell/goto` verbs
-        // (incl. the old `notifications` / `clipboard` aliases) now resolve there so
-        // a forward emitter's stale verb still reaches a live surface.
-        "chat" | "notifications" | "clipboard" | "voice" | "editor" | "code" => {
-            Some(Surface::Communications)
-        }
+        // Notifications and clipboard are content modes in the unified hub. The
+        // retired Chat / Voice / Editor product routes deliberately do not alias
+        // here: stale collaboration publishers must fail closed instead of keeping
+        // a second navigation contract reachable.
+        "notifications" | "clipboard" => Some(Surface::Communications),
         "this-node" | "thisnode" | "node" => Some(Surface::ThisNode),
         "system" => Some(Surface::System),
         "storage" => Some(Surface::Storage),
@@ -567,9 +565,7 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "about" => Some(Surface::About),
         // The Communications hub (WL-FUNC-011) — an alert/chyron `shell/goto`
         // targeting it now resolves like every other dock surface.
-        "communications" | "comms" | "mesh-teams" | "meshteams" | "teams" => {
-            Some(Surface::Communications)
-        }
+        "collaboration" | "collab" | "communications" | "comms" => Some(Surface::Communications),
         _ => None,
     }
 }
@@ -1399,13 +1395,20 @@ mod tests {
 
     #[test]
     fn resolve_action_maps_goto_and_plane_verbs() {
+        // WL-FUNC-011 — retired product routes are not aliases for the native
+        // Collaboration surface. Keeping them reachable would preserve a legacy
+        // publisher contract indefinitely.
+        for retired in ["chat", "voice", "editor", "code", "teams", "mesh-teams"] {
+            assert!(
+                resolve_action(&format!("shell/goto/{retired}")).is_none(),
+                "retired collaboration route {retired:?} remained reachable"
+            );
+        }
         assert!(matches!(
-            resolve_action("shell/goto/chat"),
+            resolve_action("shell/goto/collaboration"),
             Some(Navigate::Surface(Surface::Communications))
         ));
-        // WL-FUNC-011 Phase-2 — the retired chat/notify/clipboard verbs now resolve
-        // to the unified Communications hub so a forward emitter's old verb still
-        // reaches a live surface.
+        // Content-mode aliases continue to reach their native Collaboration modes.
         assert!(matches!(
             resolve_action("shell/goto/notifications"),
             Some(Navigate::Surface(Surface::Communications))
@@ -1443,7 +1446,10 @@ mod tests {
     fn name_maps_are_case_insensitive() {
         assert_eq!(surface_by_name("SYSTEM"), Some(Surface::System));
         assert_eq!(surface_by_name("This-Node"), Some(Surface::ThisNode));
-        assert_eq!(surface_by_name("Mesh-Teams"), Some(Surface::Communications));
+        assert_eq!(
+            surface_by_name("Collaboration"),
+            Some(Surface::Communications)
+        );
         assert_eq!(surface_by_name("car"), Some(Surface::AutoHome));
         assert_eq!(surface_by_name("AUTO-HOME"), Some(Surface::AutoHome));
         assert_eq!(plane_by_name("ThisNode"), Some(Plane::ThisNode));
@@ -1459,12 +1465,10 @@ mod tests {
         assert_eq!(surface_by_name("phones"), Some(Surface::Phones));
         assert_eq!(surface_by_name("about"), Some(Surface::About));
         assert_eq!(surface_by_name("this-node"), Some(Surface::ThisNode));
-        assert_eq!(surface_by_name("mesh-teams"), Some(Surface::Communications));
-        // WL-FUNC-011 Phase-2 — the retired Chat/Voice/Editor verbs fold onto the
-        // unified Communications hub.
-        assert_eq!(surface_by_name("editor"), Some(Surface::Communications));
-        assert_eq!(surface_by_name("voice"), Some(Surface::Communications));
-        assert_eq!(surface_by_name("chat"), Some(Surface::Communications));
+        assert_eq!(
+            surface_by_name("collaboration"),
+            Some(Surface::Communications)
+        );
         // and every Surface::ALL variant now resolves from its own (lowercased) name.
         for s in Surface::ALL {
             let verb = format!("{s:?}").to_ascii_lowercase();

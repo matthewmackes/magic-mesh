@@ -546,6 +546,7 @@ assets = [
     # approved mackesd SecretStore CLI; without it the chooser stays read-only.
     { source = "install-helpers/provision-resource-publisher-credential.sh", dest = "/usr/libexec/mackesd/provision-resource-publisher-credential", mode = "755" },
     { source = "packaging/systemd/resource-publisher-hmac.conf", dest = "/usr/libexec/mackesd/resource-publisher-hmac.conf", mode = "644" },
+    { source = "packaging/systemd/mcnf-resource-publisher-credential.service", dest = "/usr/lib/systemd/system/mcnf-resource-publisher-credential.service", mode = "644" },
     # Browser VM RDP login is rotated per serving seat and sealed by systemd.
     # The warning helper is the mandatory five-second pre-update operator notice.
     { source = "install-helpers/seat-update-warning.sh", dest = "/usr/libexec/mackesd/seat-update-warning", mode = "755" },
@@ -821,7 +822,8 @@ systemctl daemon-reload >/dev/null 2>&1 || :
 # `nebula` RPM — enable it so the overlay is boot-durable independently of
 # the grouped mackesd supervisor. Each process self-gates on the pinned role,
 # so enabling the target pre-enrollment is safe.
-systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable mackesd.target mcnf-cloud-arm-credential.service mcnf-music-action-credential.service mcnf-resource-publisher-credential.service mcnf-mesh-secret-recipient.timer nebula.service mesh-health.timer >/dev/null 2>&1 || :
+timeout 45 systemctl restart mcnf-resource-publisher-credential.service >/dev/null 2>&1 || :
 if [ "$mackesd_was_active" -eq 1 ]; then
   systemctl start mackesd.target >/dev/null 2>&1 || :
 fi
@@ -968,7 +970,7 @@ fi
 """
 pre_uninstall_script = """
 if [ "$1" = 0 ]; then
-  systemctl --no-reload disable --now mackesd.target mcnf-mesh-secret-recipient.timer mesh-health.timer >/dev/null 2>&1 || :
+  systemctl --no-reload disable --now mackesd.target mcnf-resource-publisher-credential.service mcnf-mesh-secret-recipient.timer mesh-health.timer >/dev/null 2>&1 || :
 fi
 """
 post_uninstall_script = """

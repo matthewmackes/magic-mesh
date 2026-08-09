@@ -510,6 +510,10 @@ behavioral evidence is not completion.
   office transport, canonical Alerts, migration, and hard cut remain.
 - **Transfer wire checkpoint (2026-08-06):** duplicate `schema_version` fields are rejected at media transfer admission; `.50` passed 1/1.
   Evidence: `docs/platform/evidence/WL-FUNC-011-2026-08-06-transfer-wire-boundary-r1.md`.
+- **Legacy route hard-cut checkpoint (2026-08-09):** retired Chat, Voice,
+  Editor, Code, Teams, and Mesh Teams navigation contracts now fail closed;
+  canonical Collaboration routes remain. BigBoy passed 25/25 bridge tests:
+  `docs/platform/evidence/WL-FUNC-011-2026-08-09-legacy-route-admission-r2.md`.
 - Remaining work:
   1. S1 Reconcile parity and contracts.
      - Objective: map every legacy command, route, state writer, package, and workflow to one of six sections or retirement.
@@ -596,17 +600,18 @@ behavioral evidence is not completion.
 - Problem: Clipboard is text-only and cannot safely negotiate rich MIME payloads across local seat, mesh peers, and guest VDI.
 - Required outcome: one versioned bounded clipboard contract supports text, HTML, images, files, and typed metadata through direct DRM, authenticated mesh, and VDI paths
   with explicit permission, limits, and cleanup.
-- Current state: text shortcuts, direct DRM copy/cut/paste, bounded rich contracts, authenticated mesh adapters, and transfer scaffolding exist; live DRM/mesh,
-  guest adapters, permissions, CAS cleanup, and proof remain.
+- Current state: bounded rich contracts and DRM/mesh/VDI scaffolding exist; live adapters, permissions, cleanup, and proof remain.
 - **JSON admission (2026-08-06):** duplicate keys fail closed; `.50` passed 1/1: `docs/platform/evidence/WL-FUNC-016-2026-08-06-clipboard-json-admission-r1.md`.
 - **S1 rich contract (2026-08-08):** V2 offers, generations, secret policy, and denials passed 72/72: `docs/platform/evidence/WL-FUNC-016-2026-08-08-rich-contract-s1-r1.md`.
 - **S3 mesh transport (2026-08-08):** signed target frames passed 7/7; cross-node/CAS proof remains: `docs/platform/evidence/WL-FUNC-016-2026-08-08-mesh-transport-s3-r1.md`.
-- **S2 DRM authority (2026-08-08):** one bounded seat authority revokes stale focus generations and keeps Bus I/O off-render; DRM passed 19/19 on `.50`, shell/Bus 1/1 each.
-  Live-seat and rich mesh/VDI proof remain: `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`.
-- **S4 VDI transport (2026-08-08):** VNC, RDP, and SPICE carry bounded text with one-use gates, MIME refusal, and replay protection; live guest proof remains:
+- **S2 DRM authority (2026-08-08):** bounded seat authority passed DRM 19/19 on `.50`, shell/Bus 1/1; live proof remains:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-08-drm-clipboard-authority-s2-r1.md`.
+- **S4 VDI transport (2026-08-08):** bounded VNC/RDP/SPICE text with one-use/replay gates passed; live proof remains:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-vdi-clipboard-transport-s4-r1.md`.
 - **S5 permission UI (2026-08-08):** modal, VNC/RDP/SPICE one-use gating, revocation, replay, and redacted audit passed; live guest proof remains:
   `docs/platform/evidence/WL-FUNC-016-2026-08-08-permission-audit-model-s5-r1.md`.
+- **VDI metadata admission checkpoint (2026-08-09):** the 64-KiB pre-decode ceiling and bounded safe identities passed 31/31 hostile tests on `.50`:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-09-vdi-metadata-admission-r6.md`.
 - Remaining work:
   1. S1 Define the rich contract.
      - Objective: version MIME offers, selection, payload limits, origin, expiry, generation, and denial reasons.
@@ -941,6 +946,11 @@ behavioral evidence is not completion.
   shared probe inventory contains `ms-wbt-server` on TCP 3389. Authenticated
   connection/render proof and publisher-key distribution remain. Evidence:
   `docs/platform/evidence/WL-FUNC-019-2026-08-09-live-windows-rdp-discovery-s5-r1.md`.
+- **Resource credential activation checkpoint (2026-08-09):** the base RPM now
+  activates the previously inert resource-publisher credential helper through
+  a bounded idempotent oneshot before controlled shell restart. `.90` package
+  and unit gates passed; live publisher-key distribution remains:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-09-resource-credential-activation-r4.md`.
   1. S1 Freeze resource schema and identity.
      - Objective: version resource kind, stable identity, origin, owner, capabilities, freshness, lifecycle, and provenance.
      - Inputs: mesh peers, Workload, app, Android, media, and file types.
@@ -1790,6 +1800,10 @@ behavioral evidence is not completion.
   ingress now rejects replay/rollback and atomically preserves its bounded
   per-observer cursor/ledger across restart; `.170` passed 24/24:
   `docs/platform/evidence/WL-UX-013-2026-08-08-health-ingress-checkpoint-s2-r1.md`.
+- **Projection freshness checkpoint (2026-08-09):** the roster fold cannot
+  outlive its earliest admitted source or the ten-minute contract maximum;
+  `.90` passed 14/14 health tests including hostile `u64::MAX` validity:
+  `docs/platform/evidence/WL-UX-013-2026-08-09-projection-freshness-r2.md`.
   1. S1 Freeze health and expected-state contracts.
      - Objective: version bounded signed observations, expected absence, transitions, durations, grades, evidence, and redaction.
      - Inputs: health types, lifecycle/network/maintenance sources.
