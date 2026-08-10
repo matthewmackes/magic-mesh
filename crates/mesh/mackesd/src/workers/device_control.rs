@@ -594,9 +594,13 @@ async fn execute_plan(steps: &[ExecStep]) -> Result<String, String> {
     for step in steps {
         match step {
             ExecStep::SysfsWrite { path, contents } => {
-                // A real sysfs write IS `std::fs::write` — the kernel control file.
-                std::fs::write(path, contents)
-                    .map_err(|e| format!("sysfs write {} failed: {e}", path.display()))?;
+                // A control path comes from provider-owned inventory, but the
+                // replicated tree can be replaced between admission and effect.
+                // Open the final component with NOFOLLOW so that replacement by
+                // a symlink cannot redirect a privileged write to an arbitrary
+                // file. Intermediate sysfs directory links are expected Linux
+                // topology; only the actual control endpoint is constrained.
+                write_sysfs_control(path, contents)?;
                 notes.push(format!("wrote `{contents}` → {}", path.display()));
             }
             ExecStep::Command { bin, args } => {
@@ -617,6 +621,25 @@ async fn execute_plan(steps: &[ExecStep]) -> Result<String, String> {
         }
     }
     Ok(notes.join("; "))
+}
+
+/// Write one provider-planned sysfs control without following its final path
+/// component. These are existing kernel attributes, so creation is never
+/// allowed; the descriptor is also CLOEXEC because the worker may run other
+/// fixed command steps in the same action.
+fn write_sysfs_control(path: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("sysfs write {} failed to open safely: {e}", path.display()))?;
+    let mut file: std::fs::File = fd.into();
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("sysfs write {} failed: {e}", path.display()))
 }
 
 #[async_trait::async_trait]
@@ -842,6 +865,24 @@ mod tests {
         };
         let err = command_plan(DeviceControlOp::RescanBus, &target).expect_err("no usb rescan");
         assert!(err.contains("no rescan node"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sysfs_control_write_refuses_a_replaced_final_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        let control = tmp.path().join("authorized");
+        std::fs::write(&victim, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&victim, &control).unwrap();
+
+        let result = execute_plan(&[ExecStep::SysfsWrite {
+            path: control,
+            contents: "0".into(),
+        }])
+        .await;
+
+        assert!(result.is_err(), "a final symlink must not be a control target");
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
     }
 
     // ── the offered gate + audit fire, without touching real hardware ──────────

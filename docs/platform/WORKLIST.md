@@ -2270,6 +2270,10 @@ behavioral evidence is not completion.
   are sorted before the bounded provider limit, preventing directory-order
   churn in hardware summaries; `.50` passed the focused hostile-sensor gate:
   `docs/platform/evidence/WL-UX-011-2026-08-10-thermal-zone-order-r153.md`.
+- **Sysfs control nofollow checkpoint (2026-08-10):** provider-planned control
+  writes refuse a replaced final symlink before any effect; `.90` passed the
+  hostile daemon regression:
+  `docs/platform/evidence/WL-UX-011-2026-08-10-sysfs-control-nofollow-r183.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.
