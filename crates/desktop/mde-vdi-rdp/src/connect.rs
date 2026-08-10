@@ -67,14 +67,14 @@ use ironrdp_rdpsnd::client::Rdpsnd;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput, SessionError};
 use ironrdp_tokio::{
-    FramedWrite as _, NetworkClient, TokioFramed, connect_begin, connect_finalize, mark_as_upgraded,
+    connect_begin, connect_finalize, mark_as_upgraded, FramedWrite as _, NetworkClient, TokioFramed,
 };
 use tokio::net::TcpStream;
 
 use crate::audio::{
     PendingWave, PipeWireRdpsndHandler, PreparedAudio, RdpAudioCapability, RdpAudioStats,
 };
-use crate::clipboard::{ClipboardBridge, UNICODE_TEXT_FORMAT};
+use crate::clipboard::ClipboardBridge;
 use crate::config::RdpConfig;
 use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
@@ -877,11 +877,26 @@ impl RdpConnection {
         self.clipboard
             .offer_host_text(text)
             .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        self.announce_clipboard_offer()
+    }
+
+    /// Offer one bounded HTML fragment through the registered Windows CF_HTML
+    /// format. Callers retain the same permission-gate responsibility as the
+    /// Unicode path.
+    pub fn send_html_clipboard_to_guest(&mut self, html: String) -> Result<(), ConnectError> {
+        self.clipboard
+            .offer_host_html(html)
+            .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
+        self.announce_clipboard_offer()
+    }
+
+    fn announce_clipboard_offer(&mut self) -> Result<(), ConnectError> {
+        let formats = self.clipboard.advertised_formats();
         let messages = self
             .active_stage
             .get_svc_processor_mut::<CliprdrClient>()
             .ok_or_else(|| ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into()))?
-            .initiate_copy(&[UNICODE_TEXT_FORMAT])
+            .initiate_copy(&formats)
             .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
         self.write_clipboard_messages(messages)
     }
@@ -889,6 +904,11 @@ impl RdpConnection {
     /// Take the newest bounded guest Unicode text returned by CLIPRDR.
     pub fn take_guest_clipboard(&self) -> Option<String> {
         self.clipboard.take_remote_text()
+    }
+
+    /// Take the newest bounded guest HTML fragment returned by CF_HTML.
+    pub fn take_guest_html_clipboard(&self) -> Option<String> {
+        self.clipboard.take_remote_html()
     }
 
     fn write_clipboard_messages(
@@ -907,7 +927,7 @@ impl RdpConnection {
             let formats = self
                 .clipboard
                 .is_ready()
-                .then(|| vec![UNICODE_TEXT_FORMAT])
+                .then(|| self.clipboard.advertised_formats())
                 .unwrap_or_default();
             let messages = self
                 .active_stage
@@ -919,14 +939,14 @@ impl RdpConnection {
                 .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
             self.write_clipboard_messages(messages)?;
         }
-        if self.clipboard.take_remote_unicode_offer() {
+        if let Some(format) = self.clipboard.take_remote_format_request() {
             let messages = self
                 .active_stage
                 .get_svc_processor_mut::<CliprdrClient>()
                 .ok_or_else(|| {
                     ConnectError::Clipboard("RDP CLIPRDR channel is unavailable".into())
                 })?
-                .initiate_paste(ironrdp_cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT)
+                .initiate_paste(format)
                 .map_err(|error| ConnectError::Clipboard(error.to_string()))?;
             self.write_clipboard_messages(messages)?;
         }
@@ -1219,9 +1239,9 @@ impl RdpConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        CertPinChange, ConnectError, FOCUS_IN_REPEAT_COUNT, PumpOutcome, TAB_SCANCODE,
         connector_config_for, ensure_rustls_crypto_provider, focus_in_events, push_fastpath_events,
-        refresh_region_for_area,
+        refresh_region_for_area, CertPinChange, ConnectError, PumpOutcome, FOCUS_IN_REPEAT_COUNT,
+        TAB_SCANCODE,
     };
     use crate::audio::{RdpAudioCapability, RdpAudioUnsupportedReason};
     use crate::config::RdpConfig;

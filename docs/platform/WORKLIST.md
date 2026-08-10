@@ -86,12 +86,13 @@ behavioral evidence is not completion.
   proven.
 - Required outcome: One persisted idempotent Workload API controls lifecycle; only the reconciler actuates through libvirt/virtqemud or Quadlet/systemd.
   The shell consumes bounded typed projections, with tested local Display1/KMS attachment and RDP/SPICE/VNC recovery.
-- Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, and several hostile farm tests exist. Workload cleanup now treats
-  an already-stopped libvirt domain as an idempotent destroy/undefine boundary, and an independent live-proof helper validates the typed projection and refuses
-  missing runtime evidence. Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
+- Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, hostile farm tests, and idempotent stopped-domain cleanup exist.
+  Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work:
 - **Terminal attachment revocation checkpoint (2026-08-10):** permanent restart-observation failure clears its Display1 lease before journaling failure; exact machine-9
   proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
+- **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
 - **Recovered attachment lease checkpoint (2026-08-10):** restart recovery refuses false Ready without its Display1 lease; exact machine-193 proof:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-attachment-lease-r110.md`.
 - **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator accepts absent/stopped-domain cleanup while rejecting unrelated failures; 23/23 passed on `.90`:
@@ -742,6 +743,11 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Rich-session replay-capacity checkpoint (2026-08-10):** expired signed collaboration sessions release bounded ledger capacity before fresh intake while newer
   replay expiry remains monotonic; machine 9 passed the exact regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-rich-session-replay-capacity-r121.md`.
+- **RDP CF_HTML checkpoint (2026-08-10):** the production CLIPRDR adapter now
+  preserves Unicode text while adding bounded registered `HTML Format`
+  negotiation, CF_HTML offset validation, and stale/replacement refusal; four
+  focused exact `.50` tests pass:
+  `docs/platform/evidence/WL-FUNC-016-2026-08-10-rdp-cf-html-r125.md`.
 - **Expired consent capacity checkpoint (2026-08-10):** every clipboard consent sweep removes expired authority before admission, including an empty sweep; machine 193
   passed the exact denial regression: `docs/platform/evidence/WL-FUNC-016-2026-08-10-consent-capacity-cleanup-r22.md`.
 - **Permission replay-expiry checkpoint (2026-08-09):** terminal replay marks
