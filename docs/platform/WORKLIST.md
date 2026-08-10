@@ -1504,14 +1504,14 @@ behavioral evidence is not completion.
   same-provider `timeOffset=1` recovery with no fallback; cast found zero physical SSDP/Chromecast targets. Dell auth material provisioned, signed mutation refused,
   then Dell became unreachable. Shell signing now matches daemon hostname canonicalization; the Fedora 44 release-5 RPM rebuilt and passed payload gates. Live loss, renderer,
   Handoff, auth, and rotation remain; canonical peer filenames, bounded state, and DLNA Stop rollback pass 15/15, 27/27, 1/1; physical renderer/two-seat proof unavailable.
-  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`,
-  `docs/platform/evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-07-auth-runtime-guard-r1.md`.
-  New: `evidence/WL-FUNC-021-2026-08-07-peer-roster-canonical-r1.md`, `evidence/WL-FUNC-021-2026-08-07-cast-seek-rollback-r1.md`.
+  Evidence: `docs/platform/evidence/WL-FUNC-021-2026-08-07-provider-loss-audit-r1.md`, `docs/platform/evidence/WL-FUNC-021-2026-08-07-cast-runtime-audit-r2.md`,
+  `docs/platform/evidence/WL-FUNC-021-2026-08-07-auth-runtime-guard-r1.md`.
   CPU mitigations are farm-verified; gateway phases pass focused tests; Dell/seat-15 release CPU proof passes.
-  `evidence/WL-FUNC-021-2026-08-07-runtime-status-phase-coalescing-r1.md`, `evidence/WL-FUNC-021-2026-08-07-mesh-status-dedupe-r1.md`.
+  Evidence: `evidence/WL-FUNC-021-2026-08-07-runtime-status-phase-coalescing-r1.md`, `evidence/WL-FUNC-021-2026-08-07-mesh-status-dedupe-r1.md`.
   Phased media/control-plane, cast/reconnect, mde-musicd cadence guards, Music UI poll cadence, gateway survey phases are farm-verified; three-seat CPU/NWS recovery remains open.
-- **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427`
-  completed through `mde-musicd` while a bounded PipeWire default-sink monitor
+- **Seat-15 CPU (2026-08-10):** live sample found Syncthing convergence plus a shell diagnostic child; no pressure/deadlock.
+  Coalescing and steady-state retest remain: `docs/platform/evidence/WL-FUNC-021-2026-08-10-seat15-cpu-attribution-r147.md`.
+- **Live provider audio checkpoint (2026-08-06):** real Airsonic track `23427` completed through `mde-musicd` while a bounded PipeWire default-sink monitor
   captured 26.8 MiB of 48 kHz stereo s32le; 6,287,357/6,717,440 samples were
   nonzero and playback returned 0. Temporary capture files were removed.
   Provider/network-loss resume, physical-speaker judgment, and authenticated
