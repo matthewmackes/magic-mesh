@@ -95,6 +95,20 @@ def expected_gate_ids() -> list[str]:
     )
 
 
+def expected_evidence_filename(
+    revision: str, scope_kind: str, scope_id: str, gate_id: str
+) -> str:
+    if scope_kind == "github_check":
+        basename = f"{scope_id}.json"
+    elif scope_kind == "farm_package":
+        basename = (
+            "ci-gate-status.json" if scope_id == "farm-ci" else f"{scope_id}.json"
+        )
+    else:
+        basename = f"{gate_id}.json"
+    return f"docs/platform/release-evidence/{revision}/{basename}"
+
+
 def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
     matrix = require_exact_keys(matrix, TOP_KEYS, "matrix")
     if matrix["schema_version"] != 1 or matrix["kind"] != "mcnf-release-gate-matrix":
@@ -195,6 +209,13 @@ def validate_matrix(matrix: Any, expected_revision: str | None = None) -> None:
         evidence = gate["evidence_filename"]
         if not EVIDENCE_RE.fullmatch(evidence) or f"/{revision}/" not in evidence:
             fail(f"{label}.evidence_filename must be a revision-bound canonical JSON filename")
+        expected_evidence = expected_evidence_filename(
+            revision, scope_kind, scope_id, gate_id
+        )
+        if evidence != expected_evidence:
+            fail(
+                f"{label}.evidence_filename must bind {gate_id!r} to {expected_evidence!r}"
+            )
         if evidence in evidence_claims:
             fail(f"{label}.evidence_filename is reused by independent gate claims")
         evidence_claims.add(evidence)
@@ -244,7 +265,9 @@ def generated_fixture(revision: str) -> dict[str, Any]:
                 "install-helpers/test-five-seat-core.py --required-baseline"
                 if scope_kind == "seat" else f"self-test --gate {gate_id}"
             ),
-            "evidence_filename": f"docs/platform/release-evidence/{revision}/{gate_id}.json",
+            "evidence_filename": expected_evidence_filename(
+                revision, scope_kind, scope_id, gate_id
+            ),
             "pass_condition": "typed result is pass", "revision_ref": "source_revision",
             "required": True,
         })
@@ -278,6 +301,15 @@ def self_test() -> None:
             "evidence_filename", value["gates"][0]["evidence_filename"]
         ),
     )
+
+    def swap_seat_evidence(value: dict[str, Any]) -> None:
+        seats = [gate for gate in value["gates"] if gate["scope_kind"] == "seat"]
+        seats[0]["evidence_filename"], seats[1]["evidence_filename"] = (
+            seats[1]["evidence_filename"],
+            seats[0]["evidence_filename"],
+        )
+
+    case("cross-wired evidence claims", swap_seat_evidence)
     case(
         "duplicate node claim",
         lambda value: value["gates"][next(
