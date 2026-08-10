@@ -1185,6 +1185,11 @@ fn acquire_group_owner_lease(
         .write(true)
         .create(true)
         .mode(0o600)
+        // The metadata check above is defense in depth only.  The path can
+        // be replaced after that check, so make the kernel reject a final
+        // symlink at the actual lease open as well.  A process-group lease
+        // must never follow an attacker-controlled path into another inode.
+        .custom_flags(0o400000 | 0o2000000) // Linux O_NOFOLLOW | O_CLOEXEC
         .open(&path)
         .with_context(|| format!("opening worker group lease {}", path.display()))?;
     fs2::FileExt::try_lock_exclusive(&file)
@@ -1939,6 +1944,23 @@ mod tests {
             expect_blocked,
             "child process group-lease verdict did not match the live owner"
         );
+    }
+
+    #[test]
+    fn group_lease_refuses_symlinked_lock_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let owner_root = tempfile::tempdir().expect("owner root");
+        let target = owner_root.path().join("redirect-target");
+        std::fs::File::create(&target).expect("target file");
+        symlink(&target, owner_root.path().join("control.lock")).expect("symlink lock leaf");
+
+        let error = acquire_group_owner_lease(
+            owner_root.path(),
+            crate::worker_role::WorkerGroup::Control,
+        )
+        .expect_err("a process-group lease must not follow a symlink");
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     fn run_group_lease_child(root: &std::path::Path, expect_blocked: bool) {
