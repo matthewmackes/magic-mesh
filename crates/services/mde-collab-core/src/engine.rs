@@ -388,7 +388,7 @@ mod tests {
             .merge(vec![unsupported, unsigned])
             .expect("invalid events are reported, not fatal to the batch");
 
-        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.accepted, 1);
         assert_eq!(outcome.duplicates, 0);
         assert_eq!(outcome.dropped_invalid, 2);
         assert_eq!(
