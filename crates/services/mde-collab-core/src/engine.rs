@@ -458,6 +458,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(engine.all_events(), vec![original]);
+        assert_eq!(engine.all_events(), vec![original, batch_original]);
     }
 }
