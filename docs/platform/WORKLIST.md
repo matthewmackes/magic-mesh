@@ -1875,6 +1875,10 @@ behavioral evidence is not completion.
   artifact reused across independent gates; canonical matrix validation passed
   17 required gates and 15 hostile fixtures:
   `docs/platform/evidence/WL-CRIT-006-2026-08-10-unique-evidence-claims-r155.md`.
+- **Artifact revalidation (2026-08-10):** `release-evidence.sh validate` now
+  rejects missing or replaced artifact bytes even after an outer binding is
+  refreshed and CI provenance is removed; `.90` passed the focused hostile
+  self-test: `docs/platform/evidence/WL-CRIT-006-2026-08-10-artifact-revalidation-r186.md`.
   1. S1 Define release gate matrix.
      - Objective: list every required check, seat, node, artifact, threshold, owner, and evidence filename for one revision.
      - Inputs: governance, current CI, all active P0/P1 epics.

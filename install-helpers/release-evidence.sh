@@ -167,6 +167,22 @@ artifact_json() {
     '{path: $path, size_bytes: $size, sha256: $sha256}'
 }
 
+verify_artifact_descriptor() {
+  local descriptor="$1" path expected_size expected_sha256 actual_size actual_sha256
+  path="$(jq -r '.path' <<<"$descriptor")"
+  expected_size="$(jq -r '.size_bytes' <<<"$descriptor")"
+  expected_sha256="$(jq -r '.sha256' <<<"$descriptor")"
+  [ -f "$path" ] && [ ! -L "$path" ] \
+    || die "release artifact is not a regular, non-symlink file: $path"
+  actual_size="$(stat -c '%s' -- "$path")" \
+    || die "could not stat release artifact: $path"
+  actual_sha256="$(sha256sum -- "$path" | awk '{print $1}')"
+  [ "$actual_size" = "$expected_size" ] \
+    || die "release artifact changed size since evidence was written: $path"
+  [ "$actual_sha256" = "$expected_sha256" ] \
+    || die "release artifact digest does not match evidence: $path"
+}
+
 manifest_json() {
   local kind="$1" path="$2" resolved size digest
   [ -s "$path" ] || die "$kind manifest is missing or empty: $path"
@@ -578,6 +594,10 @@ validate_file() {
       (.preview | verdict_ok) and (.production | verdict_ok))
     and production_verdict_ok
   ' "$file" >/dev/null || die "invalid or incomplete evidence schema: $file"
+  local artifact_descriptor
+  while IFS= read -r artifact_descriptor; do
+    verify_artifact_descriptor "$artifact_descriptor"
+  done < <(jq -c '.artifacts[]' "$file")
   verify_descriptor "SBOM" "$(jq -c '.provenance.sbom_manifest' "$file")"
   verify_descriptor "gate" "$(jq -c '.provenance.gate_manifest' "$file")"
   if [ "$(jq -r '.provenance.resource_publisher_attestation // empty' "$file")" ]; then
@@ -847,7 +867,7 @@ self_test_ci_status() {
 }
 
 self_test() {
-  local work evidence_a evidence_b broken broken_farm short_source invalid_farm_slot ci_pair_mismatch production_pass topology farm_topology preview_farm topology_revision_mismatch topology_revision_mismatch_raw missing_ci_gate missing_github_check failed_gate unavailable_pass missing_source changed_sbom changed_gate legacy_preview legacy_production missing_resource_attestation invalid_resource_attestation descriptor_mismatch expected_a_sha expected_binding symlink_artifact reused_ci_artifact replacement_descriptor rc
+  local work evidence_a evidence_b broken broken_farm short_source invalid_farm_slot ci_pair_mismatch production_pass topology farm_topology preview_farm topology_revision_mismatch topology_revision_mismatch_raw missing_ci_gate missing_github_check failed_gate unavailable_pass missing_source changed_sbom changed_gate legacy_preview legacy_production missing_resource_attestation invalid_resource_attestation descriptor_mismatch artifact_missing artifact_changed expected_a_sha expected_binding symlink_artifact reused_ci_artifact replacement_descriptor rc
   local ci_status ci_status_single vdi_evidence resource_attestation attestation_issued_ms attestation_expires_ms two_artifacts single_artifact
   local roundtrip_status roundtrip_binding roundtrip_binding_reordered roundtrip_evidence
   local hostile_status hostile_status_changed hostile_output duplicate_status duplicate_binding
@@ -1071,6 +1091,42 @@ EOF
      (.provenance.sbom_manifest.sha256 | test("^[0-9a-f]{64}$")) and
      (.provenance.gate_manifest.sha256 | test("^[0-9a-f]{64}$"))' \
     "$evidence_a" >/dev/null || die "self-test: provenance binding was not recorded"
+
+  # A refreshed outer binding must not make absent or replaced release bytes
+  # authoritative.  These fixtures deliberately remove the CI descriptor so
+  # artifact validation cannot rely on a second gate to catch the mutation.
+  artifact_missing="$work/missing-artifact.json"
+  jq --arg path "$work/0-missing-artifact.rpm" \
+    '.provenance.ci_gate_status = null |
+      .artifacts[0].path = $path |
+      .artifacts |= sort_by(.path)' \
+    "$evidence_a" >"$artifact_missing"
+  binding="$(binding_payload "$artifact_missing" | sha256sum | awk '{print $1}')"
+  jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' \
+    "$artifact_missing" >"$artifact_missing.bound"
+  mv -- "$artifact_missing.bound" "$artifact_missing"
+  set +e
+  "$0" validate "$artifact_missing" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || die "self-test: missing release artifact was accepted after rebinding"
+
+  printf '%s\n' 'replacement bytes' >"$work/changed-artifact.rpm"
+  artifact_changed="$work/changed-artifact.json"
+  jq --arg path "$work/changed-artifact.rpm" \
+    '.provenance.ci_gate_status = null |
+     .artifacts[0].path = $path |
+     .artifacts |= sort_by(.path)' \
+    "$evidence_a" >"$artifact_changed"
+  binding="$(binding_payload "$artifact_changed" | sha256sum | awk '{print $1}')"
+  jq -S --arg binding "$binding" '.provenance.binding_sha256 = $binding' \
+    "$artifact_changed" >"$artifact_changed.bound"
+  mv -- "$artifact_changed.bound" "$artifact_changed"
+  set +e
+  "$0" validate "$artifact_changed" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || die "self-test: changed release artifact was accepted after rebinding"
 
   reused_ci_artifact="$work/reused-ci-different-artifact.json"
   printf 'replacement release artifact\n' >"$work/replacement.rpm"
