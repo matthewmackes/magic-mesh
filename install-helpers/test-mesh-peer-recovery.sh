@@ -130,8 +130,13 @@ esac
 SH
 cat >"$BIN/ip" <<'SH'
 #!/bin/sh
-test -f "${MCNF_TEST_STATE:?}/active-nebula.service" \
-    && printf '%s\n' '7: nebula1 inet 10.42.0.7/17 scope global'
+state=${MCNF_TEST_STATE:?}
+if test -f "$state/active-nebula.service"; then
+    printf '%s\n' '7: nebula1 inet 10.42.0.7/17 scope global'
+    if test -f "$state/drop-after-nebula-ready"; then
+        rm -f "$state/drop-after-nebula-ready" "$state/online"
+    fi
+fi
 SH
 cat >"$BIN/nm-online" <<'SH'
 #!/bin/sh
@@ -187,6 +192,22 @@ fi
 grep -Fq 'status=offline-during-recovery' "$STATE/notifies"
 rm -f "$STATE/drop-after-first-online-check"
 echo 'PASS stale-network fixture: post-lock attestation fails closed'
+
+# The physical link can disappear after Nebula has materialized its TUN
+# address. That overlay signal must not authorize etcd/Syncthing mutation.
+: >"$STATE/online"
+: >"$STATE/mutations"
+: >"$STATE/notifies"
+: >"$STATE/sleeps"
+: >"$STATE/drop-after-nebula-ready"
+run_helper
+printf '%s\n' nebula.service >"$STATE/expected-mutations"
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+grep -Fq 'status=offline-after-nebula' "$STATE/notifies"
+rm -f "$STATE/drop-after-nebula-ready" "$STATE/active-nebula.service" \
+    "$STATE/nebula-attempts" "$STATE/nebula-ready-checks"
+: >"$STATE/sleeps"
+echo 'PASS overlay-to-substrate fixture: link loss after Nebula readiness prevents downstream mutation'
 
 : >"$STATE/online"
 : >"$STATE/notifies"

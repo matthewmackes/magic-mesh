@@ -1983,6 +1983,11 @@ behavioral evidence is not completion.
   network readiness after acquiring its single-flight lock and refuses all
   mutation if the link disappeared; seat 90 passed the stale-network fixture:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-post-lock-network-attestation-r163.md`.
+- **Overlay-to-substrate attestation checkpoint (2026-08-10):** recovery
+  rechecks physical network readiness after Nebula's TUN address becomes ready,
+  refusing configured substrate and downstream mutation when the link then
+  disappears; `.90` passed the injected fault fixture:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-overlay-substrate-attestation-r184.md`.
 - **Syncthing reconcile bound (2026-08-10):** timer/manual runs now serialize
   and bound CLI/registry calls, preventing stalled overlap from amplifying CPU;
   `.50` passed the device-scope self-test:

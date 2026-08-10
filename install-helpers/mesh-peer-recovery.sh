@@ -252,6 +252,15 @@ main() {
         done
     fi
 
+    # Nebula's TUN address is an overlay-readiness signal, not proof that the
+    # physical link is still usable. A resume/network-return event can lose
+    # the link while the bounded overlay wait is running; do not start or
+    # otherwise mutate configured substrate services from that stale result.
+    if ! physical_network_online; then
+        publish "offline-after-nebula"
+        return 0
+    fi
+
     if [ -s "$ETCD_MEMBER_FILE" ]; then
         if ! restore_configured_service etcd.service etcd; then
             publish "failed-configured-etcd"
