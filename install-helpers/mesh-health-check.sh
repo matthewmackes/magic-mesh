@@ -21,7 +21,16 @@ set -u
 ETC_NEBULA="${MCNF_NEBULA_DIR:-/etc/nebula}"
 ROLE_FILE="${MCNF_ROLE_FILE:-/var/lib/mde/role.toml}"
 HEALTH_RUN_DIR="${MCNF_HEALTH_RUN_DIR:-/run/mesh-health}"
+NEBULA_UNREACHABLE_RESTART_STAMP="${MCNF_NEBULA_UNREACHABLE_RESTART_STAMP:-$HEALTH_RUN_DIR/nebula-unreachable.restarted}"
+NEBULA_UNREACHABLE_RESTART_COOLDOWN_S="${MCNF_NEBULA_UNREACHABLE_RESTART_COOLDOWN_S:-600}"
 log() { echo "mesh-health: $*"; }       # journal via the unit's StandardOutput
+
+case "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" in
+    ''|*[!0-9]*) NEBULA_UNREACHABLE_RESTART_COOLDOWN_S=600 ;;
+esac
+if [ "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" -lt 60 ]; then
+    NEBULA_UNREACHABLE_RESTART_COOLDOWN_S=600
+fi
 
 # Only manage a node that has actually been enrolled.
 if [ ! -f "$ETC_NEBULA/host.crt" ] &&
@@ -55,15 +64,67 @@ restart() {
     systemctl restart "$1" >/dev/null 2>&1 || log "  restart $1 failed"
 }
 
+MACKESD_GROUP_UNITS=(
+    mackesd-control.service
+    mackesd-observation.service
+    mackesd-actions.service
+    mackesd-data.service
+    mackesd-compute.service
+    mackesd-integrations.service
+)
+
+restore_grouped_mackesd_after_nebula_restart() {
+    local unit
+    # mackesd.target and mackesd-control.service Require=nebula.service. A
+    # watchdog restart therefore tears down the grouped daemon even though the
+    # fault was in the overlay. Queue an additive target start and only the
+    # missing children; never restart a group that survived the transaction.
+    log "RECOVER: restoring grouped mackesd after nebula restart"
+    systemctl --no-block start mackesd.target >/dev/null 2>&1 \
+        || log "  start mackesd.target failed"
+    for unit in "${MACKESD_GROUP_UNITS[@]}"; do
+        if ! systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
+            systemctl --no-block start "$unit" >/dev/null 2>&1 \
+                || log "  start $unit failed"
+        fi
+    done
+}
+
+restart_nebula_and_restore_groups() {
+    local reason="$1"
+    log "RECOVER: restarting nebula.service ($reason)"
+    alert nebula.service "$reason"
+    if systemctl restart nebula.service >/dev/null 2>&1; then
+        restore_grouped_mackesd_after_nebula_restart
+    else
+        log "  restart nebula.service failed"
+    fi
+}
+
+nebula_unreachable_restart_due() {
+    local now stamp_mtime
+    now="$(date +%s 2>/dev/null || true)"
+    stamp_mtime="$(stat -c %Y "$NEBULA_UNREACHABLE_RESTART_STAMP" 2>/dev/null || true)"
+    [ -z "$now" ] || [ -z "$stamp_mtime" ] \
+        || [ "$((now - stamp_mtime))" -ge "$NEBULA_UNREACHABLE_RESTART_COOLDOWN_S" ]
+}
+
+record_nebula_unreachable_restart() {
+    mkdir -p "$HEALTH_RUN_DIR" 2>/dev/null || true
+    : > "$NEBULA_UNREACHABLE_RESTART_STAMP"
+}
+
 # 0. Shared-state plane health. SUBSTRATE-V2: the plane is etcd (coordination)
 #    + Syncthing (files). When this node is on the etcd coordination plane
 #    (setup-etcd wrote the endpoints file), assert etcd quorum health + the
 #    Syncthing daemon.
 ETCD_ENDPOINTS_FILE="${MCNF_ETCD_ENDPOINTS_FILE:-/etc/mackesd/etcd-endpoints}"
+ETCD_MEMBER_FILE="${MCNF_ETCD_MEMBER_FILE:-/etc/etcd/etcd.env}"
 SYNCTHING_FOLDER_ID="${MCNF_SYNCTHING_FOLDER_ID:-mcnf-mesh}"
 PEER_PUBLICATION_STAMP="${MCNF_PEER_PUBLICATION_STAMP:-$HEALTH_RUN_DIR/peer-publication.ok}"
 PEER_PUBLICATION_MAX_AGE_S="${MCNF_PEER_PUBLICATION_MAX_AGE_S:-120}"
 publication_failed=0
+coordination_failed=0
 if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
     # etcd coordination plane: quorum health (any reachable client endpoint).
     EPS="$(tr '\n' ',' < "$ETCD_ENDPOINTS_FILE" | sed 's/,$//')"
@@ -85,7 +146,16 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ]; then
             fi
         done
         if [ "$healthy_endpoint" -eq 0 ]; then
-            restart etcd.service "etcd unreachable (coordination plane down)"
+            coordination_failed=1
+            if [ -s "$ETCD_MEMBER_FILE" ]; then
+                restart etcd.service "etcd unreachable (coordination plane down)"
+            else
+                # Workstations are coordination clients, not local members.
+                # Restarting their condition-skipped etcd.service cannot heal a
+                # remote quorum and creates false recovery churn every minute.
+                log "DEGRADED: coordination endpoints unreachable; client-only node has no local etcd member to restart"
+                alert etcd-client "coordination endpoints unreachable; no local member to restart"
+            fi
         fi
     fi
     # Syncthing file plane (non-critical to liveness, but recover + note it).
@@ -164,14 +234,6 @@ fi
 
 # 1. Every independently supervised worker group must be active. Checking only
 #    mackesd.target would miss a group that failed after the target started.
-MACKESD_GROUP_UNITS=(
-    mackesd-control.service
-    mackesd-observation.service
-    mackesd-actions.service
-    mackesd-data.service
-    mackesd-compute.service
-    mackesd-integrations.service
-)
 for mackesd_group_unit in "${MACKESD_GROUP_UNITS[@]}"; do
     if ! systemctl is-active --quiet "$mackesd_group_unit"; then
         restart "$mackesd_group_unit" "process group not active"
@@ -195,10 +257,11 @@ if [ -s "$ETCD_ENDPOINTS_FILE" ] && {
 fi
 
 # 2. nebula must be active AND own the overlay interface.
+overlay_failed=0
 if ! systemctl is-active --quiet nebula.service; then
-    restart nebula.service "not active"
+    restart_nebula_and_restore_groups "not active"
 elif ! ip -o link show nebula1 >/dev/null 2>&1; then
-    restart nebula.service "nebula1 interface missing"
+    restart_nebula_and_restore_groups "nebula1 interface missing"
 else
     # 3. Overlay liveness — a peer must be able to reach a lighthouse over the
     #    overlay. Skip on the lighthouse itself (am_lighthouse: true). Ping the
@@ -212,13 +275,30 @@ else
             if ping -c 3 -W 2 "$ip" >/dev/null 2>&1; then reachable=1; break; fi
         done
         if [ "${#LH[@]}" -gt 0 ] && [ "$reachable" -eq 0 ]; then
-            restart nebula.service "overlay unreachable: no lighthouse answered"
+            overlay_failed=1
+            if nebula_unreachable_restart_due; then
+                # Record before the restart so a failed or timed-out restart
+                # cannot be retried every minute and collapse Requires=
+                # dependants indefinitely.
+                record_nebula_unreachable_restart
+                restart_nebula_and_restore_groups \
+                    "overlay unreachable: no lighthouse answered"
+            else
+                log "DEGRADED: overlay unreachable; nebula restart suppressed by ${NEBULA_UNREACHABLE_RESTART_COOLDOWN_S}s cooldown"
+                alert nebula.service \
+                    "overlay unreachable; repeated restart suppressed"
+            fi
+        else
+            rm -f -- "$NEBULA_UNREACHABLE_RESTART_STAMP"
         fi
     fi
 fi
 
-if [ "$publication_failed" -ne 0 ]; then
-    log "DEGRADED: own peer publication is stale; recovery requested"
+if [ "$publication_failed" -ne 0 ] || [ "$overlay_failed" -ne 0 ] \
+   || [ "$coordination_failed" -ne 0 ]; then
+    if [ "$publication_failed" -ne 0 ]; then
+        log "DEGRADED: own peer publication is stale; recovery requested"
+    fi
     exit 1
 fi
 log "ok"
