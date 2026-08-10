@@ -438,7 +438,13 @@ fn validate_dib(
         .filter(|bits| matches!(bits, 24 | 32))
         .ok_or(ClipboardBridgeError::InvalidImage)?;
     let compression = u32_at(16).ok_or(ClipboardBridgeError::InvalidImage)?;
-    if !matches!(compression, 0 | 3) {
+    if !matches!(compression, 0 | 3)
+        // BI_BITFIELDS needs channel masks after the 40-byte
+        // BITMAPINFOHEADER. This validator treats `header` as the complete
+        // pixel-data offset, so accepting a 40-byte bitfield header would
+        // interpret mask bytes (or absent bytes) as pixels.
+        || compression == 3 && header < 52
+    {
         return Err(ClipboardBridgeError::InvalidImage);
     }
     let row_bits = u64::try_from(width)
@@ -708,6 +714,19 @@ mod tests {
         hostile[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
         assert_eq!(
             bridge.offer_host_dibv5(hostile),
+            Err(ClipboardBridgeError::InvalidImage)
+        );
+
+        let mut missing_bitfield_masks = vec![0_u8; 40 + 4];
+        missing_bitfield_masks[0..4].copy_from_slice(&40_u32.to_le_bytes());
+        missing_bitfield_masks[4..8].copy_from_slice(&1_i32.to_le_bytes());
+        missing_bitfield_masks[8..12].copy_from_slice(&(-1_i32).to_le_bytes());
+        missing_bitfield_masks[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        missing_bitfield_masks[14..16].copy_from_slice(&32_u16.to_le_bytes());
+        missing_bitfield_masks[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        missing_bitfield_masks[20..24].copy_from_slice(&4_u32.to_le_bytes());
+        assert_eq!(
+            super::validate_dib(&missing_bitfield_masks, Some(DIB_FORMAT.id())),
             Err(ClipboardBridgeError::InvalidImage)
         );
     }
