@@ -19,6 +19,7 @@ printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
 printf '%s\n' member >"$ROOT/etcd.env"
 printf '%s\n' configured >"$ROOT/syncthing.conf"
 : >"$STATE/mutations"
+: >"$STATE/restarts"
 : >"$STATE/notifies"
 : >"$STATE/sleeps"
 
@@ -33,6 +34,7 @@ case "$1" in
     restart)
         unit=$2
         printf '%s\n' "$unit" >>"$state/mutations"
+        printf '%s\n' "$unit" >>"$state/restarts"
         if [ "$unit" = nebula.service ]; then
             count=$(cat "$state/nebula-attempts" 2>/dev/null || printf 0)
             count=$((count + 1))
@@ -103,6 +105,21 @@ case "$1" in
             unit=$2
             printf '%s\n' "$unit" >>"$state/mutations"
             [ ! -f "$state/fail-start-$unit" ] || exit 1
+            : >"$state/active-$unit"
+        elif [ "${2:-}" = mackesd.target ]; then
+            printf '%s\n' mackesd.target >>"$state/mutations"
+            if [ ! -f "$state/target-active" ]; then
+                if [ -f "$state/delay-groups" ]; then
+                    : >"$state/pending-groups"
+                else
+                    for group in control observation actions data compute integrations; do
+                        : >"$state/active-mackesd-$group.service"
+                    done
+                fi
+            fi
+        elif printf '%s\n' "${2:-}" | grep -Eq '^mackesd-(control|observation|actions|data|compute|integrations)\.service$'; then
+            unit=$2
+            printf '%s\n' "$unit" >>"$state/mutations"
             : >"$state/active-$unit"
         else
             printf 'trigger:%s\n' "$*" >>"$state/triggers"
@@ -269,6 +286,29 @@ cmp "$STATE/expected-mutations" "$STATE/mutations"
 [ ! -s "$STATE/sleeps" ]
 grep -Fq 'status=already-recovered' "$STATE/notifies"
 echo 'PASS repeated healthy event: no overlay or service restart'
+
+# A network-return event can find the target active while one grouped daemon is
+# missing. Recovery must start only that group. Restarting the target creates a
+# long stop transaction and can repeatedly strand Eagle with most groups down.
+: >"$STATE/target-active"
+rm -f "$STATE/active-mackesd-observation.service"
+: >"$STATE/mutations"
+: >"$STATE/restarts"
+: >"$STATE/notifies"
+run_helper
+cat >"$STATE/expected-mutations" <<'EOF'
+xdg-binds
+mackesd.target
+mackesd-observation.service
+EOF
+cmp "$STATE/expected-mutations" "$STATE/mutations"
+if grep -Fqx mackesd.target "$STATE/restarts"; then
+    echo 'partial grouped recovery restarted the target' >&2
+    exit 1
+fi
+grep -Fq 'status=recovered' "$STATE/notifies"
+rm -f "$STATE/target-active"
+echo 'PASS partial grouped recovery: missing child starts without target restart'
 
 : >"$STATE/mutations"
 flock "$ROOT/recovery.lock" sh -c 'touch "$1"; /usr/bin/sleep 3' sh "$STATE/lock-held" &

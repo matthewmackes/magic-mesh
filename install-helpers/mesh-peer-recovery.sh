@@ -106,11 +106,26 @@ wait_grouped_mackesd_ready() {
     return 1
 }
 
+start_grouped_mackesd_without_disruption() {
+    local unit
+    # Recovery is additive. `restart mackesd.target` begins by stopping every
+    # PartOf child and, when queued with --no-block, can make a transiently
+    # active child set look recovered while that stop transaction is still
+    # draining. Start the target, then explicitly start only missing groups.
+    bounded_systemctl --no-block start mackesd.target >/dev/null 2>&1 || return 1
+    for unit in control observation actions data compute integrations; do
+        if ! bounded_systemctl is-active --quiet "mackesd-$unit.service" >/dev/null 2>&1; then
+            bounded_systemctl --no-block start "mackesd-$unit.service" >/dev/null 2>&1 \
+                || return 1
+        fi
+    done
+}
+
 grouped_mackesd_target_starting() {
     local state
     state="$(bounded_systemctl show mackesd.target -p ActiveState --value 2>/dev/null)" \
         || return 1
-    [ "$state" = active ] || [ "$state" = activating ]
+    [ "$state" = activating ]
 }
 
 restore_xdg_binds() {
@@ -249,13 +264,12 @@ main() {
 
     publish "restoring-grouped-mackesd"
     # During boot the target can already be activating its six notify children;
-    # let that bounded job settle instead of restarting it underneath itself.
-    # If it is not starting (or does not settle), queue one non-blocking restart
-    # and poll the exact child readiness.  A blocking target restart can exceed
-    # the per-command timeout while healthy children are still reaching READY.
+    # let that bounded job settle. If it does not settle, perform additive
+    # recovery only: start the target and any missing group without stopping a
+    # healthy process. Poll the exact child readiness after those start jobs.
     if grouped_mackesd_target_starting && wait_grouped_mackesd_ready; then
         :
-    elif ! bounded_systemctl --no-block restart mackesd.target >/dev/null 2>&1 \
+    elif ! start_grouped_mackesd_without_disruption \
         || ! wait_grouped_mackesd_ready; then
         publish "failed-grouped-mackesd"
         return 1

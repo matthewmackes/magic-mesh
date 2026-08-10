@@ -1882,6 +1882,9 @@ behavioral evidence is not completion.
 - **Eagle rollout preflights (2026-08-09):** Eagle was inspected without mutation; release 12 lacks recovery, while the available release-23 bytes are unsigned,
   source-unbound, and incomplete, so no warning or rollout ran: `docs/platform/evidence/WL-CRIT-007-2026-08-09-eagle-recovery-preflight-r6.md`,
   `docs/platform/evidence/WL-CRIT-007-WL-FUNC-021-2026-08-09-eagle-release23-alignment-r7.md`.
+- **Eagle additive recovery checkpoint (2026-08-09):** release 29 exposed a repeated asynchronous target-restart loop. Recovery now starts the target and only missing
+  groups without stopping healthy processes; `.50` passed the full fixture. Privileged Eagle deployment remains:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-eagle-additive-group-recovery-r8.md`.
 - **Workload/session recovery checkpoint (2026-08-08):** terminal Display1
   recovery now reattaches only the latest valid exact generation and revokes
   superseded, expired, mismatched, orphaned, or stopped-workload leases without
