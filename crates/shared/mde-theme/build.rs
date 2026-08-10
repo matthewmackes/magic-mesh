@@ -4,14 +4,14 @@
 //! with `env!`:
 //!
 //! * `MDE_BUILD_VERSION` — the crate (workspace) `CARGO_PKG_VERSION`.
-//! * `MDE_BUILD_GIT_HASH` — `git rev-parse --short HEAD`, or the sentinel
-//!   `nogit` when git is absent (a release tarball / shallow export).
+//! * `MDE_BUILD_GIT_HASH` — the exact immutable source revision from a governed
+//!   build receipt, or an explicit `non-promotable-*` marker for developer builds.
 //! * `MDE_BUILD_DATE` — UTC calendar date `YYYY-MM-DD`; from `SOURCE_DATE_EPOCH`
 //!   when set (reproducible builds), else the current build time.
 //! * `MDE_BUILD_CHANNEL` — the release channel from `MDE_CHANNEL`, default `dev`.
 //!
-//! It never panics on a missing git / env — every lookup degrades to a sentinel
-//! so an offline, git-less packaging build still stamps a valid identity line.
+//! A build declaring `MCNF_BUILD_PROMOTABLE=1` fails closed unless its receipt is
+//! exact and, when Git metadata is present, matches a clean checkout at HEAD.
 
 use std::process::Command;
 
@@ -20,10 +20,10 @@ fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_owned());
     println!("cargo:rustc-env=MDE_BUILD_VERSION={version}");
 
-    // Short git hash — best-effort. No git (release tarball) → the `nogit`
-    // sentinel rather than a build failure.
-    let git_hash = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "nogit".to_owned());
-    println!("cargo:rustc-env=MDE_BUILD_GIT_HASH={git_hash}");
+    println!(
+        "cargo:rustc-env=MDE_BUILD_GIT_HASH={}",
+        source_revision_stamp()
+    );
 
     // Build date (UTC). Reproducible builds pin `SOURCE_DATE_EPOCH`; otherwise
     // stamp the wall-clock build time.
@@ -50,21 +50,68 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-env-changed=MDE_CHANNEL");
+    println!("cargo:rerun-if-env-changed=MCNF_BUILD_SOURCE_REVISION");
+    println!("cargo:rerun-if-env-changed=MCNF_BUILD_PROMOTABLE");
+}
+
+fn source_revision_stamp() -> String {
+    let promotable = std::env::var("MCNF_BUILD_PROMOTABLE").as_deref() == Ok("1");
+    let receipt = std::env::var("MCNF_BUILD_SOURCE_REVISION")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+
+    if promotable {
+        let revision = receipt
+            .unwrap_or_else(|| panic!("promotable build requires MCNF_BUILD_SOURCE_REVISION"));
+        assert!(
+            exact_revision(&revision),
+            "promotable source revision must be an exact lowercase 40- or 64-hex Git object ID"
+        );
+        if let Some(head) = git(&["rev-parse", "--verify", "HEAD^{commit}"]) {
+            assert_eq!(
+                head, revision,
+                "promotable source receipt does not match checkout HEAD"
+            );
+            let status = git_allow_empty(&["status", "--porcelain=v1", "--untracked-files=normal"])
+                .expect("promotable build could not determine checkout cleanliness");
+            assert!(status.is_empty(), "promotable build checkout is dirty");
+        }
+        return revision;
+    }
+
+    match git(&["rev-parse", "--verify", "HEAD^{commit}"]) {
+        Some(head) if exact_revision(&head) => {
+            match git_allow_empty(&["status", "--porcelain=v1", "--untracked-files=normal"]) {
+                Some(status) if status.is_empty() => format!("non-promotable-unreceipted-{head}"),
+                Some(_) => format!("non-promotable-dirty-{head}"),
+                None => "non-promotable-unresolved".to_owned(),
+            }
+        }
+        _ => "non-promotable-unresolved".to_owned(),
+    }
+}
+
+fn exact_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Run `git <args>` and return the trimmed stdout, or `None` when git is
 /// missing, errors, or prints nothing (so the caller can substitute a sentinel).
 fn git(args: &[&str]) -> Option<String> {
+    git_allow_empty(args).filter(|text| !text.is_empty())
+}
+
+fn git_allow_empty(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    Some(text)
 }
 
 /// Current Unix time (seconds since the epoch), or `0` if the clock is before

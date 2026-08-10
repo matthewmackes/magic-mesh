@@ -59,6 +59,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # string locally, so $MDE_RPM_* expand on this host before being sent to the VM.
 # shellcheck source=install-helpers/rpm-features.sh disable=SC1091
 source "$REPO/install-helpers/rpm-features.sh"
+SOURCE_RECEIPT_HELPER="$REPO/install-helpers/source-revision-receipt.sh"
 TOFU_DIR="${MCNF_TOFU_DIR:-$REPO/infra/tofu}"
 # Per-slot remote dir lets concurrent agents share one VM (each its own target/).
 # Base is `magic-mesh-farm` (NOT the bare `magic-mesh`): the build VMs carry a
@@ -112,6 +113,26 @@ do_sync() {
     --exclude '/.claude' \
     --exclude '/.git' \
     "$REPO/" "$DEST:$REMOTE_DIR/"
+}
+
+# A promotable package is built from Git's immutable committed snapshot, never
+# from a concurrently changing working directory. The receipt resolver has
+# already refused dirty/unresolvable source before this function is called.
+do_sync_revision() {
+  local revision="$1" snapshot
+  [[ "$revision" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
+    || { warn "refusing immutable sync for malformed revision '$revision'"; return 2; }
+  assert_sync_space
+  snapshot="$(mktemp -d)"
+  trap 'rm -rf -- "$snapshot"' EXIT
+  git -C "$REPO" archive --format=tar "$revision" | tar -xf - -C "$snapshot"
+  log "rsync immutable source revision $revision → $DEST:$REMOTE_DIR"
+  rsync -az --checksum --delete -e "${SSH[*]}" \
+    --exclude '/target' --exclude '/target-f43' --exclude '/target-f44' \
+    --exclude '/.claude' --exclude '/.git' \
+    "$snapshot/" "$DEST:$REMOTE_DIR/"
+  rm -rf -- "$snapshot"
+  trap - EXIT
 }
 
 # Run a command in the remote repo with the cargo env + the workspace config
@@ -422,6 +443,12 @@ route_self_test() {
   check "workspace test → small"  "$(unset MCNF_BUILD_SHAPE; infer_shape test --workspace)" small
   check "bare build → small"      "$(unset MCNF_BUILD_SHAPE; infer_shape build)" small
   check "per-crate release→small" "$(unset MCNF_BUILD_SHAPE; infer_shape build -p mackesd --release)" small
+  # Cargo argv must remain data after it crosses SSH. A filter containing a
+  # command separator previously could run a second command after green tests
+  # (observed as a post-success `H: command not found`).
+  check "cargo argv quotes command separators" \
+    "$(quote_args test -p mackesd 'camera; H')" \
+    " test -p mackesd camera\\;\\ H"
   check "MCNF_BUILD_SHAPE=big"    "$(MCNF_BUILD_SHAPE=big infer_shape build -p mackesd)" big
   check "MCNF_BUILD_SHAPE=small"  "$(MCNF_BUILD_SHAPE=small infer_shape build --workspace)" small
 
@@ -527,7 +554,12 @@ esac
 case "${1:-}" in
   sync) do_sync ;;
 
-  cargo) shift; do_sync; remote "cargo $*" ;;
+  cargo)
+    shift
+    do_sync
+    cargo_args="$(quote_args "$@")"
+    remote "cargo$cargo_args"
+    ;;
 
   gates)
     do_sync
@@ -559,7 +591,11 @@ case "${1:-}" in
     ;;
 
   rpm)
-    do_sync
+    IFS=$'\t' read -r MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH \
+      < <("$SOURCE_RECEIPT_HELPER" --repo "$REPO")
+    export MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH
+    log "promotable source receipt: $MCNF_BUILD_SOURCE_REVISION (epoch $SOURCE_DATE_EPOCH)"
+    do_sync_revision "$MCNF_BUILD_SOURCE_REVISION"
     assert_rpm_target_fedora
     # build-deploy-7 — cargo-generate-rpm is NOT installed per-cut on this path;
     # it is pinned at VM-PROVISIONING time to CGR_VERSION by
@@ -608,7 +644,7 @@ case "${1:-}" in
     # build-deploy-3 — feature list + --locked come from rpm-features.sh (sourced
     # above); $MDE_RPM_* expand HERE on the local host, so the literal flags land
     # in the remote command string identical to build-rpm-fedora43.sh's.
-    remote "mkdir -p target/generate-rpm && rm -f target/generate-rpm/magic-mesh*.rpm && cargo build --workspace --release $MDE_RPM_LOCKED && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd && cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-lighthouse-*.rpm"
+    remote "export MCNF_BUILD_SOURCE_REVISION=$MCNF_BUILD_SOURCE_REVISION MCNF_BUILD_PROMOTABLE=1 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH; mkdir -p target/generate-rpm && rm -f target/generate-rpm/magic-mesh*.rpm && cargo build --workspace --release $MDE_RPM_LOCKED && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd && cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-lighthouse-*.rpm"
     mkdir -p "$ARTIFACTS"
     rm -f "$ARTIFACTS"/magic-mesh*.rpm
     log "pulling RPM(s) → $ARTIFACTS"
@@ -622,10 +658,14 @@ case "${1:-}" in
 
   container-rpm)
     shift
-    do_sync
+    IFS=$'\t' read -r MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH \
+      < <("$SOURCE_RECEIPT_HELPER" --repo "$REPO")
+    export MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH
+    log "promotable source receipt: $MCNF_BUILD_SOURCE_REVISION (epoch $SOURCE_DATE_EPOCH)"
+    do_sync_revision "$MCNF_BUILD_SOURCE_REVISION"
     log "Fedora container RPM cut on $BUILD_HOST (Podman stays on the farm)"
     args="$(quote_args "$@")"
-    remote "MCNF_FARM_REMOTE=1 bash install-helpers/build-rpm-fedora43.sh$args"
+    remote "MCNF_FARM_REMOTE=1 MCNF_BUILD_SOURCE_REVISION=$MCNF_BUILD_SOURCE_REVISION MCNF_BUILD_PROMOTABLE=1 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH bash install-helpers/build-rpm-fedora43.sh$args"
     ;;
 
   pull)

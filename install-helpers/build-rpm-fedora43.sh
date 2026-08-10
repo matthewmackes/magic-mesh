@@ -56,6 +56,14 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 FEDORA="${1:-43}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
+# The outer farm dispatcher resolves this from one clean checkout before its
+# git-free rsync. Never let the container infer or invent candidate identity.
+: "${MCNF_BUILD_SOURCE_REVISION:?promotable RPM build requires an immutable source revision receipt}"
+: "${SOURCE_DATE_EPOCH:?promotable RPM build requires the receipt commit epoch}"
+"$REPO/install-helpers/source-revision-receipt.sh" --verify \
+  "$MCNF_BUILD_SOURCE_REVISION" "$SOURCE_DATE_EPOCH" >/dev/null
+export MCNF_BUILD_PROMOTABLE=1 MCNF_BUILD_SOURCE_REVISION SOURCE_DATE_EPOCH
+
 # build-deploy-7 — reproducible-cut pins (single source, overridable per cut).
 # cargo-generate-rpm is pinned to the canonical version (docs/BUILD-ENVIRONMENT.md
 # §2 + install-helpers/setup-build-vm-toolchain.sh + infra/ansible
@@ -218,6 +226,9 @@ podman run --rm \
     -e "MODE=$MODE" \
     -e "CGR_VERSION=$CGR_VERSION" \
     -e "RUSTUP_INIT_SHA256=$RUSTUP_INIT_SHA256" \
+    -e "MCNF_BUILD_SOURCE_REVISION=$MCNF_BUILD_SOURCE_REVISION" \
+    -e "MCNF_BUILD_PROMOTABLE=1" \
+    -e "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
     -v "$REPO:/src" \
     -v "$HOME/.cargo/registry:/root/.cargo/registry" \
     -v "$HOME/.cargo/git:/root/.cargo/git" \

@@ -14,7 +14,7 @@
 
 /// The stamped version — the workspace `CARGO_PKG_VERSION` at compile time.
 const VERSION: &str = env!("MDE_BUILD_VERSION");
-/// The stamped git short-hash, or the `nogit` sentinel for a git-less build.
+/// The exact source revision for a promotable build, or a `non-promotable-*` marker.
 const GIT_HASH: &str = env!("MDE_BUILD_GIT_HASH");
 /// The stamped UTC build date (`YYYY-MM-DD`).
 const BUILD_DATE: &str = env!("MDE_BUILD_DATE");
@@ -45,7 +45,7 @@ pub struct BuildInfo {
     pub version: &'static str,
     /// Codename for the version's major epoch (`"Construct"`; `""` if unknown).
     pub codename: &'static str,
-    /// Git short-hash at build time, or the `nogit` sentinel.
+    /// Exact source revision, or an explicit marker that forbids promotion.
     pub git_hash: &'static str,
     /// UTC build date, `YYYY-MM-DD`.
     pub build_date: &'static str,
@@ -158,8 +158,10 @@ mod tests {
     fn info_fields_are_all_populated() {
         let info = info();
         assert!(!info.version.is_empty());
-        // May be the `nogit` sentinel on a git-less build, but never empty.
+        // A governed RPM carries an exact revision; all other builds say why
+        // they are non-promotable instead of presenting the old `nogit` ambiguity.
         assert!(!info.git_hash.is_empty());
+        assert_ne!(info.git_hash, "nogit");
         assert!(!info.build_date.is_empty());
         assert!(!info.channel.is_empty());
         // Codename is "Construct" for the current 12.x epoch.
