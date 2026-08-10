@@ -1696,6 +1696,10 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
+- **Replay cursor recovery checkpoint (2026-08-10):** duplicate Clock request
+  replays cannot regress or clear the durable Bus action cursor; `.50` passed
+  the hostile stale/`NULL` cursor regression:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-clock-replay-cursor-r187.md`.
 - **Stopwatch elapsed-deadline checkpoint (2026-08-10):** overdue running stopwatches fail closed during admission and recovery; BigBoy passed:
   `docs/platform/evidence/WL-FUNC-022-2026-08-10-stopwatch-elapsed-deadline-r161.md`.
 - **Peer stopwatch transport checkpoint (2026-08-10):** approved targeted mirrors preserve origin/revision and hostile variants fail closed; BigBoy passed 2/2:

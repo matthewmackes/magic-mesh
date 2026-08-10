@@ -4423,6 +4423,62 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_clock_replay_cannot_regress_or_clear_action_cursor() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+        let command = fixture.timer_command("cursor-replay", 1, NOW + 60_000);
+        fixture.publish(&command);
+        fixture.worker.tick_once().unwrap();
+
+        let durable = fixture.worker.store.load("seat-1").unwrap().unwrap();
+        let cursor = durable.action_cursor.clone().expect("admitted cursor");
+        let mut replay = fixture.worker.snapshot.as_ref().unwrap().clone();
+        replay.revision += 1;
+        replay.produced_at_utc_ms = NOW;
+        stamp_revision(&mut replay, "seat-1");
+
+        assert!(!fixture
+            .worker
+            .store
+            .commit(
+                "seat-1",
+                durable.revision,
+                &replay,
+                Some("cursor-replay"),
+                Some(&"0".repeat(64)),
+                Some("00000000000000000000000000"),
+                &[],
+            )
+            .unwrap());
+        assert_eq!(
+            fixture.worker.store.load("seat-1").unwrap().unwrap().action_cursor,
+            Some(cursor.clone())
+        );
+
+        let mut replay = fixture.worker.snapshot.as_ref().unwrap().clone();
+        replay.revision += 1;
+        replay.produced_at_utc_ms = NOW;
+        stamp_revision(&mut replay, "seat-1");
+        assert!(!fixture
+            .worker
+            .store
+            .commit(
+                "seat-1",
+                durable.revision,
+                &replay,
+                Some("cursor-replay"),
+                Some(&"0".repeat(64)),
+                None,
+                &[],
+            )
+            .unwrap());
+        assert_eq!(
+            fixture.worker.store.load("seat-1").unwrap().unwrap().action_cursor,
+            Some(cursor)
+        );
+    }
+
+    #[test]
     fn stopwatch_commands_cannot_claim_a_foreign_origin() {
         let mut fixture = Fixture::new();
         fixture.worker.tick_once().unwrap();

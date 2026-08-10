@@ -842,10 +842,17 @@ fn commit_clock_authority(
                 let _same_admitted_command = seen_fingerprint
                     .as_deref()
                     .is_some_and(|seen| Some(seen) == request_fingerprint);
-                conn.execute(
-                    "UPDATE clock_authority SET action_cursor = ?2 WHERE node_id = ?1",
-                    (node_id, action_cursor),
-                )?;
+                // A replay can arrive from a process with an older in-memory
+                // cursor.  Never move the durable cursor backwards (or erase
+                // it when an older caller has no cursor); doing so would make
+                // the worker consume already-admitted Bus commands again
+                // after recovery.
+                if let Some(cursor) = action_cursor {
+                    conn.execute(
+                        "UPDATE clock_authority SET action_cursor = CASE WHEN action_cursor IS NULL OR action_cursor < ?2 THEN ?2 ELSE action_cursor END WHERE node_id = ?1",
+                        (node_id, cursor),
+                    )?;
+                }
                 return Ok(WriteResponse::Changed(false));
             }
         }
