@@ -106,6 +106,8 @@ behavioral evidence is not completion.
 - **Partition geometry refusal:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`.
 - **Mountpoint safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`.
 - **Storage name safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-storage-name-safety-r177.md`.
+- **Idle Display1 polling:** seat `.50` passed bounded active/idle backoff coverage:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-idle-backoff-r178.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
@@ -162,8 +164,6 @@ behavioral evidence is not completion.
 - **Display1/clipboard/audio authority checkpoints (2026-08-06/10):** readiness, damage, packet-safe frame/FD delivery, lease-bound focused QEMU input, local VM
   audio admission and obsolete clipboard removal are proven; live hardware proof remains. Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-display1-seqpacket-r21.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-input-audio-r23.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-clipboard-authority-hard-cut-s6.md`.
-- **Storage path-boundary checkpoint (2026-08-06):** virtual-storage validation rejects symlinks/outside-root images; `.90` passed:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-storage-path-boundary-r1.md`.
 - **Storage Bus transaction checkpoint (2026-08-09):** stable reads precede effects; late/replaced storage and failed publication correct forward without repeated operations.
   BigBoy passed six exact gates: `docs/platform/evidence/WL-ARCH-009-WL-ARCH-010-2026-08-09-storage-bus-transaction-recovery-r79.md`.
 - **Durable journal checkpoint (2026-08-06):** persisted Workload journals reject
@@ -406,12 +406,12 @@ behavioral evidence is not completion.
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
 - Remaining work: **HTTPS policy (r159):** bounded policy fallback rejects malformed or unsafe configuration;
   BigBoy passed `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
-- **Worker alias checkpoint (2026-08-10):** unknown normalized aliases fail closed; seat 90: `docs/platform/evidence/WL-ARCH-009-2026-08-10-explicit-worker-aliases-r158.md`.
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
   `docs/platform/evidence/WL-ARCH-009-2026-08-10-cross-process-worker-owner-r118.md`.
-- **Mirror owner (2026-08-10):** only Data publishes `mirror_syncd`; machine 193 passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-mirror-owner-gate-r109.md`.
+- **Symlink-safe group leases:** seat `.90` passed kernel-enforced lock-leaf refusal:
+  `docs/platform/evidence/WL-ARCH-009-2026-08-10-group-lease-symlink-r179.md`.
 - **Grouped crash-isolation checkpoint (2026-08-08):** Release 21 proved that
   `Requires=` edges cascaded one integrations crash through all six groups.
   Release 23 replaces grouped ownership edges with ordered `Wants=`, rejects
@@ -1936,6 +1936,8 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **All-home XDG preflight:** seat `.50` refused a later hostile target before any mount mutation:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-xdg-all-home-preflight-r178.md`.
 - **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
   the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
   `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.

@@ -7,9 +7,19 @@ HELPER="$REPO/install-helpers/mesh-xdg-bind-recovery.sh"
 ROOT="$(mktemp -d /tmp/mcnf-xdg-recovery-test.XXXXXX)"
 HOME_A="/home/mcnf-xdg-test-$$-a"
 HOME_B="/home/mcnf-xdg-test-$$-b"
-trap 'rm -rf -- "$ROOT" "$HOME_A" "$HOME_B"' EXIT
-mkdir -p "$ROOT/bin" "$ROOT/mesh" "$ROOT/home/alice" "$ROOT/home/bob" "$ROOT/state"
-mkdir -p "$HOME_A" "$HOME_B"
+if [ "$(id -u)" -eq 0 ]; then
+    PRIVILEGE=()
+else
+    PRIVILEGE=(sudo -n)
+fi
+cleanup() {
+    rm -rf -- "$ROOT"
+    "${PRIVILEGE[@]}" rm -rf -- "$HOME_A" "$HOME_B"
+}
+trap cleanup EXIT
+mkdir -p "$ROOT/bin" "$ROOT/mesh" "$ROOT/state"
+"${PRIVILEGE[@]}" mkdir -p "$HOME_A" "$HOME_B"
+"${PRIVILEGE[@]}" chown "$(id -u):$(id -g)" "$HOME_A" "$HOME_B"
 
 cat >"$ROOT/passwd" <<EOF
 alice:x:1000:1000::${HOME_A}:/bin/bash
@@ -35,7 +45,7 @@ rm -rf "$HOME_B/Music"
 ln -s /etc "$HOME_B/Music"
 : >"$ROOT/state/mounts"
 printf '%s\n' 'role = "workstation"' >"$ROOT/role.toml"
-if MCNF_XDG_TEST_STATE="$ROOT/state" \
+if "${PRIVILEGE[@]}" env MCNF_XDG_TEST_STATE="$ROOT/state" \
     MCNF_XDG_PASSWD_FILE="$ROOT/passwd" \
     MCNF_ROLE_FILE="$ROOT/role.toml" \
     MCNF_XDG_MESH_HOME="$ROOT/mesh" \

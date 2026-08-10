@@ -66,6 +66,10 @@ const MAX_RETRY_BACKOFF_MS: u64 = 30_000;
 /// The hardened seat-user PipeWire-Pulse bridge consumed by system QEMU.
 const WORKLOAD_AUDIO_PORT: u16 = 4713;
 const WORKLOAD_AUDIO_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Keep active input responsive while backing off idle attachment threads so a
+/// connected but unused guest does not consume a core on a small seat.
+const DISPLAY1_INPUT_IDLE_MIN_SLEEP: Duration = Duration::from_millis(5);
+const DISPLAY1_INPUT_IDLE_MAX_SLEEP: Duration = Duration::from_millis(25);
 /// Rootful Quadlet's transient, node-local source directory. Workload
 /// operations are executed by the system daemon, so user-scoped Quadlets
 /// would be invisible to the sole systemd authority.
@@ -1029,6 +1033,7 @@ impl Display1AttachmentRuntime {
                         let mut input = Display1InputState::default();
                         let mut input_epoch = server.input_epoch();
                         let mut pending_lifecycle_release = false;
+                        let mut idle_input_polls = 0_u32;
                         while !shutdown.load(Ordering::Acquire) {
                             if display1_peer.qemu.is_closed() {
                                 let _ = runtime.block_on(input.release_all(&display1_peer));
@@ -1065,13 +1070,18 @@ impl Display1AttachmentRuntime {
                             }
                             let result = match server.poll_input() {
                                 Ok(Display1InputPoll::Input(message)) => {
+                                    idle_input_polls = 0;
                                     runtime.block_on(input.apply(&display1_peer, message))
                                 }
                                 Ok(Display1InputPoll::Disconnected) => {
+                                    idle_input_polls = 0;
                                     pending_lifecycle_release = true;
                                     Ok(())
                                 }
-                                Ok(Display1InputPoll::Idle) => Ok(()),
+                                Ok(Display1InputPoll::Idle) => {
+                                    idle_input_polls = idle_input_polls.saturating_add(1);
+                                    Ok(())
+                                }
                                 Err(error) => Err(error),
                             };
                             if let Err(reason) = result {
@@ -1083,7 +1093,7 @@ impl Display1AttachmentRuntime {
                                     .store(DISPLAY1_REGISTRATION_FAILED, Ordering::Release);
                                 break;
                             }
-                            thread::sleep(Duration::from_millis(5));
+                            thread::sleep(display1_input_sleep(idle_input_polls));
                         }
                         let _ = runtime.block_on(input.release_all(&display1_peer));
                     }
@@ -1126,6 +1136,21 @@ impl Display1AttachmentRuntime {
     fn first_frame_seen(&self) -> bool {
         self.server.first_frame_seen()
     }
+}
+
+/// Return the polling delay for one attachment's current input idleness.
+///
+/// The first idle polls retain the old 5 ms input latency. Once the relay has
+/// stayed idle, the delay rises in small steps and is capped at 25 ms, avoiding
+/// a busy loop without making a fresh input feel sluggish.
+fn display1_input_sleep(idle_polls: u32) -> Duration {
+    let step = u64::from((idle_polls / 8).min(4));
+    let min_millis = u64::try_from(DISPLAY1_INPUT_IDLE_MIN_SLEEP.as_millis()).unwrap_or(u64::MAX);
+    let max_millis = u64::try_from(DISPLAY1_INPUT_IDLE_MAX_SLEEP.as_millis()).unwrap_or(u64::MAX);
+    let millis = min_millis
+        .saturating_add(step.saturating_mul(5))
+        .min(max_millis);
+    Duration::from_millis(millis)
 }
 
 impl Drop for Display1AttachmentRuntime {
@@ -5776,6 +5801,15 @@ mod tests {
             .expect_err("an orphan overlay must require explicit recovery");
         assert!(matches!(error, WorkloadActuatorError::Permanent(_)));
         assert_eq!(fs::read(&path).expect("retained overlay"), b"retained overlay");
+    }
+
+    #[test]
+    fn display1_input_poll_sleep_backs_off_only_when_idle() {
+        assert_eq!(display1_input_sleep(0), Duration::from_millis(5));
+        assert_eq!(display1_input_sleep(7), Duration::from_millis(5));
+        assert_eq!(display1_input_sleep(8), Duration::from_millis(10));
+        assert_eq!(display1_input_sleep(31), Duration::from_millis(20));
+        assert_eq!(display1_input_sleep(u32::MAX), Duration::from_millis(25));
     }
 
     #[test]
