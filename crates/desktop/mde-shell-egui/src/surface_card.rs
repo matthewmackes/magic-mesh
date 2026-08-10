@@ -736,19 +736,20 @@ impl SurfaceCardState {
     ) -> Option<SurfaceCardHandoff> {
         let mut handoff = None;
         let SurfaceEnableOutcome::Completed { activation, mok } = &res.outcome else {
-            if let SurfaceEnableOutcome::Refused { code, reason } = &res.outcome {
-                ui.horizontal_wrapped(|ui| {
-                    mde_egui::status_dot(ui, Style::WARN);
-                    ui.add_space(Style::SP_XS);
-                    mde_egui::muted_note(
-                        ui,
-                        format!(
-                            "Activation refused ({}) — {reason}",
-                            enable_refusal_label(*code)
-                        ),
-                    );
-                });
-            }
+            ui.horizontal_wrapped(|ui| {
+                mde_egui::status_dot(ui, Style::WARN);
+                ui.add_space(Style::SP_XS);
+                let message = match &res.outcome {
+                    SurfaceEnableOutcome::Refused { code, reason } => format!(
+                        "Activation refused ({}) — {reason}",
+                        enable_refusal_label(*code)
+                    ),
+                    SurfaceEnableOutcome::Interrupted =>
+                        "Activation was interrupted by a worker restart; effects were not repeated. Re-run verification before a new request.".to_string(),
+                    SurfaceEnableOutcome::Completed { .. } => return,
+                };
+                mde_egui::muted_note(ui, message);
+            });
             return None;
         };
         // Activation units.
@@ -1358,7 +1359,7 @@ impl SurfaceCardState {
                 SurfaceEnableOutcome::Completed { activation, .. } => {
                     Some(activation.configs.clone())
                 }
-                SurfaceEnableOutcome::Refused { .. } => None,
+                SurfaceEnableOutcome::Refused { .. } | SurfaceEnableOutcome::Interrupted => None,
             })
             .unwrap_or_default();
         if configs.is_empty() {
@@ -1856,6 +1857,10 @@ fn firmware_apply_outcome_label(
             Style::DANGER,
             "Failed — fwupd did not accept the selected release; re-read inventory before retrying.",
         ),
+        SurfaceFirmwareApplyOutcome::Interrupted => (
+            Style::DANGER,
+            "Interrupted by a worker restart — the possibly completed fwupd effect was not repeated; re-read inventory before retrying.",
+        ),
     }
 }
 
@@ -1910,7 +1915,8 @@ fn read_latest_firmware_apply_result(
 
 /// Admit only the exact pending cancellation decision. A refused/too-late
 /// cancellation never clears the original apply slot, so its eventual action
-/// result remains the sole effect authority.
+/// result remains the sole effect authority. This presentation-only state does
+/// not influence daemon admission, claims, or effects.
 fn read_latest_firmware_cancel_result(
     persist: &Persist,
     topic: &str,
@@ -2428,7 +2434,7 @@ mod tests {
         hostile.push(unknown);
         let duplicate = serde_json::to_string(&valid).unwrap().replacen(
             "{",
-            r#"{"result_schema_version":2,"result_schema_version":2,"#,
+            r#"{"result_schema_version":3,"result_schema_version":3,"#,
             1,
         );
         hostile.push(duplicate);
@@ -2834,8 +2840,8 @@ mod tests {
         hostile.push(future.to_json().unwrap());
         hostile.push(valid.replacen("{", r#"{"unknown":true,"#, 1));
         hostile.push(valid.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"schema_version\":2",
             1,
         ));
         hostile.push(

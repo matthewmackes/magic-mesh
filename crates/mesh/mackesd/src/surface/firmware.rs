@@ -1210,21 +1210,27 @@ mod worker {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use mackes_mesh_types::cloud::CloudArmedToken;
     pub use mackes_mesh_types::surface_hardware::SurfaceFirmwareApplyRequest as FwApplyRequest;
     use mackes_mesh_types::surface_hardware::{
         SurfaceActionCancellationOutcome, SurfaceActionCancellationRefusal,
         SurfaceActionCancellationRequest, SurfaceActionCancellationResult,
         SurfaceActionCancellationSource, SurfaceAvailability, SurfaceCancellableAction,
-        SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult, SurfaceFirmwareApplyTarget,
-        SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration, SurfacePublication,
-        SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION, SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
-        SURFACE_HARDWARE_SCHEMA_VERSION,
+        SurfaceFirmwareApplyOutcome, SurfaceFirmwareApplyRefusal, SurfaceFirmwareApplyResult,
+        SurfaceFirmwareApplyTarget, SurfaceModelIdentity, SurfaceObservationSource,
+        SurfaceProGeneration, SurfacePublication, SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+        SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION, SURFACE_HARDWARE_SCHEMA_VERSION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
+    use sha2::{Digest as _, Sha256};
 
     use super::{run_apply, run_inventory, shared_inventory, ApplyResult, LiveFwupd, SurfaceModel};
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+    use crate::surface::action_journal::{
+        ActionClaim, CancelDisposition, CancelIntent, ClaimDisposition, JournalAction,
+        JournalDecision, JournalKey, JournalOutcome, JournalPhase, SurfaceActionJournal,
+    };
     use crate::surface::verify::{
         board_topic, run_verify, shared_board, shared_summary, summary_topic, LiveSurfaceProbes,
     };
@@ -1274,14 +1280,6 @@ mod worker {
         format!("state/hardware/surface/{node}/fw-apply-cancel")
     }
 
-    fn fw_apply_claim_topic(node: &str) -> String {
-        format!("state/hardware/surface/{node}/fw-apply-claim")
-    }
-
-    fn fw_apply_cancel_claim_topic(node: &str) -> String {
-        format!("state/hardware/surface/{node}/fw-apply-cancel-claim")
-    }
-
     /// The per-node `surface_firmware` worker.
     pub struct SurfaceFirmwareWorker {
         node_id: String,
@@ -1291,6 +1289,7 @@ mod worker {
         action_cursor: Option<String>,
         cancel_cursor: Option<String>,
         authorizer: Arc<ActionAuthorizer>,
+        journal_root: Option<PathBuf>,
     }
 
     impl SurfaceFirmwareWorker {
@@ -1306,6 +1305,7 @@ mod worker {
                 action_cursor: None,
                 cancel_cursor: None,
                 authorizer: Arc::new(ActionAuthorizer::production()),
+                journal_root: None,
             }
         }
 
@@ -1339,11 +1339,12 @@ mod worker {
             Self {
                 node_id,
                 detection,
-                bus_root: Some(bus_root),
+                bus_root: Some(bus_root.clone()),
                 poll: POLL,
                 action_cursor: None,
                 cancel_cursor: None,
                 authorizer,
+                journal_root: Some(bus_root.join("surface-action-journal")),
             }
         }
 
@@ -1365,12 +1366,19 @@ mod worker {
         /// Drain any new fw-apply requests, run the typed-armed verb, publish
         /// the result, and on a successful apply re-run SURFACE-4's verify.
         fn poll_once(&mut self, persist: &Persist) {
+            let Ok(journal) = self.journal() else {
+                return;
+            };
+            self.recover_pending(persist, &journal);
+            self.retry_unpublished_results(persist, &journal);
+            self.retry_unpublished_late_cancellations(persist, &journal);
+            let _ = journal.gc_expired(wall_now_ms());
             self.publish_inventory(persist);
             let topic = fw_apply_topic(&self.node_id);
             let Ok(msgs) = persist.list_since(&topic, self.action_cursor.as_deref()) else {
                 return;
             };
-            let cancelled = self.drain_cancellations(persist);
+            let cancelled = self.drain_cancellations(persist, &journal, &msgs);
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
                 if msg.body.as_deref().is_some_and(|body| {
@@ -1379,9 +1387,69 @@ mod worker {
                 }) {
                     continue;
                 }
-                let (admitted_request, result) =
-                    self.apply_request_with_admission(msg.body.as_deref(), Some(persist));
-                self.publish_result(persist, admitted_request.as_ref(), &result);
+                let body = msg.body.as_deref();
+                let mut claimed_key = None;
+                if let Some(body) = body {
+                    if let Some(request) = decode_historical_apply(body, &self.node_id) {
+                        let context = MutationContext {
+                            verb: FW_ACTION_AUTH_VERB,
+                            node: &self.node_id,
+                            target: &request.device_id,
+                        };
+                        let key = JournalKey {
+                            node: self.node_id.clone(),
+                            action: JournalAction::FirmwareApply,
+                            target_request_id: request.header.request_id.clone(),
+                        };
+                        let allow_historical = journal.get(&key).ok().flatten().is_some();
+                        if let Some(token) = self.verified_token(
+                            body,
+                            context,
+                            request.header.issued_at_ms,
+                            allow_historical,
+                        ) {
+                            if let Ok(claim) = self.action_claim(&msg.ulid, body, &request, &token)
+                            {
+                                match journal.claim_action(&claim) {
+                                    Ok(ClaimDisposition::Claimed) => {
+                                        claimed_key = Some(claim.key.clone());
+                                    }
+                                    Ok(ClaimDisposition::AlreadyClaimed) => {
+                                        self.record_interrupted_action(&journal, &claim);
+                                        self.retry_unpublished_results(persist, &journal);
+                                        continue;
+                                    }
+                                    Ok(
+                                        ClaimDisposition::CancellationWon
+                                        | ClaimDisposition::Closed,
+                                    )
+                                    | Err(_) => {
+                                        self.retry_unpublished_results(persist, &journal);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let (admitted_request, result) = self.apply_request_with_admission(body, None);
+                if let Some(key) = claimed_key {
+                    if let Some(result_body) = self.result_body(admitted_request.as_ref(), &result)
+                    {
+                        let decision = JournalDecision {
+                            outcome: JournalOutcome::ActionCompleted,
+                            decided_at_ms: wall_now_ms(),
+                            result_sha256: exact_sha256(&result_body),
+                            result_body,
+                        };
+                        let _ = journal.record_decision(&key, &decision);
+                        self.retry_unpublished_results(persist, &journal);
+                    }
+                } else {
+                    self.publish_result(persist, admitted_request.as_ref(), &result);
+                }
                 // Verify re-runs after a successful firmware change (lock #8).
                 debug_assert_eq!(
                     result.reverify,
@@ -1397,14 +1465,16 @@ mod worker {
         /// Authorize cancellations first, then atomically consume the original
         /// action capability as the durable pending claim. A capability already
         /// consumed by an effect is always `TooLate`; it is never interrupted.
-        fn drain_cancellations(&mut self, persist: &Persist) -> HashSet<String> {
+        fn drain_cancellations(
+            &mut self,
+            persist: &Persist,
+            journal: &SurfaceActionJournal,
+            actions: &[mde_bus::persist::StoredMessage],
+        ) -> HashSet<String> {
             let topic = fw_apply_cancel_topic(&self.node_id);
             let Ok(messages) = persist.list_since(&topic, self.cancel_cursor.as_deref()) else {
                 return HashSet::new();
             };
-            let all_actions = persist
-                .list_since(&fw_apply_topic(&self.node_id), None)
-                .unwrap_or_default();
             let mut cancelled = HashSet::new();
             for message in messages {
                 self.cancel_cursor = Some(message.ulid.clone());
@@ -1414,61 +1484,55 @@ mod worker {
                 let Some(historical) = decode_historical_cancellation(body, &self.node_id) else {
                     continue;
                 };
-                if let Some(prior) = prior_cancellation_result(
-                    persist,
-                    &fw_apply_cancel_result_topic(&self.node_id),
-                    &historical,
-                ) {
-                    if matches!(prior, SurfaceActionCancellationOutcome::Cancelled) {
-                        cancelled.insert(historical.target_request_id.clone());
-                    }
-                    continue;
-                }
-                let cancel = match SurfaceActionCancellationRequest::from_json_at(
-                    body.as_bytes(),
-                    &self.node_id,
-                    wall_now_ms(),
-                ) {
-                    Ok(live) => live,
-                    Err(_)
-                        if exact_body_seen(
-                            persist,
-                            &fw_apply_cancel_claim_topic(&self.node_id),
-                            body,
-                        ) =>
-                    {
-                        historical
-                    }
-                    Err(_) => continue,
-                };
-                let outcome = self.decide_cancellation(persist, body, &cancel, &all_actions);
+                let (outcome, outbox_owned) =
+                    self.decide_cancellation(journal, &message.ulid, body, &historical, actions);
                 if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
-                    cancelled.insert(cancel.target_request_id.clone());
+                    cancelled.insert(historical.target_request_id.clone());
+                } else if !outbox_owned {
+                    let result = self.cancellation_result(&historical, outcome);
+                    publish(
+                        persist,
+                        &fw_apply_cancel_result_topic(&self.node_id),
+                        &result,
+                    );
                 }
-                self.publish_cancellation_result(persist, &cancel, outcome);
             }
+            self.retry_unpublished_results(persist, journal);
             cancelled
         }
 
         fn decide_cancellation(
             &self,
-            persist: &Persist,
+            journal: &SurfaceActionJournal,
+            cancel_source_ulid: &str,
             body: &str,
             cancel: &SurfaceActionCancellationRequest,
             actions: &[mde_bus::persist::StoredMessage],
-        ) -> SurfaceActionCancellationOutcome {
+        ) -> (SurfaceActionCancellationOutcome, bool) {
             let refused = SurfaceActionCancellationOutcome::Refused;
             if cancel.action != SurfaceCancellableAction::FirmwareApply
                 || cancel.model != self.shared_model()
             {
-                return refused(SurfaceActionCancellationRefusal::IdentityMismatch);
+                return (
+                    refused(SurfaceActionCancellationRefusal::IdentityMismatch),
+                    false,
+                );
             }
-            let Some((original_body, original)) = actions.iter().find_map(|message| {
-                let raw = message.body.as_deref()?;
-                let request = decode_historical_apply(raw, &self.node_id)?;
-                (request.header.request_id == cancel.target_request_id).then_some((raw, request))
-            }) else {
-                return refused(SurfaceActionCancellationRefusal::UnknownTarget);
+            let Some((original_source_ulid, original_body, original)) =
+                actions.iter().find_map(|message| {
+                    let raw = message.body.as_deref()?;
+                    let request = decode_historical_apply(raw, &self.node_id)?;
+                    (request.header.request_id == cancel.target_request_id).then_some((
+                        message.ulid.as_str(),
+                        raw,
+                        request,
+                    ))
+                })
+            else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::UnknownTarget),
+                    false,
+                );
             };
             let exact = SurfaceFirmwareApplyTarget {
                 device_id: original.device_id.clone(),
@@ -1477,71 +1541,504 @@ mod worker {
                 release_checksum: original.release_checksum.clone(),
             };
             if cancel.firmware_target.as_ref() != Some(&exact) {
-                return refused(SurfaceActionCancellationRefusal::IdentityMismatch);
+                return (
+                    refused(SurfaceActionCancellationRefusal::IdentityMismatch),
+                    false,
+                );
             }
-            if exact_body_seen(persist, &fw_apply_claim_topic(&self.node_id), original_body) {
-                return refused(SurfaceActionCancellationRefusal::TooLate);
-            }
-            let resumed =
-                exact_body_seen(persist, &fw_apply_cancel_claim_topic(&self.node_id), body);
-            if resumed {
-                let Ok(issued_at_ms) = i64::try_from(cancel.header.issued_at_ms) else {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
-                };
-                if self
-                    .authorizer
-                    .verify_historical_claim(
-                        body,
-                        MutationContext {
-                            verb: FW_CANCEL_AUTH_VERB,
-                            node: &self.node_id,
-                            target: &cancel.target_request_id,
-                        },
-                        issued_at_ms,
+            let key = JournalKey {
+                node: self.node_id.clone(),
+                action: JournalAction::FirmwareApply,
+                target_request_id: original.header.request_id.clone(),
+            };
+            let existing = journal.get(&key).ok().flatten();
+            let original_context = MutationContext {
+                verb: FW_ACTION_AUTH_VERB,
+                node: &self.node_id,
+                target: &original.device_id,
+            };
+            let cancel_context = MutationContext {
+                verb: FW_CANCEL_AUTH_VERB,
+                node: &self.node_id,
+                target: &cancel.target_request_id,
+            };
+            let Some(original_token) = self.verified_token(
+                original_body,
+                original_context,
+                original.header.issued_at_ms,
+                existing.is_some(),
+            ) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let Some(cancel_token) = self.verified_token(
+                body,
+                cancel_context,
+                cancel.header.issued_at_ms,
+                existing.is_some(),
+            ) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let Ok(action) = self.action_claim(
+                original_source_ulid,
+                original_body,
+                &original,
+                &original_token,
+            ) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let Ok(cancel_expiry) = u64::try_from(cancel_token.expires_at_ms) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let intent = CancelIntent {
+                source_ulid: cancel_source_ulid.to_owned(),
+                cancellation_id: cancel.header.request_id.clone(),
+                exact_body_sha256: exact_sha256(body),
+                target: action,
+                claimed_at_ms: cancel.header.issued_at_ms,
+                expires_at_ms: cancel_expiry,
+            };
+            let disposition = match journal.record_cancel_intent(&key, &intent) {
+                Ok(disposition) => disposition,
+                Err(_) => {
+                    return (
+                        refused(SurfaceActionCancellationRefusal::Authorization),
+                        false,
                     )
-                    .is_err()
-                {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
                 }
-            } else {
-                if self
-                    .authorizer
-                    .authorize(
-                        body,
-                        MutationContext {
-                            verb: FW_CANCEL_AUTH_VERB,
-                            node: &self.node_id,
-                            target: &cancel.target_request_id,
-                        },
+            };
+            if matches!(disposition, CancelDisposition::Closed) {
+                let outcome = journal
+                    .get(&key)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| cancellation_outcome(&record))
+                    .unwrap_or_else(|| refused(SurfaceActionCancellationRefusal::Authorization));
+                return (outcome, true);
+            }
+            if matches!(disposition, CancelDisposition::ActionAlreadyClaimed) {
+                let outcome = refused(SurfaceActionCancellationRefusal::TooLate);
+                let already_durable = journal.get(&key).ok().flatten().is_some_and(|record| {
+                    matches!(
+                        record.phase,
+                        JournalPhase::ActionClaimedCancel {
+                            late_cancel_decision: Some(_),
+                            ..
+                        } | JournalPhase::Closed {
+                            late_cancel_decision: Some(_),
+                            ..
+                        }
                     )
-                    .is_err()
+                });
+                if already_durable {
+                    return (outcome, true);
+                }
+                let result = self.cancellation_result(cancel, outcome);
+                let Ok(result_body) = serde_json::to_string(&result) else {
+                    return (
+                        refused(SurfaceActionCancellationRefusal::Authorization),
+                        true,
+                    );
+                };
+                let decision = JournalDecision {
+                    outcome: JournalOutcome::Refused,
+                    decided_at_ms: result.completed_at_ms,
+                    result_sha256: exact_sha256(&result_body),
+                    result_body,
+                };
+                return if journal.record_late_cancel_decision(&key, &decision).is_ok() {
+                    (outcome, true)
+                } else {
+                    (
+                        refused(SurfaceActionCancellationRefusal::Authorization),
+                        true,
+                    )
+                };
+            }
+            let outcome = {
+                let _ = self.authorizer.authorize(body, cancel_context);
+                let _ = self.authorizer.authorize(original_body, original_context);
+                SurfaceActionCancellationOutcome::Cancelled
+            };
+            let result = self.cancellation_result(cancel, outcome);
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    true,
+                );
+            };
+            let decision = JournalDecision {
+                outcome: if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
+                    JournalOutcome::Cancelled
+                } else {
+                    JournalOutcome::Refused
+                },
+                decided_at_ms: result.completed_at_ms,
+                result_sha256: exact_sha256(&result_body),
+                result_body,
+            };
+            if journal.record_decision(&key, &decision).is_err() {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    true,
+                );
+            }
+            (outcome, true)
+        }
+
+        fn journal(&self) -> Result<SurfaceActionJournal, String> {
+            match &self.journal_root {
+                Some(root) => {
+                    SurfaceActionJournal::open_at(root.clone(), rustix::process::geteuid().as_raw())
+                }
+                None => SurfaceActionJournal::open_default(),
+            }
+        }
+
+        fn action_claim(
+            &self,
+            source_ulid: &str,
+            body: &str,
+            request: &FwApplyRequest,
+            token: &CloudArmedToken,
+        ) -> Result<ActionClaim, String> {
+            Ok(ActionClaim {
+                key: JournalKey {
+                    node: self.node_id.clone(),
+                    action: JournalAction::FirmwareApply,
+                    target_request_id: request.header.request_id.clone(),
+                },
+                source_ulid: source_ulid.to_owned(),
+                request_id: request.header.request_id.clone(),
+                exact_body_sha256: exact_sha256(body),
+                model_product: self.shared_model().product,
+                model_generation: generation_label(self.shared_model().generation).into(),
+                firmware_target: Some(SurfaceFirmwareApplyTarget {
+                    device_id: request.device_id.clone(),
+                    inventory_published_at_ms: request.inventory_published_at_ms,
+                    release_version: request.release_version.clone(),
+                    release_checksum: request.release_checksum.clone(),
+                }),
+                claimed_at_ms: request.header.issued_at_ms,
+                expires_at_ms: u64::try_from(token.expires_at_ms)
+                    .map_err(|_| "negative Surface firmware capability expiry".to_string())?,
+            })
+        }
+
+        fn verified_token(
+            &self,
+            body: &str,
+            context: MutationContext<'_>,
+            issued_at_ms: u64,
+            allow_historical: bool,
+        ) -> Option<CloudArmedToken> {
+            if let Ok(token) = self.authorizer.verify_exact_body(body, context) {
+                return Some(token);
+            }
+            if !allow_historical {
+                return None;
+            }
+            self.authorizer
+                .verify_historical_claim(body, context, i64::try_from(issued_at_ms).ok()?)
+                .ok()?;
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()?
+                .get("armed_token")?
+                .as_str()
+                .and_then(CloudArmedToken::parse)
+        }
+
+        fn retry_unpublished_results(&self, persist: &Persist, journal: &SurfaceActionJournal) {
+            let Ok(records) = journal.unpublished() else {
+                return;
+            };
+            for record in records {
+                if record.key.node != self.node_id
+                    || record.key.action != JournalAction::FirmwareApply
                 {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                    continue;
+                }
+                let JournalPhase::Closed {
+                    decision, cancel, ..
+                } = record.phase
+                else {
+                    continue;
+                };
+                let topic = if cancel.is_some()
+                    && matches!(
+                        decision.outcome,
+                        JournalOutcome::Cancelled | JournalOutcome::Refused
+                    ) {
+                    let Ok(result) = serde_json::from_str::<SurfaceActionCancellationResult>(
+                        &decision.result_body,
+                    ) else {
+                        continue;
+                    };
+                    if result.validate().is_err()
+                        || result.source
+                            != SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker
+                        || result.node != self.node_id
+                        || result.target_request_id != record.key.target_request_id
+                    {
+                        continue;
+                    }
+                    fw_apply_cancel_result_topic(&self.node_id)
+                } else if matches!(
+                    decision.outcome,
+                    JournalOutcome::ActionCompleted | JournalOutcome::Interrupted
+                ) {
+                    let Ok(result) =
+                        SurfaceFirmwareApplyResult::from_json(decision.result_body.as_bytes())
+                    else {
+                        continue;
+                    };
+                    if result.publication.node != self.node_id
+                        || result.request_id != record.key.target_request_id
+                    {
+                        continue;
+                    }
+                    fw_result_topic(&self.node_id)
+                } else {
+                    continue;
+                };
+                if persist
+                    .write(&topic, Priority::Default, None, Some(&decision.result_body))
+                    .is_ok()
+                {
+                    let _ = journal.mark_published(&record.key, &decision.result_sha256);
+                }
+            }
+        }
+
+        fn retry_unpublished_late_cancellations(
+            &self,
+            persist: &Persist,
+            journal: &SurfaceActionJournal,
+        ) {
+            let Ok(records) = journal.unpublished_late_cancellations() else {
+                return;
+            };
+            for record in records {
+                if record.key.node != self.node_id
+                    || record.key.action != JournalAction::FirmwareApply
+                {
+                    continue;
+                }
+                let decision = match record.phase {
+                    JournalPhase::ActionClaimedCancel {
+                        late_cancel_decision: Some(decision),
+                        ..
+                    }
+                    | JournalPhase::Closed {
+                        winner: crate::surface::action_journal::JournalWinner::Action,
+                        late_cancel_decision: Some(decision),
+                        ..
+                    } => decision,
+                    _ => continue,
+                };
+                let Ok(result) =
+                    serde_json::from_str::<SurfaceActionCancellationResult>(&decision.result_body)
+                else {
+                    continue;
+                };
+                if result.validate().is_err()
+                    || result.source != SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker
+                    || result.node != self.node_id
+                    || result.target_request_id != record.key.target_request_id
+                    || result.outcome
+                        != SurfaceActionCancellationOutcome::Refused(
+                            SurfaceActionCancellationRefusal::TooLate,
+                        )
+                {
+                    continue;
                 }
                 if persist
                     .write(
-                        &fw_apply_cancel_claim_topic(&self.node_id),
+                        &fw_apply_cancel_result_topic(&self.node_id),
                         Priority::Default,
                         None,
-                        Some(body),
+                        Some(&decision.result_body),
                     )
-                    .is_err()
+                    .is_ok()
                 {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                    let _ =
+                        journal.mark_late_cancel_published(&record.key, &decision.result_sha256);
                 }
             }
-            match self.authorizer.authorize(
-                original_body,
-                MutationContext {
-                    verb: FW_ACTION_AUTH_VERB,
-                    node: &self.node_id,
-                    target: &original.device_id,
-                },
-            ) {
-                Ok(()) => SurfaceActionCancellationOutcome::Cancelled,
-                Err(_) if resumed => SurfaceActionCancellationOutcome::Cancelled,
-                Err(_) => refused(SurfaceActionCancellationRefusal::TooLate),
+        }
+
+        fn recover_pending(&self, persist: &Persist, journal: &SurfaceActionJournal) {
+            let Ok(records) = journal.pending_recovery() else {
+                return;
+            };
+            for record in records {
+                if record.key.node != self.node_id
+                    || record.key.action != JournalAction::FirmwareApply
+                {
+                    continue;
+                }
+                match record.phase {
+                    JournalPhase::ActionClaimed { action } => {
+                        self.record_interrupted_action(journal, &action);
+                    }
+                    JournalPhase::ActionClaimedCancel {
+                        action,
+                        cancel,
+                        late_cancel_decision,
+                        ..
+                    } => {
+                        if late_cancel_decision.is_none()
+                            && !self.record_recovered_late_cancellation(journal, &action, &cancel)
+                        {
+                            continue;
+                        }
+                        self.retry_unpublished_late_cancellations(persist, journal);
+                        self.record_interrupted_action(journal, &action);
+                    }
+                    JournalPhase::CancelClaimed { action, cancel } => {
+                        self.record_recovered_cancellation(
+                            journal,
+                            &action,
+                            &cancel,
+                            SurfaceActionCancellationOutcome::Cancelled,
+                        );
+                    }
+                    JournalPhase::Closed { .. } => {}
+                }
             }
+        }
+
+        fn record_interrupted_action(&self, journal: &SurfaceActionJournal, action: &ActionClaim) {
+            let Some(generation) = claim_generation(action) else {
+                return;
+            };
+            let Some(target) = action.firmware_target.clone() else {
+                return;
+            };
+            let result = SurfaceFirmwareApplyResult {
+                result_schema_version: SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION,
+                publication: SurfacePublication {
+                    schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: self.node_id.clone(),
+                    model: SurfaceModelIdentity {
+                        product: action.model_product.clone(),
+                        generation,
+                    },
+                    source: SurfaceObservationSource::Fwupd,
+                    published_at_ms: wall_now_ms(),
+                    availability: SurfaceAvailability::Fresh,
+                },
+                request_id: action.key.target_request_id.clone(),
+                target: Some(target),
+                outcome: SurfaceFirmwareApplyOutcome::Interrupted,
+            };
+            if result.validate().is_err() {
+                return;
+            }
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return;
+            };
+            let decision = JournalDecision {
+                outcome: JournalOutcome::Interrupted,
+                decided_at_ms: result.publication.published_at_ms,
+                result_sha256: exact_sha256(&result_body),
+                result_body,
+            };
+            let _ = journal.record_decision(&action.key, &decision);
+        }
+
+        fn record_recovered_cancellation(
+            &self,
+            journal: &SurfaceActionJournal,
+            action: &ActionClaim,
+            cancel: &CancelIntent,
+            outcome: SurfaceActionCancellationOutcome,
+        ) {
+            let Some(generation) = claim_generation(action) else {
+                return;
+            };
+            let result = SurfaceActionCancellationResult {
+                schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                cancellation_id: cancel.cancellation_id.clone(),
+                target_request_id: action.key.target_request_id.clone(),
+                action: SurfaceCancellableAction::FirmwareApply,
+                model: SurfaceModelIdentity {
+                    product: action.model_product.clone(),
+                    generation,
+                },
+                firmware_target: action.firmware_target.clone(),
+                source: SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
+                completed_at_ms: wall_now_ms(),
+                outcome,
+            };
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return;
+            };
+            let decision = JournalDecision {
+                outcome: if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
+                    JournalOutcome::Cancelled
+                } else {
+                    JournalOutcome::Refused
+                },
+                decided_at_ms: result.completed_at_ms,
+                result_sha256: exact_sha256(&result_body),
+                result_body,
+            };
+            let _ = journal.record_decision(&action.key, &decision);
+        }
+
+        fn record_recovered_late_cancellation(
+            &self,
+            journal: &SurfaceActionJournal,
+            action: &ActionClaim,
+            cancel: &CancelIntent,
+        ) -> bool {
+            let Some(generation) = claim_generation(action) else {
+                return false;
+            };
+            let result = SurfaceActionCancellationResult {
+                schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                cancellation_id: cancel.cancellation_id.clone(),
+                target_request_id: action.key.target_request_id.clone(),
+                action: SurfaceCancellableAction::FirmwareApply,
+                model: SurfaceModelIdentity {
+                    product: action.model_product.clone(),
+                    generation,
+                },
+                firmware_target: action.firmware_target.clone(),
+                source: SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
+                completed_at_ms: wall_now_ms(),
+                outcome: SurfaceActionCancellationOutcome::Refused(
+                    SurfaceActionCancellationRefusal::TooLate,
+                ),
+            };
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return false;
+            };
+            journal
+                .record_late_cancel_decision(
+                    &action.key,
+                    &JournalDecision {
+                        outcome: JournalOutcome::Refused,
+                        decided_at_ms: result.completed_at_ms,
+                        result_sha256: exact_sha256(&result_body),
+                        result_body,
+                    },
+                )
+                .is_ok()
         }
 
         fn shared_model(&self) -> SurfaceModelIdentity {
@@ -1561,13 +2058,12 @@ mod worker {
             }
         }
 
-        fn publish_cancellation_result(
+        fn cancellation_result(
             &self,
-            persist: &Persist,
             request: &SurfaceActionCancellationRequest,
             outcome: SurfaceActionCancellationOutcome,
-        ) {
-            let result = SurfaceActionCancellationResult {
+        ) -> SurfaceActionCancellationResult {
+            SurfaceActionCancellationResult {
                 schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
                 node: self.node_id.clone(),
                 cancellation_id: request.header.request_id.clone(),
@@ -1578,13 +2074,6 @@ mod worker {
                 source: SurfaceActionCancellationSource::LocalSurfaceFirmwareWorker,
                 completed_at_ms: wall_now_ms(),
                 outcome,
-            };
-            if result.validate().is_ok() {
-                publish(
-                    persist,
-                    &fw_apply_cancel_result_topic(&self.node_id),
-                    &result,
-                );
             }
         }
 
@@ -1603,7 +2092,7 @@ mod worker {
         fn apply_request_with_admission(
             &self,
             body: Option<&str>,
-            persist: Option<&Persist>,
+            _persist: Option<&Persist>,
         ) -> (Option<FwApplyRequest>, ApplyResult) {
             let Some(body) = body else {
                 return (
@@ -1647,26 +2136,6 @@ mod worker {
                 node: &self.node_id,
                 target: device_id,
             };
-            if let Some(persist) = persist {
-                if persist
-                    .write(
-                        &fw_apply_claim_topic(&self.node_id),
-                        Priority::Default,
-                        None,
-                        Some(body),
-                    )
-                    .is_err()
-                {
-                    return (
-                        Some(req.clone()),
-                        self.refused_result_with_wire(
-                            device_id,
-                            "firmware apply durable claim could not be recorded",
-                            SurfaceFirmwareApplyRefusal::Contract,
-                        ),
-                    );
-                }
-            }
             if let Err(error) = self.authorizer.authorize(body, context) {
                 tracing::warn!(
                     target: "mackesd::surface_firmware",
@@ -1736,6 +2205,22 @@ mod worker {
             request: Option<&FwApplyRequest>,
             result: &ApplyResult,
         ) {
+            let Some(body) = self.result_body(request, result) else {
+                return;
+            };
+            let _ = persist.write(
+                &fw_result_topic(&self.node_id),
+                Priority::Default,
+                None,
+                Some(&body),
+            );
+        }
+
+        fn result_body(
+            &self,
+            request: Option<&FwApplyRequest>,
+            result: &ApplyResult,
+        ) -> Option<String> {
             let (product, generation) = match &self.detection.model {
                 SurfaceModel::Known(device) => (device.product.clone(), device.contract_generation),
                 SurfaceModel::UnknownSurface { product } => {
@@ -1778,9 +2263,9 @@ mod worker {
                     %error,
                     "refusing invalid shared firmware apply result"
                 );
-                return;
+                return None;
             }
-            publish(persist, &fw_result_topic(&self.node_id), &shared);
+            serde_json::to_string(&shared).ok()
         }
 
         /// Re-run SURFACE-4's verify and re-publish the board + compact summary
@@ -1816,6 +2301,49 @@ mod worker {
             .unwrap_or(u64::MAX)
     }
 
+    fn exact_sha256(body: &str) -> String {
+        format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    fn generation_label(generation: SurfaceProGeneration) -> &'static str {
+        match generation {
+            SurfaceProGeneration::Pro5 => "pro5",
+            SurfaceProGeneration::Pro6 => "pro6",
+            SurfaceProGeneration::Unsupported => "unsupported",
+        }
+    }
+
+    fn claim_generation(action: &ActionClaim) -> Option<SurfaceProGeneration> {
+        match (
+            action.model_product.as_str(),
+            action.model_generation.as_str(),
+        ) {
+            ("Surface Pro 5", "pro5") => Some(SurfaceProGeneration::Pro5),
+            ("Surface Pro 6", "pro6") => Some(SurfaceProGeneration::Pro6),
+            _ => None,
+        }
+    }
+
+    fn cancellation_outcome(
+        record: &crate::surface::action_journal::JournalRecord,
+    ) -> Option<SurfaceActionCancellationOutcome> {
+        let JournalPhase::Closed { decision, .. } = &record.phase else {
+            return None;
+        };
+        if matches!(
+            decision.outcome,
+            JournalOutcome::Cancelled | JournalOutcome::Refused
+        ) {
+            serde_json::from_str::<SurfaceActionCancellationResult>(&decision.result_body)
+                .ok()
+                .map(|result| result.outcome)
+        } else {
+            Some(SurfaceActionCancellationOutcome::Refused(
+                SurfaceActionCancellationRefusal::TooLate,
+            ))
+        }
+    }
+
     fn decode_historical_apply(body: &str, node: &str) -> Option<FwApplyRequest> {
         mackes_mesh_types::workloads::reject_duplicate_json_keys(body).ok()?;
         let envelope: FwApplyRequest = serde_json::from_str(body).ok()?;
@@ -1834,36 +2362,6 @@ mod worker {
             envelope.header.issued_at_ms,
         )
         .ok()
-    }
-
-    fn exact_body_seen(persist: &Persist, topic: &str, expected: &str) -> bool {
-        persist.list_since(topic, None).is_ok_and(|messages| {
-            messages
-                .iter()
-                .any(|message| message.body.as_deref() == Some(expected))
-        })
-    }
-
-    fn prior_cancellation_result(
-        persist: &Persist,
-        topic: &str,
-        request: &SurfaceActionCancellationRequest,
-    ) -> Option<SurfaceActionCancellationOutcome> {
-        persist
-            .list_since(topic, None)
-            .ok()?
-            .iter()
-            .find_map(|message| {
-                let body = message.body.as_deref()?;
-                let result: SurfaceActionCancellationResult = serde_json::from_str(body).ok()?;
-                (result.validate().is_ok()
-                    && result.cancellation_id == request.header.request_id
-                    && result.target_request_id == request.target_request_id
-                    && result.action == request.action
-                    && result.model == request.model
-                    && result.firmware_target == request.firmware_target)
-                    .then_some(result.outcome)
-            })
     }
 
     /// Publish a serializable payload to `topic` (best-effort; a failed write
@@ -2066,6 +2564,46 @@ mod worker {
         }
 
         #[test]
+        fn journal_only_recovery_preserves_typed_firmware_target() {
+            let dir = tempfile::tempdir().unwrap();
+            let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+            let body = signed_request("node-a", "dev-1", Some(FW_ARM_TOKEN), "firmware-orphan");
+            let mut worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            let journal = worker.journal().unwrap();
+            let request = decode_historical_apply(&body, "node-a").unwrap();
+            let context = MutationContext {
+                verb: FW_ACTION_AUTH_VERB,
+                node: "node-a",
+                target: &request.device_id,
+            };
+            let token = worker
+                .verified_token(&body, context, request.header.issued_at_ms, false)
+                .unwrap();
+            let claim = worker
+                .action_claim("01ARZ3NDEKTSV4RRFFQ69G5FAF", &body, &request, &token)
+                .unwrap();
+            let expected_target = claim.firmware_target.clone();
+            assert_eq!(journal.claim_action(&claim), Ok(ClaimDisposition::Claimed));
+
+            // No retained Bus request exists. Startup recovery must close the
+            // non-repeatable claim before consulting that queue.
+            worker.poll_once(&persist);
+
+            let results = persist
+                .list_since(&fw_result_topic("node-a"), None)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let result = SurfaceFirmwareApplyResult::from_json(
+                results[0].body.as_deref().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(result.request_id, "firmware-orphan");
+            assert_eq!(result.target, expected_target);
+            assert_eq!(result.outcome, SurfaceFirmwareApplyOutcome::Interrupted);
+            assert!(journal.pending_recovery().unwrap().is_empty());
+        }
+
+        #[test]
         fn cancellation_claims_pending_firmware_without_invoking_or_interrupting_fwupd() {
             let dir = tempfile::tempdir().unwrap();
             let persist = Persist::open(dir.path().to_path_buf()).unwrap();
@@ -2098,10 +2636,6 @@ mod worker {
             assert_eq!(result.outcome, SurfaceActionCancellationOutcome::Cancelled);
             assert!(persist
                 .list_since(&fw_result_topic("node-a"), None)
-                .unwrap()
-                .is_empty());
-            assert!(persist
-                .list_since(&fw_apply_claim_topic("node-a"), None)
                 .unwrap()
                 .is_empty());
         }

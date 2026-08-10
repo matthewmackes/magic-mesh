@@ -32,7 +32,7 @@ pub const MAX_SURFACE_ACTION_FUTURE_SKEW_MS: u64 = 5_000;
 pub const SURFACE_CAMERA_PROOF_ARM_TOKEN: &str = "PROVE CAMERA";
 /// Firmware-apply result schema. Version 2 explicitly replaces the former
 /// private daemon JSON shape that carried unbounded free-form reasons.
-pub const SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION: u64 = 2;
+pub const SURFACE_FIRMWARE_APPLY_RESULT_SCHEMA_VERSION: u64 = 3;
 /// Shared schema for pending-only Surface action cancellation requests/results.
 pub const SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION: u64 = 1;
 
@@ -717,6 +717,9 @@ pub enum SurfaceFirmwareApplyOutcome {
     Unavailable(SurfaceFirmwareApplyUnavailable),
     /// The admitted provider ran but failed.
     Failed(SurfaceFirmwareApplyFailure),
+    /// A durable apply claim survived a worker restart without a terminal
+    /// result. The worker refuses to repeat a possibly completed fwupd effect.
+    Interrupted,
 }
 
 impl SurfaceFirmwareApplyOutcome {
@@ -1627,7 +1630,7 @@ mod tests {
         let raw = serde_json::to_string(&value).unwrap();
         let duplicate = raw.replacen(
             "{",
-            r#"{"result_schema_version":2,"result_schema_version":2,"#,
+            r#"{"result_schema_version":3,"result_schema_version":3,"#,
             1,
         );
         assert_eq!(

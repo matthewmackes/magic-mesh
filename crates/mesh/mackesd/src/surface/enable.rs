@@ -1189,6 +1189,11 @@ mod worker {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use mackes_mesh_types::cloud::CloudArmedToken;
+    use mackes_mesh_types::surface_enable::{
+        SurfaceEnableOutcome as SharedOutcome, SurfaceEnableResult as SharedEnableResult,
+        SurfaceEnableSource as SharedSource, SURFACE_ENABLE_RESULT_SCHEMA_VERSION,
+    };
     pub use mackes_mesh_types::surface_hardware::SurfaceEnableRequest as EnableRequest;
     use mackes_mesh_types::surface_hardware::{
         SurfaceActionCancellationOutcome, SurfaceActionCancellationRefusal,
@@ -1198,11 +1203,16 @@ mod worker {
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
+    use sha2::{Digest as _, Sha256};
 
     use super::{
         run_enable, shared_result, EnableRefusal, EnableResult, LiveSurfaceActions, SurfaceModel,
     };
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+    use crate::surface::action_journal::{
+        ActionClaim, CancelDisposition, CancelIntent, ClaimDisposition, JournalAction,
+        JournalDecision, JournalKey, JournalOutcome, JournalPhase, SurfaceActionJournal,
+    };
     use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
 
@@ -1240,14 +1250,6 @@ mod worker {
         format!("state/hardware/surface/{node}/enable-cancel")
     }
 
-    fn enable_claim_topic(node: &str) -> String {
-        format!("state/hardware/surface/{node}/enable-claim")
-    }
-
-    fn enable_cancel_claim_topic(node: &str) -> String {
-        format!("state/hardware/surface/{node}/enable-cancel-claim")
-    }
-
     /// The per-node `surface_enable` worker.
     pub struct SurfaceEnableWorker {
         node_id: String,
@@ -1257,6 +1259,7 @@ mod worker {
         action_cursor: Option<String>,
         cancel_cursor: Option<String>,
         authorizer: Arc<ActionAuthorizer>,
+        journal_root: Option<PathBuf>,
     }
 
     impl SurfaceEnableWorker {
@@ -1272,6 +1275,7 @@ mod worker {
                 action_cursor: None,
                 cancel_cursor: None,
                 authorizer: Arc::new(ActionAuthorizer::production()),
+                journal_root: None,
             }
         }
 
@@ -1286,11 +1290,12 @@ mod worker {
             Self {
                 node_id,
                 detection,
-                bus_root: Some(bus_root),
+                bus_root: Some(bus_root.clone()),
                 poll: POLL,
                 action_cursor: None,
                 cancel_cursor: None,
                 authorizer: Arc::new(ActionAuthorizer::production()),
+                journal_root: Some(bus_root.join("surface-action-journal")),
             }
         }
 
@@ -1306,11 +1311,12 @@ mod worker {
             Self {
                 node_id,
                 detection,
-                bus_root: Some(bus_root),
+                bus_root: Some(bus_root.clone()),
                 poll: POLL,
                 action_cursor: None,
                 cancel_cursor: None,
                 authorizer,
+                journal_root: Some(bus_root.join("surface-action-journal")),
             }
         }
 
@@ -1318,11 +1324,18 @@ mod worker {
         /// Pulled out so a test drives it against a temp Bus without the run
         /// loop / clock.
         fn poll_once(&mut self, persist: &Persist) {
+            let Ok(journal) = self.journal() else {
+                return;
+            };
+            self.recover_pending(persist, &journal);
+            self.retry_unpublished_results(persist, &journal);
+            self.retry_unpublished_late_cancellations(persist, &journal);
+            let _ = journal.gc_expired(wall_now_ms());
             let topic = enable_topic(&self.node_id);
             let Ok(msgs) = persist.list_since(&topic, self.action_cursor.as_deref()) else {
                 return;
             };
-            let cancelled = self.drain_cancellations(persist);
+            let cancelled = self.drain_cancellations(persist, &journal, &msgs);
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
                 if msg.body.as_deref().is_some_and(|body| {
@@ -1331,28 +1344,91 @@ mod worker {
                 }) {
                     continue;
                 }
-                let (admitted_request_id, result) =
-                    self.apply_request_with_admission(msg.body.as_deref(), Some(persist));
+                let body = msg.body.as_deref();
+                let mut claimed_key = None;
+                if let Some(body) = body {
+                    if let Some(request) = decode_historical_enable(body, &self.node_id) {
+                        let context = MutationContext {
+                            verb: ENABLE_ACTION_AUTH_VERB,
+                            node: &self.node_id,
+                            target: &self.node_id,
+                        };
+                        let key = JournalKey {
+                            node: self.node_id.clone(),
+                            action: JournalAction::Enable,
+                            target_request_id: request.header.request_id.clone(),
+                        };
+                        let allow_historical = journal.get(&key).ok().flatten().is_some();
+                        if let Some(token) = self.verified_token(
+                            body,
+                            context,
+                            request.header.issued_at_ms,
+                            allow_historical,
+                        ) {
+                            if let Ok(claim) = self.action_claim(&msg.ulid, body, &request, &token)
+                            {
+                                match journal.claim_action(&claim) {
+                                    Ok(ClaimDisposition::Claimed) => {
+                                        claimed_key = Some(claim.key.clone());
+                                    }
+                                    Ok(ClaimDisposition::AlreadyClaimed) => {
+                                        self.record_interrupted_action(&journal, &claim);
+                                        self.retry_unpublished_results(persist, &journal);
+                                        continue;
+                                    }
+                                    Ok(
+                                        ClaimDisposition::CancellationWon
+                                        | ClaimDisposition::Closed,
+                                    )
+                                    | Err(_) => {
+                                        self.retry_unpublished_results(persist, &journal);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let (admitted_request_id, result) = self.apply_request_with_admission(body, None);
                 // Publication freshness starts after every activation/MOK
                 // effect completes, never when the request was received.
                 let published_at_ms = wall_now_ms();
-                self.publish(
-                    persist,
-                    admitted_request_id.as_deref(),
-                    published_at_ms,
-                    &result,
-                );
+                if let Some(key) = claimed_key {
+                    if let Some(result_body) =
+                        self.result_body(admitted_request_id.as_deref(), published_at_ms, &result)
+                    {
+                        let decision = JournalDecision {
+                            outcome: JournalOutcome::ActionCompleted,
+                            decided_at_ms: published_at_ms,
+                            result_sha256: exact_sha256(&result_body),
+                            result_body,
+                        };
+                        let _ = journal.record_decision(&key, &decision);
+                        self.retry_unpublished_results(persist, &journal);
+                    }
+                } else {
+                    self.publish(
+                        persist,
+                        admitted_request_id.as_deref(),
+                        published_at_ms,
+                        &result,
+                    );
+                }
             }
         }
 
-        fn drain_cancellations(&mut self, persist: &Persist) -> HashSet<String> {
+        fn drain_cancellations(
+            &mut self,
+            persist: &Persist,
+            journal: &SurfaceActionJournal,
+            actions: &[mde_bus::persist::StoredMessage],
+        ) -> HashSet<String> {
             let topic = enable_cancel_topic(&self.node_id);
             let Ok(messages) = persist.list_since(&topic, self.cancel_cursor.as_deref()) else {
                 return HashSet::new();
             };
-            let all_actions = persist
-                .list_since(&enable_topic(&self.node_id), None)
-                .unwrap_or_default();
             let mut cancelled = HashSet::new();
             for message in messages {
                 self.cancel_cursor = Some(message.ulid.clone());
@@ -1362,125 +1438,535 @@ mod worker {
                 let Some(historical) = decode_historical_cancellation(body, &self.node_id) else {
                     continue;
                 };
-                if let Some(prior) = prior_cancellation_result(
-                    persist,
-                    &enable_cancel_result_topic(&self.node_id),
-                    &historical,
-                ) {
-                    if matches!(prior, SurfaceActionCancellationOutcome::Cancelled) {
-                        cancelled.insert(historical.target_request_id.clone());
-                    }
-                    continue;
-                }
-                let cancel = match SurfaceActionCancellationRequest::from_json_at(
-                    body.as_bytes(),
-                    &self.node_id,
-                    wall_now_ms(),
-                ) {
-                    Ok(live) => live,
-                    Err(_)
-                        if exact_body_seen(
-                            persist,
-                            &enable_cancel_claim_topic(&self.node_id),
-                            body,
-                        ) =>
-                    {
-                        historical
-                    }
-                    Err(_) => continue,
-                };
-                let outcome = self.decide_cancellation(persist, body, &cancel, &all_actions);
+                let (outcome, outbox_owned) =
+                    self.decide_cancellation(journal, &message.ulid, body, &historical, actions);
                 if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
-                    cancelled.insert(cancel.target_request_id.clone());
+                    cancelled.insert(historical.target_request_id.clone());
+                } else if !outbox_owned {
+                    let result = self.cancellation_result(&historical, outcome);
+                    if let Ok(result_body) = serde_json::to_string(&result) {
+                        let _ = persist.write(
+                            &enable_cancel_result_topic(&self.node_id),
+                            Priority::Default,
+                            None,
+                            Some(&result_body),
+                        );
+                    }
                 }
-                self.publish_cancellation_result(persist, &cancel, outcome);
             }
+            self.retry_unpublished_results(persist, journal);
             cancelled
         }
 
         fn decide_cancellation(
             &self,
-            persist: &Persist,
+            journal: &SurfaceActionJournal,
+            cancel_source_ulid: &str,
             body: &str,
             cancel: &SurfaceActionCancellationRequest,
             actions: &[mde_bus::persist::StoredMessage],
-        ) -> SurfaceActionCancellationOutcome {
+        ) -> (SurfaceActionCancellationOutcome, bool) {
             let refused = SurfaceActionCancellationOutcome::Refused;
             if cancel.action != SurfaceCancellableAction::Enable
                 || cancel.model != self.shared_model()
                 || cancel.firmware_target.is_some()
             {
-                return refused(SurfaceActionCancellationRefusal::IdentityMismatch);
+                return (
+                    refused(SurfaceActionCancellationRefusal::IdentityMismatch),
+                    false,
+                );
             }
-            let Some((original_body, _original)) = actions.iter().find_map(|message| {
-                let raw = message.body.as_deref()?;
-                let request = decode_historical_enable(raw, &self.node_id)?;
-                (request.header.request_id == cancel.target_request_id).then_some((raw, request))
-            }) else {
-                return refused(SurfaceActionCancellationRefusal::UnknownTarget);
+            let Some((original_source_ulid, original_body, original)) =
+                actions.iter().find_map(|message| {
+                    let raw = message.body.as_deref()?;
+                    let request = decode_historical_enable(raw, &self.node_id)?;
+                    (request.header.request_id == cancel.target_request_id).then_some((
+                        message.ulid.as_str(),
+                        raw,
+                        request,
+                    ))
+                })
+            else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::UnknownTarget),
+                    false,
+                );
             };
-            if exact_body_seen(persist, &enable_claim_topic(&self.node_id), original_body) {
-                return refused(SurfaceActionCancellationRefusal::TooLate);
-            }
-            let resumed = exact_body_seen(persist, &enable_cancel_claim_topic(&self.node_id), body);
-            if resumed {
-                let Ok(issued_at_ms) = i64::try_from(cancel.header.issued_at_ms) else {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
-                };
-                if self
-                    .authorizer
-                    .verify_historical_claim(
-                        body,
-                        MutationContext {
-                            verb: ENABLE_CANCEL_AUTH_VERB,
-                            node: &self.node_id,
-                            target: &cancel.target_request_id,
-                        },
-                        issued_at_ms,
+            let key = JournalKey {
+                node: self.node_id.clone(),
+                action: JournalAction::Enable,
+                target_request_id: original.header.request_id.clone(),
+            };
+            let existing = journal.get(&key).ok().flatten();
+            let original_context = MutationContext {
+                verb: ENABLE_ACTION_AUTH_VERB,
+                node: &self.node_id,
+                target: &self.node_id,
+            };
+            let cancel_context = MutationContext {
+                verb: ENABLE_CANCEL_AUTH_VERB,
+                node: &self.node_id,
+                target: &cancel.target_request_id,
+            };
+            let Some(original_token) = self.verified_token(
+                original_body,
+                original_context,
+                original.header.issued_at_ms,
+                existing.is_some(),
+            ) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let Some(cancel_token) = self.verified_token(
+                body,
+                cancel_context,
+                cancel.header.issued_at_ms,
+                existing.is_some(),
+            ) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let Ok(action) = self.action_claim(
+                original_source_ulid,
+                original_body,
+                &original,
+                &original_token,
+            ) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let Ok(cancel_expiry) = u64::try_from(cancel_token.expires_at_ms) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    false,
+                );
+            };
+            let intent = CancelIntent {
+                source_ulid: cancel_source_ulid.to_owned(),
+                cancellation_id: cancel.header.request_id.clone(),
+                exact_body_sha256: exact_sha256(body),
+                target: action,
+                claimed_at_ms: cancel.header.issued_at_ms,
+                expires_at_ms: cancel_expiry,
+            };
+            let disposition = match journal.record_cancel_intent(&key, &intent) {
+                Ok(disposition) => disposition,
+                Err(_) => {
+                    return (
+                        refused(SurfaceActionCancellationRefusal::Authorization),
+                        false,
                     )
-                    .is_err()
-                {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
                 }
-            } else {
-                if self
-                    .authorizer
-                    .authorize(
-                        body,
-                        MutationContext {
-                            verb: ENABLE_CANCEL_AUTH_VERB,
-                            node: &self.node_id,
-                            target: &cancel.target_request_id,
-                        },
+            };
+            if matches!(disposition, CancelDisposition::Closed) {
+                let outcome = journal
+                    .get(&key)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| cancellation_outcome(&record))
+                    .unwrap_or_else(|| refused(SurfaceActionCancellationRefusal::Authorization));
+                return (outcome, true);
+            }
+            if matches!(disposition, CancelDisposition::ActionAlreadyClaimed) {
+                let outcome = refused(SurfaceActionCancellationRefusal::TooLate);
+                let already_durable = journal.get(&key).ok().flatten().is_some_and(|record| {
+                    matches!(
+                        record.phase,
+                        JournalPhase::ActionClaimedCancel {
+                            late_cancel_decision: Some(_),
+                            ..
+                        } | JournalPhase::Closed {
+                            late_cancel_decision: Some(_),
+                            ..
+                        }
                     )
-                    .is_err()
+                });
+                if already_durable {
+                    return (outcome, true);
+                }
+                let result = self.cancellation_result(cancel, outcome);
+                let Ok(result_body) = serde_json::to_string(&result) else {
+                    return (
+                        refused(SurfaceActionCancellationRefusal::Authorization),
+                        true,
+                    );
+                };
+                let decision = JournalDecision {
+                    outcome: JournalOutcome::Refused,
+                    decided_at_ms: result.completed_at_ms,
+                    result_sha256: exact_sha256(&result_body),
+                    result_body,
+                };
+                return if journal.record_late_cancel_decision(&key, &decision).is_ok() {
+                    (outcome, true)
+                } else {
+                    (
+                        refused(SurfaceActionCancellationRefusal::Authorization),
+                        true,
+                    )
+                };
+            }
+            let outcome = {
+                // The authenticated intent is durable before this nonce spend.
+                // An exact retained intent therefore remains authoritative if a
+                // crash occurs immediately before or after either consumption.
+                let _ = self.authorizer.authorize(body, cancel_context);
+                let _ = self.authorizer.authorize(original_body, original_context);
+                SurfaceActionCancellationOutcome::Cancelled
+            };
+            let result = self.cancellation_result(cancel, outcome);
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    true,
+                );
+            };
+            let decision = JournalDecision {
+                outcome: if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
+                    JournalOutcome::Cancelled
+                } else {
+                    JournalOutcome::Refused
+                },
+                decided_at_ms: result.completed_at_ms,
+                result_sha256: exact_sha256(&result_body),
+                result_body,
+            };
+            if journal.record_decision(&key, &decision).is_err() {
+                return (
+                    refused(SurfaceActionCancellationRefusal::Authorization),
+                    true,
+                );
+            }
+            (outcome, true)
+        }
+
+        fn journal(&self) -> Result<SurfaceActionJournal, String> {
+            match &self.journal_root {
+                Some(root) => {
+                    SurfaceActionJournal::open_at(root.clone(), rustix::process::geteuid().as_raw())
+                }
+                None => SurfaceActionJournal::open_default(),
+            }
+        }
+
+        fn action_claim(
+            &self,
+            source_ulid: &str,
+            body: &str,
+            request: &EnableRequest,
+            token: &CloudArmedToken,
+        ) -> Result<ActionClaim, String> {
+            Ok(ActionClaim {
+                key: JournalKey {
+                    node: self.node_id.clone(),
+                    action: JournalAction::Enable,
+                    target_request_id: request.header.request_id.clone(),
+                },
+                source_ulid: source_ulid.to_owned(),
+                request_id: request.header.request_id.clone(),
+                exact_body_sha256: exact_sha256(body),
+                model_product: self.shared_model().product,
+                model_generation: generation_label(self.shared_model().generation).into(),
+                firmware_target: None,
+                claimed_at_ms: request.header.issued_at_ms,
+                expires_at_ms: u64::try_from(token.expires_at_ms)
+                    .map_err(|_| "negative Surface enable capability expiry".to_string())?,
+            })
+        }
+
+        fn verified_token(
+            &self,
+            body: &str,
+            context: MutationContext<'_>,
+            issued_at_ms: u64,
+            allow_historical: bool,
+        ) -> Option<CloudArmedToken> {
+            if let Ok(token) = self.authorizer.verify_exact_body(body, context) {
+                return Some(token);
+            }
+            if !allow_historical {
+                return None;
+            }
+            self.authorizer
+                .verify_historical_claim(body, context, i64::try_from(issued_at_ms).ok()?)
+                .ok()?;
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()?
+                .get("armed_token")?
+                .as_str()
+                .and_then(CloudArmedToken::parse)
+        }
+
+        fn retry_unpublished_results(&self, persist: &Persist, journal: &SurfaceActionJournal) {
+            let Ok(records) = journal.unpublished() else {
+                return;
+            };
+            for record in records {
+                if record.key.node != self.node_id || record.key.action != JournalAction::Enable {
+                    continue;
+                }
+                let JournalPhase::Closed {
+                    decision, cancel, ..
+                } = record.phase
+                else {
+                    continue;
+                };
+                let topic = if cancel.is_some()
+                    && matches!(
+                        decision.outcome,
+                        JournalOutcome::Cancelled | JournalOutcome::Refused
+                    ) {
+                    let Ok(result) = serde_json::from_str::<SurfaceActionCancellationResult>(
+                        &decision.result_body,
+                    ) else {
+                        continue;
+                    };
+                    if result.validate().is_err()
+                        || result.source
+                            != SurfaceActionCancellationSource::LocalSurfaceEnableWorker
+                        || result.node != self.node_id
+                        || result.target_request_id != record.key.target_request_id
+                    {
+                        continue;
+                    }
+                    enable_cancel_result_topic(&self.node_id)
+                } else if matches!(
+                    decision.outcome,
+                    JournalOutcome::ActionCompleted | JournalOutcome::Interrupted
+                ) {
+                    let Ok(result) = SharedEnableResult::from_json_for_node_at(
+                        decision.result_body.as_bytes(),
+                        &self.node_id,
+                        decision.decided_at_ms,
+                    ) else {
+                        continue;
+                    };
+                    if result.request_id != record.key.target_request_id {
+                        continue;
+                    }
+                    result_topic(&self.node_id)
+                } else {
+                    continue;
+                };
+                if persist
+                    .write(&topic, Priority::Default, None, Some(&decision.result_body))
+                    .is_ok()
                 {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                    let _ = journal.mark_published(&record.key, &decision.result_sha256);
+                }
+            }
+        }
+
+        fn retry_unpublished_late_cancellations(
+            &self,
+            persist: &Persist,
+            journal: &SurfaceActionJournal,
+        ) {
+            let Ok(records) = journal.unpublished_late_cancellations() else {
+                return;
+            };
+            for record in records {
+                if record.key.node != self.node_id || record.key.action != JournalAction::Enable {
+                    continue;
+                }
+                let decision = match record.phase {
+                    JournalPhase::ActionClaimedCancel {
+                        late_cancel_decision: Some(decision),
+                        ..
+                    }
+                    | JournalPhase::Closed {
+                        winner: crate::surface::action_journal::JournalWinner::Action,
+                        late_cancel_decision: Some(decision),
+                        ..
+                    } => decision,
+                    _ => continue,
+                };
+                let Ok(result) =
+                    serde_json::from_str::<SurfaceActionCancellationResult>(&decision.result_body)
+                else {
+                    continue;
+                };
+                if result.validate().is_err()
+                    || result.source != SurfaceActionCancellationSource::LocalSurfaceEnableWorker
+                    || result.node != self.node_id
+                    || result.target_request_id != record.key.target_request_id
+                    || result.outcome
+                        != SurfaceActionCancellationOutcome::Refused(
+                            SurfaceActionCancellationRefusal::TooLate,
+                        )
+                {
+                    continue;
                 }
                 if persist
                     .write(
-                        &enable_cancel_claim_topic(&self.node_id),
+                        &enable_cancel_result_topic(&self.node_id),
                         Priority::Default,
                         None,
-                        Some(body),
+                        Some(&decision.result_body),
                     )
-                    .is_err()
+                    .is_ok()
                 {
-                    return refused(SurfaceActionCancellationRefusal::Authorization);
+                    let _ =
+                        journal.mark_late_cancel_published(&record.key, &decision.result_sha256);
                 }
             }
-            match self.authorizer.authorize(
-                original_body,
-                MutationContext {
-                    verb: ENABLE_ACTION_AUTH_VERB,
-                    node: &self.node_id,
-                    target: &self.node_id,
-                },
-            ) {
-                Ok(()) => SurfaceActionCancellationOutcome::Cancelled,
-                Err(_) if resumed => SurfaceActionCancellationOutcome::Cancelled,
-                Err(_) => refused(SurfaceActionCancellationRefusal::TooLate),
+        }
+
+        fn recover_pending(&self, persist: &Persist, journal: &SurfaceActionJournal) {
+            let Ok(records) = journal.pending_recovery() else {
+                return;
+            };
+            for record in records {
+                if record.key.node != self.node_id || record.key.action != JournalAction::Enable {
+                    continue;
+                }
+                match record.phase {
+                    JournalPhase::ActionClaimed { action } => {
+                        self.record_interrupted_action(journal, &action);
+                    }
+                    JournalPhase::ActionClaimedCancel {
+                        action,
+                        cancel,
+                        late_cancel_decision,
+                        ..
+                    } => {
+                        if late_cancel_decision.is_none()
+                            && !self.record_recovered_late_cancellation(journal, &action, &cancel)
+                        {
+                            // Never erase the exact retained cancellation by
+                            // closing the action when its TooLate decision
+                            // could not first be made durable.
+                            continue;
+                        }
+                        self.retry_unpublished_late_cancellations(persist, journal);
+                        self.record_interrupted_action(journal, &action);
+                    }
+                    JournalPhase::CancelClaimed { action, cancel } => {
+                        self.record_recovered_cancellation(
+                            journal,
+                            &action,
+                            &cancel,
+                            SurfaceActionCancellationOutcome::Cancelled,
+                        );
+                    }
+                    JournalPhase::Closed { .. } => {}
+                }
             }
+        }
+
+        fn record_interrupted_action(&self, journal: &SurfaceActionJournal, action: &ActionClaim) {
+            let Some(generation) = claim_generation(action) else {
+                return;
+            };
+            let result = SharedEnableResult {
+                schema_version: SURFACE_ENABLE_RESULT_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                request_id: action.key.target_request_id.clone(),
+                model: action.model_product.clone(),
+                generation,
+                source: SharedSource::LocalSurfaceEnableWorker,
+                published_at_ms: wall_now_ms(),
+                outcome: SharedOutcome::Interrupted,
+            };
+            let Ok(result_body) = result.to_json() else {
+                return;
+            };
+            let decision = JournalDecision {
+                outcome: JournalOutcome::Interrupted,
+                decided_at_ms: result.published_at_ms,
+                result_sha256: exact_sha256(&result_body),
+                result_body,
+            };
+            let _ = journal.record_decision(&action.key, &decision);
+        }
+
+        fn record_recovered_cancellation(
+            &self,
+            journal: &SurfaceActionJournal,
+            action: &ActionClaim,
+            cancel: &CancelIntent,
+            outcome: SurfaceActionCancellationOutcome,
+        ) {
+            let Some(generation) = claim_generation(action) else {
+                return;
+            };
+            let result = SurfaceActionCancellationResult {
+                schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                cancellation_id: cancel.cancellation_id.clone(),
+                target_request_id: action.key.target_request_id.clone(),
+                action: SurfaceCancellableAction::Enable,
+                model: SurfaceModelIdentity {
+                    product: action.model_product.clone(),
+                    generation,
+                },
+                firmware_target: None,
+                source: SurfaceActionCancellationSource::LocalSurfaceEnableWorker,
+                completed_at_ms: wall_now_ms(),
+                outcome,
+            };
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return;
+            };
+            let decision = JournalDecision {
+                outcome: if matches!(outcome, SurfaceActionCancellationOutcome::Cancelled) {
+                    JournalOutcome::Cancelled
+                } else {
+                    JournalOutcome::Refused
+                },
+                decided_at_ms: result.completed_at_ms,
+                result_sha256: exact_sha256(&result_body),
+                result_body,
+            };
+            let _ = journal.record_decision(&action.key, &decision);
+        }
+
+        fn record_recovered_late_cancellation(
+            &self,
+            journal: &SurfaceActionJournal,
+            action: &ActionClaim,
+            cancel: &CancelIntent,
+        ) -> bool {
+            let Some(generation) = claim_generation(action) else {
+                return false;
+            };
+            let result = SurfaceActionCancellationResult {
+                schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
+                node: self.node_id.clone(),
+                cancellation_id: cancel.cancellation_id.clone(),
+                target_request_id: action.key.target_request_id.clone(),
+                action: SurfaceCancellableAction::Enable,
+                model: SurfaceModelIdentity {
+                    product: action.model_product.clone(),
+                    generation,
+                },
+                firmware_target: None,
+                source: SurfaceActionCancellationSource::LocalSurfaceEnableWorker,
+                completed_at_ms: wall_now_ms(),
+                outcome: SurfaceActionCancellationOutcome::Refused(
+                    SurfaceActionCancellationRefusal::TooLate,
+                ),
+            };
+            let Ok(result_body) = serde_json::to_string(&result) else {
+                return false;
+            };
+            journal
+                .record_late_cancel_decision(
+                    &action.key,
+                    &JournalDecision {
+                        outcome: JournalOutcome::Refused,
+                        decided_at_ms: result.completed_at_ms,
+                        result_sha256: exact_sha256(&result_body),
+                        result_body,
+                    },
+                )
+                .is_ok()
         }
 
         fn shared_model(&self) -> SurfaceModelIdentity {
@@ -1500,13 +1986,12 @@ mod worker {
             }
         }
 
-        fn publish_cancellation_result(
+        fn cancellation_result(
             &self,
-            persist: &Persist,
             request: &SurfaceActionCancellationRequest,
             outcome: SurfaceActionCancellationOutcome,
-        ) {
-            let result = SurfaceActionCancellationResult {
+        ) -> SurfaceActionCancellationResult {
+            SurfaceActionCancellationResult {
                 schema_version: SURFACE_ACTION_CANCELLATION_SCHEMA_VERSION,
                 node: self.node_id.clone(),
                 cancellation_id: request.header.request_id.clone(),
@@ -1517,17 +2002,6 @@ mod worker {
                 source: SurfaceActionCancellationSource::LocalSurfaceEnableWorker,
                 completed_at_ms: wall_now_ms(),
                 outcome,
-            };
-            if result.validate().is_ok() {
-                let Ok(body) = serde_json::to_string(&result) else {
-                    return;
-                };
-                let _ = persist.write(
-                    &enable_cancel_result_topic(&self.node_id),
-                    Priority::Default,
-                    None,
-                    Some(&body),
-                );
             }
         }
 
@@ -1544,7 +2018,7 @@ mod worker {
         fn apply_request_with_admission(
             &self,
             body: Option<&str>,
-            persist: Option<&Persist>,
+            _persist: Option<&Persist>,
         ) -> (Option<String>, EnableResult) {
             let Some(body) = body else {
                 return (
@@ -1573,25 +2047,6 @@ mod worker {
                 node: &self.node_id,
                 target: &self.node_id,
             };
-            if let Some(persist) = persist {
-                if persist
-                    .write(
-                        &enable_claim_topic(&self.node_id),
-                        Priority::Default,
-                        None,
-                        Some(body),
-                    )
-                    .is_err()
-                {
-                    return (
-                        Some(request_id),
-                        self.refused_result(
-                            EnableRefusal::Contract,
-                            "surface enable durable claim could not be recorded",
-                        ),
-                    );
-                }
-            }
             if let Err(error) = self.authorizer.authorize(body, context) {
                 tracing::warn!(
                     target: "mackesd::surface_enable",
@@ -1648,28 +2103,7 @@ mod worker {
             published_at_ms: u64,
             result: &EnableResult,
         ) {
-            let Some(request_id) = request_id else {
-                tracing::warn!(
-                    target: "mackesd::surface_enable",
-                    node = %self.node_id,
-                    "not publishing an enable diagnostic without an admitted request identity"
-                );
-                return;
-            };
-            let SurfaceModel::Known(device) = &self.detection.model else {
-                return;
-            };
-            let Ok(shared) =
-                shared_result(&self.node_id, request_id, published_at_ms, device, result)
-            else {
-                tracing::warn!(
-                    target: "mackesd::surface_enable",
-                    node = %self.node_id,
-                    "not publishing an enable diagnostic outside the strict shared contract"
-                );
-                return;
-            };
-            let Ok(body) = shared.to_json() else {
+            let Some(body) = self.result_body(request_id, published_at_ms, result) else {
                 return;
             };
             let topic = result_topic(&self.node_id);
@@ -1681,6 +2115,36 @@ mod worker {
                 );
             }
         }
+
+        fn result_body(
+            &self,
+            request_id: Option<&str>,
+            published_at_ms: u64,
+            result: &EnableResult,
+        ) -> Option<String> {
+            let Some(request_id) = request_id else {
+                tracing::warn!(
+                    target: "mackesd::surface_enable",
+                    node = %self.node_id,
+                    "not publishing an enable diagnostic without an admitted request identity"
+                );
+                return None;
+            };
+            let SurfaceModel::Known(device) = &self.detection.model else {
+                return None;
+            };
+            let Ok(shared) =
+                shared_result(&self.node_id, request_id, published_at_ms, device, result)
+            else {
+                tracing::warn!(
+                    target: "mackesd::surface_enable",
+                    node = %self.node_id,
+                    "not publishing an enable diagnostic outside the strict shared contract"
+                );
+                return None;
+            };
+            shared.to_json().ok()
+        }
     }
 
     fn wall_now_ms() -> u64 {
@@ -1690,6 +2154,49 @@ mod worker {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX)
+    }
+
+    fn exact_sha256(body: &str) -> String {
+        format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    fn generation_label(generation: SurfaceProGeneration) -> &'static str {
+        match generation {
+            SurfaceProGeneration::Pro5 => "pro5",
+            SurfaceProGeneration::Pro6 => "pro6",
+            SurfaceProGeneration::Unsupported => "unsupported",
+        }
+    }
+
+    fn claim_generation(action: &ActionClaim) -> Option<SurfaceProGeneration> {
+        match (
+            action.model_product.as_str(),
+            action.model_generation.as_str(),
+        ) {
+            ("Surface Pro 5", "pro5") => Some(SurfaceProGeneration::Pro5),
+            ("Surface Pro 6", "pro6") => Some(SurfaceProGeneration::Pro6),
+            _ => None,
+        }
+    }
+
+    fn cancellation_outcome(
+        record: &crate::surface::action_journal::JournalRecord,
+    ) -> Option<SurfaceActionCancellationOutcome> {
+        let JournalPhase::Closed { decision, .. } = &record.phase else {
+            return None;
+        };
+        if matches!(
+            decision.outcome,
+            JournalOutcome::Cancelled | JournalOutcome::Refused
+        ) {
+            serde_json::from_str::<SurfaceActionCancellationResult>(&decision.result_body)
+                .ok()
+                .map(|result| result.outcome)
+        } else {
+            Some(SurfaceActionCancellationOutcome::Refused(
+                SurfaceActionCancellationRefusal::TooLate,
+            ))
+        }
     }
 
     fn decode_historical_enable(body: &str, node: &str) -> Option<EnableRequest> {
@@ -1710,36 +2217,6 @@ mod worker {
             envelope.header.issued_at_ms,
         )
         .ok()
-    }
-
-    fn exact_body_seen(persist: &Persist, topic: &str, expected: &str) -> bool {
-        persist.list_since(topic, None).is_ok_and(|messages| {
-            messages
-                .iter()
-                .any(|message| message.body.as_deref() == Some(expected))
-        })
-    }
-
-    fn prior_cancellation_result(
-        persist: &Persist,
-        topic: &str,
-        request: &SurfaceActionCancellationRequest,
-    ) -> Option<SurfaceActionCancellationOutcome> {
-        persist
-            .list_since(topic, None)
-            .ok()?
-            .iter()
-            .find_map(|message| {
-                let body = message.body.as_deref()?;
-                let result: SurfaceActionCancellationResult = serde_json::from_str(body).ok()?;
-                (result.validate().is_ok()
-                    && result.cancellation_id == request.header.request_id
-                    && result.target_request_id == request.target_request_id
-                    && result.action == request.action
-                    && result.model == request.model
-                    && result.firmware_target.is_none())
-                .then_some(result.outcome)
-            })
     }
 
     /// The default Bus root (same shape the other bus workers use).
@@ -1908,8 +2385,178 @@ mod worker {
             )
         }
 
+        fn journal_claim(
+            worker: &SurfaceEnableWorker,
+            body: &str,
+            source_ulid: &str,
+        ) -> ActionClaim {
+            let request = decode_historical_enable(body, &worker.node_id).unwrap();
+            let context = MutationContext {
+                verb: ENABLE_ACTION_AUTH_VERB,
+                node: &worker.node_id,
+                target: &worker.node_id,
+            };
+            let token = worker
+                .verified_token(body, context, request.header.issued_at_ms, false)
+                .unwrap();
+            worker
+                .action_claim(source_ulid, body, &request, &token)
+                .unwrap()
+        }
+
+        fn journal_cancel(
+            worker: &SurfaceEnableWorker,
+            action: ActionClaim,
+            body: &str,
+            source_ulid: &str,
+        ) -> CancelIntent {
+            let request = decode_historical_cancellation(body, &worker.node_id).unwrap();
+            let context = MutationContext {
+                verb: ENABLE_CANCEL_AUTH_VERB,
+                node: &worker.node_id,
+                target: &request.target_request_id,
+            };
+            let token = worker
+                .verified_token(body, context, request.header.issued_at_ms, false)
+                .unwrap();
+            CancelIntent {
+                source_ulid: source_ulid.into(),
+                cancellation_id: request.header.request_id,
+                exact_body_sha256: exact_sha256(body),
+                target: action,
+                claimed_at_ms: request.header.issued_at_ms,
+                expires_at_ms: u64::try_from(token.expires_at_ms).unwrap(),
+            }
+        }
+
         #[test]
-        fn pending_cancellation_is_restart_idempotent_and_crash_after_claim_recovers() {
+        fn journal_only_recovery_closes_orphan_cancelled_and_too_late_enable() {
+            let dir = tempfile::tempdir().unwrap();
+            let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+            let orphan_body = signed_request("node-a", "enable-orphan");
+            let cancelled_body = signed_request("node-a", "enable-cancelled");
+            let cancel_body = signed_cancel("node-a", "enable-cancelled", "cancel-won");
+            let late_body = signed_request("node-a", "enable-too-late");
+            let late_cancel_body = signed_cancel("node-a", "enable-too-late", "cancel-too-late");
+            let mut worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            let journal = worker.journal().unwrap();
+
+            let orphan = journal_claim(&worker, &orphan_body, "01ARZ3NDEKTSV4RRFFQ69G5FAA");
+            assert_eq!(journal.claim_action(&orphan), Ok(ClaimDisposition::Claimed));
+
+            let cancelled = journal_claim(&worker, &cancelled_body, "01ARZ3NDEKTSV4RRFFQ69G5FAB");
+            let cancel = journal_cancel(
+                &worker,
+                cancelled.clone(),
+                &cancel_body,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAC",
+            );
+            assert_eq!(
+                journal.record_cancel_intent(&cancelled.key, &cancel),
+                Ok(CancelDisposition::CancelledPending)
+            );
+
+            let late = journal_claim(&worker, &late_body, "01ARZ3NDEKTSV4RRFFQ69G5FAD");
+            assert_eq!(journal.claim_action(&late), Ok(ClaimDisposition::Claimed));
+            let late_cancel = journal_cancel(
+                &worker,
+                late.clone(),
+                &late_cancel_body,
+                "01ARZ3NDEKTSV4RRFFQ69G5FAE",
+            );
+            assert_eq!(
+                journal.record_cancel_intent(&late.key, &late_cancel),
+                Ok(CancelDisposition::ActionAlreadyClaimed)
+            );
+            assert!(matches!(
+                journal.get(&late.key).unwrap().unwrap().phase,
+                JournalPhase::ActionClaimedCancel {
+                    late_cancel_decision: None,
+                    ..
+                }
+            ));
+
+            // No action or cancellation Bus rows exist: recovery authority is
+            // exclusively the root-owned journal. This is the crash point
+            // after retaining the late cancel but before its decision.
+            worker.poll_once(&persist);
+
+            let enable_results = persist.list_since(&result_topic("node-a"), None).unwrap();
+            assert_eq!(enable_results.len(), 2);
+            let interrupted: Vec<_> = enable_results
+                .iter()
+                .map(|row| {
+                    SharedEnableResult::from_json_for_node_at(
+                        row.body.as_deref().unwrap().as_bytes(),
+                        "node-a",
+                        wall_now_ms(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert!(interrupted
+                .iter()
+                .all(|result| result.outcome == SharedOutcome::Interrupted));
+            let request_ids: HashSet<_> = interrupted
+                .iter()
+                .map(|result| result.request_id.as_str())
+                .collect();
+            assert_eq!(
+                request_ids,
+                HashSet::from(["enable-orphan", "enable-too-late"])
+            );
+
+            let cancel_results = persist
+                .list_since(&enable_cancel_result_topic("node-a"), None)
+                .unwrap();
+            assert_eq!(cancel_results.len(), 2);
+            let outcomes: Vec<_> = cancel_results
+                .iter()
+                .map(|row| {
+                    serde_json::from_str::<SurfaceActionCancellationResult>(
+                        row.body.as_deref().unwrap(),
+                    )
+                    .unwrap()
+                    .outcome
+                })
+                .collect();
+            assert!(outcomes.contains(&SurfaceActionCancellationOutcome::Cancelled));
+            assert!(
+                outcomes.contains(&SurfaceActionCancellationOutcome::Refused(
+                    SurfaceActionCancellationRefusal::TooLate
+                ))
+            );
+            assert!(matches!(
+                journal.get(&late.key).unwrap().unwrap().phase,
+                JournalPhase::Closed {
+                    late_cancel_decision: Some(_),
+                    late_cancel_published: true,
+                    ..
+                }
+            ));
+            assert!(journal.pending_recovery().unwrap().is_empty());
+
+            let mut restarted = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            restarted.poll_once(&persist);
+            assert_eq!(
+                persist
+                    .list_since(&result_topic("node-a"), None)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                persist
+                    .list_since(&enable_cancel_result_topic("node-a"), None)
+                    .unwrap()
+                    .len(),
+                2,
+                "restart does not duplicate either published terminal outbox"
+            );
+        }
+
+        #[test]
+        fn pending_cancellation_is_restart_idempotent() {
             let dir = tempfile::tempdir().unwrap();
             let persist = Persist::open(dir.path().to_path_buf()).unwrap();
             let action = signed_request("node-a", "enable-pending");
@@ -1928,29 +2575,6 @@ mod worker {
                     Priority::Default,
                     None,
                     Some(&cancel),
-                )
-                .unwrap();
-
-            // Model a crash after durable cancellation claim + original-token
-            // consumption but before terminal result publication.
-            persist
-                .write(
-                    &enable_cancel_claim_topic("node-a"),
-                    Priority::Default,
-                    None,
-                    Some(&cancel),
-                )
-                .unwrap();
-            let authorizer =
-                ActionAuthorizer::for_test(AUTH_KEY, dir.path().join("auth"), wall_now_ms() as i64);
-            authorizer
-                .authorize(
-                    &action,
-                    MutationContext {
-                        verb: ENABLE_ACTION_AUTH_VERB,
-                        node: "node-a",
-                        target: "node-a",
-                    },
                 )
                 .unwrap();
 

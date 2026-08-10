@@ -30,6 +30,9 @@ use mackes_mesh_types::surface_hardware::SurfaceProGeneration;
 /// machine, built on this module's [`SurfaceDevice`]/[`SurfaceProfile`].
 pub mod enable;
 
+/// Root-owned, crash-safe arbitration shared by Surface mutation workers.
+pub mod action_journal;
+
 /// SURFACE-4 — the day-2 verify half: per-subsystem live probes folded to a
 /// tri-state board (Ok/Failed/Degraded + NeedsGesture) across this module's
 /// [`SurfaceProfile`] checklist, plus the compact `state/hardware/surface/<node>`

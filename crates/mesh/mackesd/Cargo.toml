@@ -564,6 +564,7 @@ assets = [
     # activated on an admitted Surface Pro 5/6 node.
     { source = "install-helpers/provision-surface-mok-import-credentials.sh", dest = "/usr/libexec/mackesd/provision-surface-mok-import-credentials", mode = "755" },
     { source = "install-helpers/mint-surface-mok-import.sh", dest = "/usr/libexec/mackesd/mint-surface-mok-import", mode = "755" },
+    { source = "install-helpers/cancel-surface-mok-import.sh", dest = "/usr/libexec/mackesd/cancel-surface-mok-import", mode = "755" },
     { source = "packaging/systemd/surface-mok-import-credential.conf", dest = "/usr/libexec/mackesd/surface-mok-import-credential.conf", mode = "644" },
     # WL-FUNC-021 — Music mutations use a dedicated asymmetric credential:
     # only the root DRM shell receives the encrypted seed; mde-musicd reads the

@@ -133,6 +133,10 @@ pub fn cancel(node: &str, target_request_id: &str) -> anyhow::Result<()> {
         node != "peer:unknown" && !node.is_empty(),
         "local node identity is unavailable"
     );
+    ensure!(
+        is_surface_mok_request_id(target_request_id),
+        "target is not an exact lowercase Surface MOK request id"
+    );
     let _mint_lock = acquire_mint_lock()?;
     let detection = mackesd_core::surface::detect();
     let mackesd_core::surface::SurfaceModel::Known(device) = detection.model else {
@@ -179,6 +183,19 @@ pub fn cancel(node: &str, target_request_id: &str) -> anyhow::Result<()> {
     .context("publishing the pending-only Surface enable cancellation")?;
     println!("cancel-surface-mok-import: submitted pending-only cancellation");
     Ok(())
+}
+
+fn is_surface_mok_request_id(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("surface-mok-") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
 }
 
 fn build_cancellation(
@@ -602,6 +619,22 @@ mod tests {
             cloud_request_digest(&tampered).unwrap(),
             "target substitution cannot reuse the cancellation capability"
         );
+    }
+
+    #[test]
+    fn cancellation_target_requires_exact_lowercase_v4_surface_mok_id() {
+        assert!(is_surface_mok_request_id(
+            "surface-mok-12345678-1234-4abc-8def-1234567890ab"
+        ));
+        assert!(!is_surface_mok_request_id(
+            "surface-mok-12345678-1234-4abc-8def-1234567890AB"
+        ));
+        assert!(!is_surface_mok_request_id(
+            "surface-mok-12345678-1234-7abc-8def-1234567890ab"
+        ));
+        assert!(!is_surface_mok_request_id(
+            "../surface-mok-12345678-1234-4abc-8def-1234567890ab"
+        ));
     }
 
     #[test]

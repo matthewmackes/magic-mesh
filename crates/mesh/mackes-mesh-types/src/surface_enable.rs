@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::surface_hardware::SurfaceProGeneration;
 
 /// Current Surface enable-result schema.
-pub const SURFACE_ENABLE_RESULT_SCHEMA_VERSION: u64 = 1;
+pub const SURFACE_ENABLE_RESULT_SCHEMA_VERSION: u64 = 2;
 /// Maximum encoded result size.
 pub const MAX_SURFACE_ENABLE_RESULT_WIRE_BYTES: usize = 64 * 1024;
 /// Maximum age admitted by consumers.
@@ -226,6 +226,9 @@ pub enum SurfaceEnableOutcome {
         /// Bounded operator-facing diagnostic.
         reason: String,
     },
+    /// A durable claim survived a worker restart without a terminal result.
+    /// The worker does not repeat possibly completed hardware effects.
+    Interrupted,
 }
 
 /// Versioned local Surface Pro 5/6 enable result.
@@ -275,6 +278,7 @@ impl SurfaceEnableResult {
             SurfaceEnableOutcome::Refused { reason, .. } => {
                 validate_text(reason, MAX_REASON_BYTES, "refusal.reason")
             }
+            SurfaceEnableOutcome::Interrupted => Ok(()),
         }
     }
 
@@ -441,8 +445,8 @@ mod tests {
             Err(SurfaceEnableContractError::Malformed)
         ));
         let duplicate = body.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"schema_version\":2",
             1,
         );
         assert!(matches!(
