@@ -142,6 +142,17 @@ impl AndroidCatalogWorker {
                     continue;
                 }
             };
+            if current.as_ref().is_some_and(|existing| {
+                candidate.payload.catalog_id != existing.payload.catalog_id
+            }) {
+                tracing::warn!(
+                    target: "mackesd::android_catalog",
+                    catalog_id = %candidate.payload.catalog_id,
+                    "refused signed Android catalog identity switch"
+                );
+                *cursor = Some(row_ulid);
+                continue;
+            }
             if current
                 .as_ref()
                 .is_some_and(|existing| candidate.payload.revision <= existing.payload.revision)
@@ -458,10 +469,27 @@ mod tests {
     const NOW: u64 = 1_786_000_000_300;
 
     fn signed_catalog(key: &SigningKey, revision: u64) -> AndroidSignedCatalog {
-        signed_catalog_at(key, revision, NOW)
+        signed_catalog_with_id(key, revision, "aosp-starter-production")
+    }
+
+    fn signed_catalog_with_id(
+        key: &SigningKey,
+        revision: u64,
+        catalog_id: &str,
+    ) -> AndroidSignedCatalog {
+        signed_catalog_at_with_id(key, revision, NOW, catalog_id)
     }
 
     fn signed_catalog_at(key: &SigningKey, revision: u64, now_ms: u64) -> AndroidSignedCatalog {
+        signed_catalog_at_with_id(key, revision, now_ms, "aosp-starter-production")
+    }
+
+    fn signed_catalog_at_with_id(
+        key: &SigningKey,
+        revision: u64,
+        now_ms: u64,
+        catalog_id: &str,
+    ) -> AndroidSignedCatalog {
         let image = AndroidImageManifest::new(
             "aosp-cuttlefish-2026-08",
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -505,7 +533,7 @@ mod tests {
             "android-release-v1",
             AndroidCatalogPayload {
                 schema_version: ANDROID_SIGNED_CATALOG_SCHEMA_VERSION,
-                catalog_id: "aosp-starter-production".into(),
+                catalog_id: catalog_id.into(),
                 revision,
                 issued_at_unix_ms: now_ms - 100,
                 expires_at_unix_ms: now_ms + 60_000,
@@ -593,6 +621,38 @@ mod tests {
         assert_eq!(
             load_last_good(worker.config.as_ref().unwrap(), NOW).unwrap(),
             Some(good)
+        );
+    }
+
+    #[test]
+    fn trusted_higher_revision_cannot_switch_catalog_identity() {
+        let temp = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let worker = worker(&temp, &key);
+        let good = signed_catalog(&key, 7);
+        let mut persist = Persist::open(temp.path().join("bus")).unwrap();
+        import(&persist, &good);
+        import(
+            &persist,
+            &signed_catalog_with_id(&key, 8, "aosp-alternate-production"),
+        );
+        let mut cursor = None;
+        let mut current = None;
+        assert_eq!(
+            worker
+                .process_once(&mut persist, &mut cursor, &mut current, NOW)
+                .unwrap(),
+            1
+        );
+        assert_eq!(current.as_ref(), Some(&good));
+        assert!(cursor.is_some(), "refused terminal import advances cursor");
+        assert_eq!(
+            persist
+                .list_since(&android_catalog_state_topic("node-01").unwrap(), None)
+                .unwrap()
+                .len(),
+            1,
+            "identity switch must not publish a second catalog"
         );
     }
 
