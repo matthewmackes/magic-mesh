@@ -1647,8 +1647,8 @@ behavioral evidence is not completion.
 - **Multi-process peer acceptance (2026-08-09):** independent processes reopened Bus/SQLite state for signed delivery, rejoin, local opt-out, and global Stop/Snooze
   convergence; machine 9 passed 1 parent plus 14 child ticks: `docs/platform/evidence/WL-FUNC-022-2026-08-09-multi-process-peer-acceptance-s2-r5.md`.
 - Remaining work:
-- **Stopwatch origin-authority checkpoint (2026-08-10):** mirrored controls, forged origins, and identity transfer now fail closed; BigBoy/`.50` passed 3/3:
-  `docs/platform/evidence/WL-FUNC-022-2026-08-10-stopwatch-origin-authority-r143.md`.
+- **Peer stopwatch transport checkpoint (2026-08-10):** approved targeted mirrors preserve origin/revision and hostile variants fail closed; BigBoy passed 2/2:
+  `docs/platform/evidence/WL-FUNC-022-2026-08-10-peer-stopwatch-transport-r146.md`.
 - **Ringing schedule-removal checkpoint (2026-08-10):** removal now persists a terminal acknowledgement, queues Music Stop, and cancels pending snooze children before
   deleting the schedule; `.90` passed: `docs/platform/evidence/WL-FUNC-022-2026-08-10-ringing-schedule-removal-r128.md`.
 - **Clock Bus recovery (2026-08-09):** complete reads survive late/replaced storage; failed commits/publications/acks retry. Machine 194 passed four exact tests:
