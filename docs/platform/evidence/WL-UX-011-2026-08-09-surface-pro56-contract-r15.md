@@ -20,6 +20,8 @@ Changed production paths:
 - `crates/mesh/mackesd/src/surface/mok_credential.rs`
 - `crates/mesh/mackesd/src/surface/firmware.rs`
 - `crates/mesh/mackesd/src/surface/verify.rs`
+- `crates/mesh/mackesd/src/cli/surface_mok_mint.rs`
+- `crates/mesh/mackesd/src/ipc/action_auth.rs`
 - `crates/desktop/mde-shell-egui/src/surface_card.rs`
 - `crates/shared/mde-egui/src/display.rs`
 - `crates/shared/mde-egui/src/drm.rs`
@@ -32,10 +34,16 @@ Changed production paths:
 - `packaging/surface/surface-stack.schema.json`
 - `packaging/surface/surface-stack.f44.json`
 - `install-helpers/collect-surface-acceptance.py`
+- `install-helpers/build-surface-kernel-f44.sh`
 - `install-helpers/build-surface-userspace-f44.sh`
 - `install-helpers/fetch-surface-build-inputs.sh`
+- `install-helpers/mint-surface-mok-import.sh`
+- `install-helpers/preflight-surface-pro56-deployment.py`
+- `install-helpers/provision-surface-mok-import-credentials.sh`
 - `install-helpers/verify-surface-stack.sh`
+- `packaging/systemd/surface-mok-import-credential.conf`
 - `docs/ops/surface-pro56-acceptance-collection.md`
+- `docs/ops/surface-pro56-deployment-preflight.md`
 
 The shared schema provides:
 
@@ -63,15 +71,16 @@ label is canonicalized to `"Surface Pro 5"`.
 
 The daemon enable/firmware consumers use the shared request types and perform
 bounded admission before HMAC validation. The shell publishes only the firmware
-request whose fresh inventory/release/checksum fields are present; Surface
-activation and MOK reboot controls are visibly disabled until the shared
-Preview/Commit/Cancel/Audit authority carries a fresh provider generation.
-Externally published enable requests still cannot retrigger udev or write the
-platform profile until those changes join the shared staged-control authority.
-iptsd presets remain package-owned and rotation remains DRM-runner-owned. The
-MOK sub-action is narrower: an already-authorized exact request may import only
-the fixed package certificate when matching sealed systemd credentials are
-present; the shell still emits no reboot intent.
+request whose fresh inventory/release/checksum fields are present; ordinary
+Surface activation and MOK reboot controls remain absent from the shell. An
+exact-body, single-use, local authorized enable request can now retrigger only
+the package-owned iptsd hidraw rule, prove an active instance, and set only the
+fixed `balanced` SAM profile through `surface-control` with read-back proof.
+iptsd device admission remains package-owned and rotation remains
+DRM-runner-owned. The MOK sub-action is narrower: the root-only local minter
+constructs one action token and sealed permit with the same node, request,
+nonce, 30-second expiry, and fixed-certificate SHA-1 binding; it cannot mint a
+reboot intent.
 
 Secure Boot and enrolled-key posture use fixed, bounded `mokutil` reads; module
 checks are fixed sysfs reads. Pending MOK proof derives the complete SHA-1
@@ -81,8 +90,11 @@ fingerprints; malformed, duplicate, truncated, or non-UTF-8 output fails closed.
 SHA-1 is used only as mokutil's certificate identifier, not as a trust primitive.
 MOK import consumes a sealed permit bound to the node, request id, action-auth
 nonce/expiry, and exact certificate fingerprint, then confirms that fingerprint
-through `mokutil --list-new`. Packaging the short-lived credential provisioner
-and the typed host-state reboot handoff remains open.
+through `mokutil --list-new`. The packaged minter publishes a complete encrypted
+credential generation atomically, shares one root lock with the activator,
+bounds and reaps every helper, requires the action service to become active,
+and restores the prior credential/drop-in/service state on pre-commit failure.
+Reboot remains the separate typed host-state handoff.
 
 The live firmware provider now performs fixed-argv, locale-stable, 20-second
 bounded `fwupdmgr get-devices` and `get-updates` JSON reads, with concurrent
@@ -126,14 +138,15 @@ revisions. Commands and artifacts are bounded, output is redacted and
 SHA-256-bound, and the manifest always records
 `physical_acceptance_claimed: false`. It cannot substitute for hands-on proof.
 
-The bootc compose no longer treats a missing linux-surface repository, signing
-key, or RPM as a successful best-effort build. Its static image verifier now
+The bootc compose no longer treats a missing release-ready linux-surface
+artifact set, signing key, or RPM as a successful best-effort build. Its static
+image verifier now
 requires the Surface RPM set, the `iptsd@.service` per-device template, the
 linux-surface Secure Boot certificate, and explicit iptsd presets for both Pro 5
-and Pro 6. This deliberately exposes the current Fedora 44 repository gap as a
-compose failure instead of shipping a false support claim. The verifier passed
-`bash -n`; no image compose is claimed because the required F44 repository is
-not yet available. The compose copies the governed F44 manifest and refuses to
+and Pro 6. This deliberately exposes the current release-signing and complete
+artifact gap as a compose failure instead of shipping a false support claim.
+The verifier passed `bash -n`; no image compose is claimed because the complete
+signed F44 artifact set is not yet available. The compose copies the governed F44 manifest and refuses to
 continue while its exact status is not `ready`, preventing a later upstream
 repository appearance from silently bypassing the provenance gate.
 
@@ -142,7 +155,10 @@ The hardened provenance verifier requires exactly `kernel-surface`, `iptsd`,
 artifact filenames, exact whole-file hashes and NEVRAs, a pinned local RPM key,
 an exact Fedora 44 bootc base digest, and required
 kernel/module signer plus certificate bindings. The committed manifest is
-honestly `blocked` with all unavailable immutable values null.
+honestly `blocked` with all unavailable immutable values null. Its blocker text
+distinguishes the missing kernel signer/capacity from the unsigned userspace
+producer proof; it no longer claims the locked sources themselves are
+unavailable.
 
 The producer side now has a separate Fedora 44 build-input lock. It binds a
 digest-pinned Fedora 44 builder image and the complete official source set:
@@ -158,8 +174,8 @@ access, or Podman. A valid blocked manifest exits through
 manifest later becomes ready, the driver and Containerfile require its exact
 Fedora 44 base digest and install only verified local RPM paths; they do not
 import a mutable network key or resolve unconstrained Surface package names.
-This records rather than silently
-settles the project-wide baseline decision.
+This records rather than silently settles the project-wide signing and release
+artifact decision.
 
 The live mutation seams are no longer blanket stubs. Firmware apply now
 re-reads updates, binds one exact device/version/SHA-256/HTTPS location/declared
@@ -276,11 +292,11 @@ The provenance verifier ran on `172.20.0.50`, slot `surface-provenance-r1`:
 ```text
 Surface artifact provenance self-test passed (18 hostile fixtures rejected)
 blocked_rc=3
-BLOCKED: Fedora 44 Surface stack provenance is unavailable
+BLOCKED: Fedora 44 Surface stack release provenance is incomplete
 ```
 
 `git diff --check`, shell syntax, shellcheck, and JSON parsing passed. The
-blocked exit is the intended result, not a passing package/image claim.
+blocked exit is the intended result, not a passing signed-package/image claim.
 The bootc driver preflight was also exercised with a no-op Podman fixture and
 returned code 3 at the Surface provenance gate before invoking Podman.
 
@@ -394,6 +410,20 @@ farm slots:
   passed its hostile PATH/PYTHONPATH, encrypted-pair, packaging, and explicit
   no-direct-reboot assertions; the focused daemon reboot-handoff refusal test
   passed 1/1.
+- `.170 / surface-enable-live`: the final fixed-argv iptsd/SAM activation suite
+  passed 36/36 twice after inherited-environment hardening; exact-file rustfmt
+  also passed.
+- `.90 / surface-mok-minter`: the final focused minter suite passed 4/4 for
+  exact request/token/permit binding, zeroized passphrase shape, atomic
+  generation/no-overwrite behavior, and bounded TERM-to-KILL reap. The farm and
+  local hostile helper suites, Bash syntax, ShellCheck, rustfmt, and scoped
+  diff checks passed. No real password, MOK enrollment, or reboot was used.
+- The fail-closed Pro 5/6 deployment preflight passed its local hostile suite
+  and produced bounded valid JSON with exit 3. It rejects a dirty claimed
+  revision, stale remote collector hash, inherited SSH proxy/control behavior,
+  and oversized command output. The live Pro 6 LAN answered in 0.309 ms, but
+  the governed root/mm key remained refused and the overlay remained
+  unavailable.
 
 The first secret-bearing kernel producer was correctly rejected because it
 mounted the Secure Boot private key into a networked upstream build container.
@@ -408,16 +438,15 @@ versus the 45 GiB minimum, module-signer verification remains downstream, and
 final RPM release signing is still required.
 
 `git diff --check` passed after the exact formatter wave. These are checkpoint
-gates only: the missing governed Fedora 44 artifacts and live Surface
-credential still prevent image/deployment acceptance.
+gates only: the missing complete release-signed Fedora 44 artifact set and live
+Surface credential still prevent image/deployment acceptance.
 
 ## Remaining acceptance work
 
-- Add the local privileged minting front-end that creates the exact action token
-  and nonce-bound sealed permit. The packaged activator now validates and
-  installs the complete host-encrypted credential pair at one stop/start
-  boundary, but deliberately cannot mint authority. Reboot remains a separate
-  exact-body, single-use host-state `propose` then `confirm` pair.
+- Exercise the fixed iptsd/SAM activation and packaged local MOK minter on a
+  recovery-ready Surface. Complete MOK enrollment still requires the operator's
+  firmware interaction, and reboot remains a separate exact-body, single-use
+  host-state `propose` then `confirm` pair.
 - Run privacy-armed camera frame and fingerprint functional hardware proof; the
   production inventory probes now verify libcamera/fprintd stack enumeration
   without capture, claim, enrollment, authentication, or enrolled-print reads.
@@ -433,7 +462,7 @@ credential still prevent image/deployment acceptance.
   compose still fails closed without the complete governed artifact set.
 - Restore governed SSH/current-release access; the documented key is currently
   rejected on LAN and the overlay path is unavailable. On 2026-08-09 the Pro 6
-  repeatedly answered LAN ICMP at `172.20.146.79` (latest 0.443 ms), but
+  repeatedly answered LAN ICMP at `172.20.146.79` (latest 0.309 ms), but
   rejected the governed key for both `root` and `mm`; `10.42.0.7` did not answer
   ICMP.
 - Run direct touch, pen, Type Cover, SAM, accelerometer/rotation, camera,

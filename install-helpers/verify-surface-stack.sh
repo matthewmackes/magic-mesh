@@ -312,7 +312,7 @@ try:
     path = Path(sys.argv[1]); document = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
     result = validate(document)
     if result == "blocked":
-        print("BLOCKED: Fedora 44 Surface stack provenance is unavailable", file=sys.stderr)
+        print("BLOCKED: Fedora 44 Surface stack release provenance is incomplete", file=sys.stderr)
         for blocker in document["blockers"]: print(f"  - {blocker}", file=sys.stderr)
         raise SystemExit(3)
     rows, sources = verify_artifacts(document, sys.argv[2])

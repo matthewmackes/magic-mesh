@@ -11,17 +11,17 @@
   "signing_key": { "filename": null, "sha256": null, "fingerprint": null },
   "status": "blocked",
   "blockers": [
-    "No governed Fedora 44 kernel-surface source and RPM provenance is recorded.",
-    "No governed Fedora 44 iptsd source and RPM provenance is recorded.",
-    "No governed Fedora 44 libwacom-surface source and RPM provenance is recorded.",
-    "No governed Fedora 44 surface-control source and RPM provenance is recorded.",
-    "No governed Fedora 44 surface-secureboot source, RPM, and certificate provenance is recorded."
+    "No complete release-ready Fedora 44 kernel-surface RPM exists: the matching module-signing key and required build capacity are unavailable, and RPM release signing is pending.",
+    "The built Fedora 44 iptsd RPM proof is unsigned and has not been published as a release-signed governed artifact.",
+    "The built Fedora 44 libwacom-surface RPM proof is unsigned and has not been published as a release-signed governed artifact.",
+    "The built Fedora 44 surface-control RPM proof is unsigned and has not been published as a release-signed governed artifact.",
+    "The built Fedora 44 surface-secureboot RPM proof is unsigned and has not been published with the certificate used to sign the final kernel modules."
   ],
   "packages": [
     {
       "name": "kernel-surface",
       "availability": "unavailable",
-      "blocker": "No governed Fedora 44 kernel-surface source and RPM provenance is recorded.",
+      "blocker": "No complete release-ready Fedora 44 kernel-surface RPM exists: the matching module-signing key and required build capacity are unavailable, and RPM release signing is pending.",
       "source": { "filename": null, "url": null, "ref": null, "sha256": null, "license": null },
       "rpm": { "filename": null, "nevra": null, "sha256": null, "signing_fingerprint": null },
       "kernel_module_signing": { "applicability": "required", "signer": null, "certificate_sha256": null }
@@ -29,7 +29,7 @@
     {
       "name": "iptsd",
       "availability": "unavailable",
-      "blocker": "No governed Fedora 44 iptsd source and RPM provenance is recorded.",
+      "blocker": "The built Fedora 44 iptsd RPM proof is unsigned and has not been published as a release-signed governed artifact.",
       "source": { "filename": null, "url": null, "ref": null, "sha256": null, "license": null },
       "rpm": { "filename": null, "nevra": null, "sha256": null, "signing_fingerprint": null },
       "kernel_module_signing": { "applicability": "not-applicable", "signer": null, "certificate_sha256": null }
@@ -37,7 +37,7 @@
     {
       "name": "libwacom-surface",
       "availability": "unavailable",
-      "blocker": "No governed Fedora 44 libwacom-surface source and RPM provenance is recorded.",
+      "blocker": "The built Fedora 44 libwacom-surface RPM proof is unsigned and has not been published as a release-signed governed artifact.",
       "source": { "filename": null, "url": null, "ref": null, "sha256": null, "license": null },
       "rpm": { "filename": null, "nevra": null, "sha256": null, "signing_fingerprint": null },
       "kernel_module_signing": { "applicability": "not-applicable", "signer": null, "certificate_sha256": null }
@@ -45,7 +45,7 @@
     {
       "name": "surface-control",
       "availability": "unavailable",
-      "blocker": "No governed Fedora 44 surface-control source and RPM provenance is recorded.",
+      "blocker": "The built Fedora 44 surface-control RPM proof is unsigned and has not been published as a release-signed governed artifact.",
       "source": { "filename": null, "url": null, "ref": null, "sha256": null, "license": null },
       "rpm": { "filename": null, "nevra": null, "sha256": null, "signing_fingerprint": null },
       "kernel_module_signing": { "applicability": "not-applicable", "signer": null, "certificate_sha256": null }
@@ -53,7 +53,7 @@
     {
       "name": "surface-secureboot",
       "availability": "unavailable",
-      "blocker": "No governed Fedora 44 surface-secureboot source, RPM, and certificate provenance is recorded.",
+      "blocker": "The built Fedora 44 surface-secureboot RPM proof is unsigned and has not been published with the certificate used to sign the final kernel modules.",
       "source": { "filename": null, "url": null, "ref": null, "sha256": null, "license": null },
       "rpm": { "filename": null, "nevra": null, "sha256": null, "signing_fingerprint": null },
       "kernel_module_signing": { "applicability": "required", "signer": null, "certificate_sha256": null }

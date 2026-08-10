@@ -2046,11 +2046,16 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-cancellation-r14.md`.
 - **Surface Pro 5/6 contract checkpoint (2026-08-09):** one shared bounded
   observation/action contract now gates exact Pro 5 SKU and Pro 6 identity,
-  fail-closed activation, bounded firmware/camera reads, and local-only typed
-  shell projections. Fedora
-  44 image promotion fails closed because governed linux-surface source/RPM
-  provenance is unavailable; no physical acceptance is claimed. Focused farm
-  contract, daemon, shell, provenance, and collector gates passed:
+  fail-closed activation, exact device-scoped firmware apply, read-only
+  camera/fingerprint discovery, sole-runner DRM mode changes, and local-only
+  typed shell projections. Fixed iptsd/SAM activation, a crash-safe local MOK
+  authority minter, and a revision/collector-bound deployment preflight now
+  fail closed around the remaining physical steps. Exact locked sources and
+  unsigned Fedora 44 userspace RPM producer proof exist. Image promotion still fails closed
+  pending the matching kernel-module signing key, kernel build capacity,
+  release-signed artifact publication, governed seat access, and direct Pro 6
+  then Pro 5 physical proof. Focused farm contract, daemon, shell, producer,
+  provenance, and collector gates passed; no physical acceptance is claimed:
   `docs/platform/evidence/WL-UX-011-2026-08-09-surface-pro56-contract-r15.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
