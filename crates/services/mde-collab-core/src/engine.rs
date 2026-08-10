@@ -45,6 +45,8 @@ pub enum MergeRejectionReason {
     UnsupportedSchema,
     /// The envelope is unsigned, malformed, or its signature does not verify.
     InvalidSignature,
+    /// The event id was already observed with different signed contents.
+    ConflictingDuplicate,
 }
 
 /// An event rejected during [`CollabEngine::merge`].
@@ -201,6 +203,7 @@ impl CollabEngine {
         }
         let mut outcome = MergeOutcome::default();
         let mut accept: Vec<CollabEventEnvelope> = Vec::new();
+        let mut pending: BTreeMap<EventId, CollabEventEnvelope> = BTreeMap::new();
         let mut merged_clock = self.clock;
         for env in incoming {
             if env.schema_version != SCHEMA_VERSION {
@@ -219,13 +222,34 @@ impl CollabEngine {
                 });
                 continue;
             }
-            if self.events.contains_key(&env.event_id) {
-                outcome.duplicates += 1;
+            if let Some(existing) = self.events.get(&env.event_id) {
+                if existing == &env {
+                    outcome.duplicates += 1;
+                } else {
+                    outcome.dropped_invalid += 1;
+                    outcome.rejected.push(MergeRejection {
+                        event_id: env.event_id,
+                        reason: MergeRejectionReason::ConflictingDuplicate,
+                    });
+                }
+                continue;
+            }
+            if let Some(existing) = pending.get(&env.event_id) {
+                if existing == &env {
+                    outcome.duplicates += 1;
+                } else {
+                    outcome.dropped_invalid += 1;
+                    outcome.rejected.push(MergeRejection {
+                        event_id: env.event_id,
+                        reason: MergeRejectionReason::ConflictingDuplicate,
+                    });
+                }
                 continue;
             }
             // Advance our own clock past the observed one (HLC receive rule) so a
             // subsequent local event still dominates everything we have seen.
             merged_clock = merged_clock.merge(env.clock, merged_clock.wall_ms);
+            pending.insert(env.event_id, env.clone());
             accept.push(env);
         }
         outcome.accepted = accept.len();
@@ -382,5 +406,58 @@ mod tests {
         );
         assert!(engine.all_events().is_empty());
         assert_eq!(engine.clock(), ActorClock::zero());
+    }
+
+    #[test]
+    fn merge_rejects_conflicting_event_id_reuse_in_log_and_batch() {
+        let mut engine = CollabEngine::in_memory("viewer").expect("engine");
+        let original = signed_event();
+        engine
+            .merge(vec![original.clone()])
+            .expect("original event");
+
+        let mut conflict = original.clone();
+        conflict.kind = CollabEventKind::SpaceCreated {
+            kind: SpaceKind::Team,
+            name: "different".into(),
+        };
+        Ed25519Signer::from_seed([7; 32]).sign(&mut conflict);
+
+        let mut batch_original = signed_event();
+        batch_original.event_id = EventId::from_uuid(Uuid::from_u128(5));
+        Ed25519Signer::from_seed([7; 32]).sign(&mut batch_original);
+        let mut batch_conflict = batch_original.clone();
+        batch_conflict.kind = CollabEventKind::SpaceCreated {
+            kind: SpaceKind::Team,
+            name: "batch-different".into(),
+        };
+        Ed25519Signer::from_seed([7; 32]).sign(&mut batch_conflict);
+
+        let outcome = engine
+            .merge(vec![
+                conflict,
+                original.clone(),
+                batch_original.clone(),
+                batch_conflict,
+            ])
+            .expect("conflicting duplicates are reported, not fatal to the batch");
+
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.duplicates, 1);
+        assert_eq!(outcome.dropped_invalid, 2);
+        assert_eq!(
+            outcome.rejected,
+            vec![
+                MergeRejection {
+                    event_id: original.event_id,
+                    reason: MergeRejectionReason::ConflictingDuplicate,
+                },
+                MergeRejection {
+                    event_id: batch_original.event_id,
+                    reason: MergeRejectionReason::ConflictingDuplicate,
+                },
+            ]
+        );
+        assert_eq!(engine.all_events(), vec![original]);
     }
 }
