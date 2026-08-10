@@ -260,8 +260,6 @@ main() {
         publish "skipped-syncthing-unconfigured"
     fi
 
-    restore_role_desktop_state "$role" || return 1
-
     publish "restoring-grouped-mackesd"
     # During boot the target can already be activating its six notify children;
     # let that bounded job settle. If it does not settle, perform additive
@@ -274,6 +272,10 @@ main() {
         publish "failed-grouped-mackesd"
         return 1
     fi
+    # Desktop bind repair is the final local mutation.  Keep it behind the
+    # grouped readiness gate so a failed daemon/session recovery cannot report
+    # or partially apply a healthy desktop state.
+    restore_role_desktop_state "$role" || return 1
     publish "recovered"
 }
 

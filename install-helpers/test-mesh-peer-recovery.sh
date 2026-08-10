@@ -217,8 +217,8 @@ cat >"$STATE/expected-mutations" <<'EOF'
 nebula.service
 etcd.service
 syncthing.service
-xdg-binds
 mackesd.target
+xdg-binds
 EOF
 cmp "$STATE/expected-mutations" "$STATE/mutations"
 printf '1\n1\n' >"$STATE/expected-sleeps"
@@ -254,8 +254,8 @@ rm -f "$STATE"/active-etcd.service "$STATE"/active-mackesd-*.service
 run_helper
 cat >"$STATE/expected-mutations" <<'EOF'
 etcd.service
-xdg-binds
 mackesd.target
+xdg-binds
 EOF
 cmp "$STATE/expected-mutations" "$STATE/mutations"
 grep -Fq 'status=syncthing-already-ready' "$STATE/notifies"
@@ -297,9 +297,9 @@ rm -f "$STATE/active-mackesd-observation.service"
 : >"$STATE/notifies"
 run_helper
 cat >"$STATE/expected-mutations" <<'EOF'
-xdg-binds
 mackesd.target
 mackesd-observation.service
+xdg-binds
 EOF
 cmp "$STATE/expected-mutations" "$STATE/mutations"
 if grep -Fqx mackesd.target "$STATE/restarts"; then
