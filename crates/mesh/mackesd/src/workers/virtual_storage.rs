@@ -1559,6 +1559,34 @@ impl LiveVirtualExecutor {
     pub fn new(qemu: Arc<dyn QemuImgRunner>, podman: Arc<dyn PodmanStorageRunner>) -> Self {
         Self { qemu, podman }
     }
+
+    /// Run an image-producing operation without ever overwriting an existing
+    /// destination, and remove a destination that the backend left behind when
+    /// the operation failed. Validation normally proves the destination absent,
+    /// but this second check closes the direct-executor and stage/apply race.
+    fn create_image<F>(&self, destination: &Path, operation: F) -> Result<(), VExecError>
+    where
+        F: FnOnce() -> Result<(), QemuImgError>,
+    {
+        if destination.exists() {
+            return Err(VExecError::Fs {
+                path: disp(destination),
+                reason: "refusing to overwrite existing image".into(),
+            });
+        }
+        match operation() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if destination.exists() {
+                    std::fs::remove_file(destination).map_err(|cleanup| VExecError::Fs {
+                        path: disp(destination),
+                        reason: format!("backend failed ({error}); cleanup failed: {cleanup}"),
+                    })?;
+                }
+                Err(error.into())
+            }
+        }
+    }
 }
 
 impl VirtualExecutor for LiveVirtualExecutor {
@@ -1568,7 +1596,7 @@ impl VirtualExecutor for LiveVirtualExecutor {
                 path,
                 format,
                 size_mib,
-            } => Ok(self.qemu.create(path, *format, *size_mib)?),
+            } => self.create_image(path, || self.qemu.create(path, *format, *size_mib)),
             VirtualStorageOp::ImageResize { path, new_size_mib } => {
                 // Determine grow vs shrink from the live image (qemu-img needs
                 // --shrink to authorize a shrink).
@@ -1579,13 +1607,13 @@ impl VirtualExecutor for LiveVirtualExecutor {
                 Ok(self.qemu.resize(path, *new_size_mib, shrink)?)
             }
             VirtualStorageOp::ImageConvert { src, dst, format } => {
-                Ok(self.qemu.convert(src, dst, *format)?)
+                self.create_image(dst, || self.qemu.convert(src, dst, *format))
             }
             VirtualStorageOp::ImageCloneGolden {
                 golden,
                 dest,
                 format,
-            } => Ok(self.qemu.convert(golden, dest, *format)?),
+            } => self.create_image(dest, || self.qemu.convert(golden, dest, *format)),
             VirtualStorageOp::ImageSnapshot { path, tag } => {
                 Ok(self.qemu.snapshot(SnapshotAction::Create, path, tag)?)
             }
@@ -2996,6 +3024,29 @@ mod tests {
         }
     }
 
+    struct PartialFailQemu;
+    impl QemuImgRunner for PartialFailQemu {
+        fn info(&self, _: &Path) -> Result<ImageInfo, QemuImgError> {
+            Err(QemuImgError::Unavailable("test-only".into()))
+        }
+        fn create(&self, path: &Path, _: ImageFormat, _: u64) -> Result<(), QemuImgError> {
+            std::fs::write(path, b"partial image").unwrap();
+            Err(QemuImgError::Failed {
+                op: "create",
+                reason: "backend failed after creating destination".into(),
+            })
+        }
+        fn resize(&self, _: &Path, _: u64, _: bool) -> Result<(), QemuImgError> {
+            Ok(())
+        }
+        fn convert(&self, _: &Path, _: &Path, _: ImageFormat) -> Result<(), QemuImgError> {
+            Ok(())
+        }
+        fn snapshot(&self, _: SnapshotAction, _: &Path, _: &str) -> Result<(), QemuImgError> {
+            Ok(())
+        }
+    }
+
     struct FakePodman {
         volumes_json: String,
         df_json: String,
@@ -3023,6 +3074,31 @@ mod tests {
         fn snapshot(&self, _bus_root: Option<&Path>) -> VirtualInUseSnapshot {
             self.0.clone()
         }
+    }
+
+    #[test]
+    fn failed_new_image_operation_cleans_partial_destination_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("new.qcow2");
+        let executor = LiveVirtualExecutor::new(
+            Arc::new(PartialFailQemu),
+            Arc::new(FakePodman {
+                volumes_json: "[]".into(),
+                df_json: "[]".into(),
+            }),
+        );
+        let op = VirtualStorageOp::ImageCreate {
+            path: destination.clone(),
+            format: ImageFormat::Qcow2,
+            size_mib: 64,
+        };
+        assert!(executor.apply(&op).is_err());
+        assert!(!destination.exists());
+
+        std::fs::write(&destination, b"keep me").unwrap();
+        let error = executor.apply(&op).unwrap_err().to_string();
+        assert!(error.contains("refusing to overwrite"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
     }
 
     #[test]
