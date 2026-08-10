@@ -387,7 +387,6 @@ behavioral evidence is not completion.
   no more than three selected seats; put the longest build on
   BigBoy.
 - Origin or merged source IDs: 2026-07-28 Option 3; archived WL-PERF-003, FUNC-001..004, ARCH-005; browser-perf-native design.
-
 ### WL-ARCH-009 - Process-isolated mackesd and unified Workers interface
 - Status: Remaining
 - Priority: P0
@@ -401,8 +400,9 @@ behavioral evidence is not completion.
 - **Runtime census/aggregate checkpoints (2026-08-09):** 160 starts fail closed without stable registry rows; six group maps feed one Observation aggregate, proven live in
   `docs/platform/evidence/WL-ARCH-009-2026-08-09-release29-runtime-status-live-r104.md` (linked ownership evidence included).
 - **Runtime freshness (2026-08-10):** empty aggregates expire; BigBoy passed: `docs/platform/evidence/WL-ARCH-009-2026-08-10-runtime-aggregate-freshness-r153.md`.
-- Remaining work: **Explicit worker-alias checkpoint (2026-08-10):** unknown normalized aliases fail closed; seat 90 passed:
-  `docs/platform/evidence/WL-ARCH-009-2026-08-10-explicit-worker-aliases-r158.md`.
+- Remaining work: **HTTPS policy (r159):** bounded policy fallback rejects malformed or unsafe configuration;
+  BigBoy passed `docs/platform/evidence/WL-ARCH-009-2026-08-10-https-policy-loader-r159.md`.
+- **Worker alias checkpoint (2026-08-10):** unknown normalized aliases fail closed; seat 90: `docs/platform/evidence/WL-ARCH-009-2026-08-10-explicit-worker-aliases-r158.md`.
 - **Live duplicate-owner refusal (2026-08-10):** release 32 on Dell rejected a second Control owner at the live SQLite-writer socket while the installed owner remained
   active: `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
 - **Cross-process owner checkpoint (2026-08-10):** the six installed groups hold shared-root kernel leases and refuse duplicate process/alias owners; exact BigBoy proof:
@@ -1163,7 +1163,10 @@ behavioral evidence is not completion.
   exposes typed Open/Start/Resume/Transfer actions; and never launches an untrusted or ambiguous resource.
 - Current state: universal contracts, source adapters/deduplication, a pure searchable Remote Sessions model, and fail-closed typed action routing exist. Complete route
   fixtures, responsive captures, and live recovery proof remain.
-- Remaining work:
+- Remaining work: **Service-action admission checkpoint (2026-08-10):** ready service actions fail closed when authentication, target identity,
+  issuance, expiry, or ambiguity checks do not hold;
+  seat 50 passed:
+  `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-action-admission-r159.md`.
 - **Service route-isolation checkpoint (2026-08-10):** a ready Service/Launch action cannot cross-route into Workloads authority; `.90` passed the exact fixture:
   `docs/platform/evidence/WL-FUNC-019-2026-08-10-service-route-isolation-r142.md`.
 - **Seat-15 RDP resource/provenance checkpoint (2026-08-10):** Release 32 preserves SSH/22 and RDP/3389 independently, publishes the available approval-gated Desktop card
@@ -1914,6 +1917,9 @@ behavioral evidence is not completion.
   certificate/key/role state is gone, and rejects unsupported roles before
   joining. Ordering, desktop restoration, and fleet convergence proof remain.
 - Remaining work:
+- **Syncthing registry-amplification checkpoint (2026-08-10):** duplicate/hostile registry output is capped before CLI mutation;
+  the BigBoy self-test passes and the live seat-15 sample remains non-pegged:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-10-syncthing-registry-cap-r158.md`.
 - **Release-32 corrected-forward checkpoint (2026-08-10):** Dell, seat 15, and Surface returned from the signed F44 upgrade with exact package bytes, Nebula, Construct,
   target, and all six groups active; Surface root-key access is now direct:
   `docs/platform/evidence/WL-CRIT-006-WL-CRIT-007-2026-08-10-release32-f44-three-seat-r126.md`.
