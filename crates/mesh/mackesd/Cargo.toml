@@ -452,7 +452,10 @@ payload_compress = "xz"
 # -29 (2026-08-09): keep runtime-status admission aligned with the Supervisor's
 # canonical kebab-to-snake worker aliases so every process group publishes and
 # health recovery does not cycle otherwise-healthy grouped daemons.
-release = "29"
+# -30 (2026-08-10): carry lease-bound Display1 guest input, the live seat audio
+# endpoint contract, corrected-forward Nebula recovery, and governed Surface
+# hardware acceptance into one Fedora 44 engineering-preview candidate.
+release = "30"
 summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
