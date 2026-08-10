@@ -90,23 +90,23 @@ behavioral evidence is not completion.
 - Status: Remaining
 - Priority: P0
 - Complexity: Epic
-- Problem: VM, container, session, console, and shell paths still publish or interpret overlapping lifecycle state; local attachment and capacity admission are not fully proven.
+- Problem: overlapping VM/container/session lifecycle state and incomplete local attachment/capacity proof.
 - Required outcome: One persisted idempotent Workload API controls lifecycle; only the reconciler actuates through libvirt/virtqemud or Quadlet/systemd.
   The shell consumes bounded typed projections, with tested local Display1/KMS attachment and RDP/SPICE/VNC recovery.
-- Current state: Typed contracts, journal retention, bounded readers, cancellation, Display1 seams, hostile farm tests, and idempotent stopped-domain cleanup exist.
-  Caller migration, real adapters, restart recovery, native KMS/EGL, packaging, and Dell/seat-15 proof remain.
+- Current state: typed contracts, journals, cancellation, Display1, hostile tests, cleanup; adapters, recovery, KMS/EGL, packaging, and Dell/seat-15 proof remain.
 - Remaining work: **Recovered lease deadline checkpoint (2026-08-10):** expired recovered attachment leases are refused; BigBoy passed the focused gate:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-lease-deadline-r158.md`.
 - **VM resource-efficiency checkpoints (2026-08-10):** Dom0-safe CPU pinning, bounded queues, qcow2 discard, and shared non-Dom0 CPU pools passed focused `.90` gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Dom0 reserve (2026-08-10):** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-dom0-cpu-reserve-r154.md`.
+- **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
 - **Terminal attachment revocation (2026-08-10):** exact machine-9 proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
-- **Recovered attachment lease checkpoints (2026-08-10):** restart recovery refuses false Ready without its Display1 lease, requires its full journaled identity, and revokes
-  substitutions; focused `.90`/BigBoy proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-exact-recovered-attachment-identity-r130.md`.
-- **Cleanup idempotence checkpoint (2026-08-06):** the sole libvirt actuator accepts absent/stopped-domain cleanup while rejecting unrelated failures; 23/23 passed on `.90`:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
+- **Recovered attachment identity:** exact lease/generation proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-exact-recovered-attachment-identity-r130.md`.
+- **Cleanup idempotence (2026-08-06):** sole libvirt actuator passed 23/23 on `.90`: `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
 - **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
   `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
 - **Admission/live proof checkpoints (2026-08-06/09):** the strict helper validates typed placement, resources, retry, and lease safety. Dell was unreachable; seat 15 lacked
