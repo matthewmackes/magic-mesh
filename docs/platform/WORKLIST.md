@@ -329,6 +329,9 @@ behavioral evidence is not completion.
 - **Portable bundle integrity (2026-08-10):** payload size/hash, symlink,
   duplicate, and unexpected-file checks passed `.90`:
   `docs/platform/evidence/WL-ARCH-008-2026-08-10-portable-bundle-integrity-r176.md`.
+- **Special-node refusal (2026-08-10):** `.90` passed the migration boundary
+  fixture that refuses an allowlisted FIFO instead of silently omitting it:
+  `docs/platform/evidence/WL-ARCH-008-2026-08-10-special-node-refusal-r185.md`.
   1. S1 Preserve history and build the standalone repository.
      - Objective: publish a clean clone containing every old Browser source, asset, policy, unit, document, and relevant history.
      - Inputs: current repo commit, Browser inventory, licenses.

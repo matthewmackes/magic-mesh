@@ -142,23 +142,40 @@ def denied(relative: str) -> str | None:
 
 
 def iter_files(root: Path) -> Iterable[tuple[Path, str]]:
-    """Yield regular files and explicit symlink entries beneath *root*."""
+    """Yield every non-directory entry beneath *root* without following links.
+
+    ``os.walk`` omits FIFOs, sockets, and device nodes.  Omitting one from the
+    inventory would make a migration appear successful while silently losing a
+    source entry, so special nodes are yielded and rejected by ``migrate`` as
+    non-regular files instead.
+    """
 
     if not root.exists():
         return
     if root.is_symlink() or not root.is_dir():
         raise MigrationError(f"source root is not a real directory: {root}")
-    for directory, dirnames, filenames in os.walk(root, followlinks=False):
-        directory_path = Path(directory)
-        dirnames[:] = sorted(dirnames)
-        filenames = sorted(filenames)
-        for name in (*dirnames, *filenames):
-            path = directory_path / name
+
+    def walk(directory: Path) -> Iterable[tuple[Path, str]]:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise MigrationError(f"source directory is unreadable: {directory}") from error
+        for entry in entries:
+            path = Path(entry.path)
             relative = relative_safe(path, root)
-            if path.is_symlink():
-                yield path, relative
-            elif path.is_file():
-                yield path, relative
+            try:
+                if entry.is_symlink():
+                    yield path, relative
+                elif entry.is_dir(follow_symlinks=False):
+                    yield from walk(path)
+                else:
+                    # Includes regular files and special nodes.  The caller
+                    # records a failed entry for anything non-regular.
+                    yield path, relative
+            except OSError as error:
+                raise MigrationError(f"source entry is unreadable: {path}") from error
+
+    yield from walk(root)
 
 
 def profile_candidates(root: Path) -> Iterable[tuple[Path, str, str | None]]:

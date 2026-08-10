@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -232,6 +233,29 @@ def validate_partial_bundle_refusal(module: ModuleType, base: Path) -> None:
         raise BoundaryError("failed source entries must not leave a partial bundle")
 
 
+def validate_special_node_refusal(module: ModuleType, base: Path) -> None:
+    """A special source node must not disappear from a successful bundle."""
+
+    profile = base / "special-profile"
+    profile.mkdir()
+    (profile / "Bookmarks").write_text("{}\n", encoding="utf-8")
+    special = profile / "History"
+    try:
+        os.mkfifo(special)
+    except (AttributeError, NotImplementedError, OSError) as exc:
+        raise BoundaryError(f"fixture filesystem must support FIFOs: {exc}") from exc
+    output = base / "special-output"
+    try:
+        module.migrate([(profile, "profile")], output)
+    except module.MigrationError as exc:
+        if "failed source entries" not in str(exc):
+            raise BoundaryError(f"special source node failed for the wrong reason: {exc}") from exc
+    else:
+        raise BoundaryError("special source nodes must fail closed rather than disappear")
+    if output.exists():
+        raise BoundaryError("special source node refusal must not leave a partial bundle")
+
+
 def validate_existing_bundle_integrity(module: ModuleType, base: Path) -> None:
     roots = fixture_roots(base)
     mutations = {
@@ -289,6 +313,8 @@ def validate_source(repo_root: Path) -> None:
         validate_live_source_race_refusal(module, Path(raw))
     with tempfile.TemporaryDirectory(prefix="browser-portable-partial-") as raw:
         validate_partial_bundle_refusal(module, Path(raw))
+    with tempfile.TemporaryDirectory(prefix="browser-portable-special-") as raw:
+        validate_special_node_refusal(module, Path(raw))
     with tempfile.TemporaryDirectory(prefix="browser-portable-integrity-") as raw:
         validate_existing_bundle_integrity(module, Path(raw))
 
