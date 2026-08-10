@@ -1021,6 +1021,12 @@ pub enum OpInvalid {
         /// The partition.
         partition: String,
     },
+    /// A mount destination is relative, root, or contains traversal components.
+    #[error("unsafe mountpoint {mountpoint}")]
+    UnsafeMountpoint {
+        /// The rejected destination.
+        mountpoint: String,
+    },
     /// An op that needs a specific filesystem (a subvolume op needs btrfs) on a
     /// partition carrying a different one.
     #[error("partition {partition} is {found}, not {need} — op needs {need}")]
@@ -1119,6 +1125,14 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
         }
         StorageOp::Mount { partition, .. } => {
             let p = require_partition(topo, partition)?;
+            let StorageOp::Mount { mountpoint, .. } = op else {
+                unreachable!("matched mount operation");
+            };
+            if !safe_mountpoint(mountpoint) {
+                return Err(OpInvalid::UnsafeMountpoint {
+                    mountpoint: mountpoint.clone(),
+                });
+            }
             if let Some(mp) = &p.mountpoint {
                 return Err(OpInvalid::AlreadyMounted {
                     partition: partition.clone(),
@@ -1149,6 +1163,21 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
         | StorageOp::SubvolumeDelete { partition, .. }
         | StorageOp::SubvolumeSnapshot { partition, .. } => validate_subvolume(topo, partition),
     }
+}
+
+/// Accept only an absolute, non-root mount destination with normal path
+/// components. Symlink and ownership checks are apply-time responsibilities of
+/// the privileged executor; lexical traversal is refused before it reaches one.
+fn safe_mountpoint(mountpoint: &str) -> bool {
+    let path = Path::new(mountpoint);
+    mountpoint.starts_with('/')
+        && mountpoint != "/"
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 /// Validate a `Grow`: the target must move up and fit the disk's free space.
@@ -4013,6 +4042,26 @@ mod tests {
     #[test]
     fn validate_mount_unmount_and_resize_directions() {
         let topo = sample_topo();
+        for mountpoint in ["relative", "/", "/var/lib/../etc"] {
+            assert!(matches!(
+                validate_op(
+                    &StorageOp::Mount {
+                        partition: "/dev/sdb1".into(),
+                        mountpoint: mountpoint.into(),
+                    },
+                    &topo
+                ),
+                Err(OpInvalid::UnsafeMountpoint { .. })
+            ));
+        }
+        assert!(validate_op(
+            &StorageOp::Mount {
+                partition: "/dev/sdb1".into(),
+                mountpoint: "/var/lib/mde-vms".into(),
+            },
+            &topo
+        )
+        .is_ok());
         // Unmount an unmounted partition → NotMounted.
         assert!(matches!(
             validate_op(

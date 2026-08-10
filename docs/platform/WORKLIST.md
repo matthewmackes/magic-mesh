@@ -104,10 +104,10 @@ behavioral evidence is not completion.
 - **Start-failure attachment revocation:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-start-failure-attachment-revocation-r172.md`.
 - **Quadlet attachment cleanup:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-quadlet-attachment-cleanup-r173.md`.
 - **Partition geometry refusal:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-partition-geometry-refusal-r174.md`.
+- **Mountpoint safety:** seat `.90` passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-mountpoint-safety-r175.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
-- **Terminal attachment revocation (2026-08-10):** exact machine-9 proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-terminal-attachment-revocation-r119.md`.
 - **Uncommitted attachment revocation checkpoint (2026-08-10):** rejected transitions revoke new leases before durable final outcomes; exact `.90` proof:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-uncommitted-attachment-revocation-r124.md`.
 - **Recovered attachment identity:** exact lease/generation proof: `docs/platform/evidence/WL-ARCH-010-2026-08-10-exact-recovered-attachment-identity-r130.md`.
