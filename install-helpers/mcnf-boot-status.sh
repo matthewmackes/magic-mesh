@@ -28,7 +28,9 @@ readonly UNITS=(
 )
 
 mkdir -p "$STATE_DIR"
-rm -f "$READY_FILE"
+# /run is boot-scoped, so a ready marker cannot survive a reboot.  Preserve it
+# on service restarts: deleting a live shell's marker would let this projector
+# reclaim tty1 after Construct already owns the seat.
 
 log_event() {
   # journald is the platform log authority; logger is available in the base

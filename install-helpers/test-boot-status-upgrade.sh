@@ -23,10 +23,12 @@ grep -Fq '/usr/libexec/mackesd/setup-selinux-web-preview' "$manifest"
 grep -Fq '/usr/libexec/mackesd/setup-selinux-web-cef' "$manifest"
 grep -Fq 'mcnf-boot-status.service' "$manifest"
 grep -Fq 'ExecStart=/usr/libexec/mackesd/mcnf-boot-status' "$boot_status_unit"
+grep -Fq 'RuntimeDirectory=mde' "$boot_status_unit"
 grep -Fq 'Restart=on-failure' "$boot_status_unit"
 grep -Fq 'boot-status.tsv' "$boot_status_helper"
 grep -Fq 'logger -t mcnf-boot-status' "$boot_status_helper"
 grep -Fq 'boot status projection complete' "$boot_status_helper"
+! grep -Fq 'rm -f "$READY_FILE"' "$boot_status_helper"
 
 # Fresh bootc installs must not regress the RPM upgrade correction.  Explicit
 # Plymouth disablement wins even when the upstream base image still adds rhgb.
