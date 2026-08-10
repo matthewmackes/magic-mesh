@@ -1085,6 +1085,8 @@ behavioral evidence is not completion.
 - **App VM timeout cleanup (2026-08-09):** expired post-admission opens revoke the lease and remain `Stopping` until adapter cleanup proves no backend/attachment survives;
   machine 193 passed the hostile regression 1/1: `docs/platform/evidence/WL-FUNC-018-2026-08-09-app-vm-timeout-cleanup-s3-r4.md`.
 - Remaining work:
+- **Launch-action admission checkpoint (2026-08-10):** installed Flatpak rows without exact `launch` authority are withheld before App-VM projection; seat 90 passed:
+  `docs/platform/evidence/WL-FUNC-018-2026-08-10-launch-action-admission-r162.md`.
 - **Blocked App-VM authorization checkpoint (2026-08-10):** stale, unavailable, or malformed blocked Flatpak rows now fail before root authorization or Bus payload;
   `.90` passed the focused regression: `docs/platform/evidence/WL-FUNC-018-2026-08-10-blocked-appvm-authorization-r127.md`.
 - **App VM generation rollback (2026-08-10):** later lower-generation runtime
