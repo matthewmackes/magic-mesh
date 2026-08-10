@@ -3333,6 +3333,40 @@ mod tests {
     }
 
     #[test]
+    fn ready_service_launch_cannot_cross_route_to_workload_authority() {
+        // Enabled provider services ship a ready Launch action, but their
+        // execution authority is the service worker, never the Workloads lane.
+        let mut catalog = catalog(HealthStatus::Available);
+        catalog.cards[0].identity = ResourceIdentity::new(
+            ResourceClass::Service,
+            IdentityAuthority::Provider,
+            "provider/subsonic/music",
+            vec![],
+        )
+        .expect("service identity");
+        catalog.cards[0].provenance[0].source_id = "registry/music".into();
+        catalog.cards[0].actions[0].action_id = "launch".into();
+        catalog.cards[0].actions[0].verb = ResourceActionVerb::Launch;
+        catalog.content_digest = None;
+        catalog.content_digest = Some(catalog.computed_content_digest());
+        catalog.validate().expect("ready service catalog");
+
+        let mut invocation = invocation(&catalog);
+        invocation.resource_id = catalog.cards[0].resource_id().into();
+        invocation.action_id = "launch".into();
+        invocation.verb = ResourceActionVerb::Launch;
+        if let TypedAuthorityRequest::Workload(request) = &mut invocation.authority_request {
+            request.action = WorkloadOperationAction::StartAndAttach;
+        }
+
+        assert_eq!(
+            plan(&catalog, &invocation, &signer(), NOW + 1),
+            Err(RefusalCode::TargetMismatch),
+            "a shipped Service/Launch selection must not be republished as a workload operation"
+        );
+    }
+
+    #[test]
     fn executable_resource_verbs_have_distinct_authorization_contexts() {
         let catalog = catalog(HealthStatus::Available);
         for (verb, expected) in [
