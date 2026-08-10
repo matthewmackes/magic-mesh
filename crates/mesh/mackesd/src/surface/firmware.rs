@@ -40,7 +40,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use mackes_mesh_types::surface_hardware::{
@@ -78,7 +78,7 @@ const FWUPD_STAGE_ROOT: &str = "/var/tmp";
 
 /// A typed failure from the [`Fwupd`] seam — mirrors
 /// [`super::enable::EnableError`]'s honest split.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FwError {
     /// A provider seam deliberately reports an unavailable fwupd action.
     IntegrationGated {
@@ -662,7 +662,7 @@ fn safe_https_location(location: &str) -> bool {
 }
 
 /// One updatable firmware component on the node — the Install tab's row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FwDevice {
     /// fwupd's stable device id (the apply verb targets this).
     pub device_id: String,
@@ -839,7 +839,7 @@ fn merge_inventory(devices: &[RawDevice], updates: &[RawDevice]) -> Vec<FwDevice
 /// The node's firmware inventory — the model string plus one row per fwupd
 /// device. SURFACE-6's Install tab renders it; it publishes to
 /// `state/hardware/surface/<node>/firmware`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareInventory {
     /// The recognised model's product string (empty when the node isn't a
     /// recognised Surface — then `devices` is empty and nothing is read).
@@ -1735,7 +1735,7 @@ mod worker {
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let w = SurfaceFirmwareWorker::with_parts(
                 "node-a".into(),
-                detection("Surface Pro 8"),
+                detection("Surface Pro 6"),
                 dir.path().to_path_buf(),
             );
 
@@ -1749,7 +1749,7 @@ mod worker {
                 items[0].body.as_deref().unwrap().as_bytes(),
             )
             .expect("shared firmware inventory");
-            assert_eq!(inv.publication.model.product, "Surface Pro 8");
+            assert_eq!(inv.publication.model.product, "Surface Pro 6");
             assert!(inv.skipped.is_none() || inv.devices.is_empty());
         }
 
@@ -1759,7 +1759,7 @@ mod worker {
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let mut w = SurfaceFirmwareWorker::with_parts(
                 "node-a".into(),
-                detection("Surface Pro 8"),
+                detection("Surface Pro 6"),
                 dir.path().to_path_buf(),
             );
 
@@ -2045,7 +2045,7 @@ mod worker {
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let w = SurfaceFirmwareWorker::with_parts(
                 "node-r".into(),
-                detection("Surface Pro 8"),
+                detection("Surface Pro 6"),
                 dir.path().to_path_buf(),
             );
             w.reverify(&persist);
@@ -2057,7 +2057,7 @@ mod worker {
                 boards[0].body.as_deref().unwrap().as_bytes(),
             )
             .expect("shared verify board");
-            assert_eq!(board.publication.model.product, "Surface Pro 8");
+            assert_eq!(board.publication.model.product, "Surface Pro 6");
         }
     }
 }

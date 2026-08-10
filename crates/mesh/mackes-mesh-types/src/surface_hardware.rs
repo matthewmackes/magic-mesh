@@ -1367,7 +1367,7 @@ mod tests {
         substituted.publication.model.product = "Surface Pro 5".into();
         assert_eq!(
             substituted.validate(),
-            Err(SurfaceContractError::Invalid("firmware apply model"))
+            Err(SurfaceContractError::Invalid("model generation"))
         );
     }
 

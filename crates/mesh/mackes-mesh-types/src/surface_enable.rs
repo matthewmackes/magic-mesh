@@ -204,8 +204,6 @@ pub enum SurfaceEnableRefusal {
     Contract,
     /// Exact-body action authorization failed.
     Authorization,
-    /// Obsolete reboot-arm input was supplied.
-    ObsoleteRebootArm,
     /// Local policy refused the operation.
     Policy,
 }

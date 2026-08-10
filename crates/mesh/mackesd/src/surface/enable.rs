@@ -46,7 +46,6 @@ use std::process::Command;
 #[cfg(feature = "async-services")]
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 
 #[cfg(feature = "async-services")]
@@ -98,7 +97,7 @@ const SHA1_FINGERPRINT_BYTES: usize = 20;
 /// A typed configuration knob the enable plan applies. Each maps to a
 /// specific linux-surface tuning; the seam applies the `value` for the key
 /// (§9 — a typed verb, never a raw shell string).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKey {
     /// Surface Aggregator platform perf profile (`low-power`/`balanced`/
     /// `performance`) — the SAM thermal/battery envelope.
@@ -122,7 +121,7 @@ impl ConfigKey {
 }
 
 /// The current firmware Secure-Boot posture, as the enable flow needs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecureBootState {
     /// Secure Boot is disabled — unsigned linux-surface modules load freely,
     /// so MOK enrollment is skipped entirely.
@@ -167,7 +166,7 @@ pub trait SurfaceActions {
 }
 
 /// A typed failure from the [`SurfaceActions`] seam.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnableError {
     /// The live action isn't wired to real hardware yet — the honest answer
     /// on any non-Surface dev box / CI (§7: never a faked success). `action`
@@ -659,7 +658,7 @@ impl SurfaceActions for LiveSurfaceActions {
 
 /// One config step in the enable plan — the knob, the value to write, and
 /// the subsystem it serves (for the board).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigStep {
     /// The typed knob.
     pub key: ConfigKey,
@@ -671,7 +670,7 @@ pub struct ConfigStep {
 
 /// The per-model activation plan: which units to bring up and which config
 /// knobs to apply. A pure fold over the [`SurfaceProfile`] — no I/O.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnablePlan {
     /// systemd units to enable + start (iptsd where the model has a
     /// touch/pen digitizer).
@@ -715,7 +714,7 @@ pub fn plan_enable(device: &SurfaceDevice) -> EnablePlan {
 // ─────────────────────────── the MOK state machine (pure) ───────────────────
 
 /// The Secure-Boot / MOK posture the enable flow classifies before acting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MokState {
     /// Secure Boot is off — unsigned modules load; nothing to enroll.
     NotSecureBoot,
@@ -790,7 +789,7 @@ still staged until enrolled. Reboot only through System → Power & Battery."
 // ─────────────────────────── result types ───────────────────────────────────
 
 /// The outcome of one plan step (unit or config) against the seam.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     /// Applied this call.
     Applied,
@@ -839,7 +838,7 @@ impl StepOutcome {
 }
 
 /// One unit's activation record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitResult {
     /// The systemd unit.
     pub unit: String,
@@ -848,7 +847,7 @@ pub struct UnitResult {
 }
 
 /// One config knob's application record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigResult {
     /// The knob.
     pub key: ConfigKey,
@@ -859,7 +858,7 @@ pub struct ConfigResult {
 }
 
 /// The activation half of the result (iptsd + config).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivationResult {
     /// Per-unit outcomes.
     pub units: Vec<UnitResult>,
@@ -868,7 +867,7 @@ pub struct ActivationResult {
 }
 
 /// The MOK-enrollment half of the result — the state machine's verdict.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MokEnrollment {
     /// Secure Boot off — no enrollment needed.
     NotRequired,
@@ -879,20 +878,11 @@ pub enum MokEnrollment {
     },
     /// Key staged, awaiting the separately governed host reboot. Carries the
     /// exact firmware copy + the key fingerprint confirmed at the blue screen.
-    ImportedAwaitingArm {
+    ImportedAwaitingHostReboot {
         /// The blue-screen firmware copy ([`mok_firmware_prompt`]).
         firmware_prompt: String,
-        /// Reserved wire-compatibility field. New producers always emit an
-        /// empty string; reboot authority is never carried in this result.
-        arm_token: String,
         /// The staged key's fingerprint (confirmed at the blue screen).
         key_fingerprint: String,
-    },
-    /// Legacy read compatibility for results produced before reboot authority
-    /// moved exclusively to host-state. New code never produces this variant.
-    RebootArmed {
-        /// The reboot action's outcome.
-        outcome: StepOutcome,
     },
     /// The MOK posture couldn't be determined (a gated/failed seam read).
     Undetermined {
@@ -901,9 +891,9 @@ pub enum MokEnrollment {
     },
 }
 
-/// The full typed result the `surface_enable` verb returns — what SURFACE-4
-/// publishes and SURFACE-6's Install tab renders.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Private in-process result of the `surface_enable` verb. The worker projects
+/// this into the bounded shared [`SharedEnableResult`] contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnableResult {
     /// The recognised model's product string (empty when skipped).
     pub model: String,
@@ -915,8 +905,7 @@ pub struct EnableResult {
     /// The MOK-enrollment verdict.
     pub mok: MokEnrollment,
     /// Private typed refusal provenance used only at the shared publication
-    /// boundary. It is never serialized as part of this legacy diagnostic.
-    #[serde(skip)]
+    /// boundary.
     refusal: Option<EnableRefusal>,
 }
 
@@ -924,7 +913,6 @@ pub struct EnableResult {
 enum EnableRefusal {
     Contract,
     Authorization,
-    ObsoleteRebootArm,
     Policy,
 }
 
@@ -969,7 +957,6 @@ fn shared_result(
         let code = match result.refusal.unwrap_or(EnableRefusal::Policy) {
             EnableRefusal::Contract => SharedRefusal::Contract,
             EnableRefusal::Authorization => SharedRefusal::Authorization,
-            EnableRefusal::ObsoleteRebootArm => SharedRefusal::ObsoleteRebootArm,
             EnableRefusal::Policy => SharedRefusal::Policy,
         };
         SharedOutcome::Refused {
@@ -1010,10 +997,9 @@ fn shared_result(
             MokEnrollment::Enrolled { modules_loaded } => SharedMokState::Enrolled {
                 modules_loaded: *modules_loaded,
             },
-            MokEnrollment::ImportedAwaitingArm {
+            MokEnrollment::ImportedAwaitingHostReboot {
                 firmware_prompt,
                 key_fingerprint,
-                ..
             } => SharedMokState::AwaitingGovernedHostReboot {
                 firmware_prompt: firmware_prompt.clone(),
                 key_fingerprint: key_fingerprint.clone(),
@@ -1021,9 +1007,6 @@ fn shared_result(
             MokEnrollment::Undetermined { reason } => SharedMokState::Undetermined {
                 reason: reason.clone(),
             },
-            MokEnrollment::RebootArmed { .. } => {
-                return Err("legacy reboot state cannot enter the shared contract");
-            }
         };
         SharedOutcome::Completed {
             activation: SharedActivation { units, configs },
@@ -1068,17 +1051,10 @@ fn shared_step_outcome(outcome: &StepOutcome) -> SharedStepOutcome {
 /// fake; production hands [`LiveSurfaceActions`] (fixed/bounded reads,
 /// request-bound MOK import, and fail-closed staged actions).
 ///
-/// `arm` is retained only for shared request compatibility. Any value is an
-/// obsolete reboot-arm request and is refused before activation or MOK effects.
-///
 /// A non-Surface (or unrecognised-Surface) node is skipped cleanly — no
 /// actions, an honest `skipped` reason, no MOK.
 #[must_use]
-pub fn run_enable(
-    actions: &impl SurfaceActions,
-    detection: &SurfaceDetection,
-    arm: Option<&str>,
-) -> EnableResult {
+pub fn run_enable(actions: &impl SurfaceActions, detection: &SurfaceDetection) -> EnableResult {
     let device = match &detection.model {
         SurfaceModel::NotASurface => {
             return EnableResult::skipped("", "not a Microsoft Surface");
@@ -1101,14 +1077,6 @@ pub fn run_enable(
                 "{} is detected but not admitted by the Surface Pro 5/6 action contract",
                 device.product
             ),
-        );
-    }
-
-    if arm.is_some() {
-        return EnableResult::refused(
-            device.product.clone(),
-            EnableRefusal::ObsoleteRebootArm,
-            "obsolete Surface reboot-arm input refused; use the governed System Power & Battery workflow",
         );
     }
 
@@ -1187,9 +1155,8 @@ fn run_mok(actions: &impl SurfaceActions) -> MokEnrollment {
             // Stage the key and hand back proof/copy only. Reboot is not part
             // of this seam and can only be proposed/confirmed through host-state.
             match actions.mok_import(Path::new(MOK_KEY_PATH)) {
-                Ok(key_fingerprint) => MokEnrollment::ImportedAwaitingArm {
+                Ok(key_fingerprint) => MokEnrollment::ImportedAwaitingHostReboot {
                     firmware_prompt: mok_firmware_prompt(),
-                    arm_token: String::new(),
                     key_fingerprint,
                 },
                 Err(e) => MokEnrollment::Undetermined {
@@ -1323,13 +1290,8 @@ mod worker {
             };
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
-                let received_at_ms = wall_now_ms();
-                let admitted_request_id = msg.body.as_deref().and_then(|body| {
-                    EnableRequest::from_json_at(body.as_bytes(), &self.node_id, received_at_ms)
-                        .ok()
-                        .map(|request| request.header.request_id)
-                });
-                let result = self.apply_request(msg.body.as_deref());
+                let (admitted_request_id, result) =
+                    self.apply_request_with_admission(msg.body.as_deref());
                 // Publication freshness starts after every activation/MOK
                 // effect completes, never when the request was received.
                 let published_at_ms = wall_now_ms();
@@ -1345,21 +1307,39 @@ mod worker {
         /// Authenticate and decode one raw Bus request, then run the typed
         /// enable verb. Parsing is side-effect free; the shared exact-body
         /// gate runs before [`run_enable`] or any privileged seam call.
+        #[cfg(test)]
         fn apply_request(&self, body: Option<&str>) -> EnableResult {
+            self.apply_request_with_admission(body).1
+        }
+
+        /// Parse the shared request exactly once, preserving the same admitted
+        /// identity across authorization, effects, and result publication.
+        fn apply_request_with_admission(
+            &self,
+            body: Option<&str>,
+        ) -> (Option<String>, EnableResult) {
             let Some(body) = body else {
-                return self
-                    .refused_result(EnableRefusal::Contract, "enable request body is missing");
+                return (
+                    None,
+                    self.refused_result(EnableRefusal::Contract, "enable request body is missing"),
+                );
             };
             let req =
                 match EnableRequest::from_json_at(body.as_bytes(), &self.node_id, wall_now_ms()) {
                     Ok(req) => req,
                     Err(error) => {
-                        return self.refused_result(
-                            EnableRefusal::Contract,
-                            &format!("enable request failed shared contract admission: {error}"),
+                        return (
+                            None,
+                            self.refused_result(
+                                EnableRefusal::Contract,
+                                &format!(
+                                    "enable request failed shared contract admission: {error}"
+                                ),
+                            ),
                         );
                     }
                 };
+            let request_id = req.header.request_id.clone();
             let context = MutationContext {
                 verb: ENABLE_ACTION_AUTH_VERB,
                 node: &self.node_id,
@@ -1372,15 +1352,12 @@ mod worker {
                     %error,
                     "refused unauthorized surface enable"
                 );
-                return self.refused_result(
-                    EnableRefusal::Authorization,
-                    &format!("surface enable authorization refused: {error}"),
-                );
-            }
-            if req.arm_token.is_some() {
-                return self.refused_result(
-                    EnableRefusal::ObsoleteRebootArm,
-                    "obsolete Surface reboot-arm input refused; use the governed System Power & Battery workflow",
+                return (
+                    Some(request_id),
+                    self.refused_result(
+                        EnableRefusal::Authorization,
+                        &format!("surface enable authorization refused: {error}"),
+                    ),
                 );
             }
             let Some(authorization) = req
@@ -1389,9 +1366,12 @@ mod worker {
                 .as_deref()
                 .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
             else {
-                return self.refused_result(
-                    EnableRefusal::Authorization,
-                    "surface enable authorization refused: verified capability is unavailable",
+                return (
+                    Some(request_id),
+                    self.refused_result(
+                        EnableRefusal::Authorization,
+                        "surface enable authorization refused: verified capability is unavailable",
+                    ),
                 );
             };
             let actions = LiveSurfaceActions::for_request(
@@ -1400,7 +1380,8 @@ mod worker {
                 &authorization.nonce,
                 u64::try_from(authorization.expires_at_ms).unwrap_or(0),
             );
-            run_enable(&actions, &self.detection, req.arm_token.as_deref())
+            let result = run_enable(&actions, &self.detection);
+            (Some(request_id), result)
         }
 
         fn refused_result(&self, refusal: EnableRefusal, reason: &str) -> EnableResult {
@@ -1572,7 +1553,7 @@ mod worker {
             )
         }
 
-        fn signed_request(node: &str, arm_token: Option<&str>, nonce: &str) -> String {
+        fn signed_request(node: &str, nonce: &str) -> String {
             let unsigned = serde_json::to_string(&EnableRequest {
                 header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
                     schema_version:
@@ -1582,7 +1563,6 @@ mod worker {
                     issued_at_ms: wall_now_ms(),
                     armed_token: None,
                 },
-                arm_token: arm_token.map(str::to_string),
             })
             .expect("serialize shared enable request");
             authorize_test_body(
@@ -1608,7 +1588,7 @@ mod worker {
             let mut w = authorized_worker("node-a", detection("Surface Pro 8"), dir.path());
 
             // The Install tab requests enable (no arm token).
-            let req = signed_request("node-a", None, "surface-enable-valid");
+            let req = signed_request("node-a", "surface-enable-valid");
             persist
                 .write(&enable_topic("node-a"), Priority::Default, None, Some(&req))
                 .expect("write request");
@@ -1622,14 +1602,14 @@ mod worker {
         }
 
         #[test]
-        fn authorized_obsolete_reboot_arm_is_refused_before_live_actions() {
+        fn obsolete_reboot_arm_field_fails_contract_before_live_actions() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let mut worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
-            let request = signed_request(
-                "node-a",
-                Some("REBOOT-TO-ENROLL-MOK"),
-                "surface-enable-obsolete-reboot",
+            let request = signed_request("node-a", "surface-enable-obsolete-reboot").replacen(
+                "{",
+                r#"{"arm_token":"REBOOT-TO-ENROLL-MOK","#,
+                1,
             );
             persist
                 .write(
@@ -1639,30 +1619,12 @@ mod worker {
                     Some(&request),
                 )
                 .expect("write request");
-            let before = wall_now_ms();
-
             worker.poll_once(&persist);
 
-            let after = wall_now_ms();
             let output = persist
                 .list_since(&result_topic("node-a"), None)
                 .expect("list result");
-            assert_eq!(output.len(), 1);
-            let shared = SharedEnableResult::from_json_at(
-                output[0].body.as_deref().unwrap().as_bytes(),
-                "node-a",
-                "surface-enable-obsolete-reboot",
-                after,
-            )
-            .expect("admit shared result");
-            assert!((before..=after).contains(&shared.published_at_ms));
-            assert!(matches!(
-                shared.outcome,
-                SharedOutcome::Refused {
-                    code: SharedRefusal::ObsoleteRebootArm,
-                    ..
-                }
-            ));
+            assert!(output.is_empty(), "unknown legacy authority is unadmitted");
         }
 
         #[test]
@@ -1670,7 +1632,7 @@ mod worker {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let mut w = authorized_worker("n", detection("Surface Pro 6"), dir.path());
-            let req = signed_request("n", None, "surface-enable-cursor");
+            let req = signed_request("n", "surface-enable-cursor");
             persist
                 .write(&enable_topic("n"), Priority::Default, None, Some(&req))
                 .expect("write");
@@ -1724,7 +1686,6 @@ mod worker {
                     issued_at_ms: 1,
                     armed_token: None,
                 },
-                arm_token: None,
             };
             let result = worker.apply_request(Some(
                 &serde_json::to_string(&request).expect("serialize hostile request"),
@@ -1744,7 +1705,6 @@ mod worker {
                     issued_at_ms: 1,
                     armed_token: None,
                 },
-                arm_token: None,
             };
             let result = worker.apply_request(Some(
                 &serde_json::to_string(&stale).expect("serialize stale request"),
@@ -1761,10 +1721,10 @@ mod worker {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let mut w = authorized_worker("node-replay", detection("Surface Pro 6"), dir.path());
-            let original = signed_request("node-replay", None, "surface-enable-replay");
+            let original = signed_request("node-replay", "surface-enable-replay");
             let tampered = original.replace(
-                "\"arm_token\":null",
-                "\"arm_token\":\"REBOOT-TO-ENROLL-MOK\"",
+                "\"request_id\":\"surface-enable-replay\"",
+                "\"request_id\":\"surface-enable-tampered\"",
             );
             for request in [&tampered, &original, &original] {
                 persist
@@ -1785,11 +1745,16 @@ mod worker {
             assert_eq!(out.len(), 3);
             let results: Vec<SharedEnableResult> = out
                 .iter()
-                .map(|item| {
+                .enumerate()
+                .map(|(index, item)| {
                     SharedEnableResult::from_json_at(
                         item.body.as_deref().unwrap().as_bytes(),
                         "node-replay",
-                        "surface-enable-replay",
+                        if index == 0 {
+                            "surface-enable-tampered"
+                        } else {
+                            "surface-enable-replay"
+                        },
                         wall_now_ms(),
                     )
                     .unwrap()
@@ -2016,7 +1981,7 @@ mod tests {
             model: identify(&dmi),
             dmi,
         };
-        let r = run_enable(&FakeActions::default(), &det, None);
+        let r = run_enable(&FakeActions::default(), &det);
         assert_eq!(r.skipped.as_deref(), Some("not a Microsoft Surface"));
         assert!(r.activation.units.is_empty());
         assert_eq!(r.mok, MokEnrollment::NotRequired);
@@ -2034,7 +1999,7 @@ mod tests {
             model: identify(&dmi),
             dmi,
         };
-        let r = run_enable(&FakeActions::default(), &det, None);
+        let r = run_enable(&FakeActions::default(), &det);
         assert!(r
             .skipped
             .as_deref()
@@ -2051,7 +2016,6 @@ mod tests {
                 ..Default::default()
             },
             &detect_of("Surface Pro 7"),
-            Some("obsolete-reboot-arm"),
         );
         assert!(result
             .skipped
@@ -2068,7 +2032,7 @@ mod tests {
             secure_boot: Some(SecureBootState::Disabled),
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
+        let r = run_enable(&fake, &detect_of("Surface Pro 6"));
         assert_eq!(r.model, "Surface Pro 6");
         assert_eq!(r.activation.units[0].outcome, StepOutcome::Applied);
         assert!(r
@@ -2087,42 +2051,17 @@ mod tests {
             import_fingerprint: Some("12:34:56".into()),
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
+        let r = run_enable(&fake, &detect_of("Surface Pro 6"));
         match r.mok {
-            MokEnrollment::ImportedAwaitingArm {
+            MokEnrollment::ImportedAwaitingHostReboot {
                 firmware_prompt,
-                arm_token,
                 key_fingerprint,
             } => {
-                assert!(arm_token.is_empty());
                 assert_eq!(key_fingerprint, "12:34:56");
                 assert!(firmware_prompt.contains("Enroll MOK"));
             }
-            other => panic!("expected ImportedAwaitingArm, got {other:?}"),
+            other => panic!("expected ImportedAwaitingHostReboot, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn obsolete_reboot_arm_is_refused_before_every_effect() {
-        let fake = FakeActions {
-            secure_boot: Some(SecureBootState::Enabled),
-            enrolled: false,
-            pending: true,
-            ..Default::default()
-        };
-        let result = run_enable(
-            &fake,
-            &detect_of("Surface Pro 6"),
-            Some("REBOOT-TO-ENROLL-MOK"),
-        );
-        assert_eq!(fake.effects.get(), 0);
-        assert!(result.activation.units.is_empty());
-        assert!(result.activation.configs.is_empty());
-        assert_eq!(result.mok, MokEnrollment::NotRequired);
-        assert!(result
-            .skipped
-            .as_deref()
-            .is_some_and(|reason| reason.contains("obsolete Surface reboot-arm input refused")));
     }
 
     #[test]
@@ -2197,18 +2136,6 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
         assert!(certificate_sha1(&vec![0_u8; MOK_OUTPUT_LIMIT_BYTES]).is_err());
     }
 
-    #[test]
-    fn every_non_null_arm_value_is_refused_instead_of_staging() {
-        let fake = FakeActions {
-            secure_boot: Some(SecureBootState::Enabled),
-            enrolled: false,
-            ..Default::default()
-        };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), Some("nope"));
-        assert_eq!(fake.effects.get(), 0);
-        assert!(r.skipped.is_some());
-    }
-
     #[cfg(feature = "async-services")]
     #[test]
     fn shared_projection_removes_legacy_reboot_state_and_binds_request() {
@@ -2226,9 +2153,8 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
                     outcome: StepOutcome::AlreadyActive,
                 }],
             },
-            mok: MokEnrollment::ImportedAwaitingArm {
+            mok: MokEnrollment::ImportedAwaitingHostReboot {
                 firmware_prompt: mok_firmware_prompt(),
-                arm_token: String::new(),
                 key_fingerprint: "01:23:45:67:89:AB:CD:EF:10:32:54:76:98:BA:DC:FE:11:22:33:44"
                     .into(),
             },
@@ -2261,10 +2187,6 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
         for (internal, expected) in [
             (EnableRefusal::Contract, SharedRefusal::Contract),
             (EnableRefusal::Authorization, SharedRefusal::Authorization),
-            (
-                EnableRefusal::ObsoleteRebootArm,
-                SharedRefusal::ObsoleteRebootArm,
-            ),
             (EnableRefusal::Policy, SharedRefusal::Policy),
         ] {
             let diagnostic = EnableResult::refused(
@@ -2295,7 +2217,7 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
             modules_loaded: true,
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
+        let r = run_enable(&fake, &detect_of("Surface Pro 6"));
         assert_eq!(
             r.mok,
             MokEnrollment::Enrolled {
@@ -2312,7 +2234,7 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
             modules_loaded: false,
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
+        let r = run_enable(&fake, &detect_of("Surface Pro 6"));
         assert_eq!(
             r.mok,
             MokEnrollment::Enrolled {
@@ -2327,7 +2249,7 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
             sb_read_fails: true,
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
+        let r = run_enable(&fake, &detect_of("Surface Pro 6"));
         assert!(matches!(r.mok, MokEnrollment::Undetermined { .. }));
     }
 
@@ -2338,7 +2260,7 @@ SHA1 Fingerprint: 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00\n"
             enable_fails: true,
             ..Default::default()
         };
-        let r = run_enable(&fake, &detect_of("Surface Pro 6"), None);
+        let r = run_enable(&fake, &detect_of("Surface Pro 6"));
         assert!(matches!(
             r.activation.units[0].outcome,
             StepOutcome::Failed { .. }

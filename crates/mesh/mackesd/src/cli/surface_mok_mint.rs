@@ -138,7 +138,6 @@ fn build_bound_material(
             issued_at_ms: u64::try_from(now).context("negative system clock")?,
             armed_token: None,
         },
-        arm_token: None,
     };
     let unsigned = serde_json::to_string(&request).context("serializing Surface request")?;
     let token = CloudArmedToken::mint(
