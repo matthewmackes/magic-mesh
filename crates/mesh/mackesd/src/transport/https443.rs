@@ -26,8 +26,8 @@
 //!     `/etc/mde/connect/policy.toml` translation layer once
 //!     that lands).
 //!   * `/etc/mde/connect/policy.toml` `https_fallback.host`
-//!     field (TODO — file-config loader is a follow-up; today
-//!     the env var is the only source).
+//!     field (bounded and fail-closed when the environment is
+//!     unset).
 //!
 //! When no fallback host is configured, every `open()` returns
 //! `TransportError::Misconfigured { code: "no_fallback_host" }`
@@ -57,6 +57,7 @@ use mackes_transport::{
     TransportKind,
 };
 use rustls::pki_types::ServerName;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
@@ -73,6 +74,12 @@ use crate::nebula_enroll_client::PinnedCertVerifier;
 ///   * `headscale.mackes.dev:443`         → explicit
 ///   * `fallback.example.com:8443`        → alt port for bench
 pub const FALLBACK_HOST_ENV: &str = "MDE_HTTPS_FALLBACK_HOST";
+
+/// System policy source used when the explicit environment override is absent.
+pub const FALLBACK_POLICY_PATH: &str = "/etc/mde/connect/policy.toml";
+
+/// Keep operator-controlled TOML bounded before parsing it.
+const MAX_FALLBACK_POLICY_BYTES: usize = 64 * 1024;
 
 /// Default TLS port for the fallback. RFC-2818 + Q10 lock —
 /// the whole point is to be indistinguishable from real HTTPS,
@@ -98,6 +105,35 @@ impl FallbackHostConfig {
     pub fn from_env() -> Option<Self> {
         let raw = std::env::var(FALLBACK_HOST_ENV).ok()?;
         Self::parse(&raw)
+    }
+
+    /// Load the explicit environment override, or the HTTPS fallback section
+    /// from a policy file when the override is absent. A present but malformed
+    /// environment value never falls through to the file, preserving the
+    /// documented precedence and failing closed.
+    #[must_use]
+    pub fn from_env_or_policy_file(policy_path: &Path) -> Option<Self> {
+        match std::env::var(FALLBACK_HOST_ENV) {
+            Ok(raw) => Self::parse(&raw).and_then(Self::validated),
+            Err(std::env::VarError::NotPresent) => Self::from_policy_file(policy_path),
+            Err(std::env::VarError::NotUnicode(_)) => None,
+        }
+    }
+
+    /// Read `[https_fallback].host` from a bounded regular file without
+    /// following a final symlink. Invalid TOML, missing fields, invalid SNI,
+    /// and port zero all produce `None` so an untrusted file cannot activate
+    /// an unverified endpoint.
+    #[must_use]
+    pub fn from_policy_file(policy_path: &Path) -> Option<Self> {
+        let raw = read_bounded_no_follow(policy_path, MAX_FALLBACK_POLICY_BYTES)?;
+        let policy: HttpsFallbackPolicy = toml::from_str(std::str::from_utf8(&raw).ok()?).ok()?;
+        let host = policy.https_fallback?.host?;
+        Self::parse(&host).and_then(Self::validated)
+    }
+
+    fn validated(config: Self) -> Option<Self> {
+        (config.port != 0 && config.sni().is_some()).then_some(config)
     }
 
     /// Pure parser. `host` or `host:port`. Returns `None` on
@@ -144,6 +180,56 @@ impl FallbackHostConfig {
     pub fn socket_addr_string(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpsFallbackPolicy {
+    https_fallback: Option<HttpsFallbackSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpsFallbackSection {
+    host: Option<String>,
+}
+
+fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    let max_bytes = u64::try_from(max_bytes).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(usize::try_from(max_bytes).ok()?)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= usize::try_from(max_bytes).ok()?).then_some(bytes)
 }
 
 fn build_pinned_client_config(fingerprint: &str) -> Arc<rustls::ClientConfig> {
@@ -218,7 +304,7 @@ impl NebulaHttps443Transport {
     /// fail-closed default for callers that have not supplied persisted trust.
     #[must_use]
     pub fn new() -> Self {
-        let config = FallbackHostConfig::from_env();
+        let config = FallbackHostConfig::from_env_or_policy_file(Path::new(FALLBACK_POLICY_PATH));
         if config.is_none() {
             warn!(
                 env = FALLBACK_HOST_ENV,
@@ -245,7 +331,7 @@ impl NebulaHttps443Transport {
     }
 
     fn from_bundle_with_authority_pin(bundle_path: &Path, authority_pin: &Path) -> Self {
-        let config = FallbackHostConfig::from_env();
+        let config = FallbackHostConfig::from_env_or_policy_file(Path::new(FALLBACK_POLICY_PATH));
         let selection = config.as_ref().and_then(|fallback| {
             let bundle = crate::ca::bundle::read_bundle(bundle_path).ok()?;
             if !crate::ca::bundle::relay_trust_authority_matches_pin(&bundle, authority_pin) {
@@ -513,6 +599,32 @@ mod tests {
         // raw value as the host.
         assert_eq!(c.host, "badhost:notaport");
         assert_eq!(c.port, 443);
+    }
+
+    #[test]
+    fn policy_file_loader_is_bounded_and_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = dir.path().join("policy.toml");
+        std::fs::write(
+            &policy,
+            "[https_fallback]\nhost = \"fallback.example.com:8443\"\n",
+        )
+        .expect("write policy");
+        assert_eq!(
+            FallbackHostConfig::from_policy_file(&policy),
+            Some(FallbackHostConfig {
+                host: "fallback.example.com".into(),
+                port: 8443,
+            })
+        );
+
+        std::fs::write(&policy, "[https_fallback]\nhost = \"bad host\"\n")
+            .expect("write invalid policy");
+        assert!(FallbackHostConfig::from_policy_file(&policy).is_none());
+
+        std::fs::write(&policy, vec![b'x'; MAX_FALLBACK_POLICY_BYTES + 1])
+            .expect("write oversized policy");
+        assert!(FallbackHostConfig::from_policy_file(&policy).is_none());
     }
 
     #[test]
