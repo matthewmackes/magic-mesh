@@ -6,8 +6,13 @@ tracker remains `docs/platform/WORKLIST.md`.
 `install-helpers/collect-surface-acceptance.py` takes a read-only inventory of a
 Surface candidate. It does not start or stop services, trigger udev, install
 packages, query for firmware updates, enroll keys, change radio state, suspend,
-reboot, play or record audio, or open a camera stream. Camera evidence is limited
-to libcamera enumeration. Network connection names, addresses, MAC addresses,
+reboot, play or record audio, or open a camera stream. It inventories libcamera
+and separately reads the newest result from the exact local
+`state/hardware/surface/<local-node>/camera-proof` Bus lane. That result must be
+a shared schema-1 `passed` result for the exact Pro 5/6 model and generation,
+no more than 90 seconds old (with at most five seconds future skew). The
+collector opens `/run/mde-bus/index.sqlite` read-only and never requests a new
+proof. Network connection names, addresses, MAC addresses,
 and common secret forms are excluded or redacted.
 
 The interactive Surface card has a separate functional camera proof; it is not
@@ -47,9 +52,17 @@ power/volume buttons, microSD, hibernation support, and boot/upgrade/rollback
 recovery. The collector records whether the kernel advertises suspend and
 hibernation modes but never enters either state.
 
+Run the Surface card's explicitly armed `PROVE CAMERA` action immediately before
+collection. `camera-proof.json` retains only the exact node, normalized model,
+generation, completion time, closed `passed` outcome, and SHA-256 of the shared
+result. It explicitly records that frame bytes, device identifiers, and the
+request identifier were not retained. An absent, stale, failed, foreign, or
+mismatched result makes the bundle incomplete.
+
 The bundle contains structured JSON for DMI identity, Fedora/package NEVRAs,
 kernel/module signing, iptsd instances, input classes, SAM/IIO, DRM connector,
 mode, framebuffer, and available atomic-state inventory, libcamera,
+the privacy-safe hash-bound camera functional proof,
 Wi-Fi/Bluetooth state without identifiers, read-only fwupd device inventory,
 audio nodes without media activity, battery/power/S0ix snapshots, and core
 service/binary revisions. Button candidates, the MMC reader/media topology, and

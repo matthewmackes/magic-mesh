@@ -72,6 +72,12 @@ and every artifact SHA-256, collector SHA-256, the installed `magic-mesh`
 package identity, all limitations, and every
 operator observation. The revision is explicitly marked as operator-declared;
 the recorder does not pretend the older collector can derive it from a binary.
+It also binds `camera-proof.json` and the SHA-256 of its exact shared camera
+result projection. Acceptance requires that proof to have been `passed`, exact
+for the seat's normalized model/generation and local node, and fresh when the
+collector snapshot was created. No frame bytes, camera/device identifier, or
+request identifier enters the record. Existing records without this binding
+are intentionally invalid and must be recollected and re-recorded.
 Exit `0` means the inventory was complete and every explicitly performed check
 passed. Exit `3` means the
 record is structurally complete and hash-valid but at least one inventory probe

@@ -19,6 +19,8 @@ from typing import Any
 SCHEMA_VERSION = 1
 MAX_FILE_BYTES = 512 * 1024
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
+CAMERA_PROOF_MAX_AGE_MS = 90_000
+CAMERA_PROOF_FUTURE_SKEW_MS = 5_000
 RECORD_KIND = "mcnf-surface-pro56-physical-acceptance"
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 OBSERVER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._-]{1,127}$")
@@ -26,7 +28,7 @@ TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_FILES = (
     "identity.json", "release-packages.json", "kernel-modules.json", "iptsd.json",
-    "input.json", "buttons-storage.json", "sam-iio.json", "drm.json", "cameras.json",
+    "input.json", "buttons-storage.json", "sam-iio.json", "drm.json", "cameras.json", "camera-proof.json",
     "radios.json", "firmware.json", "audio.json", "power.json", "services.json",
 )
 COLLECTOR_MANUAL_CHECKS = (
@@ -111,6 +113,39 @@ def governed_text(value: Any, field: str, maximum: int = 2048) -> str:
     return value
 
 
+def validate_camera_proof(value: Any, generation: int, captured: datetime) -> dict[str, Any]:
+    required = {
+        "topic", "node", "model", "generation", "completed_at_ms", "outcome",
+        "result_sha256", "frame_bytes_retained", "device_identifier_retained",
+        "request_identifier_retained",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise RecordError("camera proof projection schema is invalid")
+    node = value.get("node")
+    expected_model = "Surface Pro 6" if generation == 6 else "Surface Pro 5"
+    if (
+        not isinstance(node, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node) is None
+        or value.get("topic") != f"state/hardware/surface/{node}/camera-proof"
+        or value.get("model") != expected_model
+        or value.get("generation") != generation
+        or value.get("outcome") != "passed"
+        or not isinstance(value.get("result_sha256"), str)
+        or SHA256.fullmatch(value["result_sha256"]) is None
+        or value.get("frame_bytes_retained") is not False
+        or value.get("device_identifier_retained") is not False
+        or value.get("request_identifier_retained") is not False
+    ):
+        raise RecordError("camera proof identity, outcome, or privacy binding is invalid")
+    completed = value.get("completed_at_ms")
+    if not isinstance(completed, int) or isinstance(completed, bool) or completed <= 0:
+        raise RecordError("camera proof completion timestamp is invalid")
+    captured_ms = int(captured.timestamp() * 1000)
+    if completed > captured_ms + CAMERA_PROOF_FUTURE_SKEW_MS or captured_ms - completed > CAMERA_PROOF_MAX_AGE_MS:
+        raise RecordError("camera proof was not fresh at collection")
+    return value
+
+
 def load_bundle(bundle: Path) -> dict[str, Any]:
     if bundle.is_symlink() or not bundle.is_dir():
         raise RecordError("collector bundle must be a real directory")
@@ -147,6 +182,7 @@ def load_bundle(bundle: Path) -> dict[str, Any]:
     artifact_binding = []
     seen: set[str] = set()
     observed_incomplete = []
+    camera_proof: dict[str, Any] | None = None
     for item in artifacts:
         if not isinstance(item, dict) or set(item) != {"file", "bytes", "sha256", "status"}:
             raise RecordError("collector artifact descriptor is invalid")
@@ -168,6 +204,8 @@ def load_bundle(bundle: Path) -> dict[str, Any]:
             raise RecordError(f"collector artifact schema is invalid: {name}")
         if item["status"] != "ok":
             observed_incomplete.append(name)
+        elif name == "camera-proof.json":
+            camera_proof = validate_camera_proof(document.get("data"), generation, captured)
         artifact_binding.append({"file": name, "bytes": len(data), "sha256": item["sha256"]})
     if manifest["incomplete_probes"] != sorted(observed_incomplete) or manifest["collection_verdict"] != ("incomplete" if observed_incomplete else "complete"):
         raise RecordError("collector incomplete-probe verdict is inconsistent")
@@ -192,6 +230,12 @@ def load_bundle(bundle: Path) -> dict[str, Any]:
     )
     if not isinstance(magic_mesh_nevra, list) or not magic_mesh_nevra:
         raise RecordError("collector lacks the installed magic-mesh package identity")
+    if manifest["collection_verdict"] == "complete" and camera_proof is None:
+        raise RecordError("complete collector bundle lacks a successful fresh camera proof")
+    camera_artifact_sha256 = next(
+        (item["sha256"] for item in artifact_binding if item["file"] == "camera-proof.json"),
+        None,
+    )
     return {
         "manifest": manifest,
         "captured": captured,
@@ -207,6 +251,11 @@ def load_bundle(bundle: Path) -> dict[str, Any]:
         "sku": sku,
         "collection_verdict": manifest["collection_verdict"],
         "incomplete_probes": manifest["incomplete_probes"],
+        "camera_proof": (
+            {**camera_proof, "artifact_sha256": camera_artifact_sha256}
+            if camera_proof is not None
+            else None
+        ),
     }
 
 
@@ -258,7 +307,11 @@ def build_record(bundle: dict[str, Any], observations: dict[str, Any], prior_sha
         raise RecordError("operator identifier is invalid")
     now = datetime.now(timezone.utc)
     checks = validate_observations(observations["observations"], bundle["captured"], now)
-    accepted = bundle["collection_verdict"] == "complete" and all(item["outcome"] == "pass" for item in checks)
+    accepted = (
+        bundle["collection_verdict"] == "complete"
+        and bundle["camera_proof"] is not None
+        and all(item["outcome"] == "pass" for item in checks)
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": RECORD_KIND,
@@ -274,6 +327,7 @@ def build_record(bundle: dict[str, Any], observations: dict[str, Any], prior_sha
             "collection_verdict": bundle["collection_verdict"],
             "incomplete_probes": bundle["incomplete_probes"],
         },
+        "camera_proof": bundle["camera_proof"],
         "prior_pro6_record_sha256": prior_sha256,
         "observations": checks,
         "record_status": "complete",
@@ -289,7 +343,7 @@ def validate_record(record_path: Path, bundle_path: Path, prior_path: Path | Non
     expected = {
         "schema_version", "kind", "recorded_at_utc", "seat_label", "surface", "revision", "revision_provenance",
         "observer", "collector_bundle", "prior_pro6_record_sha256", "observations",
-        "record_status", "acceptance_verdict", "limitations", "hardware_mutated_by_recorder",
+        "camera_proof", "record_status", "acceptance_verdict", "limitations", "hardware_mutated_by_recorder",
     }
     if not isinstance(record, dict) or set(record) != expected or record.get("schema_version") != SCHEMA_VERSION or record.get("kind") != RECORD_KIND:
         raise RecordError("physical acceptance record schema is invalid")
@@ -313,8 +367,13 @@ def validate_record(record_path: Path, bundle_path: Path, prior_path: Path | Non
 
 def validate_prior_pro6(record_path: Path, bundle_path: Path) -> str:
     prior = validate_record(record_path, bundle_path)
-    if prior["surface"]["generation"] != 6 or prior["seat_label"] != "Surface" or prior["record_status"] != "complete":
-        raise RecordError("prior record is not a completed canonical Pro 6 acceptance record")
+    if (
+        prior["surface"]["generation"] != 6
+        or prior["seat_label"] != "Surface"
+        or prior["record_status"] != "complete"
+        or prior["acceptance_verdict"] != "accepted"
+    ):
+        raise RecordError("prior record is not an accepted canonical Pro 6 acceptance record")
     return sha256_file(record_path)
 
 
@@ -366,6 +425,68 @@ def self_test() -> int:
     try: json.loads('{"check":"touch","check":"pen"}', object_pairs_hook=strict_object)
     except RecordError: pass
     else: raise AssertionError("accepted duplicate JSON field")
+    captured_ms = int(captured.timestamp() * 1000)
+    proof = {
+        "topic": "state/hardware/surface/surface-6/camera-proof",
+        "node": "surface-6",
+        "model": "Surface Pro 6",
+        "generation": 6,
+        "completed_at_ms": captured_ms - 1,
+        "outcome": "passed",
+        "result_sha256": "a" * 64,
+        "frame_bytes_retained": False,
+        "device_identifier_retained": False,
+        "request_identifier_retained": False,
+    }
+    assert validate_camera_proof(proof, 6, captured) == proof
+    for update in (
+        {"model": "Surface Pro 5"},
+        {"generation": 5},
+        {"outcome": "failed"},
+        {"result_sha256": "bad"},
+        {"frame_bytes_retained": True},
+        {"completed_at_ms": captured_ms - CAMERA_PROOF_MAX_AGE_MS - 1},
+        {"completed_at_ms": captured_ms + CAMERA_PROOF_FUTURE_SKEW_MS + 1},
+        {"device_id": "/dev/video0"},
+    ):
+        candidate = dict(proof)
+        candidate.update(update)
+        try: validate_camera_proof(candidate, 6, captured)
+        except RecordError: pass
+        else: raise AssertionError("accepted absent, stale, mismatched, or identifying camera proof")
+    bound_proof = {**proof, "artifact_sha256": "b" * 64}
+    bundle = {
+        "captured": captured,
+        "seat": "Surface",
+        "generation": 6,
+        "model": "Surface Pro 6",
+        "sku": "Surface_Pro_6",
+        "collection_verdict": "complete",
+        "incomplete_probes": [],
+        "manifest": {"captured_at_utc": "2026-08-09T00:00:00Z"},
+        "binding": {
+            "manifest_sha256": "c" * 64,
+            "collector_sha256": "d" * 64,
+            "magic_mesh_nevra": [{
+                "name": "magic-mesh", "epoch": "0", "version": "1",
+                "release": "1", "arch": "x86_64",
+            }],
+            "artifacts": [{"file": "camera-proof.json", "bytes": 1, "sha256": "b" * 64}],
+        },
+        "camera_proof": bound_proof,
+    }
+    accepted = build_record(
+        bundle,
+        {
+            "schema_version": 1,
+            "revision": "a" * 40,
+            "observer": "operator-test",
+            "observations": rows,
+        },
+        None,
+    )
+    if accepted["acceptance_verdict"] != "accepted" or accepted["camera_proof"] != bound_proof:
+        raise AssertionError("accepted record did not cryptographically bind the camera proof")
     print("record-surface-physical-acceptance: self-test passed")
     return 0
 

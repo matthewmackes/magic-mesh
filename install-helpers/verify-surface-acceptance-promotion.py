@@ -22,6 +22,8 @@ KIND = "mcnf-surface-acceptance-promotion-input"
 MAX_FILE_BYTES = 512 * 1024
 MAX_RECORD_AGE = timedelta(days=7)
 MAX_PREFLIGHT_AGE = timedelta(hours=24)
+CAMERA_PROOF_MAX_AGE_MS = 90_000
+CAMERA_PROOF_FUTURE_SKEW_MS = 5_000
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 STACK_PACKAGES = {
@@ -38,7 +40,9 @@ REQUIRED_EVIDENCE = {
         ("cold boot",), ("reboot",), ("upgrade",), ("rollback",), ("secure boot", "secure-boot"),
     ),
 }
-REQUIRED_COLLECTOR_ARTIFACTS = {"audio.json", "power.json", "radios.json", "services.json"}
+REQUIRED_COLLECTOR_ARTIFACTS = {
+    "audio.json", "power.json", "radios.json", "services.json", "camera-proof.json"
+}
 
 
 class PromotionError(RuntimeError):
@@ -212,6 +216,62 @@ def validate_evidence_text(
         raise PromotionError(f"required physical evidence is incomplete: {check}")
 
 
+def validate_camera_proof_binding(
+    record: dict[str, Any], bundle: Path, generation: int, captured: datetime
+) -> dict[str, Any]:
+    artifact = load_json(bundle / "camera-proof.json")
+    if not isinstance(artifact, dict) or set(artifact) != {"schema_version", "status", "data"}:
+        raise PromotionError("camera proof artifact schema is invalid")
+    if artifact.get("schema_version") != 1 or artifact.get("status") != "ok":
+        raise PromotionError("camera proof artifact is not a successful observation")
+    proof = artifact.get("data")
+    required = {
+        "topic", "node", "model", "generation", "completed_at_ms", "outcome",
+        "result_sha256", "frame_bytes_retained", "device_identifier_retained",
+        "request_identifier_retained",
+    }
+    expected_model = "Surface Pro 6" if generation == 6 else "Surface Pro 5"
+    if not isinstance(proof, dict) or set(proof) != required:
+        raise PromotionError("camera proof projection schema is invalid")
+    node = proof.get("node")
+    if (
+        not isinstance(node, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node) is None
+        or proof.get("topic") != f"state/hardware/surface/{node}/camera-proof"
+        or proof.get("model") != expected_model
+        or proof.get("generation") != generation
+        or proof.get("outcome") != "passed"
+        or not isinstance(proof.get("result_sha256"), str)
+        or SHA256.fullmatch(proof["result_sha256"]) is None
+        or proof.get("frame_bytes_retained") is not False
+        or proof.get("device_identifier_retained") is not False
+        or proof.get("request_identifier_retained") is not False
+    ):
+        raise PromotionError("camera proof identity, outcome, or privacy binding is invalid")
+    completed = proof.get("completed_at_ms")
+    captured_ms = int(captured.timestamp() * 1000)
+    if not isinstance(completed, int) or isinstance(completed, bool) or completed <= 0:
+        raise PromotionError("camera proof completion timestamp is invalid")
+    if completed > captured_ms + CAMERA_PROOF_FUTURE_SKEW_MS or captured_ms - completed > CAMERA_PROOF_MAX_AGE_MS:
+        raise PromotionError("camera proof was not fresh at collection")
+    artifact_sha256 = sha256_file(bundle / "camera-proof.json")
+    expected_record = {**proof, "artifact_sha256": artifact_sha256}
+    if record.get("camera_proof") != expected_record:
+        raise PromotionError("physical record does not hash-bind the exact camera proof")
+    return {
+        "artifact_sha256": artifact_sha256,
+        "result_sha256": proof["result_sha256"],
+        "node": node,
+        "model": expected_model,
+        "generation": generation,
+        "completed_at_ms": completed,
+        "outcome": "passed",
+        "frame_bytes_retained": False,
+        "device_identifier_retained": False,
+        "request_identifier_retained": False,
+    }
+
+
 def validate_seat(
     record_path: Path, bundle: Path, generation: int, revision: str,
     stack_packages: dict[str, dict[str, Any]], now: datetime,
@@ -235,6 +295,7 @@ def validate_seat(
     require_fresh(captured, now, MAX_RECORD_AGE, "collector evidence")
     if captured > recorded:
         raise PromotionError("physical and collector evidence timestamps are misordered")
+    camera_proof = validate_camera_proof_binding(record, bundle, generation, captured)
     stack_deployed, magic_mesh = bundle_package_identity(bundle)
     expected_nevras = {name: row["nevra"] for name, row in stack_packages.items()}
     if stack_deployed != expected_nevras:
@@ -253,6 +314,7 @@ def validate_seat(
         "model": surface["model"], "sku": surface.get("sku"),
         "revision": revision, "magic_mesh_nevra": magic_mesh["nevra"],
         "recorded_at_utc": record["recorded_at_utc"],
+        "camera_proof": camera_proof,
         "required_evidence": validate_required_evidence(record, bundle),
     }
 
@@ -318,6 +380,33 @@ def self_test() -> int:
     except PromotionError: pass
     else: raise AssertionError("accepted stale physical evidence")
     with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        captured_ms = int(now.timestamp() * 1000)
+        proof = {
+            "topic": "state/hardware/surface/surface-6/camera-proof",
+            "node": "surface-6", "model": "Surface Pro 6", "generation": 6,
+            "completed_at_ms": captured_ms - 1, "outcome": "passed",
+            "result_sha256": "a" * 64, "frame_bytes_retained": False,
+            "device_identifier_retained": False, "request_identifier_retained": False,
+        }
+        proof_path = root / "camera-proof.json"
+        proof_path.write_text(json.dumps({"schema_version": 1, "status": "ok", "data": proof}) + "\n")
+        camera_record = {"camera_proof": {**proof, "artifact_sha256": sha256_file(proof_path)}}
+        assert validate_camera_proof_binding(camera_record, root, 6, now)["outcome"] == "passed"
+        for hostile in (
+            {},
+            {"camera_proof": {**camera_record["camera_proof"], "result_sha256": "b" * 64}},
+            {"camera_proof": {**camera_record["camera_proof"], "frame_bytes_retained": True}},
+        ):
+            try: validate_camera_proof_binding(hostile, root, 6, now)
+            except PromotionError: pass
+            else: raise AssertionError("accepted missing, mismatched, or identifying camera proof binding")
+        stale = {**proof, "completed_at_ms": captured_ms - CAMERA_PROOF_MAX_AGE_MS - 1}
+        proof_path.write_text(json.dumps({"schema_version": 1, "status": "ok", "data": stale}) + "\n")
+        stale_record = {"camera_proof": {**stale, "artifact_sha256": sha256_file(proof_path)}}
+        try: validate_camera_proof_binding(stale_record, root, 6, now)
+        except PromotionError: pass
+        else: raise AssertionError("accepted stale camera proof")
         output = Path(directory) / "promotion.json"
         write_new(output, {"verdict": "ready"})
         original = output.read_bytes()

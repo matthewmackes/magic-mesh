@@ -21,7 +21,10 @@ Promotion admission requires all of the following:
   suspend/resume/S0ix plus Wi-Fi/Bluetooth/mesh recovery sequence, and cold
   boot/reboot/upgrade/rollback/Secure-Boot recovery; and
 - the hash-bound `audio.json`, `power.json`, `radios.json`, and `services.json`
-  collector artifacts all have status `ok`.
+  collector artifacts all have status `ok`; and
+- the hash-bound `camera-proof.json` is a successful shared camera proof for the
+  exact local node/model/generation, was fresh at collection, and explicitly
+  retained no frame bytes, device identifier, or request identifier.
 
 Physical records and collector snapshots older than seven days are stale. The
 current preflight format has no internal timestamp, so the verifier transparently
@@ -59,6 +62,9 @@ There is no manual override, assumed pass, incomplete acceptance, or
 foreign-model compatibility path. Exit `0` and a newly written lock are the
 only ready result. Any missing, stale, blocked, non-passing, mismatched, or
 tampered input exits `2` without writing a promotion lock.
+Collector bundles and physical records created before the camera-proof binding
+are deliberately not grandfathered; repeat the read-only collection and
+governed recording steps.
 
 Run hostile parser/contract tests without artifacts or hardware:
 

@@ -17,6 +17,7 @@ import re
 import selectors
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -25,6 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 SCHEMA_VERSION = 1
@@ -32,6 +34,9 @@ MAX_COMMAND_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 12.0
+CAMERA_PROOF_MAX_AGE_MS = 90_000
+CAMERA_PROOF_FUTURE_SKEW_MS = 5_000
+SYSTEM_BUS_ROOT = Path("/run/mde-bus")
 MAX_SYSFS_ENTRIES = 128
 ALLOWED_SEAT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 EXPECTED_FILES = (
@@ -44,6 +49,7 @@ EXPECTED_FILES = (
     "sam-iio.json",
     "drm.json",
     "cameras.json",
+    "camera-proof.json",
     "radios.json",
     "firmware.json",
     "audio.json",
@@ -579,6 +585,118 @@ def probe_cameras() -> dict[str, Any]:
     return result("error", {"operation": "enumeration-only"}, "no allowlisted libcamera enumerator installed")
 
 
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CollectError(f"duplicate JSON field: {key}")
+        value[key] = item
+    return value
+
+
+def admit_camera_proof(body: bytes, node: str, expected: int, now_ms: int) -> dict[str, Any]:
+    """Validate and privacy-project one shared camera proof result."""
+    if not body or len(body) > 64 * 1024:
+        raise CollectError("camera proof result exceeds the bounded wire size")
+    try:
+        value = json.loads(body, object_pairs_hook=strict_object)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CollectError("camera proof result is malformed") from exc
+    required = {"schema_version", "node", "request_id", "model", "completed_at_ms", "outcome"}
+    if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != 1:
+        raise CollectError("camera proof result schema is invalid")
+    if value.get("node") != node or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node):
+        raise CollectError("camera proof result is for a foreign or invalid node")
+    request_id = value.get("request_id")
+    if not isinstance(request_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", request_id) is None:
+        raise CollectError("camera proof request identity is invalid")
+    normalized_model = "Surface Pro 6" if expected == 6 else "Surface Pro 5"
+    generation = "pro6" if expected == 6 else "pro5"
+    if value.get("model") != {"product": normalized_model, "generation": generation}:
+        raise CollectError("camera proof model or generation is mismatched")
+    if value.get("outcome") != {"state": "passed"}:
+        raise CollectError("camera functional proof did not pass")
+    completed = value.get("completed_at_ms")
+    if not isinstance(completed, int) or isinstance(completed, bool) or completed <= 0:
+        raise CollectError("camera proof completion timestamp is invalid")
+    if completed > now_ms + CAMERA_PROOF_FUTURE_SKEW_MS or now_ms - completed > CAMERA_PROOF_MAX_AGE_MS:
+        raise CollectError("camera proof result is stale or future-dated")
+    return {
+        "topic": f"state/hardware/surface/{node}/camera-proof",
+        "node": node,
+        "model": normalized_model,
+        "generation": expected,
+        "completed_at_ms": completed,
+        "outcome": "passed",
+        "result_sha256": sha256_bytes(body),
+        "frame_bytes_retained": False,
+        "device_identifier_retained": False,
+        "request_identifier_retained": False,
+    }
+
+
+def validate_camera_proof_projection(value: Any, expected: int, captured_at_ms: int) -> dict[str, Any]:
+    required = {
+        "topic", "node", "model", "generation", "completed_at_ms", "outcome",
+        "result_sha256", "frame_bytes_retained", "device_identifier_retained",
+        "request_identifier_retained",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise CollectError("camera proof projection schema is invalid")
+    node = value.get("node")
+    model = "Surface Pro 6" if expected == 6 else "Surface Pro 5"
+    if (
+        not isinstance(node, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", node) is None
+        or value.get("topic") != f"state/hardware/surface/{node}/camera-proof"
+        or value.get("model") != model
+        or value.get("generation") != expected
+        or value.get("outcome") != "passed"
+        or re.fullmatch(r"[0-9a-f]{64}", value.get("result_sha256", "")) is None
+        or value.get("frame_bytes_retained") is not False
+        or value.get("device_identifier_retained") is not False
+        or value.get("request_identifier_retained") is not False
+    ):
+        raise CollectError("camera proof projection identity, outcome, or privacy binding is invalid")
+    completed = value.get("completed_at_ms")
+    if not isinstance(completed, int) or isinstance(completed, bool):
+        raise CollectError("camera proof projection timestamp is invalid")
+    if completed > captured_at_ms + CAMERA_PROOF_FUTURE_SKEW_MS or captured_at_ms - completed > CAMERA_PROOF_MAX_AGE_MS:
+        raise CollectError("camera proof projection was not fresh at collection")
+    return value
+
+
+def probe_camera_proof(expected: int, seat: str) -> dict[str, Any]:
+    """Read the exact local result lane without opening a camera or mutating Bus."""
+    del seat
+    node = read_optional(Path("/etc/hostname"), 128)
+    if node is None:
+        return result("error", reason="local node identity is unavailable")
+    database = SYSTEM_BUS_ROOT / "index.sqlite"
+    try:
+        root_info = SYSTEM_BUS_ROOT.lstat()
+        db_info = database.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            raise CollectError("system Bus root is not a real directory")
+        if stat.S_ISLNK(db_info.st_mode) or not stat.S_ISREG(db_info.st_mode):
+            raise CollectError("system Bus index is not a regular file")
+        topic = f"state/hardware/surface/{node}/camera-proof"
+        uri = f"file:{quote(str(database), safe='/')}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            row = connection.execute(
+                "SELECT CASE WHEN length(body) <= 65536 THEN body ELSE NULL END, length(body) "
+                "FROM messages WHERE topic = ? ORDER BY ulid DESC LIMIT 1",
+                (topic,),
+            ).fetchone()
+        if row is None or not isinstance(row[0], str) or row[1] is None or row[1] > 64 * 1024:
+            raise CollectError("fresh local camera proof result is absent or oversized")
+        projected = admit_camera_proof(row[0].encode("utf-8"), node, expected, int(time.time() * 1000))
+        return result("ok", projected)
+    except (OSError, sqlite3.Error, CollectError) as exc:
+        return result("error", reason=str(exc))
+
+
 def probe_radios() -> dict[str, Any]:
     nm = command_lines(("/usr/bin/nmcli", "--terse", "--fields", "DEVICE,TYPE,STATE", "device", "status"), 128)
     bt_command = run_fixed(("/usr/bin/bluetoothctl", "show"))
@@ -729,6 +847,9 @@ PROBES = (
     ("audio.json", probe_audio),
     ("power.json", probe_power),
     ("services.json", probe_services),
+    # Read the already-completed proof last so manifest creation cannot age it
+    # behind unrelated inventory commands. This remains a read-only Bus query.
+    ("camera-proof.json", probe_camera_proof),
 )
 
 
@@ -754,7 +875,7 @@ def collect(out: Path, seat: str, expected: int) -> int:
         statuses: dict[str, str] = {}
         for filename, probe in PROBES:
             try:
-                value = probe(expected, seat) if filename == "identity.json" else probe()
+                value = probe(expected, seat) if filename in {"identity.json", "camera-proof.json"} else probe()
             except Exception as exc:  # each failed probe remains explicit evidence
                 value = result("error", reason=f"collector probe failed: {type(exc).__name__}: {exc}")
             statuses[filename] = value["status"]
@@ -814,7 +935,10 @@ def validate(bundle: Path) -> int:
             raise CollectError(f"invalid artifact: {path.name}")
     if sum(path.stat().st_size for path in bundle.iterdir()) > MAX_BUNDLE_BYTES:
         raise CollectError(f"bundle exceeds {MAX_BUNDLE_BYTES} bytes")
-    manifest = json.loads(read_limited(bundle / "manifest.json", MAX_ARTIFACT_BYTES))
+    manifest = json.loads(
+        read_limited(bundle / "manifest.json", MAX_ARTIFACT_BYTES),
+        object_pairs_hook=strict_object,
+    )
     manifest_keys = {
         "schema_version", "collector", "seat_label", "captured_at_utc", "expected_surface_pro_generation",
         "collection_scope", "collection_verdict", "incomplete_probes",
@@ -852,13 +976,27 @@ def validate(bundle: Path) -> int:
         path = bundle / name
         if item["bytes"] != path.stat().st_size or item["sha256"] != sha256_file(path):
             raise CollectError(f"artifact integrity mismatch: {name}")
-        document = json.loads(read_limited(path, MAX_ARTIFACT_BYTES))
+        document = json.loads(
+            read_limited(path, MAX_ARTIFACT_BYTES), object_pairs_hook=strict_object
+        )
         if not isinstance(document, dict) or not set(document).issubset({"schema_version", "status", "data", "reason"}):
             raise CollectError(f"artifact envelope is invalid: {name}")
         if document.get("schema_version") != SCHEMA_VERSION or document.get("status") not in ("ok", "error", "unavailable") or document.get("status") != item["status"]:
             raise CollectError(f"artifact envelope mismatch: {name}")
         if item["status"] != "ok":
             observed_incomplete.append(name)
+        elif name == "camera-proof.json":
+            captured_at_ms = int(
+                datetime.strptime(manifest["captured_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+                * 1000
+            )
+            validate_camera_proof_projection(
+                document.get("data"),
+                manifest["expected_surface_pro_generation"],
+                captured_at_ms,
+            )
     if seen != set(EXPECTED_FILES):
         raise CollectError("manifest does not cover every artifact")
     if manifest.get("physical_acceptance_claimed") is not False:
@@ -910,7 +1048,46 @@ def self_test() -> int:
     except CollectError as exc:
         if str(exc) == "oversized fwupd inventory accepted":
             raise
-    print(f"Surface acceptance collector self-test passed ({len(hostile)} hostile strings and bounded fwupd fixtures)")
+    now_ms = 1_800_000_000_000
+    camera = {
+        "schema_version": 1,
+        "node": "surface-6",
+        "request_id": "camera-proof-self-test",
+        "model": {"product": "Surface Pro 6", "generation": "pro6"},
+        "completed_at_ms": now_ms - 1,
+        "outcome": {"state": "passed"},
+    }
+    body = json.dumps(camera, sort_keys=True, separators=(",", ":")).encode()
+    proof = admit_camera_proof(body, "surface-6", 6, now_ms)
+    validate_camera_proof_projection(proof, 6, now_ms)
+    if "camera-proof-self-test" in json.dumps(proof) or proof["result_sha256"] != sha256_bytes(body):
+        raise CollectError("camera proof projection retained an identifier or lost its hash binding")
+    hostile_camera = []
+    for update in (
+        {"node": "foreign"},
+        {"model": {"product": "Surface Pro 5", "generation": "pro5"}},
+        {"outcome": {"state": "failed", "reason": "capture_failed"}},
+        {"completed_at_ms": now_ms - CAMERA_PROOF_MAX_AGE_MS - 1},
+        {"completed_at_ms": now_ms + CAMERA_PROOF_FUTURE_SKEW_MS + 1},
+        {"device_id": "/dev/video0"},
+        {"frame": "pixels"},
+    ):
+        candidate = dict(camera)
+        candidate.update(update)
+        hostile_camera.append(json.dumps(candidate, separators=(",", ":")).encode())
+    hostile_camera.append(body.replace(b'"node":"surface-6"', b'"node":"surface-6","node":"surface-6"'))
+    hostile_camera.append(b" " * (64 * 1024 + 1))
+    for candidate in hostile_camera:
+        try:
+            admit_camera_proof(candidate, "surface-6", 6, now_ms)
+        except CollectError:
+            pass
+        else:
+            raise CollectError("hostile camera proof result was admitted")
+    print(
+        "Surface acceptance collector self-test passed "
+        f"({len(hostile)} hostile strings, bounded fwupd, and {len(hostile_camera)} camera fixtures)"
+    )
     return 0
 
 
