@@ -2065,6 +2065,19 @@ behavioral evidence is not completion.
   proof. Focused farm contract, daemon, shell, producer, provenance, and
   collector gates passed; no physical acceptance is claimed:
   `docs/platform/evidence/WL-UX-011-2026-08-09-surface-pro56-contract-r15.md`.
+- **Surface Pro 5/6 first-class runtime checkpoint (2026-08-10):** shared
+  bounded enable/MOK and firmware-result contracts replace private shell wire
+  mirrors; `surface_enable` has no reboot authority or legacy arm state; staged
+  MOK routes authority-free to the existing host-state Power workflow. A
+  separately authorized one-frame camera proof discards all pixels and now
+  hash-binds collector, physical-record, and promotion input. Device Inventory
+  renders exact Pro 5/6 Surface summaries fleet-wide while every remote control
+  remains refused. Final adversarial farm gates passed 19 shared and 120 daemon
+  Surface tests; focused shell, camera, firmware, fleet, and hostile parser
+  gates also pass. Physical acceptance and promotion still fail closed pending
+  the kernel signing key/capacity, release-signed artifact set, approved SSH key
+  artifact, governed canonical-seat access, and direct Pro 6 then Pro 5 proof:
+  `docs/platform/evidence/WL-UX-011-2026-08-10-surface-pro56-first-class-runtime-r16.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.
