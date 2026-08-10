@@ -23,7 +23,7 @@ use mackes_mesh_types::clock::{
     ClockScheduleKindV1, ClockScheduleV1, ClockSettingsV1, ClockSnapshotV1, ClockStopwatchV1,
     ClockTargetDisposition, ClockTargetState, ClockTimerPhase, ClockValidationContext,
     ClockWeekday, CLOCK_AUDIO_ACTION_TOPIC, CLOCK_SCHEMA_VERSION, MAX_CLOCK_AUDIO_REQUEST_TTL_MS,
-    MAX_CLOCK_COMMAND_TTL_MS, MAX_CLOCK_OCCURRENCES,
+    MAX_CLOCK_COMMAND_TTL_MS, MAX_CLOCK_OCCURRENCES, MAX_CLOCK_STOPWATCH_ELAPSED_MS,
 };
 use mackes_mesh_types::music_auth::{self, MusicAuthContext, MUSIC_AUTH_CREDENTIAL_NAME};
 use mde_bus::hooks::config::Priority;
@@ -400,6 +400,7 @@ impl ClockWorker {
                 snapshot.revision == record.revision,
                 "Clock revision mismatch"
             );
+            validate_stopwatch_deadlines(&snapshot, now_ms)?;
             self.action_cursor = record.action_cursor;
             self.snapshot = Some(snapshot);
             return Ok(());
@@ -457,6 +458,7 @@ impl ClockWorker {
                 snapshot.revision == record.revision,
                 "Clock revision mismatch"
             );
+            validate_stopwatch_deadlines(&snapshot, self.clock.now_ms())?;
             self.action_cursor = record.action_cursor;
             self.snapshot = Some(snapshot);
             // A prior attempt may have committed and then failed to publish.
@@ -804,6 +806,7 @@ impl ClockWorker {
                 }
             }
             ClockCommandKindV1::UpsertStopwatch { stopwatch } => {
+                validate_stopwatch_deadline(&stopwatch, now_ms)?;
                 anyhow::ensure!(
                     stopwatch.origin_node_id == command_origin,
                     "Clock stopwatch origin mismatch"
@@ -1979,6 +1982,39 @@ fn upsert_stopwatch(stopwatches: &mut Vec<ClockStopwatchV1>, stopwatch: ClockSto
     } else {
         stopwatches.push(stopwatch);
     }
+}
+
+fn validate_stopwatch_deadlines(
+    snapshot: &ClockSnapshotV1,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    for stopwatch in &snapshot.stopwatches {
+        validate_stopwatch_deadline(stopwatch, now_ms)?;
+    }
+    Ok(())
+}
+
+fn validate_stopwatch_deadline(
+    stopwatch: &ClockStopwatchV1,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    if stopwatch.phase != mackes_mesh_types::clock::ClockStopwatchPhase::Running {
+        return Ok(());
+    }
+    let started_wall_utc_ms = stopwatch
+        .started_wall_utc_ms
+        .ok_or_else(|| anyhow::anyhow!("running Clock stopwatch lacks a wall-clock start"))?;
+    let live_elapsed_ms = u64::try_from(now_ms.saturating_sub(started_wall_utc_ms))
+        .map_err(|_| anyhow::anyhow!("Clock stopwatch live elapsed time underflowed"))?;
+    let elapsed_ms = stopwatch
+        .accumulated_elapsed_ms
+        .checked_add(live_elapsed_ms)
+        .ok_or_else(|| anyhow::anyhow!("Clock stopwatch elapsed time overflowed"))?;
+    anyhow::ensure!(
+        elapsed_ms <= MAX_CLOCK_STOPWATCH_ELAPSED_MS,
+        "Clock stopwatch exceeded its bounded elapsed deadline"
+    );
+    Ok(())
 }
 
 fn stamp_revision(snapshot: &mut ClockSnapshotV1, local_node_id: &str) {
@@ -4457,6 +4493,56 @@ mod tests {
                 .origin_node_id,
             "seat-1"
         );
+    }
+
+    #[test]
+    fn running_stopwatch_past_elapsed_deadline_is_not_admitted() {
+        let mut fixture = Fixture::new();
+        fixture.worker.tick_once().unwrap();
+
+        let mut command = signed_stopwatch_for(
+            &fixture.signing_key,
+            "seat-1-key",
+            "seat-1",
+            "seat-1",
+            "stopwatch-overdue",
+            1,
+            "stopwatch-overdue",
+            1,
+            &["seat-1"],
+            0,
+        );
+        let ClockCommandKindV1::UpsertStopwatch { stopwatch } = &mut command.body else {
+            unreachable!();
+        };
+        stopwatch.phase = mackes_mesh_types::clock::ClockStopwatchPhase::Running;
+        stopwatch.started_wall_utc_ms = Some(
+            NOW
+                .checked_sub(MAX_CLOCK_STOPWATCH_ELAPSED_MS as i64)
+                .and_then(|value| value.checked_sub(1))
+                .unwrap(),
+        );
+        stopwatch.started_monotonic_ms = Some(1);
+        command.signature.clear();
+        command.signer_id.clear();
+        let command = command
+            .sign(
+                "seat-1-key",
+                &fixture.signing_key,
+                &ClockValidationContext {
+                    wall_utc_ms: NOW,
+                    monotonic_ms: 90_000,
+                    zone_exists: &zone_exists,
+                },
+            )
+            .unwrap();
+
+        fixture.publish(&command);
+        fixture.worker.tick_once().unwrap();
+
+        let snapshot = fixture.worker.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.revision, 1);
+        assert!(snapshot.stopwatches.is_empty());
     }
 
     #[test]
