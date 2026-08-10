@@ -101,6 +101,7 @@ behavioral evidence is not completion.
 - **Dom0 reserve (2026-08-10):** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-dom0-cpu-reserve-r154.md`.
 - **VM/image cleanup:** BigBoy; overlay and virtual-image failure cleanup evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
+- **Workload-pool rollback:** seat `.90` passed the focused storage gate: `docs/platform/evidence/WL-ARCH-010-2026-08-10-workload-pool-mount-rollback-r169.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.

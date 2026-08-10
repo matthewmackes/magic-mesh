@@ -2130,59 +2130,80 @@ pub fn configure_workload_pool_layout(
             reason: format!("mount workload pool exited with {mount_status}"),
         });
     }
-    validate_workload_storage_layout(mountpoint, &subtree).map_err(|reason| {
-        StorageError::OpFailed {
-            op: "create_workload_subtree",
-            reason,
-        }
-    })?;
-    ensure_managed_directory(&subtree).map_err(|reason| StorageError::OpFailed {
-        op: "create_workload_subtree",
-        reason,
-    })?;
-    let rules = [
-        (mountpoint, "virt_image_t"),
-        (subtree.as_path(), "container_file_t"),
-    ];
-    for (path, context) in rules {
-        let pattern = format!("{}(/.*)?", path.display());
-        let mut modify = Command::new("semanage");
-        modify.args(["fcontext", "-m", "-t", context, &pattern]);
-        let modify_status = status_with_timeout(modify, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+    let layout_result = (|| {
+        validate_workload_storage_layout(mountpoint, &subtree).map_err(|reason| {
             StorageError::OpFailed {
-                op: "label_workload_pool",
-                reason: format!("SELinux fcontext update failed to start: {error}"),
+                op: "create_workload_subtree",
+                reason,
             }
         })?;
-        if !modify_status.success() {
-            let mut add = Command::new("semanage");
-            add.args(["fcontext", "-a", "-t", context, &pattern]);
-            let add_status = status_with_timeout(add, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+        ensure_managed_directory(&subtree).map_err(|reason| StorageError::OpFailed {
+            op: "create_workload_subtree",
+            reason,
+        })?;
+        let rules = [
+            (mountpoint, "virt_image_t"),
+            (subtree.as_path(), "container_file_t"),
+        ];
+        for (path, context) in rules {
+            let pattern = format!("{}(/.*)?", path.display());
+            let mut modify = Command::new("semanage");
+            modify.args(["fcontext", "-m", "-t", context, &pattern]);
+            let modify_status = status_with_timeout(modify, DEFAULT_CMD_TIMEOUT).map_err(|error| {
                 StorageError::OpFailed {
                     op: "label_workload_pool",
-                    reason: format!("SELinux fcontext add failed to start: {error}"),
+                    reason: format!("SELinux fcontext update failed to start: {error}"),
                 }
             })?;
-            if !add_status.success() {
-                return Err(StorageError::OpFailed {
-                    op: "label_workload_pool",
-                    reason: format!("SELinux fcontext rule rejected for {}", path.display()),
-                });
+            if !modify_status.success() {
+                let mut add = Command::new("semanage");
+                add.args(["fcontext", "-a", "-t", context, &pattern]);
+                let add_status = status_with_timeout(add, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+                    StorageError::OpFailed {
+                        op: "label_workload_pool",
+                        reason: format!("SELinux fcontext add failed to start: {error}"),
+                    }
+                })?;
+                if !add_status.success() {
+                    return Err(StorageError::OpFailed {
+                        op: "label_workload_pool",
+                        reason: format!("SELinux fcontext rule rejected for {}", path.display()),
+                    });
+                }
             }
         }
-    }
-    let mut restore = Command::new("restorecon");
-    restore.args(["-RF", mountpoint_string.as_str()]);
-    let restore_status = status_with_timeout(restore, DEFAULT_CMD_TIMEOUT).map_err(|error| {
-        StorageError::OpFailed {
-            op: "restore_workload_pool",
-            reason: format!("restorecon failed to start: {error}"),
+        let mut restore = Command::new("restorecon");
+        restore.args(["-RF", mountpoint_string.as_str()]);
+        let restore_status = status_with_timeout(restore, DEFAULT_CMD_TIMEOUT).map_err(|error| {
+            StorageError::OpFailed {
+                op: "restore_workload_pool",
+                reason: format!("restorecon failed to start: {error}"),
+            }
+        })?;
+        if !restore_status.success() {
+            return Err(StorageError::OpFailed {
+                op: "restore_workload_pool",
+                reason: format!("restorecon exited with {restore_status}"),
+            });
         }
-    })?;
-    if !restore_status.success() {
-        return Err(StorageError::OpFailed {
-            op: "restore_workload_pool",
-            reason: format!("restorecon exited with {restore_status}"),
+        Ok(())
+    })();
+    if let Err(error) = layout_result {
+        let mut unmount = Command::new("umount");
+        unmount.arg(mountpoint_string.as_str());
+        let cleanup = status_with_timeout(unmount, DEFAULT_CMD_TIMEOUT).map_err(|cleanup| {
+            format!("unmount failed to start: {cleanup}")
+        });
+        return Err(match cleanup {
+            Ok(status) if status.success() => error,
+            Ok(status) => StorageError::OpFailed {
+                op: "workload_pool_cleanup",
+                reason: format!("layout failed ({error}); unmount exited with {status}"),
+            },
+            Err(cleanup) => StorageError::OpFailed {
+                op: "workload_pool_cleanup",
+                reason: format!("layout failed ({error}); {cleanup}"),
+            },
         });
     }
     Ok(())
