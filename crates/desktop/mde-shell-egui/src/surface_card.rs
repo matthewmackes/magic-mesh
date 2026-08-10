@@ -60,12 +60,6 @@ const MAX_SURFACE_STATE_AGE_MS: u64 = 90_000;
 /// Tolerated publisher/seat wall-clock skew before a future state is refused.
 const MAX_SURFACE_STATE_FUTURE_SKEW_MS: u64 = 5_000;
 
-/// The exact token the operator types to arm the post-import MOK reboot (mirror
-/// of `mackesd::surface::enable::MOK_ARM_TOKEN`, lock #6). The daemon also
-/// echoes it in [`MokEnrollment::ImportedAwaitingArm`]; the button compares
-/// against that echoed value so a token change can't drift silently.
-const MOK_ARM_TOKEN: &str = "REBOOT-TO-ENROLL-MOK";
-
 /// The exact token the operator types to arm a firmware apply (mirror of
 /// `mackesd::surface::firmware::FW_ARM_TOKEN`, lock #8).
 const FW_ARM_TOKEN: &str = "APPLY-SURFACE-FIRMWARE";
@@ -348,9 +342,6 @@ pub(crate) struct SurfaceCardState {
     apply: Option<ApplyResult>,
     /// The showing tab.
     tab: Tab,
-    /// The operator's typed MOK arm token (compared against the daemon's echoed
-    /// token before the reboot can be armed).
-    mok_arm_input: String,
     /// The operator's typed firmware arm token.
     fw_arm_input: String,
     /// The firmware device the operator selected to apply.
@@ -386,7 +377,6 @@ impl Default for SurfaceCardState {
             firmware: None,
             apply: None,
             tab: Tab::default(),
-            mok_arm_input: String::new(),
             fw_arm_input: String::new(),
             selected_fw: None,
             action_note: None,
@@ -576,7 +566,7 @@ impl SurfaceCardState {
         ui.add_space(Style::SP_S);
 
         // ── header: the model + the enablement rollup (real, lock #7) ──
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("Surface / Hardware Enablement")
                     .color(Style::TEXT)
@@ -584,7 +574,7 @@ impl SurfaceCardState {
                     .strong(),
             );
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.colored_label(
                 Style::ACCENT,
                 RichText::new(&summary.publication.model.product).size(Style::SMALL),
@@ -649,7 +639,7 @@ impl SurfaceCardState {
         }
 
         // ── tab bar ──
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for tab in Tab::ALL {
                 if ui.selectable_label(self.tab == tab, tab.label()).clicked() {
                     self.tab = tab;
@@ -674,15 +664,14 @@ impl SurfaceCardState {
     // ─────────────────────────── Install tab ───────────────────────────
 
     fn show_install(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.add_enabled(
-                false,
-                egui::Button::new(RichText::new("Activate / enable").size(Style::BODY)),
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                Style::ACCENT,
+                RichText::new("GOVERNED ACTIVATION")
+                    .size(Style::SMALL)
+                    .strong(),
             );
-            mde_egui::muted_note(
-                ui,
-                "Unavailable until Surface controls use Preview / Commit / Cancel / Audit with a fresh provider generation.",
-            );
+            mde_egui::muted_note(ui, "Local exact-body authority · audited result below");
         });
         ui.add_space(Style::SP_S);
 
@@ -699,7 +688,10 @@ impl SurfaceCardState {
                 );
             }
             None => {
-                mde_egui::muted_note(ui, "No enable run yet \u{2014} activate to begin.");
+                mde_egui::muted_note(
+                    ui,
+                    "No activation result yet. Surface controls remain unchanged.",
+                );
             }
         }
 
@@ -719,7 +711,7 @@ impl SurfaceCardState {
     fn show_enable_result(&mut self, ui: &mut egui::Ui, res: &EnableResult) {
         // Activation units.
         for unit in &res.activation.units {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 mde_egui::status_dot(ui, unit.outcome.tone());
                 ui.add_space(Style::SP_XS);
                 ui.label(
@@ -743,7 +735,7 @@ impl SurfaceCardState {
         ui.add_space(Style::SP_XS);
         match &res.mok {
             MokEnrollment::NotRequired => {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, Style::OK);
                     ui.add_space(Style::SP_XS);
                     mde_egui::muted_note(ui, "Secure Boot off \u{2014} no key to enroll.");
@@ -755,7 +747,7 @@ impl SurfaceCardState {
                 } else {
                     Style::WARN
                 };
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, tone);
                     ui.add_space(Style::SP_XS);
                     mde_egui::muted_note(
@@ -769,7 +761,7 @@ impl SurfaceCardState {
                 });
             }
             MokEnrollment::RebootArmed { outcome } => {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, outcome.tone());
                     ui.add_space(Style::SP_XS);
                     mde_egui::muted_note(
@@ -779,7 +771,7 @@ impl SurfaceCardState {
                 });
             }
             MokEnrollment::Undetermined { reason } => {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, Style::WARN);
                     ui.add_space(Style::SP_XS);
                     mde_egui::muted_note(ui, format!("MOK posture undetermined \u{2014} {reason}"));
@@ -787,19 +779,13 @@ impl SurfaceCardState {
             }
             MokEnrollment::ImportedAwaitingArm {
                 firmware_prompt,
-                arm_token,
+                arm_token: _,
                 key_fingerprint,
-            } => self.show_mok_arm(ui, firmware_prompt, arm_token, key_fingerprint),
+            } => self.show_mok_arm(ui, firmware_prompt, key_fingerprint),
         }
     }
 
-    fn show_mok_arm(
-        &mut self,
-        ui: &mut egui::Ui,
-        firmware_prompt: &str,
-        arm_token: &str,
-        key_fingerprint: &str,
-    ) {
+    fn show_mok_arm(&mut self, ui: &mut egui::Ui, firmware_prompt: &str, key_fingerprint: &str) {
         mde_egui::field(ui, "Key fingerprint", key_fingerprint, Style::TEXT);
         ui.add_space(Style::SP_XS);
         // The exact blue-screen firmware copy, verbatim (lock #6 — honest about
@@ -810,36 +796,17 @@ impl SurfaceCardState {
                 .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Type to arm")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                Style::WARN,
+                RichText::new("PENDING FIRMWARE ENROLLMENT")
+                    .size(Style::SMALL)
+                    .strong(),
             );
-            ui.add_space(Style::SP_S);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.mok_arm_input)
-                    .hint_text(MOK_ARM_TOKEN)
-                    .desired_width(Style::SP_XL * 6.0),
+            mde_egui::muted_note(
+                ui,
+                "Reboot requires a separate host-state propose/confirm operation.",
             );
-        });
-        ui.add_space(Style::SP_XS);
-        // The token remains visible for the future staged-control flow, but no
-        // reboot intent is emitted until that authority is connected.
-        let armed = self.mok_arm_input.trim() == arm_token;
-        ui.horizontal(|ui| {
-            ui.add_enabled(
-                false,
-                egui::Button::new(RichText::new("Arm reboot").size(Style::BODY)),
-            );
-            if !armed {
-                mde_egui::muted_note(ui, "Type the exact token above to arm the reboot.");
-            } else {
-                mde_egui::muted_note(
-                    ui,
-                    "Reboot remains unavailable until staged-control authority is connected.",
-                );
-            }
         });
     }
 
@@ -863,7 +830,7 @@ impl SurfaceCardState {
             return;
         }
         for dev in &inv.devices {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let selectable = dev.update_available && dev.available_checksum.is_some();
                 let selected = self.selected_fw.as_deref() == Some(dev.device_id.as_str());
                 let tone = if dev.update_available {
@@ -919,7 +886,7 @@ impl SurfaceCardState {
             let msg = res
                 .skipped
                 .map_or(msg, |reason| format!("skipped \u{2014} {reason}"));
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 mde_egui::status_dot(ui, tone);
                 ui.add_space(Style::SP_XS);
                 mde_egui::muted_note(ui, format!("{}: {msg}", res.device_id));
@@ -961,22 +928,21 @@ impl SurfaceCardState {
         release_checksum: &str,
     ) {
         ui.add_space(Style::SP_S);
-        ui.horizontal(|ui| {
+        ui.vertical(|ui| {
             ui.label(
                 RichText::new("Type to arm")
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.add_space(Style::SP_S);
             ui.add(
                 egui::TextEdit::singleline(&mut self.fw_arm_input)
                     .hint_text(FW_ARM_TOKEN)
-                    .desired_width(Style::SP_XL * 6.0),
+                    .desired_width(ui.available_width().min(Style::SP_XL * 6.0)),
             );
         });
         ui.add_space(Style::SP_XS);
         let armed = self.fw_arm_input.trim() == FW_ARM_TOKEN;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     armed,
@@ -1024,7 +990,7 @@ impl SurfaceCardState {
     // ───────────────────────────── Test tab ─────────────────────────────
 
     fn show_test(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button(RichText::new("Re-read board").size(Style::BODY))
                 .clicked()
@@ -1051,7 +1017,7 @@ impl SurfaceCardState {
             return;
         }
         for row in &board.rows {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 mde_egui::status_dot(ui, probe_tone(row.state));
                 ui.add_space(Style::SP_XS);
                 ui.label(
@@ -1065,7 +1031,7 @@ impl SurfaceCardState {
                     RichText::new(probe_word(row.state)).size(Style::SMALL),
                 );
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_space(Style::SP_M);
                 mde_egui::muted_note(ui, &row.reason);
             });
@@ -1078,9 +1044,10 @@ impl SurfaceCardState {
     fn show_config(&mut self, ui: &mut egui::Ui) {
         // The applied per-model config knobs, read from the enable result (§7:
         // rendered from real Bus state — the daemon owns the per-model values;
-        // they're (re)applied by the Install tab's Enable, no per-knob verb).
+        // they're applied by the governed local activation, with no raw
+        // per-knob verb exposed to this card).
         ui.label(
-            RichText::new("Applied config (via Enable)")
+            RichText::new("Applied Surface configuration")
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL)
                 .strong(),
@@ -1092,13 +1059,10 @@ impl SurfaceCardState {
             .map(|e| e.activation.configs.clone())
             .unwrap_or_default();
         if configs.is_empty() {
-            mde_egui::muted_note(
-                ui,
-                "No config applied yet \u{2014} run Enable to apply iptsd sensitivity, SAM perf, and rotation hints.",
-            );
+            mde_egui::muted_note(ui, "No governed SAM profile result has been published yet.");
         } else {
             for cfg in &configs {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     mde_egui::status_dot(ui, cfg.outcome.tone());
                     ui.add_space(Style::SP_XS);
                     ui.label(
@@ -1114,7 +1078,7 @@ impl SurfaceCardState {
         ui.add_space(Style::SP_XS);
         mde_egui::muted_note(
             ui,
-            "Rotation lock + tablet-mode behavior follow the seat formfactor signal (lock 9), which the shell publishes on tablet/laptop transitions.",
+            "Rotation and tablet-mode behavior follow live seat form-factor and IIO state in the DRM runner; activation does not write a rotation hint.",
         );
 
         ui.add_space(Style::SP_M);
@@ -1201,7 +1165,7 @@ impl SurfaceCardState {
 
         // The mode picker (native ↔ HD, lock 12). HD is offered only when the
         // connector actually advertises 1920×1080 (never fabricated).
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let modes: Vec<mde_egui::PanelMode> = ctrl.modes().to_vec();
             for mode in modes {
                 let selected = mode == active;
@@ -1256,7 +1220,7 @@ impl SurfaceCardState {
 fn show_scale_control(ui: &mut egui::Ui, ctrl: &mut DisplayController) {
     let mut scale = ctrl.effective_scale();
     let computed = ctrl.computed_scale();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new("Scale")
                 .color(Style::TEXT_DIM)
@@ -1278,7 +1242,7 @@ fn show_scale_control(ui: &mut egui::Ui, ctrl: &mut DisplayController) {
             ui.ctx().set_pixels_per_point(ctrl.effective_scale());
         }
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         mde_egui::muted_note(ui, format!("panel-computed {computed:.2}\u{00D7}"));
         ui.add_space(Style::SP_S);
         if ctrl.scale_override().is_some() && ui.small_button("reset").clicked() {
@@ -1446,7 +1410,7 @@ mod tests {
     };
     use mde_bus::persist::Persist;
     use mde_egui::egui::{pos2, vec2, Rect};
-    use mde_egui::PanelMode;
+    use mde_egui::{Density, PanelMode, StyleColorScheme};
 
     const ACTION_NOW_MS: u64 = 1_800_000_000_000;
 
@@ -1511,14 +1475,12 @@ mod tests {
                 ],
             }),
             enable: Some(EnableResult {
-                model: "Surface Pro 7".to_string(),
+                model: "Surface Pro 6".to_string(),
                 skipped: None,
                 activation: ActivationResult {
                     units: vec![UnitResult {
-                        unit: "iptsd.service".to_string(),
-                        outcome: StepOutcome::Gated {
-                            reason: "enable iptsd.service: integration-gated".to_string(),
-                        },
+                        unit: "iptsd@.service".to_string(),
+                        outcome: StepOutcome::AlreadyActive,
                     }],
                     configs: vec![ConfigResult {
                         key: ConfigKey::SamPerfProfile,
@@ -1529,7 +1491,7 @@ mod tests {
                 mok: MokEnrollment::ImportedAwaitingArm {
                     firmware_prompt: "After the reboot the firmware shows a blue screen..."
                         .to_string(),
-                    arm_token: MOK_ARM_TOKEN.to_string(),
+                    arm_token: "REBOOT-TO-ENROLL-MOK".to_string(),
                     key_fingerprint: "SHA1:ab:cd:ef".to_string(),
                 },
             }),
@@ -1573,7 +1535,6 @@ mod tests {
                 firmware: None,
                 apply: None,
                 tab: Tab::default(),
-                mok_arm_input: String::new(),
                 fw_arm_input: String::new(),
                 selected_fw: None,
                 action_note: None,
@@ -1605,6 +1566,35 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+    }
+
+    fn render_shapes_at(
+        state: &mut SurfaceCardState,
+        tab: Tab,
+        width: f32,
+        scheme: StyleColorScheme,
+        density: Density,
+        zoom: f32,
+    ) -> (Vec<egui::epaint::ClippedShape>, Rect) {
+        state.tab = tab;
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(&ctx, scheme, density);
+        ctx.set_zoom_factor(zoom);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 1600.0))),
+            ..Default::default()
+        };
+        // egui applies a requested zoom at the next begin-pass. Prime one pass
+        // so the measured layout uses both the intended viewport and text scale.
+        let _ = ctx.run(input.clone(), |_| {});
+        let mut content_rect = Rect::NOTHING;
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                state.show(ui);
+                content_rect = ui.min_rect();
+            });
+        });
+        (output.shapes, content_rect)
     }
 
     #[test]
@@ -1643,6 +1633,33 @@ mod tests {
     }
 
     #[test]
+    fn surface_card_reflows_at_narrow_touch_and_large_text_in_dark_and_light() {
+        for scheme in [StyleColorScheme::Dark, StyleColorScheme::Light] {
+            for (width, density, zoom) in [
+                (320.0, Density::Touch, 1.35),
+                (480.0, Density::Touch, 1.15),
+                (960.0, Density::Mouse, 1.0),
+            ] {
+                for tab in Tab::ALL {
+                    let mut state = fixture();
+                    let (shapes, content_rect) =
+                        render_shapes_at(&mut state, tab, width, scheme, density, zoom);
+                    assert!(
+                        !shapes.is_empty(),
+                        "{tab:?} produced no shapes at {width}px/{scheme:?}/{density:?}/{zoom}x"
+                    );
+                    assert!(
+                        content_rect.is_finite()
+                            && content_rect.min.x >= -1.0
+                            && content_rect.max.x <= width + 1.0,
+                        "{tab:?} laid out {content_rect:?} outside the horizontal viewport at {width}px/{scheme:?}/{density:?}/{zoom}x"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn firmware_request_serialises_to_the_worker_wire_shape() {
         let firmware = SurfaceFirmwareApplyRequest {
             header: test_action_header("firmware-apply"),
@@ -1669,9 +1686,9 @@ mod tests {
         assert_eq!(board.rows[1].state, SurfaceProbeState::NeedsGesture);
 
         let mok: EnableResult = serde_json::from_str(
-            r#"{"model":"Surface Pro 7","skipped":null,
-                "activation":{"units":[{"unit":"iptsd.service","outcome":"AlreadyActive"}],
-                  "configs":[{"key":"SamPerfProfile","subsystem":"Sam","outcome":{"Gated":{"reason":"gated"}}}]},
+            r#"{"model":"Surface Pro 6","skipped":null,
+                "activation":{"units":[{"unit":"iptsd@.service","outcome":"AlreadyActive"}],
+                  "configs":[{"key":"SamPerfProfile","subsystem":"Sam","outcome":"Applied"}]},
                 "mok":{"Enrolled":{"modules_loaded":true}}}"#,
         )
         .expect("enable decodes");
@@ -1683,7 +1700,7 @@ mod tests {
         ));
         assert!(matches!(
             mok.activation.configs[0].outcome,
-            StepOutcome::Gated { .. }
+            StepOutcome::Applied
         ));
 
         let summary_body = serde_json::to_vec(fixture.summary.as_ref().unwrap()).unwrap();
