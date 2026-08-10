@@ -17,8 +17,8 @@
 //! ## One wire contract, no daemon dependency (§6 glue)
 //!
 //! Like the other Bus-backed provisioning surfaces, this module
-//! leans inward only on `mde-bus` and mirrors the surface workers' wire
-//! contracts with local serde structs: it **reads** the typed state the workers
+//! leans inward only on `mde-bus` and the shared bounded Surface contract: it
+//! **reads** the typed state the workers
 //! publish under `state/hardware/surface/<node>/*` and **publishes** the typed
 //! requests they drain under `action/hardware/surface/<node>/*`. The `<node>`
 //! id is discovered from the Bus itself — the summary topic a Surface node
@@ -34,11 +34,17 @@
 //! (or no Surface) on the box the card simply isn't drawn.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::surface_hardware::{
+    SURFACE_HARDWARE_SCHEMA_VERSION, SurfaceActionHeader, SurfaceAvailability,
+    SurfaceFirmwareApplyRequest, SurfaceFirmwareInventory, SurfaceFleetSummary, SurfaceProbeState,
+    SurfaceSubsystem, SurfaceVerifyBoard,
+};
 use mde_egui::egui::{self, RichText};
 use mde_egui::{DisplayController, ModeClass, PanelInfo, Style};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -48,6 +54,11 @@ use crate::bus_reader::BusReader;
 /// Poll cadence — the surface workers publish on 2–30 s ticks, so a modest read
 /// cadence keeps the card fresh without spinning. Matches the This Node plane.
 const REFRESH: Duration = Duration::from_secs(5);
+/// A verifier publishes every 30 seconds. Three missed publications is the
+/// bounded point where a previously fresh observation becomes visibly stale.
+const MAX_SURFACE_STATE_AGE_MS: u64 = 90_000;
+/// Tolerated publisher/seat wall-clock skew before a future state is refused.
+const MAX_SURFACE_STATE_FUTURE_SKEW_MS: u64 = 5_000;
 
 /// The exact token the operator types to arm the post-import MOK reboot (mirror
 /// of `mackesd::surface::enable::MOK_ARM_TOKEN`, lock #6). The daemon also
@@ -72,10 +83,6 @@ fn board_topic(node: &str) -> String {
 /// The typed enable-result lane (Install tab).
 fn enable_result_topic(node: &str) -> String {
     format!("state/hardware/surface/{node}/enable")
-}
-/// The enable request lane (Install tab activate / MOK arm).
-fn enable_action_topic(node: &str) -> String {
-    format!("action/hardware/surface/{node}/enable")
 }
 /// The fwupd inventory lane (Install tab).
 fn firmware_topic(node: &str) -> String {
@@ -107,81 +114,50 @@ enum Subsystem {
     Fingerprint,
 }
 
-impl Subsystem {
-    /// Human label for the board row (mirrors the daemon's `Subsystem::label`).
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Touch => "Touchscreen",
-            Self::Pen => "Pen / stylus",
-            Self::TypeCover => "Type Cover",
-            Self::Sam => "Surface Aggregator (battery/thermal)",
-            Self::RotationAccel => "Auto-rotation (accelerometer)",
-            Self::Cameras => "Cameras",
-            Self::WifiBt => "Wi-Fi / Bluetooth",
-            Self::S0ix => "S0ix suspend",
-            Self::Fingerprint => "Fingerprint reader",
-        }
+fn probe_tone(state: SurfaceProbeState) -> egui::Color32 {
+    match state {
+        SurfaceProbeState::Ok => Style::OK,
+        SurfaceProbeState::Degraded => Style::WARN,
+        SurfaceProbeState::Failed => Style::DANGER,
+        SurfaceProbeState::NeedsGesture => Style::ACCENT,
     }
 }
 
-/// Mirror of the daemon's `ProbeState` tri-state (+ gesture).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-enum ProbeState {
-    Ok,
-    Degraded,
-    Failed,
-    NeedsGesture,
-}
-
-impl ProbeState {
-    /// The `Style` palette tone for this state (§4 tokens only).
-    const fn tone(self) -> egui::Color32 {
-        match self {
-            Self::Ok => Style::OK,
-            Self::Degraded => Style::WARN,
-            Self::Failed => Style::DANGER,
-            Self::NeedsGesture => Style::ACCENT,
-        }
-    }
-    /// The short word rendered beside the dot.
-    const fn word(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Degraded => "degraded",
-            Self::Failed => "failed",
-            Self::NeedsGesture => "needs gesture",
-        }
+fn probe_word(state: SurfaceProbeState) -> &'static str {
+    match state {
+        SurfaceProbeState::Ok => "ok",
+        SurfaceProbeState::Degraded => "degraded",
+        SurfaceProbeState::Failed => "failed",
+        SurfaceProbeState::NeedsGesture => "needs gesture",
     }
 }
 
-/// Mirror of the daemon's `SubsystemVerdict` — one board row.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct SubsystemVerdict {
-    subsystem: Subsystem,
-    state: ProbeState,
-    reason: String,
+fn shared_subsystem_label(subsystem: SurfaceSubsystem) -> &'static str {
+    match subsystem {
+        SurfaceSubsystem::Touch => "Touchscreen",
+        SurfaceSubsystem::Pen => "Pen / stylus",
+        SurfaceSubsystem::TypeCover => "Type Cover",
+        SurfaceSubsystem::Sam => "Surface Aggregator (battery/thermal)",
+        SurfaceSubsystem::RotationAccel => "Auto-rotation (accelerometer)",
+        SurfaceSubsystem::Cameras => "Cameras",
+        SurfaceSubsystem::WifiBt => "Wi-Fi / Bluetooth",
+        SurfaceSubsystem::S0ix => "S0ix suspend",
+        SurfaceSubsystem::Fingerprint => "Fingerprint reader",
+    }
 }
 
-/// Mirror of the daemon's `VerifyBoard` (SURFACE-4, Test tab).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct VerifyBoard {
-    model: String,
-    #[serde(default)]
-    skipped: Option<String>,
-    #[serde(default)]
-    rows: Vec<SubsystemVerdict>,
-}
-
-/// Mirror of the daemon's compact `FleetSummary` (the model gate, lock #7).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct FleetSummary {
-    #[allow(dead_code)]
-    node: String,
-    model: String,
-    enablement_pct: u8,
-    red_count: usize,
-    #[serde(default)]
-    red_subsystems: Vec<String>,
+fn shared_subsystem_id(subsystem: SurfaceSubsystem) -> &'static str {
+    match subsystem {
+        SurfaceSubsystem::Touch => "touch",
+        SurfaceSubsystem::Pen => "pen",
+        SurfaceSubsystem::TypeCover => "type_cover",
+        SurfaceSubsystem::Sam => "sam",
+        SurfaceSubsystem::RotationAccel => "rotation_accel",
+        SurfaceSubsystem::Cameras => "cameras",
+        SurfaceSubsystem::WifiBt => "wifi_bt",
+        SurfaceSubsystem::S0ix => "s0ix",
+        SurfaceSubsystem::Fingerprint => "fingerprint",
+    }
 }
 
 /// Mirror of the daemon's `ConfigKey`.
@@ -285,29 +261,6 @@ struct EnableResult {
     mok: MokEnrollment,
 }
 
-/// Mirror of the daemon's `FwDevice` (SURFACE-5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct FwDevice {
-    device_id: String,
-    name: String,
-    plugin: String,
-    current_version: String,
-    #[serde(default)]
-    available_version: Option<String>,
-    #[serde(default)]
-    update_available: bool,
-}
-
-/// Mirror of the daemon's `FirmwareInventory` (SURFACE-5, Install tab).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct FirmwareInventory {
-    model: String,
-    #[serde(default)]
-    skipped: Option<String>,
-    #[serde(default)]
-    devices: Vec<FwDevice>,
-}
-
 /// Mirror of the daemon's `ApplyOutcome`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 enum ApplyOutcome {
@@ -330,25 +283,24 @@ struct ApplyResult {
     reverify: bool,
 }
 
-// ───────────────────────── the wire mirrors — actions (§6) ──────────────────
+// ───────────────────────── shared action contract (§6) ─────────────────────
 
-/// Mirror of the worker's `EnableRequest`. Serialises to the exact body the
-/// `surface_enable` worker's `parse_action` decodes; `arm_token` is present
-/// only on the reboot-arming call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct EnableRequest {
-    schema_version: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    arm_token: Option<String>,
-}
-
-/// Mirror of the worker's `FwApplyRequest`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct FwApplyRequest {
-    schema_version: u64,
-    device_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    arm_token: Option<String>,
+fn surface_action_header(node: &str) -> SurfaceActionHeader {
+    static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let issued_at_ms: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    SurfaceActionHeader {
+        schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+        node: node.to_string(),
+        request_id: format!("surface-{issued_at_ms}-{sequence}"),
+        issued_at_ms,
+        armed_token: None,
+    }
 }
 
 // ──────────────────────────── the card state ────────────────────────────────
@@ -385,13 +337,13 @@ pub(crate) struct SurfaceCardState {
     node: Option<String>,
     /// The compact fleet summary — `Some` IS the model gate (a Surface node
     /// published it; a non-Surface node never does).
-    summary: Option<FleetSummary>,
+    summary: Option<SurfaceFleetSummary>,
     /// The full tri-state probe board (Test tab).
-    board: Option<VerifyBoard>,
+    board: Option<SurfaceVerifyBoard>,
     /// The typed enable result (Install tab).
     enable: Option<EnableResult>,
     /// The fwupd inventory (Install tab).
-    firmware: Option<FirmwareInventory>,
+    firmware: Option<SurfaceFirmwareInventory>,
     /// The last fw-apply typed result (Install tab).
     apply: Option<ApplyResult>,
     /// The showing tab.
@@ -492,28 +444,37 @@ impl SurfaceCardState {
         ctx.request_repaint_after(REFRESH);
     }
 
-    /// Discover the node + re-read all state lanes. A missing Bus / topic leaves
-    /// the field untouched (the card stays gated or keeps its last read).
+    /// Bind the exact local node + re-read all state lanes. A missing local
+    /// summary clears retained state; a remote Surface can never become This Node.
     fn refresh(&mut self) {
         // arch-11: open through the shared BusReader seam.
         let Some(persist) = BusReader::new(self.bus_root.clone()).open() else {
+            self.clear_surface_state();
             return;
         };
-        if self.node.is_none() {
-            self.node = discover_node(&persist);
+        let local_node = crate::explorer::local_hostname();
+        if discover_node(&persist, &local_node).is_none() {
+            self.clear_surface_state();
+            return;
+        }
+        if self.node.as_deref() != Some(local_node.as_str()) {
+            self.clear_surface_state();
+            self.node = Some(local_node);
         }
         let Some(node) = self.node.clone() else {
             return;
         };
-        read_latest(
+        read_latest_surface_summary(
             &persist,
             &summary_topic(&node),
+            &node,
             &mut self.cur_summary,
             &mut self.summary,
         );
-        read_latest(
+        read_latest_surface_board(
             &persist,
             &board_topic(&node),
+            &node,
             &mut self.cur_board,
             &mut self.board,
         );
@@ -523,9 +484,10 @@ impl SurfaceCardState {
             &mut self.cur_enable,
             &mut self.enable,
         );
-        read_latest(
+        read_latest_surface_firmware(
             &persist,
             &firmware_topic(&node),
+            &node,
             &mut self.cur_firmware,
             &mut self.firmware,
         );
@@ -535,6 +497,33 @@ impl SurfaceCardState {
             &mut self.cur_apply,
             &mut self.apply,
         );
+        // Re-age retained facts on every poll as well as on decode. Otherwise
+        // a last-good `Fresh` value would stay cosmetically fresh forever when
+        // the producer stops publishing and the cursor sees no new messages.
+        let now_ms = wall_clock_ms();
+        if let Some(summary) = self.summary.as_mut() {
+            let _ = admit_publication_freshness(&mut summary.publication, &node, now_ms);
+        }
+        if let Some(board) = self.board.as_mut() {
+            let _ = admit_publication_freshness(&mut board.publication, &node, now_ms);
+        }
+        if let Some(firmware) = self.firmware.as_mut() {
+            let _ = admit_publication_freshness(&mut firmware.publication, &node, now_ms);
+        }
+    }
+
+    fn clear_surface_state(&mut self) {
+        self.node = None;
+        self.summary = None;
+        self.board = None;
+        self.enable = None;
+        self.firmware = None;
+        self.apply = None;
+        self.cur_summary = None;
+        self.cur_board = None;
+        self.cur_enable = None;
+        self.cur_firmware = None;
+        self.cur_apply = None;
     }
 
     /// Force an immediate re-read (the Test tab's re-read control + used after a
@@ -587,7 +576,7 @@ impl SurfaceCardState {
         ui.horizontal(|ui| {
             ui.colored_label(
                 Style::ACCENT,
-                RichText::new(&summary.model).size(Style::SMALL),
+                RichText::new(&summary.publication.model.product).size(Style::SMALL),
             );
             ui.add_space(Style::SP_S);
             let tone = if summary.red_count > 0 {
@@ -608,12 +597,39 @@ impl SurfaceCardState {
                     RichText::new(format!(
                         "{} red: {}",
                         summary.red_count,
-                        summary.red_subsystems.join(", ")
+                        summary
+                            .red_subsystems
+                            .iter()
+                            .copied()
+                            .map(shared_subsystem_id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ))
                     .size(Style::SMALL),
                 );
             }
         });
+        match &summary.publication.availability {
+            SurfaceAvailability::Fresh => {
+                mde_egui::muted_note(
+                    ui,
+                    format!(
+                        "Fresh local {:?} observation · published {}",
+                        summary.publication.source, summary.publication.published_at_ms
+                    ),
+                );
+            }
+            SurfaceAvailability::Stale { reason } => {
+                mde_egui::muted_note(ui, format!("Stale hardware state: {reason}"));
+            }
+            SurfaceAvailability::Unavailable { reason } => {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!("Hardware state unavailable: {reason}"))
+                        .size(Style::SMALL),
+                );
+            }
+        }
         ui.add_space(Style::SP_S);
 
         if let Some(err) = self.last_error.clone() {
@@ -646,48 +662,15 @@ impl SurfaceCardState {
 
     // ─────────────────────────── Install tab ───────────────────────────
 
-    /// Publish a schema-v1, exact-body-authorized `surface-enable` request.
-    /// The daemon still enforces the typed MOK token separately; this HMAC
-    /// capability only proves that the root shell minted this exact action.
-    fn publish_enable_action(&mut self, arm_token: Option<String>, note: &str) {
-        let unsigned = serde_json::to_string(&EnableRequest {
-            schema_version: 1,
-            arm_token,
-        })
-        .unwrap_or_default();
-        let Some(node) = self.node.as_deref().filter(|node| !node.trim().is_empty()) else {
-            self.last_error = Some("Surface enable authorization has no target node.".to_string());
-            return;
-        };
-        let body =
-            match crate::iac::authorize_root_mutation_body(&unsigned, "surface-enable", node, node)
-            {
-                Ok(body) => body,
-                Err(error) => {
-                    self.last_error =
-                        Some(format!("Surface enable authorization unavailable: {error}"));
-                    return;
-                }
-            };
-        let topic = self.action_topic(enable_action_topic);
-        self.publish(&topic, &body, note);
-    }
-
     fn show_install(&mut self, ui: &mut egui::Ui) {
-        // Activate / enable — the surface_enable verb (no arm token).
         ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("Activate / enable").size(Style::BODY))
-                .clicked()
-            {
-                self.publish_enable_action(
-                    None,
-                    "Enable requested \u{2014} the node is running it\u{2026}",
-                );
-            }
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new("Activate / enable").size(Style::BODY)),
+            );
             mde_egui::muted_note(
                 ui,
-                "Enable iptsd + apply this model's config, then classify Secure-Boot / MOK.",
+                "Unavailable until Surface controls use Preview / Commit / Cancel / Audit with a fresh provider generation.",
             );
         });
         ui.add_space(Style::SP_S);
@@ -830,25 +813,21 @@ impl SurfaceCardState {
             );
         });
         ui.add_space(Style::SP_XS);
-        // The interlock: the reboot arms only when the typed token matches the
-        // daemon's echoed one (never automatic).
+        // The token remains visible for the future staged-control flow, but no
+        // reboot intent is emitted until that authority is connected.
         let armed = self.mok_arm_input.trim() == arm_token;
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    armed,
-                    egui::Button::new(RichText::new("Arm reboot").size(Style::BODY)),
-                )
-                .clicked()
-            {
-                self.publish_enable_action(
-                    Some(arm_token.to_string()),
-                    "Reboot armed \u{2014} the node will reboot to enroll.",
-                );
-                self.mok_arm_input.clear();
-            }
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new("Arm reboot").size(Style::BODY)),
+            );
             if !armed {
                 mde_egui::muted_note(ui, "Type the exact token above to arm the reboot.");
+            } else {
+                mde_egui::muted_note(
+                    ui,
+                    "Reboot remains unavailable until staged-control authority is connected.",
+                );
             }
         });
     }
@@ -862,13 +841,19 @@ impl SurfaceCardState {
             mde_egui::muted_note(ui, format!("Firmware unavailable: {reason}"));
             return;
         }
+        if let SurfaceAvailability::Unavailable { reason } | SurfaceAvailability::Stale { reason } =
+            &inv.publication.availability
+        {
+            mde_egui::muted_note(ui, format!("Firmware unavailable: {reason}"));
+            return;
+        }
         if inv.devices.is_empty() {
             mde_egui::muted_note(ui, "fwupd reports no updatable devices.");
             return;
         }
         for dev in &inv.devices {
             ui.horizontal(|ui| {
-                let selectable = dev.update_available;
+                let selectable = dev.update_available && dev.available_checksum.is_some();
                 let selected = self.selected_fw.as_deref() == Some(dev.device_id.as_str());
                 let tone = if dev.update_available {
                     Style::WARN
@@ -899,6 +884,9 @@ impl SurfaceCardState {
                     _ => format!("{} ({})", dev.current_version, dev.plugin),
                 };
                 mde_egui::muted_note(ui, ver);
+                if dev.update_available && dev.available_checksum.is_none() {
+                    mde_egui::muted_note(ui, "no SHA-256; apply disabled");
+                }
             });
         }
 
@@ -929,14 +917,38 @@ impl SurfaceCardState {
 
         // The typed-armed apply control.
         if let Some(device_id) = self.selected_fw.clone() {
-            self.show_fw_apply_control(ui, &device_id);
+            if let Some(device) = inv
+                .devices
+                .iter()
+                .find(|device| device.device_id == device_id)
+            {
+                if let (Some(version), Some(checksum)) = (
+                    device.available_version.as_deref(),
+                    device.available_checksum.as_deref(),
+                ) {
+                    self.show_fw_apply_control(
+                        ui,
+                        &device.device_id,
+                        inv.publication.published_at_ms,
+                        version,
+                        checksum,
+                    );
+                }
+            }
         }
     }
 
     /// The SURFACE-5 typed-armed `fw-apply` control for the selected device:
     /// the arm-token input + an Apply button gated on the exact [`FW_ARM_TOKEN`]
     /// (lock #8 — a firmware apply is never automatic).
-    fn show_fw_apply_control(&mut self, ui: &mut egui::Ui, device_id: &str) {
+    fn show_fw_apply_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        device_id: &str,
+        inventory_published_at_ms: u64,
+        release_version: &str,
+        release_checksum: &str,
+    ) {
         ui.add_space(Style::SP_S);
         ui.horizontal(|ui| {
             ui.label(
@@ -961,13 +973,16 @@ impl SurfaceCardState {
                 )
                 .clicked()
             {
-                let unsigned = serde_json::to_string(&FwApplyRequest {
-                    schema_version: 1,
+                let node = self.node.as_deref().unwrap_or_default();
+                let unsigned = serde_json::to_string(&SurfaceFirmwareApplyRequest {
+                    header: surface_action_header(node),
                     device_id: device_id.to_string(),
+                    inventory_published_at_ms,
+                    release_version: release_version.to_string(),
+                    release_checksum: release_checksum.to_string(),
                     arm_token: Some(FW_ARM_TOKEN.to_string()),
                 })
                 .unwrap_or_default();
-                let node = self.node.as_deref().unwrap_or_default();
                 let body = match crate::iac::authorize_root_mutation_body(
                     &unsigned,
                     "surface-firmware-apply",
@@ -1026,17 +1041,17 @@ impl SurfaceCardState {
         }
         for row in &board.rows {
             ui.horizontal(|ui| {
-                mde_egui::status_dot(ui, row.state.tone());
+                mde_egui::status_dot(ui, probe_tone(row.state));
                 ui.add_space(Style::SP_XS);
                 ui.label(
-                    RichText::new(row.subsystem.label())
+                    RichText::new(shared_subsystem_label(row.subsystem))
                         .color(Style::TEXT)
                         .size(Style::SMALL),
                 );
                 ui.add_space(Style::SP_S);
                 ui.colored_label(
-                    row.state.tone(),
-                    RichText::new(row.state.word()).size(Style::SMALL),
+                    probe_tone(row.state),
+                    RichText::new(probe_word(row.state)).size(Style::SMALL),
                 );
             });
             ui.horizontal(|ui| {
@@ -1240,15 +1255,16 @@ fn show_scale_control(ui: &mut egui::Ui, ctrl: &mut DisplayController) {
 /// Discover this node's `<node>` id from the Bus: the summary topic
 /// `state/hardware/surface/<node>` (no further path segment) a Surface node
 /// publishes. `None` when no Surface summary exists (the model gate is closed).
-fn discover_node(persist: &Persist) -> Option<String> {
-    const PREFIX: &str = "state/hardware/surface/";
+fn discover_node(persist: &Persist, expected_node: &str) -> Option<String> {
+    if expected_node.trim().is_empty() {
+        return None;
+    }
+    let expected_topic = summary_topic(expected_node);
     let topics = persist.list_topics().ok()?;
-    topics.iter().find_map(|t| {
-        let rest = t.strip_prefix(PREFIX)?;
-        // The summary lane has no further '/' — the sub-lanes (/probes,
-        // /enable, /firmware, /fw-apply) do.
-        (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_string())
-    })
+    topics
+        .iter()
+        .any(|topic| topic == &expected_topic)
+        .then(|| expected_node.to_string())
 }
 
 /// Read the latest message on `topic`, advancing `cursor`, decoding into `slot`.
@@ -1272,12 +1288,155 @@ fn read_latest<T: for<'de> Deserialize<'de>>(
     }
 }
 
+fn read_latest_surface_summary(
+    persist: &Persist,
+    topic: &str,
+    expected_node: &str,
+    cursor: &mut Option<String>,
+    slot: &mut Option<SurfaceFleetSummary>,
+) {
+    let now_ms = wall_clock_ms();
+    read_latest_with(persist, topic, cursor, slot, |body| {
+        decode_surface_summary_at(body, expected_node, now_ms)
+    });
+}
+
+fn read_latest_surface_board(
+    persist: &Persist,
+    topic: &str,
+    expected_node: &str,
+    cursor: &mut Option<String>,
+    slot: &mut Option<SurfaceVerifyBoard>,
+) {
+    let now_ms = wall_clock_ms();
+    read_latest_with(persist, topic, cursor, slot, |body| {
+        decode_surface_board_at(body, expected_node, now_ms)
+    });
+}
+
+fn read_latest_surface_firmware(
+    persist: &Persist,
+    topic: &str,
+    expected_node: &str,
+    cursor: &mut Option<String>,
+    slot: &mut Option<SurfaceFirmwareInventory>,
+) {
+    let now_ms = wall_clock_ms();
+    read_latest_with(persist, topic, cursor, slot, |body| {
+        let mut value = SurfaceFirmwareInventory::from_json(body).ok()?;
+        admit_publication_freshness(&mut value.publication, expected_node, now_ms)?;
+        Some(value)
+    });
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn admit_publication_freshness(
+    publication: &mut mackes_mesh_types::surface_hardware::SurfacePublication,
+    expected_node: &str,
+    now_ms: u64,
+) -> Option<()> {
+    if publication.node != expected_node {
+        return None;
+    }
+    if matches!(publication.availability, SurfaceAvailability::Fresh) {
+        if publication.published_at_ms > now_ms.saturating_add(MAX_SURFACE_STATE_FUTURE_SKEW_MS) {
+            return None;
+        }
+        if now_ms.saturating_sub(publication.published_at_ms) > MAX_SURFACE_STATE_AGE_MS {
+            publication.availability = SurfaceAvailability::Stale {
+                reason: "no admitted Surface verification publication for 90 seconds".into(),
+            };
+        }
+    }
+    Some(())
+}
+
+fn decode_surface_summary_at(
+    body: &[u8],
+    expected_node: &str,
+    now_ms: u64,
+) -> Option<SurfaceFleetSummary> {
+    let mut value = SurfaceFleetSummary::from_json(body).ok()?;
+    admit_publication_freshness(&mut value.publication, expected_node, now_ms)?;
+    Some(value)
+}
+
+fn decode_surface_board_at(
+    body: &[u8],
+    expected_node: &str,
+    now_ms: u64,
+) -> Option<SurfaceVerifyBoard> {
+    let mut value = SurfaceVerifyBoard::from_json(body).ok()?;
+    admit_publication_freshness(&mut value.publication, expected_node, now_ms)?;
+    Some(value)
+}
+
+/// Read an untrusted Bus lane through its bounded contract decoder. The cursor
+/// advances over rejected messages so a hostile record cannot pin polling;
+/// the last admitted value remains visible until a valid replacement arrives.
+fn read_latest_with<T>(
+    persist: &Persist,
+    topic: &str,
+    cursor: &mut Option<String>,
+    slot: &mut Option<T>,
+    decode: impl Fn(&[u8]) -> Option<T>,
+) {
+    let Ok(msgs) = persist.list_since(topic, cursor.as_deref()) else {
+        return;
+    };
+    for msg in msgs {
+        *cursor = Some(msg.ulid.clone());
+        if let Some(body) = msg.body.as_deref() {
+            if let Some(decoded) = decode(body.as_bytes()) {
+                *slot = Some(decoded);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::surface_hardware::{
+        MAX_SURFACE_WIRE_BYTES, SurfaceModelIdentity, SurfaceObservationSource,
+        SurfaceProGeneration, SurfaceProbeVerdict, SurfacePublication,
+    };
     use mde_bus::persist::Persist;
-    use mde_egui::egui::{pos2, vec2, Rect};
     use mde_egui::PanelMode;
+    use mde_egui::egui::{Rect, pos2, vec2};
+
+    const ACTION_NOW_MS: u64 = 1_800_000_000_000;
+
+    fn test_action_header(request_id: &str) -> SurfaceActionHeader {
+        SurfaceActionHeader {
+            schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+            node: "this-node".into(),
+            request_id: request_id.into(),
+            issued_at_ms: ACTION_NOW_MS,
+            armed_token: None,
+        }
+    }
+
+    fn test_publication() -> SurfacePublication {
+        SurfacePublication {
+            schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+            node: "this-node".into(),
+            model: SurfaceModelIdentity {
+                product: "Surface Pro 6".into(),
+                generation: SurfaceProGeneration::Pro6,
+            },
+            source: SurfaceObservationSource::Kernel,
+            published_at_ms: ACTION_NOW_MS,
+            availability: SurfaceAvailability::Fresh,
+        }
+    }
 
     /// A recognised-Surface fixture state: a summary (the model gate open), a
     /// probe board, an enable result mid-MOK, a firmware inventory, and an
@@ -1288,30 +1447,29 @@ mod tests {
         SurfaceCardState {
             bus_root: None,
             node: Some("this-node".to_string()),
-            summary: Some(FleetSummary {
-                node: "this-node".to_string(),
-                model: "Surface Pro 7".to_string(),
+            summary: Some(SurfaceFleetSummary {
+                publication: test_publication(),
                 enablement_pct: 75,
                 red_count: 1,
-                red_subsystems: vec!["cameras".to_string()],
+                red_subsystems: vec![SurfaceSubsystem::Cameras],
             }),
-            board: Some(VerifyBoard {
-                model: "Surface Pro 7".to_string(),
+            board: Some(SurfaceVerifyBoard {
+                publication: test_publication(),
                 skipped: None,
                 rows: vec![
-                    SubsystemVerdict {
-                        subsystem: Subsystem::Touch,
-                        state: ProbeState::Ok,
+                    SurfaceProbeVerdict {
+                        subsystem: SurfaceSubsystem::Touch,
+                        state: SurfaceProbeState::Ok,
                         reason: "touchscreen enumerated (IPTS)".to_string(),
                     },
-                    SubsystemVerdict {
-                        subsystem: Subsystem::Pen,
-                        state: ProbeState::NeedsGesture,
+                    SurfaceProbeVerdict {
+                        subsystem: SurfaceSubsystem::Pen,
+                        state: SurfaceProbeState::NeedsGesture,
                         reason: "press the pen to the screen".to_string(),
                     },
-                    SubsystemVerdict {
-                        subsystem: Subsystem::Cameras,
-                        state: ProbeState::Failed,
+                    SurfaceProbeVerdict {
+                        subsystem: SurfaceSubsystem::Cameras,
+                        state: SurfaceProbeState::Failed,
                         reason: "no V4L2 capture device".to_string(),
                     },
                 ],
@@ -1339,15 +1497,19 @@ mod tests {
                     key_fingerprint: "SHA1:ab:cd:ef".to_string(),
                 },
             }),
-            firmware: Some(FirmwareInventory {
-                model: "Surface Pro 7".to_string(),
+            firmware: Some(SurfaceFirmwareInventory {
+                publication: SurfacePublication {
+                    source: SurfaceObservationSource::Fwupd,
+                    ..test_publication()
+                },
                 skipped: None,
-                devices: vec![FwDevice {
+                devices: vec![mackes_mesh_types::surface_hardware::SurfaceFirmwareDevice {
                     device_id: "dev-uefi".to_string(),
                     name: "System Firmware".to_string(),
                     plugin: "uefi_capsule".to_string(),
                     current_version: "1.2.9".to_string(),
                     available_version: Some("1.2.10".to_string()),
+                    available_checksum: Some("a".repeat(64)),
                     update_available: true,
                 }],
             }),
@@ -1445,98 +1607,30 @@ mod tests {
     }
 
     #[test]
-    fn mok_arm_is_gated_on_the_exact_typed_token() {
-        // The interlock: the reboot arms only when the typed token equals the
-        // daemon's echoed token (lock #6 — never automatic).
-        let mut s = fixture();
-        s.mok_arm_input = "wrong".to_string();
-        // The gate is the string equality the button uses. Pull the daemon's
-        // echoed arm token out of the fixture's mid-MOK state and prove it.
-        let mok = s
-            .enable
-            .as_ref()
-            .expect("fixture has an enable result")
-            .mok
-            .clone();
-        // No unwrap/panic: fall back to an empty token, then assert the fixture
-        // really is mid-MOK (the empty fallback would fail this).
-        let arm_token = match mok {
-            MokEnrollment::ImportedAwaitingArm { arm_token, .. } => arm_token,
-            _ => String::new(),
+    fn firmware_request_serialises_to_the_worker_wire_shape() {
+        let firmware = SurfaceFirmwareApplyRequest {
+            header: test_action_header("firmware-apply"),
+            device_id: "dev-uefi".to_string(),
+            inventory_published_at_ms: ACTION_NOW_MS,
+            release_version: "1.2.10".to_string(),
+            release_checksum: "a".repeat(64),
+            arm_token: Some(FW_ARM_TOKEN.to_string()),
         };
-        assert!(!arm_token.is_empty(), "fixture is constructed mid-MOK");
-        assert_ne!(
-            s.mok_arm_input.trim(),
-            arm_token,
-            "wrong token stays unarmed"
-        );
-        s.mok_arm_input = MOK_ARM_TOKEN.to_string();
-        assert_eq!(s.mok_arm_input.trim(), arm_token, "the exact token arms");
-    }
-
-    #[test]
-    fn enable_request_serialises_to_the_worker_wire_shape() {
-        // Activate (no arm) omits arm_token; the reboot-arming call carries it.
+        let firmware_json = serde_json::to_vec(&firmware).unwrap();
         assert_eq!(
-            serde_json::to_string(&EnableRequest {
-                schema_version: 1,
-                arm_token: None,
-            })
-            .unwrap(),
-            r#"{"schema_version":1}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&EnableRequest {
-                schema_version: 1,
-                arm_token: Some(MOK_ARM_TOKEN.to_string())
-            })
-            .unwrap(),
-            r#"{"schema_version":1,"arm_token":"REBOOT-TO-ENROLL-MOK"}"#
-        );
-        // fw-apply carries the device id + the firmware arm token.
-        assert_eq!(
-            serde_json::to_string(&FwApplyRequest {
-                schema_version: 1,
-                device_id: "dev-uefi".to_string(),
-                arm_token: Some(FW_ARM_TOKEN.to_string())
-            })
-            .unwrap(),
-            r#"{"schema_version":1,"device_id":"dev-uefi","arm_token":"APPLY-SURFACE-FIRMWARE"}"#
+            SurfaceFirmwareApplyRequest::from_json_at(&firmware_json, "this-node", ACTION_NOW_MS),
+            Ok(firmware)
         );
     }
 
     #[test]
-    fn enable_publisher_mints_exact_body_capability() {
-        let unsigned = serde_json::to_string(&EnableRequest {
-            schema_version: 1,
-            arm_token: None,
-        })
-        .unwrap();
-        let signed = crate::iac::authorize_root_mutation_body(
-            &unsigned,
-            "surface-enable",
-            "this-node",
-            "this-node",
-        )
-        .expect("test mint seam");
-        let body: serde_json::Value = serde_json::from_str(&signed).unwrap();
-        assert_eq!(body["schema_version"], serde_json::json!(1));
-        assert!(body["armed_token"].as_str().is_some());
-        assert_eq!(body["arm_token"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn state_mirrors_decode_the_worker_wire_bodies() {
-        // The daemon's default enum reprs decode into the local mirrors (§6 —
-        // the mirrors can't silently drift from the worker's serde shape).
-        let board: VerifyBoard = serde_json::from_str(
-            r#"{"model":"Surface Pro 7","skipped":null,"rows":[
-                {"subsystem":"Touch","state":"Ok","reason":"enumerated"},
-                {"subsystem":"Pen","state":"NeedsGesture","reason":"stroke the pen"}]}"#,
-        )
-        .expect("board decodes");
-        assert_eq!(board.rows[0].subsystem, Subsystem::Touch);
-        assert_eq!(board.rows[1].state, ProbeState::NeedsGesture);
+    fn shared_surface_state_decodes_the_worker_wire_bodies() {
+        let fixture = fixture();
+        let board_body = serde_json::to_vec(fixture.board.as_ref().unwrap()).unwrap();
+        let board = decode_surface_board_at(&board_body, "this-node", ACTION_NOW_MS)
+            .expect("board decodes");
+        assert_eq!(board.rows[0].subsystem, SurfaceSubsystem::Touch);
+        assert_eq!(board.rows[1].state, SurfaceProbeState::NeedsGesture);
 
         let mok: EnableResult = serde_json::from_str(
             r#"{"model":"Surface Pro 7","skipped":null,
@@ -1556,17 +1650,72 @@ mod tests {
             StepOutcome::Gated { .. }
         ));
 
-        let summary: FleetSummary = serde_json::from_str(
-            r#"{"node":"n","model":"Surface Go 2","enablement_pct":100,"red_count":0,"red_subsystems":[]}"#,
-        )
-        .expect("summary decodes");
-        assert_eq!(summary.enablement_pct, 100);
+        let summary_body = serde_json::to_vec(fixture.summary.as_ref().unwrap()).unwrap();
+        let summary = decode_surface_summary_at(&summary_body, "this-node", ACTION_NOW_MS)
+            .expect("summary decodes");
+        assert_eq!(summary.enablement_pct, 75);
     }
 
     #[test]
-    fn discover_node_finds_the_summary_lane_not_the_sub_lanes() {
-        // The summary topic (no trailing segment) is the model gate; the
-        // sub-lanes (/probes, /enable) must not be mistaken for it.
+    fn shared_surface_state_rejects_hostile_wire_bodies() {
+        let valid_board = serde_json::to_vec(fixture().board.as_ref().unwrap()).unwrap();
+        let valid_summary = serde_json::to_vec(fixture().summary.as_ref().unwrap()).unwrap();
+        assert!(decode_surface_board_at(&valid_board, "this-node", ACTION_NOW_MS).is_some());
+        assert!(decode_surface_summary_at(&valid_summary, "this-node", ACTION_NOW_MS).is_some());
+
+        let unknown_board = String::from_utf8(valid_board.clone()).unwrap().replacen(
+            "\"skipped\":null",
+            "\"skipped\":null,\"surprise\":true",
+            1,
+        );
+        assert!(
+            decode_surface_board_at(unknown_board.as_bytes(), "this-node", ACTION_NOW_MS).is_none()
+        );
+
+        let duplicate_summary = String::from_utf8(valid_summary.clone()).unwrap().replacen(
+            "\"enablement_pct\":75",
+            "\"enablement_pct\":75,\"enablement_pct\":75",
+            1,
+        );
+        assert!(
+            decode_surface_summary_at(duplicate_summary.as_bytes(), "this-node", ACTION_NOW_MS)
+                .is_none()
+        );
+
+        let oversized = vec![b' '; MAX_SURFACE_WIRE_BYTES + 1];
+        assert!(decode_surface_board_at(&oversized, "this-node", ACTION_NOW_MS).is_none());
+        assert!(decode_surface_summary_at(&oversized, "this-node", ACTION_NOW_MS).is_none());
+
+        assert!(decode_surface_board_at(&valid_board, "foreign-node", ACTION_NOW_MS).is_none());
+        assert!(decode_surface_summary_at(&valid_summary, "foreign-node", ACTION_NOW_MS).is_none());
+    }
+
+    #[test]
+    fn fresh_surface_state_ages_to_stale_and_future_state_is_refused() {
+        let summary_body = serde_json::to_vec(fixture().summary.as_ref().unwrap()).unwrap();
+        let stale = decode_surface_summary_at(
+            &summary_body,
+            "this-node",
+            ACTION_NOW_MS + MAX_SURFACE_STATE_AGE_MS + 1,
+        )
+        .expect("old state is retained with an honest stale label");
+        assert!(matches!(
+            stale.publication.availability,
+            SurfaceAvailability::Stale { .. }
+        ));
+        assert!(
+            decode_surface_summary_at(
+                &summary_body,
+                "this-node",
+                ACTION_NOW_MS - MAX_SURFACE_STATE_FUTURE_SKEW_MS - 1,
+            )
+            .is_none(),
+            "implausibly future state is refused"
+        );
+    }
+
+    #[test]
+    fn discover_node_requires_the_exact_local_summary_lane() {
         let dir = std::env::temp_dir().join(format!(
             "mde-surfcard-{}",
             std::time::SystemTime::now()
@@ -1585,13 +1734,53 @@ mod tests {
             .expect("write probes");
         persist
             .write(
+                "state/hardware/surface/remote-surface",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("write remote summary");
+        assert_eq!(discover_node(&persist, "anvil"), None);
+        persist
+            .write(
                 "state/hardware/surface/anvil",
                 Priority::Default,
                 None,
                 Some("{}"),
             )
-            .expect("write summary");
-        assert_eq!(discover_node(&persist).as_deref(), Some("anvil"));
+            .expect("write local summary");
+        assert_eq!(discover_node(&persist, "anvil").as_deref(), Some("anvil"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_clears_retained_surface_when_the_local_topic_is_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "mde-surfcard-clear-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let persist = Persist::open(dir.clone()).expect("open replacement bus");
+        persist
+            .write(
+                "state/hardware/surface/remote-only",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("write remote summary");
+
+        let mut state = fixture();
+        assert!(state.summary.is_some(), "fixture begins as a Surface");
+        state.bus_root = Some(dir.clone());
+        state.refresh();
+        assert!(state.node.is_none());
+        assert!(state.summary.is_none());
+        assert!(state.board.is_none());
+        assert!(state.firmware.is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

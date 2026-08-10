@@ -50,8 +50,11 @@
 # Fedora 42 matches the fleet's RPM channel (the gh-pages repo serves
 # fedora-$releasever; the mesh-service container image is FROM fedora:42 too).
 # Override with --build-arg BOOTC_BASE=… for an F43+ rebase.
-ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42
+ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:44@sha256:0000000000000000000000000000000000000000000000000000000000000000
 FROM ${BOOTC_BASE}
+ARG BOOTC_BASE
+ARG SURFACE_MANIFEST_SHA256
+ARG SURFACE_LOCK_SHA256
 
 # Two RPM lanes (build-image.sh drives this):
 #   repo  (default) — install magic-mesh from the GitHub-hosted dnf channel
@@ -152,8 +155,8 @@ RUN set -eux; \
 # baking it universally makes a Surface boot tablet-ready with NO day-2 kernel
 # surgery (lock 1: enablement rides the image; update = image swap) while costing
 # an idle non-Surface box nothing. Source = the canonical linux-surface project
-# (github.com/linux-surface); its Fedora channel is pkg.surfacelinux.com, packages
-# signed by the project key (surface.asc on the linux-surface GitHub repo).
+# (github.com/linux-surface). Only governed local artifacts from that project's
+# Fedora build lane are admitted; no mutable repository is consulted here.
 #   · kernel-surface     — the patched kernel + Surface modules (IPTS touch/pen,
 #                          SAM battery/thermal/perf, Type Cover, sensors/accel,
 #                          WiFi/BT quirks, S0ix suspend). A mainline superset — its
@@ -170,50 +173,58 @@ RUN set -eux; \
 #   · fwupd              — the LVFS firmware client the SURFACE-5 firmware panel
 #                          drives (UEFI / touch-controller / SAM); a standard
 #                          Fedora package, universal on every role.
-# The repo pins skip_if_unavailable so a transient mirror outage degrades to "no
-# surface packages" rather than failing the whole image build; gpgcheck stays ON
-# (packages are project-signed; repo_gpgcheck off matches upstream's repodata).
-# $releasever expands to the bootc base's Fedora release, so an F43 rebase tracks
-# the matching linux-surface channel. --allowerasing lets kernel-surface REPLACE
-# the base kernel (the intended single-kernel bootc image; the surface kernel is
-# the mainline superset described above). Network egress to pkg.surfacelinux.com +
-# raw.githubusercontent.com is needed here; airgapped builders point at a LAN mirror.
-# fwupd (base Fedora, the SURFACE-5 firmware panel + universal LVFS client) ALWAYS
-# installs. The linux-surface layer is BEST-EFFORT: the project publishes per-Fedora
-# repos on its own cadence, so a brand-new Fedora (e.g. f44 today → repomd 404) or an
-# offline builder must degrade to "no surface support" and STILL build a working image
-# — not hard-fail the whole ISO (the block's original `dnf -y install` betrayed the
-# skip_if_unavailable intent). The surface kernel swap only happens if the surface
-# packages actually installed. Inert on non-Surface hardware either way (lock 10).
+# Surface support is a required image invariant. The build driver admits only a
+# complete local artifact bundle: one SHA-256-pinned signing key plus exactly
+# five SHA-256/NEVRA/signer-pinned RPMs. No live Surface repository or mutable
+# network key participates in image composition. The lock and manifest hashes
+# are build arguments so direct Containerfile callers cannot substitute either.
+COPY packaging/surface/surface-stack.f44.json /usr/share/magic-mesh/surface-stack.f44.json
+COPY packaging/surface/.surface-install.lock /usr/share/magic-mesh/surface-install.lock
+COPY packaging/surface/artifacts/ /tmp/surface-artifacts/
 RUN set -eux; \
+    test -n "${SURFACE_MANIFEST_SHA256}"; \
+    test -n "${SURFACE_LOCK_SHA256}"; \
+    echo "${SURFACE_MANIFEST_SHA256}  /usr/share/magic-mesh/surface-stack.f44.json" | sha256sum -c -; \
+    echo "${SURFACE_LOCK_SHA256}  /usr/share/magic-mesh/surface-install.lock" | sha256sum -c -; \
+    test "$(awk -F '\t' '$1 == "MANIFEST" {print $2}' /usr/share/magic-mesh/surface-install.lock)" = "${SURFACE_MANIFEST_SHA256}"; \
+    test "$(awk -F '\t' '$1 == "BASE" {print $2}' /usr/share/magic-mesh/surface-install.lock)" = "${BOOTC_BASE}"; \
+    test "$(rpm -E %fedora)" = 44 || { \
+        echo 'Surface stack provenance targets Fedora 44; refusing a different bootc base' >&2; \
+        exit 1; \
+    }; \
     dnf -y install fwupd; \
-    if rpm --import https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc 2>/dev/null; then \
-        printf '%s\n' \
-            '[linux-surface]' \
-            'name=linux-surface' \
-            'baseurl=https://pkg.surfacelinux.com/fedora/f$releasever/' \
-            'enabled=1' \
-            'gpgcheck=1' \
-            'repo_gpgcheck=0' \
-            'skip_if_unavailable=1' \
-            'gpgkey=https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc' \
-            > /etc/yum.repos.d/linux-surface.repo; \
-        if dnf -y install --allowerasing \
-                kernel-surface iptsd libwacom-surface \
-                surface-control surface-secureboot; then \
-            base_kernels="$(rpm -qa \
-                kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra \
-                | grep -v surface || true)"; \
-            if [ -n "${base_kernels}" ]; then dnf -y remove ${base_kernels}; fi; \
-            echo "SURFACE-1: linux-surface layer installed for f$(rpm -E %fedora)"; \
-        else \
-            echo "SURFACE-1: no linux-surface packages for f$(rpm -E %fedora) (project hasn't published this Fedora yet) — building WITHOUT surface tablet support; harmless on non-Surface hardware, re-add when the channel exists"; \
-            rm -f /etc/yum.repos.d/linux-surface.repo; \
-        fi; \
-    else \
-        echo "SURFACE-1: cannot import the linux-surface key (offline builder?) — skipping the surface layer"; \
-    fi; \
-    dnf clean all
+    key_sha="$(awk -F '\t' '$1 == "KEY" {print $2}' /usr/share/magic-mesh/surface-install.lock)"; \
+    key_fpr="$(awk -F '\t' '$1 == "KEY" {print $3}' /usr/share/magic-mesh/surface-install.lock)"; \
+    key_file="$(awk -F '\t' '$1 == "KEY" {print $4}' /usr/share/magic-mesh/surface-install.lock)"; \
+    test -n "${key_sha}"; test -n "${key_fpr}"; \
+    case "${key_file}" in ''|*[!A-Za-z0-9._+~-]*) exit 1;; esac; \
+    echo "${key_sha}  /tmp/surface-artifacts/${key_file}" | sha256sum -c -; \
+    rpm --import "/tmp/surface-artifacts/${key_file}"; \
+    test "$(awk -F '\t' '$1 == "SOURCE" {count++} END {print count+0}' /usr/share/magic-mesh/surface-install.lock)" = 5; \
+    while IFS="$(printf '\t')" read -r kind source_sha source_file; do \
+        test "${kind}" = SOURCE || continue; \
+        case "${source_file}" in ''|*[!A-Za-z0-9._+~-]*) exit 1;; esac; \
+        echo "${source_sha}  /tmp/surface-artifacts/${source_file}" | sha256sum -c -; \
+    done < /usr/share/magic-mesh/surface-install.lock; \
+    test "$(awk -F '\t' '$1 == "RPM" {count++} END {print count+0}' /usr/share/magic-mesh/surface-install.lock)" = 5; \
+    while IFS="$(printf '\t')" read -r kind rpm_sha rpm_nevra rpm_fpr rpm_file; do \
+        test "${kind}" = RPM || continue; \
+        case "${rpm_file}" in ''|*[!A-Za-z0-9._+~-]*|*.rpm.rpm) exit 1;; esac; \
+        case "${rpm_file}" in *.rpm) :;; *) exit 1;; esac; \
+        test "${rpm_fpr}" = "${key_fpr}"; \
+        echo "${rpm_sha}  /tmp/surface-artifacts/${rpm_file}" | sha256sum -c -; \
+        test "$(rpm -qp --qf '%{NAME}-%|EPOCH?{%{EPOCH}:}:{}|%{VERSION}-%{RELEASE}.%{ARCH}' "/tmp/surface-artifacts/${rpm_file}")" = "${rpm_nevra}"; \
+        rpmkeys --checksig --verbose "/tmp/surface-artifacts/${rpm_file}"; \
+    done < /usr/share/magic-mesh/surface-install.lock; \
+    test "$(find /tmp/surface-artifacts -maxdepth 1 -type f ! -name .gitkeep | wc -l)" = 11; \
+    dnf -y install --allowerasing /tmp/surface-artifacts/*.rpm; \
+    base_kernels="$(rpm -qa \
+        kernel kernel-core kernel-modules kernel-modules-core kernel-modules-extra \
+        | grep -v surface || true)"; \
+    if [ -n "${base_kernels}" ]; then dnf -y remove ${base_kernels}; fi; \
+    echo "SURFACE-1: required linux-surface layer installed for f$(rpm -E %fedora)"; \
+    dnf clean all; \
+    rm -rf /tmp/surface-artifacts
 
 # BOOTC-COMPLETENESS (2026-07-21, operator: "go full Atomic — complete runtime +
 # full virt") — the runtime pieces the base RPM Requires CANNOT express, per the

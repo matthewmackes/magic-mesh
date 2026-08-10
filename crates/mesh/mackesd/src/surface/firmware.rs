@@ -24,12 +24,24 @@
 //!
 //! **Every fwupd call sits behind the injectable [`Fwupd`] seam.** The JSON
 //! parse is a pure fold ([`inventory_from_json`]) unit-tested with fixtures;
-//! the production seam ([`LiveFwupd`]) is integration-gated — an honest typed
-//! [`FwError::IntegrationGated`] when fwupd/network is absent (§7 — it never
-//! fakes an update, and §9 — the typed verb layer, no raw shell string
-//! escapes this module). §6-clean: it stays wholly in mackesd.
+//! the production seam ([`LiveFwupd`]) invokes only fixed `/usr/bin/fwupdmgr`
+//! read argv with a locale, time, and output bound. Apply remains fail-closed
+//! after binding a fresh inventory publication, exact release, and SHA-256:
+//! the production exact-release install seam is not implemented yet.
+//! §6-clean: it stays wholly in mackesd.
+
+use std::io::{self, Read};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+use mackes_mesh_types::surface_hardware::{
+    SURFACE_HARDWARE_SCHEMA_VERSION, SurfaceAvailability, SurfaceFirmwareDevice,
+    SurfaceFirmwareInventory, SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration,
+    SurfacePublication,
+};
 
 use super::{SurfaceDetection, SurfaceModel};
 
@@ -41,15 +53,23 @@ use super::{SurfaceDetection, SurfaceModel};
 /// [`super::enable::MOK_ARM_TOKEN`] interlock.
 pub const FW_ARM_TOKEN: &str = "APPLY-SURFACE-FIRMWARE";
 
+const FWUPDMGR: &str = "/usr/bin/fwupdmgr";
+const GET_DEVICES_ARGS: [&str; 3] = ["get-devices", "--json", "--no-unreported-check"];
+const GET_UPDATES_ARGS: [&str; 3] = ["get-updates", "--json", "--no-unreported-check"];
+const FWUPD_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const FWUPD_POLL: Duration = Duration::from_millis(25);
+const MAX_FWUPD_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_FWUPD_DEVICES: usize = 64;
+const MAX_FWUPD_FIELD_BYTES: usize = 512;
+
 // ─────────────────────────────── the seam ───────────────────────────────────
 
 /// A typed failure from the [`Fwupd`] seam — mirrors
 /// [`super::enable::EnableError`]'s honest split.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FwError {
-    /// The live fwupd call isn't wired to real hardware/network yet — the
-    /// honest answer on any non-Surface dev box / headless CI (§7: never a
-    /// faked update). `action` names what was gated.
+    /// A mutating fwupd action is deliberately unavailable because its shared
+    /// authority contract is not strong enough yet.
     IntegrationGated {
         /// The fwupd action that is integration-gated.
         action: String,
@@ -86,9 +106,8 @@ impl std::error::Error for FwError {}
 ///
 /// # Errors
 ///
-/// Each method returns [`FwError::IntegrationGated`] when the live call is
-/// integration-gated (no fwupd / no Surface) and [`FwError::Failed`] on a
-/// concrete failure.
+/// Reads return [`FwError::Failed`] for missing binaries, timeouts, bad status,
+/// oversized output, or malformed JSON. Mutation remains integration-gated.
 pub trait Fwupd {
     /// Raw `fwupdmgr get-devices --json` output (the full inventory).
     ///
@@ -101,39 +120,170 @@ pub trait Fwupd {
     /// # Errors
     /// The seam's typed [`FwError`] (gated / failed) — see the trait docs.
     fn get_updates_json(&self) -> Result<String, FwError>;
-    /// Apply the pending update for `device_id` (`fwupdmgr update <id>`). Only
-    /// ever called after the typed arm matched.
+    /// Future exact-bound apply seam. Production refuses this until the shared
+    /// request includes inventory generation, release, and checksum bindings.
     ///
     /// # Errors
     /// The seam's typed [`FwError`] (gated / failed) — see the trait docs.
-    fn apply_update(&self, device_id: &str) -> Result<(), FwError>;
+    fn apply_update(
+        &self,
+        device_id: &str,
+        release_version: &str,
+        release_checksum: &str,
+    ) -> Result<(), FwError>;
 }
 
-/// The production seam. **Integration-gated** (lock #8).
-///
-/// Every live fwupd call returns an honest [`FwError::IntegrationGated`] until
-/// it's wired to a real fwupd/LVFS at integration — never a faked update. The
-/// pure parse + apply fold is fully exercised behind [`Fwupd`] with a fake.
+/// The production seam. Reads use fixed, bounded `/usr/bin/fwupdmgr` argv.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveFwupd;
 
 impl LiveFwupd {
-    fn gated<T>(action: impl Into<String>) -> Result<T, FwError> {
-        Err(FwError::IntegrationGated {
-            action: action.into(),
+    fn read_json(action: &str, args: &[&str]) -> Result<String, FwError> {
+        let output = run_fwupdmgr(args).map_err(|error| FwError::Failed {
+            action: action.to_string(),
+            detail: error.to_string(),
+        })?;
+        if !output.status.success() {
+            return Err(FwError::Failed {
+                action: action.to_string(),
+                detail: bounded_text(&output.stderr),
+            });
+        }
+        if output.stdout_truncated {
+            return Err(FwError::Failed {
+                action: action.to_string(),
+                detail: format!("stdout exceeded {MAX_FWUPD_OUTPUT_BYTES} bytes"),
+            });
+        }
+        if output.stderr_truncated {
+            return Err(FwError::Failed {
+                action: action.to_string(),
+                detail: format!("stderr exceeded {MAX_FWUPD_OUTPUT_BYTES} bytes"),
+            });
+        }
+        String::from_utf8(output.stdout).map_err(|error| FwError::Failed {
+            action: action.to_string(),
+            detail: format!("stdout was not UTF-8: {error}"),
         })
     }
 }
 
 impl Fwupd for LiveFwupd {
     fn get_devices_json(&self) -> Result<String, FwError> {
-        Self::gated("fwupdmgr get-devices")
+        Self::read_json("fwupdmgr get-devices", &GET_DEVICES_ARGS)
     }
     fn get_updates_json(&self) -> Result<String, FwError> {
-        Self::gated("fwupdmgr get-updates")
+        Self::read_json("fwupdmgr get-updates", &GET_UPDATES_ARGS)
     }
-    fn apply_update(&self, device_id: &str) -> Result<(), FwError> {
-        Self::gated(format!("fwupdmgr update {device_id}"))
+    fn apply_update(
+        &self,
+        _device_id: &str,
+        _release_version: &str,
+        _release_checksum: &str,
+    ) -> Result<(), FwError> {
+        Err(FwError::IntegrationGated {
+            action: "fwupdmgr exact-release install is not implemented".into(),
+        })
+    }
+}
+
+struct FwupdOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_bounded(mut reader: impl Read) -> io::Result<Captured> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(Captured { bytes, truncated });
+        }
+        let keep = count.min(MAX_FWUPD_OUTPUT_BYTES.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..keep]);
+        truncated |= keep != count;
+    }
+}
+
+fn reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_fwupdmgr(args: &[&str]) -> io::Result<FwupdOutput> {
+    let mut child = Command::new(FWUPDMGR)
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        reap(&mut child);
+        io::Error::other("fwupdmgr stdout pipe unavailable")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        reap(&mut child);
+        io::Error::other("fwupdmgr stderr pipe unavailable")
+    })?;
+    let stdout_reader = thread::spawn(move || read_bounded(stdout));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr));
+    let deadline = Instant::now() + FWUPD_READ_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                reap(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            reap(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "fwupdmgr exceeded 20 second timeout",
+            ));
+        }
+        thread::sleep(FWUPD_POLL);
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("fwupdmgr stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("fwupdmgr stderr reader panicked"))??;
+    Ok(FwupdOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    })
+}
+
+fn bounded_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        "fwupdmgr exited unsuccessfully without diagnostics".into()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -167,6 +317,8 @@ struct RawDevice {
 struct RawRelease {
     #[serde(default, rename = "Version")]
     version: String,
+    #[serde(default, rename = "Checksum")]
+    checksums: Vec<String>,
 }
 
 /// One updatable firmware component on the node — the Install tab's row.
@@ -182,6 +334,8 @@ pub struct FwDevice {
     pub current_version: String,
     /// The newest available version, when fwupd reports a release for it.
     pub available_version: Option<String>,
+    /// SHA-256 of the exact available cabinet, when fwupd publishes one.
+    pub available_checksum: Option<String>,
     /// Whether the available version is a genuine update over the current one
     /// (see [`version_newer`]) — the field the panel's "Update" button gates
     /// on. A present-but-not-newer release is honestly *not* an update.
@@ -229,6 +383,18 @@ pub fn inventory_from_json(
     devices_json: &str,
     updates_json: &str,
 ) -> Result<Vec<FwDevice>, FwError> {
+    mackes_mesh_types::workloads::reject_duplicate_json_keys(devices_json).map_err(|error| {
+        FwError::Failed {
+            action: "parse fwupdmgr get-devices".into(),
+            detail: error.to_string(),
+        }
+    })?;
+    mackes_mesh_types::workloads::reject_duplicate_json_keys(updates_json).map_err(|error| {
+        FwError::Failed {
+            action: "parse fwupdmgr get-updates".into(),
+            detail: error.to_string(),
+        }
+    })?;
     let devices: RawDeviceList =
         serde_json::from_str(devices_json).map_err(|e| FwError::Failed {
             action: "parse fwupdmgr get-devices".to_string(),
@@ -239,7 +405,49 @@ pub fn inventory_from_json(
             action: "parse fwupdmgr get-updates".to_string(),
             detail: e.to_string(),
         })?;
+    validate_raw_inventory(&devices.devices, "get-devices")?;
+    validate_raw_inventory(&updates.devices, "get-updates")?;
     Ok(merge_inventory(&devices.devices, &updates.devices))
+}
+
+fn validate_raw_inventory(devices: &[RawDevice], source: &str) -> Result<(), FwError> {
+    if devices.len() > MAX_FWUPD_DEVICES {
+        return Err(FwError::Failed {
+            action: format!("parse fwupdmgr {source}"),
+            detail: format!("device count exceeds {MAX_FWUPD_DEVICES}"),
+        });
+    }
+    let mut ids = std::collections::HashSet::new();
+    for device in devices {
+        let valid = [&device.device_id, &device.name, &device.version]
+            .into_iter()
+            .all(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= MAX_FWUPD_FIELD_BYTES
+                    && !value.chars().any(char::is_control)
+            })
+            && (device.plugin.is_empty()
+                || (device.plugin.len() <= MAX_FWUPD_FIELD_BYTES
+                    && !device.plugin.chars().any(char::is_control)))
+            && device.releases.len() <= MAX_FWUPD_DEVICES
+            && device.releases.iter().all(|release| {
+                !release.version.trim().is_empty()
+                    && release.version.len() <= MAX_FWUPD_FIELD_BYTES
+                    && !release.version.chars().any(char::is_control)
+                    && release.checksums.len() <= 8
+                    && release.checksums.iter().all(|checksum| {
+                        matches!(checksum.len(), 40 | 64)
+                            && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            });
+        if !valid || !ids.insert(device.device_id.as_str()) {
+            return Err(FwError::Failed {
+                action: format!("parse fwupdmgr {source}"),
+                detail: "invalid, oversized, or duplicate firmware row".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Merge the raw device list with the raw update list (pure). Kept separate
@@ -250,12 +458,20 @@ fn merge_inventory(devices: &[RawDevice], updates: &[RawDevice]) -> Vec<FwDevice
         .map(|dev| {
             // The available release is the update list's first `Releases`
             // entry for this device id (fwupd lists the newest first).
-            let available_version = updates
+            let available_release = updates
                 .iter()
                 .find(|u| u.device_id == dev.device_id)
-                .and_then(|u| u.releases.first())
-                .map(|r| r.version.clone())
-                .filter(|v| !v.is_empty());
+                .and_then(|u| u.releases.first());
+            let available_version = available_release
+                .map(|release| release.version.clone())
+                .filter(|version| !version.is_empty());
+            let available_checksum = available_release.and_then(|release| {
+                release
+                    .checksums
+                    .iter()
+                    .find(|checksum| checksum.len() == 64)
+                    .map(|checksum| checksum.to_ascii_lowercase())
+            });
             let update_available = available_version
                 .as_deref()
                 .is_some_and(|av| version_newer(av, &dev.version));
@@ -265,6 +481,7 @@ fn merge_inventory(devices: &[RawDevice], updates: &[RawDevice]) -> Vec<FwDevice
                 plugin: dev.plugin.clone(),
                 current_version: dev.version.clone(),
                 available_version,
+                available_checksum,
                 update_available,
             }
         })
@@ -329,12 +546,10 @@ pub fn run_inventory(fwupd: &impl Fwupd, detection: &SurfaceDetection) -> Firmwa
         Ok(j) => j,
         Err(e) => return FirmwareInventory::skipped(model, e.to_string()),
     };
-    // The updates read is best-effort: if fwupd can't tell us what has an
-    // update we still show the inventory (every device just reads "up to date"
-    // honestly), never a fabricated available version.
-    let updates_json = fwupd
-        .get_updates_json()
-        .unwrap_or_else(|_| EMPTY_DEVICE_LIST.to_string());
+    let updates_json = match fwupd.get_updates_json() {
+        Ok(json) => json,
+        Err(error) => return FirmwareInventory::skipped(model, error.to_string()),
+    };
 
     match inventory_from_json(&devices_json, &updates_json) {
         Ok(devices) => FirmwareInventory {
@@ -344,6 +559,57 @@ pub fn run_inventory(fwupd: &impl Fwupd, detection: &SurfaceDetection) -> Firmwa
         },
         Err(e) => FirmwareInventory::skipped(model, e.to_string()),
     }
+}
+
+fn shared_inventory(
+    node: &str,
+    detection: &SurfaceDetection,
+    inventory: &FirmwareInventory,
+    published_at_ms: u64,
+) -> Result<SurfaceFirmwareInventory, mackes_mesh_types::surface_hardware::SurfaceContractError> {
+    let generation = match &detection.model {
+        SurfaceModel::Known(device) => device.contract_generation,
+        SurfaceModel::UnknownSurface { .. } | SurfaceModel::NotASurface => {
+            SurfaceProGeneration::Unsupported
+        }
+    };
+    let availability = inventory
+        .skipped
+        .as_ref()
+        .map_or(SurfaceAvailability::Fresh, |reason| {
+            SurfaceAvailability::Unavailable {
+                reason: reason.clone(),
+            }
+        });
+    let value = SurfaceFirmwareInventory {
+        publication: SurfacePublication {
+            schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+            node: node.to_string(),
+            model: SurfaceModelIdentity {
+                product: inventory.model.clone(),
+                generation,
+            },
+            source: SurfaceObservationSource::Fwupd,
+            published_at_ms,
+            availability,
+        },
+        skipped: inventory.skipped.clone(),
+        devices: inventory
+            .devices
+            .iter()
+            .map(|device| SurfaceFirmwareDevice {
+                device_id: device.device_id.clone(),
+                name: device.name.clone(),
+                plugin: device.plugin.clone(),
+                current_version: device.current_version.clone(),
+                available_version: device.available_version.clone(),
+                available_checksum: device.available_checksum.clone(),
+                update_available: device.update_available,
+            })
+            .collect(),
+    };
+    value.validate()?;
+    Ok(value)
 }
 
 /// An empty fwupd device envelope — the honest fallback when the updates read
@@ -420,18 +686,22 @@ impl ApplyResult {
 /// when the operator typed the exact [`FW_ARM_TOKEN`].
 ///
 /// Reuses SURFACE-3's [`super::enable::is_armed`] interlock. An un-armed call
-/// is **refused** and nothing runs (lock #8 — never an auto-apply). A
-/// successful apply sets `reverify` so the worker re-runs SURFACE-4's verify.
-/// Pure control flow over the injectable [`Fwupd`] seam; production hands
-/// [`LiveFwupd`] (integration-gated).
+/// is **refused** and nothing runs (lock #8 — never an auto-apply).
+/// The selected inventory publication must still be fresh, and an immediate
+/// fwupd re-read must reproduce the exact device, release, and SHA-256 binding
+/// before the provider seam is allowed to mutate anything.
 #[must_use]
 pub fn run_apply(
     fwupd: &impl Fwupd,
     detection: &SurfaceDetection,
     device_id: &str,
     arm: Option<&str>,
+    inventory_published_at_ms: u64,
+    now_ms: u64,
+    release_version: &str,
+    release_checksum: &str,
 ) -> ApplyResult {
-    let model = match &detection.model {
+    let (model, generation) = match &detection.model {
         SurfaceModel::NotASurface => {
             return ApplyResult::skipped("", device_id, "not a Microsoft Surface");
         }
@@ -442,8 +712,19 @@ pub fn run_apply(
                 &format!("unrecognised Surface: {product} (no per-model profile)"),
             );
         }
-        SurfaceModel::Known(dev) => dev.product.clone(),
+        SurfaceModel::Known(dev) => (dev.product.clone(), dev.contract_generation),
     };
+
+    if !matches!(
+        generation,
+        SurfaceProGeneration::Pro5 | SurfaceProGeneration::Pro6
+    ) {
+        return ApplyResult::skipped(
+            model,
+            device_id,
+            "Surface generation is not admitted by the Pro 5/6 firmware contract",
+        );
+    }
 
     // The typed-arm interlock: no matching token → refuse, run nothing.
     if !super::enable::is_armed(arm, FW_ARM_TOKEN) {
@@ -458,13 +739,56 @@ pub fn run_apply(
         };
     }
 
-    let outcome = match fwupd.apply_update(device_id) {
+    let binding_invalid = inventory_published_at_ms == 0
+        || inventory_published_at_ms
+            > now_ms.saturating_add(
+                mackes_mesh_types::surface_hardware::MAX_SURFACE_ACTION_FUTURE_SKEW_MS,
+            )
+        || now_ms.saturating_sub(inventory_published_at_ms)
+            > mackes_mesh_types::surface_hardware::MAX_SURFACE_STATE_AGE_MS
+        || release_version.trim().is_empty()
+        || release_checksum.len() != 64
+        || !release_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if binding_invalid {
+        return ApplyResult {
+            model,
+            skipped: None,
+            device_id: device_id.to_string(),
+            outcome: ApplyOutcome::Refused {
+                reason: "firmware apply selection is stale or has an invalid release binding"
+                    .into(),
+            },
+            reverify: false,
+        };
+    }
+
+    let fresh = run_inventory(fwupd, detection);
+    let Some(device) = fresh.devices.iter().find(|device| {
+        device.device_id == device_id
+            && device.update_available
+            && device.available_version.as_deref() == Some(release_version)
+            && device.available_checksum.as_deref() == Some(release_checksum)
+    }) else {
+        return ApplyResult {
+            model,
+            skipped: None,
+            device_id: device_id.to_string(),
+            outcome: ApplyOutcome::Refused {
+                reason: fresh.skipped.unwrap_or_else(|| {
+                    "firmware release changed or no longer matches the selected SHA-256".into()
+                }),
+            },
+            reverify: false,
+        };
+    };
+
+    let outcome = match fwupd.apply_update(&device.device_id, release_version, release_checksum) {
         Ok(()) => ApplyOutcome::Applied,
-        Err(e @ FwError::IntegrationGated { .. }) => ApplyOutcome::Gated {
-            reason: e.to_string(),
-        },
-        Err(e @ FwError::Failed { .. }) => ApplyOutcome::Failed {
-            reason: e.to_string(),
+        Err(FwError::IntegrationGated { action }) => ApplyOutcome::Gated { reason: action },
+        Err(FwError::Failed { action, detail }) => ApplyOutcome::Failed {
+            reason: format!("{action}: {detail}"),
         },
     };
     let reverify = outcome.triggers_reverify();
@@ -482,8 +806,8 @@ pub fn run_apply(
 
 #[cfg(feature = "async-services")]
 pub use worker::{
-    fw_apply_topic, fw_result_topic, inventory_topic, FwApplyRequest, SurfaceFirmwareWorker,
-    FW_ACTION_AUTH_VERB,
+    FW_ACTION_AUTH_VERB, FwApplyRequest, SurfaceFirmwareWorker, fw_apply_topic, fw_result_topic,
+    inventory_topic,
 };
 
 #[cfg(feature = "async-services")]
@@ -492,7 +816,7 @@ mod worker {
     //! it reads + updates only its own firmware, never a remote node). Each
     //! tick it publishes the fwupd inventory to [`inventory_topic`]; it drains
     //! [`fw_apply_topic`] for typed-armed apply requests, runs
-    //! [`super::run_apply`] against the integration-gated [`super::LiveFwupd`],
+    //! [`super::run_apply`] against [`super::LiveFwupd`],
     //! publishes the [`super::ApplyResult`] to [`fw_result_topic`], and on a
     //! successful apply re-runs SURFACE-4's verify (reusing
     //! [`crate::surface::verify::run_verify`]) and re-publishes the board +
@@ -500,18 +824,18 @@ mod worker {
 
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    pub use mackes_mesh_types::surface_hardware::SurfaceFirmwareApplyRequest as FwApplyRequest;
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
-    use serde::{Deserialize, Serialize};
 
-    use super::{run_apply, run_inventory, ApplyResult, LiveFwupd, SurfaceModel};
+    use super::{ApplyResult, LiveFwupd, SurfaceModel, run_apply, run_inventory, shared_inventory};
     use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::verify::{
-        board_topic, run_verify, summarize, summary_topic, LiveSurfaceProbes,
+        LiveSurfaceProbes, board_topic, run_verify, shared_board, shared_summary, summary_topic,
     };
-    use crate::surface::{detect, SurfaceDetection};
+    use crate::surface::{SurfaceDetection, detect};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Poll cadence — firmware is operator-driven + slow-moving, so a modest
@@ -541,25 +865,6 @@ mod worker {
     #[must_use]
     pub fn fw_result_topic(node: &str) -> String {
         format!("state/hardware/surface/{node}/fw-apply")
-    }
-
-    /// The fw-apply request envelope. `device_id` names the fwupd device;
-    /// `arm_token` carries the operator-typed [`super::FW_ARM_TOKEN`] that
-    /// arms the apply (absent = a refused dry request).
-    ///
-    /// The raw JSON body must additionally carry `schema_version: 1` and an
-    /// `armed_token` minted by the shared [`ActionAuthorizer`] for
-    /// [`FW_ACTION_AUTH_VERB`], this node id, and `device_id`. The shared gate
-    /// authenticates the exact raw body before this typed payload reaches
-    /// [`run_apply`]; `armed_token` is intentionally not copied into this
-    /// struct so it cannot be confused with the human typed interlock.
-    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FwApplyRequest {
-        /// The fwupd device id to update.
-        pub device_id: String,
-        /// The typed arming token (present only to actually apply).
-        #[serde(default)]
-        pub arm_token: Option<String>,
     }
 
     /// The per-node `surface_firmware` worker.
@@ -628,7 +933,15 @@ mod worker {
         /// against a temp Bus without the run loop/clock.
         fn publish_inventory(&self, persist: &Persist) {
             let inventory = run_inventory(&LiveFwupd, &self.detection);
-            publish(persist, &inventory_topic(&self.node_id), &inventory);
+            match shared_inventory(&self.node_id, &self.detection, &inventory, wall_now_ms()) {
+                Ok(inventory) => publish(persist, &inventory_topic(&self.node_id), &inventory),
+                Err(error) => tracing::warn!(
+                    target: "mackesd::surface_firmware",
+                    node = %self.node_id,
+                    %error,
+                    "refusing invalid Surface firmware publication"
+                ),
+            }
         }
 
         /// Drain any new fw-apply requests, run the typed-armed verb, publish
@@ -658,13 +971,18 @@ mod worker {
             let Some(body) = body else {
                 return self.refused_result("", "firmware apply request body is missing");
             };
-            let req = match serde_json::from_str::<FwApplyRequest>(body) {
-                Ok(req) => req,
-                Err(_) => {
-                    return self
-                        .refused_result("", "firmware apply request is not a valid JSON object")
-                }
-            };
+            let req =
+                match FwApplyRequest::from_json_at(body.as_bytes(), &self.node_id, wall_now_ms()) {
+                    Ok(req) => req,
+                    Err(error) => {
+                        return self.refused_result(
+                            "",
+                            &format!(
+                                "firmware apply request failed shared contract admission: {error}"
+                            ),
+                        );
+                    }
+                };
             let device_id = req.device_id.trim();
             if device_id.is_empty() {
                 return self
@@ -693,6 +1011,10 @@ mod worker {
                 &self.detection,
                 device_id,
                 req.arm_token.as_deref(),
+                req.inventory_published_at_ms,
+                wall_now_ms(),
+                &req.release_version,
+                &req.release_checksum,
             )
         }
 
@@ -722,11 +1044,33 @@ mod worker {
         /// (reusing verify's own hook), so the Test tab + fleet rollup reflect
         /// the freshly-applied firmware.
         fn reverify(&self, persist: &Persist) {
-            let board = run_verify(&LiveSurfaceProbes, &self.detection);
-            publish(persist, &board_topic(&self.node_id), &board);
-            let summary = summarize(&self.node_id, &board);
-            publish(persist, &summary_topic(&self.node_id), &summary);
+            let private = run_verify(&LiveSurfaceProbes, &self.detection);
+            match shared_board(&self.node_id, &self.detection, &private, wall_now_ms()) {
+                Ok(board) => {
+                    publish(persist, &board_topic(&self.node_id), &board);
+                    publish(
+                        persist,
+                        &summary_topic(&self.node_id),
+                        &shared_summary(&board),
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    target: "mackesd::surface_firmware",
+                    node = %self.node_id,
+                    %error,
+                    "refusing invalid post-firmware Surface verification publication"
+                ),
+            }
         }
+    }
+
+    fn wall_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     /// Publish a serializable payload to `topic` (best-effort; a failed write
@@ -794,10 +1138,9 @@ mod worker {
         use std::sync::Arc;
 
         use super::*;
-        use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
-        use crate::surface::firmware::{ApplyOutcome, FirmwareInventory};
-        use crate::surface::verify::VerifyBoard;
-        use crate::surface::{identify, DmiInfo, MS_VENDOR};
+        use crate::ipc::action_auth::{ActionAuthorizer, MutationContext, authorize_test_body};
+        use crate::surface::firmware::ApplyOutcome;
+        use crate::surface::{DmiInfo, MS_VENDOR, identify};
 
         const AUTH_KEY: &[u8] = b"surface-firmware-action-auth-test-key";
         const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -856,12 +1199,22 @@ mod worker {
             arm_token: Option<&str>,
             nonce: &str,
         ) -> String {
-            let unsigned = serde_json::json!({
-                "schema_version": 1,
-                "device_id": device_id,
-                "arm_token": arm_token,
+            let unsigned = serde_json::to_string(&FwApplyRequest {
+                header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
+                    schema_version:
+                        mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: node.to_string(),
+                    request_id: nonce.to_string(),
+                    issued_at_ms: wall_now_ms(),
+                    armed_token: None,
+                },
+                device_id: device_id.to_string(),
+                inventory_published_at_ms: wall_now_ms(),
+                release_version: "1.2.4".into(),
+                release_checksum: "a".repeat(64),
+                arm_token: arm_token.map(str::to_string),
             })
-            .to_string();
+            .expect("serialize shared firmware request");
             authorize_test_body(
                 AUTH_KEY,
                 &unsigned,
@@ -891,13 +1244,12 @@ mod worker {
                 .list_since(&inventory_topic("node-a"), None)
                 .expect("list inventory");
             assert_eq!(items.len(), 1, "one inventory published");
-            let inv: FirmwareInventory =
-                serde_json::from_str(items[0].body.as_deref().unwrap()).unwrap();
-            assert_eq!(inv.model, "Surface Pro 8");
-            // Live fwupd is integration-gated headless → an honest skip reason,
-            // never a fabricated device list.
-            assert!(inv.skipped.is_some());
-            assert!(inv.devices.is_empty());
+            let inv = mackes_mesh_types::surface_hardware::SurfaceFirmwareInventory::from_json(
+                items[0].body.as_deref().unwrap().as_bytes(),
+            )
+            .expect("shared firmware inventory");
+            assert_eq!(inv.publication.model.product, "Surface Pro 8");
+            assert!(inv.skipped.is_none() || inv.devices.is_empty());
         }
 
         #[test]
@@ -912,7 +1264,18 @@ mod worker {
 
             // The Install tab requests an apply WITHOUT the arm token.
             let req = serde_json::to_string(&FwApplyRequest {
+                header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
+                    schema_version:
+                        mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: "node-a".into(),
+                    request_id: "unarmed-apply".into(),
+                    issued_at_ms: wall_now_ms(),
+                    armed_token: None,
+                },
                 device_id: "uefi-1".into(),
+                inventory_published_at_ms: wall_now_ms(),
+                release_version: "1.2.4".into(),
+                release_checksum: "a".repeat(64),
                 arm_token: None,
             })
             .unwrap();
@@ -980,15 +1343,53 @@ mod worker {
             let ApplyOutcome::Refused { reason } = result.outcome else {
                 panic!("missing authorization refusal");
             };
-            assert!(reason.contains("authorization refused"));
+            assert!(reason.contains("shared contract admission"));
             assert!(!result.reverify);
         }
 
         #[test]
-        fn valid_hmac_then_typed_arm_reaches_live_fwupd_seam() {
+        fn duplicate_and_foreign_firmware_fields_fail_shared_admission() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let worker = authorized_worker("node-a", detection("Surface Pro 6"), dir.path());
+            let duplicate = format!(
+                r#"{{"schema_version":1,"node":"node-a","request_id":"fw-duplicate","issued_at_ms":{},"device_id":"uefi-1","device_id":"uefi-2"}}"#,
+                wall_now_ms()
+            );
+            let result = worker.apply_request(Some(&duplicate));
+            let ApplyOutcome::Refused { reason } = result.outcome else {
+                panic!("duplicate key reached the effect path");
+            };
+            assert!(reason.contains("shared contract admission"));
+
+            let foreign = FwApplyRequest {
+                header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
+                    schema_version:
+                        mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: "node-b".into(),
+                    request_id: "fw-foreign".into(),
+                    issued_at_ms: wall_now_ms(),
+                    armed_token: None,
+                },
+                device_id: "uefi-1".into(),
+                inventory_published_at_ms: wall_now_ms(),
+                release_version: "1.2.4".into(),
+                release_checksum: "a".repeat(64),
+                arm_token: None,
+            };
+            let result = worker.apply_request(Some(
+                &serde_json::to_string(&foreign).expect("serialize foreign request"),
+            ));
+            let ApplyOutcome::Refused { reason } = result.outcome else {
+                panic!("foreign request reached the effect path");
+            };
+            assert!(reason.contains("different node"));
+        }
+
+        #[test]
+        fn valid_hmac_then_typed_arm_revalidates_live_inventory() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
-            let mut w = authorized_worker("node-auth", detection("Surface Pro 8"), dir.path());
+            let mut w = authorized_worker("node-auth", detection("Surface Pro 6"), dir.path());
             let request = signed_request(
                 "node-auth",
                 "uefi-1",
@@ -1011,15 +1412,18 @@ mod worker {
                 .expect("list results");
             let result: ApplyResult =
                 serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
-            assert!(matches!(result.outcome, ApplyOutcome::Gated { .. }));
-            assert!(!result.reverify, "headless LiveFwupd remains gated");
+            let ApplyOutcome::Refused { reason } = result.outcome else {
+                panic!("unbound firmware request was not refused");
+            };
+            assert!(reason.contains("fwupdmgr"));
+            assert!(!result.reverify);
         }
 
         #[test]
         fn hmac_success_does_not_replace_the_typed_arm_interlock() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
-            let mut w = authorized_worker("node-arm", detection("Surface Pro 8"), dir.path());
+            let mut w = authorized_worker("node-arm", detection("Surface Pro 6"), dir.path());
             let request = signed_request("node-arm", "uefi-1", None, "surface-fw-unarmed");
             persist
                 .write(
@@ -1077,7 +1481,7 @@ mod worker {
                 .map(|item| serde_json::from_str(item.body.as_deref().unwrap()).unwrap())
                 .collect();
             assert!(matches!(results[0].outcome, ApplyOutcome::Refused { .. }));
-            assert!(matches!(results[1].outcome, ApplyOutcome::Gated { .. }));
+            assert!(matches!(results[1].outcome, ApplyOutcome::Refused { .. }));
             let ApplyOutcome::Refused { reason } = &results[2].outcome else {
                 panic!("replay was not refused");
             };
@@ -1094,7 +1498,18 @@ mod worker {
                 dir.path().to_path_buf(),
             );
             let req = serde_json::to_string(&FwApplyRequest {
+                header: mackes_mesh_types::surface_hardware::SurfaceActionHeader {
+                    schema_version:
+                        mackes_mesh_types::surface_hardware::SURFACE_HARDWARE_SCHEMA_VERSION,
+                    node: "n".into(),
+                    request_id: "cursor-apply".into(),
+                    issued_at_ms: wall_now_ms(),
+                    armed_token: None,
+                },
                 device_id: "uefi-1".into(),
+                inventory_published_at_ms: wall_now_ms(),
+                release_version: "1.2.4".into(),
+                release_checksum: "a".repeat(64),
                 arm_token: None,
             })
             .unwrap();
@@ -1125,9 +1540,11 @@ mod worker {
                 .list_since(&board_topic("node-r"), None)
                 .expect("list boards");
             assert_eq!(boards.len(), 1, "a verify board was re-published");
-            let board: VerifyBoard =
-                serde_json::from_str(boards[0].body.as_deref().unwrap()).unwrap();
-            assert_eq!(board.model, "Surface Pro 8");
+            let board = mackes_mesh_types::surface_hardware::SurfaceVerifyBoard::from_json(
+                boards[0].body.as_deref().unwrap().as_bytes(),
+            )
+            .expect("shared verify board");
+            assert_eq!(board.publication.model.product, "Surface Pro 8");
         }
     }
 }
@@ -1137,7 +1554,10 @@ mod worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::{identify, DmiInfo, MS_VENDOR};
+    use crate::surface::{DmiInfo, MS_VENDOR, identify};
+
+    const APPLY_NOW_MS: u64 = 1_800_000_000_000;
+    const RELEASE_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     /// A scripted fake fwupd seam so the parse + apply run without a machine.
     #[derive(Clone)]
@@ -1166,7 +1586,12 @@ mod tests {
         fn get_updates_json(&self) -> Result<String, FwError> {
             self.updates_json.clone()
         }
-        fn apply_update(&self, _device_id: &str) -> Result<(), FwError> {
+        fn apply_update(
+            &self,
+            _device_id: &str,
+            _release_version: &str,
+            _release_checksum: &str,
+        ) -> Result<(), FwError> {
             self.apply.clone()
         }
     }
@@ -1197,8 +1622,8 @@ mod tests {
     // lists a release that is NOT newer (already current); touch has none.
     const UPDATES_JSON: &str = r#"{
       "Devices": [
-        { "DeviceId": "sysfw-1", "Name": "System Firmware", "Version": "1.2.3", "Releases": [ { "Version": "1.2.4" } ] },
-        { "DeviceId": "dbx-1", "Name": "UEFI dbx", "Version": "20230101", "Releases": [ { "Version": "20230101" } ] }
+        { "DeviceId": "sysfw-1", "Name": "System Firmware", "Version": "1.2.3", "Releases": [ { "Version": "1.2.4", "Checksum": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] } ] },
+        { "DeviceId": "dbx-1", "Name": "UEFI dbx", "Version": "20230101", "Releases": [ { "Version": "20230101", "Checksum": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] } ] }
       ]
     }"#;
 
@@ -1227,6 +1652,7 @@ mod tests {
         assert_eq!(sysfw.name, "System Firmware");
         assert_eq!(sysfw.current_version, "1.2.3");
         assert_eq!(sysfw.available_version.as_deref(), Some("1.2.4"));
+        assert_eq!(sysfw.available_checksum.as_deref(), Some(RELEASE_SHA256));
         assert!(sysfw.update_available, "1.2.4 > 1.2.3 is a real update");
 
         // A release that isn't newer is honestly NOT an update.
@@ -1252,6 +1678,62 @@ mod tests {
     fn malformed_json_is_an_honest_error_not_a_panic() {
         let err = inventory_from_json("not json", "{}").unwrap_err();
         assert!(matches!(err, FwError::Failed { .. }));
+    }
+
+    #[test]
+    fn inventory_rejects_duplicate_oversized_and_excess_rows() {
+        let duplicate = r#"{"Devices":[{"DeviceId":"same","Name":"A","Version":"1"},{"DeviceId":"same","Name":"B","Version":"2"}]}"#;
+        assert!(inventory_from_json(duplicate, EMPTY_DEVICE_LIST).is_err());
+
+        let oversized = serde_json::json!({"Devices": [{
+            "DeviceId": "x",
+            "Name": "x".repeat(MAX_FWUPD_FIELD_BYTES + 1),
+            "Version": "1"
+        }]});
+        assert!(inventory_from_json(&oversized.to_string(), EMPTY_DEVICE_LIST).is_err());
+
+        let rows: Vec<_> = (0..=MAX_FWUPD_DEVICES)
+            .map(|index| {
+                serde_json::json!({
+                    "DeviceId": format!("device-{index}"), "Name": "Device", "Version": "1"
+                })
+            })
+            .collect();
+        assert!(
+            inventory_from_json(
+                &serde_json::json!({"Devices": rows}).to_string(),
+                EMPTY_DEVICE_LIST
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_capture_discards_beyond_the_hard_limit() {
+        let captured = read_bounded(std::io::Cursor::new(vec![b'x'; MAX_FWUPD_OUTPUT_BYTES + 1]))
+            .expect("bounded read");
+        assert_eq!(captured.bytes.len(), MAX_FWUPD_OUTPUT_BYTES);
+        assert!(captured.truncated);
+    }
+
+    #[test]
+    fn live_read_argv_is_fixed_json_only() {
+        assert_eq!(FWUPDMGR, "/usr/bin/fwupdmgr");
+        assert_eq!(
+            GET_DEVICES_ARGS,
+            ["get-devices", "--json", "--no-unreported-check"]
+        );
+        assert_eq!(
+            GET_UPDATES_ARGS,
+            ["get-updates", "--json", "--no-unreported-check"]
+        );
+        assert!(!GET_DEVICES_ARGS.iter().any(|arg| arg.contains("update")));
+        assert!(!GET_UPDATES_ARGS.iter().any(|arg| *arg == "update"));
+    }
+
+    #[test]
+    fn inventory_rejects_duplicate_json_keys() {
+        assert!(inventory_from_json(r#"{"Devices":[],"Devices":[]}"#, EMPTY_DEVICE_LIST).is_err());
     }
 
     // ── the inventory verb ──────────────────────────────────────────────────
@@ -1299,12 +1781,33 @@ mod tests {
             ..Default::default()
         };
         let inv = run_inventory(&fake, &detect_of("Surface Pro 8"));
-        assert!(inv
-            .skipped
-            .as_deref()
-            .unwrap()
-            .contains("integration-gated"));
+        assert!(
+            inv.skipped
+                .as_deref()
+                .unwrap()
+                .contains("integration-gated")
+        );
         assert!(inv.devices.is_empty(), "never a fabricated device list");
+    }
+
+    #[test]
+    fn failed_updates_query_never_fabricates_up_to_date_rows() {
+        let fake = FakeFwupd {
+            devices_json: Ok(DEVICES_JSON.to_string()),
+            updates_json: Err(FwError::Failed {
+                action: "fwupdmgr get-updates".into(),
+                detail: "daemon unavailable".into(),
+            }),
+            apply: Ok(()),
+        };
+        let inventory = run_inventory(&fake, &detect_of("Surface Pro 6"));
+        assert!(
+            inventory
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("daemon unavailable"))
+        );
+        assert!(inventory.devices.is_empty());
     }
 
     // ── the typed-armed apply verb ──────────────────────────────────────────
@@ -1315,7 +1818,16 @@ mod tests {
             apply: Ok(()),
             ..Default::default()
         };
-        let r = run_apply(&fake, &detect_of("Surface Pro 8"), "sysfw-1", None);
+        let r = run_apply(
+            &fake,
+            &detect_of("Surface Pro 6"),
+            "sysfw-1",
+            None,
+            APPLY_NOW_MS,
+            APPLY_NOW_MS,
+            "1.2.4",
+            RELEASE_SHA256,
+        );
         assert!(matches!(r.outcome, ApplyOutcome::Refused { .. }));
         assert!(!r.reverify, "a refused apply does not re-verify");
     }
@@ -1326,58 +1838,135 @@ mod tests {
             apply: Ok(()),
             ..Default::default()
         };
-        let r = run_apply(&fake, &detect_of("Surface Pro 8"), "sysfw-1", Some("nope"));
+        let r = run_apply(
+            &fake,
+            &detect_of("Surface Pro 6"),
+            "sysfw-1",
+            Some("nope"),
+            APPLY_NOW_MS,
+            APPLY_NOW_MS,
+            "1.2.4",
+            RELEASE_SHA256,
+        );
         assert!(matches!(r.outcome, ApplyOutcome::Refused { .. }));
     }
 
     #[test]
-    fn armed_apply_updates_and_triggers_reverify() {
+    fn armed_apply_without_generation_release_and_checksum_is_refused() {
         let fake = FakeFwupd {
             apply: Ok(()),
             ..Default::default()
         };
         let r = run_apply(
             &fake,
-            &detect_of("Surface Pro 8"),
+            &detect_of("Surface Pro 6"),
             "sysfw-1",
             Some(FW_ARM_TOKEN),
+            0,
+            APPLY_NOW_MS,
+            "",
+            "",
         );
-        assert_eq!(r.outcome, ApplyOutcome::Applied);
+        let ApplyOutcome::Refused { reason } = r.outcome else {
+            panic!("unbound apply was not refused");
+        };
+        assert!(reason.contains("stale") || reason.contains("invalid release binding"));
         assert_eq!(r.device_id, "sysfw-1");
-        assert!(r.reverify, "a successful apply re-runs verify");
+        assert!(!r.reverify);
+    }
+
+    #[test]
+    fn missing_bindings_prevent_the_apply_seam_from_being_called() {
+        struct PanicApply;
+        impl Fwupd for PanicApply {
+            fn get_devices_json(&self) -> Result<String, FwError> {
+                Ok(EMPTY_DEVICE_LIST.into())
+            }
+            fn get_updates_json(&self) -> Result<String, FwError> {
+                Ok(EMPTY_DEVICE_LIST.into())
+            }
+            fn apply_update(
+                &self,
+                _device_id: &str,
+                _release_version: &str,
+                _release_checksum: &str,
+            ) -> Result<(), FwError> {
+                panic!("unsafe fwupd apply seam reached")
+            }
+        }
+        let result = run_apply(
+            &PanicApply,
+            &detect_of("Surface Pro 6"),
+            "sysfw-1",
+            Some(FW_ARM_TOKEN),
+            0,
+            APPLY_NOW_MS,
+            "",
+            "",
+        );
+        assert!(matches!(result.outcome, ApplyOutcome::Refused { .. }));
+        assert!(!result.reverify);
     }
 
     #[test]
     fn armed_apply_failure_is_honest_and_does_not_reverify() {
         let fake = FakeFwupd {
+            devices_json: Ok(DEVICES_JSON.to_string()),
+            updates_json: Ok(UPDATES_JSON.to_string()),
             apply: Err(FwError::Failed {
                 action: "fwupdmgr update sysfw-1".into(),
                 detail: "device rejected the update".into(),
             }),
-            ..Default::default()
         };
         let r = run_apply(
             &fake,
-            &detect_of("Surface Pro 8"),
+            &detect_of("Surface Pro 6"),
             "sysfw-1",
             Some(FW_ARM_TOKEN),
+            APPLY_NOW_MS,
+            APPLY_NOW_MS,
+            "1.2.4",
+            RELEASE_SHA256,
         );
         assert!(matches!(r.outcome, ApplyOutcome::Failed { .. }));
-        assert!(!r.reverify, "a failed apply changed nothing → no re-verify");
+        assert!(!r.reverify);
     }
 
     #[test]
-    fn armed_apply_gated_live_is_honest_never_faked() {
-        // The production seam must answer honestly headless — a gated apply is
-        // Gated, never a fake Applied.
-        let r = run_apply(
-            &LiveFwupd,
-            &detect_of("Surface Pro 8"),
+    fn exact_fresh_release_binding_reaches_the_apply_seam() {
+        let fake = FakeFwupd {
+            devices_json: Ok(DEVICES_JSON.to_string()),
+            updates_json: Ok(UPDATES_JSON.to_string()),
+            apply: Ok(()),
+        };
+        let result = run_apply(
+            &fake,
+            &detect_of("Surface Pro 6"),
             "sysfw-1",
             Some(FW_ARM_TOKEN),
+            APPLY_NOW_MS,
+            APPLY_NOW_MS,
+            "1.2.4",
+            RELEASE_SHA256,
         );
-        assert!(matches!(r.outcome, ApplyOutcome::Gated { .. }));
-        assert!(!r.reverify, "a gated apply did not change firmware");
+        assert_eq!(result.outcome, ApplyOutcome::Applied);
+        assert!(result.reverify);
+    }
+
+    #[test]
+    fn armed_apply_live_is_refused_before_fwupdmgr() {
+        let r = run_apply(
+            &LiveFwupd,
+            &detect_of("Surface Pro 6"),
+            "sysfw-1",
+            Some(FW_ARM_TOKEN),
+            APPLY_NOW_MS,
+            APPLY_NOW_MS,
+            "1.2.4",
+            RELEASE_SHA256,
+        );
+        assert!(matches!(r.outcome, ApplyOutcome::Refused { .. }));
+        assert!(!r.reverify);
     }
 
     #[test]
@@ -1391,32 +1980,45 @@ mod tests {
             model: identify(&dmi),
             dmi,
         };
-        let r = run_apply(&FakeFwupd::default(), &det, "sysfw-1", Some(FW_ARM_TOKEN));
+        let r = run_apply(
+            &FakeFwupd::default(),
+            &det,
+            "sysfw-1",
+            Some(FW_ARM_TOKEN),
+            APPLY_NOW_MS,
+            APPLY_NOW_MS,
+            "1.2.4",
+            RELEASE_SHA256,
+        );
         assert_eq!(r.skipped.as_deref(), Some("not a Microsoft Surface"));
     }
 
     #[test]
     fn triggers_reverify_only_on_applied() {
         assert!(ApplyOutcome::Applied.triggers_reverify());
-        assert!(!ApplyOutcome::Refused {
-            reason: String::new()
-        }
-        .triggers_reverify());
-        assert!(!ApplyOutcome::Gated {
-            reason: String::new()
-        }
-        .triggers_reverify());
-        assert!(!ApplyOutcome::Failed {
-            reason: String::new()
-        }
-        .triggers_reverify());
+        assert!(
+            !ApplyOutcome::Refused {
+                reason: String::new()
+            }
+            .triggers_reverify()
+        );
+        assert!(
+            !ApplyOutcome::Gated {
+                reason: String::new()
+            }
+            .triggers_reverify()
+        );
+        assert!(
+            !ApplyOutcome::Failed {
+                reason: String::new()
+            }
+            .triggers_reverify()
+        );
     }
 
     #[test]
-    fn live_inventory_is_integration_gated_never_faked_green() {
-        // The production seam headless: honest skip, no fabricated devices.
+    fn live_inventory_is_either_real_or_explicitly_unavailable() {
         let inv = run_inventory(&LiveFwupd, &detect_of("Surface Pro 8"));
-        assert!(inv.skipped.is_some());
-        assert!(inv.devices.is_empty());
+        assert!(inv.skipped.is_none() || inv.devices.is_empty());
     }
 }

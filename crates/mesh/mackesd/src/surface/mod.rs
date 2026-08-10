@@ -23,6 +23,8 @@
 
 use std::path::Path;
 
+use mackes_mesh_types::surface_hardware::SurfaceProGeneration;
+
 /// SURFACE-3 — the day-2 activation half: the `surface_enable` verb/worker
 /// (iptsd activate + per-model config) and the guided MOK enrollment state
 /// machine, built on this module's [`SurfaceDevice`]/[`SurfaceProfile`].
@@ -41,7 +43,7 @@ pub mod verify;
 /// (lock #8). Injectable [`firmware::Fwupd`] seam; live calls integration-gated.
 pub mod firmware;
 
-/// The four DMI fields the Surface identity fold reads, already
+/// The five DMI fields the Surface identity fold reads, already
 /// trimmed. A field the firmware/kernel doesn't expose is the empty
 /// string (never an error) — best-effort, like every other mackesd
 /// probe.
@@ -52,6 +54,9 @@ pub struct DmiInfo {
     pub sys_vendor: String,
     /// `/sys/class/dmi/id/product_name` — e.g. `"Surface Pro 7"`.
     pub product_name: String,
+    /// `/sys/class/dmi/id/product_sku` — required to distinguish a Surface
+    /// Pro 5, whose `product_name` is only `"Surface Pro"`.
+    pub product_sku: String,
     /// `/sys/class/dmi/id/product_version` — sometimes carries the
     /// generation when `product_name` is bare (`"Surface_Pro_7"`).
     pub product_version: String,
@@ -65,7 +70,7 @@ pub struct DmiInfo {
 /// The injectable DMI seam. Production reads `/sys`; tests hand a
 /// fixture [`DmiInfo`] straight to [`identify`].
 pub trait DmiSource {
-    /// Read the four DMI fields for this host. Best-effort: missing
+    /// Read the five DMI fields for this host. Best-effort: missing
     /// fields come back empty, never erroring.
     fn read(&self) -> DmiInfo;
 }
@@ -92,6 +97,7 @@ impl DmiSource for SysfsDmi {
         DmiInfo {
             sys_vendor: Self::field("sys_vendor"),
             product_name: Self::field("product_name"),
+            product_sku: Self::field("product_sku"),
             product_version: Self::field("product_version"),
             chassis_type: Self::field("chassis_type"),
         }
@@ -100,6 +106,11 @@ impl DmiSource for SysfsDmi {
 
 /// The DMI `sys_vendor` string a genuine Microsoft Surface reports.
 pub const MS_VENDOR: &str = "Microsoft Corporation";
+
+/// Exact SMBIOS SKUs used by the Wi-Fi and LTE Surface Pro 5 variants.
+/// Their product name is the otherwise generation-less `"Surface Pro"`, so
+/// no other SKU may promote that generic identity into the Pro 5 contract.
+const SURFACE_PRO_5_SKUS: [&str; 2] = ["Surface_Pro_1796", "Surface_Pro_1807"];
 
 /// One line-item subsystem the linux-surface matrix enables (design
 /// lock #2). A [`SurfaceProfile`] declares which of these a given model
@@ -350,6 +361,9 @@ pub struct SurfaceDevice {
     /// Generation number parsed from the product string (`7` for
     /// `"Surface Pro 7"`), if present.
     pub generation: Option<u32>,
+    /// Generation admitted by the shared Pro 5/6 wire contract. Detection of
+    /// any other Surface remains honest but is not promoted to supported.
+    pub contract_generation: SurfaceProGeneration,
     /// The raw DMI product string it matched (`"Surface Pro 7"`).
     pub product: String,
     /// The subsystem checklist this model carries.
@@ -422,6 +436,22 @@ pub fn identify(dmi: &DmiInfo) -> SurfaceModel {
     let product = pick_product(dmi);
     let normalised = product.replace('_', " ");
 
+    if normalised == "Surface Pro" {
+        if SURFACE_PRO_5_SKUS.contains(&dmi.product_sku.trim()) {
+            return SurfaceModel::Known(SurfaceDevice {
+                family: SurfaceFamily::Pro,
+                generation: Some(5),
+                contract_generation: SurfaceProGeneration::Pro5,
+                product: "Surface Pro 5".to_string(),
+                profile: SurfaceFamily::Pro.profile(),
+            });
+        }
+
+        return SurfaceModel::UnknownSurface {
+            product: normalised,
+        };
+    }
+
     for family in FAMILY_MATCH {
         if let Some(rest) = normalised.strip_prefix(family.dmi_prefix()) {
             // Guard against a false prefix hit ("Surface Prodigy"): the
@@ -432,6 +462,7 @@ pub fn identify(dmi: &DmiInfo) -> SurfaceModel {
             return SurfaceModel::Known(SurfaceDevice {
                 family,
                 generation: parse_generation(rest),
+                contract_generation: contract_generation(family, parse_generation(rest)),
                 product: normalised,
                 profile: family.profile(),
             });
@@ -440,6 +471,16 @@ pub fn identify(dmi: &DmiInfo) -> SurfaceModel {
 
     SurfaceModel::UnknownSurface {
         product: normalised,
+    }
+}
+
+const fn contract_generation(
+    family: SurfaceFamily,
+    generation: Option<u32>,
+) -> SurfaceProGeneration {
+    match (family, generation) {
+        (SurfaceFamily::Pro, Some(6)) => SurfaceProGeneration::Pro6,
+        _ => SurfaceProGeneration::Unsupported,
     }
 }
 
@@ -485,6 +526,7 @@ mod tests {
         DmiInfo {
             sys_vendor: vendor.to_string(),
             product_name: product.to_string(),
+            product_sku: String::new(),
             product_version: String::new(),
             chassis_type: String::new(),
         }
@@ -526,6 +568,55 @@ mod tests {
         };
         assert_eq!(dev.family, SurfaceFamily::Pro);
         assert_eq!(dev.generation, None);
+        assert_eq!(dev.contract_generation, SurfaceProGeneration::Unsupported);
+    }
+
+    #[test]
+    fn surface_pro_6_maps_to_the_explicit_shared_contract() {
+        let SurfaceModel::Known(pro6) = identify(&dmi(MS_VENDOR, "Surface Pro 6")) else {
+            panic!("expected Surface Pro 6");
+        };
+        assert_eq!(pro6.contract_generation, SurfaceProGeneration::Pro6);
+    }
+
+    #[test]
+    fn surface_pro_5_wifi_and_lte_skus_map_to_the_pro5_contract() {
+        for sku in SURFACE_PRO_5_SKUS {
+            let mut fixture = dmi(MS_VENDOR, "Surface Pro");
+            fixture.product_sku = sku.to_string();
+            let SurfaceModel::Known(device) = identify(&fixture) else {
+                panic!("expected Surface Pro 5 for SKU {sku}");
+            };
+            assert_eq!(device.generation, Some(5));
+            assert_eq!(device.contract_generation, SurfaceProGeneration::Pro5);
+            assert_eq!(device.product, "Surface Pro 5");
+        }
+    }
+
+    #[test]
+    fn generic_surface_pro_requires_an_exact_pro5_sku() {
+        for sku in ["", "Surface_Pro_179", "Surface_Pro_1796_extra"] {
+            let mut fixture = dmi(MS_VENDOR, "Surface Pro");
+            fixture.product_sku = sku.to_string();
+            assert!(matches!(
+                identify(&fixture),
+                SurfaceModel::UnknownSurface { .. }
+            ));
+        }
+
+        let mut forged_vendor = dmi("Contoso", "Surface Pro");
+        forged_vendor.product_sku = "Surface_Pro_1796".to_string();
+        assert_eq!(identify(&forged_vendor), SurfaceModel::NotASurface);
+
+        let SurfaceModel::Known(synthetic_name) = identify(&dmi(MS_VENDOR, "Surface Pro 5")) else {
+            panic!("the family detector should still recognize the product string");
+        };
+        assert_eq!(synthetic_name.generation, Some(5));
+        assert_eq!(
+            synthetic_name.contract_generation,
+            SurfaceProGeneration::Unsupported,
+            "only a real Pro 5 SKU may enter the privileged Pro 5 contract"
+        );
     }
 
     #[test]
@@ -624,6 +715,7 @@ mod tests {
         let d = DmiInfo {
             sys_vendor: MS_VENDOR.to_string(),
             product_name: String::new(),
+            product_sku: String::new(),
             product_version: "Surface_Pro_9".to_string(),
             chassis_type: "31".to_string(),
         };

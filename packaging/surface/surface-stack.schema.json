@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magic-mesh.invalid/schemas/surface-stack-provenance-v2.json",
+  "title": "MCNF Fedora 44 Surface stack provenance",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "target", "signing_key", "status", "blockers", "packages"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "kind": { "const": "mcnf-surface-stack-provenance" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "release", "arch", "profile", "bootc_base"],
+      "properties": {
+        "os": { "const": "fedora" },
+        "release": { "const": 44 },
+        "arch": { "const": "x86_64" },
+        "profile": { "const": "workstation-bootc" },
+        "bootc_base": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "signing_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256", "fingerprint"],
+      "properties": {
+        "filename": { "$ref": "#/$defs/nullableString" },
+        "sha256": { "$ref": "#/$defs/nullableString" },
+        "fingerprint": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "status": { "enum": ["ready", "blocked"] },
+    "blockers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "packages": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/package" }
+    }
+  },
+  "$defs": {
+    "nullableString": { "type": ["string", "null"] },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "availability", "blocker", "source", "rpm", "kernel_module_signing"],
+      "properties": {
+        "name": {
+          "enum": [
+            "kernel-surface",
+            "iptsd",
+            "libwacom-surface",
+            "surface-control",
+            "surface-secureboot"
+          ]
+        },
+        "availability": { "enum": ["ready", "unavailable"] },
+        "blocker": { "$ref": "#/$defs/nullableString" },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["filename", "url", "ref", "sha256", "license"],
+          "properties": {
+            "filename": { "$ref": "#/$defs/nullableString" },
+            "url": { "$ref": "#/$defs/nullableString" },
+            "ref": { "$ref": "#/$defs/nullableString" },
+            "sha256": { "$ref": "#/$defs/nullableString" },
+            "license": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "rpm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["filename", "nevra", "sha256", "signing_fingerprint"],
+          "properties": {
+            "filename": { "$ref": "#/$defs/nullableString" },
+            "nevra": { "$ref": "#/$defs/nullableString" },
+            "sha256": { "$ref": "#/$defs/nullableString" },
+            "signing_fingerprint": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "kernel_module_signing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["applicability", "signer", "certificate_sha256"],
+          "properties": {
+            "applicability": { "enum": ["required", "not-applicable"] },
+            "signer": { "$ref": "#/$defs/nullableString" },
+            "certificate_sha256": { "$ref": "#/$defs/nullableString" }
+          }
+        }
+      }
+    }
+  }
+}

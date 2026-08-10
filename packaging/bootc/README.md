@@ -10,7 +10,7 @@ directory adds the image lane on top of the same monolithic `magic-mesh` RPM.
 
 Contents:
 
-- `Containerfile` — FROM `quay.io/fedora/fedora-bootc:42`, installs the
+- `Containerfile` — FROM the manifest-authorized, digest-pinned Fedora 44 bootc base, installs the
   `magic-mesh` RPM (two lanes, below), adds the cloud substrate: `podman`,
   libvirt/QEMU-KVM, Open vSwitch, and OVN host bits. `cloud-hypervisor` is
   deliberately absent per CONSTRUCT-CLOUD/QC-1. Wires the DRM seat, boots to
@@ -25,7 +25,11 @@ Contents:
   registry is unreachable from this host (`GATED[E12-13/base-image]`, the
   expected outcome on the airgap-ish farm; never a raw podman splat mid-build).
   An image already in local storage skips the pull probe entirely, so a
-  side-loaded base (`podman load`) builds fully offline. Shellcheck-clean.
+  side-loaded base (`podman load`) builds fully offline. Before any staging,
+  pull, or build it requires the complete Surface provenance verifier to pass
+  and requires the effective bootc base to exactly match the manifest's
+  digest-pinned `quay.io/fedora/fedora-bootc:44@sha256:...` identity. A ready
+  manifest supplies that base; `--base` may only repeat it. Shellcheck-clean.
 - `system-preset/45-mcnf-quasar.preset` — the image-lane systemd preset (the
   declared seat policy; the Containerfile's `systemctl enable` materializes
   it, the preset keeps factory-reset/`preset-all` flows honest).
@@ -38,6 +42,13 @@ Contents:
 - `context.containerignore` — build-context allowlist (only `packaging/`
   reaches the builder), passed via `--ignorefile` so no other container
   build inherits it.
+- `../surface/` — the Fedora 44 Surface package provenance schema and manifest.
+  Run `install-helpers/verify-surface-stack.sh --self-test`, then
+  `install-helpers/verify-surface-stack.sh`, before treating the Surface layer
+  as buildable. The committed manifest is intentionally `blocked`: no governed
+  Fedora 44 source/RPM/signing evidence is currently available. A future ready
+  manifest admits only exact local RPM bytes and NEVRAs signed by the pinned
+  local key; no mutable repository URL or network key enters the Surface install.
 
 ## Building
 
@@ -49,7 +60,8 @@ Context is always the **repo root** (the Containerfile COPYies
 packaging/bootc/build-image.sh
 
 # Lane B — local RPM: bake a farm-built RPM (no channel dependency)
-packaging/bootc/build-image.sh --rpm ~/mcnf-release-artifacts/magic-mesh-11.4.5-1.x86_64.rpm
+packaging/bootc/build-image.sh \
+  --rpm ~/mcnf-release-artifacts/magic-mesh-11.4.5-1.x86_64.rpm
 
 # Either lane + a bootable disk image (root podman required)
 sudo packaging/bootc/build-image.sh --rpm <rpm> --disk qcow2

@@ -113,6 +113,8 @@ pub mod worker_runtime;
 pub mod route_trace;
 /// WL-FUNC-019 — bounded SSH/SFTP browsing and X11 resource admission.
 pub mod ssh_x11;
+/// WL-UX-011 — bounded Microsoft Surface Pro 5/6 observation and action contracts.
+pub mod surface_hardware;
 // WL-RUN-006 (2026-07-19) — the router firewall-edit verb (`action/router/*`
 // `RouterActionRequest`) + its tamper-evident audit schema. The "mutations
 // fast-follow" of the router-control read slice: the shell's Device-Manager

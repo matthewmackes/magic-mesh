@@ -16,10 +16,11 @@
 //! fake green.
 //!
 //! **Every reading comes through the injectable [`SurfaceProbes`] seam.**
-//! The production seam ([`LiveSurfaceProbes`]) reads `/sys` / evdev
-//! directly (§9 — no `dmidecode`/shell), and the confirmations a headless
-//! box genuinely can't make safely (a camera frame grab, a fingerprint
-//! enroll capability) come back as an honest [`ProbeError::IntegrationGated`]
+//! The production seam ([`LiveSurfaceProbes`]) reads `/sys` / evdev directly
+//! and uses one fixed-argv, bounded libcamera enumeration command (§9 — no
+//! `dmidecode` or shell). Confirmations a headless box genuinely can't make
+//! safely (a camera frame grab, a fingerprint enroll capability) remain
+//! unperformed or return an honest [`ProbeError::IntegrationGated`]
 //! rather than a faked success (§7 — the same discipline
 //! [`super::enable::LiveSurfaceActions`] uses). Interactive-gesture probes
 //! (pen pressure/tilt, S0ix suspend residency) fold to
@@ -32,8 +33,16 @@
 //! red subsystems) the Controller/fleet rollup reads (lock #7 — visibility
 //! only, never remote control). §6-clean: it stays wholly in mackesd.
 
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use mackes_mesh_types::surface_hardware::{
+    SURFACE_HARDWARE_SCHEMA_VERSION, SurfaceAvailability, SurfaceFleetSummary,
+    SurfaceModelIdentity, SurfaceObservationSource, SurfaceProGeneration, SurfaceProbeState,
+    SurfaceProbeVerdict, SurfacePublication, SurfaceSubsystem, SurfaceVerifyBoard,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{Subsystem, SurfaceDetection, SurfaceDevice, SurfaceModel, SurfaceProfile};
@@ -241,8 +250,8 @@ pub trait SurfaceProbes {
 
 // ─────────────────────────── the production seam ────────────────────────────
 
-/// The production seam. §9-clean: it reads `/sys` / evdev directly (no
-/// `dmidecode`/shell).
+/// The production seam. §9-clean: it reads `/sys` / evdev directly and runs
+/// only a fixed-argv, bounded libcamera enumeration (no `dmidecode`/shell).
 ///
 /// The confirmations a headless box genuinely can't
 /// make safely — a camera **frame grab** and a fingerprint **enroll
@@ -260,7 +269,10 @@ impl LiveSurfaceProbes {
     const IIO_DIR: &'static str = "/sys/bus/iio/devices";
     const NET_DIR: &'static str = "/sys/class/net";
     const BT_DIR: &'static str = "/sys/class/bluetooth";
-    const V4L_DIR: &'static str = "/sys/class/video4linux";
+    const LIBCAMERA_CAM: &'static str = "/usr/bin/cam";
+    const LIBCAMERA_ARGS: [&'static str; 1] = ["--list"];
+    const LIBCAMERA_TIMEOUT: Duration = Duration::from_secs(5);
+    const LIBCAMERA_OUTPUT_LIMIT: usize = 64 * 1024;
     /// A representative Intel PMC S0ix residency counter (µs since boot).
     const S0IX_RESIDENCY: &'static str = "/sys/kernel/debug/pmc_core/slp_s0_residency_usec";
 
@@ -300,6 +312,137 @@ impl LiveSurfaceProbes {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false)
     }
+
+    /// Enumerate cameras through libcamera without opening a capture stream.
+    /// The fixed command is time- and output-bounded and never invokes a
+    /// shell. Frame capture remains a separately armed/privacy-gated action.
+    fn enumerate_libcamera() -> Result<bool, ProbeError> {
+        let output = run_bounded_command(
+            Self::LIBCAMERA_CAM,
+            &Self::LIBCAMERA_ARGS,
+            Self::LIBCAMERA_TIMEOUT,
+            Self::LIBCAMERA_OUTPUT_LIMIT,
+        )
+        .map_err(|detail| ProbeError::Failed {
+            probe: "libcamera enumeration".to_string(),
+            detail,
+        })?;
+
+        parse_libcamera_list(&output).map_err(|detail| ProbeError::Failed {
+            probe: "libcamera enumeration".to_string(),
+            detail,
+        })
+    }
+}
+
+/// Run one fixed-argv observation command with bounded wall time and output.
+/// Both pipes are drained concurrently so a noisy program cannot deadlock the
+/// daemon. Output beyond `limit` is rejected rather than parsed partially.
+fn run_bounded_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    limit: usize,
+) -> Result<String, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start {program}: {e}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not capture libcamera stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not capture libcamera stderr".to_string())?;
+    let stdout_reader = std::thread::spawn(move || read_bounded(stdout, limit));
+    let stderr_reader = std::thread::spawn(move || read_bounded(stderr, limit));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {} seconds", timeout.as_secs()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for {program}: {e}"));
+            }
+        }
+    };
+
+    let (stdout, stdout_overflow) = stdout_reader
+        .join()
+        .map_err(|_| "libcamera stdout reader failed".to_string())?
+        .map_err(|e| format!("could not read libcamera stdout: {e}"))?;
+    let (stderr, stderr_overflow) = stderr_reader
+        .join()
+        .map_err(|_| "libcamera stderr reader failed".to_string())?
+        .map_err(|e| format!("could not read libcamera stderr: {e}"))?;
+
+    if stdout_overflow || stderr_overflow {
+        return Err(format!("output exceeded {limit} bytes"));
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    if !status.success() {
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("exited with {status}")
+        } else {
+            format!("exited with {status}: {detail}")
+        });
+    }
+    String::from_utf8(stdout).map_err(|_| "stdout was not valid UTF-8".to_string())
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut output = Vec::with_capacity(limit.min(4096));
+    reader
+        .by_ref()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut output)?;
+    let overflow = output.len() > limit;
+    output.truncate(limit);
+    Ok((output, overflow))
+}
+
+/// Parse `cam --list` conservatively. A successful command with the expected
+/// header and no numbered entries truthfully means no libcamera cameras. Any
+/// unfamiliar output is an error, not an inferred success.
+fn parse_libcamera_list(output: &str) -> Result<bool, String> {
+    let mut saw_header = false;
+    let mut camera_count = 0usize;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Available cameras:" {
+            saw_header = true;
+            continue;
+        }
+        if saw_header {
+            let Some((index, _description)) = trimmed.split_once(':') else {
+                continue;
+            };
+            if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
+                camera_count = camera_count.saturating_add(1);
+            }
+        }
+    }
+    if !saw_header {
+        return Err("unexpected output (missing `Available cameras:` header)".to_string());
+    }
+    Ok(camera_count > 0)
 }
 
 impl SurfaceProbes for LiveSurfaceProbes {
@@ -372,17 +515,13 @@ impl SurfaceProbes for LiveSurfaceProbes {
     }
 
     fn probe_camera(&self) -> Result<CameraReading, ProbeError> {
-        // Enumeration is a §9 file read; actually opening the V4L2 device and
-        // grabbing a frame is a live interaction a headless box can't safely
-        // do — gate the whole probe honestly rather than claim a green frame.
-        if Self::any_dir_entry(Self::V4L_DIR) {
-            Self::gated("camera frame capture")
-        } else {
-            Ok(CameraReading {
-                device_present: false,
-                frame_captured: false,
-            })
-        }
+        // libcamera is the authoritative enumeration path for the IPU3 camera
+        // stack used by Surface Pro 5/6. Enumeration has no capture side
+        // effect; frame capture remains privacy-gated and is never attempted.
+        Ok(CameraReading {
+            device_present: Self::enumerate_libcamera()?,
+            frame_captured: false,
+        })
     }
 
     fn probe_wifi_bt(&self) -> Result<WifiBtReading, ProbeError> {
@@ -811,10 +950,113 @@ pub fn summarize(node: impl Into<String>, board: &VerifyBoard) -> FleetSummary {
     }
 }
 
+fn shared_subsystem(subsystem: Subsystem) -> SurfaceSubsystem {
+    match subsystem {
+        Subsystem::Touch => SurfaceSubsystem::Touch,
+        Subsystem::Pen => SurfaceSubsystem::Pen,
+        Subsystem::TypeCover => SurfaceSubsystem::TypeCover,
+        Subsystem::Sam => SurfaceSubsystem::Sam,
+        Subsystem::RotationAccel => SurfaceSubsystem::RotationAccel,
+        Subsystem::Cameras => SurfaceSubsystem::Cameras,
+        Subsystem::WifiBt => SurfaceSubsystem::WifiBt,
+        Subsystem::S0ix => SurfaceSubsystem::S0ix,
+        Subsystem::Fingerprint => SurfaceSubsystem::Fingerprint,
+    }
+}
+
+fn shared_probe_state(state: ProbeState) -> SurfaceProbeState {
+    match state {
+        ProbeState::Ok => SurfaceProbeState::Ok,
+        ProbeState::Degraded => SurfaceProbeState::Degraded,
+        ProbeState::Failed => SurfaceProbeState::Failed,
+        ProbeState::NeedsGesture => SurfaceProbeState::NeedsGesture,
+    }
+}
+
+/// Fold the verifier's private classification values into the one bounded
+/// cross-tier state contract. Validation is deliberately producer-side too:
+/// hostile or unexpectedly large kernel-provided text is never written to the
+/// Bus for downstream consumers to mistake for admitted state.
+pub(crate) fn shared_board(
+    node: &str,
+    detection: &SurfaceDetection,
+    board: &VerifyBoard,
+    published_at_ms: u64,
+) -> Result<SurfaceVerifyBoard, mackes_mesh_types::surface_hardware::SurfaceContractError> {
+    let generation = match &detection.model {
+        SurfaceModel::Known(device) => device.contract_generation,
+        SurfaceModel::UnknownSurface { .. } | SurfaceModel::NotASurface => {
+            SurfaceProGeneration::Unsupported
+        }
+    };
+    let availability = board
+        .skipped
+        .as_ref()
+        .map_or(SurfaceAvailability::Fresh, |reason| {
+            SurfaceAvailability::Unavailable {
+                reason: reason.clone(),
+            }
+        });
+    let publication = SurfacePublication {
+        schema_version: SURFACE_HARDWARE_SCHEMA_VERSION,
+        node: node.to_string(),
+        model: SurfaceModelIdentity {
+            product: board.model.clone(),
+            generation,
+        },
+        // The board is a local kernel/device observation. Individual rows say
+        // when an operator gesture is still required; this is not an assertion
+        // that such a gesture has already occurred.
+        source: SurfaceObservationSource::Kernel,
+        published_at_ms,
+        availability,
+    };
+    let value = SurfaceVerifyBoard {
+        publication,
+        skipped: board.skipped.clone(),
+        rows: board
+            .rows
+            .iter()
+            .map(|row| SurfaceProbeVerdict {
+                subsystem: shared_subsystem(row.subsystem),
+                state: shared_probe_state(row.state),
+                reason: row.reason.clone(),
+            })
+            .collect(),
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+pub(crate) fn shared_summary(board: &SurfaceVerifyBoard) -> SurfaceFleetSummary {
+    let total = board.rows.len();
+    let enabled = board
+        .rows
+        .iter()
+        .filter(|row| row.state == SurfaceProbeState::Ok)
+        .count();
+    let red_subsystems: Vec<_> = board
+        .rows
+        .iter()
+        .filter(|row| row.state == SurfaceProbeState::Failed)
+        .map(|row| row.subsystem)
+        .collect();
+    SurfaceFleetSummary {
+        publication: board.publication.clone(),
+        enablement_pct: if total == 0 {
+            0
+        } else {
+            u8::try_from(enabled * 100 / total).unwrap_or(100)
+        },
+        red_count: red_subsystems.len(),
+        red_subsystems,
+    }
+}
+
 // ─────────────────────────── the Bus worker (per-node) ──────────────────────
 
 #[cfg(feature = "async-services")]
-pub use worker::{board_topic, summary_topic, SurfaceVerifyWorker};
+pub use worker::{SurfaceVerifyWorker, board_topic, summary_topic};
 
 #[cfg(feature = "async-services")]
 mod worker {
@@ -827,13 +1069,13 @@ mod worker {
     //! #7). On a non-Surface node it idles (never touches the Bus).
 
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
-    use super::{run_verify, summarize, LiveSurfaceProbes};
-    use crate::surface::{detect, SurfaceDetection};
+    use super::{LiveSurfaceProbes, run_verify, shared_board, shared_summary};
+    use crate::surface::{SurfaceDetection, detect};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Re-verify cadence — the board is fleet-visibility, not hot-path, so a
@@ -893,8 +1135,22 @@ mod worker {
         /// so a test drives it against a temp Bus without the run loop/clock.
         fn probe_once(&self, persist: &Persist) {
             let board = run_verify(&LiveSurfaceProbes, &self.detection);
+            let published_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+                .unwrap_or(1);
+            let Ok(board) = shared_board(&self.node_id, &self.detection, &board, published_at_ms)
+            else {
+                tracing::warn!(
+                    target: "mackesd::surface_verify",
+                    "refusing invalid Surface verification publication"
+                );
+                return;
+            };
             publish(persist, &board_topic(&self.node_id), &board);
-            let summary = summarize(&self.node_id, &board);
+            let summary = shared_summary(&board);
+            debug_assert!(summary.validate().is_ok());
             publish(persist, &summary_topic(&self.node_id), &summary);
         }
     }
@@ -962,13 +1218,16 @@ mod worker {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::surface::verify::{FleetSummary, VerifyBoard};
-        use crate::surface::{identify, DmiInfo, MS_VENDOR};
+        use crate::surface::{DmiInfo, MS_VENDOR, identify};
+        use mackes_mesh_types::surface_hardware::{
+            SurfaceFleetSummary, SurfaceProGeneration, SurfaceVerifyBoard,
+        };
 
         fn detection(product: &str) -> SurfaceDetection {
             let dmi = DmiInfo {
                 sys_vendor: MS_VENDOR.to_string(),
                 product_name: product.to_string(),
+                product_sku: String::new(),
                 ..Default::default()
             };
             SurfaceDetection {
@@ -1001,7 +1260,7 @@ mod worker {
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
             let w = SurfaceVerifyWorker::with_parts(
                 "node-a".into(),
-                detection("Surface Pro 8"),
+                detection("Surface Pro 6"),
                 dir.path().to_path_buf(),
             );
 
@@ -1011,19 +1270,25 @@ mod worker {
                 .list_since(&board_topic("node-a"), None)
                 .expect("list boards");
             assert_eq!(boards.len(), 1, "one board published");
-            let board: VerifyBoard =
-                serde_json::from_str(boards[0].body.as_deref().unwrap()).unwrap();
-            assert_eq!(board.model, "Surface Pro 8");
+            let board =
+                SurfaceVerifyBoard::from_json(boards[0].body.as_deref().unwrap().as_bytes())
+                    .unwrap();
+            assert_eq!(board.publication.model.product, "Surface Pro 6");
+            assert_eq!(
+                board.publication.model.generation,
+                SurfaceProGeneration::Pro6
+            );
             assert!(!board.rows.is_empty(), "the Pro claims subsystems");
 
             let summaries = persist
                 .list_since(&summary_topic("node-a"), None)
                 .expect("list summaries");
             assert_eq!(summaries.len(), 1, "one summary published");
-            let summary: FleetSummary =
-                serde_json::from_str(summaries[0].body.as_deref().unwrap()).unwrap();
-            assert_eq!(summary.node, "node-a");
-            assert_eq!(summary.model, "Surface Pro 8");
+            let summary =
+                SurfaceFleetSummary::from_json(summaries[0].body.as_deref().unwrap().as_bytes())
+                    .unwrap();
+            assert_eq!(summary.publication.node, "node-a");
+            assert_eq!(summary.publication.model.product, "Surface Pro 6");
             // Live seam is integration-gated headless → nothing fully green,
             // so enablement is honestly 0% (never a faked green).
             assert_eq!(summary.enablement_pct, 0);
@@ -1036,7 +1301,7 @@ mod worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::{identify, DmiInfo, MS_VENDOR};
+    use crate::surface::{DmiInfo, MS_VENDOR, identify};
 
     /// A fully scripted fake seam so the folds + board run green without a
     /// machine. Each field drives the matching probe's reading.
@@ -1128,9 +1393,15 @@ mod tests {
     }
 
     fn detect_of(product: &str) -> SurfaceDetection {
+        let (product_name, product_sku) = if product == "Surface Pro 5" {
+            ("Surface Pro", "Surface_Pro_1796")
+        } else {
+            (product, "")
+        };
         let dmi = DmiInfo {
             sys_vendor: MS_VENDOR.to_string(),
-            product_name: product.to_string(),
+            product_name: product_name.to_string(),
+            product_sku: product_sku.to_string(),
             ..Default::default()
         };
         SurfaceDetection {
@@ -1350,6 +1621,39 @@ mod tests {
     }
 
     #[test]
+    fn libcamera_parser_requires_its_header_and_numbered_camera_rows() {
+        let listed = "[0:00:00.000] INFO Camera camera_manager.cpp\n\
+                      Available cameras:\n\
+                      0: 'Front Camera' (/base/ipu3/camera0)\n\
+                      1: 'Rear Camera' (/base/ipu3/camera1)\n";
+        assert_eq!(parse_libcamera_list(listed), Ok(true));
+        assert_eq!(parse_libcamera_list("Available cameras:\n"), Ok(false));
+        assert!(parse_libcamera_list("0: camera-shaped noise\n").is_err());
+    }
+
+    #[test]
+    fn libcamera_enumeration_is_fixed_bounded_and_never_captures() {
+        assert_eq!(LiveSurfaceProbes::LIBCAMERA_CAM, "/usr/bin/cam");
+        assert_eq!(LiveSurfaceProbes::LIBCAMERA_ARGS, ["--list"]);
+        assert_eq!(LiveSurfaceProbes::LIBCAMERA_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(LiveSurfaceProbes::LIBCAMERA_OUTPUT_LIMIT, 64 * 1024);
+
+        let verdict = classify_camera(Ok(CameraReading {
+            device_present: true,
+            frame_captured: false,
+        }));
+        assert_eq!(verdict.state, ProbeState::Degraded);
+        assert!(verdict.reason.contains("no frame captured"));
+    }
+
+    #[test]
+    fn bounded_reader_reports_and_truncates_oversize_output() {
+        let (bytes, overflow) = read_bounded(&b"12345"[..], 4).expect("bounded read");
+        assert_eq!(bytes, b"1234");
+        assert!(overflow);
+    }
+
+    #[test]
     fn a_gated_probe_is_honestly_red_not_fake_green() {
         let v = classify_camera(Err(ProbeError::IntegrationGated {
             probe: "camera frame capture".into(),
@@ -1365,14 +1669,18 @@ mod tests {
         // A clamshell Laptop has no detachable Type Cover → that row must not
         // appear (verify neither probes nor faults it).
         let board = run_verify(&FakeProbes::default(), &detect_of("Surface Laptop 3"));
-        assert!(!board
-            .rows
-            .iter()
-            .any(|r| r.subsystem == Subsystem::TypeCover));
-        assert!(!board
-            .rows
-            .iter()
-            .any(|r| r.subsystem == Subsystem::RotationAccel));
+        assert!(
+            !board
+                .rows
+                .iter()
+                .any(|r| r.subsystem == Subsystem::TypeCover)
+        );
+        assert!(
+            !board
+                .rows
+                .iter()
+                .any(|r| r.subsystem == Subsystem::RotationAccel)
+        );
         // But it DOES claim + probe the fingerprint reader.
         assert_eq!(state_of(&board, Subsystem::Fingerprint), ProbeState::Ok);
     }
@@ -1393,10 +1701,56 @@ mod tests {
             assert_eq!(state_of(&board, s), ProbeState::Ok, "{s:?} should be green");
         }
         // The Pro has IR-face, not a fingerprint reader — not claimed/probed.
-        assert!(!board
-            .rows
-            .iter()
-            .any(|r| r.subsystem == Subsystem::Fingerprint));
+        assert!(
+            !board
+                .rows
+                .iter()
+                .any(|r| r.subsystem == Subsystem::Fingerprint)
+        );
+    }
+
+    #[test]
+    fn pro_5_and_6_keep_exact_model_identity_and_camera_evidence() {
+        for product in ["Surface Pro 5", "Surface Pro 6"] {
+            let board = run_verify(&FakeProbes::default(), &detect_of(product));
+            assert_eq!(board.model, product);
+            assert!(board.skipped.is_none());
+            assert_eq!(state_of(&board, Subsystem::Cameras), ProbeState::Ok);
+            assert!(
+                board
+                    .rows
+                    .iter()
+                    .any(|row| row.subsystem == Subsystem::TypeCover)
+            );
+        }
+    }
+
+    #[test]
+    fn shared_publication_carries_pro_5_and_6_identity_source_and_freshness() {
+        for (product, generation) in [
+            ("Surface Pro 5", SurfaceProGeneration::Pro5),
+            ("Surface Pro 6", SurfaceProGeneration::Pro6),
+        ] {
+            let detection = detect_of(product);
+            let private = run_verify(&FakeProbes::default(), &detection);
+            let board = shared_board("surface-seat", &detection, &private, 42)
+                .expect("healthy fixture admits to shared contract");
+            assert_eq!(board.publication.node, "surface-seat");
+            assert_eq!(board.publication.model.product, product);
+            assert_eq!(board.publication.model.generation, generation);
+            assert_eq!(board.publication.source, SurfaceObservationSource::Kernel);
+            assert_eq!(board.publication.availability, SurfaceAvailability::Fresh);
+            assert!(board.validate().is_ok());
+            assert!(shared_summary(&board).validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn shared_publication_refuses_hostile_probe_reason() {
+        let detection = detect_of("Surface Pro 6");
+        let mut private = run_verify(&FakeProbes::default(), &detection);
+        private.rows[0].reason = "bad\0reason".into();
+        assert!(shared_board("surface-seat", &detection, &private, 42).is_err());
     }
 
     #[test]
@@ -1417,6 +1771,7 @@ mod tests {
         let dmi = DmiInfo {
             sys_vendor: "Dell Inc.".into(),
             product_name: "XPS 13".into(),
+            product_sku: String::new(),
             ..Default::default()
         };
         let det = SurfaceDetection {
@@ -1502,9 +1857,9 @@ mod tests {
             .iter()
             .find(|r| r.subsystem == Subsystem::Cameras)
             .expect("camera row");
-        // Camera is either absent (no v4l dir) or gated — both are red, never
-        // a fake green.
-        assert_eq!(camera.state, ProbeState::Failed);
+        // Enumeration may fail/return absent (red) or find a libcamera camera
+        // (degraded because capture stays privacy-gated), but never turns green.
+        assert_ne!(camera.state, ProbeState::Ok);
         let fp = board
             .rows
             .iter()

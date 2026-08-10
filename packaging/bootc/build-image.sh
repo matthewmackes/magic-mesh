@@ -10,7 +10,7 @@
 #                                          # magic-mesh-*.rpm(s); repeat --rpm to stage
 #                                          # the base + browser pair into one seat image
 #   build-image.sh --tag <image:tag>       # default localhost/magic-mesh-bootc:latest
-#   build-image.sh --base <bootc-base>     # default quay.io/fedora/fedora-bootc:42
+#   build-image.sh --base <bootc-base>     # must equal manifest's digest-pinned Fedora 44 base
 #   build-image.sh --disk <qcow2|raw|anaconda-iso> [--out <dir>]
 #                                          # ALSO run bootc-image-builder (needs root podman)
 #
@@ -24,6 +24,7 @@
 #      On the airgap-ish farm this is the EXPECTED outcome, not a bug: gain
 #      egress or side-load the base once (`podman load`) and re-run.
 #      (MCNF_PULL_TIMEOUT=<secs> bounds the probe; default 120.)
+#      Also used for a valid but explicitly blocked Surface provenance manifest.
 set -euo pipefail
 
 # Print the header comment block (line 2 → first non-comment) so usage never
@@ -34,6 +35,10 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BOOTC_DIR="$REPO/packaging/bootc"
 CONTAINERFILE="$BOOTC_DIR/Containerfile"
 RPMS_DIR="$BOOTC_DIR/rpms"
+SURFACE_VERIFY="$REPO/install-helpers/verify-surface-stack.sh"
+SURFACE_MANIFEST="$REPO/packaging/surface/surface-stack.f44.json"
+SURFACE_ARTIFACTS="$REPO/packaging/surface/artifacts"
+SURFACE_LOCK="$REPO/packaging/surface/.surface-install.lock"
 
 TAG="localhost/magic-mesh-bootc:latest"
 BASE=""
@@ -96,11 +101,34 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Surface admission is deliberately first. The committed blocked manifest must
+# return the typed provenance gate before checking, pulling, or invoking Podman.
+[ -x "$SURFACE_VERIFY" ] || { echo "REFUSED[WL-UX-011/surface-provenance]: verifier missing/not executable: $SURFACE_VERIFY" >&2; exit 2; }
+[ -f "$SURFACE_MANIFEST" ] || { echo "REFUSED[WL-UX-011/surface-provenance]: manifest missing: $SURFACE_MANIFEST" >&2; exit 2; }
+surface_rc=0
+rm -f "$SURFACE_LOCK"
+trap 'rm -f "$SURFACE_LOCK"' EXIT
+"$SURFACE_VERIFY" --manifest "$SURFACE_MANIFEST" --artifact-dir "$SURFACE_ARTIFACTS" --emit-lock "$SURFACE_LOCK" || surface_rc=$?
+case "$surface_rc" in
+    0) ;;
+    3)
+        echo "GATED[WL-UX-011/surface-provenance]: Fedora 44 Surface stack provenance is unavailable" >&2
+        exit 3
+        ;;
+    *)
+        echo "REFUSED[WL-UX-011/surface-provenance]: invalid Surface stack provenance (verifier rc=$surface_rc)" >&2
+        exit 2
+        ;;
+esac
+
 # ── Pre-flight: collect EVERY missing input, then refuse in one shot ─────────
 missing=()
 command -v podman >/dev/null 2>&1 || missing+=("podman is not installed / not on PATH")
 [ -f "$CONTAINERFILE" ]           || missing+=("Containerfile missing: $CONTAINERFILE")
 [ -d "$RPMS_DIR" ]                || missing+=("staging dir missing: $RPMS_DIR")
+[ -x "$SURFACE_VERIFY" ]          || missing+=("Surface provenance verifier missing/not executable: $SURFACE_VERIFY")
+[ -f "$SURFACE_MANIFEST" ]        || missing+=("Surface provenance manifest missing: $SURFACE_MANIFEST")
+[ -d "$SURFACE_ARTIFACTS" ]       || missing+=("Surface artifact directory missing: $SURFACE_ARTIFACTS")
 [ -f "$REPO/packaging/repo/magic-mesh.repo" ] || missing+=("channel repo file missing: $REPO/packaging/repo/magic-mesh.repo")
 
 if [ "$LANE" = "local" ]; then
@@ -146,15 +174,20 @@ fi
 # ── The base-image gate, THEN the build ──────────────────────────────────────
 # Effective base = --base, else the Containerfile's ARG default (single source
 # of truth — never restate the quay ref here).
-EFFECTIVE_BASE="${BASE:-$(sed -n 's/^ARG BOOTC_BASE=//p' "$CONTAINERFILE" | head -n 1)}"
-if [ -z "$EFFECTIVE_BASE" ]; then
-    echo "FATAL: cannot determine the base image (no --base and no 'ARG BOOTC_BASE=' in $CONTAINERFILE)" >&2
+LOCKED_BASE="$(awk -F '\t' '$1 == "BASE" { print $2 }' "$SURFACE_LOCK")"
+EFFECTIVE_BASE="${BASE:-$LOCKED_BASE}"
+if [ -z "$LOCKED_BASE" ] || [ "$EFFECTIVE_BASE" != "$LOCKED_BASE" ]; then
+    echo "REFUSED[WL-UX-011/surface-base]: --base must exactly equal the manifest-authorized digest-pinned Fedora 44 base" >&2
+    echo "  authorized: $LOCKED_BASE" >&2
+    echo "  requested:  $EFFECTIVE_BASE" >&2
     exit 2
 fi
 resolve_image "$EFFECTIVE_BASE" "bootc base"
 
-build_args=(--build-arg "MCNF_RPM_LANE=$LANE")
-[ -n "$BASE" ] && build_args+=(--build-arg "BOOTC_BASE=$BASE")
+MANIFEST_SHA256="$(awk -F '\t' '$1 == "MANIFEST" { print $2 }' "$SURFACE_LOCK")"
+LOCK_SHA256="$(sha256sum "$SURFACE_LOCK" | awk '{print $1}')"
+build_args=(--build-arg "MCNF_RPM_LANE=$LANE" --build-arg "BOOTC_BASE=$EFFECTIVE_BASE"
+    --build-arg "SURFACE_MANIFEST_SHA256=$MANIFEST_SHA256" --build-arg "SURFACE_LOCK_SHA256=$LOCK_SHA256")
 
 echo "==> bootc image build: lane=$LANE tag=$TAG base=$EFFECTIVE_BASE"
 # --ignorefile: context is the repo root but only packaging/ is COPYied —

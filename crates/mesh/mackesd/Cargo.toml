@@ -164,6 +164,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Crypto: SHA-256 for the audit-log hash chain + 16-char URL-safe
 # passcode generation.
 sha2 = "0.10"
+# mokutil identifies pending X.509 certificates by SHA-1. Hash the fixed DER
+# certificate in-process; this is legacy identifier matching, not trust.
+sha1 = "0.10"
 rand = "0.8"
 # WL-FUNC-014 — Subsonic gateway token injection:
 # token = md5(password + salt), matching the AirSonic/OpenSubsonic contract.

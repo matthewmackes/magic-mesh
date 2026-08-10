@@ -33,6 +33,11 @@ done
 for p in qemu-kvm libvirt-daemon-driver-qemu libvirt-daemon-config-network ovn-host openvswitch cloud-init qemu-guest-agent; do
     rpm -q "$p" >/dev/null 2>&1 && ok "package installed: $p" || bad "package missing: $p"
 done
+for p in kernel-surface iptsd libwacom-surface surface-control surface-secureboot fwupd; do
+    rpm -q "$p" >/dev/null 2>&1 \
+        && ok "required Surface package installed: $p" \
+        || bad "required Surface package missing: $p"
+done
 virsh --version >/dev/null 2>&1 \
     && ok "virsh executes ($(virsh --version))" \
     || bad "virsh does not execute"
@@ -67,6 +72,17 @@ module_count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)"
 find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -name '*.surface.*' | grep -q . \
     && ok "surface kernel is the bootc kernel" \
     || bad "surface kernel modules tree missing"
+[ -f /usr/lib/systemd/system/iptsd@.service ] \
+    && ok "iptsd per-device template present" \
+    || bad "iptsd@.service missing"
+[ -f /usr/share/surface-secureboot/surface.cer ] \
+    && ok "linux-surface Secure Boot certificate present" \
+    || bad "linux-surface Secure Boot certificate missing"
+for generation in 5 6; do
+    [ -f "/usr/share/iptsd/surface-pro-${generation}.conf" ] \
+        && ok "iptsd Surface Pro ${generation} preset present" \
+        || bad "iptsd Surface Pro ${generation} preset missing"
+done
 
 # The seat unit, its preset, and the role gate.
 [ -f /usr/lib/systemd/system/mde-shell-egui.service ] \

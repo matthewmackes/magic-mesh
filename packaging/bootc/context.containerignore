@@ -4,3 +4,4 @@
 # .git/, docs/, infra/, target*/ …) would ride along as dead context weight.
 *
 !packaging
+!packaging/**

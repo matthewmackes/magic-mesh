@@ -4286,6 +4286,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "signal-hook 0.4.4",
  "task-supervisor",

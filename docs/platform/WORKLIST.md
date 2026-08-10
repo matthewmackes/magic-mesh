@@ -1888,8 +1888,13 @@ behavioral evidence is not completion.
   invoking lifecycle apply/cancel. `.90` passed 3/3; live first-frame proof
   remains: `docs/platform/evidence/WL-CRIT-007-2026-08-08-workload-session-recovery-s3-r1.md`.
 - **Dell/bootc truthful boot status (2026-08-09):** warned release 25 removed blank boot gating; Construct activated at 28.434s before mesh at 58.966s. Release 27 retains
-  the live kernel policy, and immutable bootc now has parity: `docs/platform/evidence/WL-CRIT-007-2026-08-09-dell-boot-status-release25-r18.md`,
-  `docs/platform/evidence/WL-CRIT-007-2026-08-09-bootc-truthful-boot-status-r101.md`.
+  the live kernel policy, and immutable bootc now has parity. Warned release 29
+  reboot acceptance reconfirmed the correction: Construct was active at 25.986s,
+  handed off its splash around 43s, and preceded mesh convergence at 57.526s;
+  the running persistent 8-GiB Browser VM survived intact:
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-dell-boot-status-release25-r18.md`,
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-bootc-truthful-boot-status-r101.md`,
+  `docs/platform/evidence/WL-CRIT-007-2026-08-09-dell-boot-status-release29-r105.md`.
 - **Corrected-forward Release 21 checkpoint (2026-08-08):** the Fedora 44
   package passed integrity, ABI, payload, transaction, and installed-file
   verification. Warned reboots on seat `.15` and Dell `.225` changed both boot
@@ -2036,6 +2041,14 @@ behavioral evidence is not completion.
   refuses a second mutation while retaining that identity. BigBoy passed six
   exact contract, executor, and shell tests:
   `docs/platform/evidence/WL-UX-011-2026-08-09-device-control-cancellation-r14.md`.
+- **Surface Pro 5/6 contract checkpoint (2026-08-09):** one shared bounded
+  observation/action contract now gates exact Pro 5 SKU and Pro 6 identity,
+  fail-closed activation, bounded firmware/camera reads, and local-only typed
+  shell projections. Fedora
+  44 image promotion fails closed because governed linux-surface source/RPM
+  provenance is unavailable; no physical acceptance is claimed. Focused farm
+  contract, daemon, shell, provenance, and collector gates passed:
+  `docs/platform/evidence/WL-UX-011-2026-08-09-surface-pro56-contract-r15.md`.
   1. S1 Freeze provider/entity/action contracts.
      - Objective: define source, freshness, capability, entity, conflict, history, export, and action schemas with redaction.
      - Inputs: worker contracts, existing This Node providers, UX-011 survey.
