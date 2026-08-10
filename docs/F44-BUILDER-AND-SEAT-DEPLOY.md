@@ -10,6 +10,13 @@
 > and preserve live rollout evidence in
 > [the 2026-08-03 seat record](ops/f44-seat-rollout-surface-2026-08-03.md).
 
+> **TEST-SEAT CAP — operator lock 2026-08-10:** the five addresses above remain
+> the deployment inventory, but no validation, capture, chaos, recovery,
+> acceptance, or rollout-proof activity may require or exercise more than three
+> physical seats. The required release test baseline is exactly Dell, Basement
+> seat 15, and Surface. Eagle and T480 are optional non-gating inspections or
+> separately bounded deployment-wave targets.
+
 > **Why this doc exists (operator directive 2026-07-12):** *"Add all learned
 > information so that no other AI need to discover it."* Everything below was
 > discovered live while cutting the 12.0.0 RPM and deploying it to the physical
@@ -324,9 +331,10 @@ as enrollment proof.
 ## 8. Historical fresh-seat activation lesson (learned live 2026-07-12, seat 15)
 
 > **Historical, not a current seat-15 procedure:** Basement seat 15 is now an
-> enrolled Workstation at `172.20.0.15` / `10.42.0.5` and belongs in the five-seat
-> deployment set. Do not rerun fresh-seat activation during a routine RPM
-> replacement. The steps remain here for a genuinely new or reimaged seat.
+> enrolled Workstation at `172.20.0.15` / `10.42.0.5` and belongs in the current
+> three-seat release-test baseline. Do not rerun fresh-seat activation during a
+> routine RPM replacement. The steps remain here for a genuinely new or
+> reimaged seat.
 
 Installing the RPM does **not** make a seat run — the node is **role-gated fail-closed**.
 The original observation was made on seat 15 while it was still brand new:
