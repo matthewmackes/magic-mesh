@@ -2227,7 +2227,14 @@ impl WorkloadActuator for SystemWorkloadActuator {
                 WorkloadBackend::LibvirtVirtqemud
                     if request.action == WorkloadOperationAction::StartAndAttach =>
                 {
-                    self.define_vm(request)?;
+                    if let Err(error) = self.define_vm(request) {
+                        // The attachment is provisioned before the VM so the
+                        // definition can bind its authenticated endpoint. A
+                        // definition failure must not strand that capability
+                        // while the operation retries or becomes terminal.
+                        self.remove_attachment(request);
+                        return Err(error);
+                    }
                 }
                 WorkloadBackend::QuadletSystemd => {}
                 WorkloadBackend::LibvirtVirtqemud => {}

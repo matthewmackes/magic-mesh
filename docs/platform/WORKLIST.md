@@ -103,6 +103,7 @@ behavioral evidence is not completion.
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
 - **Workload-pool rollback:** seat `.90` passed the focused storage gate: `docs/platform/evidence/WL-ARCH-010-2026-08-10-workload-pool-mount-rollback-r169.md`.
 - **Secure VM XML staging:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-secure-vm-xml-staging-r170.md`.
+- **Definition-failure attachment revocation:** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-define-failure-attachment-revocation-r171.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
