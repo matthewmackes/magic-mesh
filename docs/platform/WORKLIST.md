@@ -99,7 +99,8 @@ behavioral evidence is not completion.
 - **VM resource-efficiency checkpoints (2026-08-10):** Dom0-safe CPU pinning, bounded queues, qcow2 discard, and shared non-Dom0 CPU pools passed focused `.90` gates:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-guest-discard-efficiency-r148.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-shared-guest-cpu-pool-r152.md`.
 - **Dom0 reserve (2026-08-10):** BigBoy passed: `docs/platform/evidence/WL-ARCH-010-2026-08-10-dom0-cpu-reserve-r154.md`.
-- **VM overlay cleanup:** BigBoy: `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`.
+- **VM/image cleanup:** BigBoy; overlay and virtual-image failure cleanup evidence:
+  `docs/platform/evidence/WL-ARCH-010-2026-08-10-vm-overlay-failure-cleanup-r167.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-virtual-image-failure-cleanup-r168.md`.
 - **Native attachment hardening (2026-08-10):** lease bounds, recovered-ready revocation, and relay-loss input reset passed focused farm gates. Evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-bounded-attachment-lease-window-r165.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-10-recovered-ready-without-lease-r166.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-10-display1-relay-loss-reset-r166.md`.
@@ -110,16 +111,12 @@ behavioral evidence is not completion.
 - **Cleanup idempotence (2026-08-06):** sole libvirt actuator passed 23/23 on `.90`: `docs/platform/evidence/WL-ARCH-010-2026-08-06-cleanup-idempotence-r1.md`.
 - **Dell Display1/RDP checkpoint (2026-08-09):** release 26 requires Fedora's D-Bus QEMU backend; one GL Display1 head boots with disk identity preserved and RDP ready:
   `docs/platform/evidence/WL-ARCH-008-WL-ARCH-010-2026-08-09-dell-display1-rdp-release26-r92.md`.
-- **Admission/live proof checkpoints (2026-08-06/09):** the strict helper validates typed placement, resources, retry, and lease safety. Dell was unreachable; seat 15 lacked
-  a revision receipt, typed projection, operation, and attachment generation, so acceptance refused:
-  `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
+- **Admission/live proof:** helper passed placement/resource/retry/lease; Dell was unreachable; seat 15 acceptance refused for missing receipt/projection/operation/generation.
+  Evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-06-admission-proof-r1.md`, `docs/platform/evidence/WL-ARCH-010-2026-08-09-dell-seat15-live-acceptance-r15.md`.
 - **Native attachment route (2026-08-09):** invalid routes fail before effects; farm proof: `docs/platform/evidence/WL-ARCH-010-2026-08-09-native-attachment-route-r14.md`.
-- **Console authority removal checkpoint (2026-08-08):** the raw console relay, cloud console dispatch,
-  shell endpoint reader, obsolete Browser attach envelope, and matching live verifier were deleted.
-  Typed Workload Open plus authenticated Display1 leases remain; focused BigBoy/`.90` gates pass.
-  A bounded channel lets only the Workload reconciler execute cold-migration VM effects; Restart
-  persists Stop/Starting before effects and replays active starts once. Recovered cancellation owns its
-  exact Restart target through cleanup. Restart evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`,
+- **Console authority removal checkpoint (2026-08-08):** raw console relay, cloud dispatch, shell reader, obsolete Browser envelope, and live verifier were deleted.
+  Typed Workload Open plus authenticated Display1 leases remain; focused BigBoy/`.90` gates pass. Only the Workload reconciler executes cold-migration VM effects;
+  Restart persists Stop/Starting before effects, replays starts, and owns cancelled Restart; evidence: `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-journal-r16.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-09-restart-cancellation-ownership-r17.md`. Other evidence:
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-console-authority-removal-r1.md`,
   `docs/platform/evidence/WL-ARCH-010-2026-08-08-migration-authority-r1.md`.
