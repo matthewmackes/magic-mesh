@@ -534,17 +534,12 @@ impl WorkerRuntimeSampler {
             .collect::<Vec<_>>();
         let mut admitted_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            // Match Supervisor::accepts_worker: a few long-lived Worker
-            // implementations expose a kebab-case diagnostic name while the
-            // canonical registry predates it with snake_case. Exact registry
-            // identities still win; only an absent exact row may use the
-            // underscore alias.
-            let mut contract = crate::worker_role::worker_contract_for(row.name)
+            // Match Supervisor::accepts_worker: only aliases explicitly
+            // owned by the canonical registry may enter the status stream.
+            let contract = crate::worker_role::runtime_spec(&row.name)
+                .map(crate::worker_role::worker_contract)
+                .transpose()
                 .map_err(WorkerRuntimeStatusError::Contract)?;
-            if contract.is_none() && row.name.contains('-') {
-                contract = crate::worker_role::worker_contract_for(&row.name.replace('-', "_"))
-                    .map_err(WorkerRuntimeStatusError::Contract)?;
-            }
             match contract {
                 Some(contract) => admitted_rows.push((row, contract)),
                 None => return Err(WorkerRuntimeStatusError::UnregisteredWorker),

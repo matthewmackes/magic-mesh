@@ -1738,6 +1738,39 @@ pub fn spec(worker: &str) -> Option<&'static WorkerSpec> {
     WORKER_REGISTRY.iter().find(|s| s.name == worker)
 }
 
+/// Runtime spellings emitted by older worker implementations while the
+/// canonical registry uses underscore-separated identities.  This is an
+/// explicit ownership boundary: do not infer aliases by normalizing arbitrary
+/// input, because that would let an uncensused runtime name claim a live
+/// worker's group and status row.
+const WORKER_RUNTIME_ALIASES: &[(&str, &str)] = &[
+    ("nebula-supervisor", "nebula_supervisor"),
+    ("health-reconciler", "health_reconciler"),
+    ("mesh-latency", "mesh_latency"),
+    ("mesh-router", "mesh_router"),
+    ("nebula-ca-backup", "nebula_ca_backup"),
+    ("nebula-csr-watcher", "nebula_csr_watcher"),
+    ("nebula-enroll-listener", "nebula_enroll_listener"),
+    ("nebula-https-listener", "nebula_https_listener"),
+    ("stun-gather", "stun_gather"),
+    ("kdc-host", "kdc_host"),
+];
+
+/// Resolve a production worker name to its canonical registry row.
+///
+/// Exact canonical names always win.  Only aliases emitted by a known worker
+/// implementation are accepted; unknown kebab/snake transformations fail
+/// closed instead of crossing a process-group ownership boundary.
+#[must_use]
+pub fn runtime_spec(worker: &str) -> Option<&'static WorkerSpec> {
+    spec(worker).or_else(|| {
+        WORKER_RUNTIME_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == worker)
+            .and_then(|(_, canonical)| spec(canonical))
+    })
+}
+
 /// WL-ARCH-009 — the complete runtime-contract registry.
 ///
 /// Process entrypoints and status projections consume this view instead of
@@ -2765,6 +2798,21 @@ mod tests {
             "uncensused_responder",
             WorkerGroup::Control
         ));
+    }
+
+    #[test]
+    fn runtime_aliases_are_explicit_and_unknown_normalizations_fail_closed() {
+        assert_eq!(
+            runtime_spec("mesh-router").map(|worker| worker.name),
+            Some("mesh_router")
+        );
+        assert_eq!(
+            runtime_spec("mesh_router").map(|worker| worker.name),
+            Some("mesh_router")
+        );
+        assert!(runtime_spec("mesh-router-shadow").is_none());
+        assert!(runtime_spec("mesh_router_shadow").is_none());
+        assert!(runtime_spec("nebula--supervisor").is_none());
     }
 
     #[test]

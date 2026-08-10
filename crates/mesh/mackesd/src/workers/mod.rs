@@ -1150,12 +1150,7 @@ impl Drop for WorkerOwnerLease {
 }
 
 fn canonical_worker_identity(name: &'static str) -> &'static str {
-    crate::worker_role::spec(name)
-        .or_else(|| {
-            name.contains('-')
-                .then(|| name.replace('-', "_"))
-                .and_then(|alias| crate::worker_role::spec(&alias))
-        })
+    crate::worker_role::runtime_spec(name)
         .map_or(name, |spec| spec.name)
 }
 
@@ -1273,14 +1268,11 @@ impl Supervisor {
     pub fn accepts_worker(&self, name: &str) -> bool {
         match self.worker_group {
             None => true,
-            // A small set of long-lived Worker implementations expose a
-            // kebab-case diagnostic name while their canonical registry entry
-            // predates that spelling and uses snake_case. Preserve exact
-            // canonical names such as `link-traffic`; only try the underscore
-            // alias when exact lookup is absent. Unknown names still fail
-            // closed.
-            Some(group) => crate::worker_role::spec(name)
-                .or_else(|| crate::worker_role::spec(&name.replace('-', "_")))
+            // A small, registry-owned set of long-lived Worker
+            // implementations expose a kebab-case diagnostic name while the
+            // canonical row uses snake_case. Unknown names must not acquire
+            // ownership through generic punctuation normalization.
+            Some(group) => crate::worker_role::runtime_spec(name)
                 .map(|spec| spec.group == group)
                 .unwrap_or_else(|| {
                     panic!(
