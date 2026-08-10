@@ -110,6 +110,24 @@ The Browser VM has no Nebula process or host certificate. A one-time
 immediately after restart and did not repeat; it was not a copied guest
 identity.
 
+The final farm-verified watchdog payload was installed byte-for-byte at
+`/usr/libexec/mackesd/mesh-health-check` with SHA-256
+`9c1024941633d74c8befbb388d7a1aa5b52685a0fa0b6e48f00b78995b6b82e0`.
+The release-29 original and the preceding first hotfix remain recoverable at
+`/var/lib/mackesd/recovery-backups/mesh-health-check.release29-20260810T041649Z`
+and
+`/var/lib/mackesd/recovery-backups/mesh-health-check.hotfix1-20260810T042136Z`.
+
+The deliberately hostile live follow-through also exercised the new
+publication cooldown. A stale stamp caused one observation restart at 00:21,
+and the next two timer passes remained degraded while suppressing another
+restart. Publication then committed at 00:23:19. The 00:23:38 timer pass logged
+the client-only endpoint-probe warning, accepted the 33-second-old committed
+stamp as authoritative, logged `mesh-health: ok`, and exited 0. At that point
+all six groups, `mackesd.target`, the shell, timer, and Nebula were active;
+Nebula still had its single 00:07:12 start timestamp and `NRestarts=0`. There
+were zero later Nebula stops and zero later UDP EPERM records.
+
 ## Remaining limits
 
 Lighthouse `.1` answered Nebula traffic but could not commit an etcd proposal;
