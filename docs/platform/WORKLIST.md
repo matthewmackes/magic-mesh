@@ -2403,6 +2403,9 @@ behavioral evidence is not completion.
 - Remaining work:
 - **Future health freshness:** `.50` passed refusal of zero/future-dated snapshots:
   `docs/platform/evidence/WL-UX-013-2026-08-10-future-health-freshness-r181.md`.
+- **Duplicate active-condition admission:** `.90` passed refusal of repeated active
+  `(scope, id)` identities while preserving repeated resolved records for recurrence:
+  `docs/platform/evidence/WL-UX-013-2026-08-10-duplicate-active-condition-r185.md`.
 - **Health expiry projection checkpoint (2026-08-10):** expired checkpoint state and stale invalid projections fail closed without touching symlinks; BigBoy passed:
   `docs/platform/evidence/WL-UX-013-2026-08-10-health-expiry-projection-r160.md`.
 - **Availability duplicate-precedence checkpoint (2026-08-10):** duplicate evidence is classified before at-capacity overflow in forward and reversed order, while a

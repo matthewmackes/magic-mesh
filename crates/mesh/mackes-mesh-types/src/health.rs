@@ -1228,8 +1228,14 @@ impl NodeHealthState {
         if self.resolved_conditions.len() > MAX_NODE_HEALTH_CONDITIONS {
             return Err(NodeHealthValidationError::TooMany("resolved_conditions"));
         }
+        let mut active_condition_identities = BTreeSet::new();
         for condition in &self.active_conditions {
             validate_condition(condition, &self.publisher, self.published_at_ms, true)?;
+            if !active_condition_identities.insert((condition.scope.clone(), condition.id.clone())) {
+                return Err(NodeHealthValidationError::Contradictory(
+                    "duplicate active condition identity",
+                ));
+            }
         }
         for condition in &self.resolved_conditions {
             validate_condition(condition, &self.publisher, self.published_at_ms, false)?;
@@ -2341,6 +2347,27 @@ mod tests {
             wrong_lane.validate_at(100),
             Err(NodeHealthValidationError::Contradictory(
                 "condition is in the wrong lifecycle lane"
+            ))
+        );
+    }
+
+    #[test]
+    fn node_health_publication_rejects_duplicate_active_condition_identity() {
+        let mut duplicate = state("node", 1, 100);
+        let condition = condition("node", HealthSeverity::Warning);
+        duplicate.active_conditions = vec![condition.clone(), condition];
+        duplicate.grade = NodeGrade::evaluate(
+            "node",
+            duplicate.grade.capability_score,
+            duplicate.grade.factors,
+            &duplicate.active_conditions,
+            duplicate.grade.evaluated_at_ms,
+        );
+
+        assert_eq!(
+            duplicate.validate_at(100),
+            Err(NodeHealthValidationError::Contradictory(
+                "duplicate active condition identity"
             ))
         );
     }
